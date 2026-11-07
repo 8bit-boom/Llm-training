@@ -7,7 +7,7 @@ Gets this computer ready to train: it checks your NVIDIA graphics card and the d
 - An NVIDIA graphics card (your **RTX 5090** is ideal; 8 GB of memory is the minimum, 16 GB or more is comfortable).
 - A recent NVIDIA driver (version **570 or newer** for RTX 50 cards, 560 or newer for older cards).
 - About **15 GB** of free disk space for the software (40 GB or more is comfortable; models and checkpoints are big).
-- The installer tool **uv** (one command from <https://docs.astral.sh/uv/>). Later versions of ND Lore Forge will include it.
+- The installer tool **uv**. The installers ship it; if you run from source, install it from <https://docs.astral.sh/uv/>.
 - An internet connection for the install.
 
 ## What to do

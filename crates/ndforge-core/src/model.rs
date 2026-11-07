@@ -405,6 +405,11 @@ impl AppModel {
         Ok(crate::evaluate::runs::save_transcript(self.project_ref()?, run, items)?.to_string_lossy().to_string())
     }
 
+    /// Plain text for a bug report (no keys, no tokens).
+    pub fn problem_report(&self) -> String {
+        crate::diagnose::report(self.project.as_ref(), &self.settings)
+    }
+
     pub fn project_clone(&self) -> Result<Project> {
         Ok(self.project_ref()?.clone())
     }

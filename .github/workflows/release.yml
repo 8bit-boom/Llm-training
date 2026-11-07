@@ -1,0 +1,42 @@
+# Builds the installers when a tag like v0.1.0 is pushed (or by hand) and attaches them to the release.
+# NOT YET RUN: the first run is the first build of the installers.
+name: Release
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf libfuse2
+      - run: cargo install tauri-cli --version "^2" --locked
+      - run: packaging/linux/build.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: "dist/ND-Lore-Forge-*" }
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install tauri-cli --version "^2" --locked
+      - run: choco install innosetup -y --no-progress
+      - run: powershell -ExecutionPolicy Bypass -File packaging/windows/build.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: "dist/ND-Lore-Forge-Setup-*.exe" }
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: softprops/action-gh-release@v2
+        with: { files: "artifacts/**/*" }

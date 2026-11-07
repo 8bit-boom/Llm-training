@@ -33,6 +33,7 @@ function setState(s) { if (s) { state = s; } }
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
+  items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
     `<button class="step ${s.key === page ? "current" : ""}" data-key="${s.key}" ${s.unlocked ? "" : "disabled"}>${s.done ? "✓ " : s.unlocked ? "" : "🔒 "}${esc(s.label)}</button>`).join("");
   $("steps").querySelectorAll("button").forEach((b) => b.onclick = () => go(b.dataset.key));
@@ -638,6 +639,23 @@ function wireTest() {
   on("te-save", async () => { const f = await teCall("test_save_transcript", { run: te.run, items: te.chat }); if (f) te.ok = "Saved: " + f; render(); });
 }
 
+// ------------------------------------------------------------------------------------------------------------ guide
+let gd = { html: null, report: null, copied: false };
+function renderGuide() {
+  if (gd.html == null) return `<h1>Guide</h1><p class="lead">Loading…</p>`;
+  return `<div class="guide">${gd.html}</div>
+    <div class="card wide"><h2>Something is wrong?</h2><p>The help panel on the right lists the usual problems. If it is not there, make a report and send it with your question. It contains no passwords or access keys.</p>
+      <div class="row"><button class="primary" id="gd-report">Make a problem report</button>${gd.report ? `<button class="secondary" id="gd-copy">${gd.copied ? "Copied" : "Copy to the clipboard"}</button>` : ""}</div>
+      ${gd.report ? `<textarea id="gd-text" rows="14" readonly>${esc(gd.report)}</textarea>` : ""}</div>`;
+}
+async function gdLoad() { gd.html = await invoke("help", { key: "guide" }); if (page === "guide") render(); }
+function wireGuide() {
+  if (page !== "guide") return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("gd-report", async () => { gd.report = await invoke("problem_report"); gd.copied = false; render(); });
+  on("gd-copy", async () => { try { await navigator.clipboard.writeText(gd.report); gd.copied = true; } catch (_) { $("gd-text").select(); } render(); });
+}
+
 function renderSoon(key) {
   const [t, lead] = TITLES[key];
   return `<h1>${t}</h1><p class="lead">${lead}</p><span class="soon">Coming in a later version. The help panel shows what this step will do.</span>`;
@@ -647,7 +665,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : page === "test" ? renderTest() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -673,6 +691,7 @@ function wire() {
   wireTrain();
   wireUse();
   wireTest();
+  wireGuide();
   wireRetrain();
   on("recheck", refreshEnv);
   on("install", () => startEnv("env_install"));
@@ -761,12 +780,13 @@ async function go(key) {
   message = message && message.kind === "err" && key !== "welcome" && key !== "data" ? null : message;
   render();
   if (key === "setup") refreshEnv();
+  if (key === "guide") gdLoad();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
   if (key === "use" && state.bundle) usRefresh();
   if (key === "test" && state.bundle) { te.ok = null; teRefresh(); }
   if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
-  $("help").innerHTML = await invoke("help", { key });
+  $("help").innerHTML = await invoke("help", { key: key === "guide" ? "troubleshooting" : key });
   $("help").scrollTop = 0;
 }
 

@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod dataset;
+pub mod diagnose;
 pub mod diff;
 pub mod envmgr;
 pub mod evaluate;

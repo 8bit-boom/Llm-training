@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": {
+      "../dist/stage/worker": "worker",
+      "../dist/stage/tools": "tools"
+    },
+    "linux": { "deb": { "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"] } }
+  }
+}
