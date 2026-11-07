@@ -1,67 +1,59 @@
 # nd-world Training Bundle, format version 1 (`.ndtrain`)
 
-The contract between nd-world (producer) and ND Lore Forge (consumer). Both repositories keep a copy of this file and the
-sample bundle `tests/fixtures/sample.ndtrain`; a change to the format bumps `version`.
+> Copy of nd-world's `docs/TRAINING_BUNDLE_FORMAT.md`. nd-world is the producer; change it there first, then copy here.
 
-A bundle holds the text of **one world** for **GM-only** training. It is a **zip** file. Every member is UTF-8. `*.json` is one
-JSON document; `*.jsonl` is one JSON object per line (no blank lines). Text only: no images, audio, video, accounts or tokens.
+`GET /export/training.ndtrain` (Tools → Export & Backup → "Training bundle", GM only, the active world) downloads one world's
+text for **ND Lore Forge**, the program that fine-tunes a small model on it (repository `Llm-training`, which keeps a copy of this
+file as `docs/BUNDLE_FORMAT.md` and a sample bundle as `tests/fixtures/sample.ndtrain`). A format change bumps `version`.
 
-## Zip rules (so two implementations produce identical bytes)
+The bundle is for a **GM-only** model, so it contains GM secrets: `[gmonly]` text, hidden entities and notes, facts marked hidden.
+Treat it like a backup. It never contains users, e-mail addresses, passwords, tokens, 2FA data, images, audio, video, maps, dice
+history, live/combat state, **character journals and goals** or **GM→player private notes**.
 
-- Members are written in the order of the table below (alphabetical within a group), with fixed timestamp `1980-01-01 00:00:00`,
-  Unix mode `0o644`, and `ZIP_DEFLATED` level 6.
-- JSON is written with `ensure_ascii=False`, keys in the order shown below, `separators=(",", ":")` for JSONL lines and
-  `indent=2` for `.json` documents, `\n` line endings, and a final newline.
-- Records inside a `.jsonl` file are ordered by `id` ascending unless stated otherwise.
+Code: `app/training_bundle.py` (Python, the oracle) and `rust/nd-gateway/src/export.rs` `training_bundle` (the gateway; identical members).
 
-## Members
+## Zip
 
-| Member | Required | Contents |
+A zip of UTF-8 members. `*.json` = one JSON document (`indent=2`, then a final newline); `*.jsonl` = one compact JSON object per
+line (`separators=(",", ":")`, `ensure_ascii=False`, `\n` after every line). Members are stored in the order below, with timestamp
+`1980-01-01 00:00:00`, mode `0644`, deflate level 6. Records are ordered by `id` ascending unless stated. Optional members are
+left out when they would be empty.
+
+| Member | Always | Record |
 |---|---|---|
-| `manifest.json` | yes | See below. Written last in content terms (it hashes the others) but stored first in the zip. |
-| `world.json` | yes | `{"id", "name", "slug", "description", "kinds": [...], "templates": [...], "calendar": {...}, "rulesets": [...]}` |
-| `entities.jsonl` | yes | One entity per line (below). |
-| `entity_notes.jsonl` | no | `{"id", "entity_id", "content", "visible_to_players", "updated_at"}` |
-| `relations.jsonl` | no | `{"id", "source_id", "source_name", "target_id", "target_name", "relation"}`; untyped links use `relation: "related"`. |
-| `rules.md` | no | The world's effective rules text (Markdown); the core-rules fallback when the world has none. |
-| `rules_sheets.jsonl` | no | `{"id", "template", "rules_md"}` for sheet templates that carry rules text. |
-| `sessions.jsonl` | no | `{"id", "session_num", "session_date", "title", "summary", "npcs": [{"entity_id","name"}], "loot": [...]}` |
-| `facts.jsonl` | no | `{"id", "game_session_id", "content", "visible_to_players", "tags"}` |
-| `quests.jsonl` | no | `{"id", "title", "status", "category", "summary", "body", "linked_entities": [...], "parent_id"}` |
-| `tables.jsonl` | no | `{"id", "name", "category", "description", "entries": [{"label", "weight"}]}` |
-| `ai_instructions.jsonl` | no | Enabled standing AI instructions: `{"id", "title", "content", "applies_to_players"}` |
-| `characters.jsonl` | no | Player characters: `{"id", "name", "race", "char_class", "level", "backstory", "notes", "equipment", "feats"}`; no owner or account fields. |
+| `manifest.json` | yes | see below |
+| `world.json` | yes | `{"id","name","slug","description","templates":[{"id","slug","name","kind","fields":[…]}]}`; templates are the world's own and the global ones; `fields` is the template's field list (ids and labels) |
+| `entities.jsonl` | yes (may be empty) | `{"id","kind","subtype","name","aliases":[…],"folder","tags":[…],"summary","body","template":slug\|null,"custom_fields":{field id: value},"roleplay_personality","visible_to_players","group_ids":[…],"rag_priority","updated_at"}` |
+| `entity_notes.jsonl` | no | `{"id","entity_id","content","visible_to_players","updated_at"}` for every note pinned to an entity of the world |
+| `relations.jsonl` | no | `{"id","source_id","source_name","target_id","target_name","relation"}`: typed relations first (by id), then the plain "related" links (by source, target). `id` is the position, 1…n |
+| `rules.md` | no | the world's rules text; the bundled core rules when the world has none (raw Markdown, `:::gm` blocks kept) |
+| `rules_sheets.jsonl` | no | `{"id","template","rules_md"}` of the world's character-sheet templates that carry rules text |
+| `sessions.jsonl` | no | `{"id","session_num","session_date","title","summary","npcs":[…],"loot":[…]}` |
+| `facts.jsonl` | no | `{"id","game_session_id","content","visible_to_players","tags"}` |
+| `quests.jsonl` | no | `{"id","title","status","category","summary","body","linked_entities":[…],"parent_id"}` |
+| `tables.jsonl` | no | `{"id","name","category","description","entries":[…]}` (the world's own tables) |
+| `ai_instructions.jsonl` | no | enabled standing AI instructions: `{"id","title","content","applies_to_players"}` |
+| `characters.jsonl` | no | `{"id","name","race","char_class","level","backstory","notes","equipment":[…],"feats":[…]}` — no owner or account fields |
 
-### Entity record
-
-```json
-{"id": 12, "kind": "character", "subtype": "NPC", "name": "Anders de Vallière", "aliases": ["Anders"],
- "folder": "NPCs", "tags": ["hunter"], "summary": "...", "body": "markdown, access tags kept raw",
- "custom_fields": {"rank": "Captain"}, "roleplay_personality": "gruff, ...", "visible_to_players": true,
- "group_ids": [], "rag_priority": false, "updated_at": "2026-11-02T10:00:00"}
-```
-
-`body`, `summary`, `roleplay_personality`, notes and facts keep nd-world's access tags **raw** (`[gmonly]…[/gmonly]`,
-`[for=IDs]…[/for]`, `[reveal=DATE]…[/reveal]`). The consumer decides what to do with them (ND Lore Forge trains a GM model and
-turns them into labelled text). `custom_fields` uses readable labels, resolved through `world.json` templates.
+Normalisation (so Python and Rust agree): `aliases` / `tags` are the comma-separated text split, each part stripped, empty parts
+dropped; `group_ids`, `npcs`, `loot`, `linked_entities`, `entries`, `equipment`, `feats`, `fields` are the stored JSON when it is a list
+(`custom_fields`: a dict), else empty; booleans are the stored flag's truthiness; `updated_at` is the stored text with the first space
+turned into `T`. Access tags (`[gmonly]`, `[for=IDs]`, `[reveal=DATE]`) stay raw in every text field: the reader decides what to do.
+`custom_fields` keeps field ids; `world.json` templates map id → label.
 
 ### manifest.json
 
 ```json
-{"format": "nd-training-bundle", "version": 1, "created": "2026-11-07T12:00:00Z", "nd_build": "…",
+{"format": "nd-training-bundle", "version": 1, "created": "2026-11-07T12:00:00Z", "nd_build": "abc1234",
  "world": {"id": 1, "name": "…", "slug": "…", "description": "…"},
- "files": {"entities.jsonl": {"sha256": "…", "bytes": 12345, "records": 312}, "world.json": {"sha256": "…", "bytes": 800}}}
+ "files": {"world.json": {"sha256": "…", "bytes": 800}, "entities.jsonl": {"sha256": "…", "bytes": 12345, "records": 312}}}
 ```
 
-`records` is present for `.jsonl` members. `files` lists every other member (not the manifest itself).
+`files` lists every other member in order; `records` = lines of a `.jsonl`. `created` is the only value that differs between two
+exports of an unchanged world.
 
-## Never included
+## Reader rules
 
-Users, e-mail addresses, passwords, tokens, 2FA data, images/audio/video, map and schematic geometry, dice history, live and
-combat state, **character journals and goals**, **GM-to-player private notes**.
-
-## Consumer rules
-
-1. Reject anything whose `format` is not `nd-training-bundle` or whose `version` is higher than supported.
-2. Verify every listed member's SHA-256 and size; reject on mismatch or on an unlisted member.
-3. Ignore unknown members and unknown keys (forward compatibility); treat missing optional members as empty.
+1. Refuse a `format` other than `nd-training-bundle` or a `version` higher than the reader knows.
+2. Check every listed member's SHA-256 and size; refuse a member the manifest does not list.
+3. Ignore unknown keys; treat a missing optional member as empty.

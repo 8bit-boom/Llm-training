@@ -4,25 +4,23 @@ from pathlib import Path
 from ndforge.ingest.bundle import write_bundle
 
 WORLD = {"id": 1, "name": "Ashfall Reach", "slug": "ashfall-reach", "description": "A sample world.",
-         "kinds": ["character", "location", "organization", "creature", "event", "item", "feat", "note"],
-         "templates": [{"id": 1, "slug": "npc", "name": "NPC", "fields": [{"id": "rank", "label": "Rank"}]}],
-         "calendar": {}, "rulesets": ["nd"]}
+         "templates": [{"id": 1, "slug": "npc", "name": "NPC", "kind": "character", "fields": [{"id": "rank", "label": "Rank"}]}]}
 
 
 def entities(variant: int = 1) -> list[dict]:
     anders = {"id": 1, "kind": "character", "subtype": "player character", "name": "Anders de Vallière",
               "aliases": ["Anders"], "folder": "Heroes", "tags": ["hunter", "fire"],
               "summary": "A Widow-Bound Hunter.", "body": "# Anders\nHunts colossal beasts. [gmonly]He fears fire.[/gmonly]",
-              "custom_fields": {"Rank": "Captain"}, "roleplay_personality": "gruff, terse", "visible_to_players": True,
+              "template": "npc", "custom_fields": {"rank": "Captain"}, "roleplay_personality": "gruff, terse", "visible_to_players": True,
               "group_ids": [], "rag_priority": False, "updated_at": "2026-11-01T10:00:00"}
     dock = {"id": 2, "kind": "location", "subtype": "city", "name": "Dockside", "aliases": [], "folder": "", "tags": [],
-            "summary": "A harbour district.", "body": "Smugglers meet here.", "custom_fields": {}, "roleplay_personality": "",
+            "summary": "A harbour district.", "body": "Smugglers meet here.", "template": None, "custom_fields": {}, "roleplay_personality": "",
             "visible_to_players": True, "group_ids": [], "rag_priority": False, "updated_at": "2026-11-01T10:00:00"}
     out = [anders, dock]
     if variant == 2:  # a later export: one changed, one new, one removed (Dockside)
         anders = dict(anders, body=anders["body"] + "\nHe carries the Grandcouteau.", updated_at="2026-11-05T10:00:00")
         out = [anders, {"id": 3, "kind": "organization", "subtype": "guild", "name": "The Greyfather Pack", "aliases": [],
-                        "folder": "", "tags": [], "summary": "Beast hunters.", "body": "", "custom_fields": {},
+                        "folder": "", "tags": [], "summary": "Beast hunters.", "body": "", "template": None, "custom_fields": {},
                         "roleplay_personality": "", "visible_to_players": False, "group_ids": [], "rag_priority": False,
                         "updated_at": "2026-11-05T10:00:00"}]
     return out
