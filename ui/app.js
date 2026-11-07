@@ -22,6 +22,14 @@ async function call(cmd, args) {
   catch (e) { message = { kind: "err", text: String(e) }; render(); return null; }
 }
 
+// night mode: "auto" follows the system until the user chooses
+const systemDark = () => window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+function applyTheme() {
+  const t = state.settings.theme || "auto";
+  if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t);
+  $("night").checked = t === "dark" || (t === "auto" && systemDark());
+}
+
 function setState(s) { if (s) { state = s; } }
 
 function renderSteps() {
@@ -197,6 +205,7 @@ function render() {
   const el = $("page");
   el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
+  applyTheme();
   $("expert").checked = state.settings.expert_mode;
   $("helptoggle").checked = state.settings.show_help_panel;
   $("layout").classList.toggle("nohelp", !state.settings.show_help_panel);
@@ -302,6 +311,7 @@ async function go(key) {
 async function init() {
   setState(await invoke("get_state"));
   $("expert").onchange = async (e) => setState(await invoke("set_setting", { key: "expert_mode", value: e.target.checked })) || render();
+  $("night").onchange = async (e) => { setState(await invoke("set_theme", { theme: e.target.checked ? "dark" : "light" })); render(); };
   $("helptoggle").onchange = async (e) => { setState(await invoke("set_setting", { key: "show_help_panel", value: e.target.checked })); render(); };
   try {
     await tauri.webview.getCurrentWebview().onDragDropEvent((e) => {

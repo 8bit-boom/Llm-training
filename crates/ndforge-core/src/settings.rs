@@ -12,12 +12,14 @@ pub struct Settings {
     pub expert_mode: bool,
     pub show_help_panel: bool,
     pub welcome_seen: bool,
+    /// "auto" (follow the system), "light" or "dark" (night mode)
+    pub theme: String,
     pub recent_projects: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, recent_projects: Vec::new() }
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), recent_projects: Vec::new() }
     }
 }
 

@@ -249,6 +249,11 @@ fn model_flow_matches_the_window() {
     m.set_setting("show_help_panel", false).unwrap();
     assert_eq!(m.state()["settings"]["show_help_panel"], false);
     assert!(m.set_setting("nope", true).is_err());
+    assert_eq!(m.state()["settings"]["theme"], "auto");
+    m.set_theme("dark").unwrap();
+    assert_eq!(m.state()["settings"]["theme"], "dark");
+    assert!(m.set_theme("purple").is_err());
+    assert_eq!(AppModel::load().settings.theme, "dark"); // remembered
 }
 
 #[test]

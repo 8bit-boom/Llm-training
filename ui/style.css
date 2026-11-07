@@ -1,10 +1,12 @@
 :root {
   --bg: #f4f5f8; --panel: #ffffff; --text: #1d2130; --dim: #5d6478; --line: #d6d9e3; --accent: #1f6feb; --accent-text: #fff;
-  --ok: #1a7f4b; --err: #c0392b; --sel: #e4ecfd;
+  --ok: #1a7f4b; --err: #c0392b; --sel: #e4ecfd; color-scheme: light;
 }
+/* night mode: the system's dark setting while no choice was made, or the explicit choice */
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; }
+  :root:not([data-theme="light"]) { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; color-scheme: dark; }
 }
+:root[data-theme="dark"] { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; color-scheme: dark; }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }

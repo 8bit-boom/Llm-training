@@ -98,6 +98,13 @@ fn dataset_save(s: State<App>) -> Out<Value> {
 }
 
 #[tauri::command]
+fn set_theme(s: State<App>, theme: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.set_theme(&theme).map_err(|e| e.to_string())?;
+    Ok(m.state())
+}
+
+#[tauri::command]
 fn help(key: String) -> String {
     help_html(&key)
 }
@@ -149,7 +156,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

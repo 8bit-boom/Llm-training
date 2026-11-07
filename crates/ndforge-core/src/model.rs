@@ -52,7 +52,7 @@ impl AppModel {
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
-            "settings": {"expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel},
+            "settings": {"expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme},
             "projects_dir": default_projects_dir(),
         })
     }
@@ -97,6 +97,16 @@ impl AppModel {
         };
         project.import_bundle(&bundle)?;
         Ok(summary)
+    }
+
+    /// "auto", "light" or "dark".
+    pub fn set_theme(&mut self, theme: &str) -> Result<()> {
+        if !["auto", "light", "dark"].contains(&theme) {
+            return Err(Error::new(format!("Unknown theme: {theme}")));
+        }
+        self.settings.theme = theme.to_string();
+        self.settings.save();
+        Ok(())
     }
 
     pub fn set_setting(&mut self, key: &str, value: bool) -> Result<()> {
