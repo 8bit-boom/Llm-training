@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod diff;
+pub mod envmgr;
 pub mod error;
 pub mod help;
 pub mod model;

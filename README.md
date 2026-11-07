@@ -13,7 +13,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M1 Guided app (5 steps, help panel, projects), Rust + Tauri | done |
 | M3 Step 1: import `.ndtrain`, verification, diff | done |
 | M2 nd-world "Training bundle" download | built in the nd-world repo; waiting for its full test suite |
-| M4 onward (environment, data, training, export ...) | not started |
+| M4 Training setup: GPU/driver checks, uv install, Python worker, GPU self-test | built; needs a run on a real NVIDIA PC (the RTX 5090) |
+| M5 onward (data, training, export ...) | not started |
 
 ## Build and run
 
@@ -27,3 +28,10 @@ cargo install tauri-cli --version "^2" && cargo tauri build     # installer (MSI
 
 To try step 1 without nd-world, choose `tests/fixtures/sample.ndtrain` (regenerate: `cargo run -p ndforge-core --example make_sample`).
 `NDFORGE_CONFIG_DIR` and `NDFORGE_PROJECTS_DIR` move the settings and the projects folder.
+
+## Training setup (M4)
+
+Open **⚙ Training setup** in the window. It checks the NVIDIA card and driver (RTX 50 cards need driver 570+), free disk space and
+[uv](https://docs.astral.sh/uv/), installs a Python environment with the right CUDA build of PyTorch, and runs a 30-second GPU self-test
+(`worker/`, `python -m ndforge_worker job.json`, JSON lines on stdout; see `worker/ndforge_worker/protocol.py`). The worker has its
+own tests: `cd worker && python -m pytest tests`. `NDFORGE_ENV_DIR`, `NDFORGE_WORKER_DIR` and `NDFORGE_UV` override where things are found.

@@ -15,6 +15,7 @@ let state = null;
 let page = "welcome";
 let pending = null;      // a checked file waiting for the user's confirmation: {path, info}
 let message = null;      // {kind: "err"|"ok", text}
+let env = { status: null, running: false, log: [], step: "", progress: null, result: null, error: null };
 const $ = (id) => document.getElementById(id);
 
 async function call(cmd, args) {
@@ -26,6 +27,7 @@ function setState(s) { if (s) { state = s; } }
 
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
+  items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
     `<button class="step ${s.key === page ? "current" : ""}" data-key="${s.key}" ${s.unlocked ? "" : "disabled"}>${s.done ? "✓ " : s.unlocked ? "" : "🔒 "}${esc(s.label)}</button>`).join("");
   $("steps").querySelectorAll("button").forEach((b) => b.onclick = () => go(b.dataset.key));
@@ -67,6 +69,49 @@ function renderData() {
     ${msgHtml()}${pendingCard()}${bundleCard()}`;
 }
 
+const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
+
+function renderSetup() {
+  const st = env.status;
+  const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
+  const busy = env.running;
+  const log = env.log.slice(-200).map(esc).join("\n");
+  const result = env.result ? `<div class="ok">Test passed: ${esc(env.result.device_name)} · ${esc(env.result.precision)} · tiny model trained in ${esc(env.result.train_seconds)} s (peak memory ${esc(env.result.peak_vram_mb)} MB).</div>` : "";
+  return `<h1>Training setup</h1>
+    <p class="lead">Gets this computer ready to train: checks the graphics card and driver, installs the training software, and tests the card. The help panel explains each step.</p>
+    <ul class="checks">${checks}</ul>
+    <div class="row">
+      <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
+      <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
+      <button class="primary" id="selftest" ${busy || !st || !st.env_installed ? "disabled" : ""}>Test the graphics card</button>
+      <button class="secondary" id="cancelenv" ${busy ? "" : "disabled"}>Cancel</button>
+    </div>
+    ${env.step ? `<div class="stepline">${esc(env.step)}</div>` : ""}
+    ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
+    ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
+    ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}`;
+}
+
+async function refreshEnv() {
+  env.status = await invoke("env_status");
+  if (page === "setup") render();
+}
+
+async function startEnv(cmd) {
+  env.running = true; env.log = []; env.step = ""; env.progress = null; env.result = null; env.error = null;
+  render();
+  try { await invoke(cmd); } catch (e) { env.running = false; env.error = String(e); render(); }
+}
+
+function onEnvEvent(p) {
+  if (p.kind === "log") env.log.push(p.text);
+  else if (p.kind === "step") { env.step = `Step ${p.index} of ${p.total}: ${p.text}`; env.progress = (p.index - 1) / p.total; }
+  else if (p.kind === "progress") { env.step = p.text || p.step; env.progress = p.value; }
+  else if (p.kind === "done") { env.running = false; env.progress = 1; env.step = "Finished."; if (p.data && p.data.device_name) env.result = p.data; refreshEnv(); }
+  else if (p.kind === "error") { env.running = false; env.progress = null; env.error = p.text; refreshEnv(); }
+  if (page === "setup") { render(); const l = $("log"); if (l) l.scrollTop = l.scrollHeight; }
+}
+
 function renderSoon(key) {
   const [t, lead] = TITLES[key];
   return `<h1>${t}</h1><p class="lead">${lead}</p><span class="soon">Coming in a later version. The help panel shows what this step will do.</span>`;
@@ -76,7 +121,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   $("expert").checked = state.settings.expert_mode;
   $("helptoggle").checked = state.settings.show_help_panel;
@@ -97,6 +142,10 @@ function wire() {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });
     if (f) checkFile(f);
   });
+  on("recheck", refreshEnv);
+  on("install", () => startEnv("env_install"));
+  on("selftest", () => startEnv("env_selftest"));
+  on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
   on("cancel", () => { pending = null; render(); });
 }
@@ -133,6 +182,7 @@ async function go(key) {
   page = key;
   message = message && message.kind === "err" && key !== "welcome" && key !== "data" ? null : message;
   render();
+  if (key === "setup") refreshEnv();
   $("help").innerHTML = await invoke("help", { key });
   $("help").scrollTop = 0;
 }
@@ -149,6 +199,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   go("welcome");
 }
 init();

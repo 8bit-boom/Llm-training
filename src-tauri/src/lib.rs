@@ -1,13 +1,21 @@
 //! The window shell. All logic is in `ndforge-core` (`AppModel`); these commands forward to it and return its JSON, or the
 //! plain-language error text, to the page.
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ndforge_core::help::help_html;
 use ndforge_core::model::AppModel;
 use serde_json::Value;
-use tauri::State;
+use tauri::{Emitter, State};
 
 struct App(Mutex<AppModel>);
+
+/// One long job at a time (install or self-test); `cancel` stops it.
+#[derive(Default)]
+struct Tasks {
+    busy: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
 
 type Out<T> = Result<T, String>;
 
@@ -59,11 +67,54 @@ fn help(key: String) -> String {
     help_html(&key)
 }
 
+#[tauri::command]
+fn env_status() -> Value {
+    ndforge_core::envmgr::tasks::status()
+}
+
+/// Runs `job` on a thread; its progress goes to the window as "env-event" events, the end as {"kind": "done"|"error"}.
+fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, cancel) = (tasks.busy.clone(), tasks.cancel.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("env-event", v); };
+        let end = match job(&cancel, &mut emit) {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
+            Err(msg) => serde_json::json!({"kind": "error", "text": msg}),
+        };
+        busy.store(false, Ordering::SeqCst);
+        let _ = app.emit("env-event", end);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn env_install(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
+    spawn_task(app, &tasks, |cancel, emit| {
+        ndforge_core::envmgr::tasks::install(cancel, emit).map(|_| Value::Null).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
+    spawn_task(app, &tasks, |cancel, emit| ndforge_core::envmgr::tasks::selftest(cancel, emit).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn env_cancel(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, help])
+        .manage(Tasks::default())
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, help, env_status, env_install, env_selftest, env_cancel])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

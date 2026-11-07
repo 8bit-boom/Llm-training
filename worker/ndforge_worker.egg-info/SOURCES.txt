@@ -1,0 +1,10 @@
+pyproject.toml
+ndforge_worker/__init__.py
+ndforge_worker/__main__.py
+ndforge_worker/protocol.py
+ndforge_worker/selftest.py
+ndforge_worker.egg-info/PKG-INFO
+ndforge_worker.egg-info/SOURCES.txt
+ndforge_worker.egg-info/dependency_links.txt
+ndforge_worker.egg-info/top_level.txt
+tests/test_worker.py
