@@ -14,7 +14,8 @@ use crate::train::catalog::{find, models, ModelEntry};
 use crate::train::plan::{plan, recommended_method, Hyper, Method, Preset};
 use crate::export::modelfile::ollama_name;
 use crate::export::runs as exports;
-use crate::settings::OllamaServer;
+use crate::settings::{OllamaServer, TrainServer};
+use crate::remote::run::Target;
 use crate::train::{retrain, runs};
 use crate::settings::Settings;
 
@@ -30,11 +31,13 @@ pub const STEP_LABELS: [(&str, &str); 5] = [
 pub struct AppModel {
     pub settings: Settings,
     pub project: Option<Project>,
+    /// what each training server reported last time it was checked (its card), by address
+    pub remote_status: std::collections::HashMap<String, Value>,
 }
 
 impl AppModel {
     pub fn load() -> Self {
-        AppModel { settings: Settings::load(), project: None }
+        AppModel { settings: Settings::load(), project: None, remote_status: Default::default() }
     }
 
     /// Everything the window needs to draw itself.
@@ -181,11 +184,16 @@ impl AppModel {
 
     // ------------------------------------------------------------------ step 3: training
     /// Everything the Train page shows: the five models with fit marks for this card, the newest saved data version, the runs.
-    pub fn train_state(&self) -> Result<Value> {
+    pub fn train_state(&self, server: Option<&str>) -> Result<Value> {
         let p = self.project_ref()?;
         let gpus = crate::envmgr::gpu::detect_gpus();
         let gpu = gpus.as_ref().ok().and_then(|g| g.first().cloned());
-        let vram = gpu.as_ref().map(|g| g.vram_gb());
+        // the card the plan is for: this PC's, or the chosen server's as last reported
+        let server_gpu = server.and_then(|u| self.remote_status.get(u)).and_then(|st| st["gpu"].as_object().cloned());
+        let vram = match server {
+            Some(_) => server_gpu.as_ref().and_then(|g| g.get("vram_gb")).and_then(|v| v.as_f64()),
+            None => gpu.as_ref().map(|g| g.vram_gb()),
+        };
         let version = runs::latest_version(p);
         let stats = version.as_ref().map(|(_, m)| runs::data_stats(m)).unwrap_or_default();
         let cards: Vec<Value> = models().iter().map(|m| {
@@ -200,6 +208,7 @@ impl AppModel {
             "gpu": gpu.as_ref().map(|g| json!({"name": g.name, "vram_gb": (g.vram_gb() * 10.0).round() / 10.0, "precision": g.precision()})),
             "gpu_problem": gpus.err(),
             "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "servers": self.settings.train_servers.iter().map(|s| json!({"name": s.name, "url": s.url, "status": self.remote_status.get(&s.url)})).collect::<Vec<_>>(),
             "version": version.map(|(n, m)| json!({"number": n, "counts": m["counts"], "tokens": m["tokens"], "created": m["created"]})),
             "runs": runs::list_runs(p),
         }))
@@ -225,34 +234,46 @@ impl AppModel {
         Ok(h)
     }
 
-    pub fn train_plan(&self, model_id: &str, method: Method, preset: Preset) -> Result<Value> {
+    pub fn train_plan(&self, model_id: &str, method: Method, preset: Preset, server: Option<&str>) -> Result<Value> {
         let p = self.project_ref()?;
         let m = find(model_id).ok_or_else(|| Error::new("Unknown model."))?;
-        let vram = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb()));
+        let vram = match server {
+            Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
+            None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+        };
         let stats = runs::latest_version(p).map(|(_, mf)| runs::data_stats(&mf)).unwrap_or_default();
         Ok(serde_json::to_value(plan(&m, method, preset, vram, stats, runs::load_measured(&m.id, method)))?)
     }
 
     /// Everything needed to start (or continue) a run: the project, the model, the settings and the job for the worker.
-    pub fn train_job(&self, model_id: &str, method: Method, preset: Preset, overrides: &Value, resume: Option<&str>) -> Result<TrainJob> {
+    pub fn train_job(&self, model_id: &str, method: Method, preset: Preset, overrides: &Value, resume: Option<&str>, server: Option<&str>) -> Result<TrainJob> {
         let p = self.project_ref()?.clone();
         if let Some(name) = resume {
             let cfg: Value = std::fs::read(runs::runs_dir(&p).join(name).join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| Error::new("That run cannot be continued (its settings are missing)."))?;
             let m = find(cfg["model"]["repo"].as_str().and_then(|r| models().into_iter().find(|m| m.repo == r)).map(|m| m.id).as_deref().unwrap_or("")).ok_or_else(|| Error::new("The model of that run is no longer in the catalog."))?;
             let hyper: Hyper = serde_json::from_value(cfg["hyper"].clone()).map_err(|_| Error::new("The settings of that run are damaged."))?;
             let method: Method = serde_json::from_value(cfg["method"].clone()).unwrap_or(Method::Lora);
+            let remote = match cfg["remote"]["url"].as_str() {
+                Some(url) => Some(self.target_for(url)?),
+                None => None,
+            };
             let mut job = cfg;
             job["resume"] = json!(true);
-            return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job });
+            return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job, remote });
         }
         let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
         let (version, manifest) = runs::latest_version(&p).ok_or_else(|| Error::new("Save a version of the training data first (Step 2)."))?;
-        let vram = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb()));
-        let pl = plan(&m, method, preset, vram, runs::data_stats(&manifest), runs::load_measured(&m.id, method));
+        let remote = match server { Some(u) => Some(self.target_for(u)?), None => None };
+        let vram = match server {
+            Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
+            None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+        };
+        let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
+        let pl = plan(&m, method, preset, vram, runs::data_stats(&manifest), measured);
         let hyper = Self::hyper_with(pl.hyper, overrides)?;
         let name = runs::run_name(&m.id);
         let job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
-        Ok(TrainJob { project: p, model: m, method, hyper, name, job })
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
     }
 
     pub fn train_metrics(&self, run: &str) -> Result<Value> {
@@ -318,6 +339,36 @@ impl AppModel {
         Ok((format!("You are the game master's assistant for the tabletop world \"{}\".", p.world_name), "Tell me about this world.".to_string()))
     }
 
+    // ------------------------------------------------------------------ training servers
+    pub fn add_train_server(&mut self, name: &str, url: &str, token: &str) -> Result<()> {
+        let (name, url) = (name.trim(), crate::export::ollama::normalize_url(url));
+        if name.is_empty() || url == "http://" || token.trim().is_empty() {
+            return Err(Error::new("Give the server a name, an address (for example http://truenas:8765) and the access token (NDFORGE_TOKEN of the worker)."));
+        }
+        self.settings.train_servers.retain(|s| s.url != url);
+        self.settings.train_servers.push(TrainServer { name: name.to_string(), url: url.clone() });
+        self.settings.save();
+        crate::secrets::set(&url, token.trim())
+    }
+
+    pub fn remove_train_server(&mut self, url: &str) -> Result<()> {
+        self.settings.train_servers.retain(|s| s.url != url);
+        self.remote_status.remove(url);
+        self.settings.save();
+        crate::secrets::remove(url)
+    }
+
+    /// name, address and token of a server the user added.
+    pub fn target_for(&self, url: &str) -> Result<Target> {
+        let s = self.settings.train_servers.iter().find(|s| s.url == url).ok_or_else(|| Error::new("That training server is no longer in the list. Add it again."))?;
+        let token = crate::secrets::get(url).ok_or_else(|| Error::new("The access token of that server is missing. Add the server again."))?;
+        Ok(Target { name: s.name.clone(), url: s.url.clone(), token })
+    }
+
+    pub fn set_remote_status(&mut self, url: &str, status: Value) {
+        self.remote_status.insert(url.to_string(), status);
+    }
+
     // ------------------------------------------------------------------ retrain with the new export
     pub fn retrain_info(&self) -> Result<Value> {
         retrain::info(self.project_ref()?)
@@ -334,13 +385,16 @@ impl AppModel {
         if from_previous {
             job["init_adapter"] = json!(runs::runs_dir(&p).join(&last_name).join("adapter"));
         }
-        Ok(TrainJob { project: p, model: m, method, hyper, name, job })
+        // a run that was made on a server is retrained there
+        let remote = match cfg["remote"]["url"].as_str() { Some(url) => Some(self.target_for(url)?), None => None };
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
     }
 }
 
 /// A run ready to start.
 #[derive(Debug)]
 pub struct TrainJob {
+    pub remote: Option<Target>,
     pub project: Project,
     pub model: ModelEntry,
     pub method: Method,

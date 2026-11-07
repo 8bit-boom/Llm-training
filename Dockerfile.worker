@@ -1,0 +1,37 @@
+# ND Lore Forge worker: trains on this computer's NVIDIA card for the desktop program (docs/TRUENAS_WORKER.md).
+#   docker build -f Dockerfile.worker -t nd-lore-forge-worker .
+# TORCH_CUDA is the PyTorch CUDA build: cu126 needs host driver 560+, cu128 needs 570+ (RTX 50 cards), cu124 works with 550+.
+#
+# NOTE: this file has not been built yet (no Docker daemon where it was written); the server program it runs is tested (`cargo test -p ndforge-core`).
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY src-tauri ./src-tauri
+COPY ui ./ui
+COPY catalog ./catalog
+RUN cargo build --release -p ndforge-server
+
+FROM ubuntu:24.04
+ARG TORCH_CUDA=cu126
+ARG PYTHON_VERSION=3.13
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy
+RUN uv venv --python ${PYTHON_VERSION} --seed /opt/venv
+RUN uv pip install --python /opt/venv/bin/python torch --index-url https://download.pytorch.org/whl/${TORCH_CUDA}
+# Unsloth (fast, small memory); if it cannot be installed the plain libraries are used instead (slower, more memory)
+RUN uv pip install --python /opt/venv/bin/python unsloth \
+    || uv pip install --python /opt/venv/bin/python transformers trl peft datasets accelerate bitsandbytes
+COPY worker /app/worker
+RUN uv pip install --python /opt/venv/bin/python /app/worker
+COPY --from=build /src/target/release/ndforge-server /usr/local/bin/ndforge-server
+
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NDFORGE_DATA=/data NDFORGE_PYTHON=/opt/venv/bin/python NDFORGE_WORKER_DIR=/app/worker NDFORGE_LISTEN=0.0.0.0:8765 \
+    PYTHONUNBUFFERED=1
+VOLUME /data
+EXPOSE 8765
+ENTRYPOINT ["ndforge-server"]

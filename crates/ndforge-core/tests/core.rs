@@ -297,32 +297,32 @@ fn model_train_state_and_jobs() {
     std::env::set_var("NDFORGE_PROJECTS_DIR", d.path().join("projects4"));
     std::env::set_var("NDFORGE_ENV_DIR", d.path().join("noenv"));
     let mut m = AppModel::load();
-    assert!(m.train_state().unwrap_err().0.contains("Create or open a project"));
+    assert!(m.train_state(None).unwrap_err().0.contains("Create or open a project"));
     m.create_project("Tr").unwrap();
-    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({}), None).unwrap_err().0.contains("Save a version"));
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({}), None, None).unwrap_err().0.contains("Save a version"));
     let f = build(d.path(), "1.ndtrain", 1);
     m.apply_bundle(f.to_str().unwrap()).unwrap();
     m.dataset_generate(json!({})).unwrap();
     m.dataset_save().unwrap();
-    let st = m.train_state().unwrap();
+    let st = m.train_state(None).unwrap();
     assert_eq!(st["models"].as_array().unwrap().len(), 5);
     assert_eq!(st["version"]["number"], 1);
     assert_eq!(st["env_ready"], false);
-    let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None).unwrap();
+    let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None, None).unwrap();
     assert_eq!(job.job["model"]["repo"], "unsloth/Qwen3.5-4B");
     assert_eq!((job.hyper.rank, job.job["hyper"]["max_steps"].as_u64()), (4, Some(60)));
     assert!(job.job["dataset"]["train"].as_str().unwrap().ends_with("datasets/v1/train.jsonl"));
     assert_eq!(job.job["resume"], false);
     // bad settings are plain errors
-    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 0}), None).unwrap_err().0.contains("rank"));
-    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"nonsense": 1}), None).unwrap_err().0.contains("Unknown setting"));
-    assert!(m.train_job("nope", Method::Lora, Preset::Quick, &json!({}), None).unwrap_err().0.contains("model"));
-    assert!(m.train_plan("gemma4-e2b", Method::Qlora, Preset::Normal).unwrap()["steps"].as_u64().unwrap() > 0);
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 0}), None, None).unwrap_err().0.contains("rank"));
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"nonsense": 1}), None, None).unwrap_err().0.contains("Unknown setting"));
+    assert!(m.train_job("nope", Method::Lora, Preset::Quick, &json!({}), None, None).unwrap_err().0.contains("model"));
+    assert!(m.train_plan("gemma4-e2b", Method::Qlora, Preset::Normal, None).unwrap()["steps"].as_u64().unwrap() > 0);
     // resuming reads the run's own config
     let run_dir = job.project.folder.join("runs").join(&job.name);
     std::fs::create_dir_all(&run_dir).unwrap();
     std::fs::write(run_dir.join("config.json"), serde_json::to_vec(&job.job).unwrap()).unwrap();
-    let r = m.train_job("", Method::Lora, Preset::Quick, &json!({}), Some(&job.name)).unwrap();
+    let r = m.train_job("", Method::Lora, Preset::Quick, &json!({}), Some(&job.name), None).unwrap();
     assert_eq!((r.job["resume"].clone(), r.model.id.as_str(), r.hyper.rank), (json!(true), "qwen3.5-4b", 4));
-    assert!(m.train_job("", Method::Lora, Preset::Quick, &json!({}), Some("missing")).is_err());
+    assert!(m.train_job("", Method::Lora, Preset::Quick, &json!({}), Some("missing"), None).is_err());
 }

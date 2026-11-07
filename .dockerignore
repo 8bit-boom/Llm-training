@@ -1,0 +1,7 @@
+target
+.git
+**/__pycache__
+worker/tests
+tests
+*.md
+!README.md

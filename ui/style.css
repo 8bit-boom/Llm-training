@@ -35,7 +35,7 @@ button.primary, button.secondary { font: inherit; border-radius: 8px; padding: 9
 button.primary { background: var(--accent); color: var(--accent-text); font-weight: 600; }
 button.secondary { background: none; color: var(--accent); }
 button:disabled { opacity: .5; cursor: not-allowed; }
-input[type=text] { font: inherit; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); min-width: 260px; flex: 1; }
+input[type=text], input[type=password] { font: inherit; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); min-width: 260px; flex: 1; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; margin: 16px 0; max-width: 62ch; }
 .card h2 { margin: 0 0 8px; font-size: 18px; }

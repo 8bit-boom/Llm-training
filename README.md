@@ -17,7 +17,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M5 Step 2: make training data (world book + simple facts), review, save versions | done |
 | M6 Step 3: PEFT + SFT training (Unsloth), live charts, stop/resume | built; needs a first run on the RTX 5090 |
 | M7 Step 5: GGUF + Modelfile, install into Ollama (PC or TrueNAS), "Retrain with the new export" | built; needs a first run with a real model and Ollama |
-| M8 onward (TrueNAS worker, full fine-tune ...) | not started |
+| M8 Train on the TrueNAS server (worker server + client + compose) | built; the container image still has to be built once |
+| M9 onward (full fine-tune, teacher examples, test page ...) | not started |
 
 ## Build and run
 
@@ -73,3 +74,9 @@ last finished run's settings (optionally continuing from its adapter with a shor
 install them. Earlier runs, versions and files are kept.
 
 Tests: Rust `cargo test --workspace` (the template test uses `go` when installed), worker `cd worker && python -m pytest tests`.
+
+## Training on the TrueNAS server (M8)
+
+`crates/ndforge-server` is the worker that runs in a container on the server (`Dockerfile.worker`, `truenas-worker-compose.yml`): token-protected HTTP, one job at a time, runs the same
+Python worker as a local run, keeps checkpoints, frees the card by unloading Ollama. In the window, **Step 3 → Where to train** picks this PC or a server; the run looks the same, the finished adapter is copied back.
+Guide: [docs/TRUENAS_WORKER.md](docs/TRUENAS_WORKER.md). Protocol: `crates/ndforge-core/src/remote/mod.rs`.

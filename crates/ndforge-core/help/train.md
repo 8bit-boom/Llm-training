@@ -8,6 +8,7 @@ Teaches the chosen model your world. It uses the **newest saved version** from S
 - The first run of a model **downloads it** (2 to 20 GB) from Hugging Face, so you need an internet connection once.
 
 ## What to do
+0. **Where to train.** On this computer, or on your TrueNAS server's graphics card (add it once with its address and access token; see docs/TRUENAS_WORKER.md). With a server chosen, the cards show what fits *its* card. While it trains there, AI chat, transcription and image generation on that server wait. The trained model is copied back to this computer.
 1. **Choose the model.** Each card shows whether it fits your graphics card (✓ fits, ⚠ tight, ✗ too big) and the memory it needs. Qwen3.5 4B is a good start; on a 32 GB card all five fit.
 2. **Choose how to train.**
    - **LoRA, 16-bit** is the best choice whenever it fits.

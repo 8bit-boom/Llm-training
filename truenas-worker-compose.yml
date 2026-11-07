@@ -1,0 +1,29 @@
+# ND Lore Forge worker for TrueNAS SCALE (Custom App / Docker Compose): trains on the server's NVIDIA card for the desktop program.
+# Read docs/TRUENAS_WORKER.md first. In short:
+#   1. create a dataset for it, e.g. /mnt/DeadPool/apps/nd-lore-forge-worker
+#   2. choose a long random token (openssl rand -hex 24) and put it below as NDFORGE_TOKEN
+#   3. deploy, then in ND Lore Forge: Step 3 -> Where to train -> Add a server (http://<truenas-address>:8765 and the token)
+services:
+  worker:
+    image: ghcr.io/8bit-boom/nd-lore-forge-worker:latest      # or build it yourself: docker build -f Dockerfile.worker -t nd-lore-forge-worker .
+    # build: {context: ., dockerfile: Dockerfile.worker, args: {TORCH_CUDA: cu126}}
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      NDFORGE_TOKEN: "change-me-to-a-long-random-token"
+      # nd-world's Ollama on this server (the worker unloads its models so the card is free while training); leave empty if you have none
+      OLLAMA_URL: "http://ollama:11434"
+      # HF_TOKEN: ""                                          # only for models that need a Hugging Face login
+    volumes:
+      - /mnt/DeadPool/apps/nd-lore-forge-worker:/data          # jobs, checkpoints and downloaded models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

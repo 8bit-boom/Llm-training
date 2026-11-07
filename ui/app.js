@@ -150,7 +150,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -193,6 +193,17 @@ function renderTrain() {
     return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}</strong>${c.recommended === tr.method ? "" : ""}
       <span class="dim">${m.params_b.toFixed(1)} B parameters · ${esc(m.license)}</span><span>${fit[0]} ${fit[1]} · ≈ ${f.measured != null ? f.measured + " GB measured" : f.est_vram_gb + " GB"}</span><span class="dim">${esc(m.good_for)}</span></button>`;
   }).join("");
+  const srv = tr.server ? st.servers.find((x) => x.url === tr.server) : null;
+  const srvStatus = srv && srv.status;
+  const srvLine = !srv ? `Training on this computer: ${gpu}.` : srvStatus
+    ? (srvStatus.gpu ? `${esc(srv.name)}: ${esc(srvStatus.gpu.name)} · ${srvStatus.gpu.vram_gb} GB · ${esc(srvStatus.gpu.precision)} · ${srvStatus.busy ? "busy with " + esc(srvStatus.job) : "free"}${srvStatus.ollama ? " · Ollama there will be paused while training" : ""}` : `${esc(srv.name)}: no graphics card (${esc(srvStatus.gpu_problem || "none found")})`)
+    : "Not checked yet. Press “Test the connection”.";
+  const where = `<div class="card wide"><h2>Where to train</h2><div class="row"><label>Computer <select id="tr-where"><option value="">This computer</option>${st.servers.map((x) => `<option value="${esc(x.url)}" ${tr.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("")}</select></label>
+      ${srv ? `<button class="secondary" id="srv-test" ${tr.running ? "disabled" : ""}>Test the connection</button><button class="secondary" id="srv-remove" ${tr.running ? "disabled" : ""}>Remove this server</button>` : ""}
+      <button class="secondary" id="srv-add">Add a server…</button></div>
+    ${tr.adding ? `<div class="row"><input type="text" id="s-name" placeholder="Name, e.g. TrueNAS"><input type="text" id="s-url" placeholder="Address, e.g. http://truenas:8765"><input type="password" id="s-token" placeholder="Access token (NDFORGE_TOKEN)" style="min-width:220px"><button class="primary" id="s-save">Add</button><button class="secondary" id="s-cancel">Cancel</button></div>` : ""}
+    <div class="dim">${srvLine}</div>${tr.srvCheck ? `<div class="${tr.srvCheck.ok ? "ok" : "err"}">${esc(tr.srvCheck.text)}</div>` : ""}
+    ${srv ? `<p class="dim">The server's graphics card is used only by the training until it ends: AI chat, transcription and image generation on that server wait or are unavailable meanwhile. Only LoRA / QLoRA is available there. The trained model is copied back to this computer.</p>` : ""}</div>`;
   const pl = tr.plan;
   const sel = st.models.find((c) => c.model.id === tr.model);
   const exp = state.settings.expert_mode && pl ? `<div class="card wide"><h2>Settings (Expert)</h2><div class="grid">${[
@@ -203,7 +214,7 @@ function renderTrain() {
     ${pl.notes.length ? `<ul>${pl.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>` : "";
   const last = st.runs[0];
   const canResume = last && (last.status === "stopped" || last.status === "failed") && !tr.running;
-  const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || !st.env_ready ? "disabled" : ""}>Start training</button>
+  const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
     <button class="secondary" id="tr-stop" ${tr.running ? "" : "disabled"}>Stop</button>
     ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)})</button>` : ""}</div>`;
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
@@ -213,10 +224,10 @@ function renderTrain() {
     ${(() => { const m = tr.metrics.at(-1); return m ? `<div class="stats"><span>Step <strong>${m.step}/${m.total_steps}</strong></span><span>Loss <strong>${(+m.loss).toFixed(3)}</strong></span><span>Memory peak <strong>${m.vram_mb ? (m.vram_mb / 1024).toFixed(1) + " GB" : "–"}</strong></span><span>GPU <strong>${m.gpu_temp != null ? m.gpu_temp + " °C" : "–"}</strong></span><span>Time left <strong>${fmtEta(m.eta_s)}</strong></span></div>` : ""; })()}
     ${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
     ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
-  const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th></th></tr>${st.runs.map((r) =>
-    `<tr><td>${esc(r.name)}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
+  const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th>Where</th><th></th></tr>${st.runs.map((r) =>
+    `<tr><td>${esc(r.name)}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
   return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
-    <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${env}
+    <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${tr.server ? "" : env}${where}
     <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>
     <div class="card wide"><h2>2 · How to train</h2><div class="row"><label>Type <select id="tr-method"><option value="lora" ${tr.method === "lora" ? "selected" : ""}>LoRA, 16-bit (recommended)</option><option value="qlora" ${tr.method === "qlora" ? "selected" : ""}>QLoRA, 4-bit (needs less memory)</option></select></label>
       <label>Preset <select id="tr-preset"><option value="quick" ${tr.preset === "quick" ? "selected" : ""}>Quick test (minutes)</option><option value="normal" ${tr.preset === "normal" ? "selected" : ""}>Normal</option><option value="best" ${tr.preset === "best" ? "selected" : ""}>Best quality (slower)</option></select></label></div>
@@ -226,15 +237,21 @@ function renderTrain() {
 
 async function trRefresh() {
   try {
-    tr.state = await invoke("train_state");
+    tr.state = await invoke("train_state", { server: tr.server || null });
     if (!tr.model && tr.state.models.length) {
       const first = tr.state.models.find((c) => c.lora.fit === "yes" || c.lora.fit === "tight") || tr.state.models[0];
       tr.model = tr.state.models.find((c) => c.model.id === "qwen3.5-4b")?.model.id ?? first.model.id;
       tr.method = (tr.state.models.find((c) => c.model.id === tr.model) || first).recommended;
     }
-    if (tr.model) tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset });
+    if (tr.model) tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset, server: tr.server || null });
   } catch (e) { tr.error = String(e); }
   if (page === "train") render();
+}
+
+function onServerEvent(p) {
+  if (p.kind === "done") tr.srvCheck = { ok: true, text: p.data.gpu ? `Connected. ${p.data.gpu.name}, ${p.data.gpu.vram_gb} GB, ${p.data.busy ? "busy" : "free"}.` : "Connected, but the server found no graphics card." };
+  else tr.srvCheck = { ok: false, text: p.text };
+  trRefresh();
 }
 
 function onTrainEvent(p) {
@@ -252,7 +269,7 @@ async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
   const over = {};
   Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = k === "lr" || k === "epochs" ? Number(v) : Number(v); });
-  try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null }); }
+  try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
   catch (e) { tr.running = false; tr.error = String(e); render(); }
 }
 
@@ -260,6 +277,16 @@ function wireTrain() {
   if (page !== "train" || !tr.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
   document.querySelectorAll("[data-model]").forEach((b) => b.onclick = () => { tr.model = b.dataset.model; tr.over = {}; trRefresh(); });
+  const wh = $("tr-where"); if (wh) wh.onchange = () => { tr.server = wh.value; tr.srvCheck = null; tr.over = {}; trRefresh(); if (tr.server && !(tr.state.servers.find((x) => x.url === tr.server) || {}).status) invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); };
+  on("srv-test", () => { tr.srvCheck = null; invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); });
+  on("srv-remove", async () => { tr.state = await invoke("train_server_remove", { url: tr.server }); tr.server = ""; tr.srvCheck = null; trRefresh(); });
+  on("srv-add", () => { tr.adding = true; render(); });
+  on("s-cancel", () => { tr.adding = false; render(); });
+  on("s-save", async () => {
+    try { tr.state = await invoke("train_server_add", { name: $("s-name").value, url: $("s-url").value, token: $("s-token").value }); tr.server = tr.state.servers.at(-1).url; tr.adding = false; tr.srvCheck = null; await trRefresh();
+      invoke("train_server_check", { url: tr.server }).catch(() => {}); }
+    catch (e) { tr.srvCheck = { ok: false, text: String(e) }; render(); }
+  });
   const m = $("tr-method"); if (m) m.onchange = () => { tr.method = m.value; tr.over = {}; trRefresh(); };
   const pr = $("tr-preset"); if (pr) pr.onchange = () => { tr.preset = pr.value; tr.over = {}; trRefresh(); };
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
@@ -594,6 +621,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }

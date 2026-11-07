@@ -7,7 +7,7 @@ use ndforge_core::help::help_html;
 use ndforge_core::model::AppModel;
 use ndforge_core::train::plan::{Method, Preset};
 use serde_json::Value;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 struct App(Mutex<AppModel>);
 
@@ -105,15 +105,24 @@ fn set_theme(s: State<App>, theme: String) -> Out<Value> {
     Ok(m.state())
 }
 
-#[tauri::command]
-fn train_state(s: State<App>) -> Out<Value> {
-    lock(&s).train_state().map_err(|e| e.to_string())
+/// Trains on this PC, or on the server the job names.
+fn run_training(job: &ndforge_core::model::TrainJob, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> ndforge_core::Result<Value> {
+    match &job.remote {
+        None => ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), stop, std::time::Duration::from_secs(120), emit),
+        Some(target) => ndforge_core::remote::run::execute_remote(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), target, stop,
+            job.job["resume"] == true, std::time::Duration::from_secs(1), emit),
+    }
 }
 
 #[tauri::command]
-fn train_plan(s: State<App>, model: String, method: String, preset: String) -> Out<Value> {
+fn train_state(s: State<App>, server: Option<String>) -> Out<Value> {
+    lock(&s).train_state(server.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn train_plan(s: State<App>, model: String, method: String, preset: String, server: Option<String>) -> Out<Value> {
     let (method, preset) = parse_choice(&method, &preset)?;
-    lock(&s).train_plan(&model, method, preset).map_err(|e| e.to_string())
+    lock(&s).train_plan(&model, method, preset, server.as_deref()).map_err(|e| e.to_string())
 }
 
 fn parse_choice(method: &str, preset: &str) -> Out<(Method, Preset)> {
@@ -124,9 +133,9 @@ fn parse_choice(method: &str, preset: &str) -> Out<(Method, Preset)> {
 
 /// Starts a training run (or continues `resume`); progress goes to the window as "train-event" events.
 #[tauri::command]
-fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, method: String, preset: String, overrides: Value, resume: Option<String>) -> Out<String> {
+fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, method: String, preset: String, overrides: Value, resume: Option<String>, server: Option<String>) -> Out<String> {
     let (method, preset) = parse_choice(&method, &preset)?;
-    let job = lock(&s).train_job(&model, method, preset, &overrides, resume.as_deref()).map_err(|e| e.to_string())?;
+    let job = lock(&s).train_job(&model, method, preset, &overrides, resume.as_deref(), server.as_deref()).map_err(|e| e.to_string())?;
     if tasks.busy.swap(true, Ordering::SeqCst) {
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
@@ -135,7 +144,7 @@ fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model:
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
-        let r = ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job, stop, std::time::Duration::from_secs(120), &mut emit);
+        let r = run_training(&job, stop, &mut emit);
         busy.store(false, Ordering::SeqCst);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
@@ -237,7 +246,7 @@ fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
         emit(serde_json::json!({"kind": "stage", "text": "Training the new run"}));
-        let train = ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), stop.clone(), std::time::Duration::from_secs(120), &mut emit);
+        let train = run_training(&job, stop.clone(), &mut emit);
         let outcome: Result<Value, String> = match train {
             Err(e) => Err(e.to_string()),
             Ok(result) if result["stopped"] == true => Ok(result),
@@ -266,6 +275,40 @@ fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from
         let _ = app.emit("train-event", end);
     });
     Ok(name)
+}
+
+#[tauri::command]
+fn train_server_add(s: State<App>, name: String, url: String, token: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.add_train_server(&name, &url, &token).map_err(|e| e.to_string())?;
+    m.train_state(Some(&ndforge_core::export::ollama::normalize_url(&url))).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn train_server_remove(s: State<App>, url: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.remove_train_server(&url).map_err(|e| e.to_string())?;
+    m.train_state(None).map_err(|e| e.to_string())
+}
+
+/// Asks a training server what it has (card, busy, Ollama); answers as a "server-event" done/error and remembers the card for the plan.
+#[tauri::command]
+fn train_server_check(app: tauri::AppHandle, s: State<App>, url: String) -> Out<()> {
+    let target = lock(&s).target_for(&url).map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let result = ndforge_core::remote::client::RemoteClient::new(&target.url, &target.token).status();
+        let ev = match result {
+            Ok(st) => {
+                let model: State<App> = handle.state();
+                lock(&model).set_remote_status(&target.url, st.clone());
+                serde_json::json!({"kind": "done", "url": target.url, "data": st})
+            }
+            Err(e) => serde_json::json!({"kind": "error", "url": target.url, "text": e.to_string()}),
+        };
+        let _ = handle.emit("server-event", ev);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -320,7 +363,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

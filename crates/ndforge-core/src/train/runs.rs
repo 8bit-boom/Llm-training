@@ -121,22 +121,58 @@ fn set_state(dir: &Path, patch: Value) {
     let _ = write_json(&dir.join("state.json"), &v);
 }
 
-/// Runs the job to the end, stopping or failing. `stop` (set by the Stop button) asks for a graceful stop: the worker finishes the current step, saves a checkpoint and exits;
-/// after `grace` it is killed. Every event goes to `on_event` as JSON ({"kind": ...}) and the charts' events are kept in metrics.jsonl.
-pub fn execute(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name: &str, job: Value, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
-    let py = python_path(&env_dir());
-    if !py.is_file() {
-        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+/// Turns what the worker says into the events the window shows, keeps the charts' events in `metrics.jsonl` and the progress in `state.json`.
+pub struct Recorder {
+    dir: PathBuf,
+    metrics: std::fs::File,
+    last_step: u64,
+    total: u64,
+}
+
+impl Recorder {
+    pub fn new(dir: &Path) -> Result<Recorder> {
+        std::fs::create_dir_all(dir)?;
+        Ok(Recorder { dir: dir.to_path_buf(), metrics: std::fs::OpenOptions::new().create(true).append(true).open(dir.join("metrics.jsonl"))?, last_step: 0, total: 0 })
     }
-    let dir = runs_dir(p).join(name);
-    std::fs::create_dir_all(&dir)?;
-    write_json(&dir.join("config.json"), &job)?;
-    set_state(&dir, json!({"name": name, "model_id": m.id, "model": m.name, "method": method, "status": "running", "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                           "seq": hyper.max_seq, "batch": hyper.batch, "error": null}));
+
+    pub fn from_worker(&mut self, e: WorkerEvent) -> Value {
+        match e {
+            WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
+            WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
+            WorkerEvent::Other(mut v) => {
+                let kind = v["type"].as_str().unwrap_or("event").to_string();
+                v["kind"] = json!(kind);
+                self.record(&v);
+                v
+            }
+        }
+    }
+
+    /// An event that already has a "kind" (from a remote worker): keep what the charts need.
+    pub fn record(&mut self, v: &Value) {
+        let kind = v["kind"].as_str().unwrap_or("");
+        if matches!(kind, "metric" | "sample" | "start") {
+            use std::io::Write;
+            let mut line = v.clone();
+            line["type"] = json!(kind);
+            let _ = writeln!(self.metrics, "{line}");
+        }
+        if kind == "metric" {
+            self.last_step = v["step"].as_u64().unwrap_or(self.last_step);
+            self.total = v["total_steps"].as_u64().unwrap_or(self.total);
+            set_state(&self.dir, json!({"step": self.last_step, "total_steps": self.total, "loss": v["loss"], "peak_vram_mb": v["vram_mb"]}));
+        }
+    }
+}
+
+/// Runs a training job with the worker until it ends. `stop` (the Stop button) asks the worker to finish the current step, save a checkpoint and
+/// exit (a STOP file in `out_dir`); after `grace` it is killed. Returns the worker's result, or an error (a kill is "Cancelled.").
+pub fn drive(py: &Path, out_dir: &Path, job: &Value, stop: Arc<AtomicBool>, grace: Duration, on_worker: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
+    std::fs::create_dir_all(out_dir)?;
     let kill = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
-        let (kill, done, stop, stop_file) = (kill.clone(), done.clone(), stop.clone(), dir.join("STOP"));
+        let (kill, done, stop, stop_file) = (kill.clone(), done.clone(), stop, out_dir.join("STOP"));
         std::thread::spawn(move || {
             let mut asked: Option<std::time::Instant> = None;
             while !done.load(Ordering::SeqCst) {
@@ -151,42 +187,43 @@ pub fn execute(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name:
             }
         })
     };
-    let mut metrics = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("metrics.jsonl"))?;
-    let mut last_step = 0u64;
-    let mut total = 0u64;
-    let outcome = run_job(&py, &worker_dir(), &job, &kill, &mut |e| {
-        let ev = match e {
-            WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
-            WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
-            WorkerEvent::Other(mut v) => {
-                let kind = v["type"].as_str().unwrap_or("event").to_string();
-                v["kind"] = json!(kind);
-                if matches!(kind.as_str(), "metric" | "sample" | "start") {
-                    use std::io::Write;
-                    let _ = writeln!(metrics, "{}", v);
-                }
-                if kind == "metric" {
-                    last_step = v["step"].as_u64().unwrap_or(last_step);
-                    total = v["total_steps"].as_u64().unwrap_or(total);
-                    set_state(&dir, json!({"step": last_step, "total_steps": total, "loss": v["loss"], "peak_vram_mb": v["vram_mb"]}));
-                }
-                v
-            }
-        };
-        on_event(ev);
-    });
+    let outcome = run_job(py, &worker_dir(), job, &kill, on_worker);
     done.store(true, Ordering::SeqCst);
     let _ = watcher.join();
-    let _ = std::fs::remove_file(dir.join("STOP"));
+    let _ = std::fs::remove_file(out_dir.join("STOP"));
+    outcome
+}
+
+/// Runs the job on this PC to the end, stopping or failing, and keeps the run's state. Every event goes to `on_event` as JSON ({"kind": ...}).
+pub fn execute(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name: &str, job: Value, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let py = python_path(&env_dir());
+    if !py.is_file() {
+        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+    }
+    let dir = runs_dir(p).join(name);
+    std::fs::create_dir_all(&dir)?;
+    write_json(&dir.join("config.json"), &job)?;
+    set_state(&dir, json!({"name": name, "model_id": m.id, "model": m.name, "method": method, "status": "running", "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                           "seq": hyper.max_seq, "batch": hyper.batch, "error": null}));
+    let mut rec = Recorder::new(&dir)?;
+    let outcome = drive(&py, &dir, &job, stop, grace, &mut |e| {
+        let ev = rec.from_worker(e);
+        on_event(ev);
+    });
+    finish(&dir, m, method, hyper, outcome, true)
+}
+
+/// Writes the final state of a run from the worker's outcome (shared by local and remote runs). `record_memory`: the peak memory is of THIS PC's card.
+pub fn finish(dir: &Path, m: &ModelEntry, method: Method, hyper: &Hyper, outcome: Result<Value>, record_memory: bool) -> Result<Value> {
     match outcome {
         Ok(result) => {
             let stopped = result["stopped"].as_bool().unwrap_or(false);
             if stopped {
-                set_state(&dir, json!({"status": "stopped", "step": result["steps"], "peak_vram_mb": result["peak_vram_mb"]}));
+                set_state(dir, json!({"status": "stopped", "step": result["steps"], "peak_vram_mb": result["peak_vram_mb"]}));
             } else {
                 write_json(&dir.join("result.json"), &result)?;
-                set_state(&dir, json!({"status": "done", "step": result["steps"], "total_steps": result["total_steps"], "loss": result["final_loss"], "peak_vram_mb": result["peak_vram_mb"]}));
-                if let Some(mb) = result["peak_vram_mb"].as_f64().filter(|mb| *mb > 0.0) {
+                set_state(dir, json!({"status": "done", "step": result["steps"], "total_steps": result["total_steps"], "loss": result["final_loss"], "peak_vram_mb": result["peak_vram_mb"]}));
+                if let Some(mb) = result["peak_vram_mb"].as_f64().filter(|mb| *mb > 0.0 && record_memory) {
                     record_measured(&m.id, method, mb / 1024.0, hyper.max_seq, hyper.batch);
                 }
             }
@@ -194,14 +231,18 @@ pub fn execute(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name:
         }
         Err(e) if e.0 == "Cancelled." => {
             // killed after the grace period: the last checkpoint is kept and the run can be continued
-            set_state(&dir, json!({"status": "stopped"}));
+            set_state(dir, json!({"status": "stopped"}));
             Err(Error::new("Stopped. The run can be continued from its last saved point."))
         }
         Err(e) => {
-            set_state(&dir, json!({"status": "failed", "error": e.0}));
+            set_state(dir, json!({"status": "failed", "error": e.0}));
             Err(e)
         }
     }
+}
+
+pub fn set_run_state(dir: &Path, patch: Value) {
+    set_state(dir, patch);
 }
 
 /// Every run, newest first, with its state.
@@ -223,8 +264,11 @@ pub fn read_metrics(p: &Project, name: &str) -> Vec<Value> {
     std::fs::read_to_string(runs_dir(p).join(name).join("metrics.jsonl")).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
 
-/// A run that was stopped or failed after saving a checkpoint can be continued.
+/// A run that was stopped or failed after saving a checkpoint can be continued (a remote run keeps its checkpoints on the server).
 pub fn resumable(p: &Project, name: &str) -> bool {
+    if read_json(&runs_dir(p).join(name).join("state.json")).is_some_and(|s| s["server"].is_string() && matches!(s["status"].as_str(), Some("stopped" | "failed" | "interrupted"))) {
+        return true;
+    }
     let d = runs_dir(p).join(name).join("checkpoints");
     std::fs::read_dir(d).map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false)
 }

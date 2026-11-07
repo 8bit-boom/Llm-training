@@ -130,6 +130,18 @@ impl Ollama {
         Ok(v["message"]["content"].as_str().unwrap_or("").to_string())
     }
 
+    /// Names of the models Ollama has loaded in memory right now (`GET /api/ps`).
+    pub fn loaded(&self) -> Result<Vec<String>> {
+        let v: Value = self.agent.get(&format!("{}/api/ps", self.base)).call().map_err(|e| unreachable(&self.base, e))?.into_json().map_err(|e| Error::new(format!("Unexpected answer from Ollama: {e}")))?;
+        Ok(v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default())
+    }
+
+    /// Takes a model out of memory (`keep_alive: 0`), which frees its graphics memory.
+    pub fn unload(&self, model: &str) -> Result<()> {
+        self.agent.post(&format!("{}/api/generate", self.base)).send_json(json!({"model": model, "keep_alive": 0})).map_err(|e| unreachable(&self.base, e))?;
+        Ok(())
+    }
+
     pub fn delete(&self, model: &str) -> Result<()> {
         self.agent.delete(&format!("{}/api/delete", self.base)).send_json(json!({"model": model})).map_err(|e| unreachable(&self.base, e))?;
         Ok(())

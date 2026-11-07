@@ -13,6 +13,13 @@ pub struct OllamaServer {
     pub url: String,
 }
 
+/// A computer that can train for us (the TrueNAS server). Its access token is kept in `secrets`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrainServer {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -22,13 +29,14 @@ pub struct Settings {
     /// "auto" (follow the system), "light" or "dark" (night mode)
     pub theme: String,
     pub ollama_servers: Vec<OllamaServer>,
+    pub train_servers: Vec<TrainServer>,
     pub recent_projects: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(),
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], recent_projects: Vec::new() }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), recent_projects: Vec::new() }
     }
 }
 

@@ -1,0 +1,8 @@
+[package]
+name = "ndforge-server"
+version.workspace = true
+edition.workspace = true
+description = "ND Lore Forge worker: trains on this computer's graphics card for the desktop program (runs in a container on the TrueNAS server)"
+
+[dependencies]
+ndforge-core = { path = "../ndforge-core" }
