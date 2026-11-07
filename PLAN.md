@@ -1,305 +1,407 @@
-# ND Lore Forge — plan
+# ND Lore Forge — plan (revision 2)
 
-A desktop program for **Windows and Linux** with a GUI that turns an nd-world world (its lore, rules and mechanics) into a
-training dataset and fine-tunes a small open model (Qwen3.5, Gemma 4 and similar) on it. The result is a small model made
-for one world, which nd-world can then use for AI Chat, Talk to NPCs, Ask AI and the Chronicler.
+A desktop program for **Windows and Linux** with an easy, guided GUI that turns one nd-world world (its lore, rules and
+mechanics) into training data and fine-tunes a small model on it — **Qwen3.5 2B / 4B / 9B** or **Gemma 4 E2B / E4B**.
+The result is a small **GM model** made for that world, which nd-world can then use for AI Chat, Ask AI, Talk to NPCs and
+the Chronicler.
 
 Status: **plan only, nothing is implemented yet.** Working name: *ND Lore Forge* (`ndforge`).
+
+### What changed in revision 2 (owner's answers, 2026-11-07)
+
+| Question | Answer | Effect on the plan |
+|---|---|---|
+| Where to train | On the owner's PC; maybe on TrueNAS | PC is the default everywhere; TrueNAS becomes an optional "train on my server" milestone (§10). |
+| GM or Player model | **GM model only, trained on all data** | Player/audience filtering and leak scans are removed. GM secrets are *kept* and labelled. A warning about player-facing AI is added (§8.3). |
+| Which world | Chosen by the owner | The GUI lists the worlds nd-world offers and lets the owner pick one per project. |
+| Teacher model | Local PC runs Gemma 4 and Qwen3.5; TrueNAS runs Gemma 4 | Teacher can be a model on the PC (Ollama / llama.cpp) or the TrueNAS Gemma 4 over the network (§6.4). |
+| Models | Qwen3.5 2B, 4B, 9B; Gemma 4 E2B, E4B | Exactly these five in the model picker (§7.1). |
+| Getting data | Either **connect nd-world to the program**, or a **special export file from nd-world** | New nd-world feature: the **Training Bundle** — one format, delivered either as a downloaded `.ndtrain` file or over a live connection (§5). |
+| GUI | Easy to understand, with detailed instructions | Guided step-by-step design with an instructions panel on every page, plain-language help for every setting (§4). |
 
 ---
 
 ## 1. Goals and non-goals
 
 **Goals**
-1. One GUI program, the same on Windows 10/11 and Linux (x86-64, NVIDIA GPU), that runs the whole loop:
-   import world → build dataset → review → train → evaluate → export → use in nd-world.
-2. Read nd-world data the way nd-world exports it today, so **nd-world does not need to change** for version 1.
-3. Train Qwen3.5 and Gemma 4 small models (and other Hugging Face causal LMs) with LoRA / QLoRA on a single consumer or
-   server GPU, including the 16 GB Tesla T10 / T4 and the V100 that nd-world's own docs target.
-4. Keep secrets secret: a model meant for players never sees `[gmonly]` text or hidden entities during training.
-5. Produce files nd-world can load straight away: GGUF + an Ollama `Modelfile`, or a model folder for Unsloth Studio.
+1. One GUI program for Windows 10/11 and Linux (x86-64, NVIDIA GPU) that a non-expert can follow from start to finish:
+   **Get world data → Make training data → Train → Test → Use in nd-world.**
+2. Two ways to get the world in, both producing the same data:
+   **(A) Connect** to a running nd-world with a URL + access token, or **(B) Import** a `.ndtrain` file exported from nd-world.
+3. Train the five chosen models with LoRA / QLoRA on one GPU, on the PC (default) or the TrueNAS server (Tesla T10, 16 GB).
+4. A **GM model** that knows everything in the world, including secrets, and knows which facts are secrets.
+5. Produce files nd-world loads straight away: GGUF + Ollama `Modelfile`, or a model folder for Unsloth Studio.
 
 **Non-goals (version 1)**
-- Training from scratch or training large models (> ~14 B parameters).
-- AMD / Intel / Apple GPUs (CPU-only works for data building and tiny smoke runs, not for real training).
-- Multi-GPU / multi-machine training (single GPU only; remote training over SSH is a later phase, see §11).
-- Image / audio fine-tuning — Qwen3.5 and Gemma 4 are multimodal, but only the text part is trained; vision towers stay frozen.
+- Player-safe models (not needed; can be added later because the bundle keeps visibility flags).
+- Training from scratch, models other than the five listed (an "advanced: other Hugging Face model" box may come later).
+- AMD / Intel / Apple GPUs; multi-GPU training. CPU works for data preparation only.
+- Image/audio training — Qwen3.5 and Gemma 4 are multimodal, but only the text part is trained.
 
-## 2. The key design decision: what "teaching lore" actually needs
+## 2. How the model learns the world
 
-Fine-tuning alone memorises facts poorly and makes a small model confidently invent details. The plan therefore uses
-**three layers**, and the GUI makes them separate, visible steps:
+Fine-tuning alone memorises facts poorly and makes a small model invent details, so training uses three layers. The GUI
+explains each in plain words; the owner never has to know the terms.
 
-| Layer | What it does | Data |
+| Layer | Plain-language name in the GUI | What it does |
 |---|---|---|
-| **A. Continued pre-training (CPT, optional)** | Soaks the world's names, style, vocabulary and rules text into the model. | Raw "lore book" text rendered from every entity, rules, sessions. |
-| **B. Supervised fine-tuning (SFT, main step)** | Teaches the model to *answer questions about* the world, explain mechanics, role-play NPCs, and say "that is not in the lore" instead of inventing. | Question/answer and multi-turn chat examples built from the lore (templated + teacher-generated + verified). |
-| **C. Retrieval stays on** | nd-world already does RAG (`app/retrieval.py`, vault chunks, knowledge graph). The tuned model is trained *with* retrieved context in some examples, so it uses RAG well instead of replacing it. | A share of SFT examples include a "Context:" block the way nd-world builds its prompts. |
+| Continued pre-training (optional) | **"Read the world book"** | The model reads all lore as text, learning names, style, rules wording. |
+| Supervised fine-tuning (main step) | **"Practise answering questions"** | Question/answer and chat examples: lore questions, rules explained, NPC role-play, and saying "that isn't in the lore" instead of inventing. |
+| Retrieval stays on in nd-world | **"Use nd-world's lore search"** | Part of the practice examples include a context block like the one nd-world adds to its prompts, so the model uses nd-world's search results well instead of replacing them. |
 
-Result: a small model that knows the world's vocabulary and rules by heart, stays grounded when nd-world gives it
-context, and admits gaps — which is what makes a 2–9 B model usable instead of the 26 B default.
+---
 
-## 3. Target models and hardware
+## 3. Big picture
 
-| Family | Sizes worth training here | Notes |
-|---|---|---|
-| Qwen3.5 | ~0.8 B, 2 B, 4 B, 9 B | Strong multilingual and reasoning; has "thinking" mode — train with thinking off by default, option to keep it. |
-| Gemma 4 | E2B, E4B (and 26B-A4B MoE only on ≥ 24–32 GB, experimental) | Matches nd-world's current default family (`gemma4:26b`), so the tuned E4B is a drop-in smaller sibling. |
-| Others | Any HF causal LM with a chat template (Llama 3.x, Mistral, Phi, SmolLM …) | Via the generic backend. |
+```
+ nd-world (TrueNAS)                                   ND Lore Forge (PC)
+ ┌──────────────────────────────┐                     ┌───────────────────────────────────────────┐
+ │ Training Bundle builder      │ ── (A) Connect ───► │ 1 Get world data                          │
+ │  (new, Python + Rust gateway)│    URL + token      │ 2 Make training data ◄── teacher model    │
+ │                              │                     │      (PC Ollama/llama.cpp or TrueNAS)     │
+ │ Export & Backup hub:         │ ── (B) .ndtrain ──► │ 3 Train  (PC GPU, or TrueNAS worker)      │
+ │  "Download training bundle"  │    file             │ 4 Test                                    │
+ └──────────────────────────────┘                     │ 5 Use in nd-world → GGUF / Ollama ────────┼──► back to nd-world
+                                                      └───────────────────────────────────────────┘
+```
 
-Exact model IDs are **not hard-coded**: a `models.toml` catalog lists the known-good repos (Unsloth's pre-quantised 4-bit
-repos and the official ones), and the user can paste any Hugging Face ID. The catalog is checked against the hub at
-implementation time because names change.
+---
 
-**Hardware presets** (auto-detected, user can override):
+## 4. The GUI: easy to understand, with detailed instructions
 
-| VRAM | Default | Precision |
-|---|---|---|
-| 6–8 GB | Qwen3.5 2 B / Gemma 4 E2B, QLoRA 4-bit, seq 2048 | fp16 or bf16 |
-| 12–16 GB (T4/T10, RTX 4060 Ti 16 GB, 4070 Ti S) | Qwen3.5 4 B / Gemma 4 E4B QLoRA; 9 B QLoRA at seq 2048 | **fp16 on Turing/Volta** (no bf16), bf16 on Ampere+ |
-| 24 GB+ | 9 B LoRA 16-bit or QLoRA with long context | bf16 |
+### 4.1 Design rules
+1. **A guided path, not a pile of settings.** The main window is five numbered steps in a left sidebar with a progress
+   tick for each. A step unlocks when the one before it is done; the next action is always one big highlighted button.
+2. **An instructions panel on every page** (right side, can be collapsed), always with the same four headings:
+   *What this step does* · *What you need before you start* · *What to do* (numbered, with small screenshots) ·
+   *What happens next / how long it takes*.
+3. **Every setting has a "?"** that opens a plain-language explanation, a recommended value, and what happens if it is
+   set higher or lower. Example for "Epochs": *"How many times the model reads all practice examples. 2–3 is usual. More
+   can make it repeat the examples word-for-word instead of understanding them."*
+4. **Simple mode by default, Expert mode on a switch.** Simple mode shows only: world, model, "Quick test / Normal / Best
+   quality", and Start. Every expert value still has a safe default computed for the PC's GPU.
+5. **Check before you start.** Each step shows a checklist with green / yellow / red lights (GPU found, enough VRAM,
+   enough disk space, teacher model reachable, nd-world reachable) and estimated **time** and **disk space** before the
+   owner presses Start.
+6. **Errors in plain language with a fix.** Never a raw stack trace first. E.g. *"The GPU ran out of memory. The 9B model
+   needs more memory than this card has with these settings. [Use the recommended smaller settings] [Pick the 4B model]"*;
+   the technical log is one click away ("Show details", "Copy for a bug report").
+7. **Show, don't just tell.** During training, a few fixed probe questions about the chosen world are answered every
+   few minutes, so the owner sees the answers improve. The loss chart has a short "what does this chart mean" note.
+8. **Built-in help:** a first-run welcome tour (5 screens), a full user guide inside the app (Help → Guide, also in
+   `docs/`), a glossary (LoRA, epoch, loss, quantisation, GGUF, VRAM …) linked from every page, and a troubleshooting page.
+9. **Long jobs can be left alone:** a desktop notification when a job finishes or fails; jobs resume after a restart.
+10. Light/dark theme following the system; text size setting; keyboard accessible. UI language: English first, all
+    strings in translation files so other languages can be added.
 
-The hardware probe reads GPU name, compute capability, VRAM, driver/CUDA version and RAM, and picks precision automatically
-(compute capability < 8.0 → fp16, SDPA attention instead of FlashAttention 2).
+### 4.2 Pages
 
-## 4. Technology choices
+| Page | What the owner sees |
+|---|---|
+| **Welcome / Projects** | "Create a project" (one project = one world + one model family), recent projects, the welcome tour. |
+| **1 · Get world data** | Two big cards: **"Connect to nd-world"** (address, access token, Test connection, then a list of worlds to choose from) and **"Import a training file"** (drag and drop a `.ndtrain`). Instructions explain how to make a token / file in nd-world with screenshots. After import: a summary ("312 entities, rules 48 pages, 27 session recaps, 140 facts …") and, on re-import, what changed. A third small option: "I only have an old World JSON export" (works, with less data). |
+| **2 · Make training data** | Recipe with on/off switches and a "how much" slider per kind of example (§6.3), teacher model setup with Test button, time estimate, Generate with progress, then a review table (search, filter, edit, delete, "looks good") and **Save this version**. |
+| **3 · Train** | Model picker with the five models as cards (size, VRAM needed, speed, "fits your GPU ✓/✗"), where to train (This PC / My TrueNAS server), preset, Start / Pause / Stop, live charts, probe answers, ETA, GPU temperature. |
+| **4 · Test** | Score card (lore accuracy, made-up answers, rules questions, general chat), side-by-side chat: original model vs trained model, "ask your own question", save transcripts. Plain verdict: *"Better than the original on 86 % of lore questions."* |
+| **5 · Use in nd-world** | Choose file size/quality (Q4 / Q5 / Q8), Create, then step-by-step instructions to load it in nd-world (Ollama or Unsloth Studio) with copy buttons for each command and setting; optional "Send to my TrueNAS Ollama" button. |
+| **Settings** | GPU info, installed training environment (install / repair / update), folders, saved nd-world connections and tokens (stored in the OS keyring), teacher model defaults, theme. |
+
+---
+
+## 5. Getting world data: the nd-world Training Bundle
+
+### 5.1 One format, two ways to deliver it
+A new nd-world feature builds a **Training Bundle** of one world: everything useful for training, text only, no images,
+no accounts. It is offered in two ways that return **byte-identical content**:
+
+- **(B) File:** Tools → 📦 Export & Backup → **"Training bundle (for ND Lore Forge)"** → downloads `<world-slug>.ndtrain`.
+  The owner copies it to the PC and drops it on page 1. Works offline, and with nd-world on TrueNAS and the PC far apart.
+- **(A) Connect:** in nd-world, Account → **"Connect ND Lore Forge"** creates an access token (shown once, with a copy
+  button). In ND Lore Forge, page 1 → enter the nd-world address + token → Test → pick a world → **Fetch**.
+  "Fetch again" later updates the project with whatever changed in nd-world.
+
+Older nd-world versions without the feature: the existing **World JSON export** can still be imported (entities only).
+
+### 5.2 Bundle format (`.ndtrain`, format version 1)
+A zip with UTF-8 JSON/JSONL files (a JSONL line = one record), so it streams for big worlds and is easy to inspect:
+
+| File | Contents |
+|---|---|
+| `manifest.json` | `format: "nd-training-bundle"`, `version: 1`, created time, nd-world build (`ND_BUILD`), world id/name/slug/description, record counts, SHA-256 of every file. |
+| `world.json` | Kinds (built-in + the world's custom kinds), entity templates (field ids → labels, so custom fields become readable), calendar config, ruleset names used by combat. |
+| `entities.jsonl` | Every entity: kind, subtype, name, **aliases**, folder, tags, summary, body (markdown, **with `[gmonly]` and other tags kept raw**), custom fields, **roleplay_personality**, `visible_to_players`, `rag_priority`, updated_at. |
+| `entity_notes.jsonl` | Notes attached to entities (with their visibility flag). |
+| `relations.jsonl` | Typed relations (`located_in`, `member_of` …) and the untyped "related" links, by entity id + name. |
+| `rules.md` + `rules_sheets.jsonl` | The world's effective rules text (the core rules fallback if the world has none) and rules text from sheet templates. |
+| `sessions.jsonl` | Game sessions: number, date, title, recap, NPCs present, loot. |
+| `facts.jsonl` | Session facts with their session and visibility. |
+| `quests.jsonl` | Quests with status, category, body, linked entities, parent quest. |
+| `tables.jsonl` | The world's random tables (name, category, description, entries + weights). |
+| `ai_instructions.jsonl` | The GM's standing AI instructions (enabled ones), so the model can learn the house style. |
+| `characters.jsonl` | Player characters: name, race, class, level, backstory, notes, equipment, feats. **No user accounts, emails or owner ids.** |
+
+**Never included:** users, e-mails, passwords, tokens, 2FA, images/audio/video, maps and schematics geometry, dice
+history, live/combat state, **character journals and goals** (private to the player even from the GM in nd-world) and
+**GM→player private notes** (personal). These stay out even though the model is GM-only, because the bundle may be
+copied to another machine.
+
+### 5.3 Changes in nd-world (separate work in the nd-world repo, following its CLAUDE.md)
+nd-world's rules apply in full: Python is the oracle, the Rust gateway must answer byte-identically, and the Rust-only
+image must not lose the feature.
+
+1. **Python first** — `app/training_bundle.py`: one builder used by both the file download and the API, streamed
+   (reuse `app/streaming_export.py`) so a large world does not sit in memory. Routes:
+   - `GET /worlds/{id}/export/training.ndtrain` (GM only, session cookie) — the file.
+   - `GET /api/training/v1/worlds` and `GET /api/training/v1/worlds/{id}/bundle` (GM only, **Bearer token**) — the
+     connection. Bearer auth today exists only for `/mcp`; it is added for the `/api/training/v1/*` prefix only,
+     read-only, reusing `ApiToken` (sha256 hash lookup, `last_used_at` updated), with the token's user required to be a
+     GM of that world.
+   - Account page: "Connect ND Lore Forge" creates a labelled token; Export & Backup hub: the new download button with
+     a one-line explanation.
+2. **Rust gateway port** — `rust/nd-gateway/src/export.rs` (bundle), `auth.rs` (Bearer for the prefix), and the two page
+   changes in the Rust renderer. In `python_free()` mode it must not decline on accented names, rich-text notes, `null`
+   where a list is expected, or thousands of rows.
+3. **Tests** — a parity test in `tests/test_gateway_golden.py` (same world → same bytes from both servers, file and API),
+   a Rust-only test with `_python_free_gateway(seed)`, auth tests (no token / player token / other world's token → 401/403).
+4. **Docs** — `docs/FORK_STATUS.md`, `docs/RUST_SWITCH_OFF.md`, `docs/API_REFERENCE.md`, README "Data & Backups".
+5. Full suite before pushing (`bash scripts/gateway_suite.sh 4 all` + `pytest -n 4`).
+
+Zip byte-identity needs fixed file order, fixed timestamps and stored (or one agreed deflate) compression in both
+implementations; the parity test compares the unpacked files too, so a mismatch points at the file that differs.
+
+---
+
+## 6. Making training data (page 2)
+
+### 6.1 Import and normalise
+The bundle (or World JSON) is read into one canonical record per item, saved in the project as a **snapshot** with a
+content hash. Re-fetching shows a diff (added / changed / removed) and later steps only redo what changed.
+
+### 6.2 Cleaning, GM secrets kept and labelled
+- Because this is a GM model, `[gmonly]…[/gmonly]` content is **kept** but rewritten as a clear label, e.g.
+  *"(GM secret: the duke is the cult leader)"*, so the model learns the fact *and* that players don't know it — useful when
+  the GM asks "what don't my players know about X?". Same for `[for=…]` (→ "known only to <player character>") and
+  `[reveal=DATE]` (→ "revealed on DATE"), and hidden entities (→ "hidden from players").
+- Other nd-world markup (`[spoiler]`, `[color]`, `[mark]`, `[u]`, autolinks, image embeds) is unwrapped to plain markdown;
+  `[[wikilinks]]` become names. The tag grammar follows nd-world's `app/rendering.py`; tests use fixtures produced by
+  nd-world's own code so tags are recognised the same way (nesting, unclosed tags, mixed case).
+- Long texts are split by heading into chunks that keep the entity name; near-duplicates are removed; accented names are
+  kept exactly.
+
+### 6.3 Kinds of practice examples (each with an on/off switch and a "how much" slider)
+1. **World book** (for "Read the world book") — every record as a readable article; rules as chapters.
+2. **Simple facts** (no AI needed) — from structured data: who/what is X, also known as, where is X (relations), members
+   of an organisation, custom fields, random table contents, "how does <rule> work".
+3. **Deeper questions** (teacher model) — per chunk, grounded questions and answers: explain, compare, connect two related
+   entities, "what would happen if", multi-turn chats.
+4. **Rules and mechanics practice** (teacher model) — worked examples for the world's rules (dice pools, combat turns for
+   its ruleset: nd / worm / hunt / asterion / generic), checked against the rules text.
+5. **NPC role-play** — in-character dialogues for entities with a `roleplay_personality`, using the same system prompt shape
+   as nd-world's Talk to NPCs.
+6. **Campaign history** — from session recaps, facts and quests: "what happened in session 12", "who did the party meet in
+   …", quest status — the Chronicler's job.
+7. **Using lore search** — questions answered with an nd-world-style context block, including cases where the context lacks
+   the answer and the right reply says so.
+8. **"Not in the lore"** — questions about made-up names and events → a short honest "that isn't in this world's lore".
+9. **General chat** (default ~10 %) — a small open instruction dataset so the model does not forget ordinary conversation.
+10. **House style** — the GM's AI instructions become the system prompt of a share of examples.
+
+**Checking the teacher's work:** every teacher-written example is checked (by the teacher in "judge" mode): *is every
+claim supported by the source text?* Unsupported examples are dropped or flagged for review. Generation is cached per
+chunk, resumable, and can run overnight.
+
+**Test questions are kept apart:** ~10 % of facts/entities are held out *by fact* (not by rewording) for page 4, so the
+test measures what the model learned, not what it copied.
+
+### 6.4 Teacher model options
+Any OpenAI-compatible endpoint; the GUI offers presets with a Test button:
+- **On this PC** — Ollama or a llama.cpp server running Gemma 4 or Qwen3.5 (a bigger size than the one being trained is
+  better). The program generates first, then asks Ollama to unload the model (`keep_alive: 0`) before training, so they
+  never fight for the GPU.
+- **On TrueNAS** — the server's Gemma 4 (26B) through Unsloth Studio or Ollama, over the network. Can generate while the
+  PC is free; warning shown not to run it on a session night (it shares the T10 with chat and transcription).
+- **None** — only "World book" and "Simple facts" (no teacher needed); fine for a first try.
+
+### 6.5 Review and save
+The review table shows every example next to the text it came from; filter by kind, source, judge score; edit, delete,
+mark good. **"Save this version"** writes `datasets/vN/train.jsonl`, `test.jsonl` and `manifest.json` (bundle hash,
+recipe, counts, token totals). Training always uses a saved version, so every trained model can say exactly what it learned from.
+
+---
+
+## 7. Training (page 3)
+
+### 7.1 The five models
+Shown as cards. VRAM figures are first estimates for QLoRA (4-bit) at 2048 tokens and **are measured on real hardware
+in milestone M5** before they are shown as facts; Gemma 4 "E" sizes are *effective* parameter counts and the real weights
+are larger, which the estimate accounts for.
+
+| Model | Good for | Approx. VRAM (QLoRA) | Approx. VRAM (LoRA 16-bit) |
+|---|---|---|---|
+| Qwen3.5 2B | Fast first tries, weak PCs | ~5–6 GB | ~8–10 GB |
+| Gemma 4 E2B | Same family as nd-world's default chat model | ~6–8 GB | ~12 GB |
+| Qwen3.5 4B | Good balance | ~8–9 GB | ~14–16 GB |
+| Gemma 4 E4B | Good balance, Gemma family | ~9–11 GB | ~18–20 GB |
+| Qwen3.5 9B | Best quality of the five | ~12–14 GB | ~24 GB+ |
+
+The exact Hugging Face repos (official and Unsloth's pre-quantised) live in `catalog/models.toml`, checked against the hub
+when implementation starts. Qwen3.5's "thinking" mode is trained **off** by default (simple-mode answers stay short), with an
+expert option to keep it.
+
+### 7.2 Engine and settings
+- **Unsloth** (supports Qwen3.5 and Gemma 4, about half the VRAM, Windows + Linux), with plain Transformers + PEFT + TRL as
+  a fallback backend.
+- Methods: QLoRA (default), LoRA 16-bit (if VRAM allows), optional "Read the world book" stage before practice in one run.
+- Chat format from each model's own tokenizer template; loss only on the assistant's answers.
+- **Presets:** *Quick test* (~10–20 min, proves everything works), *Normal*, *Best quality*, computed from GPU, model and
+  dataset size. Precision chosen automatically: bf16 on RTX 30xx and newer, **fp16 on older cards like the T10 (Turing)**,
+  with SDPA attention where FlashAttention 2 is not available.
+- Live: loss/test-loss chart, speed, VRAM, GPU temperature, ETA, probe answers; Pause / Stop / Resume from checkpoint;
+  out-of-memory → plain explanation and one-click retry with smaller settings.
+- Each run: `runs/<name>/` with settings, logs, checkpoints, the trained adapter and scores.
+
+### 7.3 Where to train
+- **This PC (default)** — the training environment is installed by the program on first use (see §9).
+- **My TrueNAS server (optional, milestone M11)** — see §10.
+
+---
+
+## 8. Test and use (pages 4 and 5)
+
+### 8.1 Test
+Automatic after training, original vs trained model, on the held-out questions: **lore accuracy** (fuzzy match + judge),
+**made-up answers** (share of "not in the lore" questions answered with inventions), **rules questions** with known
+answers, **general chat** sanity, plus the side-by-side chat. Runs can be compared in a table.
+
+### 8.2 Use in nd-world
+1. Merge the trained adapter into the model; convert to **GGUF** and shrink it (Q4_K_M default, Q5_K_M, Q8_0).
+2. Write an Ollama `Modelfile` (chat template, stop words, recommended context and temperature) and a model card
+   (base model, world, dataset version, scores, licence: Gemma terms / Qwen licence).
+3. Install it, with instructions and copy buttons for each path:
+   - **Ollama on the PC:** `ollama create <world>-gm -f Modelfile` (button does it).
+   - **Ollama on TrueNAS (legacy backend):** copy the GGUF + Modelfile to the server (button: upload over the network if
+     the Ollama API is reachable), then set `OLLAMA_MODEL=<world>-gm` in nd-world.
+   - **Unsloth Studio (current backend):** put the GGUF where Studio's Model Hub sees it (or a private Hugging Face repo),
+     set `UNSLOTH_MODEL` and `LLM_CONTEXT_TOKENS` to the context the model was loaded with.
+   - Keep nd-world's lore retrieval on.
+
+### 8.3 Important warning shown on page 5
+This model knows **all** GM secrets. If players in this world can use AI (the per-world "players can use Ask AI" option),
+they would be talking to a model that knows the twists. The page tells the GM to either keep player AI off for that world
+or keep player-facing AI on the original model. (A later nd-world option "separate model for player-facing AI" is listed as
+a possible follow-up, not part of this plan.)
+
+---
+
+## 9. Technology and installation
 
 | Part | Choice | Why |
 |---|---|---|
-| Language | Python 3.12 | The whole training stack is Python. |
-| GUI | **PySide6 (Qt 6)** + pyqtgraph for live charts | Native look on Windows and Linux, handles long background jobs, no browser needed, LGPL. |
-| Training engine | **Unsloth** (primary) with a plain **Transformers + PEFT + TRL** backend as fallback | Unsloth supports Qwen3.5 and Gemma 4, cuts VRAM roughly in half, runs on Windows and Linux; the fallback covers models Unsloth does not support yet. |
-| Datasets | `datasets` + JSONL files on disk | Easy to inspect, diff and version. |
-| Teacher LLM (synthetic data) | Any **OpenAI-compatible endpoint**: the user's nd-world Unsloth Studio or Ollama (`gemma4:26b`), local llama.cpp server, or a cloud API | Reuses what the user already runs. |
-| Export | llama.cpp `convert_hf_to_gguf.py` + `llama-quantize` (or Unsloth's `save_pretrained_gguf`), Ollama CLI | GGUF is what Ollama and Unsloth Studio load. |
-| Environment | **uv**-managed virtual environment, created by the app on first run | Torch/CUDA wheels are big and GPU-specific; keeping them out of the installer keeps it small and lets the app pick the right CUDA build. |
-| Packaging | PyInstaller (GUI shell) → Inno Setup installer (Windows), AppImage + tar.gz (Linux) | One-click install on both. |
-| Secrets (HF token, API keys) | OS keyring (`keyring`: Windows Credential Manager / Secret Service) | Never in project files or logs. |
+| Language | Python 3.12 | The training stack is Python. |
+| GUI | **PySide6 (Qt 6)** + pyqtgraph | Native on Windows and Linux, good for long background jobs, rich help panels (HTML), LGPL. |
+| Training | Unsloth; fallback Transformers + PEFT + TRL | See §7.2. |
+| Data | `datasets` + JSONL on disk | Easy to inspect and version. |
+| Teacher | OpenAI-compatible HTTP client (httpx) | Works with Ollama, llama.cpp, Unsloth Studio. |
+| Export | llama.cpp convert + quantise (or Unsloth's GGUF export), Ollama API/CLI | GGUF is what nd-world's backends load. |
+| Environment | **uv**-managed environment created by the app | Torch/CUDA is large and GPU-specific; the installer stays small and the app picks the right CUDA build. |
+| Packaging | PyInstaller → Inno Setup installer (Windows), AppImage + tar.gz (Linux) | One-click install. |
+| Secrets | OS keyring (Windows Credential Manager / Secret Service) | nd-world tokens and HF tokens never in project files or logs. |
 
-**Process model:** the GUI never imports torch. Each long job (dataset generation, training, evaluation, export) runs as a
-**separate worker process** inside the managed environment and reports progress as JSON lines over a pipe. This keeps the
-GUI responsive, lets "Stop" kill a job cleanly and always frees GPU memory, and means a CUDA crash cannot take the GUI down.
-The same worker has a CLI (`ndforge train project.toml`) so a run can also be started headless on the server.
+**Process model:** the GUI never loads torch. Every long job (fetch, data generation, training, testing, export) runs as a
+**separate worker process** that reports progress as JSON lines; Stop always ends it and frees the GPU, and a crash cannot
+take the window down. The same worker has a command line (`ndforge train project.toml`), which is also what the TrueNAS
+worker runs.
 
-## 5. Where the data comes from (nd-world inputs)
+**First run on a PC:** the welcome tour ends at "Set up training": the app checks the NVIDIA driver, picks the CUDA build,
+installs the environment with a progress bar (several GB, one time), and runs a 30-second GPU self-test. If the driver is
+too old it says which version is needed and links the NVIDIA download page.
 
-All importers produce one canonical record per item (see §6). Supported sources, in priority order:
+## 10. Optional: training on TrueNAS
 
-1. **World JSON export** (Tools → Export & Backup → World JSON): `{"world": {...}, "entities": [...]}` — entities with
-   `kind, subtype, name, folder, tags, summary, body, visible_to_players, template, custom_fields_json`. Embedded
-   `image_data` is ignored (dropped on import to save memory).
-2. **Split export files**: `entities/{kind}.json`, `rules.json` (`rules_md`), `player-characters.json`, sheet templates.
-3. **nd-world API with a token** (read-only): the same bearer token the MCP server uses (`/mcp` tools `list_worlds`,
-   `search_entities`, `get_entity`, `get_rules`, `list_sessions`, `get_session`, `list_tables`, `list_quests`). Pulls
-   sessions/recaps, facts, quests, random tables and relations that the JSON export does not include. Only read tools
-   are ever called.
-4. **A copy of `world.db`** (SQLite), opened strictly read-only (`mode=ro`), for the richest import: entities, aliases,
-   `roleplay_personality`, `entity_relations`, `entity_links`, facts, game sessions, quests, random tables, rules text,
-   AI instructions. The GUI warns to use a **backup copy, never the live database** (same rule as nd-world's CLAUDE.md).
-5. **Loose files**: the repo's `lore/` JSON format (`{"entities": [...]}`), an Obsidian vault folder (markdown +
-   frontmatter + `[[wikilinks]]`, as nd-world's vault sync reads it), plain `.md` / `.txt` / `.pdf` rulebooks
-   (e.g. `docs/asterion_rules.md`, `app/core_rules.md`).
+- A Docker image **`nd-lore-forge-worker`** (built from this repo, `Dockerfile.worker`) with the training environment and a
+  small job API (HTTPS + token; start job, stream progress, download results). A ready `truenas-compose.yml` snippet with
+  GPU passthrough is provided, in the same style as nd-world's own compose files.
+- In the GUI: Settings → "My TrueNAS server" (address + token + Test), then page 3 → "Where to train: My TrueNAS server".
+  The project's saved dataset is uploaded, progress and charts look exactly like local training, the result comes back
+  to the PC (or is installed directly into the server's Ollama).
+- GPU sharing on the T10: before starting, the worker asks Ollama / Unsloth Studio to unload their models and warns that AI
+  chat, transcription and image generation will be slow or unavailable until training ends; precision fp16. All five models
+  fit the 16 GB card with QLoRA (9B with the shorter context preset).
 
-Each import is a **snapshot** with a content hash, so a dataset always says exactly which world data it came from and a
-re-import shows a diff (added / changed / removed entities).
-
-## 6. Data pipeline
-
-```
-sources ─► import ─► canonical records ─► audience filter ─► clean & chunk ─► dataset builders ─► review ─► versioned dataset
-```
-
-### 6.1 Canonical record
-`{id, world, kind, subtype, name, aliases[], tags[], folder, summary, body_md, fields{}, relations[{type, target}],
-visible_to_players, group_limited, source, updated_at}` plus separate record types for `rules_section`, `session_recap`,
-`fact`, `quest`, `random_table`, `ai_instruction`, `pc_sheet`.
-
-### 6.2 Audience filter (security-critical)
-Every project chooses an **audience**: **GM model** (sees everything) or **Player model** (spoiler-safe). A model cannot
-be trusted to keep a secret it was trained on, so for a Player model the filter removes, before anything else runs:
-- entities / quests / facts with `visible_to_players = false`, or limited to player groups (`group_ids_json`);
-- `[gmonly]…[/gmonly]` blocks; `[for=IDs]…[/for]` blocks (always dropped — the model is shared by all players);
-  `[reveal=DATE]…` blocks whose date has not passed at build time; malformed tags → dropped (nd-world's "hide, never show");
-- AI instructions not marked `applies_to_players`; GM-only fields of PC sheets.
-
-The tag rules are a port of nd-world's `app/rendering.py::strip_gm_only`. Following nd-world's "Python is the oracle"
-rule, the test suite includes **parity fixtures generated by running nd-world's own function** on tricky inputs
-(nesting, unclosed tags, mixed case, dates) and the port must match byte for byte. After building, a **leak scan** checks
-that no string from any removed block appears anywhere in the Player dataset; a hit blocks training.
-
-`[spoiler]…[/spoiler]` is kept (players can click it open) but unwrapped to plain text.
-
-### 6.3 Cleaning and chunking
-Strip nd-world markup (`[color]`, `[mark]`, `[u]`, spoiler wrappers, autolinks, image embeds) to plain markdown; normalise
-`[[wikilinks]]` to names; split long bodies by heading into ~300–800-token chunks that keep the entity name in each chunk;
-deduplicate near-identical text (MinHash); keep accented names exactly (Anders de Vallière).
-
-### 6.4 Dataset builders (each one can be switched on/off and weighted)
-1. **Lore book (CPT text)** — every record rendered as a readable article ("# Name — kind / subtype\nAlso known as …\n
-   Summary … Body … Related: …"), rules as their own chapters.
-2. **Template Q&A (deterministic, no LLM needed)** — from structured fields: "Who is X?", "What is X also called?",
-   "Where is X located?" (relations), "What does organisation Y do?", custom fields ("What is X's rank?"), random-table
-   contents, rule section → "How does <mechanic> work?". Several phrasings per question.
-3. **Teacher-generated Q&A (synthetic)** — for each chunk the teacher model writes N grounded questions + answers
-   (factual, "explain", "compare", "what would happen if" for mechanics, multi-hop across related entities), multi-turn
-   chats, worked rules examples (dice pools, combat turns for the world's ruleset — nd / worm / hunt / asterion / generic).
-4. **NPC role-play** — for entities with `roleplay_personality`, in-character dialogues that follow that direction, with
-   the system prompt format nd-world's Talk-to-NPC uses.
-5. **Grounded-context examples** — questions answered with a nd-world-style retrieved context block, including examples
-   where the context is incomplete and the right answer says so.
-6. **"Not in the lore" negatives** — questions about invented names and events → a short refusal ("That isn't in this
-   world's lore"). For Player models, also questions aimed at removed secrets → "Your character doesn't know that."
-7. **General replay** — a small share (configurable, default ~10 %) of a general open instruction dataset so the model
-   does not forget how to follow ordinary instructions.
-
-**Verification pass:** every synthetic example is checked by the teacher (or a second model) as a judge: "Is every claim
-in the answer supported by the source chunk?" Unsupported examples are dropped or sent to review. The generation is
-resumable and cached per chunk hash, so re-running after a small world change only regenerates what changed.
-
-**Split:** a held-out evaluation set is split **by fact/entity**, not by paraphrase, so evaluation measures recall, not
-copy-paste. Default 90/10.
-
-### 6.5 Review and versioning
-The Dataset page shows every example with its source record, lets the user edit, approve, reject, filter (by kind,
-builder, judge score) and search. "Freeze" writes `datasets/<version>/train.jsonl, eval.jsonl, manifest.json`
-(source snapshot hash, audience, builder settings, counts, token totals). Training always points at a frozen version.
-
-## 7. Training
-
-- **Methods:** QLoRA (default), LoRA 16-bit, full fine-tune (only for ≤ 1 B models); optional two-stage **CPT → SFT**
-  pipeline as one run.
-- **Chat format:** taken from the model's own tokenizer chat template (Qwen3.5 / Gemma 4 differ); loss on assistant
-  turns only; optional packing; Qwen thinking off unless chosen.
-- **Presets:** *Smoke test* (50 steps, proves the setup), *Balanced*, *Max quality*; each computed from VRAM, model size
-  and dataset size (rank, alpha, LR, batch / grad accumulation, epochs, max seq len). Every value stays editable in an
-  "Advanced" panel; a VRAM estimate updates live before starting.
-- **Run management:** each run gets `runs/<timestamp-name>/` with the full config, logs, checkpoints, adapter, metrics.
-  Resume from checkpoint, stop, and "duplicate run with changes".
-- **Live view:** loss / eval loss / learning rate / grad norm charts, tokens per second, VRAM, GPU temperature (useful for
-  the passive T10), ETA, and periodic sample answers to fixed probe questions so you can *see* the model learn.
-- **Safety nets:** OOM → suggest the next smaller preset and offer to retry; disk-space check before saving checkpoints.
-
-## 8. Evaluation
-
-Runs automatically at the end of training (and on demand) on the held-out set, base model vs tuned model:
-- **Lore accuracy:** fuzzy match + LLM-judge score on held-out questions.
-- **Hallucination rate:** share of "not in the lore" probes that get an invented answer.
-- **Secret-leak test (Player models):** probes built from removed GM-only content; any reproduced secret = fail.
-- **Rules / mechanics checks:** worked-example questions with known answers.
-- **General sanity:** a few ordinary prompts, to catch a model that forgot how to talk.
-- **Playground:** side-by-side chat with base and tuned model (optionally with a pasted context block), saved transcripts.
-- **Run comparison** table and charts across runs.
-
-## 9. Export and use in nd-world
-
-1. Merge LoRA into the base weights (16-bit safetensors), or keep the adapter alone.
-2. Convert to **GGUF** and quantise (Q4_K_M default; Q5_K_M, Q8_0, F16 options).
-3. Write an Ollama `Modelfile` (chat template, stop tokens, recommended context and temperature), and optionally run
-   `ollama create <world>-lore` locally or on a remote Ollama URL.
-4. Optionally push to a **private** Hugging Face repo so Unsloth Studio's Model Hub can download it.
-5. Write a model card: base model, world, audience (GM/Player), dataset version and hash, eval results, licence notes.
-6. Show the exact next step for nd-world: set `OLLAMA_MODEL=<name>` (legacy backend) or `UNSLOTH_MODEL=<repo>` and
-   `LLM_CONTEXT_TOKENS` (Unsloth Studio), and keep retrieval on.
-
-Licence note shown in the export page: Gemma models are under Google's Gemma terms, Qwen under its own licence; the tuned
-model inherits them.
-
-## 10. GUI layout
-
-Left sidebar, one page per step; a status bar shows the active project, GPU and the running job.
-
-| Page | Contents |
-|---|---|
-| **Projects** | New / open / recent; a project = one world + one audience. Wizard for first project. |
-| **Sources** | Add World JSON / split files / `world.db` copy / API URL + token / folders; import preview (counts per kind, diff vs last snapshot); audience switch with clear GM/Player explanation. |
-| **Dataset** | Builder toggles and weights, teacher endpoint settings and a cost/time estimate, "Generate" with progress, review table and editor, leak-scan result, "Freeze version". |
-| **Train** | Model picker (catalog + any HF ID, download progress), method, preset, advanced panel, VRAM estimate, Start/Stop/Resume, live charts and sample answers. |
-| **Evaluate** | Metrics, base-vs-tuned table, playground chat, run comparison. |
-| **Export** | Format/quant options, Ollama create / HF push, model card, "how to use it in nd-world" instructions. |
-| **Settings** | Managed environment (install/repair/update, CUDA build), GPU info, storage paths (models cache, projects), tokens in keyring, theme (light/dark), language. |
+---
 
 ## 11. Repository layout (this repo)
 
 ```
 Llm-training/
-  pyproject.toml            # ndforge package; GUI deps only (PySide6, pyqtgraph, pydantic, keyring, httpx)
-  requirements/             # worker env: train-cuda124.txt, train-cuda128.txt, cpu.txt (pinned)
+  pyproject.toml              # ndforge (GUI side: PySide6, pyqtgraph, pydantic, keyring, httpx)
+  requirements/               # worker environment, pinned: cuda12x.txt, cpu.txt
+  catalog/models.toml         # the five models: repos, chat template notes, VRAM measurements
   src/ndforge/
-    app.py                  # entry point
-    gui/                    # pages/, widgets/, charts, job monitor
-    core/                   # project.py (project.toml), paths, settings, jobs.py (worker process + JSON-line protocol)
-    envmgr/                 # uv bootstrap, GPU/CUDA detection, torch wheel selection, health check
-    ingest/                 # world_json.py, split_files.py, sqlite_copy.py, api_client.py, lore_folder.py, vault.py, documents.py
-    privacy/                # markup.py (port of strip_gm_only), audience.py, leak_scan.py
-    dataset/                # canonical.py, clean.py, chunk.py, builders/{lorebook,template_qa,synthetic,npc,grounded,negatives,replay}.py,
-                            # verify.py, split.py, freeze.py
-    teacher/                # OpenAI-compatible client, prompts, cache, rate limiting
-    train/                  # worker.py, presets.py, vram_estimate.py, backends/{unsloth_backend,hf_backend}.py, callbacks.py
-    evaluate/               # metrics.py, judge.py, probes.py, playground.py
-    export/                 # merge.py, gguf.py, ollama.py, hf_push.py, model_card.py
-    cli.py                  # headless: ndforge import|build|train|eval|export project.toml
-  catalog/models.toml       # known-good model repos per family and size
-  tests/                    # unit, parity fixtures from nd-world, tiny-model smoke training, pytest-qt GUI tests
-  packaging/                # pyinstaller spec, windows/ (Inno Setup), linux/ (AppImage)
-  docs/                     # user guide, dataset format, troubleshooting
-  .github/workflows/        # CI: lint + tests on windows-latest and ubuntu-latest; build installers on tag
+    app.py                    # entry point
+    gui/                      # main window, steps/, instructions panel, help/glossary viewer, charts, job monitor
+    help/                     # page instructions, setting explanations, glossary, guide (markdown + screenshots)
+    core/                     # project.py (project.toml), settings, jobs.py (worker process + JSON-line protocol)
+    envmgr/                   # uv bootstrap, GPU/driver/CUDA detection, self-test
+    ingest/                   # bundle.py (.ndtrain), ndworld_client.py (Connect), world_json.py (legacy), snapshot + diff
+    dataset/                  # canonical.py, markup.py (GM-secret labelling), chunk.py, builders/*.py, verify.py, split.py, freeze.py
+    teacher/                  # OpenAI-compatible client, prompts, cache, Ollama unload
+    train/                    # worker.py, presets.py, vram_estimate.py, backends/{unsloth,hf}.py, probes.py
+    evaluate/                 # metrics.py, judge.py, compare.py, playground.py
+    export/                   # merge.py, gguf.py, ollama.py, model_card.py
+    remote/                   # TrueNAS worker client + server (job API)
+    cli.py                    # ndforge fetch|build|train|test|export
+  docs/                       # user guide, bundle format spec (shared with nd-world), troubleshooting
+  tests/                      # unit, bundle fixtures, markup fixtures from nd-world, tiny-model smoke run, pytest-qt
+  packaging/                  # pyinstaller spec, windows/ (Inno Setup), linux/ (AppImage), Dockerfile.worker
+  .github/workflows/          # lint + tests on windows-latest and ubuntu-latest; installers on tag
 ```
 
-Project folder (user data, outside the repo):
-```
-MyWorld-Player/
-  project.toml  sources/<snapshot-hash>/  records.jsonl  datasets/v1/  runs/<run>/  exports/<run>-<quant>.gguf
-```
+The **bundle format spec** (`docs/BUNDLE_FORMAT.md`) is written first and copied to nd-world's docs, so both repos build
+against the same contract; sample bundles from the spec are test fixtures on both sides.
 
 ## 12. Milestones (in order; each ends with something usable)
 
-| # | Milestone | Done when |
-|---|---|---|
-| **M0** | Repo skeleton, CI on Windows + Linux, PySide6 window, settings, project files | Installer-less dev run works on both OSes; CI green. |
-| **M1** | Managed environment: uv bootstrap, GPU/CUDA probe, torch install, health check page | Fresh Windows and Linux machines reach "GPU ready" from the GUI. |
-| **M2** | Importers (World JSON, split files, lore folder, markdown) + canonical records + import preview/diff | The repo's `lore/` sample and a real World JSON export import with correct counts. |
-| **M3** | Audience filter + markup port + parity fixtures from nd-world + leak scan | Parity tests pass byte-for-byte; a seeded secret never reaches a Player dataset. |
-| **M4** | Lore book + template Q&A builders, split, review table, freeze | A frozen dataset without any LLM. |
-| **M5** | Worker process + training (Unsloth backend, QLoRA SFT) + live charts + stop/resume | *Smoke test* preset trains Qwen3.5 small / Gemma 4 E2B on a 16 GB card; GUI stays responsive; stop frees VRAM. |
-| **M6** | Export: merge, GGUF, Ollama Modelfile + create | The tuned model answers in nd-world's AI Chat through Ollama. **First end-to-end version.** |
-| **M7** | Teacher-generated data + verification + NPC + grounded + negatives + replay | Better eval scores than M4-only data on the same model. |
-| **M8** | Evaluation suite, playground, run comparison | Base vs tuned report generated automatically. |
-| **M9** | SQLite-copy and API importers (sessions, facts, quests, tables, relations, personalities) | Session recaps and NPC personalities appear in the dataset. |
-| **M10** | CPT stage, HF fallback backend, HF push, model card | Two-stage run works; a non-Unsloth model trains. |
-| **M11** | Packaging: Windows installer, Linux AppImage, user guide | Install from a release on clean Windows 11 and Ubuntu 24.04. |
-| Later | Remote worker over SSH (train on the nd-world server's GPU from a laptop); incremental re-train when the world changes; optional nd-world "training bundle" export endpoint | — |
+| # | Milestone | Where | Done when |
+|---|---|---|---|
+| **M0** | Bundle format spec v1 + sample bundles | both | Spec agreed; fixtures committed to both repos. |
+| **M1** | App skeleton: guided window, 5 steps, instructions panel, help/glossary, settings, projects; CI on Windows + Linux | Lore Forge | Clicking through all pages works on both OSes (steps empty). |
+| **M2** | nd-world Training Bundle: file download (Python + Rust, parity + Rust-only tests, docs) | nd-world | Export hub downloads a `.ndtrain` from both images; suite green. |
+| **M3** | Page 1 import of `.ndtrain` and legacy World JSON, snapshot + diff, summary | Lore Forge | A real bundle of a chosen world imports with correct counts. |
+| **M4** | Environment manager: driver check, uv install, GPU self-test | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready" from the GUI. |
+| **M5** | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review table, save version | Lore Forge | A saved dataset without any teacher model. |
+| **M6** | Training on this PC: worker, Unsloth QLoRA, presets, live charts, probes, stop/resume; **VRAM measured for all five models** | Lore Forge | *Quick test* trains each of the five on the owner's GPU; Stop frees VRAM. |
+| **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat. |
+| **M8** | Connect mode: nd-world Bearer API (Python + Rust + tests + token UI) and the Connect card / Fetch again | both | Page 1 lists worlds from a live nd-world and fetches the same data as the file. |
+| **M9** | Teacher-generated examples (deeper questions, rules practice, NPC role-play, history, lore search, not-in-lore, general, house style) + checking | Lore Forge | Better test scores than M5-only data on the same model. |
+| **M10** | Test page: scores, side-by-side chat, run comparison | Lore Forge | Original vs trained report after every run. |
+| **M11** | TrueNAS worker image, compose snippet, remote training from the GUI | Lore Forge | A run started on the PC trains on the T10 and the result comes back. |
+| **M12** | Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting | Lore Forge | Install from a release on clean Windows 11 and Ubuntu 24.04 and follow the guide end to end. |
 
-About the optional nd-world endpoint: if it is ever added, it goes through nd-world's own rules (Python handler first as
-the oracle, Rust gateway port, parity + Rust-only tests, docs updated). Version 1 deliberately needs none of that.
+## 13. Testing
 
-## 13. Testing strategy
+- **Lore Forge:** unit tests for import, markup labelling (fixtures produced by nd-world's own tag code), chunking, builders,
+  held-out split, manifest hashing, presets and VRAM maths; a tiny-model CPU smoke run through the real worker protocol in
+  CI; pytest-qt tests for the guided flow and plain-language error dialogs; manual GPU runs of the five models.
+- **nd-world:** parity (Python vs gateway) and Rust-only tests for the bundle file and API, auth tests, a big-world test
+  (thousands of entities, accented names, `null` lists) to make sure the export streams and never declines.
+- **End to end:** sample world → bundle → dataset → Quick test training → GGUF → Ollama → question answered.
 
-- **Unit:** importers on fixture exports, markup/audience filter (parity fixtures), chunking, template builders, split
-  by entity, manifest hashing, preset/VRAM maths.
-- **Leak tests:** synthetic worlds full of `[gmonly]`, `[for=…]`, `[reveal=…]`, hidden entities; assert zero leakage.
-- **Smoke training in CI:** a tiny random model on CPU for a few steps through the real worker protocol (no GPU needed).
-- **GPU tests (manual / self-hosted runner):** smoke preset per supported family on a 16 GB card.
-- **GUI:** pytest-qt for page flows; the job monitor tested against a fake worker.
-
-## 14. Risks and mitigations
+## 14. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Small model still hallucinates lore | Grounded examples + negatives + keep RAG on; hallucination metric shown prominently. |
-| GM secrets leak into a Player model | Filter first, leak scan blocks training, secret-leak eval, parity with nd-world's own stripping. |
-| Windows training quirks (Triton, bitsandbytes, paths) | Unsloth's Windows support + pinned, tested wheel sets; fallback backend; health check page with fixes. |
-| New model releases change formats | Catalog file, tokenizer chat templates instead of hard-coded formats, generic backend. |
-| Old GPUs (T10/V100: no bf16, no FlashAttention 2) | Automatic fp16 + SDPA selection; presets tested on a T4-class card. |
-| Teacher generation is slow on the home server | Caching per chunk, resumable jobs, can run overnight, cloud endpoint option. |
-| Disk usage (models + checkpoints) | Shared model cache, checkpoint retention setting, space check before every save. |
+| Small model still invents lore | Grounded and "not in the lore" examples, nd-world retrieval kept on, "made-up answers" score shown prominently. |
+| Players reach the GM model through Ask AI | Warning and instructions on page 5 (§8.3). |
+| Bundle leaves the server with all secrets | Text only, no accounts; the instructions say to treat `.ndtrain` files like backups; tokens read-only and revocable. |
+| Python and Rust bundles drift | One spec, shared fixtures, byte-parity test in nd-world's suite. |
+| Windows training quirks | Unsloth's Windows support, pinned tested wheels, fallback backend, self-test with fixes. |
+| GPU contention (teacher vs training on the PC; chat/STT vs training on TrueNAS) | Generate first, unload, then train; unload + warning on TrueNAS. |
+| Model releases change | `catalog/models.toml`, tokenizer chat templates, fallback backend. |
+| Disk space | Shared model cache, checkpoint retention setting, space check before each save. |
 
-## 15. Open questions for the owner
+## 15. Remaining questions (not blocking the start)
 
-1. **Where will training run?** Your Windows/Linux desktop (which GPU and VRAM?) or the nd-world server with the T10 —
-   this decides whether the remote-worker phase should move earlier.
-2. **GM model, Player model, or both?** (Both = two projects from the same import.)
-3. **Which worlds and rulesets first?** (e.g. the Asterion world / rules) — used for the first real test.
-4. **Teacher model:** OK to use the server's Gemma 4 26B through Unsloth Studio/Ollama, or also a cloud API?
-5. **Model size target:** fastest possible (2 B-class) or best quality that fits 16 GB (4–9 B)?
-6. **Language(s)** of the lore and of the answers (English only, or also others)?
-7. **Name** of the program (working name *ND Lore Forge*).
+1. Which **GPU and VRAM** does the PC have? (Only changes the default model and presets; the app detects it anyway.)
+2. Should the TrueNAS worker (M11) come earlier than the teacher work (M9)?
+3. Working name *ND Lore Forge* and the `.ndtrain` file extension — OK?
