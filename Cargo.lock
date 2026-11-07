@@ -1900,6 +1900,7 @@ dependencies = [
  "dirs 5.0.1",
  "fs2",
  "pulldown-cmark",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

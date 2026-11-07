@@ -63,6 +63,41 @@ fn set_setting(s: State<App>, key: String, value: bool) -> Out<Value> {
 }
 
 #[tauri::command]
+fn dataset_state(s: State<App>) -> Out<Value> {
+    lock(&s).dataset_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_generate(s: State<App>, recipe: Value) -> Out<Value> {
+    lock(&s).dataset_generate(recipe).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_examples(s: State<App>, filter: Value, offset: usize, limit: usize) -> Out<Value> {
+    lock(&s).dataset_examples(&filter, offset, limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_set_status(s: State<App>, ids: Vec<String>, status: String) -> Out<Value> {
+    lock(&s).dataset_set_status(ids, &status).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_set_status_matching(s: State<App>, filter: Value, status: String) -> Out<Value> {
+    lock(&s).dataset_set_status_matching(&filter, &status).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_edit(s: State<App>, id: String, text: String) -> Out<()> {
+    lock(&s).dataset_edit(&id, &text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn dataset_save(s: State<App>) -> Out<Value> {
+    lock(&s).dataset_save().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn help(key: String) -> String {
     help_html(&key)
 }
@@ -114,7 +149,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, help, env_status, env_install, env_selftest, env_cancel])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

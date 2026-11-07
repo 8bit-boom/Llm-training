@@ -5,7 +5,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
-  dataset: ["Step 2 · Make training data", "Turns your world into practice questions and answers."],
   train: ["Step 3 · Train", "Teaches the model your world."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   use: ["Step 5 · Use in nd-world", "Makes the model usable in nd-world."],
@@ -69,6 +68,81 @@ function renderData() {
     ${msgHtml()}${pendingCard()}${bundleCard()}`;
 }
 
+let ds = { state: null, filter: { builder: "", search: "", status: "" }, offset: 0, total: 0, items: [], editing: null, busy: false, error: null, ok: null };
+const PAGE = 20;
+
+function recipeFromForm() {
+  const r = ds.state.recipe;
+  const builders = [...document.querySelectorAll(".bld:checked")].map((c) => c.value);
+  return { ...r, world_book: $("rb-book").checked, builders, phrasings: Number($("rb-phr").value), test_percent: Number($("rb-test").value) };
+}
+
+function renderDataset() {
+  if (!state.bundle) return `<h1>Step 2 · Make training data</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = ds.state;
+  if (!st) return `<h1>Step 2 · Make training data</h1><p class="lead">Loading…</p>`;
+  const r = st.recipe, sum = st.summary;
+  const bl = st.builders.map((b) => `<label class="opt"><input type="checkbox" class="bld" value="${b.id}" ${r.builders.includes(b.id) ? "checked" : ""}> ${esc(b.name)}</label>`).join("");
+  const sel = (id, vals, cur) => `<select id="${id}">${vals.map((v) => `<option ${v == cur ? "selected" : ""}>${v}</option>`).join("")}</select>`;
+  const recipe = `<div class="card wide"><h2>Recipe</h2>
+    <label class="opt"><input type="checkbox" id="rb-book" ${r.world_book ? "checked" : ""}> <strong>World book</strong> (the lore as text)</label>
+    ${bl}
+    <div class="row" style="margin-top:10px"><label>Different wordings ${sel("rb-phr", [1, 2, 3], r.phrasings)}</label>
+      <label>Kept for testing ${sel("rb-test", [0, 10, 20, 30], r.test_percent)} %</label></div>
+    <button class="primary" id="make" ${ds.busy ? "disabled" : ""}>${sum ? "Make the examples again" : "Make the examples"}</button></div>`;
+  let summary = "";
+  if (sum) {
+    const rows = sum.builders.map((b) => `<tr><td>${esc(b.name)}</td><td>${b.kept}</td><td>${b.dropped}</td><td><button class="link" data-show="${b.id}">Show</button></td></tr>`).join("");
+    summary = `<div class="card wide"><h2>What was made</h2>${sum.stale ? `<div class="err">The world data changed since these were made. Press "Make the examples again" (your drops and edits stay).</div>` : ""}
+      <p>${sum.kept} examples kept of ${sum.total} · about ${sum.tokens.toLocaleString()} tokens · ${sum.edited} edited</p>
+      <table class="tbl"><tr><th>Kind</th><th>Kept</th><th>Dropped</th><th></th></tr>${rows}</table></div>`;
+  }
+  let review = "";
+  if (sum) {
+    const f = ds.filter;
+    const opts = [`<option value="">All kinds</option>`, ...sum.builders.map((b) => `<option value="${b.id}" ${f.builder === b.id ? "selected" : ""}>${esc(b.name)}</option>`)].join("");
+    const items = ds.items.map((e) => {
+      const q = e.text != null ? `<em>${esc(e.source_title)} (world book)</em>` : esc(e.messages.find((m) => m.role === "user")?.content);
+      const a = e.text != null ? e.text : e.messages.filter((m) => m.role === "assistant").map((m) => m.content).pop();
+      const body = ds.editing === e.id
+        ? `<textarea id="edit-box" rows="8">${esc(a)}</textarea><div class="row"><button class="primary" data-saveedit="${e.id}">Save the change</button><button class="secondary" id="canceledit">Cancel</button></div>`
+        : `<div class="ans">${esc(a)}</div>`;
+      return `<div class="ex ${e.status === "drop" ? "dropped" : ""}"><div class="q"><span class="tag">${esc(e.builder)}</span> ${q}${e.edited ? ' <span class="tag">edited</span>' : ""}</div>${body}
+        <div class="row small"><button class="secondary" data-toggle="${e.id}" data-to="${e.status === "drop" ? "keep" : "drop"}">${e.status === "drop" ? "Keep" : "Drop"}</button>
+        <button class="secondary" data-edit="${e.id}">Edit</button><span class="dim">from: ${esc(e.source_title)}</span></div></div>`;
+    }).join("") || `<p class="dim">Nothing matches.</p>`;
+    const pages = Math.max(1, Math.ceil(ds.total / PAGE)), cur = Math.floor(ds.offset / PAGE) + 1;
+    review = `<div class="card wide"><h2>Review</h2>
+      <div class="row"><select id="f-builder">${opts}</select>
+        <select id="f-status"><option value="">Kept and dropped</option><option value="keep" ${f.status === "keep" ? "selected" : ""}>Kept only</option><option value="drop" ${f.status === "drop" ? "selected" : ""}>Dropped only</option></select>
+        <input type="text" id="f-search" placeholder="Search…" value="${esc(f.search)}" style="min-width:160px">
+        <button class="secondary" id="f-go">Search</button></div>
+      <div class="row small"><span class="dim">${ds.total} shown</span><button class="secondary" id="drop-all">Drop all shown</button><button class="secondary" id="keep-all">Keep all shown</button></div>
+      ${items}
+      <div class="row"><button class="secondary" id="prev" ${ds.offset === 0 ? "disabled" : ""}>Previous</button><span>Page ${cur} of ${pages}</span><button class="secondary" id="next" ${ds.offset + PAGE >= ds.total ? "disabled" : ""}>Next</button></div></div>`;
+  }
+  const vers = st.versions.length ? `<ul>${st.versions.map((v) => `<li><strong>Version ${v.version}</strong> · ${v.counts.world_book_texts} texts, ${v.counts.train_chat} practice, ${v.counts.test_chat} for testing · ${v.created}</li>`).join("")}</ul>` : "<p class=\"dim\">No version saved yet.</p>";
+  const save = sum ? `<div class="card wide"><h2>Save</h2><p>Training uses a saved version. Dropped examples are left out.</p><button class="primary" id="save" ${ds.busy ? "disabled" : ""}>Save this version</button>${vers}</div>` : "";
+  return `<h1>Step 2 · Make training data</h1><p class="lead">Turns your world into practice material. The help panel explains every choice.</p>
+    ${ds.error ? `<div class="err">${esc(ds.error)}</div>` : ""}${ds.ok ? `<div class="ok">${esc(ds.ok)}</div>` : ""}${recipe}${summary}${review}${save}`;
+}
+
+async function dsCall(cmd, args) {
+  ds.error = null;
+  try { return await invoke(cmd, args); } catch (e) { ds.error = String(e); return null; }
+}
+
+async function dsRefresh(keepPage) {
+  const st = await dsCall("dataset_state");
+  if (st) ds.state = st;
+  if (ds.state && ds.state.summary) {
+    if (!keepPage) ds.offset = 0;
+    const r = await dsCall("dataset_examples", { filter: ds.filter, offset: ds.offset, limit: PAGE });
+    if (r) { ds.items = r.items; ds.total = r.total; }
+  }
+  if (page === "dataset") render();
+}
+
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
 function renderSetup() {
@@ -121,7 +195,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   $("expert").checked = state.settings.expert_mode;
   $("helptoggle").checked = state.settings.show_help_panel;
@@ -142,12 +216,49 @@ function wire() {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });
     if (f) checkFile(f);
   });
+  wireDataset();
   on("recheck", refreshEnv);
   on("install", () => startEnv("env_install"));
   on("selftest", () => startEnv("env_selftest"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
   on("cancel", () => { pending = null; render(); });
+}
+
+function wireDataset() {
+  if (page !== "dataset" || !ds.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("make", async () => {
+    ds.busy = true; ds.ok = null; render();
+    const r = await dsCall("dataset_generate", { recipe: recipeFromForm() });
+    ds.busy = false;
+    if (r) ds.ok = `Made ${r.total} examples (${r.kept} kept).`;
+    await dsRefresh(false);
+  });
+  on("save", async () => {
+    ds.busy = true; render();
+    const m = await dsCall("dataset_save");
+    ds.busy = false; ds.ok = m ? `Saved version ${m.version}.` : null;
+    setState(await invoke("get_state"));
+    await dsRefresh(true);
+  });
+  const readFilter = () => { ds.filter = { builder: $("f-builder").value, status: $("f-status").value, search: $("f-search").value }; };
+  on("f-go", () => { readFilter(); dsRefresh(false); });
+  const fs = $("f-search"); if (fs) fs.onkeydown = (e) => { if (e.key === "Enter") { readFilter(); dsRefresh(false); } };
+  ["f-builder", "f-status"].forEach((id) => { const e = $(id); if (e) e.onchange = () => { readFilter(); dsRefresh(false); }; });
+  on("prev", () => { ds.offset = Math.max(0, ds.offset - PAGE); dsRefresh(true); });
+  on("next", () => { ds.offset += PAGE; dsRefresh(true); });
+  on("drop-all", async () => { readFilter(); await dsCall("dataset_set_status_matching", { filter: ds.filter, status: "drop" }); dsRefresh(false); });
+  on("keep-all", async () => { readFilter(); await dsCall("dataset_set_status_matching", { filter: ds.filter, status: "keep" }); dsRefresh(false); });
+  on("canceledit", () => { ds.editing = null; render(); });
+  document.querySelectorAll("[data-show]").forEach((b) => b.onclick = () => { ds.filter = { builder: b.dataset.show, status: "", search: "" }; dsRefresh(false); });
+  document.querySelectorAll("[data-toggle]").forEach((b) => b.onclick = async () => { await dsCall("dataset_set_status", { ids: [b.dataset.toggle], status: b.dataset.to }); dsRefresh(true); });
+  document.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => { ds.editing = b.dataset.edit; render(); });
+  document.querySelectorAll("[data-saveedit]").forEach((b) => b.onclick = async () => {
+    const r = await dsCall("dataset_edit", { id: b.dataset.saveedit, text: $("edit-box").value });
+    if (r !== null || !ds.error) ds.editing = null;
+    dsRefresh(true);
+  });
 }
 
 async function createProject() {
@@ -183,6 +294,7 @@ async function go(key) {
   message = message && message.kind === "err" && key !== "welcome" && key !== "data" ? null : message;
   render();
   if (key === "setup") refreshEnv();
+  if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   $("help").innerHTML = await invoke("help", { key });
   $("help").scrollTop = 0;
 }

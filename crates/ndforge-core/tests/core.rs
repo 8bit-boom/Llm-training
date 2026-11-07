@@ -250,3 +250,34 @@ fn model_flow_matches_the_window() {
     assert_eq!(m.state()["settings"]["show_help_panel"], false);
     assert!(m.set_setting("nope", true).is_err());
 }
+
+#[test]
+fn model_dataset_flow() {
+    use ndforge_core::model::AppModel;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg3"));
+    std::env::set_var("NDFORGE_PROJECTS_DIR", d.path().join("projects3"));
+    let mut m = AppModel::load();
+    assert!(m.dataset_state().unwrap_err().0.contains("Create or open a project"));
+    m.create_project("Ds").unwrap();
+    assert!(m.dataset_generate(json!({})).unwrap_err().0.contains("Import the world data first"));
+    let f = build(d.path(), "1.ndtrain", 1);
+    m.apply_bundle(f.to_str().unwrap()).unwrap();
+    let st = m.dataset_state().unwrap();
+    assert!(st["summary"].is_null() && st["recipe"]["world_book"] == true && st["builders"].as_array().unwrap().len() == 10);
+    // an empty recipe object means "the defaults"; a bad one is a plain error
+    let sum = m.dataset_generate(json!({"phrasings": 1})).unwrap();
+    assert!(sum["total"].as_u64().unwrap() > 10);
+    assert!(m.dataset_generate(json!({"phrasings": "x"})).unwrap_err().0.contains("not valid"));
+    let page = m.dataset_examples(&json!({"builder": "fields"}), 0, 5).unwrap();
+    let id = page["items"][0]["id"].as_str().unwrap().to_string();
+    let sum = m.dataset_set_status(vec![id.clone()], "drop").unwrap();
+    assert_eq!(sum["total"].as_u64().unwrap() - sum["kept"].as_u64().unwrap(), 1);
+    m.dataset_edit(&page["items"][0]["id"].as_str().unwrap().to_string(), "x").unwrap();
+    let all = m.dataset_set_status_matching(&json!({"builder": "lists"}), "drop").unwrap();
+    assert!(all["kept"].as_u64().unwrap() > 0);
+    assert_eq!(m.dataset_save().unwrap()["version"], 1);
+    assert_eq!(m.state()["steps"][1]["done"], true);
+    assert_eq!(m.dataset_state().unwrap()["versions"].as_array().unwrap().len(), 1);
+}

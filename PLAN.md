@@ -239,8 +239,10 @@ content hash. Re-fetching shows a diff (added / changed / removed) and later ste
 claim supported by the source text?* Unsupported examples are dropped or flagged for review. Generation is cached per
 chunk, resumable, and can run overnight.
 
-**Test questions are kept apart:** ~10 % of facts/entities are held out *by fact* (not by rewording) for page 4, so the
-test measures what the model learned, not what it copied.
+**Test questions are kept apart:** ~10 % of the *sources* (entries, rules sections, sessions ...) are held out: their question/answer
+examples go to `test.jsonl` and never into training, while the world book (which contains everything) stays in `train.jsonl`. So the test
+asks about things the model was shown as text but never as a question, which measures what it learned, not what it copied. Because of this,
+training always includes the world book texts (as a plain text-learning part, also in an SFT-only run; decided in M6).
 
 ### 6.4 Teacher model options
 Any OpenAI-compatible endpoint; the GUI offers presets with a Test button:
@@ -420,7 +422,7 @@ test fixture on both sides.
 | **M2** (built; waiting for the full suite before the push) | nd-world Training Bundle download (Python + Rust, parity + Rust-only tests, docs) | nd-world | Export hub downloads a `.ndtrain` from both images; suite green. |
 | **M3** ✅ | Page 1: import `.ndtrain` and legacy World JSON, snapshot + diff, summary | Lore Forge | A real bundle of the chosen world imports with correct counts. |
 | **M4** (built; **the RTX 5090 run is still to be done on the owner's PC**) | Environment manager (Rust) + the Python worker: driver and card check, uv install, GPU self-test, "Training setup" page | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready"; the 5090 trains a tiny model. Built and tested without a GPU: driver/CUDA rules, checklist, install steps (real `uv`, fake `uv` in tests), worker protocol, cancel. Not yet seen: PyTorch's CUDA 12.8 build on the 5090 itself. |
-| **M5** | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review table, save version | Lore Forge | A saved dataset without any teacher model. |
+| **M5** ✅ | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review page, save version | Lore Forge | A saved dataset without any teacher model. Built: markup cleaner (secrets kept and labelled), articles + chunking, 10 deterministic builders, held-out split, draft with Drop/Keep/Edit that survives re-generation, saved versions `datasets/vN/`, the Step 2 page. |
 | **M6** | **PEFT + SFT training on the PC**: worker, Unsloth QLoRA/LoRA, presets, live charts, probes, stop/resume; **VRAM measured for all five models** | Lore Forge | *Quick test* trains each of the five on the 5090; Stop frees VRAM. |
 | **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning; **"Retrain with the new export" button** (§5.4) | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat, and dropping a newer export retrains it in one click. |
 | **M8** | **TrueNAS worker**: image, compose snippet, remote training from the GUI (PEFT) | Lore Forge | A run started on the PC trains on the T10 and the result comes back. |

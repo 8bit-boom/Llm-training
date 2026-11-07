@@ -5,6 +5,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::bundle::open_bundle;
+use crate::dataset::builders::{Recipe, Status, BUILDERS};
+use crate::dataset::store::{self, Filter};
 use crate::error::{Error, Result};
 use crate::paths::default_projects_dir;
 use crate::project::{BundleCheck, Project};
@@ -106,5 +108,58 @@ impl AppModel {
         }
         self.settings.save();
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ step 2: training data
+    fn project_ref(&self) -> Result<&Project> {
+        self.project.as_ref().ok_or_else(|| Error::new("Create or open a project first (Welcome page)."))
+    }
+
+    /// The recipe form, the draft's counts and the saved versions.
+    pub fn dataset_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        let recipe = store::load_recipe(p).unwrap_or_default();
+        let builders: Vec<Value> = BUILDERS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect();
+        Ok(json!({"recipe": recipe, "builders": builders, "summary": store::summary(p)?, "versions": store::versions(p)}))
+    }
+
+    pub fn dataset_generate(&self, recipe: Value) -> Result<Value> {
+        let p = self.project_ref()?;
+        let recipe: Recipe = serde_json::from_value(recipe).map_err(|e| Error::new(format!("The recipe is not valid: {e}")))?;
+        store::generate_draft(p, &recipe)
+    }
+
+    fn filter_from(v: &Value) -> Filter {
+        let text = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
+        Filter {
+            builder: text("builder"), search: text("search"),
+            status: match v["status"].as_str() { Some("keep") => Some(Status::Keep), Some("drop") => Some(Status::Drop), _ => None },
+        }
+    }
+
+    pub fn dataset_examples(&self, filter: &Value, offset: usize, limit: usize) -> Result<Value> {
+        let (total, items) = store::list(self.project_ref()?, &Self::filter_from(filter), offset, limit)?;
+        Ok(json!({"total": total, "items": items}))
+    }
+
+    pub fn dataset_set_status(&self, ids: Vec<String>, status: &str) -> Result<Value> {
+        let p = self.project_ref()?;
+        store::set_status(p, &ids, if status == "drop" { Status::Drop } else { Status::Keep })?;
+        Ok(store::summary(p)?.unwrap_or(Value::Null))
+    }
+
+    /// Every example that matches the filter (for "drop all of this kind").
+    pub fn dataset_set_status_matching(&self, filter: &Value, status: &str) -> Result<Value> {
+        let p = self.project_ref()?;
+        store::set_status_matching(p, &Self::filter_from(filter), if status == "drop" { Status::Drop } else { Status::Keep })?;
+        Ok(store::summary(p)?.unwrap_or(Value::Null))
+    }
+
+    pub fn dataset_edit(&self, id: &str, text: &str) -> Result<()> {
+        store::edit(self.project_ref()?, id, text)
+    }
+
+    pub fn dataset_save(&self) -> Result<Value> {
+        store::save_version(self.project_ref()?)
     }
 }

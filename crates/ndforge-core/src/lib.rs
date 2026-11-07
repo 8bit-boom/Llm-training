@@ -2,6 +2,7 @@
 //! (`settings`) and the instruction texts (`help`). No GUI or GPU code lives here, so it builds and tests anywhere.
 
 pub mod bundle;
+pub mod dataset;
 pub mod diff;
 pub mod envmgr;
 pub mod error;
