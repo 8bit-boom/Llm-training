@@ -263,20 +263,23 @@ recipe, counts, token totals). Training always uses a saved version, so every tr
 ## 7. Training (page 3)
 
 ### 7.1 The five models
-Shown as cards with a "fits your GPU ✓/✗" mark for each training type. Figures are first estimates at 2048 tokens and are
-**measured on the RTX 5090 in milestone M6** before the GUI treats them as facts. Gemma 4 "E" sizes are *effective* parameter
-counts (the real weights are larger), which the estimate accounts for.
+Repos verified on Hugging Face on 2026-11-07 (all exist, none gated, all **Apache-2.0**): `unsloth/Qwen3.5-2B|4B|9B` (official `Qwen/Qwen3.5-…`) and
+`unsloth/gemma-4-E2B-it`, `unsloth/gemma-4-E4B-it` (official `google/gemma-4-E…-it`); catalog in `catalog/models.toml`. Gemma 4's "E" sizes are
+*effective* counts: the checkpoints hold 5.1 B (E2B) and 8.0 B (E4B) parameters. Figures are from Unsloth's guides (bf16 LoRA at about 2048 tokens) and
+are replaced by the peak memory **measured on the owner's PC** once a run has finished.
 
-| Model | Good for | PEFT QLoRA (4-bit) | PEFT LoRA (16-bit) | Full fine-tune |
+| Model | Good for | LoRA 16-bit | QLoRA 4-bit | Full fine-tune |
 |---|---|---|---|---|
-| Qwen3.5 2B | Fast tries | ~5–6 GB | ~8–10 GB | ✓ on 5090 (~20–28 GB) |
-| Gemma 4 E2B | Same family as nd-world's chat model | ~6–8 GB | ~12 GB | ✓ probably on 5090; measured in M9 |
-| Qwen3.5 4B | Good balance | ~8–9 GB | ~14–16 GB | borderline on 5090 (8-bit optimizer, short context); measured in M9 |
-| Gemma 4 E4B | Good balance, Gemma family | ~9–11 GB | ~18–20 GB | ✗ too big for 32 GB (offered only on a bigger card) |
-| Qwen3.5 9B | Best quality of the five | ~12–14 GB | ~24–28 GB (✓ on 5090, shorter context) | ✗ |
+| Qwen3.5 2B | Fast tries | ~5 GB | ~3.5 GB (est.) | planned (M9), ~4× LoRA |
+| Gemma 4 E2B | Same family as nd-world's chat model | 8–10 GB | ~8 GB | planned (M9) |
+| Qwen3.5 4B | Good balance | ~10 GB | ~6.5 GB (est.) | planned (M9), borderline on 32 GB |
+| Gemma 4 E4B | Good balance, Gemma family | ~17 GB | ~10 GB | too big for 32 GB |
+| Qwen3.5 9B | Best quality of the five | ~22 GB (fits the 5090) | ~12 GB (est.) | too big for 32 GB |
 
-The exact Hugging Face repos live in `catalog/models.toml`, checked against the hub when implementation starts. Qwen3.5's
-"thinking" mode is trained **off** by default, with an expert option to keep it.
+Findings from the vendor's guides that shape the defaults: **Unsloth advises against 4-bit QLoRA for Qwen3.5** (higher-than-normal quantisation loss), so
+16-bit LoRA is the default wherever it fits (everything fits the 5090); QLoRA remains the choice for 16 GB cards and for Gemma 4 E4B when memory is short.
+Qwen3.5 needs `transformers` v5. A Gemma 4 E2B/E4B training loss of **13–15 is normal** (multimodal quirk): the window says so. Thinking mode is trained
+**off**: the prompt is built from each model's own chat template with thinking disabled, and the loss covers the answer and the end-of-turn marker only.
 
 ### 7.2 Training types: Full, PEFT and SFT
 Page 3 starts with a plain-language choice. **Full and PEFT say *which weights change*; SFT says *what the model is taught
@@ -423,7 +426,7 @@ test fixture on both sides.
 | **M3** ✅ | Page 1: import `.ndtrain` and legacy World JSON, snapshot + diff, summary | Lore Forge | A real bundle of the chosen world imports with correct counts. |
 | **M4** (built; **the RTX 5090 run is still to be done on the owner's PC**) | Environment manager (Rust) + the Python worker: driver and card check, uv install, GPU self-test, "Training setup" page | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready"; the 5090 trains a tiny model. Built and tested without a GPU: driver/CUDA rules, checklist, install steps (real `uv`, fake `uv` in tests), worker protocol, cancel. Not yet seen: PyTorch's CUDA 12.8 build on the 5090 itself. |
 | **M5** ✅ | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review page, save version | Lore Forge | A saved dataset without any teacher model. Built: markup cleaner (secrets kept and labelled), articles + chunking, 10 deterministic builders, held-out split, draft with Drop/Keep/Edit that survives re-generation, saved versions `datasets/vN/`, the Step 2 page. |
-| **M6** | **PEFT + SFT training on the PC**: worker, Unsloth QLoRA/LoRA, presets, live charts, probes, stop/resume; **VRAM measured for all five models** | Lore Forge | *Quick test* trains each of the five on the 5090; Stop frees VRAM. |
+| **M6** (built; **not yet run on a GPU**) | **PEFT + SFT training on the PC**: Rust catalog/presets/memory plan/runs + Python worker (Unsloth, with a Transformers + PEFT + TRL fallback), live charts, sample answers, graceful stop and resume, measured VRAM | Lore Forge | *Quick test* trains each of the five on the 5090; Stop frees VRAM. Built and tested without a GPU: the whole worker on a CPU with tiny random models of the real Qwen3.5 and Gemma 4 architectures and their real chat templates (data masking, LoRA, metrics, samples, checkpoints, resume, errors), the Rust run manager with a fake worker (stop, kill, failure), the plan for the 5090 and a 16 GB card. **Not verified:** the Unsloth code path itself, real model downloads, real speed and memory. |
 | **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning; **"Retrain with the new export" button** (§5.4) | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat, and dropping a newer export retrains it in one click. |
 | **M8** | **TrueNAS worker**: image, compose snippet, remote training from the GUI (PEFT) | Lore Forge | A run started on the PC trains on the T10 and the result comes back. |
 | **M9** | **Full fine-tune** type + "Read the world book" stage; memory estimates measured; type-choice cards in the GUI | Lore Forge | Full + SFT runs on the small models that fit the 5090; unsuitable combinations are greyed out with reasons. |

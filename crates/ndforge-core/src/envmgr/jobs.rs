@@ -14,6 +14,8 @@ use crate::error::{Error, Result};
 pub enum WorkerEvent {
     Log(String),
     Progress { step: String, value: f64, text: String },
+    /// any other event the worker sends (start, metric, sample ...), as it came
+    Other(Value),
 }
 
 /// Runs `job` and returns the worker's result data. A worker error becomes `Err` with the worker's plain-language message.
@@ -40,7 +42,8 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
                 }),
                 Some("result") => result = Some(v["data"].clone()),
                 Some("error") => failure = Some(v["message"].as_str().unwrap_or("The worker reported an error.").to_string()),
-                _ => on_event(WorkerEvent::Log(line.to_string())),
+                Some(_) => on_event(WorkerEvent::Other(v.clone())),
+                None => on_event(WorkerEvent::Log(line.to_string())),
             },
             Err(_) => on_event(WorkerEvent::Log(line.to_string())),
         }

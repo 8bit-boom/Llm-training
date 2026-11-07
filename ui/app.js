@@ -5,7 +5,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
-  train: ["Step 3 · Train", "Teaches the model your world."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   use: ["Step 5 · Use in nd-world", "Makes the model usable in nd-world."],
 };
@@ -151,6 +150,130 @@ async function dsRefresh(keepPage) {
   if (page === "dataset") render();
 }
 
+// ------------------------------------------------------------------------------------------------ step 3: train
+let tr = { state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
+
+function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
+
+function lossChart(points) {
+  if (points.length < 2) return `<div class="dim">The loss chart appears after the first steps.</div>`;
+  const W = 560, H = 190, P = 30;
+  const xs = points.map((p) => p.step), ys = points.map((p) => p.loss);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = (x) => P + (x1 === x0 ? 0 : ((x - x0) / (x1 - x0)) * (W - P - 8));
+  const sy = (y) => H - P - (y1 === y0 ? 0.5 : (y - y0) / (y1 - y0)) * (H - P - 10);
+  const d = points.map((p, i) => `${i ? "L" : "M"}${sx(p.step).toFixed(1)},${sy(p.loss).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Training loss"><path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <line x1="${P}" y1="${H - P}" x2="${W - 8}" y2="${H - P}" stroke="var(--line)"/><line x1="${P}" y1="8" x2="${P}" y2="${H - P}" stroke="var(--line)"/>
+    <text x="${P + 4}" y="18" class="axis">${y1.toFixed(2)}</text><text x="${P + 4}" y="${H - P - 4}" class="axis">${y0.toFixed(2)}</text>
+    <text x="${P}" y="${H - 8}" class="axis">step ${x0}</text><text x="${W - 60}" y="${H - 8}" class="axis">step ${x1}</text></svg>`;
+}
+
+function samplesHtml() {
+  const byQ = {};
+  tr.samples.forEach((s) => (byQ[s.question] = byQ[s.question] || []).push(s));
+  const qs = Object.keys(byQ);
+  if (!qs.length) return "";
+  return `<h3>Sample answers</h3>` + qs.map((q) => {
+    const list = byQ[q], first = list[0], last = list[list.length - 1];
+    return `<div class="sample"><div class="q">${esc(q)}</div><div class="cols"><div><span class="tag">before training</span><div class="ans">${esc(first.answer) || "<em>(empty)</em>"}</div></div>
+      ${list.length > 1 ? `<div><span class="tag">now (step ${last.step})</span><div class="ans">${esc(last.answer) || "<em>(empty)</em>"}</div></div>` : ""}</div></div>`;
+  }).join("");
+}
+
+function renderTrain() {
+  if (!state.bundle) return `<h1>Step 3 · Train</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = tr.state;
+  if (!st) return `<h1>Step 3 · Train</h1><p class="lead">Loading…</p>`;
+  if (!st.version) return `<h1>Step 3 · Train</h1><p class="lead">Save a version of the training data first (Step 2).</p>`;
+  const v = st.version;
+  const gpu = st.gpu ? `${esc(st.gpu.name)} · ${st.gpu.vram_gb} GB · ${esc(st.gpu.precision)}` : esc(st.gpu_problem || "no graphics card found");
+  const cards = st.models.map((c) => {
+    const m = c.model, f = c[tr.method], fit = FIT[f.fit] || FIT.unknown;
+    return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}</strong>${c.recommended === tr.method ? "" : ""}
+      <span class="dim">${m.params_b.toFixed(1)} B parameters · ${esc(m.license)}</span><span>${fit[0]} ${fit[1]} · ≈ ${f.measured != null ? f.measured + " GB measured" : f.est_vram_gb + " GB"}</span><span class="dim">${esc(m.good_for)}</span></button>`;
+  }).join("");
+  const pl = tr.plan;
+  const sel = st.models.find((c) => c.model.id === tr.model);
+  const exp = state.settings.expert_mode && pl ? `<div class="card wide"><h2>Settings (Expert)</h2><div class="grid">${[
+    ["rank", "LoRA rank", pl.hyper.rank], ["lr", "Learning rate", pl.hyper.lr], ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
+    ["batch", "Batch size", pl.hyper.batch], ["grad_accum", "Gradient accumulation", pl.hyper.grad_accum], ["max_seq", "Sequence length (tokens)", pl.hyper.max_seq]].map(([k, l, val]) =>
+      `<label>${l}<input type="text" class="ov" data-key="${k}" value="${tr.over[k] ?? val}"></label>`).join("")}</div></div>` : "";
+  const planHtml = pl ? `<div class="card wide"><h2>The plan</h2><p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
+    ${pl.notes.length ? `<ul>${pl.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>` : "";
+  const last = st.runs[0];
+  const canResume = last && (last.status === "stopped" || last.status === "failed") && !tr.running;
+  const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || !st.env_ready ? "disabled" : ""}>Start training</button>
+    <button class="secondary" id="tr-stop" ${tr.running ? "" : "disabled"}>Stop</button>
+    ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)})</button>` : ""}</div>`;
+  const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
+  const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
+    ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
+    ${tr.error ? `<div class="err">${esc(tr.error)}</div>` : ""}${tr.notice ? `<div class="ok">${esc(tr.notice)}</div>` : ""}
+    ${(() => { const m = tr.metrics.at(-1); return m ? `<div class="stats"><span>Step <strong>${m.step}/${m.total_steps}</strong></span><span>Loss <strong>${(+m.loss).toFixed(3)}</strong></span><span>Memory peak <strong>${m.vram_mb ? (m.vram_mb / 1024).toFixed(1) + " GB" : "–"}</strong></span><span>GPU <strong>${m.gpu_temp != null ? m.gpu_temp + " °C" : "–"}</strong></span><span>Time left <strong>${fmtEta(m.eta_s)}</strong></span></div>` : ""; })()}
+    ${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
+    ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
+  const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th></th></tr>${st.runs.map((r) =>
+    `<tr><td>${esc(r.name)}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
+  return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
+    <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${env}
+    <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>
+    <div class="card wide"><h2>2 · How to train</h2><div class="row"><label>Type <select id="tr-method"><option value="lora" ${tr.method === "lora" ? "selected" : ""}>LoRA, 16-bit (recommended)</option><option value="qlora" ${tr.method === "qlora" ? "selected" : ""}>QLoRA, 4-bit (needs less memory)</option></select></label>
+      <label>Preset <select id="tr-preset"><option value="quick" ${tr.preset === "quick" ? "selected" : ""}>Quick test (minutes)</option><option value="normal" ${tr.preset === "normal" ? "selected" : ""}>Normal</option><option value="best" ${tr.preset === "best" ? "selected" : ""}>Best quality (slower)</option></select></label></div>
+      <p class="dim">Full fine-tuning (changing every weight) comes in a later version.</p></div>
+    ${planHtml}${exp}<div class="card wide"><h2>3 · Train</h2>${ctrl}</div>${live}${runs}`;
+}
+
+async function trRefresh() {
+  try {
+    tr.state = await invoke("train_state");
+    if (!tr.model && tr.state.models.length) {
+      const first = tr.state.models.find((c) => c.lora.fit === "yes" || c.lora.fit === "tight") || tr.state.models[0];
+      tr.model = tr.state.models.find((c) => c.model.id === "qwen3.5-4b")?.model.id ?? first.model.id;
+      tr.method = (tr.state.models.find((c) => c.model.id === tr.model) || first).recommended;
+    }
+    if (tr.model) tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset });
+  } catch (e) { tr.error = String(e); }
+  if (page === "train") render();
+}
+
+function onTrainEvent(p) {
+  if (p.kind === "metric") { tr.metrics.push(p); tr.progress = p.step / Math.max(1, p.total_steps); tr.stepText = `Step ${p.step} of ${p.total_steps}`; }
+  else if (p.kind === "sample") tr.samples.push(p);
+  else if (p.kind === "progress") { if (p.step !== "train" || tr.progress == null) { tr.stepText = p.text || p.step; tr.progress = p.value; } }
+  else if (p.kind === "log") tr.log.push(p.text);
+  else if (p.kind === "done") { tr.running = false; tr.notice = p.data.stopped ? `Stopped at step ${p.data.steps}. You can continue this run later.` : `Finished: ${p.data.steps} steps, final loss ${p.data.final_loss != null ? (+p.data.final_loss).toFixed(3) : "–"}.`; trRefresh(); }
+  else if (p.kind === "error") { tr.running = false; tr.error = p.text; trRefresh(); }
+  if (page === "train") { render(); const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight; }
+}
+
+async function trStart(resume) {
+  tr.metrics = []; tr.samples = []; tr.log = []; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
+  const over = {};
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = k === "lr" || k === "epochs" ? Number(v) : Number(v); });
+  try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null }); }
+  catch (e) { tr.running = false; tr.error = String(e); render(); }
+}
+
+function wireTrain() {
+  if (page !== "train" || !tr.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  document.querySelectorAll("[data-model]").forEach((b) => b.onclick = () => { tr.model = b.dataset.model; tr.over = {}; trRefresh(); });
+  const m = $("tr-method"); if (m) m.onchange = () => { tr.method = m.value; tr.over = {}; trRefresh(); };
+  const pr = $("tr-preset"); if (pr) pr.onchange = () => { tr.preset = pr.value; tr.over = {}; trRefresh(); };
+  document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
+  on("tr-start", () => trStart(null));
+  on("tr-resume", () => trStart($("tr-resume").dataset.run));
+  on("tr-stop", () => { tr.stepText = "Stopping after this step…"; invoke("train_stop"); render(); });
+  document.querySelectorAll("[data-showrun]").forEach((b) => b.onclick = async () => {
+    const ev = await invoke("train_metrics", { run: b.dataset.showrun });
+    tr.metrics = ev.filter((e) => e.type === "metric").map((e) => ({ ...e, kind: "metric" }));
+    tr.samples = ev.filter((e) => e.type === "sample");
+    tr.notice = `Run ${b.dataset.showrun}`; tr.error = null; tr.progress = null; tr.stepText = ""; render();
+  });
+}
+
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
 function renderSetup() {
@@ -203,7 +326,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -226,6 +349,7 @@ function wire() {
     if (f) checkFile(f);
   });
   wireDataset();
+  wireTrain();
   on("recheck", refreshEnv);
   on("install", () => startEnv("env_install"));
   on("selftest", () => startEnv("env_selftest"));
@@ -304,6 +428,7 @@ async function go(key) {
   render();
   if (key === "setup") refreshEnv();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
+  if (key === "train" && state.bundle) trRefresh();
   $("help").innerHTML = await invoke("help", { key });
   $("help").scrollTop = 0;
 }
@@ -321,6 +446,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   go("welcome");
 }

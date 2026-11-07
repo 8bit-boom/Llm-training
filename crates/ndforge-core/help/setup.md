@@ -1,7 +1,7 @@
 # Training setup
 
 ## What this page does
-Gets this computer ready to train: it checks your NVIDIA graphics card and the driver, installs the training software (a Python environment with PyTorch), and tests that the card can really train.
+Gets this computer ready to train: it checks your NVIDIA graphics card and the driver, installs the training software (a Python environment with PyTorch and Unsloth), and tests that the card can really train.
 
 ## What you need before you start
 - An NVIDIA graphics card (your **RTX 5090** is ideal; 8 GB of memory is the minimum, 16 GB or more is comfortable).
@@ -12,7 +12,7 @@ Gets this computer ready to train: it checks your NVIDIA graphics card and the d
 
 ## What to do
 1. Look at the list on the left. Every line should be **green**; yellow is fine, **red** must be fixed first (the line says how).
-2. Press **Install the training software**. It downloads several GB, one time. You can watch the log and **Cancel** any time.
+2. Press **Install the training software**. It downloads several GB, one time (PyTorch, then Unsloth and the training libraries). If Unsloth cannot be installed on your computer, the plain libraries are installed instead; training still works, only slower and with more graphics memory. You can watch the log and **Cancel** any time.
 3. Press **Test the graphics card**. The card trains a tiny model for about 30 seconds.
 4. When all lines are green, you are ready for Step 3 · Train.
 

@@ -10,6 +10,9 @@ use crate::dataset::store::{self, Filter};
 use crate::error::{Error, Result};
 use crate::paths::default_projects_dir;
 use crate::project::{BundleCheck, Project};
+use crate::train::catalog::{find, models, ModelEntry};
+use crate::train::plan::{plan, recommended_method, Hyper, Method, Preset};
+use crate::train::runs;
 use crate::settings::Settings;
 
 /// (key, sidebar label)
@@ -172,4 +175,94 @@ impl AppModel {
     pub fn dataset_save(&self) -> Result<Value> {
         store::save_version(self.project_ref()?)
     }
+
+    // ------------------------------------------------------------------ step 3: training
+    /// Everything the Train page shows: the five models with fit marks for this card, the newest saved data version, the runs.
+    pub fn train_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        let gpus = crate::envmgr::gpu::detect_gpus();
+        let gpu = gpus.as_ref().ok().and_then(|g| g.first().cloned());
+        let vram = gpu.as_ref().map(|g| g.vram_gb());
+        let version = runs::latest_version(p);
+        let stats = version.as_ref().map(|(_, m)| runs::data_stats(m)).unwrap_or_default();
+        let cards: Vec<Value> = models().iter().map(|m| {
+            let one = |method: Method| {
+                let pl = plan(m, method, Preset::Normal, vram, stats, runs::load_measured(&m.id, method));
+                json!({"est_vram_gb": pl.est_vram_gb, "fit": pl.fit, "measured": runs::load_measured(&m.id, method).map(|(gb, ..)| gb)})
+            };
+            json!({"model": m, "lora": one(Method::Lora), "qlora": one(Method::Qlora), "recommended": recommended_method(m, vram)})
+        }).collect();
+        Ok(json!({
+            "models": cards,
+            "gpu": gpu.as_ref().map(|g| json!({"name": g.name, "vram_gb": (g.vram_gb() * 10.0).round() / 10.0, "precision": g.precision()})),
+            "gpu_problem": gpus.err(),
+            "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "version": version.map(|(n, m)| json!({"number": n, "counts": m["counts"], "tokens": m["tokens"], "created": m["created"]})),
+            "runs": runs::list_runs(p),
+        }))
+    }
+
+    fn hyper_with(base: Hyper, overrides: &Value) -> Result<Hyper> {
+        let mut v = serde_json::to_value(&base)?;
+        if let Some(o) = overrides.as_object() {
+            for (k, x) in o.iter().filter(|(_, x)| !x.is_null()) {
+                if v.get(k).is_none() {
+                    return Err(Error::new(format!("Unknown setting: {k}")));
+                }
+                v[k] = x.clone();
+            }
+        }
+        let h: Hyper = serde_json::from_value(v).map_err(|e| Error::new(format!("A setting is not valid: {e}")))?;
+        let bad = |what: &str| Err(Error::new(format!("{what} is out of range.")));
+        if !(1..=256).contains(&h.rank) { return bad("The LoRA rank"); }
+        if !(h.lr > 0.0 && h.lr <= 0.01) { return bad("The learning rate"); }
+        if !(h.epochs > 0.0 && h.epochs <= 20.0) { return bad("The number of epochs"); }
+        if !(1..=64).contains(&h.batch) || !(1..=512).contains(&h.grad_accum) { return bad("The batch size"); }
+        if !(256..=32768).contains(&h.max_seq) { return bad("The sequence length"); }
+        Ok(h)
+    }
+
+    pub fn train_plan(&self, model_id: &str, method: Method, preset: Preset) -> Result<Value> {
+        let p = self.project_ref()?;
+        let m = find(model_id).ok_or_else(|| Error::new("Unknown model."))?;
+        let vram = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb()));
+        let stats = runs::latest_version(p).map(|(_, mf)| runs::data_stats(&mf)).unwrap_or_default();
+        Ok(serde_json::to_value(plan(&m, method, preset, vram, stats, runs::load_measured(&m.id, method)))?)
+    }
+
+    /// Everything needed to start (or continue) a run: the project, the model, the settings and the job for the worker.
+    pub fn train_job(&self, model_id: &str, method: Method, preset: Preset, overrides: &Value, resume: Option<&str>) -> Result<TrainJob> {
+        let p = self.project_ref()?.clone();
+        if let Some(name) = resume {
+            let cfg: Value = std::fs::read(runs::runs_dir(&p).join(name).join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| Error::new("That run cannot be continued (its settings are missing)."))?;
+            let m = find(cfg["model"]["repo"].as_str().and_then(|r| models().into_iter().find(|m| m.repo == r)).map(|m| m.id).as_deref().unwrap_or("")).ok_or_else(|| Error::new("The model of that run is no longer in the catalog."))?;
+            let hyper: Hyper = serde_json::from_value(cfg["hyper"].clone()).map_err(|_| Error::new("The settings of that run are damaged."))?;
+            let method: Method = serde_json::from_value(cfg["method"].clone()).unwrap_or(Method::Lora);
+            let mut job = cfg;
+            job["resume"] = json!(true);
+            return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job });
+        }
+        let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
+        let (version, manifest) = runs::latest_version(&p).ok_or_else(|| Error::new("Save a version of the training data first (Step 2)."))?;
+        let vram = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb()));
+        let pl = plan(&m, method, preset, vram, runs::data_stats(&manifest), runs::load_measured(&m.id, method));
+        let hyper = Self::hyper_with(pl.hyper, overrides)?;
+        let name = runs::run_name(&m.id);
+        let job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job })
+    }
+
+    pub fn train_metrics(&self, run: &str) -> Result<Value> {
+        Ok(Value::Array(runs::read_metrics(self.project_ref()?, run)))
+    }
+}
+
+/// A run ready to start.
+pub struct TrainJob {
+    pub project: Project,
+    pub model: ModelEntry,
+    pub method: Method,
+    pub hyper: Hyper,
+    pub name: String,
+    pub job: Value,
 }

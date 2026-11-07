@@ -5,6 +5,18 @@ import sys
 from . import __version__, protocol
 
 
+def _explain(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    if "out of memory" in low:
+        return "The graphics card ran out of memory. Use a smaller sequence length, LoRA 4-bit (QLoRA), or a smaller model. (" + text[:200] + ")"
+    if "no module named" in low:
+        return "A training library is missing in the training software. Run the training setup again. (" + text[:200] + ")"
+    if "401" in low or "gated" in low or "repository not found" in low:
+        return "The model could not be downloaded from Hugging Face. Check the internet connection (and the model name). (" + text[:200] + ")"
+    return text[:600]
+
+
 def main(argv: list) -> int:
     if len(argv) != 2:
         protocol.error("usage", "Usage: python -m ndforge_worker <job.json>")
@@ -22,6 +34,15 @@ def main(argv: list) -> int:
     if kind == "selftest":
         from . import selftest
         return selftest.run(job)
+    if kind == "train":
+        from . import trainjob
+        try:
+            return trainjob.run(job)
+        except Exception as exc:  # turn any failure into a plain error for the window (the traceback goes to the log)
+            import traceback
+            traceback.print_exc()
+            protocol.error("train_failed", _explain(exc))
+            return 1
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1
 

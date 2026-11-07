@@ -9,10 +9,18 @@ Exit status: 0 after a result, 1 after an error."""
 import json
 import sys
 
+# the protocol goes to the REAL stdout; libraries that print (the Trainer's log dicts ...) are moved to stderr by `reserve_stdout`
+_out = sys.stdout
+
+
+def reserve_stdout() -> None:
+    """From now on `print` and library output go to stderr (shown in the log); only protocol lines use stdout."""
+    sys.stdout = sys.stderr
+
 
 def emit(kind: str, **fields) -> None:
-    sys.stdout.write(json.dumps({"type": kind, **fields}, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    _out.write(json.dumps({"type": kind, **fields}, ensure_ascii=False) + "\n")
+    _out.flush()
 
 
 def log(text: str) -> None:

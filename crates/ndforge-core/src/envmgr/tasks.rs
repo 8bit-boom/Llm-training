@@ -36,7 +36,7 @@ pub fn install(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<(
     let wheel = cuda_wheel_for(&gpu).map_err(Error::new)?;
     let plan = SetupPlan {
         env_dir: env_dir(), uv: find_uv().ok_or_else(|| Error::new("uv was not found."))?, worker_dir: worker_dir(),
-        wheel: wheel.to_string(), python_version: "3.12".to_string(),
+        wheel: wheel.to_string(), python_version: "3.13".to_string(),
     };
     run_setup(&plan, cancel, &mut |e| on_event(match e {
         Event::Step { index, total, text } => json!({"kind": "step", "index": index, "total": total, "text": text}),
@@ -55,6 +55,7 @@ pub fn selftest(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<
     let data = run_job(&py, &worker_dir(), &json!({"job": "selftest"}), cancel, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
+        WorkerEvent::Other(v) => v,
     }))?;
     std::fs::write(env.join("selftest.json"), serde_json::to_vec_pretty(&data)?)?;
     Ok(data)

@@ -1,0 +1,69 @@
+# The five models ND Lore Forge trains. Repos checked on Hugging Face (2026-11-07): all exist, are not gated and are Apache-2.0.
+# vram_*: GB for training at about 2048 tokens, from Unsloth's guides (bf16 LoRA: Qwen3.5 2B 5 / 4B 10 / 9B 22; Gemma 4 E2B 8-10, E4B 17 / 10 with 4-bit);
+# values marked "estimate" are ours. The window shows the peak memory MEASURED on this PC once a run has finished, and prefers it.
+# params_b = parameters in the checkpoint (Gemma 4 "E" sizes count their per-layer embeddings, so E2B is 5.1B and E4B 8.0B on disk).
+
+[[model]]
+id = "qwen3.5-2b"
+name = "Qwen3.5 2B"
+family = "qwen3_5"
+repo = "unsloth/Qwen3.5-2B"
+official = "Qwen/Qwen3.5-2B"
+params_b = 2.27
+license = "Apache-2.0"
+vram_lora_gb = 5.0
+vram_qlora_gb = 3.5      # estimate
+good_for = "Fast first tries and weaker graphics cards."
+note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual."
+
+[[model]]
+id = "qwen3.5-4b"
+name = "Qwen3.5 4B"
+family = "qwen3_5"
+repo = "unsloth/Qwen3.5-4B"
+official = "Qwen/Qwen3.5-4B"
+params_b = 4.66
+license = "Apache-2.0"
+vram_lora_gb = 10.0
+vram_qlora_gb = 6.5      # estimate
+good_for = "A good balance of quality and speed."
+note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual."
+
+[[model]]
+id = "qwen3.5-9b"
+name = "Qwen3.5 9B"
+family = "qwen3_5"
+repo = "unsloth/Qwen3.5-9B"
+official = "Qwen/Qwen3.5-9B"
+params_b = 9.65
+license = "Apache-2.0"
+vram_lora_gb = 22.0
+vram_qlora_gb = 12.0     # estimate
+good_for = "The best quality of the five."
+note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual. 16-bit LoRA fits a 32 GB card."
+
+[[model]]
+id = "gemma4-e2b"
+name = "Gemma 4 E2B"
+family = "gemma4"
+repo = "unsloth/gemma-4-E2B-it"
+official = "google/gemma-4-E2B-it"
+params_b = 5.12
+license = "Apache-2.0"
+vram_lora_gb = 10.0
+vram_qlora_gb = 8.0
+good_for = "Same family as nd-world's chat model; small and quick."
+note = "A training loss of 13-15 is normal for Gemma 4 E2B/E4B (a quirk of multimodal models), not a problem."
+
+[[model]]
+id = "gemma4-e4b"
+name = "Gemma 4 E4B"
+family = "gemma4"
+repo = "unsloth/gemma-4-E4B-it"
+official = "google/gemma-4-E4B-it"
+params_b = 8.0
+license = "Apache-2.0"
+vram_lora_gb = 17.0
+vram_qlora_gb = 10.0
+good_for = "A good balance, Gemma family. Unsloth suggests E4B with 4-bit over E2B with 16-bit when memory is short."
+note = "A training loss of 13-15 is normal for Gemma 4 E2B/E4B (a quirk of multimodal models), not a problem."

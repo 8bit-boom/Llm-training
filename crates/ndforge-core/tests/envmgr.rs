@@ -143,13 +143,14 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let uv = d.path().join("uv");
     std::fs::write(&uv, format!("#!/bin/sh\necho \"$@\" >> {}\necho \"running $1\"\nif [ \"$FAIL_AT\" = \"$2\" ]; then exit 2; fi\nexit 0\n", log.display())).unwrap();
     std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let plan = SetupPlan { env_dir: d.path().join("env"), uv: uv.clone(), worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.12".into() };
+    let plan = SetupPlan { env_dir: d.path().join("env"), uv: uv.clone(), worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.13".into() };
     let mut events = Vec::new();
     run_setup(&plan, &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
     let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
-    assert_eq!(lines.len(), 3);
-    assert!(lines[0].starts_with("venv --python 3.12 --seed") && lines[1].contains("https://download.pytorch.org/whl/cu128") && lines[1].contains("torch") && lines[2].contains("worker"));
-    assert_eq!(events.iter().filter(|e| matches!(e, Event::Step { .. })).count(), 3);
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].starts_with("venv --python 3.13 --seed") && lines[1].contains("https://download.pytorch.org/whl/cu128") && lines[1].contains("torch") && lines[2].contains("unsloth") && lines[3].contains("worker"));
+    assert_eq!(events.iter().filter(|e| matches!(e, Event::Step { .. })).count(), 4);
+    assert!(std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": true"));
     assert!(events.contains(&Event::Log("running pip".into())));
     assert!(plan.env_dir.join("ndforge_env.json").is_file());
     // a failing step stops the install with a readable message and no marker
@@ -158,4 +159,16 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let e = run_setup(&plan2, &AtomicBool::new(false), &mut |_| {}).unwrap_err();
     assert!(e.0.contains("failed") && e.0.contains("exit code 2"), "{e}");
     assert!(!plan2.env_dir.join("ndforge_env.json").exists());
+
+    // Unsloth cannot be installed: the plain libraries are installed instead and the install still succeeds
+    let log2 = d.path().join("uv2.log");
+    std::fs::write(&uv, format!("#!/bin/sh\necho \"$@\" >> {}\ncase \"$*\" in *unsloth*) exit 3;; esac\nexit 0\n", log2.display())).unwrap();
+    let plan3 = SetupPlan { env_dir: d.path().join("env3"), ..plan.clone() };
+    let mut ev3 = Vec::new();
+    run_setup(&plan3, &AtomicBool::new(false), &mut |e| ev3.push(e)).unwrap();
+    let lines3: Vec<String> = std::fs::read_to_string(&log2).unwrap().lines().map(String::from).collect();
+    assert_eq!(lines3.len(), 5);
+    assert!(lines3[3].contains("transformers") && lines3[3].contains("peft") && lines3[3].contains("bitsandbytes") && lines3[4].contains("worker"));
+    assert!(ev3.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth could not be installed"))));
+    assert!(std::fs::read_to_string(plan3.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": false"));
 }

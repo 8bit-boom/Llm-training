@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ndforge_core::help::help_html;
 use ndforge_core::model::AppModel;
+use ndforge_core::train::plan::{Method, Preset};
 use serde_json::Value;
 use tauri::{Emitter, State};
 
@@ -105,6 +106,57 @@ fn set_theme(s: State<App>, theme: String) -> Out<Value> {
 }
 
 #[tauri::command]
+fn train_state(s: State<App>) -> Out<Value> {
+    lock(&s).train_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn train_plan(s: State<App>, model: String, method: String, preset: String) -> Out<Value> {
+    let (method, preset) = parse_choice(&method, &preset)?;
+    lock(&s).train_plan(&model, method, preset).map_err(|e| e.to_string())
+}
+
+fn parse_choice(method: &str, preset: &str) -> Out<(Method, Preset)> {
+    let method = match method { "lora" => Method::Lora, "qlora" => Method::Qlora, other => return Err(format!("Unknown method: {other}")) };
+    let preset = match preset { "quick" => Preset::Quick, "normal" => Preset::Normal, "best" => Preset::Best, other => return Err(format!("Unknown preset: {other}")) };
+    Ok((method, preset))
+}
+
+/// Starts a training run (or continues `resume`); progress goes to the window as "train-event" events.
+#[tauri::command]
+fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, method: String, preset: String, overrides: Value, resume: Option<String>) -> Out<String> {
+    let (method, preset) = parse_choice(&method, &preset)?;
+    let job = lock(&s).train_job(&model, method, preset, &overrides, resume.as_deref()).map_err(|e| e.to_string())?;
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, stop, name) = (tasks.busy.clone(), tasks.cancel.clone(), job.name.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
+        let r = ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job, stop, std::time::Duration::from_secs(120), &mut emit);
+        busy.store(false, Ordering::SeqCst);
+        let end = match r {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
+            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
+        };
+        let _ = app.emit("train-event", end);
+    });
+    Ok(name)
+}
+
+#[tauri::command]
+fn train_stop(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn train_metrics(s: State<App>, run: String) -> Out<Value> {
+    lock(&s).train_metrics(&run).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn help(key: String) -> String {
     help_html(&key)
 }
@@ -156,7 +208,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -10,6 +10,7 @@ pub mod help;
 pub mod model;
 pub mod paths;
 pub mod project;
+pub mod train;
 pub mod sample;
 pub mod settings;
 

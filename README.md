@@ -15,7 +15,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M2 nd-world "Training bundle" download | built in the nd-world repo; waiting for its full test suite |
 | M4 Training setup: GPU/driver checks, uv install, Python worker, GPU self-test | built; needs a run on a real NVIDIA PC (the RTX 5090) |
 | M5 Step 2: make training data (world book + simple facts), review, save versions | done |
-| M6 onward (training, export ...) | not started |
+| M6 Step 3: PEFT + SFT training (Unsloth), live charts, stop/resume | built; needs a first run on the RTX 5090 |
+| M7 onward (export, TrueNAS, full fine-tune ...) | not started |
 
 ## Build and run
 
@@ -45,3 +46,14 @@ characters, GM secrets). No AI model is used: the same world and recipe always g
 (`[gmonly]`, `[for=]`, `[reveal=]`, `:::gm`) are kept but labelled, e.g. `(GM secret: ...)`. The draft (`datasets/draft/`) keeps your Drop / Keep /
 Edit decisions when it is made again; **Save this version** freezes `datasets/vN/{train,test}.jsonl` + `manifest.json`.
 Code: `crates/ndforge-core/src/dataset/` (`markup`, `docs`, `chunk`, `builders`, `split`, `store`).
+
+## Training (M6)
+
+Step 3 trains a model with **LoRA** (16-bit by default; 4-bit QLoRA when memory is short) on the newest saved data version. `catalog/models.toml` lists the
+five models (repos checked on Hugging Face). The Rust program plans the run (`train/plan.rs`: presets Quick / Normal / Best, memory estimate, lowers batch and
+sequence length to fit, replaces the estimate with the peak measured on this PC) and starts the Python worker (`worker/ndforge_worker/trainjob.py`), which
+reports JSON lines: `start`, `metric` (loss, learning rate, memory, GPU temperature, time left), `sample` (answers to fixed questions before/during/after
+training), `progress`, `log`, `result`. **Stop** writes a STOP file; the worker saves a checkpoint after the current step and exits (killed after 2 minutes
+otherwise); **Continue** resumes from the last checkpoint. Each run lives in `runs/<name>/` (`config.json`, `state.json`, `metrics.jsonl`, `checkpoints/`, `adapter/`).
+
+Worker tests (CPU, tiny random models, no downloads): `pip install torch transformers trl peft datasets pytest && cd worker && python -m pytest tests`.
