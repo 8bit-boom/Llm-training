@@ -1,0 +1,18 @@
+[package]
+name = "ndforge-core"
+version.workspace = true
+edition.workspace = true
+description = "ND Lore Forge core: training bundles, projects, settings, help (no GUI dependencies)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+toml = "0.8"
+dirs = "5"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,7 +1,8 @@
 # ND Lore Forge
 
 A Windows/Linux desktop program (GUI) that fine-tunes small LLMs (Qwen3.5 2B/4B/9B, Gemma 4 E2B/E4B) on the lore, rules and
-mechanics of one nd-world world. The plan is in [PLAN.md](PLAN.md); the file format shared with nd-world is in
+mechanics of one nd-world world. Written in **Rust** ([Tauri 2](https://tauri.app) window + `ndforge-core`); the training itself
+runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md](PLAN.md). The file format shared with nd-world:
 [docs/BUNDLE_FORMAT.md](docs/BUNDLE_FORMAT.md).
 
 ## Status
@@ -9,20 +10,20 @@ mechanics of one nd-world world. The plan is in [PLAN.md](PLAN.md); the file for
 | Milestone | State |
 |---|---|
 | M0 Bundle format spec + sample bundle | done |
-| M1 Guided app skeleton (5 steps, help panel, projects) | done |
+| M1 Guided app (5 steps, help panel, projects), Rust + Tauri | done |
 | M3 Step 1: import `.ndtrain`, verification, diff | done |
-| M2 nd-world "Training bundle" download | next (nd-world repo) |
+| M2 nd-world "Training bundle" download | built in the nd-world repo; waiting for its full test suite |
 | M4 onward (environment, data, training, export ...) | not started |
 
-## Run from source
+## Build and run
+
+Needs Rust (stable). On Linux also the Tauri libraries: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf`.
 
 ```
-python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-ndforge                                           # or: python -m ndforge
-pytest -q                                         # QT_QPA_PLATFORM=offscreen on a machine without a display
+cargo test --workspace            # the core (no window needed)
+cargo run -p nd-lore-forge        # the program
+cargo install tauri-cli --version "^2" && cargo tauri build     # installer (MSI/NSIS, AppImage/deb)
 ```
 
-On Linux the Qt libraries need `libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3`.
-
-To try step 1 without nd-world, use the sample file `tests/fixtures/sample.ndtrain` (regenerate it with `python tests/sample_bundle.py`).
+To try step 1 without nd-world, choose `tests/fixtures/sample.ndtrain` (regenerate: `cargo run -p ndforge-core --example make_sample`).
+`NDFORGE_CONFIG_DIR` and `NDFORGE_PROJECTS_DIR` move the settings and the projects folder.

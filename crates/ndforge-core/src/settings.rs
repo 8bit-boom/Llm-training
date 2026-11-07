@@ -1,0 +1,54 @@
+//! Small app-wide settings (recent projects, expert mode, help panel). JSON in the config folder; a problem reading or writing it
+//! never stops the app.
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::paths::config_dir;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Settings {
+    pub expert_mode: bool,
+    pub show_help_panel: bool,
+    pub welcome_seen: bool,
+    pub recent_projects: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, recent_projects: Vec::new() }
+    }
+}
+
+impl Settings {
+    fn file() -> PathBuf {
+        config_dir().join("settings.json")
+    }
+
+    pub fn load() -> Settings {
+        std::fs::read_to_string(Self::file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let f = Self::file();
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(f, text);
+        }
+    }
+
+    pub fn remember_project(&mut self, folder: &Path) {
+        let s = folder.to_string_lossy().to_string();
+        self.recent_projects.retain(|p| *p != s);
+        self.recent_projects.insert(0, s);
+        self.recent_projects.truncate(10);
+    }
+
+    /// Recent projects that still exist.
+    pub fn existing_recent(&self) -> Vec<String> {
+        self.recent_projects.iter().filter(|p| Path::new(p).join("project.toml").exists()).cloned().collect()
+    }
+}

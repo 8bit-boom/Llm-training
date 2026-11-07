@@ -1,6 +1,6 @@
-# ND Lore Forge — plan (revision 3)
+# ND Lore Forge — plan (revision 4)
 
-A desktop program for **Windows and Linux** with an easy, guided GUI that turns one nd-world world (its lore, rules and
+A desktop program for **Windows and Linux** (written in **Rust**, with a small Python worker only for the training itself) with an easy, guided GUI that turns one nd-world world (its lore, rules and
 mechanics) into training data and fine-tunes a small model on it — **Qwen3.5 2B / 4B / 9B** or **Gemma 4 E2B / E4B**.
 The result is a small **GM model** made for that world, which nd-world can then use for AI Chat, Ask AI, Talk to NPCs and
 the Chronicler.
@@ -28,6 +28,13 @@ Status: **plan only, nothing is implemented yet.** Working name: *ND Lore Forge*
 | Name and `.ndtrain` extension | OK | Unchanged. |
 | Fine-tuning versions | **Full, PEFT, SFT** | Training page offers these as clear choices (§7.2). |
 | Getting data | **Export file only**, no linking to nd-world | The live "Connect" mode is **removed** from version 1 (§5). No token API, no Bearer auth, no extra nd-world security surface: only a download button. |
+
+### What changed in revision 4 (owner's answers, 2026-11-07)
+
+| Topic | Answer | Effect on the plan |
+|---|---|---|
+| Language | **Rust if possible, a Rust + Python hybrid is fine** | The program is Rust (**Tauri 2**: Rust logic + a small HTML/JS window); the only Python is a **training worker** that Rust starts (§9). The Python window written for M1 was replaced. |
+| Order of work | Finish and push nd-world first (full suite) | nd-world's Training Bundle is committed and waits for a passing full suite before it is pushed. |
 
 ---
 
@@ -339,26 +346,30 @@ a possible follow-up, not part of this plan.)
 
 ## 9. Technology and installation
 
+**Rust everywhere except the training itself.** Unsloth, PyTorch and the Qwen3.5 / Gemma 4 fine-tuning code exist only in Python, and a
+pure-Rust trainer (`candle`, `burn`) cannot yet do QLoRA on these models, so training runs in a small Python **worker** that the Rust
+program installs, starts, watches and stops.
+
 | Part | Choice | Why |
 |---|---|---|
-| Language | Python 3.12 | The training stack is Python. |
-| GUI | **PySide6 (Qt 6)** + pyqtgraph | Native on Windows and Linux, good for long background jobs, rich help panels (HTML), LGPL. |
-| Training | Unsloth; fallback Transformers + PEFT + TRL | See §7.2. |
-| Data | `datasets` + JSONL on disk | Easy to inspect and version. |
-| Teacher | OpenAI-compatible HTTP client (httpx) | Works with Ollama, llama.cpp, Unsloth Studio. |
-| Export | llama.cpp convert + quantise (or Unsloth's GGUF export), Ollama API/CLI | GGUF is what nd-world's backends load. |
-| Environment | **uv**-managed environment created by the app | Torch/CUDA is large and GPU-specific; the installer stays small and the app picks the right CUDA build. |
-| Packaging | PyInstaller → Inno Setup installer (Windows), AppImage + tar.gz (Linux) | One-click install. |
-| Secrets | OS keyring (Windows Credential Manager / Secret Service) | Hugging Face and TrueNAS-worker tokens never in project files or logs. |
+| Program | **Rust** workspace: `crates/ndforge-core` (everything that is not the window: bundles, diff, projects, settings, help, application model) and `src-tauri` (the window shell) | Same language as nd-world's gateway; the core has no GUI or GPU dependencies, so it builds and tests anywhere. |
+| Window | **Tauri 2** (Rust + the system web view) with plain HTML/CSS/JS in `ui/` (no JavaScript build step, no framework) | Best fit for the detailed instructions, screenshots, help panel and live charts; one installer for Windows and Linux; the page only draws what Rust returns. |
+| Training worker | **Python** (`worker/`): Unsloth with a Transformers + PEFT + TRL fallback; does training, test answers and merging only | The only place the Python ML stack is needed. |
+| Worker protocol | Rust writes a JSON job file, starts the worker, reads **JSON lines** on its output (progress, loss, samples, errors) and kills it on Stop | The window never loads torch; a CUDA crash cannot take it down; the same worker runs on TrueNAS. |
+| Data | JSONL / TOML / JSON files in the project folder | Easy to inspect and version. |
+| Teacher | OpenAI-compatible HTTP client in Rust (`reqwest`) | Works with Ollama, llama.cpp, Unsloth Studio. |
+| Export | llama.cpp convert + quantise started from Rust; Ollama HTTP API | GGUF is what nd-world's backends load. |
+| Python environment | **uv**-managed environment created by the app on first run | Torch/CUDA is large and GPU-specific; the installer stays small and the app picks the right CUDA build. |
+| Packaging | `cargo tauri build`: MSI/NSIS installer (Windows), AppImage + deb (Linux) | One-click install. |
+| Secrets | OS keyring (`keyring` crate) | Hugging Face and TrueNAS-worker tokens never in project files or logs. |
 
-**Process model:** the GUI never loads torch. Every long job (import, data generation, training, testing, export) runs as a
-**separate worker process** that reports progress as JSON lines; Stop always ends it and frees the GPU, and a crash cannot
-take the window down. The same worker has a command line (`ndforge train project.toml`), which is also what the TrueNAS
-worker runs.
+**Process model:** the window never loads torch. Every long job (data generation, training, testing, export) runs as a
+**separate worker process** that reports progress as JSON lines; Stop always ends it and frees the GPU. The same worker has a
+command line, which is also what the TrueNAS worker runs.
 
 **First run on a PC:** the welcome tour ends at "Set up training": the app checks the NVIDIA driver, picks the CUDA build,
-installs the environment with a progress bar (several GB, one time), and runs a 30-second GPU self-test. If the driver is
-too old it says which version is needed and links the NVIDIA download page.
+installs the Python environment with a progress bar (several GB, one time), and runs a 30-second GPU self-test. If the driver
+is too old it says which version is needed and links the NVIDIA download page.
 
 ## 10. Optional: training on TrueNAS
 
@@ -378,41 +389,37 @@ too old it says which version is needed and links the NVIDIA download page.
 
 ```
 Llm-training/
-  pyproject.toml              # ndforge (GUI side: PySide6, pyqtgraph, pydantic, keyring, httpx)
-  requirements/               # worker environment, pinned: cuda12x.txt, cpu.txt
-  catalog/models.toml         # the five models: repos, chat template notes, VRAM measurements
-  src/ndforge/
-    app.py                    # entry point
-    gui/                      # main window, steps/, instructions panel, help/glossary viewer, charts, job monitor
-    help/                     # page instructions, setting explanations, glossary, guide (markdown + screenshots)
-    core/                     # project.py (project.toml), settings, jobs.py (worker process + JSON-line protocol)
-    envmgr/                   # uv bootstrap, GPU/driver/CUDA detection, self-test
-    ingest/                   # bundle.py (.ndtrain), world_json.py (legacy), snapshot + diff
-    dataset/                  # canonical.py, markup.py (GM-secret labelling), chunk.py, builders/*.py, verify.py, split.py, freeze.py
-    teacher/                  # OpenAI-compatible client, prompts, cache, Ollama unload
-    train/                    # worker.py, presets.py, vram_estimate.py, modes/{peft,full}.py, stages/{world_book,sft}.py, backends/{unsloth,hf}.py, probes.py
-    evaluate/                 # metrics.py, judge.py, compare.py, playground.py
-    export/                   # merge.py, gguf.py, ollama.py, model_card.py
-    remote/                   # TrueNAS worker client + server (job API)
-    cli.py                    # ndforge import|build|train|test|export
-  docs/                       # user guide, bundle format spec (shared with nd-world), troubleshooting
-  tests/                      # unit, bundle fixtures, markup fixtures from nd-world, tiny-model smoke run, pytest-qt
-  packaging/                  # pyinstaller spec, windows/ (Inno Setup), linux/ (AppImage), Dockerfile.worker
-  .github/workflows/          # lint + tests on windows-latest and ubuntu-latest; installers on tag
+  Cargo.toml                    # workspace: crates/ndforge-core, src-tauri
+  crates/ndforge-core/          # the program without the window (pure Rust, unit-tested)
+    src/bundle.rs  diff.rs      #   .ndtrain reader/verifier/writer, diff between two bundles
+    src/project.rs settings.rs  #   project folders, app settings
+    src/model.rs                #   AppModel: the actions and JSON the window uses
+    src/help.rs  help/*.md      #   instruction texts of every page (Markdown, compiled in)
+    src/sample.rs               #   small sample world / bundle for tests
+    (later) dataset/ teacher/ jobs/ export/ envmgr/ remote/
+  src-tauri/                    # the window shell: Tauri commands forwarding to AppModel
+  ui/                           # index.html, style.css, app.js (no build step)
+  worker/                       # (M4+) Python training worker: train / test / merge, JSON-lines protocol
+  catalog/models.toml           # (M6) the five models: repos, chat template notes, VRAM measurements
+  docs/                         # BUNDLE_FORMAT.md (copy of nd-world's), user guide, troubleshooting
+  tests/fixtures/sample.ndtrain # sample bundle (cargo run -p ndforge-core --example make_sample)
+  .github/workflows/            # cargo test on Windows + Linux; installers on tag
 ```
 
-The **bundle format spec** (`docs/BUNDLE_FORMAT.md`) is written first and copied to nd-world's docs, so both repos build
-against the same contract; sample bundles from the spec are test fixtures on both sides.
+Project folder (user data, outside the repo): `MyWorld/ project.toml  sources/<hash>.ndtrain  datasets/vN/  runs/<run>/  exports/`.
+
+The **bundle format spec** (`docs/BUNDLE_FORMAT.md`) is a copy of nd-world's `docs/TRAINING_BUNDLE_FORMAT.md`; the sample bundle is a
+test fixture on both sides.
 
 ## 12. Milestones (in order; each ends with something usable)
 
 | # | Milestone | Where | Done when |
 |---|---|---|---|
-| **M0** | Bundle format spec v1 + sample bundles | both | Spec agreed; fixtures committed to both repos. |
-| **M1** | App skeleton: guided window, 5 steps, instructions panel, help/glossary, settings, projects; CI on Windows + Linux | Lore Forge | Clicking through all pages works on both OSes (steps empty). |
-| **M2** | nd-world Training Bundle download (Python + Rust, parity + Rust-only tests, docs) | nd-world | Export hub downloads a `.ndtrain` from both images; suite green. |
-| **M3** | Page 1: import `.ndtrain` and legacy World JSON, snapshot + diff, summary | Lore Forge | A real bundle of the chosen world imports with correct counts. |
-| **M4** | Environment manager: driver check, uv install, GPU self-test, **RTX 5090 (Blackwell) verified** | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready"; the 5090 trains a tiny model. |
+| **M0** ✅ | Bundle format spec v1 + sample bundles | both | Spec agreed; fixtures committed to both repos. |
+| **M1** ✅ | App skeleton (Rust + Tauri): guided window, 5 steps, instructions panel, help, settings, projects; CI on Windows + Linux | Lore Forge | Clicking through all pages works on both OSes (steps empty). |
+| **M2** (built; waiting for the full suite before the push) | nd-world Training Bundle download (Python + Rust, parity + Rust-only tests, docs) | nd-world | Export hub downloads a `.ndtrain` from both images; suite green. |
+| **M3** ✅ | Page 1: import `.ndtrain` and legacy World JSON, snapshot + diff, summary | Lore Forge | A real bundle of the chosen world imports with correct counts. |
+| **M4** | Environment manager (Rust) + the Python worker skeleton: driver check, uv install, GPU self-test, **RTX 5090 (Blackwell) verified** | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready"; the 5090 trains a tiny model. |
 | **M5** | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review table, save version | Lore Forge | A saved dataset without any teacher model. |
 | **M6** | **PEFT + SFT training on the PC**: worker, Unsloth QLoRA/LoRA, presets, live charts, probes, stop/resume; **VRAM measured for all five models** | Lore Forge | *Quick test* trains each of the five on the 5090; Stop frees VRAM. |
 | **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning; **"Retrain with the new export" button** (§5.4) | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat, and dropping a newer export retrains it in one click. |
@@ -424,9 +431,9 @@ against the same contract; sample bundles from the spec are test fixtures on bot
 
 ## 13. Testing
 
-- **Lore Forge:** unit tests for import, markup labelling (fixtures produced by nd-world's own tag code), chunking, builders,
+- **Lore Forge:** Rust unit and integration tests (`cargo test`) for import, markup labelling (fixtures produced by nd-world's own tag code), chunking, builders,
   held-out split, manifest hashing, presets and VRAM maths; a tiny-model CPU smoke run through the real worker protocol in
-  CI; pytest-qt tests for the guided flow and plain-language error dialogs; manual GPU runs of the five models in each allowed training type.
+  CI (Python worker); tests of `AppModel` (the whole guided flow and the plain-language errors without a window) and a scripted run of the real window under a virtual display; manual GPU runs of the five models in each allowed training type.
 - **nd-world:** parity (Python vs gateway) and Rust-only tests for the bundle download, access tests (player / logged-out refused), a big-world test
   (thousands of entities, accented names, `null` lists) to make sure the export streams and never declines.
 - **End to end:** sample world → bundle → dataset → Quick test training → GGUF → Ollama → question answered.

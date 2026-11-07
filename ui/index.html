@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ND Lore Forge</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <strong class="brand">ND Lore Forge</strong>
+    <span class="spacer"></span>
+    <label class="toggle" title="Show every setting, not only the important ones"><input type="checkbox" id="expert"> Expert mode</label>
+    <label class="toggle" title="Show or hide the instructions on the right"><input type="checkbox" id="helptoggle"> Help panel</label>
+  </header>
+  <div class="layout" id="layout">
+    <nav id="steps" class="steps" aria-label="Steps"></nav>
+    <main id="page" class="page"></main>
+    <aside id="help" class="help" aria-label="Instructions"></aside>
+  </div>
+  <footer id="status" class="status">No project open</footer>
+  <script src="app.js"></script>
+</body>
+</html>
