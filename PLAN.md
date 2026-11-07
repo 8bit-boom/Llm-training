@@ -107,7 +107,7 @@ explains each in plain words; the owner never has to know the terms.
 | Page | What the owner sees |
 |---|---|
 | **Welcome / Projects** | "Create a project" (one project = one world + one model family), recent projects, the welcome tour. |
-| **1 · Get world data** | One big card: **"Import a training file"** (drag and drop a `.ndtrain`; the file already contains the one world you exported, so there is nothing to pick) and a small **"Update from a newer file"** option for later. Instructions explain how to make the file in nd-world, with screenshots. After import: a summary ("312 entities, rules 48 pages, 27 session recaps, 140 facts …") and, on re-import, what changed. A third small option: "I only have an old World JSON export" (works, with less data). |
+| **1 · Get world data** | One big card: **"Import a training file"** (drag and drop a `.ndtrain`; the file already contains the one world you exported, so there is nothing to pick) and, once a project has a trained model, a **"Retrain with the new export"** button (§5.4). Instructions explain how to make the file in nd-world, with screenshots. After import: a summary ("312 entities, rules 48 pages, 27 session recaps, 140 facts …") and, on re-import, what changed. A third small option: "I only have an old World JSON export" (works, with less data). |
 | **2 · Make training data** | Recipe with on/off switches and a "how much" slider per kind of example (§6.3), teacher model setup with Test button, time estimate, Generate with progress, then a review table (search, filter, edit, delete, "looks good") and **Save this version**. |
 | **3 · Train** | Model picker with the five models as cards (size, VRAM needed, speed, "fits your GPU ✓/✗"), training type (PEFT / Full, with SFT and optional world-book stage; see 7.2), where to train (This PC / My TrueNAS server), preset, Start / Pause / Stop, live charts, probe answers, ETA, GPU temperature. |
 | **4 · Test** | Score card (lore accuracy, made-up answers, rules questions, general chat), side-by-side chat: original model vs trained model, "ask your own question", save transcripts. Plain verdict: *"Better than the original on 86 % of lore questions."* |
@@ -121,8 +121,8 @@ explains each in plain words; the owner never has to know the terms.
 ### 5.1 File only
 nd-world gets a **Training Bundle** download: Tools → 📦 Export & Backup → **"Training bundle (for ND Lore Forge)"** →
 downloads `<world-slug>.ndtrain`. Copy it to the PC and drop it on page 1. It works offline and with nd-world on TrueNAS and
-the PC anywhere else. To retrain after the world changed, export again and use "Update from a newer file": the program
-shows what changed and rebuilds only the affected examples.
+the PC anywhere else. To retrain after the world changed, export again and drop the new file on page 1: the program
+shows what changed and offers the one-click **"Retrain with the new export"** (§5.4).
 
 A live connection (token + address) is **deliberately not built**: it would need a new login method and a new API in
 nd-world's Python app and Rust gateway for little gain. The bundle format is versioned, so a connection could be added later
@@ -169,6 +169,27 @@ gateway must answer byte-identically, and the Rust-only image must not lose the 
 
 Zip byte-identity needs a fixed file order, fixed timestamps and one agreed compression in both implementations; the parity
 test also compares the unpacked files, so a mismatch points at the file that differs.
+
+### 5.4 One-click "Retrain with the new export" (page 1)
+For a world that keeps growing. It appears when a project already has at least one trained run and a newer `.ndtrain` of the
+same world is dropped on page 1.
+
+1. **Shows what changed** first: added / changed / removed entities, rules, sessions, facts, quests ("14 new, 6 changed, 2 removed").
+   If the file is for a different world, or older than the current snapshot, it says so and offers nothing.
+2. **One button, "Retrain with the new export"**, opens a short confirmation listing exactly what will happen, with time and
+   disk estimates: it reuses the project's last choices (model, training type, stages, preset, recipe and teacher), rebuilds
+   only the examples whose source text changed (the rest come from the cache) and drops examples whose source was removed,
+   saves a new dataset version, starts a **new run** (the old run and model are kept), tests it against the previous model,
+   and prepares the export files.
+3. **Safe by default:** it never overwrites the earlier model or dataset version. It stops with a plain explanation if a step
+   needs the owner: teacher model not reachable, not enough disk space or GPU memory, or the test shows the new model scored
+   clearly worse than the previous one (it then keeps both and asks which to export).
+4. **Options in the confirmation:** continue from the previous model with a short run (faster, for small changes) or train from the original
+   (cleaner, default when more than ~25 % changed); also "after training, install into Ollama on this PC".
+5. The same action is available on the command line (`ndforge retrain project.toml new.ndtrain`) and from the project list.
+
+Built in milestone **M7** for the PEFT + SFT flow, and extended as later milestones add TrueNAS (M8), Full (M9), teacher
+examples (M10) and the test comparison (M11).
 
 ---
 
@@ -394,7 +415,7 @@ against the same contract; sample bundles from the spec are test fixtures on bot
 | **M4** | Environment manager: driver check, uv install, GPU self-test, **RTX 5090 (Blackwell) verified** | Lore Forge | Fresh Windows and Linux PCs reach "GPU ready"; the 5090 trains a tiny model. |
 | **M5** | Data: cleaning + GM-secret labels, World book + Simple facts, held-out split, review table, save version | Lore Forge | A saved dataset without any teacher model. |
 | **M6** | **PEFT + SFT training on the PC**: worker, Unsloth QLoRA/LoRA, presets, live charts, probes, stop/resume; **VRAM measured for all five models** | Lore Forge | *Quick test* trains each of the five on the 5090; Stop frees VRAM. |
-| **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat. |
+| **M7** | Export + install: GGUF, Modelfile, Ollama on PC, instructions for TrueNAS Ollama / Unsloth Studio, GM warning; **"Retrain with the new export" button** (§5.4) | Lore Forge | **First complete version:** the trained model answers in nd-world's AI Chat, and dropping a newer export retrains it in one click. |
 | **M8** | **TrueNAS worker**: image, compose snippet, remote training from the GUI (PEFT) | Lore Forge | A run started on the PC trains on the T10 and the result comes back. |
 | **M9** | **Full fine-tune** type + "Read the world book" stage; memory estimates measured; type-choice cards in the GUI | Lore Forge | Full + SFT runs on the small models that fit the 5090; unsuitable combinations are greyed out with reasons. |
 | **M10** | Teacher-generated examples (deeper questions, rules practice, NPC role-play, history, lore search, not-in-lore, general, house style) + checking | Lore Forge | Better test scores than M5-only data on the same model. |
@@ -425,7 +446,6 @@ against the same contract; sample bundles from the spec are test fixtures on bot
 | Model releases change | `catalog/models.toml`, tokenizer chat templates, fallback backend. |
 | Disk space | Shared model cache, checkpoint retention setting, space check before each save. |
 
-## 15. Remaining questions (not blocking the start)
+## 15. Remaining questions
 
-1. Is the CPU/RAM of the PC worth noting (for data preparation speed)? Not needed, the program detects it.
-2. When a world changes often, is "export a new file → Update from a newer file" convenient enough, or should a one-click "retrain with the new export" button be added to M12? (Planned as a button on page 1 either way.)
+No blocking questions. Decided: the "Retrain with the new export" button is included (§5.4, milestone M7).
