@@ -183,7 +183,10 @@ impl Project {
 
     /// Which steps are finished; drives the ticks and unlocking in the sidebar.
     pub fn progress(&self) -> [(&'static str, bool); 5] {
-        let exports = std::fs::read_dir(self.folder.join("exports")).map(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "gguf"))).unwrap_or(false);
+        // an export is a folder exports/<run>-<quant>/ holding model-<quant>.gguf
+        let exports = std::fs::read_dir(self.folder.join("exports")).map(|d| d.flatten().any(|e| {
+            std::fs::read_dir(e.path()).map(|f| f.flatten().any(|x| x.path().extension().is_some_and(|ext| ext == "gguf"))).unwrap_or(false)
+        })).unwrap_or(false);
         [
             ("data", !self.current_source.is_empty()),
             ("dataset", self.has_any("datasets", "manifest.json")),

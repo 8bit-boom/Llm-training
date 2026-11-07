@@ -40,8 +40,13 @@ def load_unsloth(cfg: dict):
         kw["load_in_4bit"] = True
     else:
         kw.update(load_in_4bit=False, load_in_16bit=True)
+    init = cfg.get("init_adapter")
+    if init:   # continue from an earlier LoRA: Unsloth loads a LoRA folder as the model (base model + trainable adapter)
+        kw["model_name"] = init
     protocol.progress("load", 0.05, "Loading the model")
     model, tokenizer = loader.from_pretrained(**kw)
+    if init:
+        return model, tokenizer, loader
     protocol.progress("load", 0.8, "Adding the LoRA layers")
     common = {"r": h["rank"], "lora_alpha": h["alpha"], "lora_dropout": 0, "bias": "none", "random_state": h["seed"]}
     if loader is FastModel:
@@ -81,6 +86,9 @@ def load_hf(cfg: dict):
     elif torch.cuda.is_available():
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
+    if cfg.get("init_adapter"):
+        from peft import PeftModel
+        return PeftModel.from_pretrained(model, cfg["init_adapter"], is_trainable=True), tokenizer, None
     lora = LoraConfig(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear")
     return get_peft_model(model, lora), tokenizer, None
 

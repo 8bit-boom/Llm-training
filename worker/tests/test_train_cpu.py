@@ -136,3 +136,104 @@ def test_stop_file_ends_training_early_but_saves(tmp_path):
     stop.write_text("")
     cb.on_step_end(None, type("S", (), {"global_step": 2})(), ctl)
     assert ctl.should_save and ctl.should_training_stop and cb.stopped
+
+
+# ---------------------------------------------------------------------------------------------------------------- export and warm start
+
+def run_export(tmp_path, family, run_out, env=None, **over):
+    job = {"job": "export", "adapter": str(run_out / "adapter"), "base": {"repo": str(tmp_path / "model"), "family": family}, "out": str(tmp_path / "exp"),
+           "quant": "q4_k_m", "backend": "hf", "gguf": False}
+    job.update(over)
+    f = tmp_path / "export-job.json"
+    f.write_text(json.dumps(job), encoding="utf-8")
+    import os
+    p = subprocess.run([sys.executable, "-X", "utf8", "-m", "ndforge_worker", str(f)], cwd=WORKER, capture_output=True, text=True, timeout=600, env={**os.environ, **(env or {})})
+    return p, [json.loads(line) for line in p.stdout.splitlines() if line.startswith("{")]
+
+
+def test_qwen_template_answers_without_thinking_by_default_after_export():
+    from ndforge_worker.families import default_non_thinking
+    from tinymodel import DATA
+    tpl = (DATA / "qwen3_5_chat_template.jinja").read_text(encoding="utf-8")
+    patched = default_non_thinking(tpl)
+    assert patched != tpl and default_non_thinking(patched) == patched          # changed once, then stable
+    from jinja2 import Environment
+    env = Environment()
+    render = lambda t, **kw: env.from_string(t).render(messages=[{"role": "user", "content": "hi"}], add_generation_prompt=True, **kw)  # noqa: E731
+    assert render(tpl).endswith("<|im_start|>assistant\n<think>\n")                                   # the original thinks by default
+    assert render(patched).endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")                 # the exported one does not
+    assert render(patched, enable_thinking=True).endswith("<|im_start|>assistant\n<think>\n")         # unless asked
+    assert render(patched, enable_thinking=False).endswith("<think>\n\n</think>\n\n")
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "gemma4"])
+def test_export_merges_the_adapter_into_the_model_without_changing_its_answers(tmp_path, family):
+    p, ev, run_out = run_job(tmp_path, family, "real")
+    assert p.returncode == 0, p.stderr[-2000:]
+    p2, ev2 = run_export(tmp_path, family, run_out)
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    res = ev2[-1]["data"]
+    merged = Path(res["merged_dir"])
+    assert res["gguf"] is None and (merged / "config.json").exists() and list(merged.glob("*.safetensors"))
+    # the merged model gives the same logits as base + adapter
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    base = AutoModelForCausalLM.from_pretrained(str(tmp_path / "model"))
+    peft_model = PeftModel.from_pretrained(base, str(run_out / "adapter")).eval()
+    merged_model = AutoModelForCausalLM.from_pretrained(str(merged)).eval()
+    ids = torch.randint(0, 100, (1, 12))
+    with torch.no_grad():
+        assert torch.allclose(peft_model(input_ids=ids).logits, merged_model(input_ids=ids).logits, atol=1e-4)
+    if family == "qwen3_5":   # the template shipped with the merged model does not think by default
+        tpl = (merged / "chat_template.jinja").read_text(encoding="utf-8") if (merged / "chat_template.jinja").exists() else json.loads((merged / "tokenizer_config.json").read_text())["chat_template"]
+        assert "enable_thinking is not defined or enable_thinking is false" in tpl
+
+
+def _fake_llama_cpp(root: Path):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "convert_hf_to_gguf.py").write_text(
+        "import sys\nargs=sys.argv\nout=args[args.index('--outfile')+1]\nassert args[args.index('--outtype')+1]=='f16'\nopen(out,'wb').write(b'GGUF-f16 '+open(args[1]+'/config.json','rb').read()[:20])\nprint('converted')\n")
+    q = root / "llama-quantize"
+    q.write_text("#!/bin/sh\necho \"quantizing $1 to $3\"\nprintf 'GGUF-%s' \"$3\" > \"$2\"\n")
+    q.chmod(0o755)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake llama-quantize is a shell script")
+def test_gguf_is_made_with_llama_cpp_and_the_big_files_are_cleaned_up(tmp_path):
+    p, ev, run_out = run_job(tmp_path, "qwen3_5")
+    assert p.returncode == 0
+    _fake_llama_cpp(tmp_path / "lcpp")
+    p2, ev2 = run_export(tmp_path, "qwen3_5", run_out, env={"LLAMA_CPP_DIR": str(tmp_path / "lcpp")}, gguf=True, quant="q5_k_m")
+    assert p2.returncode == 0, p2.stderr[-2000:] + p2.stdout[-1000:]
+    res = ev2[-1]["data"]
+    out = tmp_path / "exp"
+    assert Path(res["gguf"]) == out / "model-q5_k_m.gguf" and (out / "model-q5_k_m.gguf").read_bytes() == b"GGUF-Q5_K_M"
+    assert not (out / "merged").exists() and not (out / "model-f16.gguf").exists() and res["merged_dir"] is None
+    assert any(e["type"] == "log" and "quantizing" in e["text"] for e in ev2)
+    # f16 is the converter's own output, renamed; keep_merged keeps the merged model
+    p3, ev3 = run_export(tmp_path, "qwen3_5", run_out, env={"LLAMA_CPP_DIR": str(tmp_path / "lcpp")}, gguf=True, quant="f16", keep_merged=True)
+    assert p3.returncode == 0 and (out / "model-f16.gguf").read_bytes().startswith(b"GGUF-f16") and (out / "merged").exists()
+
+
+def test_without_llama_cpp_the_error_says_what_to_do(tmp_path):
+    p, ev, run_out = run_job(tmp_path, "qwen3_5")
+    p2, ev2 = run_export(tmp_path, "qwen3_5", run_out, env={"LLAMA_CPP_DIR": str(tmp_path / "nothing"), "HOME": str(tmp_path / "home")}, gguf=True)
+    assert p2.returncode == 1 and ev2[-1]["code"] == "export_failed" and "llama.cpp is needed" in ev2[-1]["message"]
+    p3, ev3 = run_export(tmp_path, "qwen3_5", run_out, quant="q2")
+    assert p3.returncode == 1 and "Unknown quantisation" in ev3[-1]["message"]
+
+
+def test_warm_start_continues_from_an_earlier_adapter(tmp_path):
+    p, ev, run_out = run_job(tmp_path, "qwen3_5", hyper={"max_steps": 25, "lr": 2e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-2000:]
+    first = [e for e in ev if e["type"] == "metric"]
+    cold_start_loss, last_loss = first[0]["loss"], first[-1]["loss"]
+    assert cold_start_loss - last_loss > 0.3, (cold_start_loss, last_loss)                       # the first run really learned something
+    # a second run that starts from that adapter (and barely moves: tiny learning rate) begins where the first one ended
+    p2, ev2, _ = run_job(tmp_path, "qwen3_5", init_adapter=str(run_out / "adapter"), out=str(tmp_path / "run2"), hyper={"max_steps": 2, "lr": 1e-7, "warmup": 0})
+    assert p2.returncode == 0, p2.stderr[-2000:]
+    warm = [e for e in ev2 if e["type"] == "metric"]
+    assert abs(warm[0]["loss"] - last_loss) < 0.5 * (cold_start_loss - last_loss), (warm[0]["loss"], last_loss, cold_start_loss)
+    # without init_adapter the same settings start from scratch
+    p3, ev3, _ = run_job(tmp_path, "qwen3_5", out=str(tmp_path / "run3"), hyper={"max_steps": 2, "lr": 1e-7, "warmup": 0})
+    assert [e for e in ev3 if e["type"] == "metric"][0]["loss"] > last_loss + 0.5 * (cold_start_loss - last_loss)

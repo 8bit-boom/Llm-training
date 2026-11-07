@@ -157,6 +157,118 @@ fn train_metrics(s: State<App>, run: String) -> Out<Value> {
 }
 
 #[tauri::command]
+fn export_state(s: State<App>) -> Out<Value> {
+    lock(&s).export_state().map_err(|e| e.to_string())
+}
+
+/// Makes the GGUF + Modelfile of a run; progress goes to the window as "export-event" events.
+#[tauri::command]
+fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32) -> Out<()> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "export-event", move |cancel, emit| {
+        ndforge_core::export::runs::execute(&project, &run, &quant, num_ctx, cancel, emit).map_err(|e| e.to_string())
+    })
+}
+
+/// Puts an export into an Ollama server and remembers it.
+#[tauri::command]
+fn ollama_install(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, export: String, url: String, name: String) -> Out<()> {
+    let m = lock(&s);
+    let (gguf, family, num_ctx) = m.export_for_install(&export).map_err(|e| e.to_string())?;
+    let project = m.project_clone().map_err(|e| e.to_string())?;
+    drop(m);
+    spawn_task(app, &tasks, "export-event", move |_cancel, emit| {
+        ndforge_core::export::install::install(&url, &name, &gguf, &family, num_ctx, emit).map_err(|e| e.to_string())?;
+        ndforge_core::export::runs::record_install(&project, &export, &url, &name).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"installed": name, "url": url}))
+    })
+}
+
+/// Asks the installed model one of the training's own questions.
+#[tauri::command]
+fn ollama_probe(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, url: String, name: String) -> Out<()> {
+    let (system, question) = lock(&s).probe_question().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "export-event", move |_cancel, _emit| {
+        let answer = ndforge_core::export::install::probe(&url, &name, &system, &question).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"probe": {"question": question, "answer": answer}}))
+    })
+}
+
+/// Is Ollama there? Answers as an "export-event" done/error.
+#[tauri::command]
+fn ollama_check(app: tauri::AppHandle, tasks: State<Tasks>, url: String) -> Out<()> {
+    spawn_task(app, &tasks, "export-event", move |_cancel, _emit| {
+        let o = ndforge_core::export::ollama::Ollama::new(&url);
+        let version = o.version().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"ollama_version": version, "models": o.models().unwrap_or_default()}))
+    })
+}
+
+#[tauri::command]
+fn ollama_server_add(s: State<App>, name: String, url: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.add_ollama_server(&name, &url).map_err(|e| e.to_string())?;
+    m.export_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ollama_server_remove(s: State<App>, url: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.remove_ollama_server(&url).map_err(|e| e.to_string())?;
+    m.export_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn retrain_info(s: State<App>) -> Out<Value> {
+    lock(&s).retrain_info().map_err(|e| e.to_string())
+}
+
+/// "Retrain with the new export": new data version, then a new training run, then (optionally) the files and the Ollama install.
+/// Everything is reported on the "train-event" channel; stages are {"kind": "stage", "text": ...}.
+#[tauri::command]
+fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from_previous: bool, export_after: bool, install_url: Option<String>, ollama_name: Option<String>) -> Out<String> {
+    let job = lock(&s).retrain_job(from_previous).map_err(|e| e.to_string())?;
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, stop, name) = (tasks.busy.clone(), tasks.cancel.clone(), job.name.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
+        emit(serde_json::json!({"kind": "stage", "text": "Training the new run"}));
+        let train = ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), stop.clone(), std::time::Duration::from_secs(120), &mut emit);
+        let outcome: Result<Value, String> = match train {
+            Err(e) => Err(e.to_string()),
+            Ok(result) if result["stopped"] == true => Ok(result),
+            Ok(result) => (|| {
+                if export_after {
+                    emit(serde_json::json!({"kind": "stage", "text": "Making the files for nd-world"}));
+                    let quant = ndforge_core::export::runs::list_exports(&job.project).first().and_then(|m| m["quant"].as_str().map(String::from)).unwrap_or_else(|| "q4_k_m".into());
+                    let meta = ndforge_core::export::runs::execute(&job.project, &job.name, &quant, 8192, &stop, &mut emit).map_err(|e| e.to_string())?;
+                    if let Some(url) = install_url.filter(|u| !u.is_empty()) {
+                        emit(serde_json::json!({"kind": "stage", "text": "Installing into Ollama"}));
+                        let export = meta["name"].as_str().unwrap_or("").to_string();
+                        let name = ollama_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| meta["ollama_name"].as_str().unwrap_or("world-gm").to_string());
+                        let gguf = job.project.folder.join("exports").join(&export).join(meta["gguf_file"].as_str().unwrap_or("model.gguf"));
+                        ndforge_core::export::install::install(&url, &name, &gguf, &job.model.family, 8192, &mut emit).map_err(|e| e.to_string())?;
+                        ndforge_core::export::runs::record_install(&job.project, &export, &url, &name).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(result)
+            })(),
+        };
+        busy.store(false, Ordering::SeqCst);
+        let end = match outcome {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
+            Err(e) => serde_json::json!({"kind": "error", "text": e}),
+        };
+        let _ = app.emit("train-event", end);
+    });
+    Ok(name)
+}
+
+#[tauri::command]
 fn help(key: String) -> String {
     help_html(&key)
 }
@@ -167,7 +279,7 @@ fn env_status() -> Value {
 }
 
 /// Runs `job` on a thread; its progress goes to the window as "env-event" events, the end as {"kind": "done"|"error"}.
-fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
+fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
     if tasks.busy.swap(true, Ordering::SeqCst) {
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
@@ -175,27 +287,27 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, job: impl FnOnce(&AtomicBool
     let (busy, cancel) = (tasks.busy.clone(), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("env-event", v); };
+        let mut emit = move |v: Value| { let _ = emitter.emit(channel, v); };
         let end = match job(&cancel, &mut emit) {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(msg) => serde_json::json!({"kind": "error", "text": msg}),
         };
         busy.store(false, Ordering::SeqCst);
-        let _ = app.emit("env-event", end);
+        let _ = app.emit(channel, end);
     });
     Ok(())
 }
 
 #[tauri::command]
 fn env_install(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
-    spawn_task(app, &tasks, |cancel, emit| {
+    spawn_task(app, &tasks, "env-event", |cancel, emit| {
         ndforge_core::envmgr::tasks::install(cancel, emit).map(|_| Value::Null).map_err(|e| e.to_string())
     })
 }
 
 #[tauri::command]
 fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
-    spawn_task(app, &tasks, |cancel, emit| ndforge_core::envmgr::tasks::selftest(cancel, emit).map_err(|e| e.to_string()))
+    spawn_task(app, &tasks, "env-event", |cancel, emit| ndforge_core::envmgr::tasks::selftest(cancel, emit).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -208,7 +320,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -12,7 +12,10 @@ use crate::paths::default_projects_dir;
 use crate::project::{BundleCheck, Project};
 use crate::train::catalog::{find, models, ModelEntry};
 use crate::train::plan::{plan, recommended_method, Hyper, Method, Preset};
-use crate::train::runs;
+use crate::export::modelfile::ollama_name;
+use crate::export::runs as exports;
+use crate::settings::OllamaServer;
+use crate::train::{retrain, runs};
 use crate::settings::Settings;
 
 /// (key, sidebar label)
@@ -257,7 +260,86 @@ impl AppModel {
     }
 }
 
+impl AppModel {
+    // ------------------------------------------------------------------ step 5: use in nd-world
+    pub fn export_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        Ok(json!({
+            "runs": exports::exportable_runs(p),
+            "exports": exports::list_exports(p),
+            "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+            "servers": self.settings.ollama_servers,
+            "suggested_name": ollama_name(&p.world_name, ""),
+            "world": p.world_name,
+            "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+        }))
+    }
+
+    pub fn project_clone(&self) -> Result<Project> {
+        Ok(self.project_ref()?.clone())
+    }
+
+    pub fn add_ollama_server(&mut self, name: &str, url: &str) -> Result<()> {
+        let (name, url) = (name.trim(), crate::export::ollama::normalize_url(url));
+        if name.is_empty() || url == "http://" {
+            return Err(Error::new("Give the server a name and an address (for example http://truenas:11434)."));
+        }
+        self.settings.ollama_servers.retain(|s| s.url != url);
+        self.settings.ollama_servers.push(OllamaServer { name: name.to_string(), url });
+        self.settings.save();
+        Ok(())
+    }
+
+    pub fn remove_ollama_server(&mut self, url: &str) -> Result<()> {
+        self.settings.ollama_servers.retain(|s| s.url != url);
+        self.settings.save();
+        Ok(())
+    }
+
+    /// (path of the GGUF, family, context length) of an export, for installing it.
+    pub fn export_for_install(&self, export: &str) -> Result<(std::path::PathBuf, String, u32)> {
+        let (gguf, meta) = exports::find_export(self.project_ref()?, export)?;
+        Ok((gguf, meta["family"].as_str().unwrap_or("generic").to_string(), meta["num_ctx"].as_u64().unwrap_or(8192) as u32))
+    }
+
+    pub fn record_install(&self, export: &str, url: &str, model: &str) -> Result<()> {
+        exports::record_install(self.project_ref()?, export, url, model)
+    }
+
+    /// A question to ask the installed model: one of the training's own sample questions (with its system message), else a generic one.
+    pub fn probe_question(&self) -> Result<(String, String)> {
+        let p = self.project_ref()?;
+        if let Some((n, _)) = runs::latest_version(p) {
+            let train = p.folder.join("datasets").join(format!("v{n}")).join("train.jsonl");
+            if let Some(first) = runs::probes_from_dataset(&train, 1).first() {
+                return Ok((first["system"].as_str().unwrap_or("").to_string(), first["question"].as_str().unwrap_or("").to_string()));
+            }
+        }
+        Ok((format!("You are the game master's assistant for the tabletop world \"{}\".", p.world_name), "Tell me about this world.".to_string()))
+    }
+
+    // ------------------------------------------------------------------ retrain with the new export
+    pub fn retrain_info(&self) -> Result<Value> {
+        retrain::info(self.project_ref()?)
+    }
+
+    /// Makes the new data version and returns the training run to start. `from_previous`: continue from the last model with a short run.
+    pub fn retrain_job(&self, from_previous: bool) -> Result<TrainJob> {
+        let p = self.project_ref()?.clone();
+        let (version, cfg, hyper, last_name) = retrain::prepare(&p, from_previous)?;
+        let m = models().into_iter().find(|m| Some(m.repo.as_str()) == cfg["model"]["repo"].as_str()).ok_or_else(|| Error::new("The model of the last run is no longer in the catalog."))?;
+        let method: Method = serde_json::from_value(cfg["method"].clone()).unwrap_or(Method::Lora);
+        let name = runs::run_name(&m.id);
+        let mut job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
+        if from_previous {
+            job["init_adapter"] = json!(runs::runs_dir(&p).join(&last_name).join("adapter"));
+        }
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job })
+    }
+}
+
 /// A run ready to start.
+#[derive(Debug)]
 pub struct TrainJob {
     pub project: Project,
     pub model: ModelEntry,

@@ -6,6 +6,7 @@ pub mod dataset;
 pub mod diff;
 pub mod envmgr;
 pub mod error;
+pub mod export;
 pub mod help;
 pub mod model;
 pub mod paths;

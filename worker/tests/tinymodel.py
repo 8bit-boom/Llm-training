@@ -37,7 +37,9 @@ def build_tokenizer(family: str):
 
 def build_llama_dir(path: Path, family: str):
     """A 2-layer random Llama-architecture model + the family's tokenizer and template."""
+    import torch
     from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
     tok = build_tokenizer(family)
     cfg = LlamaConfig(vocab_size=len(tok), hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
                       max_position_embeddings=512, pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
@@ -66,7 +68,9 @@ def write_jsonl(path: Path, rows: list):
 def build_arch_dir(path: Path, family: str):
     """A tiny random model of the REAL architecture (Qwen3.5: gated linear attention + full attention; Gemma 4: sliding/full attention with shared KV
     and per-layer inputs), from the text part of the real config with the sizes shrunk."""
+    import torch
     import transformers as T
+    torch.manual_seed(0)
     tok = build_tokenizer(family)
     t = json.loads((DATA / f"{family}_config.json").read_text())["text_config"]
     common = {"hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,

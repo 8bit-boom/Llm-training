@@ -22,3 +22,13 @@ QWEN_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", 
 
 def family(name: str) -> dict:
     return FAMILIES.get(name, FAMILIES["generic"])
+
+
+def default_non_thinking(template: str) -> str:
+    """Qwen3.5's chat template starts the answer with "<think>" unless `enable_thinking` is false. The model here is trained WITHOUT thinking, so the
+    exported template answers without thinking unless thinking is asked for explicitly (llama.cpp and Unsloth Studio use the template inside the GGUF)."""
+    old = "enable_thinking is defined and enable_thinking is false"
+    new = "enable_thinking is not defined or enable_thinking is false"
+    if old not in template:
+        return template
+    return template.replace(old, new)

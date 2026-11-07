@@ -43,6 +43,15 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("train_failed", _explain(exc))
             return 1
+    if kind == "export":
+        from . import exportjob
+        try:
+            return exportjob.run(job)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("export_failed", _explain(exc))
+            return 1
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1
 

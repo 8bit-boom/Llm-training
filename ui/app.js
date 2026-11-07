@@ -6,7 +6,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
-  use: ["Step 5 · Use in nd-world", "Makes the model usable in nd-world."],
 };
 
 let state = null;
@@ -72,7 +71,7 @@ function renderData() {
     <p class="lead">Export a <strong>Training bundle</strong> from nd-world (Tools → Export &amp; Backup), then choose the file here or drag it onto this page. The help panel explains how.</p>
     <div class="drop" id="drop">Drag a <code>.ndtrain</code> file here</div>
     <div class="row"><button class="primary" id="choose">${state.bundle ? "Choose a newer training file…" : "Choose training file…"}</button></div>
-    ${msgHtml()}${pendingCard()}${bundleCard()}`;
+    ${msgHtml()}${pendingCard()}${retrainCard()}${bundleCard()}`;
 }
 
 let ds = { state: null, filter: { builder: "", search: "", status: "" }, offset: 0, total: 0, items: [], editing: null, busy: false, error: null, ok: null };
@@ -241,6 +240,7 @@ async function trRefresh() {
 function onTrainEvent(p) {
   if (p.kind === "metric") { tr.metrics.push(p); tr.progress = p.step / Math.max(1, p.total_steps); tr.stepText = `Step ${p.step} of ${p.total_steps}`; }
   else if (p.kind === "sample") tr.samples.push(p);
+  else if (p.kind === "stage") { tr.stepText = p.text; tr.progress = null; }
   else if (p.kind === "progress") { if (p.step !== "train" || tr.progress == null) { tr.stepText = p.text || p.step; tr.progress = p.value; } }
   else if (p.kind === "log") tr.log.push(p.text);
   else if (p.kind === "done") { tr.running = false; tr.notice = p.data.stopped ? `Stopped at step ${p.data.steps}. You can continue this run later.` : `Finished: ${p.data.steps} steps, final loss ${p.data.final_loss != null ? (+p.data.final_loss).toFixed(3) : "–"}.`; trRefresh(); }
@@ -271,6 +271,150 @@ function wireTrain() {
     tr.metrics = ev.filter((e) => e.type === "metric").map((e) => ({ ...e, kind: "metric" }));
     tr.samples = ev.filter((e) => e.type === "sample");
     tr.notice = `Run ${b.dataset.showrun}`; tr.error = null; tr.progress = null; tr.stepText = ""; render();
+  });
+}
+
+// ------------------------------------------------------------------------------------------------ step 5: use in nd-world
+let us = { state: null, run: "", quant: "q4_k_m", numCtx: 8192, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
+
+function renderUse() {
+  if (!state.bundle) return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = us.state;
+  if (!st) return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Loading…</p>`;
+  if (!st.runs.length) return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Train a model first (Step 3). A run that was stopped can be exported too once it has saved its model.</p>`;
+  if (!us.run) us.run = st.runs[0].name;
+  if (!us.server && st.servers.length) us.server = st.servers[0].url;
+  if (!us.modelName) us.modelName = st.suggested_name;
+  const runOpts = st.runs.map((r) => `<option value="${esc(r.name)}" ${us.run === r.name ? "selected" : ""}>${esc(r.name)} · ${esc(r.model)} · ${esc(r.status)}${r.loss != null ? " · loss " + (+r.loss).toFixed(2) : ""}</option>`).join("");
+  const quantOpts = st.quants.map((q) => `<option value="${q.id}" ${us.quant === q.id ? "selected" : ""}>${esc(q.name)}</option>`).join("");
+  const busy = us.running;
+  const files = `<div class="card wide"><h2>1 · Make the files</h2>
+    <div class="row"><label>Run <select id="us-run">${runOpts}</select></label><label>File size <select id="us-quant">${quantOpts}</select></label>
+      <label>Context <select id="us-ctx">${[4096, 8192, 16384, 32768].map((n) => `<option ${us.numCtx === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
+    <p class="dim">Joins the trained add-on into the model and makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; the file is 1 to 6 GB).</p>
+    <button class="primary" id="us-make" ${busy || !st.env_ready ? "disabled" : ""}>Make the files</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first.</span>` : ""}</div>`;
+  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.size_mb != null ? e.size_mb + " MB" : "file missing"}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
+      ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
+  const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
+  const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
+  const exOpts = st.exports.map((e) => `<option value="${esc(e.name)}" ${us.exp === e.name ? "selected" : ""}>${esc(e.name)}</option>`).join("");
+  if (!us.exp && st.exports.length) us.exp = st.exports[0].name;
+  const install = st.exports.length ? `<div class="card wide"><h2>2 · Put it into Ollama</h2>
+    <div class="row"><label>Files <select id="us-exp">${exOpts}</select></label><label>Ollama server <select id="us-server">${srvOpts}</select></label>
+      <button class="secondary" id="us-addsrv">Add a server…</button></div>
+    ${us.adding ? `<div class="row"><input type="text" id="srv-name" placeholder="Name, e.g. TrueNAS"><input type="text" id="srv-url" placeholder="Address, e.g. http://truenas:11434"><button class="primary" id="srv-save">Add</button><button class="secondary" id="srv-cancel">Cancel</button></div>` : ""}
+    <div class="row"><label>Model name in Ollama <input type="text" id="us-name" value="${esc(us.modelName)}" style="min-width:220px"></label></div>
+    <div class="row"><button class="secondary" id="us-check" ${busy ? "disabled" : ""}>Is Ollama running?</button><button class="primary" id="us-install" ${busy ? "disabled" : ""}>Install into Ollama</button><button class="secondary" id="us-probe" ${busy ? "disabled" : ""}>Test it with a question</button></div>
+    ${us.check ? `<div class="${us.check.ok ? "ok" : "err"}">${esc(us.check.text)}</div>` : ""}
+    ${us.probe ? `<div class="sample"><div class="q">${esc(us.probe.question)}</div><div class="ans">${esc(us.probe.answer) || "<em>(no answer)</em>"}</div><div class="dim">One of the training's own questions. If the answer is empty or nonsense, something is wrong with how Ollama runs the model: tell me what you see.</div></div>` : ""}</div>` : "";
+  const name = us.modelName || st.suggested_name;
+  const env = `${name}`;
+  const how = st.exports.length ? `<div class="card wide"><h2>3 · Use it in nd-world</h2>
+    <p><strong>nd-world with Ollama</strong> (the legacy AI back-end):</p>
+    <ol><li>On the computer where nd-world runs, set <code>OLLAMA_MODEL=${esc(env)}</code> ${copyBtn("OLLAMA_MODEL=" + env)} in <code>.env</code> (or in the compose file), and <code>OLLAMA_URL</code> to the Ollama server you installed it into.</li>
+    <li>Restart nd-world. Or, without restarting: AI → Models tab → pick <strong>${esc(env)}</strong> → ✓ Use.</li>
+    <li>Keep nd-world's <strong>lore search</strong> switched on: the model was trained to use the context nd-world gives it.</li></ol>
+    <p><strong>On your TrueNAS server:</strong> add the server above (its Ollama must listen on the network: <code>OLLAMA_HOST=0.0.0.0</code>), install the model there, then set <code>OLLAMA_MODEL</code> as above. The model uses the server's graphics card like any other model.</p>
+    <p><strong>nd-world with Unsloth Studio</strong>: the GGUF file in the folder above can be loaded in Studio's Model Hub (local model); then set <code>UNSLOTH_MODEL</code> to it and <code>LLM_CONTEXT_TOKENS</code> to the context length it was loaded with (${us.numCtx}). The chat template inside the file answers without thinking, as the model was trained.</p>
+    <div class="warn"><strong>For the game master only.</strong> This model was trained on <em>all</em> of your world's text, including GM secrets, and it will repeat them. If players can use AI in this world ("players can use Ask AI"), turn that off, or keep players on another model.</div></div>` : "";
+  const prog = (us.running || us.step) ? `<div class="stepline">${esc(us.step)}</div>${us.progress != null ? `<progress max="1" value="${us.progress}"></progress>` : ""}` : "";
+  const msg = `${us.error ? `<div class="err">${esc(us.error)}</div>` : ""}${us.ok ? `<div class="ok">${esc(us.ok)}</div>` : ""}`;
+  const log = us.log.length ? `<details><summary>Log</summary><pre class="log">${us.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
+  return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Turns the trained model into a file nd-world can use, installs it into Ollama and shows what to set. The help panel explains each part.</p>
+    ${files}${prog}${msg}${log}${list}${install}${how}`;
+}
+
+async function usRefresh() {
+  try { us.state = await invoke("export_state"); } catch (e) { us.error = String(e); }
+  if (page === "use") render();
+}
+
+function onExportEvent(p) {
+  if (p.kind === "log") us.log.push(p.text);
+  else if (p.kind === "step") { us.step = `Step ${p.index} of ${p.total}: ${p.text}`; us.progress = (p.index - 1) / p.total; }
+  else if (p.kind === "progress") { if (p.text) us.step = p.text; if (p.value != null) us.progress = p.value; }
+  else if (p.kind === "done") {
+    us.running = false; us.progress = null; us.step = "";
+    const d = p.data || {};
+    if (d.probe) us.probe = d.probe;
+    else if (d.ollama_version) us.check = { ok: true, text: `Ollama ${d.ollama_version} is running. Models there: ${d.models.length ? d.models.join(", ") : "none yet"}.` };
+    else if (d.installed) us.ok = `Installed as "${d.installed}" at ${d.url}.`;
+    else if (d.gguf_file) us.ok = `Files made: ${d.name}.`;
+    usRefresh(); setState_(); 
+  } else if (p.kind === "error") {
+    us.running = false; us.progress = null; us.step = "";
+    if (us.pending === "check") us.check = { ok: false, text: p.text }; else us.error = p.text;
+    usRefresh();
+  }
+  if (page === "use") render();
+}
+
+async function setState_() { try { setState(await invoke("get_state")); } catch (_) { /* ignore */ } }
+
+async function usRun(kind, cmd, args) {
+  us.running = true; us.error = null; us.ok = null; us.log = []; us.step = "Starting…"; us.progress = null; us.pending = kind;
+  if (kind === "probe") us.probe = null; if (kind === "check") us.check = null;
+  render();
+  try { await invoke(cmd, args); } catch (e) { us.running = false; us.error = String(e); us.step = ""; render(); }
+}
+
+function wireUse() {
+  if (page !== "use" || !us.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, key, num) => { const e = $(id); if (e) e.onchange = () => { us[key] = num ? Number(e.value) : e.value; }; };
+  bind("us-run", "run"); bind("us-quant", "quant"); bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
+  const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
+  document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
+  on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx }));
+  on("us-check", () => usRun("check", "ollama_check", { url: us.server }));
+  on("us-install", () => usRun("install", "ollama_install", { export: us.exp, url: us.server, name: us.modelName || us.state.suggested_name }));
+  on("us-probe", () => usRun("probe", "ollama_probe", { url: us.server, name: us.modelName || us.state.suggested_name }));
+  on("us-addsrv", () => { us.adding = true; render(); });
+  on("srv-cancel", () => { us.adding = false; render(); });
+  on("srv-save", async () => {
+    try { us.state = await invoke("ollama_server_add", { name: $("srv-name").value, url: $("srv-url").value }); us.server = us.state.servers.at(-1).url; us.adding = false; us.error = null; }
+    catch (e) { us.error = String(e); }
+    render();
+  });
+}
+
+// ------------------------------------------------------------------------------------------- retrain with the new export (step 1)
+let rt = { info: null, confirm: false, fromPrev: false, exportAfter: false, installAfter: false, error: null };
+
+async function rtRefresh() {
+  try { rt.info = await invoke("retrain_info"); } catch (e) { rt.info = null; }
+  if (page === "data") render();
+}
+
+function retrainCard() {
+  const i = rt.info;
+  if (!i || !i.available) return rt.error ? `<div class="err">${esc(rt.error)}</div>` : "";
+  const l = i.last_run;
+  if (!rt.confirm) return `<div class="card wide"><h2>Your world has changed</h2><p>${esc(i.summary)}</p>
+    <p class="dim">Your trained model (${esc(l.model)}) does not know about this yet.</p><button class="primary" id="rt-open">Retrain with the new export</button>${rt.error ? `<div class="err">${esc(rt.error)}</div>` : ""}</div>`;
+  const hasEnv = us.state && us.state.servers.length;
+  return `<div class="card wide"><h2>Retrain with the new export</h2><p>${esc(i.summary)}</p><p>This will:</p><ol>${i.steps.map((x) => `<li>${esc(x)}</li>`).join("")}</ol>
+    <label class="opt"><input type="checkbox" id="rt-prev" ${rt.fromPrev || (i.continue_suggested && rt.fromPrev !== false) ? "checked" : ""}> Continue from the previous model (shorter and faster; best for small changes${i.continue_suggested ? "" : ". More than a quarter of your world changed, so training again from the original is cleaner"})</label>
+    <label class="opt"><input type="checkbox" id="rt-export" ${rt.exportAfter ? "checked" : ""}> Then make the files for nd-world (same size as before, Q4_K_M if none yet)</label>
+    <label class="opt"><input type="checkbox" id="rt-install" ${rt.installAfter ? "checked" : ""} ${hasEnv ? "" : "disabled"}> Then install it into Ollama on this computer</label>
+    <div class="row"><button class="primary" id="rt-go">Start</button><button class="secondary" id="rt-cancel">Cancel</button></div></div>`;
+}
+
+function wireRetrain() {
+  if (page !== "data") return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("rt-open", () => { rt.confirm = true; rt.fromPrev = rt.info.continue_suggested; render(); });
+  on("rt-cancel", () => { rt.confirm = false; render(); });
+  on("rt-go", async () => {
+    rt.fromPrev = $("rt-prev").checked; rt.exportAfter = $("rt-export").checked; rt.installAfter = $("rt-install").checked;
+    rt.error = null;
+    try {
+      const url = rt.installAfter && us.state ? (us.state.servers.find((x) => x.url.includes("localhost")) || us.state.servers[0]).url : null;
+      tr.metrics = []; tr.samples = []; tr.log = []; tr.progress = null; tr.stepText = "Making the new training data…"; tr.error = null; tr.notice = null; tr.running = true;
+      await invoke("retrain_start", { fromPrevious: rt.fromPrev, exportAfter: rt.exportAfter, installUrl: url, ollamaName: null });
+      rt.confirm = false; rt.info = null; go("train");
+    } catch (e) { tr.running = false; rt.error = String(e); render(); }
   });
 }
 
@@ -326,7 +470,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -350,6 +494,8 @@ function wire() {
   });
   wireDataset();
   wireTrain();
+  wireUse();
+  wireRetrain();
   on("recheck", refreshEnv);
   on("install", () => startEnv("env_install"));
   on("selftest", () => startEnv("env_selftest"));
@@ -418,7 +564,7 @@ async function checkFile(path) {
 async function applyFile() {
   const r = await call("apply_bundle", { path: pending.path });
   pending = null;
-  if (r) { setState(r.state); message = { kind: "ok", text: r.changes ? "Imported. Changes: " + r.changes : "Imported." }; }
+  if (r) { setState(r.state); message = { kind: "ok", text: r.changes ? "Imported. Changes: " + r.changes : "Imported." }; rtRefresh(); }
   render();
 }
 
@@ -429,6 +575,8 @@ async function go(key) {
   if (key === "setup") refreshEnv();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
+  if (key === "use" && state.bundle) usRefresh();
+  if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
   $("help").innerHTML = await invoke("help", { key });
   $("help").scrollTop = 0;
 }
@@ -446,6 +594,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   go("welcome");

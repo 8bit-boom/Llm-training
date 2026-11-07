@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::config_dir;
 
+/// An Ollama server the model can be installed into (this PC, the TrueNAS box ...).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OllamaServer {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -14,12 +21,14 @@ pub struct Settings {
     pub welcome_seen: bool,
     /// "auto" (follow the system), "light" or "dark" (night mode)
     pub theme: String,
+    pub ollama_servers: Vec<OllamaServer>,
     pub recent_projects: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), recent_projects: Vec::new() }
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(),
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], recent_projects: Vec::new() }
     }
 }
 

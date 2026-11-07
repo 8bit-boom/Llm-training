@@ -16,7 +16,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M4 Training setup: GPU/driver checks, uv install, Python worker, GPU self-test | built; needs a run on a real NVIDIA PC (the RTX 5090) |
 | M5 Step 2: make training data (world book + simple facts), review, save versions | done |
 | M6 Step 3: PEFT + SFT training (Unsloth), live charts, stop/resume | built; needs a first run on the RTX 5090 |
-| M7 onward (export, TrueNAS, full fine-tune ...) | not started |
+| M7 Step 5: GGUF + Modelfile, install into Ollama (PC or TrueNAS), "Retrain with the new export" | built; needs a first run with a real model and Ollama |
+| M8 onward (TrueNAS worker, full fine-tune ...) | not started |
 
 ## Build and run
 
@@ -57,3 +58,18 @@ training), `progress`, `log`, `result`. **Stop** writes a STOP file; the worker 
 otherwise); **Continue** resumes from the last checkpoint. Each run lives in `runs/<name>/` (`config.json`, `state.json`, `metrics.jsonl`, `checkpoints/`, `adapter/`).
 
 Worker tests (CPU, tiny random models, no downloads): `pip install torch transformers trl peft datasets pytest && cd worker && python -m pytest tests`.
+
+## Export and retrain (M7)
+
+**Step 5** makes `exports/<run>-<size>/` with `model-<size>.gguf`, a `Modelfile` and a model card. The worker merges the trained LoRA into the model (16-bit) and makes the
+GGUF with Unsloth's `save_pretrained_gguf`, or, without Unsloth, with a llama.cpp it finds (`LLAMA_CPP_DIR`, `~/llama.cpp`, a `llama.cpp` folder next to the program).
+Qwen3.5's chat template is edited to answer without thinking by default. **Install into Ollama** uploads the file as a blob and creates the model through Ollama's HTTP API
+(`/api/blobs`, `/api/create`), so it works for this PC and for a server such as the TrueNAS box (`http://truenas:11434`; Ollama there needs `OLLAMA_HOST=0.0.0.0`).
+**Test it** asks the installed model one of the training questions. The page lists what to set in nd-world (`OLLAMA_MODEL`, or `UNSLOTH_MODEL` + `LLM_CONTEXT_TOKENS`) and warns
+that the model knows all GM secrets.
+
+**Retrain with the new export** (Step 1, after a newer `.ndtrain` was imported): makes the examples again (drops and edits stay), saves a new data version, trains a new run with the
+last finished run's settings (optionally continuing from its adapter with a shorter run, suggested when under a quarter of the world changed) and can then make the files and
+install them. Earlier runs, versions and files are kept.
+
+Tests: Rust `cargo test --workspace` (the template test uses `go` when installed), worker `cd worker && python -m pytest tests`.
