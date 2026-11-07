@@ -150,7 +150,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -207,11 +207,23 @@ function renderTrain() {
   const pl = tr.plan;
   const sel = st.models.find((c) => c.model.id === tr.model);
   const exp = state.settings.expert_mode && pl ? `<div class="card wide"><h2>Settings (Expert)</h2><div class="grid">${[
-    ["rank", "LoRA rank", pl.hyper.rank], ["lr", "Learning rate", pl.hyper.lr], ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
+    ...(tr.method === "full" ? [] : [["rank", "LoRA rank", pl.hyper.rank]]), ["lr", "Learning rate", pl.hyper.lr], ...(pl.hyper.stages === "book_first" ? [["book_epochs", "Passes over the world book", pl.hyper.book_epochs]] : []), ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
     ["batch", "Batch size", pl.hyper.batch], ["grad_accum", "Gradient accumulation", pl.hyper.grad_accum], ["max_seq", "Sequence length (tokens)", pl.hyper.max_seq]].map(([k, l, val]) =>
       `<label>${l}<input type="text" class="ov" data-key="${k}" value="${tr.over[k] ?? val}"></label>`).join("")}</div></div>` : "";
-  const planHtml = pl ? `<div class="card wide"><h2>The plan</h2><p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
+  const planHtml = pl ? `<div class="card wide"><h2>The plan</h2>${pl.hyper.stages === "book_first" ? `<p>Two stages: the <strong>world book</strong> (${v.counts.world_book_texts} texts, ${pl.hyper.book_epochs} passes), then the <strong>practice answers</strong> (${v.counts.train_chat} examples, ${pl.hyper.epochs} passes).</p>` : ""}<p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
     ${pl.notes.length ? `<ul>${pl.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>` : "";
+  const TYPES = [["lora", "LoRA, 16-bit", "Trains a small add-on; the original model stays safe. Recommended whenever it fits."],
+    ["qlora", "QLoRA, 4-bit", "The same with the model shrunk to 4-bit: needs less memory, a little less quality."],
+    ["full", "Full fine-tune", "Changes every weight of the model: the strongest learning, but needs much more memory and disk, can make the model forget how to chat, and gives a full-size copy."]];
+  const typeCards = sel ? TYPES.map(([t, name, desc]) => {
+    const info = sel[t], fit = FIT[info.fit] || FIT.unknown;
+    const blocked = t === "full" && !info.available && !(tr.tryAnyway && info.reasons.length === 1 && info.reasons[0].includes("needs about") && !tr.server);
+    return `<button class="mcard ${tr.method === t ? "sel" : ""} ${blocked ? "off" : ""}" data-type="${t}" ${blocked ? "disabled" : ""}><strong>${name}${sel.recommended === t ? " · recommended" : ""}</strong>
+      <span>${fit[0]} ${fit[1]} · ≈ ${info.measured != null ? info.measured + " GB measured" : info.est_vram_gb + " GB"}${t === "full" ? ` · disk ≈ ${info.disk_gb} GB` : ""}</span><span class="dim">${desc}</span></button>`;
+  }).join("") : "";
+  const fullInfo = sel && sel.full;
+  const typeWhy = fullInfo && !fullInfo.available ? `<div class="dim">Full fine-tune is not available here: ${fullInfo.reasons.map(esc).join(" ")}</div>
+    ${state.settings.expert_mode && !tr.server && fullInfo.reasons.length === 1 && fullInfo.reasons[0].includes("needs about") ? `<label class="opt"><input type="checkbox" id="tr-anyway" ${tr.tryAnyway ? "checked" : ""}> Try anyway (the memory figure is an estimate; it may run out of memory)</label>` : ""}` : "";
   const last = st.runs[0];
   const canResume = last && (last.status === "stopped" || last.status === "failed") && !tr.running;
   const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
@@ -224,14 +236,19 @@ function renderTrain() {
     ${(() => { const m = tr.metrics.at(-1); return m ? `<div class="stats"><span>Step <strong>${m.step}/${m.total_steps}</strong></span><span>Loss <strong>${(+m.loss).toFixed(3)}</strong></span><span>Memory peak <strong>${m.vram_mb ? (m.vram_mb / 1024).toFixed(1) + " GB" : "–"}</strong></span><span>GPU <strong>${m.gpu_temp != null ? m.gpu_temp + " °C" : "–"}</strong></span><span>Time left <strong>${fmtEta(m.eta_s)}</strong></span></div>` : ""; })()}
     ${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
     ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
-  const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th>Where</th><th></th></tr>${st.runs.map((r) =>
-    `<tr><td>${esc(r.name)}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
+  const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Type</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th>Where</th><th></th></tr>${st.runs.map((r) =>
+    `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
   return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
     <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${tr.server ? "" : env}${where}
     <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>
-    <div class="card wide"><h2>2 · How to train</h2><div class="row"><label>Type <select id="tr-method"><option value="lora" ${tr.method === "lora" ? "selected" : ""}>LoRA, 16-bit (recommended)</option><option value="qlora" ${tr.method === "qlora" ? "selected" : ""}>QLoRA, 4-bit (needs less memory)</option></select></label>
-      <label>Preset <select id="tr-preset"><option value="quick" ${tr.preset === "quick" ? "selected" : ""}>Quick test (minutes)</option><option value="normal" ${tr.preset === "normal" ? "selected" : ""}>Normal</option><option value="best" ${tr.preset === "best" ? "selected" : ""}>Best quality (slower)</option></select></label></div>
-      <p class="dim">Full fine-tuning (changing every weight) comes in a later version.</p></div>
+    <div class="card wide"><h2>2 · How to train</h2>
+      <p class="dim" style="margin-top:0">How much of the model should change?</p>
+      <div class="mcards">${typeCards}</div>
+      ${typeWhy}
+      <p class="dim" style="margin-bottom:4px">What should it learn from?</p>
+      <label class="opt"><input type="radio" name="tr-stages" value="mixed" ${tr.stages === "mixed" || tr.preset === "quick" ? "checked" : ""}> <strong>The world book and the practice answers together</strong> (default)</label>
+      <label class="opt"><input type="radio" name="tr-stages" value="book_first" ${tr.stages === "book_first" && tr.preset !== "quick" ? "checked" : ""} ${tr.preset === "quick" ? "disabled" : ""}> <strong>The world book first, then the practice answers</strong> (two stages; better at remembering facts, takes longer${tr.preset === "quick" ? "; not for the quick test" : ""})</label>
+      <div class="row" style="margin-top:10px"><label>Preset <select id="tr-preset"><option value="quick" ${tr.preset === "quick" ? "selected" : ""}>Quick test (minutes)</option><option value="normal" ${tr.preset === "normal" ? "selected" : ""}>Normal</option><option value="best" ${tr.preset === "best" ? "selected" : ""}>Best quality (slower)</option></select></label></div></div>
     ${planHtml}${exp}<div class="card wide"><h2>3 · Train</h2>${ctrl}</div>${live}${runs}`;
 }
 
@@ -243,7 +260,12 @@ async function trRefresh() {
       tr.model = tr.state.models.find((c) => c.model.id === "qwen3.5-4b")?.model.id ?? first.model.id;
       tr.method = (tr.state.models.find((c) => c.model.id === tr.model) || first).recommended;
     }
-    if (tr.model) tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset, server: tr.server || null });
+    if (tr.model) {
+      // a type that cannot be used here (full fine-tuning on a server or a small card) falls back to the recommended one
+      const cur = tr.state.models.find((c) => c.model.id === tr.model);
+      if (cur && tr.method === "full" && !cur.full.available && !tr.tryAnyway) tr.method = cur.recommended;
+      tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset, server: tr.server || null, stages: tr.preset === "quick" ? null : tr.stages });
+    }
   } catch (e) { tr.error = String(e); }
   if (page === "train") render();
 }
@@ -255,9 +277,10 @@ function onServerEvent(p) {
 }
 
 function onTrainEvent(p) {
-  if (p.kind === "metric") { tr.metrics.push(p); tr.progress = p.step / Math.max(1, p.total_steps); tr.stepText = `Step ${p.step} of ${p.total_steps}`; }
+  if (p.kind === "metric") { tr.metrics.push(p); tr.progress = p.step / Math.max(1, p.total_steps); tr.stepText = `${p.stage_count > 1 ? (p.stage === "world_book" ? "World book · " : "Practice · ") : ""}Step ${p.step} of ${p.total_steps}`; }
   else if (p.kind === "sample") tr.samples.push(p);
   else if (p.kind === "stage") { tr.stepText = p.text; tr.progress = null; }
+  else if (p.kind === "start" && p.stage_count > 1) tr.stepText = `Stage ${p.stage_index + 1} of ${p.stage_count}: ${p.stage === "world_book" ? "reading the world book" : "practising answers"}`;
   else if (p.kind === "progress") { if (p.step !== "train" || tr.progress == null) { tr.stepText = p.text || p.step; tr.progress = p.value; } }
   else if (p.kind === "log") tr.log.push(p.text);
   else if (p.kind === "done") { tr.running = false; tr.notice = p.data.stopped ? `Stopped at step ${p.data.steps}. You can continue this run later.` : `Finished: ${p.data.steps} steps, final loss ${p.data.final_loss != null ? (+p.data.final_loss).toFixed(3) : "–"}.`; trRefresh(); }
@@ -268,7 +291,9 @@ function onTrainEvent(p) {
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = k === "lr" || k === "epochs" ? Number(v) : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = Number(v); });
+  if (tr.preset !== "quick") over.stages = tr.stages;
+  if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
   catch (e) { tr.running = false; tr.error = String(e); render(); }
 }
@@ -287,7 +312,9 @@ function wireTrain() {
       invoke("train_server_check", { url: tr.server }).catch(() => {}); }
     catch (e) { tr.srvCheck = { ok: false, text: String(e) }; render(); }
   });
-  const m = $("tr-method"); if (m) m.onchange = () => { tr.method = m.value; tr.over = {}; trRefresh(); };
+  document.querySelectorAll("[data-type]").forEach((b) => b.onclick = () => { tr.method = b.dataset.type; tr.over = {}; trRefresh(); });
+  document.querySelectorAll('input[name="tr-stages"]').forEach((r) => r.onchange = () => { tr.stages = r.value; tr.over = {}; trRefresh(); });
+  const any = $("tr-anyway"); if (any) any.onchange = () => { tr.tryAnyway = any.checked; trRefresh(); };
   const pr = $("tr-preset"); if (pr) pr.onchange = () => { tr.preset = pr.value; tr.over = {}; trRefresh(); };
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   on("tr-start", () => trStart(null));

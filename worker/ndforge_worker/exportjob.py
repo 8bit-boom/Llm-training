@@ -1,6 +1,6 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
-Config keys: adapter (folder), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q8_0", "f16"), backend (auto|unsloth|hf), gguf (bool),
+Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q8_0", "f16"), backend (auto|unsloth|hf), gguf (bool),
 keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF)."""
 import json
 import os
@@ -107,7 +107,8 @@ def run(cfg: dict) -> int:
     if quant not in QUANTS:
         raise ValueError(f"Unknown quantisation: {quant}")
     backend = backends.prepare(cfg.get("backend", "auto"))
-    merged = out / "merged"
+    full_model = cfg.get("full_model")
+    merged = Path(full_model) if full_model else out / "merged"
     gguf_path = None
     note = ""
     if backend == "unsloth" and cfg.get("gguf", True):
@@ -115,7 +116,7 @@ def run(cfg: dict) -> int:
         from .families import family
         loader = FastModel if family(cfg["base"]["family"])["loader"] == "FastModel" else FastLanguageModel
         protocol.progress("merge", 0.1, "Loading the trained model")
-        model, tokenizer = loader.from_pretrained(model_name=cfg["adapter"], max_seq_length=cfg.get("max_seq", 2048), dtype=None, load_in_4bit=False, load_in_16bit=True)
+        model, tokenizer = loader.from_pretrained(model_name=full_model or cfg["adapter"], max_seq_length=cfg.get("max_seq", 2048), dtype=None, load_in_4bit=False, load_in_16bit=True)
         tmp = out / "unsloth_gguf"
         protocol.progress("gguf", 0.3, "Merging and converting to GGUF (Unsloth)")
         model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=quant)
@@ -128,15 +129,19 @@ def run(cfg: dict) -> int:
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(str(tmp) + "_gguf", ignore_errors=True)
     else:
-        merge_hf(cfg, merged)
+        if full_model:
+            protocol.progress("merge", 0.5, "Using the fully trained model")
+            patch_template_dir(merged, cfg["base"]["family"])
+        else:
+            merge_hf(cfg, merged)
         if cfg.get("gguf", True):
             gguf_path = gguf_with_llama_cpp(cfg, merged, out, quant)
-    if gguf_path and not cfg.get("keep_merged") and merged.exists():
+    if gguf_path and not cfg.get("keep_merged") and not full_model and merged.exists():
         shutil.rmtree(merged, ignore_errors=True)
     elif not gguf_path:
         note = "Merged 16-bit model only (no GGUF requested)."
     protocol.progress("done", 1.0, "Export ready")
-    summary = {"gguf": str(gguf_path) if gguf_path else None, "merged_dir": str(merged) if merged.exists() else None, "quant": quant, "backend": backend,
+    summary = {"gguf": str(gguf_path) if gguf_path else None, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
                "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)

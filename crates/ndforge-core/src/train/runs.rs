@@ -40,10 +40,8 @@ pub fn latest_version(p: &Project) -> Option<(u32, Value)> {
 
 pub fn data_stats(manifest: &Value) -> super::plan::DataStats {
     let c = &manifest["counts"];
-    super::plan::DataStats {
-        examples: c["world_book_texts"].as_u64().unwrap_or(0) + c["train_chat"].as_u64().unwrap_or(0),
-        tokens: manifest["tokens"]["train"].as_u64().unwrap_or(0),
-    }
+    let (text, chat) = (c["world_book_texts"].as_u64().unwrap_or(0), c["train_chat"].as_u64().unwrap_or(0));
+    super::plan::DataStats { examples: text + chat, tokens: manifest["tokens"]["train"].as_u64().unwrap_or(0), text_examples: text, chat_examples: chat }
 }
 
 /// A few questions the training shows answers to now and then: identity questions about distinct entries, and one about secrets, so the owner can
@@ -81,13 +79,13 @@ fn measured_file() -> PathBuf {
 /// (peak GB, sequence length, batch) of the last finished run of this model and method on this PC.
 pub fn load_measured(model_id: &str, method: Method) -> Option<(f64, u32, u32)> {
     let v = read_json(&measured_file())?;
-    let e = &v[model_id][if method == Method::Lora { "lora" } else { "qlora" }];
+    let e = &v[model_id][method.key()];
     Some((e["gb"].as_f64()?, e["seq"].as_u64()? as u32, e["batch"].as_u64()? as u32))
 }
 
 fn record_measured(model_id: &str, method: Method, gb: f64, seq: u32, batch: u32) {
     let mut v = read_json(&measured_file()).unwrap_or_else(|| json!({}));
-    v[model_id][if method == Method::Lora { "lora" } else { "qlora" }] = json!({"gb": (gb * 10.0).round() / 10.0, "seq": seq, "batch": batch, "when": chrono::Utc::now().format("%Y-%m-%d").to_string()});
+    v[model_id][method.key()] = json!({"gb": (gb * 10.0).round() / 10.0, "seq": seq, "batch": batch, "when": chrono::Utc::now().format("%Y-%m-%d").to_string()});
     let _ = write_json(&measured_file(), &v);
 }
 
@@ -103,11 +101,19 @@ pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, ver
     if !train.is_file() {
         return Err(Error::new("The training data is missing. Save a version in Step 2 first."));
     }
-    Ok(json!({
+    let mut job = json!({
         "job": "train", "model": {"repo": m.repo, "family": m.family}, "method": method, "backend": "auto",
         "dataset": {"train": train, "version": version}, "hyper": hyper, "out": runs_dir(p).join(name), "resume": resume,
         "probes": probes_from_dataset(&train, 3), "probe_every": (hyper.save_steps).max(10), "probe_tokens": 120,
-    }))
+    });
+    // two stages: read the world book first, then practise answering (a fixed number of steps keeps one stage)
+    if hyper.stages == "book_first" && hyper.max_steps.is_none() {
+        job["stages"] = json!([
+            {"name": "world_book", "filter": "text", "epochs": hyper.book_epochs},
+            {"name": "practice", "filter": "chat", "epochs": hyper.epochs},
+        ]);
+    }
+    Ok(job)
 }
 
 fn set_state(dir: &Path, patch: Value) {
@@ -250,6 +256,7 @@ pub fn list_runs(p: &Project) -> Vec<Value> {
     let mut out: Vec<Value> = std::fs::read_dir(runs_dir(p)).map(|d| d.flatten().filter_map(|e| {
         let mut st = read_json(&e.path().join("state.json"))?;
         st["has_adapter"] = json!(e.path().join("adapter").join("adapter_config.json").is_file());
+        st["has_model"] = json!(e.path().join("model").join("config.json").is_file());
         Some(st)
     }).collect()).unwrap_or_default();
     out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
@@ -269,6 +276,8 @@ pub fn resumable(p: &Project, name: &str) -> bool {
     if read_json(&runs_dir(p).join(name).join("state.json")).is_some_and(|s| s["server"].is_string() && matches!(s["status"].as_str(), Some("stopped" | "failed" | "interrupted"))) {
         return true;
     }
+    // one stage keeps its checkpoints directly in checkpoints/, a two-stage run in checkpoints/<stage>/
     let d = runs_dir(p).join(name).join("checkpoints");
-    std::fs::read_dir(d).map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false)
+    let has = |dir: &Path| std::fs::read_dir(dir).map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false);
+    has(&d) || std::fs::read_dir(&d).map(|r| r.flatten().any(|e| e.path().is_dir() && has(&e.path()))).unwrap_or(false)
 }

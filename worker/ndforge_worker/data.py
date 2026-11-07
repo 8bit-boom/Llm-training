@@ -40,7 +40,7 @@ def render_chat(tokenizer, messages: list, fam_name: str):
 
 
 def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 3407):
-    """[{input_ids, completion_mask}] and counts. Rows whose prompt alone does not fit are skipped; longer rows are cut at max_len."""
+    """[{input_ids, completion_mask, kind: "text"|"chat"}] and counts. Rows whose prompt alone does not fit are skipped; longer rows are cut at max_len."""
     tok = _inner(tokenizer)
     bos = getattr(tok, "bos_token", None)
     out, stats = [], {"text": 0, "chat": 0, "skipped_too_long": 0, "cut": 0, "empty": 0}
@@ -72,7 +72,7 @@ def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 
             ids, mask = ids[:max_len], mask[:max_len]
             stats["cut"] += 1
         stats[kind] += 1
-        out.append({"input_ids": ids, "completion_mask": mask})
+        out.append({"input_ids": ids, "completion_mask": mask, "kind": kind})
     random.Random(seed).shuffle(out)
     stats["tokens"] = sum(len(x["input_ids"]) for x in out)
     stats["learned_tokens"] = sum(sum(x["completion_mask"]) for x in out)

@@ -8,7 +8,7 @@ use ndforge_core::export::runs as exports;
 use ndforge_core::model::AppModel;
 use ndforge_core::project::Project;
 use ndforge_core::sample;
-use ndforge_core::train::plan::{base_hyper, Method, Preset};
+use ndforge_core::train::plan::{base_hyper, base_hyper_for, Method, Preset};
 use ndforge_core::train::retrain;
 use ndforge_core::train::runs as truns;
 use serde_json::{json, Value};
@@ -168,4 +168,55 @@ fn model_settings_for_ollama_servers_and_the_probe_question() {
     m.dataset_save().unwrap();
     let (sys, q) = m.probe_question().unwrap();
     assert!(sys.contains("Ashfall Reach") && q.contains("Anders") || q.contains("Dockside"), "{sys} / {q}");
+}
+
+
+/// A finished FULL fine-tune on disk: the whole model in runs/<name>/model, no adapter.
+fn fake_done_full_run(p: &Project, name: &str, version: u32) {
+    let rdir = truns::runs_dir(p).join(name);
+    std::fs::create_dir_all(rdir.join("model")).unwrap();
+    std::fs::write(rdir.join("model/config.json"), "{}").unwrap();
+    std::fs::write(rdir.join("model/model.safetensors"), "W").unwrap();
+    let m = ndforge_core::train::catalog::find("qwen3.5-2b").unwrap();
+    let hyper = base_hyper_for(Method::Full, Preset::Normal);
+    let job = truns::build_job(p, &m, Method::Full, &hyper, version, name, false).unwrap();
+    std::fs::write(rdir.join("config.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+    std::fs::write(rdir.join("summary.json"), json!({"steps": 30, "final_loss": 0.6}).to_string()).unwrap();
+    std::fs::write(rdir.join("result.json"), "{}").unwrap();
+    std::fs::write(rdir.join("state.json"), json!({"name": name, "status": "done", "model": m.name, "model_id": m.id, "method": "full", "step": 30, "total_steps": 30}).to_string()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_full_run_is_exported_from_its_model_folder_and_retrained_from_it() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // the fake worker insists on full_model and on there being no adapter in the job
+    fake_worker(d.path(), r#"if grep -q '"full_model"' "$5" && ! grep -q '"adapter"' "$5"; then
+  printf 'GGUF' > "$out/model-$quant.gguf"
+  echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\",\"full_model\":true}}"
+else
+  echo '{"type":"error","code":"export_failed","message":"wrong job"}'; exit 1
+fi"#);
+    let mut p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_full_run(&p, "full1", 1);
+    let runs_list = exports::exportable_runs(&p);
+    assert_eq!((runs_list.len(), runs_list[0]["has_model"].clone(), runs_list[0]["has_adapter"].clone()), (1, json!(true), json!(false)));
+    let meta = exports::execute(&p, "full1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(meta["quant"], "q4_k_m");
+    assert!(p.folder.join("exports/full1-q4_k_m/model-q4_k_m.gguf").is_file());
+    // retrain with the new export, continuing from the previous FULL model: the job points at its model folder
+    let f2 = d.path().join("w2.ndtrain");
+    sample::build(&f2, 2, None).unwrap();
+    p.import_bundle(&open_bundle(&f2).unwrap()).unwrap();
+    assert_eq!(retrain::info(&p).unwrap()["last_run"]["method"], "full");
+    let mut m = AppModel::load();
+    m.open_project(p.folder.to_str().unwrap()).unwrap();
+    let warm = m.retrain_job(true).unwrap();
+    assert!(warm.job["init_model"].as_str().unwrap().ends_with("runs/full1/model") && warm.job.get("init_adapter").is_none());
+    assert_eq!((warm.method, warm.hyper.lr, warm.job["method"].as_str()), (Method::Full, 1e-5, Some("full")));
+    let cold = m.retrain_job(false).unwrap();
+    assert!(cold.job.get("init_model").is_none() && cold.job.get("init_adapter").is_none());
 }

@@ -18,7 +18,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M6 Step 3: PEFT + SFT training (Unsloth), live charts, stop/resume | built; needs a first run on the RTX 5090 |
 | M7 Step 5: GGUF + Modelfile, install into Ollama (PC or TrueNAS), "Retrain with the new export" | built; needs a first run with a real model and Ollama |
 | M8 Train on the TrueNAS server (worker server + client + compose) | built; the container image still has to be built once |
-| M9 onward (full fine-tune, teacher examples, test page ...) | not started |
+| M9 Full fine-tune + "world book first, then practice" stages, type cards | built; needs a first run on the RTX 5090 |
+| M10 onward (teacher examples, test page, installers ...) | not started |
 
 ## Build and run
 
@@ -80,3 +81,10 @@ Tests: Rust `cargo test --workspace` (the template test uses `go` when installed
 `crates/ndforge-server` is the worker that runs in a container on the server (`Dockerfile.worker`, `truenas-worker-compose.yml`): token-protected HTTP, one job at a time, runs the same
 Python worker as a local run, keeps checkpoints, frees the card by unloading Ollama. In the window, **Step 3 → Where to train** picks this PC or a server; the run looks the same, the finished adapter is copied back.
 Guide: [docs/TRUENAS_WORKER.md](docs/TRUENAS_WORKER.md). Protocol: `crates/ndforge-core/src/remote/mod.rs`.
+
+## Full fine-tuning and two stages (M9)
+
+Step 3 asks two questions. **How much of the model changes?** LoRA (default), QLoRA, or **Full fine-tune** (every weight; `method: "full"`, learning rate 1e-5, batch 1, 8-bit optimizer, gradient checkpointing;
+the whole model is saved in `runs/<name>/model/`, exported without a merge, and a retrain can continue from it). A card that cannot do it is greyed out with the reason: this computer only, a bf16 card (RTX 30 series or newer) is needed,
+memory (an estimate of about 6 bytes per parameter plus activations, replaced by the measured peak after a run), disk for the checkpoints. **What should it learn from?** Both together (default), or two stages: the world book as text, then
+the practice answers (`stages` in the job; the step numbers continue, and Continue skips a finished stage). Details: `crates/ndforge-core/src/train/plan.rs`, `worker/ndforge_worker/trainjob.py`.

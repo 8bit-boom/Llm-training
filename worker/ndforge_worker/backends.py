@@ -35,17 +35,18 @@ def load_unsloth(cfg: dict):
     fam = family(cfg["model"]["family"])
     loader = FastModel if fam["loader"] == "FastModel" else FastLanguageModel
     h = cfg["hyper"]
-    kw = {"model_name": cfg["model"]["repo"], "max_seq_length": h["max_seq"], "dtype": None, "full_finetuning": False}
+    full = cfg["method"] == "full"
+    kw = {"model_name": cfg.get("init_model") or cfg["model"]["repo"], "max_seq_length": h["max_seq"], "dtype": None, "full_finetuning": full}
     if cfg["method"] == "qlora":
         kw["load_in_4bit"] = True
     else:
         kw.update(load_in_4bit=False, load_in_16bit=True)
-    init = cfg.get("init_adapter")
+    init = cfg.get("init_adapter") if not full else None
     if init:   # continue from an earlier LoRA: Unsloth loads a LoRA folder as the model (base model + trainable adapter)
         kw["model_name"] = init
     protocol.progress("load", 0.05, "Loading the model")
     model, tokenizer = loader.from_pretrained(**kw)
-    if init:
+    if init or full:   # a loaded adapter, or full fine-tuning: every weight is trained, no LoRA layers to add
         return model, tokenizer, loader
     protocol.progress("load", 0.8, "Adding the LoRA layers")
     common = {"r": h["rank"], "lora_alpha": h["alpha"], "lora_dropout": 0, "bias": "none", "random_state": h["seed"]}
@@ -64,7 +65,10 @@ def load_hf(cfg: dict):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     h = cfg["hyper"]
     _, dtype = _precision()
-    repo = cfg["model"]["repo"]
+    full = cfg["method"] == "full"
+    if full and torch.cuda.is_available() and dtype != torch.bfloat16:
+        raise RuntimeError("Full fine-tuning needs a graphics card with bf16 (RTX 30 series or newer). Use LoRA on this card.")
+    repo = cfg.get("init_model") or cfg["model"]["repo"]
     protocol.progress("load", 0.05, "Loading the model")
     tokenizer = AutoTokenizer.from_pretrained(repo)
     if tokenizer.pad_token is None:
@@ -79,6 +83,13 @@ def load_hf(cfg: dict):
         model = AutoModelForCausalLM.from_pretrained(repo, dtype=dtype, **kwargs)
     except TypeError:  # an older transformers still calls it torch_dtype
         model = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dtype, **kwargs)
+    if full:
+        # every weight is trained: nothing to attach; checkpointing keeps the activations small
+        if torch.cuda.is_available():
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            model.enable_input_require_grads()
+        model.config.use_cache = False
+        return model, tokenizer, None
     protocol.progress("load", 0.8, "Adding the LoRA layers")
     if cfg["method"] == "qlora":
         from peft import prepare_model_for_kbit_training

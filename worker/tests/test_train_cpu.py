@@ -237,3 +237,111 @@ def test_warm_start_continues_from_an_earlier_adapter(tmp_path):
     # without init_adapter the same settings start from scratch
     p3, ev3, _ = run_job(tmp_path, "qwen3_5", out=str(tmp_path / "run3"), hyper={"max_steps": 2, "lr": 1e-7, "warmup": 0})
     assert [e for e in ev3 if e["type"] == "metric"][0]["loss"] > last_loss + 0.5 * (cold_start_loss - last_loss)
+
+
+# --------------------------------------------------------------------------------------------- full fine-tuning and two stages
+
+def _params(model_dir):
+    from transformers import AutoModelForCausalLM
+    m = AutoModelForCausalLM.from_pretrained(str(model_dir))
+    return {k: v.detach().clone() for k, v in m.state_dict().items()}
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "gemma4"])
+def test_full_fine_tuning_changes_the_weights_and_saves_the_whole_model(tmp_path, family):
+    p, ev, out = run_job(tmp_path, family, "real", method="full", hyper={"max_steps": 8, "lr": 1e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-3000:]
+    res = ev[-1]["data"]
+    assert res["adapter_dir"] is None and res["method"] == "full" and Path(res["model_dir"], "config.json").exists() and list(Path(res["model_dir"]).glob("*.safetensors"))
+    assert not (out / "adapter").exists()
+    metrics = [e for e in ev if e["type"] == "metric"]
+    assert metrics[0]["loss"] - metrics[-1]["loss"] > 0.3, [m["loss"] for m in metrics]              # it learns (full steps are strong)
+    before, after = _params(tmp_path / "model"), _params(res["model_dir"])
+    changed = [k for k in before if not torch.equal(before[k], after[k])]
+    assert len(changed) > 0.8 * len(before), f"only {len(changed)} of {len(before)} tensors changed"   # every weight is trained, not a few
+    assert any(e["type"] == "sample" for e in ev)
+
+
+def test_full_fine_tuning_refuses_a_card_without_bf16_with_a_plain_message(tmp_path, monkeypatch):
+    # simulated here by calling the loader directly with a fake fp16-only card
+    from ndforge_worker import backends
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (7, 5))
+    cfg = {"method": "full", "model": {"repo": "x", "family": "qwen3_5"}, "hyper": {"rank": 4, "alpha": 4, "max_seq": 64, "seed": 1}}
+    with pytest.raises(RuntimeError, match="needs a graphics card with bf16"):
+        backends.load_hf(cfg)
+
+
+STAGES = [{"name": "world_book", "filter": "text", "epochs": 3}, {"name": "practice", "filter": "chat", "epochs": 2}]
+
+
+def test_two_stages_read_the_world_book_first_then_practise_with_continuous_steps(tmp_path):
+    p, ev, out = run_job(tmp_path, "qwen3_5", stages=STAGES, hyper={"max_steps": None, "batch": 2, "grad_accum": 1, "lr": 5e-3, "save_steps": 100})
+    assert p.returncode == 0, p.stderr[-3000:]
+    starts = [e for e in ev if e["type"] == "start"]
+    assert [(s["stage"], s["stage_index"], s["stage_count"]) for s in starts] == [("world_book", 0, 2), ("practice", 1, 2)]
+    # 4 texts x 3 epochs / batch 2 = 6 steps, then 12 conversations x 2 epochs / 2 = 12 steps; the numbering carries on across stages
+    metrics = [e for e in ev if e["type"] == "metric"]
+    assert [m["stage"] for m in metrics] == ["world_book"] * 6 + ["practice"] * 12
+    assert [m["step"] for m in metrics] == list(range(1, 19))
+    assert {m["total_steps"] for m in metrics} == {18}
+    res = ev[-1]["data"]
+    assert res["steps"] == 18 and [c["name"] for c in res["stages"]] == ["world_book", "practice"] and Path(res["adapter_dir"], "adapter_config.json").exists()
+    # a stage with nothing to learn is skipped, not an error
+    (tmp_path / "b").mkdir()
+    p2, ev2, _ = run_job(tmp_path / "b", "qwen3_5", stages=[{"name": "world_book", "filter": "text"}, {"name": "practice", "filter": "chat"}],
+                         dataset={"train": str(_only_chat(tmp_path))}, hyper={"max_steps": None, "batch": 2, "grad_accum": 1, "epochs": 1})
+    assert p2.returncode == 0 and any(e["type"] == "log" and "has no examples" in e["text"] for e in ev2)
+
+
+def _only_chat(tmp_path):
+    f = tmp_path / "chat_only.jsonl"
+    write_jsonl(f, sample_rows(8, 0))
+    return f
+
+
+def test_a_stopped_two_stage_run_continues_in_the_stage_it_was_in(tmp_path):
+    # stop during stage 2 by letting a first run finish stage 1 and then die: simulated by running only stage 1 first with its state saved
+    p, ev, out = run_job(tmp_path, "qwen3_5", stages=STAGES[:1], hyper={"max_steps": None, "batch": 2, "grad_accum": 1, "save_steps": 2})
+    assert p.returncode == 0
+    state = json.loads((out / "stage_state.json").read_text())
+    assert state["completed"] == [{"name": "world_book", "steps": 6}]
+    # continue with both stages: stage 1 is skipped, stage 2 runs and the step numbers continue after stage 1
+    p2, ev2, _ = run_job(tmp_path, "qwen3_5", stages=STAGES, resume=True, hyper={"max_steps": None, "batch": 2, "grad_accum": 1, "save_steps": 2})
+    assert p2.returncode == 0, p2.stderr[-2500:]
+    assert any(e["type"] == "log" and 'Stage "world_book" was finished before' in e["text"] for e in ev2)
+    starts = [e for e in ev2 if e["type"] == "start"]
+    assert [s["stage"] for s in starts] == ["practice"]
+    assert [e["step"] for e in ev2 if e["type"] == "metric"][0] == 7
+    assert ev2[-1]["data"]["steps"] == 18 and [c["name"] for c in ev2[-1]["data"]["stages"]] == ["world_book", "practice"]
+
+
+def test_a_full_model_continues_from_a_saved_full_model_and_is_exported_without_a_merge(tmp_path):
+    p, ev, out = run_job(tmp_path, "qwen3_5", "real", method="full", hyper={"max_steps": 20, "lr": 1e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-2000:]
+    first = [e for e in ev if e["type"] == "metric"]
+    cold, last = first[0]["loss"], first[-1]["loss"]
+    assert cold - last > 0.3
+    model_dir = ev[-1]["data"]["model_dir"]
+    # warm start: the second run loads the first run's model, so it begins near where the first ended
+    p2, ev2, _ = run_job(tmp_path, "qwen3_5", "real", method="full", init_model=model_dir, out=str(tmp_path / "run2"), hyper={"max_steps": 2, "lr": 1e-9, "warmup": 0})
+    assert p2.returncode == 0, p2.stderr[-2000:]
+    assert abs([e for e in ev2 if e["type"] == "metric"][0]["loss"] - last) < 0.5 * (cold - last)
+    # export: nothing to merge; the template of the model folder is the non-thinking one; a GGUF comes from the model folder itself
+    if sys.platform != "win32":
+        _fake_llama_cpp(tmp_path / "lcpp")
+    job = {"job": "export", "full_model": model_dir, "base": {"repo": str(tmp_path / "model"), "family": "qwen3_5"}, "out": str(tmp_path / "expfull"), "quant": "q4_k_m",
+           "backend": "hf", "gguf": sys.platform != "win32"}
+    f = tmp_path / "ej.json"
+    f.write_text(json.dumps(job), encoding="utf-8")
+    import os
+    pe = subprocess.run([sys.executable, "-X", "utf8", "-m", "ndforge_worker", str(f)], cwd=WORKER, capture_output=True, text=True, timeout=600,
+                        env={**os.environ, "LLAMA_CPP_DIR": str(tmp_path / "lcpp")})
+    assert pe.returncode == 0, pe.stderr[-2000:]
+    res = [json.loads(line) for line in pe.stdout.splitlines() if line.startswith("{")][-1]["data"]
+    assert res["full_model"] is True and Path(model_dir, "config.json").exists()               # the trained model is kept
+    tpl = Path(model_dir, "chat_template.jinja")
+    text = tpl.read_text(encoding="utf-8") if tpl.exists() else json.loads(Path(model_dir, "tokenizer_config.json").read_text())["chat_template"]
+    assert "enable_thinking is not defined or enable_thinking is false" in text
+    if sys.platform != "win32":
+        assert Path(res["gguf"]).read_bytes() == b"GGUF-Q4_K_M"

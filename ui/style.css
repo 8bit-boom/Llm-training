@@ -83,3 +83,5 @@ button.secondary[disabled] { opacity: .4; }
 .warn { border: 2px solid var(--err); border-radius: 10px; padding: 10px 14px; margin-top: 12px; background: color-mix(in srgb, var(--err) 10%, transparent); }
 .exlist { padding-left: 18px; } .exlist li { margin-bottom: 8px; }
 code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
+
+.mcard.off, .mcard:disabled { opacity: .45; cursor: not-allowed; }

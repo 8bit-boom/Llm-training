@@ -100,6 +100,10 @@ pub fn can_install(checks: &[Check]) -> bool {
 
 /// Free space on the drive holding `dir` (its nearest existing parent).
 pub fn free_disk_gb(dir: &Path) -> Option<f64> {
+    // `NDFORGE_FREE_DISK_GB` replaces the measurement (tests, or a drive that reports its size wrongly)
+    if let Some(v) = std::env::var("NDFORGE_FREE_DISK_GB").ok().and_then(|v| v.parse::<f64>().ok()) {
+        return Some(v);
+    }
     let mut d = dir;
     while !d.exists() {
         d = d.parent()?;

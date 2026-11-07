@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::paths::default_projects_dir;
 use crate::project::{BundleCheck, Project};
 use crate::train::catalog::{find, models, ModelEntry};
-use crate::train::plan::{plan, recommended_method, Hyper, Method, Preset};
+use crate::train::plan::{full_blockers, full_disk_gb, plan, recommended_method, Hyper, Method, Preset};
 use crate::export::modelfile::ollama_name;
 use crate::export::runs as exports;
 use crate::settings::{OllamaServer, TrainServer};
@@ -196,12 +196,25 @@ impl AppModel {
         };
         let version = runs::latest_version(p);
         let stats = version.as_ref().map(|(_, m)| runs::data_stats(m)).unwrap_or_default();
+        // does the card have bf16 (needed for full fine-tuning)?
+        let bf16 = match server {
+            Some(_) => server_gpu.as_ref().and_then(|g| g.get("precision")).and_then(|v| v.as_str()).map(|p| p == "bf16"),
+            None => gpu.as_ref().map(|g| g.precision() == crate::envmgr::gpu::Precision::Bf16),
+        };
         let cards: Vec<Value> = models().iter().map(|m| {
             let one = |method: Method| {
-                let pl = plan(m, method, Preset::Normal, vram, stats, runs::load_measured(&m.id, method));
-                json!({"est_vram_gb": pl.est_vram_gb, "fit": pl.fit, "measured": runs::load_measured(&m.id, method).map(|(gb, ..)| gb)})
+                let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
+                let pl = plan(m, method, Preset::Normal, vram, stats, measured);
+                let mut v = json!({"est_vram_gb": pl.est_vram_gb, "fit": pl.fit, "measured": measured.map(|(gb, ..)| gb)});
+                if method == Method::Full {
+                    let why = full_blockers(m, vram, bf16, server.is_some());
+                    v["available"] = json!(why.is_empty());
+                    v["reasons"] = json!(why);
+                    v["disk_gb"] = json!(full_disk_gb(m));
+                }
+                v
             };
-            json!({"model": m, "lora": one(Method::Lora), "qlora": one(Method::Qlora), "recommended": recommended_method(m, vram)})
+            json!({"model": m, "lora": one(Method::Lora), "qlora": one(Method::Qlora), "full": one(Method::Full), "recommended": recommended_method(m, vram)})
         }).collect();
         Ok(json!({
             "models": cards,
@@ -214,7 +227,13 @@ impl AppModel {
         }))
     }
 
+    /// `try_anyway` in the overrides is not a setting; it switches the "too big" check for full fine-tuning off (Expert mode).
     fn hyper_with(base: Hyper, overrides: &Value) -> Result<Hyper> {
+        let mut overrides = overrides.clone();
+        if let Some(o) = overrides.as_object_mut() {
+            o.remove("try_anyway");
+        }
+        let overrides = &overrides;
         let mut v = serde_json::to_value(&base)?;
         if let Some(o) = overrides.as_object() {
             for (k, x) in o.iter().filter(|(_, x)| !x.is_null()) {
@@ -224,9 +243,18 @@ impl AppModel {
                 v[k] = x.clone();
             }
         }
-        let h: Hyper = serde_json::from_value(v).map_err(|e| Error::new(format!("A setting is not valid: {e}")))?;
+        let mut h: Hyper = serde_json::from_value(v).map_err(|e| Error::new(format!("A setting is not valid: {e}")))?;
+        if !["mixed", "book_first"].contains(&h.stages.as_str()) {
+            return Err(Error::new("The stages setting must be \"mixed\" or \"book_first\"."));
+        }
+        if h.stages == "book_first" && h.max_steps.is_some() {
+            h.stages = "mixed".into();   // a fixed number of steps is a single stage (the quick test)
+        }
+        if !(h.book_epochs > 0.0 && h.book_epochs <= 20.0) {
+            return Err(Error::new("The number of passes over the world book is out of range."));
+        }
         let bad = |what: &str| Err(Error::new(format!("{what} is out of range.")));
-        if !(1..=256).contains(&h.rank) { return bad("The LoRA rank"); }
+        if method_needs_rank(&h) && !(1..=256).contains(&h.rank) { return bad("The LoRA rank"); }
         if !(h.lr > 0.0 && h.lr <= 0.01) { return bad("The learning rate"); }
         if !(h.epochs > 0.0 && h.epochs <= 20.0) { return bad("The number of epochs"); }
         if !(1..=64).contains(&h.batch) || !(1..=512).contains(&h.grad_accum) { return bad("The batch size"); }
@@ -234,7 +262,7 @@ impl AppModel {
         Ok(h)
     }
 
-    pub fn train_plan(&self, model_id: &str, method: Method, preset: Preset, server: Option<&str>) -> Result<Value> {
+    pub fn train_plan(&self, model_id: &str, method: Method, preset: Preset, server: Option<&str>, stages: Option<&str>) -> Result<Value> {
         let p = self.project_ref()?;
         let m = find(model_id).ok_or_else(|| Error::new("Unknown model."))?;
         let vram = match server {
@@ -242,7 +270,14 @@ impl AppModel {
             None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
         };
         let stats = runs::latest_version(p).map(|(_, mf)| runs::data_stats(&mf)).unwrap_or_default();
-        Ok(serde_json::to_value(plan(&m, method, preset, vram, stats, runs::load_measured(&m.id, method)))?)
+        let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
+        let mut pl = plan(&m, method, preset, vram, stats, measured);
+        // the stage choice changes only the number of steps (a fixed-step quick test is always one stage)
+        if stages == Some("book_first") && pl.hyper.max_steps.is_none() {
+            pl.hyper.stages = "book_first".into();
+            pl.steps = crate::train::plan::steps_for(&pl.hyper, stats);
+        }
+        Ok(serde_json::to_value(pl)?)
     }
 
     /// Everything needed to start (or continue) a run: the project, the model, the settings and the job for the worker.
@@ -264,6 +299,29 @@ impl AppModel {
         let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
         let (version, manifest) = runs::latest_version(&p).ok_or_else(|| Error::new("Save a version of the training data first (Step 2)."))?;
         let remote = match server { Some(u) => Some(self.target_for(u)?), None => None };
+        if method == Method::Full {
+            let try_anyway = overrides["try_anyway"] == true;
+            let bf16 = match server {
+                Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["precision"].as_str()).map(|p| p == "bf16"),
+                None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.precision() == crate::envmgr::gpu::Precision::Bf16)),
+            };
+            let vram_for_check = match server {
+                Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
+                None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+            };
+            let mut why = full_blockers(&m, vram_for_check, bf16, server.is_some());
+            if try_anyway {
+                why.retain(|w| w.contains("needs about"));   // only the memory warning can be overridden; remote and bf16 cannot
+            }
+            if !why.is_empty() {
+                return Err(Error::new(format!("Full fine-tuning is not possible here: {}", why.join(" "))));
+            }
+            if let Some(free) = crate::envmgr::health::free_disk_gb(&p.folder) {
+                if free < full_disk_gb(&m) {
+                    return Err(Error::new(format!("Full fine-tuning of {} needs about {:.0} GB of free disk space for its checkpoints; only {:.0} GB are free.", m.name, full_disk_gb(&m), free)));
+                }
+            }
+        }
         let vram = match server {
             Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
             None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
@@ -383,12 +441,20 @@ impl AppModel {
         let name = runs::run_name(&m.id);
         let mut job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
         if from_previous {
-            job["init_adapter"] = json!(runs::runs_dir(&p).join(&last_name).join("adapter"));
+            if method == Method::Full {
+                job["init_model"] = json!(runs::runs_dir(&p).join(&last_name).join("model"));
+            } else {
+                job["init_adapter"] = json!(runs::runs_dir(&p).join(&last_name).join("adapter"));
+            }
         }
         // a run that was made on a server is retrained there
         let remote = match cfg["remote"]["url"].as_str() { Some(url) => Some(self.target_for(url)?), None => None };
         Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
     }
+}
+
+fn method_needs_rank(h: &Hyper) -> bool {
+    h.rank > 0 || h.alpha > 0   // a full fine-tune has rank 0 (unused)
 }
 
 /// A run ready to start.

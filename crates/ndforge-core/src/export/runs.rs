@@ -34,7 +34,7 @@ fn write_json(path: &std::path::Path, v: &Value) -> Result<()> {
 
 /// Runs that can be exported: they have a saved adapter. Newest first.
 pub fn exportable_runs(p: &Project) -> Vec<Value> {
-    crate::train::runs::list_runs(p).into_iter().filter(|r| r["has_adapter"] == true).collect()
+    crate::train::runs::list_runs(p).into_iter().filter(|r| r["has_adapter"] == true || r["has_model"] == true).collect()
 }
 
 pub fn list_exports(p: &Project) -> Vec<Value> {
@@ -61,7 +61,9 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
     }
     let rdir = runs_dir(p).join(run);
     let adapter = rdir.join("adapter");
-    if !adapter.join("adapter_config.json").is_file() {
+    let full = rdir.join("model");
+    let is_full = full.join("config.json").is_file();
+    if !is_full && !adapter.join("adapter_config.json").is_file() {
         return Err(Error::new("This run has no saved model to export."));
     }
     let cfg = read_json(&rdir.join("config.json")).ok_or_else(|| Error::new("The settings of this run are missing."))?;
@@ -70,8 +72,14 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
     let name = format!("{run}-{quant}");
     let out = exports_dir(p).join(&name);
     std::fs::create_dir_all(&out)?;
-    let job = json!({"job": "export", "adapter": adapter, "base": {"repo": repo, "family": family}, "out": out, "quant": quant, "backend": "auto", "gguf": true,
+    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": quant, "backend": "auto", "gguf": true,
                      "max_seq": cfg["hyper"]["max_seq"]});
+    // a full fine-tune saved the whole model (nothing to merge); a LoRA run saved an adapter
+    if is_full {
+        job["full_model"] = json!(full);
+    } else {
+        job["adapter"] = json!(adapter);
+    }
     let result = run_job(&py, &worker_dir(), &job, kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),

@@ -16,7 +16,7 @@ pub const CONTINUE_LIMIT: f64 = 0.25;
 
 /// The newest run that finished (not stopped or failed).
 pub fn last_done_run(p: &Project) -> Option<Value> {
-    list_runs(p).into_iter().find(|r| r["status"] == "done" && r["has_adapter"] == true)
+    list_runs(p).into_iter().find(|r| r["status"] == "done" && (r["has_adapter"] == true || r["has_model"] == true))
 }
 
 /// What the page shows. `available` is true when a world update has not been trained yet and a finished run exists to take the settings from.

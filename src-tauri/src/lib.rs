@@ -120,13 +120,13 @@ fn train_state(s: State<App>, server: Option<String>) -> Out<Value> {
 }
 
 #[tauri::command]
-fn train_plan(s: State<App>, model: String, method: String, preset: String, server: Option<String>) -> Out<Value> {
+fn train_plan(s: State<App>, model: String, method: String, preset: String, server: Option<String>, stages: Option<String>) -> Out<Value> {
     let (method, preset) = parse_choice(&method, &preset)?;
-    lock(&s).train_plan(&model, method, preset, server.as_deref()).map_err(|e| e.to_string())
+    lock(&s).train_plan(&model, method, preset, server.as_deref(), stages.as_deref()).map_err(|e| e.to_string())
 }
 
 fn parse_choice(method: &str, preset: &str) -> Out<(Method, Preset)> {
-    let method = match method { "lora" => Method::Lora, "qlora" => Method::Qlora, other => return Err(format!("Unknown method: {other}")) };
+    let method = match method { "lora" => Method::Lora, "qlora" => Method::Qlora, "full" => Method::Full, other => return Err(format!("Unknown method: {other}")) };
     let preset = match preset { "quick" => Preset::Quick, "normal" => Preset::Normal, "best" => Preset::Best, other => return Err(format!("Unknown preset: {other}")) };
     Ok((method, preset))
 }

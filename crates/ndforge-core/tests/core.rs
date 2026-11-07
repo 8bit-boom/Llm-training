@@ -317,7 +317,36 @@ fn model_train_state_and_jobs() {
     assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 0}), None, None).unwrap_err().0.contains("rank"));
     assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"nonsense": 1}), None, None).unwrap_err().0.contains("Unknown setting"));
     assert!(m.train_job("nope", Method::Lora, Preset::Quick, &json!({}), None, None).unwrap_err().0.contains("model"));
-    assert!(m.train_plan("gemma4-e2b", Method::Qlora, Preset::Normal, None).unwrap()["steps"].as_u64().unwrap() > 0);
+    assert!(m.train_plan("gemma4-e2b", Method::Qlora, Preset::Normal, None, None).unwrap()["steps"].as_u64().unwrap() > 0);
+    let together = m.train_plan("qwen3.5-4b", Method::Lora, Preset::Normal, None, None).unwrap();
+    let book = m.train_plan("qwen3.5-4b", Method::Lora, Preset::Normal, None, Some("book_first")).unwrap();
+    assert_eq!((together["hyper"]["stages"].as_str(), book["hyper"]["stages"].as_str()), (Some("mixed"), Some("book_first")));
+    assert!(book["steps"].as_u64().unwrap() >= together["steps"].as_u64().unwrap());
+    assert_eq!(m.train_plan("qwen3.5-4b", Method::Lora, Preset::Quick, None, Some("book_first")).unwrap()["hyper"]["stages"], "mixed");
+    // two stages: the world book first, then practice (a fixed number of steps is always one stage)
+    let two = m.train_job("qwen3.5-4b", Method::Lora, Preset::Normal, &json!({"stages": "book_first", "book_epochs": 3}), None, None).unwrap();
+    assert_eq!(two.job["stages"][0], json!({"name": "world_book", "filter": "text", "epochs": 3.0}));
+    assert_eq!(two.job["stages"][1]["name"], "practice");
+    let quick = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"stages": "book_first"}), None, None).unwrap();
+    assert!(quick.job.get("stages").is_none() && quick.hyper.stages == "mixed");
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Normal, &json!({"stages": "backwards"}), None, None).unwrap_err().0.contains("stages"));
+    // full fine-tuning: its own settings, the full card in the state, never on a server
+    std::env::set_var("NDFORGE_FREE_DISK_GB", "500");
+    let full = m.train_job("qwen3.5-2b", Method::Full, Preset::Normal, &json!({}), None, None).unwrap();
+    assert_eq!((full.job["method"].as_str(), full.job["hyper"]["rank"].as_u64(), full.hyper.lr), (Some("full"), Some(0), 1e-5));
+    let card = &m.train_state(None).unwrap()["models"][0];
+    assert!(card["full"]["available"].is_boolean() && card["full"]["reasons"].is_array() && card["full"]["disk_gb"].as_f64().unwrap() > 15.0);
+    m.add_train_server("S", "srv:8765", "secret-token-1234567").unwrap();
+    m.set_remote_status("http://srv:8765", json!({"gpu": {"name": "RTX", "vram_gb": 32.0, "precision": "bf16"}}));
+    let e = m.train_job("qwen3.5-2b", Method::Full, Preset::Normal, &json!({}), None, Some("http://srv:8765")).unwrap_err();
+    assert!(e.0.contains("this computer only"), "{e}");
+    let on_server = m.train_state(Some("http://srv:8765")).unwrap();
+    assert_eq!(on_server["models"][0]["full"]["available"], false);
+    // not enough disk for the checkpoints: a plain refusal
+    std::env::set_var("NDFORGE_FREE_DISK_GB", "5");
+    let e = m.train_job("qwen3.5-2b", Method::Full, Preset::Normal, &json!({}), None, None).unwrap_err();
+    assert!(e.0.contains("free disk space") && e.0.contains("only 5 GB"), "{e}");
+    std::env::remove_var("NDFORGE_FREE_DISK_GB");
     // resuming reads the run's own config
     let run_dir = job.project.folder.join("runs").join(&job.name);
     std::fs::create_dir_all(&run_dir).unwrap();

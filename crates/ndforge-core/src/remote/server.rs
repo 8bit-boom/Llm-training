@@ -101,6 +101,9 @@ fn append_event(dir: &Path, ev: &Value) {
 }
 
 fn start_job(s: &Arc<Shared>, id: &str, mut job: Value) -> std::result::Result<(), (u16, String)> {
+    if job["method"] == "full" {
+        return Err((400, "Full fine-tuning is not available on the server (its checkpoints and result are too big); use LoRA or QLoRA.".into()));
+    }
     let dir = job_dir(s, id);
     let out = dir.join("out");
     let input = dir.join("in");

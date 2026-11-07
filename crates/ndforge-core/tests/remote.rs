@@ -117,6 +117,8 @@ fn every_request_needs_the_token_and_ids_and_file_names_are_checked() {
     assert_eq!(http(port, "POST", "/v1/jobs/ok-id", Some(TOKEN), b"{\"job\":{\"job\":\"export\"}}").0, 400);
     assert_eq!(http(port, "POST", "/v1/jobs/ok-id", Some(TOKEN), b"{\"job\":{\"job\":\"train\"}}").0, 400);         // no data uploaded yet
     assert_eq!(http(port, "GET", "/v1/jobs/never-existed", Some(TOKEN), b"").0, 404);
+    let (code, body) = http(port, "POST", "/v1/jobs/ok-id", Some(TOKEN), b"{\"job\":{\"job\":\"train\",\"method\":\"full\"}}");
+    assert!(code == 400 && body.contains("Full fine-tuning is not available on the server"), "{code} {body}");
     assert!(!d.path().join("evil.sh").exists() && !srv.data.join("..").join("x").exists());
     // a short token is refused at start-up
     assert!(spawn(ServerConfig { token: "short".into(), listen: "127.0.0.1:0".into(), data_dir: d.path().join("x"), python: PathBuf::new(), ollama_url: None, require_gpu: false, max_upload: 1, grace: Duration::from_secs(1) }).is_err());
@@ -376,10 +378,10 @@ fn servers_are_remembered_their_tokens_are_kept_private_and_plans_use_the_server
         assert_eq!(std::fs::metadata(d.path().join("cfgs/secrets.json")).unwrap().permissions().mode() & 0o777, 0o600);
     }
     // the plan follows the chosen server's card: a 16 GB T10 cannot do Gemma 4 E4B in 16-bit, a bigger local card can
-    assert_eq!(m.train_plan("gemma4-e4b", Method::Lora, Preset::Normal, Some(url)).unwrap()["fit"], "unknown");                 // not checked yet
+    assert_eq!(m.train_plan("gemma4-e4b", Method::Lora, Preset::Normal, Some(url), None).unwrap()["fit"], "unknown");                 // not checked yet
     m.set_remote_status(url, json!({"gpu": {"name": "Tesla T10", "vram_gb": 15.6, "precision": "fp16"}, "busy": false}));
-    assert_eq!(m.train_plan("gemma4-e4b", Method::Lora, Preset::Normal, Some(url)).unwrap()["fit"], "no");
-    assert_ne!(m.train_plan("gemma4-e4b", Method::Qlora, Preset::Normal, Some(url)).unwrap()["fit"], "no");
+    assert_eq!(m.train_plan("gemma4-e4b", Method::Lora, Preset::Normal, Some(url), None).unwrap()["fit"], "no");
+    assert_ne!(m.train_plan("gemma4-e4b", Method::Qlora, Preset::Normal, Some(url), None).unwrap()["fit"], "no");
     let st = m.train_state(Some(url)).unwrap();
     let e4b = st["models"].as_array().unwrap().iter().find(|c| c["model"]["id"] == "gemma4-e4b").unwrap();
     assert_eq!((e4b["lora"]["fit"].as_str(), e4b["recommended"].as_str()), (Some("no"), Some("qlora")));   // the recommendation follows the chosen card too

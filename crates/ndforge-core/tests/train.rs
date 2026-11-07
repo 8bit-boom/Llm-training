@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ndforge_core::project::Project;
 use ndforge_core::train::catalog::{find, models};
-use ndforge_core::train::plan::{base_hyper, plan, recommended_method, steps_for, DataStats, Fit, Method, Preset};
+use ndforge_core::train::plan::{base_hyper, base_hyper_for, full_blockers, full_disk_gb, plan, recommended_method, steps_for, DataStats, Fit, Hyper, Method, Preset};
 use ndforge_core::train::runs;
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -23,7 +23,7 @@ fn catalog_has_the_five_models_with_their_repos() {
 
 const RTX5090: f64 = 31.8;
 const T10: f64 = 15.6;
-const DATA: DataStats = DataStats { examples: 400, tokens: 200_000 };
+const DATA: DataStats = DataStats { examples: 400, tokens: 200_000, text_examples: 100, chat_examples: 300 };
 
 #[test]
 fn all_five_models_fit_the_5090_with_16_bit_lora() {
@@ -56,7 +56,7 @@ fn presets_and_steps() {
     let q = base_hyper(Preset::Quick);
     assert_eq!((q.max_steps, q.max_seq), (Some(60), 1024));
     let n = base_hyper(Preset::Normal);
-    assert_eq!(steps_for(&n, DataStats { examples: 320, tokens: 0 }), 40);   // 320 examples * 2 epochs / (2*8)
+    assert_eq!(steps_for(&n, DataStats { examples: 320, tokens: 0, text_examples: 0, chat_examples: 0 }), 40);   // 320 examples * 2 epochs / (2*8)
     assert_eq!(steps_for(&q, DATA), 60);
     let m = find("qwen3.5-4b").unwrap();
     let p = plan(&m, Method::Lora, Preset::Normal, Some(RTX5090), DATA, None);
@@ -188,4 +188,96 @@ fn no_python_environment_gives_a_plain_message() {
     let e = runs::execute(&p, &m, Method::Lora, &base_hyper(Preset::Quick), "r", job, Arc::new(AtomicBool::new(false)), Duration::from_secs(1), &mut |_| {}).unwrap_err();
     assert!(e.0.contains("Training setup"));
     assert!(runs::build_job(&p, &m, Method::Lora, &base_hyper(Preset::Quick), 9, "r", false).unwrap_err().0.contains("Save a version"));
+}
+
+
+#[test]
+fn full_fine_tuning_on_the_5090_fits_the_small_models_and_says_why_it_does_not_fit_the_rest() {
+    let by = |id: &str| find(id).unwrap();
+    let p2 = plan(&by("qwen3.5-2b"), Method::Full, Preset::Normal, Some(RTX5090), DATA, None);
+    assert_eq!(p2.fit, Fit::Yes, "{p2:?}");
+    assert!(full_blockers(&by("qwen3.5-2b"), Some(RTX5090), Some(true), false).is_empty());
+    // 4B and Gemma 4 E2B are at the edge of 32 GB: offered (tight), with the settings lowered
+    for id in ["qwen3.5-4b", "gemma4-e2b"] {
+        let p = plan(&by(id), Method::Full, Preset::Normal, Some(RTX5090), DATA, None);
+        assert!(matches!(p.fit, Fit::Tight | Fit::Yes) && p.hyper.batch == 1, "{id}: {p:?}");
+        assert!(full_blockers(&by(id), Some(RTX5090), Some(true), false).is_empty(), "{id}");
+    }
+    // the big ones are refused, with the memory they would need
+    for id in ["qwen3.5-9b", "gemma4-e4b"] {
+        let why = full_blockers(&by(id), Some(RTX5090), Some(true), false);
+        assert_eq!(why.len(), 1, "{id}: {why:?}");
+        assert!(why[0].contains("needs about") && why[0].contains("this card has 32 GB") && why[0].contains("LoRA needs about"), "{}", why[0]);
+        assert_eq!(plan(&by(id), Method::Full, Preset::Normal, Some(RTX5090), DATA, None).fit, Fit::No);
+    }
+    // a 16 GB T10: no bf16 and too small; a server is never used for full fine-tuning
+    let t10 = full_blockers(&by("qwen3.5-4b"), Some(T10), Some(false), false);
+    assert!(t10.iter().any(|w| w.contains("no bf16")) && t10.iter().any(|w| w.contains("needs about")), "{t10:?}");
+    assert_eq!(full_blockers(&by("qwen3.5-2b"), Some(T10), Some(false), false).len(), 1);       // 2B would fit 16 GB, but the card has no bf16
+    assert!(full_blockers(&by("qwen3.5-2b"), Some(RTX5090), Some(true), true).iter().any(|w| w.contains("this computer only")));
+    assert!(full_blockers(&by("qwen3.5-9b"), None, None, false).is_empty());        // unknown card: not a blocker
+    assert!(plan(&by("qwen3.5-2b"), Method::Full, Preset::Normal, Some(RTX5090), DATA, None).notes.iter().any(|n| n.contains("forget how to chat")));
+    assert!(full_disk_gb(&by("qwen3.5-2b")) > 15.0 && full_disk_gb(&by("qwen3.5-2b")) < full_disk_gb(&by("qwen3.5-4b")));
+}
+
+#[test]
+fn full_presets_use_a_small_learning_rate_and_a_measured_peak_replaces_the_estimate() {
+    let f = base_hyper_for(Method::Full, Preset::Normal);
+    assert_eq!((f.lr, f.batch, f.grad_accum, f.rank), (1e-5, 1, 16, 0));
+    assert!(base_hyper_for(Method::Full, Preset::Quick).max_steps == Some(60) && base_hyper_for(Method::Full, Preset::Best).epochs == 3.0);
+    assert!(f.lr < base_hyper_for(Method::Lora, Preset::Normal).lr / 5.0);
+    let m = find("qwen3.5-2b").unwrap();
+    let est = plan(&m, Method::Full, Preset::Normal, Some(RTX5090), DATA, None).est_vram_gb;
+    let measured = plan(&m, Method::Full, Preset::Normal, Some(RTX5090), DATA, Some((12.0, 2048, 1))).est_vram_gb;
+    assert!(est > 14.0 && (measured - 12.0).abs() < 0.1, "{est} {measured}");
+}
+
+#[test]
+fn two_stage_steps_and_old_settings_files_still_load() {
+    let mut h = base_hyper(Preset::Normal);
+    let data = DataStats { examples: 320, tokens: 0, text_examples: 80, chat_examples: 240 };
+    assert_eq!(steps_for(&h, data), 40);                                   // together: 320 x 2 epochs / 16
+    h.stages = "book_first".into();
+    assert_eq!(steps_for(&h, data), 10 + 30);                              // book: 80 x 2 / 16, practice: 240 x 2 / 16
+    h.book_epochs = 3.0;
+    assert_eq!(steps_for(&h, data), 15 + 30);
+    assert_eq!(steps_for(&h, DataStats { examples: 100, tokens: 0, text_examples: 0, chat_examples: 100 }), 13);    // no world book: one stage
+    // a config.json written before M9 has no stages / book_epochs
+    let old = json!({"rank": 16, "alpha": 16, "lr": 1e-4, "epochs": 2.0, "max_steps": null, "batch": 2, "grad_accum": 8, "max_seq": 2048, "warmup": 10,
+                     "weight_decay": 0.001, "scheduler": "linear", "seed": 3407, "save_steps": 50, "logging_steps": 1});
+    let h: Hyper = serde_json::from_value(old).unwrap();
+    assert_eq!((h.stages.as_str(), h.book_epochs), ("mixed", 2.0));
+}
+
+
+#[test]
+fn run_folders_know_about_full_models_and_two_stage_checkpoints() {
+    let d = tempdir().unwrap();
+    let p = Project::create(d.path(), "R").unwrap();
+    let mk = |name: &str, files: &[&str]| {
+        let dir = runs::runs_dir(&p).join(name);
+        for f in files {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::write(dir.join("state.json"), json!({"name": name, "status": "stopped"}).to_string()).unwrap();
+    };
+    mk("lora", &["adapter/adapter_config.json", "checkpoints/checkpoint-5/trainer_state.json"]);
+    mk("full", &["model/config.json"]);
+    mk("staged", &["checkpoints/practice/checkpoint-3/trainer_state.json"]);
+    mk("empty", &["notes.txt"]);
+    let by = |n: &str| runs::list_runs(&p).into_iter().find(|r| r["name"] == n).unwrap();
+    assert_eq!((by("lora")["has_adapter"].clone(), by("lora")["has_model"].clone()), (json!(true), json!(false)));
+    assert_eq!((by("full")["has_adapter"].clone(), by("full")["has_model"].clone()), (json!(false), json!(true)));
+    assert!(runs::resumable(&p, "lora") && runs::resumable(&p, "staged") && !runs::resumable(&p, "full") && !runs::resumable(&p, "empty"));
+    // book_first makes two stages in the job, a fixed number of steps never does
+    let m = find("qwen3.5-2b").unwrap();
+    std::fs::create_dir_all(p.folder.join("datasets/v1")).unwrap();
+    std::fs::write(p.folder.join("datasets/v1/train.jsonl"), "{}\n").unwrap();
+    let mut h = base_hyper(Preset::Normal);
+    h.stages = "book_first".into();
+    let job = runs::build_job(&p, &m, Method::Lora, &h, 1, "r", false).unwrap();
+    assert_eq!(job["stages"].as_array().unwrap().len(), 2);
+    h.max_steps = Some(30);
+    assert!(runs::build_job(&p, &m, Method::Lora, &h, 1, "r", false).unwrap().get("stages").is_none());
 }
