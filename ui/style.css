@@ -88,3 +88,6 @@ code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
 .tag.chk.ok { color: var(--ok); }
 .tag.chk.warn { color: var(--warn, #b7791f); }
 .tag.chk.bad { color: var(--err); }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 6px; }
+@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+.verdict { font-size: 18px; margin: 8px 0; }

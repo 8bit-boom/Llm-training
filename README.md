@@ -20,7 +20,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M8 Train on the TrueNAS server (worker server + client + compose) | built; the container image still has to be built once |
 | M9 Full fine-tune + "world book first, then practice" stages, type cards | built; needs a first run on the RTX 5090 |
 | M10 Teacher-generated examples + checking (Step 2) | built; needs a first run with a real teacher model. "Better scores" can only be shown by the M11 test page |
-| M11 onward (test page, installers ...) | not started |
+| M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
+| M12 (installers, in-app guide with screenshots) | not started |
 
 ## Build and run
 
@@ -97,3 +98,10 @@ campaign history, lore search (nd-world's "Relevant world lore" context block), 
 or repeated run only pays for what is new), then a **judge** pass compares it with its source: *unsupported* is dropped (reviewable), *partly* is kept and marked, general chat / house style are marked "not checked". "Not in the lore" questions
 use only invented names that appear nowhere in the world; NPC prompts never contain GM secrets. Teacher examples survive "Make the examples again", keep your Drop/Edit decisions, and general chat / house style never go to the test file.
 Code: `crates/ndforge-core/src/teacher/`, tests with a mock server: `crates/ndforge-core/tests/teacher.rs`.
+
+## Test page (M11)
+
+Step 4 puts the held-out questions of the run's data version to the **original** and the **trained** model (the worker's `evaluate` job: the same weights with the LoRA layers switched off, or a fresh copy for a full fine-tune; greedy decoding) and scores them in Rust
+(`crates/ndforge-core/src/evaluate/`): lore and rules by word overlap with the expected answer (or graded by the teacher model, optional), "made-up answers" with 8 invented names that appear nowhere in the world (did it decline or invent?), and
+6 general-chat prompts (sensible or not). The verdict is plain ("Better than the original on 86 % of lore questions"), with warnings when the model invents lore or forgot general chat. Also: ask both models a free question side by side, save the chat to
+`transcripts/`, and a table comparing every tested run. Results: `runs/<run>/test.json`. The word-overlap score is a rough guide, not a grade.

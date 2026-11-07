@@ -384,6 +384,27 @@ impl AppModel {
         }))
     }
 
+    // ------------------------------------------------------------------ step 4: test
+    /// Runs that can be tested (they saved a model), the newest test of each, and the comparison table.
+    pub fn test_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        let runs: Vec<Value> = crate::evaluate::runs::testable(p);
+        let t = &self.settings.teacher;
+        Ok(json!({
+            "runs": runs, "compare": crate::evaluate::runs::compare(p), "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "teacher_ready": !t.url.trim().is_empty() && !t.model.trim().is_empty(), "teacher_model": t.model, "world": p.world_name,
+            "default_system": crate::dataset::builders::system_prompt(&p.world_name),
+        }))
+    }
+
+    pub fn test_result(&self, run: &str) -> Result<Value> {
+        Ok(crate::evaluate::runs::read_test(self.project_ref()?, run).unwrap_or(Value::Null))
+    }
+
+    pub fn test_save_transcript(&self, run: &str, items: &[Value]) -> Result<String> {
+        Ok(crate::evaluate::runs::save_transcript(self.project_ref()?, run, items)?.to_string_lossy().to_string())
+    }
+
     pub fn project_clone(&self) -> Result<Project> {
         Ok(self.project_ref()?.clone())
     }

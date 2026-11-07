@@ -74,6 +74,46 @@ fn dataset_generate(s: State<App>, recipe: Value) -> Out<Value> {
 }
 
 #[tauri::command]
+fn test_state(s: State<App>) -> Out<Value> {
+    lock(&s).test_state().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn test_result(s: State<App>, run: String) -> Out<Value> {
+    lock(&s).test_result(&run).map_err(|e| e.to_string())
+}
+
+/// Tests a run (original vs trained on the held-out questions). Events on "test-event".
+#[tauri::command]
+fn test_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, judge: bool) -> Out<()> {
+    let m = lock(&s);
+    let p = m.project_clone().map_err(|e| e.to_string())?;
+    let teacher = if judge { Some(m.teacher_client()) } else { None };
+    drop(m);
+    spawn_task(app, &tasks, "test-event", move |cancel, emit| {
+        if let Some(t) = &teacher { if !t.cfg.is_set() { return Err("Choose the teacher in Step 2 first, or untick the teacher grading.".to_string()); } }
+        let r = ndforge_core::evaluate::runs::execute(&p, &run, 30, teacher.as_ref(), cancel, emit).map_err(|e| e.to_string())?;
+        if let Some(t) = &teacher { if t.cfg.unload_after { let _ = ndforge_core::export::ollama::Ollama::new(&t.cfg.ollama_base()).unload(&t.cfg.model); } }
+        Ok(r)
+    })
+}
+
+/// One free question to both models. Events on "test-event"; the answer is {"chat": {"original", "trained"}}.
+#[tauri::command]
+fn test_ask(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, system: Option<String>, question: String) -> Out<()> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "test-event", move |cancel, emit| {
+        let a = ndforge_core::evaluate::runs::ask(&p, &run, system.as_deref(), &question, cancel, emit).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"chat": a, "question": question}))
+    })
+}
+
+#[tauri::command]
+fn test_save_transcript(s: State<App>, run: String, items: Vec<Value>) -> Out<String> {
+    lock(&s).test_save_transcript(&run, &items).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn teacher_set(s: State<App>, url: String, model: String, key: String, unload_after: bool) -> Out<Value> {
     let mut m = lock(&s);
     m.teacher_set(&url, &model, &key, unload_after).map_err(|e| e.to_string())?;
@@ -396,7 +436,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

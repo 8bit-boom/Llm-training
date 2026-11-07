@@ -345,3 +345,51 @@ def test_a_full_model_continues_from_a_saved_full_model_and_is_exported_without_
     assert "enable_thinking is not defined or enable_thinking is false" in text
     if sys.platform != "win32":
         assert Path(res["gguf"]).read_bytes() == b"GGUF-Q4_K_M"
+
+
+# ---------------------------------------------------------------------------------------------------------------- evaluate
+def run_eval(tmp_path, family, **over):
+    qs = [{"id": "a", "messages": [{"role": "system", "content": "You are the assistant."}, {"role": "user", "content": "Who is Anders?"}]},
+          {"id": "b", "messages": [{"role": "system", "content": "You are the assistant."}, {"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello."}, {"role": "user", "content": "Where is Dockside?"}]}]
+    job = {"job": "evaluate", "model": {"repo": str(tmp_path / "model"), "family": family}, "questions": qs, "max_new": 5, "out": str(tmp_path / "answers.json")}
+    job.update(over)
+    f = tmp_path / "eval.json"
+    f.write_text(json.dumps(job), encoding="utf-8")
+    p = subprocess.run([sys.executable, "-X", "utf8", "-m", "ndforge_worker", str(f)], cwd=WORKER, capture_output=True, text=True, timeout=600)
+    return p, [json.loads(line) for line in p.stdout.splitlines() if line.startswith("{")]
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "gemma4"])
+def test_evaluate_answers_with_the_original_and_the_trained_lora_model(tmp_path, family):
+    p, ev, run_out = run_job(tmp_path, family, "real", hyper={"max_steps": 20, "lr": 2e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-2000:]
+    p2, ev2 = run_eval(tmp_path, family, adapter=str(run_out / "adapter"))
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    ans = json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))
+    assert set(ans) == {"original", "trained"} and set(ans["original"]) == {"a", "b"} == set(ans["trained"])
+    assert ev2[-1]["type"] == "result" and any(e["type"] == "progress" and e["step"] == "evaluate" for e in ev2)
+    assert ans["original"] != ans["trained"]   # twenty strong steps changed what it says
+    # the adapter is switched off for the original: the same answers as the plain base model gives
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from ndforge_worker import data
+    base = AutoModelForCausalLM.from_pretrained(str(tmp_path / "model")).eval()
+    tok = AutoTokenizer.from_pretrained(str(tmp_path / "model"))
+    prompt, _ = data.render_chat(tok, [{"role": "system", "content": "You are the assistant."}, {"role": "user", "content": "Who is Anders?"}, {"role": "assistant", "content": ""}], family)
+    enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
+    with torch.no_grad():
+        o = base.generate(**enc, max_new_tokens=5, do_sample=False, pad_token_id=tok.pad_token_id or tok.eos_token_id)
+    assert ans["original"]["a"] == tok.decode(o[0][enc["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+
+def test_evaluate_a_full_model_and_one_side_only_and_a_plain_error(tmp_path):
+    p, ev, run_out = run_job(tmp_path, "qwen3_5", "real", method="full", hyper={"max_steps": 10, "lr": 1e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-2000:]
+    p2, _ = run_eval(tmp_path, "qwen3_5", full_model=str(run_out / "model"))
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    ans = json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))
+    assert set(ans) == {"original", "trained"} and ans["original"]["a"] != ans["trained"]["a"]
+    p3, _ = run_eval(tmp_path, "qwen3_5", full_model=str(run_out / "model"), which=["trained"])
+    assert p3.returncode == 0 and set(json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))) == {"trained"}
+    p4, ev4 = run_eval(tmp_path, "qwen3_5")
+    assert p4.returncode == 1 and ev4[-1]["type"] == "error" and "no saved model" in ev4[-1]["message"]

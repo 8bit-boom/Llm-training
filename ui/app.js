@@ -554,6 +554,90 @@ function onEnvEvent(p) {
   if (page === "setup") { render(); const l = $("log"); if (l) l.scrollTop = l.scrollHeight; }
 }
 
+// ------------------------------------------------------------------------------------------------------------ step 4: test
+let te = { state: null, run: "", result: null, running: false, text: "", progress: null, judge: false, chat: [], asking: false, system: "", showQ: "", error: null, ok: null };
+const CATS = [["lore", "Lore questions", "higher is better"], ["rules", "Rules questions", "higher is better"], ["made_up", "Invents answers about things that do not exist", "lower is better"], ["general", "General chat sensible", "higher is better"]];
+const pc = (x) => x == null ? "–" : Math.round(x * 100) + " %";
+
+function renderTest() {
+  if (!state.bundle) return `<h1>Step 4 · Test</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = te.state;
+  if (!st) return `<h1>Step 4 · Test</h1><p class="lead">Loading…</p>`;
+  const head = `<h1>Step 4 · Test</h1><p class="lead">Checks that the trained model knows your world better than the original. The help panel explains the scores.</p>${te.error ? `<div class="err">${esc(te.error)}</div>` : ""}${te.ok ? `<div class="ok">${esc(te.ok)}</div>` : ""}`;
+  if (!st.runs.length) return head + `<div class="card wide"><h2>Nothing to test yet</h2><p>Train a model in Step 3 first. A run that was stopped before its first save cannot be tested.</p></div>`;
+  const opts = st.runs.map((r) => `<option value="${esc(r.name)}" ${r.name === te.run ? "selected" : ""}>${esc(r.name)} · ${esc(r.method || "")}${r.tested ? " · tested" : ""}</option>`).join("");
+  const busy = te.running || te.asking;
+  const pick = `<div class="card wide"><h2>Choose a run</h2><div class="row"><select id="te-run">${opts}</select>
+      <button class="primary" id="te-go" ${busy || !st.env_ready ? "disabled" : ""}>Test this run</button>${busy ? `<button class="secondary" id="te-stop">Stop</button>` : ""}</div>
+      <label class="opt"><input type="checkbox" id="te-judge" ${te.judge ? "checked" : ""} ${st.teacher_ready ? "" : "disabled"}> Grade lore and rules answers with the teacher model${st.teacher_ready ? ` (${esc(st.teacher_model)})` : " (choose a teacher in Step 2 first)"} — more accurate than counting matching words</label>
+      ${!st.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
+      ${te.running || te.text ? `<div class="stepline">${esc(te.text)}</div>${te.progress != null ? `<progress max="1" value="${te.progress}"></progress>` : ""}` : ""}</div>`;
+  let result = "";
+  const r = te.result;
+  if (r) {
+    const row = ([id, name, dir]) => { const o = r.scores.original[id], t = r.scores.trained[id]; return o || t ? `<tr><td>${name} <span class="dim">(${dir})</span></td><td>${(o || t).n}</td><td>${pc(o && o.mean)}</td><td><strong>${pc(t && t.mean)}</strong></td></tr>` : ""; };
+    const qs = r.questions.filter((q) => !te.showQ || q.category === te.showQ).map((q) => `<div class="ex"><div class="q"><span class="tag">${esc(q.category)}</span> ${esc(q.question)}</div>
+      ${q.reference ? `<div class="dim small">Expected: ${esc(q.reference.slice(0, 400))}</div>` : ""}
+      <div class="two"><div><div class="dim small">Original · ${pc(q.score_original)}</div><div class="ans">${esc(q.original)}</div></div><div><div class="dim small">Trained · ${pc(q.score_trained)}</div><div class="ans">${esc(q.trained)}</div></div></div></div>`).join("");
+    result = `<div class="card wide"><h2>Result for ${esc(r.run)}</h2>
+      <p class="verdict ${r.verdict.better === true ? "ok" : r.verdict.better === false ? "err" : ""}"><strong>${esc(r.verdict.headline)}</strong></p>
+      ${r.verdict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}
+      <table class="tbl"><tr><th>What was checked</th><th>Questions</th><th>Original</th><th>Trained</th></tr>${CATS.map(row).join("")}</table>
+      <p class="dim small">${r.n} questions, graded by ${r.method === "teacher" ? "the teacher model" : "matching words with the expected answer (a rough guide: read the answers below)"} · data version ${r.dataset_version} · ${esc(r.created)}</p>
+      <details><summary>Read the answers</summary><div class="row"><select id="te-cat"><option value="">All</option>${CATS.map((c) => `<option value="${c[0]}" ${te.showQ === c[0] ? "selected" : ""}>${c[1]}</option>`).join("")}</select></div>${qs}</details></div>`;
+  }
+  const chat = `<div class="card wide"><h2>Ask your own question</h2><p>Both models answer the same question. Loading the models takes a moment each time.</p>
+      <details><summary>The instruction given to the model</summary><textarea id="te-sys" rows="4">${esc(te.system || st.default_system)}</textarea></details>
+      <div class="row"><input type="text" id="te-q" placeholder="For example: Who is the leader of the Greyfather Pack?" style="min-width:300px" ${busy ? "disabled" : ""}><button class="primary" id="te-ask" ${busy || !st.env_ready ? "disabled" : ""}>Ask both</button></div>
+      ${te.asking ? `<div class="stepline">${esc(te.text)}</div>` : ""}
+      ${te.chat.map((c) => `<div class="ex"><div class="q">${esc(c.question)}</div><div class="two"><div><div class="dim small">Original</div><div class="ans">${esc(c.original)}</div></div><div><div class="dim small">Trained</div><div class="ans">${esc(c.trained)}</div></div></div></div>`).join("")}
+      ${te.chat.length ? `<div class="row"><button class="secondary" id="te-save">Save this chat as a file</button></div>` : ""}</div>`;
+  const cmp = st.compare.length ? `<div class="card wide"><h2>Compare runs</h2><table class="tbl"><tr><th>Run</th><th>Model</th><th>Type</th><th>Lore</th><th>Rules</th><th>Invents</th><th>General</th></tr>${st.compare.map((c, i) => `<tr><td>${i === 0 ? "★ " : ""}${esc(c.name)}</td><td>${esc(String(c.model).split("/").pop())}</td><td>${esc(c.method)}, ${esc(c.stages)}</td><td>${pc(c.lore)} <span class="dim">(was ${pc(c.lore_original)})</span></td><td>${pc(c.rules)}</td><td>${pc(c.invented)}</td><td>${pc(c.general)}</td></tr>`).join("")}</table>
+      <p class="dim small">★ = best lore score. Runs graded by the teacher and runs graded by matching words are not comparable with each other.</p></div>` : "";
+  return head + pick + result + chat + cmp;
+}
+
+async function teCall(cmd, args) { te.error = null; try { return await invoke(cmd, args); } catch (e) { te.error = String(e); return null; } }
+
+async function teRefresh() {
+  const st = await teCall("test_state");
+  if (st) {
+    te.state = st;
+    if (!te.run || !st.runs.some((r) => r.name === te.run)) te.run = st.runs.length ? st.runs[0].name : "";
+    te.result = te.run ? await teCall("test_result", { run: te.run }) : null;
+  }
+  if (page === "test") render();
+}
+
+function onTestEvent(p) {
+  if (p.kind === "progress") { te.text = p.text || p.step; te.progress = p.value; }
+  else if (p.kind === "error") { te.running = false; te.asking = false; te.text = ""; te.progress = null; te.error = p.text; }
+  else if (p.kind === "done") {
+    const was = te.running; te.running = false; te.asking = false; te.text = ""; te.progress = null;
+    if (p.data && p.data.chat) te.chat.push({ question: p.data.question, original: p.data.chat.original, trained: p.data.chat.trained });
+    else if (was) te.ok = "Finished. The result is below.";
+    setState_(); teRefresh(); return;
+  }
+  if (page === "test") render();
+}
+
+function wireTest() {
+  if (page !== "test" || !te.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const sel = $("te-run"); if (sel) sel.onchange = () => { te.run = sel.value; te.chat = []; te.ok = null; teRefresh(); };
+  const j = $("te-judge"); if (j) j.onchange = () => { te.judge = j.checked; };
+  const cat = $("te-cat"); if (cat) cat.onchange = () => { te.showQ = cat.value; render(); };
+  on("te-go", async () => { te.running = true; te.ok = null; te.error = null; te.text = "Starting…"; te.progress = null; render(); try { await invoke("test_start", { run: te.run, judge: te.judge }); } catch (e) { te.running = false; te.error = String(e); render(); } });
+  on("te-stop", () => invoke("env_cancel"));
+  on("te-ask", async () => {
+    const q = $("te-q").value; te.system = $("te-sys").value;
+    te.asking = true; te.error = null; te.text = "Loading the models…"; render();
+    try { await invoke("test_ask", { run: te.run, system: te.system === te.state.default_system ? null : te.system, question: q }); } catch (e) { te.asking = false; te.error = String(e); render(); }
+  });
+  const q = $("te-q"); if (q) q.onkeydown = (e) => { if (e.key === "Enter") $("te-ask").click(); };
+  on("te-save", async () => { const f = await teCall("test_save_transcript", { run: te.run, items: te.chat }); if (f) te.ok = "Saved: " + f; render(); });
+}
+
 function renderSoon(key) {
   const [t, lead] = TITLES[key];
   return `<h1>${t}</h1><p class="lead">${lead}</p><span class="soon">Coming in a later version. The help panel shows what this step will do.</span>`;
@@ -563,7 +647,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : page === "test" ? renderTest() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -588,6 +672,7 @@ function wire() {
   wireDataset();
   wireTrain();
   wireUse();
+  wireTest();
   wireRetrain();
   on("recheck", refreshEnv);
   on("install", () => startEnv("env_install"));
@@ -679,6 +764,7 @@ async function go(key) {
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
   if (key === "use" && state.bundle) usRefresh();
+  if (key === "test" && state.bundle) { te.ok = null; teRefresh(); }
   if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
   $("help").innerHTML = await invoke("help", { key });
   $("help").scrollTop = 0;
@@ -697,6 +783,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
