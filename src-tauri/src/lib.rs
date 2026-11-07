@@ -74,6 +74,39 @@ fn dataset_generate(s: State<App>, recipe: Value) -> Out<Value> {
 }
 
 #[tauri::command]
+fn teacher_set(s: State<App>, url: String, model: String, key: String, unload_after: bool) -> Out<Value> {
+    let mut m = lock(&s);
+    m.teacher_set(&url, &model, &key, unload_after).map_err(|e| e.to_string())?;
+    m.dataset_state().map_err(|e| e.to_string())
+}
+
+/// Does the teacher answer? Reported on "teacher-event".
+#[tauri::command]
+fn teacher_check(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>) -> Out<()> {
+    let t = lock(&s).teacher_client();
+    spawn_task(app, &tasks, "teacher-event", move |_cancel, _emit| {
+        if !t.cfg.is_set() { return Err("Fill in the teacher's address and model name first.".to_string()); }
+        t.check().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"checked": true}))
+    })
+}
+
+/// Makes the teacher examples. Progress and the final report arrive on "teacher-event".
+#[tauri::command]
+fn teacher_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, options: Value) -> Out<()> {
+    let m = lock(&s);
+    let opt = AppModel::teacher_options(options).map_err(|e| e.to_string())?;
+    let (t, p) = (m.teacher_client(), m.project_clone().map_err(|e| e.to_string())?);
+    drop(m);
+    spawn_task(app, &tasks, "teacher-event", move |cancel, emit| ndforge_core::teacher::run(&p, &t, &opt, cancel, emit).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn teacher_clear(s: State<App>, kind: Option<String>, forget_cache: bool) -> Out<Value> {
+    lock(&s).teacher_clear(kind.as_deref(), forget_cache).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn dataset_examples(s: State<App>, filter: Value, offset: usize, limit: usize) -> Out<Value> {
     lock(&s).dataset_examples(&filter, offset, limit).map_err(|e| e.to_string())
 }
@@ -363,7 +396,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

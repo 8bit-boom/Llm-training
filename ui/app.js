@@ -74,7 +74,7 @@ function renderData() {
     ${msgHtml()}${pendingCard()}${retrainCard()}${bundleCard()}`;
 }
 
-let ds = { state: null, filter: { builder: "", search: "", status: "" }, offset: 0, total: 0, items: [], editing: null, busy: false, error: null, ok: null };
+let ds = { state: null, filter: { builder: "", search: "", status: "" }, offset: 0, total: 0, items: [], editing: null, busy: false, error: null, ok: null, tc: { running: false, text: "", progress: null, report: null, opts: null, trial: false, open: false } };
 const PAGE = 20;
 
 function recipeFromForm() {
@@ -82,6 +82,9 @@ function recipeFromForm() {
   const builders = [...document.querySelectorAll(".bld:checked")].map((c) => c.value);
   return { ...r, world_book: $("rb-book").checked, builders, phrasings: Number($("rb-phr").value), test_percent: Number($("rb-test").value) };
 }
+
+const CHECKS = { supported: ["✓ checked", "ok"], partly: ["⚠ partly supported", "warn"], unsupported: ["✗ not supported", "bad"], unchecked: ["not checked", ""] };
+function badge(e) { const c = CHECKS[e.check]; return c ? ` <span class="tag chk ${c[1]}">${c[0]}</span>` : ""; }
 
 function renderDataset() {
   if (!state.bundle) return `<h1>Step 2 · Make training data</h1><p class="lead">Import your world data first (Step 1).</p>`;
@@ -96,6 +99,29 @@ function renderDataset() {
     <div class="row" style="margin-top:10px"><label>Different wordings ${sel("rb-phr", [1, 2, 3], r.phrasings)}</label>
       <label>Kept for testing ${sel("rb-test", [0, 10, 20, 30], r.test_percent)} %</label></div>
     <button class="primary" id="make" ${ds.busy ? "disabled" : ""}>${sum ? "Make the examples again" : "Make the examples"}</button></div>`;
+  let teacher = "";
+  if (sum && st.teacher) {
+    const T = st.teacher, tc = ds.tc, o = tc.opts || T.options, s0 = T.settings;
+    const kinds = T.kinds.map((k) => `<label class="opt"><input type="checkbox" class="tk" value="${k.id}" ${o.kinds.includes(k.id) ? "checked" : ""}> <strong>${esc(k.name)}</strong> <span class="dim">— ${esc(k.help)}</span></label>`).join("");
+    const rep = tc.report ? `<div class="ok">${tc.report.stopped ? "Stopped. " : ""}Made ${tc.report.added} new examples from ${tc.report.jobs_done} of ${tc.report.jobs} pieces of text. Checked: ${tc.report.supported} supported, ${tc.report.partly} partly (kept, marked), ${tc.report.unsupported} unsupported (dropped), ${tc.report.unchecked} not checked.${tc.report.failed_calls ? ` ${tc.report.failed_calls} requests failed${tc.report.first_error ? ": " + esc(tc.report.first_error) : ""}.` : ""}</div>` : "";
+    teacher = `<div class="card wide"><h2>Better examples with a teacher model <span class="tag">optional</span></h2>
+      <p>A bigger model (for example Gemma 4 on your TrueNAS) reads your world and writes deeper questions, rules practice, NPC talk and more. A second pass checks every answer against the lore and drops what the lore does not support.</p>
+      <div class="row"><label>Address <input type="text" id="t-url" value="${esc(s0.url)}" style="min-width:230px"></label>
+        <label>Model name <input type="text" id="t-model" value="${esc(s0.model)}" placeholder="for example gemma4:e4b" style="min-width:170px"></label>
+        <label>Access key <input type="password" id="t-key" placeholder="${T.has_key ? "(saved — leave empty to keep)" : "(none needed for Ollama)"}" style="min-width:150px"></label></div>
+      <label class="opt"><input type="checkbox" id="t-unload" ${s0.unload_after ? "checked" : ""}> The teacher is an Ollama server: free its memory when finished, so training can use the graphics card</label>
+      <div class="row"><button class="secondary" id="t-save">Save</button><button class="secondary" id="t-check" ${tc.running ? "disabled" : ""}>Test the connection</button></div>
+      <details ${tc.open ? "open" : ""} id="t-more"><summary>Choose what to make</summary>${kinds}
+        <div class="row" style="margin-top:8px"><label>Examples per piece of text ${sel("t-per", [1, 2, 3, 4], o.per_source)}</label>
+          <label>General chat ${sel("t-gen", [0, 5, 10, 20, 30], o.general_percent)} %</label></div>
+        <label class="opt"><input type="checkbox" id="t-judge" ${o.judge ? "checked" : ""}> Check every answer against the lore (recommended)</label>
+        <label class="opt"><input type="checkbox" id="t-partly" ${o.drop_partly ? "checked" : ""}> Also drop answers that are only partly supported</label></details>
+      <div class="row"><button class="primary" id="t-run" ${tc.running ? "disabled" : ""}>Make with the teacher</button>
+        <button class="secondary" id="t-trial" ${tc.running ? "disabled" : ""}>Try on 5 pieces first</button>
+        ${tc.running ? `<button class="secondary" id="t-stop">Stop</button>` : ""}
+        <button class="secondary" id="t-clear" ${tc.running ? "disabled" : ""}>Remove all teacher examples</button></div>
+      ${tc.running || tc.text ? `<div class="stepline">${esc(tc.text)}</div>${tc.progress != null ? `<progress max="1" value="${tc.progress}"></progress>` : ""}` : ""}${rep}</div>`;
+  }
   let summary = "";
   if (sum) {
     const rows = sum.builders.map((b) => `<tr><td>${esc(b.name)}</td><td>${b.kept}</td><td>${b.dropped}</td><td><button class="link" data-show="${b.id}">Show</button></td></tr>`).join("");
@@ -113,9 +139,9 @@ function renderDataset() {
       const body = ds.editing === e.id
         ? `<textarea id="edit-box" rows="8">${esc(a)}</textarea><div class="row"><button class="primary" data-saveedit="${e.id}">Save the change</button><button class="secondary" id="canceledit">Cancel</button></div>`
         : `<div class="ans">${esc(a)}</div>`;
-      return `<div class="ex ${e.status === "drop" ? "dropped" : ""}"><div class="q"><span class="tag">${esc(e.builder)}</span> ${q}${e.edited ? ' <span class="tag">edited</span>' : ""}</div>${body}
+      return `<div class="ex ${e.status === "drop" ? "dropped" : ""}"><div class="q"><span class="tag">${esc(e.builder)}</span>${badge(e)} ${q}${e.edited ? ' <span class="tag">edited</span>' : ""}</div>${body}
         <div class="row small"><button class="secondary" data-toggle="${e.id}" data-to="${e.status === "drop" ? "keep" : "drop"}">${e.status === "drop" ? "Keep" : "Drop"}</button>
-        <button class="secondary" data-edit="${e.id}">Edit</button><span class="dim">from: ${esc(e.source_title)}</span></div></div>`;
+        <button class="secondary" data-edit="${e.id}">Edit</button><span class="dim">from: ${esc(e.source_title)}</span></div>${e.note && e.check !== "supported" ? `<div class="dim small">Checker: ${esc(e.note)}</div>` : ""}</div>`;
     }).join("") || `<p class="dim">Nothing matches.</p>`;
     const pages = Math.max(1, Math.ceil(ds.total / PAGE)), cur = Math.floor(ds.offset / PAGE) + 1;
     review = `<div class="card wide"><h2>Review</h2>
@@ -130,7 +156,20 @@ function renderDataset() {
   const vers = st.versions.length ? `<ul>${st.versions.map((v) => `<li><strong>Version ${v.version}</strong> · ${v.counts.world_book_texts} texts, ${v.counts.train_chat} practice, ${v.counts.test_chat} for testing · ${v.created}</li>`).join("")}</ul>` : "<p class=\"dim\">No version saved yet.</p>";
   const save = sum ? `<div class="card wide"><h2>Save</h2><p>Training uses a saved version. Dropped examples are left out.</p><button class="primary" id="save" ${ds.busy ? "disabled" : ""}>Save this version</button>${vers}</div>` : "";
   return `<h1>Step 2 · Make training data</h1><p class="lead">Turns your world into practice material. The help panel explains every choice.</p>
-    ${ds.error ? `<div class="err">${esc(ds.error)}</div>` : ""}${ds.ok ? `<div class="ok">${esc(ds.ok)}</div>` : ""}${recipe}${summary}${review}${save}`;
+    ${ds.error ? `<div class="err">${esc(ds.error)}</div>` : ""}${ds.ok ? `<div class="ok">${esc(ds.ok)}</div>` : ""}${recipe}${teacher}${summary}${review}${save}`;
+}
+
+function onTeacherEvent(p) {
+  const tc = ds.tc;
+  if (p.kind === "progress") { tc.text = p.text; tc.progress = p.total ? p.done / p.total : null; }
+  else if (p.kind === "error") { tc.running = false; tc.text = ""; ds.error = p.text; }
+  else if (p.kind === "done") {
+    tc.running = false; tc.text = ""; tc.progress = null;
+    if (p.data && p.data.checked) ds.ok = "The teacher answered. Everything is ready.";
+    else tc.report = p.data;
+    dsRefresh(true); return;
+  }
+  if (page === "dataset") render();
 }
 
 async function dsCall(cmd, args) {
@@ -583,6 +622,16 @@ function wireDataset() {
   on("next", () => { ds.offset += PAGE; dsRefresh(true); });
   on("drop-all", async () => { readFilter(); await dsCall("dataset_set_status_matching", { filter: ds.filter, status: "drop" }); dsRefresh(false); });
   on("keep-all", async () => { readFilter(); await dsCall("dataset_set_status_matching", { filter: ds.filter, status: "keep" }); dsRefresh(false); });
+  // the teacher
+  const tcOpts = () => ({ kinds: [...document.querySelectorAll(".tk")].filter((c) => c.checked).map((c) => c.value), per_source: +$("t-per").value, general_percent: +$("t-gen").value, judge: $("t-judge").checked, drop_partly: $("t-partly").checked, limit: null });
+  const tcSave = async () => { const r = await dsCall("teacher_set", { url: $("t-url").value, model: $("t-model").value, key: $("t-key").value, unloadAfter: $("t-unload").checked }); if (r) ds.state = r; return !!r; };
+  const tcGo = async (cmd, args) => { ds.tc.opts = tcOpts(); ds.tc.open = $("t-more").open; if (!(await tcSave())) return render(); ds.error = null; ds.ok = null; ds.tc.running = true; ds.tc.text = "Starting…"; ds.tc.progress = null; ds.tc.report = null; render(); try { await invoke(cmd, args); } catch (e) { ds.tc.running = false; ds.error = String(e); render(); } };
+  on("t-save", async () => { ds.tc.opts = tcOpts(); ds.ok = (await tcSave()) ? "Teacher saved." : null; render(); });
+  on("t-check", () => { ds.tc.check = true; tcGo("teacher_check", {}); });
+  on("t-run", () => { ds.tc.check = false; tcGo("teacher_start", { options: tcOpts() }); });
+  on("t-trial", () => { ds.tc.check = false; tcGo("teacher_start", { options: { ...tcOpts(), limit: 5 } }); });
+  on("t-stop", () => invoke("env_cancel"));
+  on("t-clear", async () => { if (!confirm("Remove every example the teacher made? (Your other examples stay. The teacher's stored answers are kept, so making them again costs nothing.)")) return; await dsCall("teacher_clear", { kind: null, forgetCache: false }); dsRefresh(false); });
   on("canceledit", () => { ds.editing = null; render(); });
   document.querySelectorAll("[data-show]").forEach((b) => b.onclick = () => { ds.filter = { builder: b.dataset.show, status: "", search: "" }; dsRefresh(false); });
   document.querySelectorAll("[data-toggle]").forEach((b) => b.onclick = async () => { await dsCall("dataset_set_status", { ids: [b.dataset.toggle], status: b.dataset.to }); dsRefresh(true); });
@@ -648,6 +697,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }

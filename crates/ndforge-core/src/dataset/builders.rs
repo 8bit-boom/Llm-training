@@ -38,6 +38,12 @@ pub struct Example {
     pub status: Status,
     #[serde(default)]
     pub edited: bool,
+    /// teacher examples: what the checking pass said ("supported", "partly", "unsupported", "unchecked")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    /// teacher examples: the checker's reason
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,7 +80,7 @@ impl Default for Recipe {
     }
 }
 
-fn hash_hex(parts: &[&str]) -> String {
+pub(crate) fn hash_hex(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     for p in parts {
         h.update(p.as_bytes());
@@ -83,7 +89,7 @@ fn hash_hex(parts: &[&str]) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn hash_num(s: &str) -> usize {
+pub(crate) fn hash_num(s: &str) -> usize {
     let d = Sha256::digest(s.as_bytes());
     usize::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
 }
@@ -99,7 +105,7 @@ fn pick<'a>(templates: &[&'a str], key: &str, n: usize) -> Vec<&'a str> {
 }
 
 /// At most `max` characters, cut at a paragraph or sentence end when possible.
-fn shorten(text: &str, max: usize) -> String {
+pub(crate) fn shorten(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -107,6 +113,11 @@ fn shorten(text: &str, max: usize) -> String {
     let end = cut.rfind("\n\n").or_else(|| cut.rfind(". ").map(|i| i + 1)).unwrap_or(cut.len());
     let kept = cut[..end].trim_end();
     if kept.chars().count() < max / 3 { cut.trim_end().to_string() } else { kept.to_string() }
+}
+
+/// The system prompt every practice conversation starts with (the teacher examples use it too).
+pub fn system_prompt(world: &str) -> String {
+    format!("You are the game master's assistant for the tabletop world \"{world}\". Answer from the world's lore and rules. Text marked \"GM secret\" is not known to the players. If something is not in the lore, say so instead of inventing it.")
 }
 
 struct Maker<'a> {
@@ -117,7 +128,7 @@ struct Maker<'a> {
 
 impl Maker<'_> {
     fn system(&self) -> String {
-        format!("You are the game master's assistant for the tabletop world \"{}\". Answer from the world's lore and rules. Text marked \"GM secret\" is not known to the players. If something is not in the lore, say so instead of inventing it.", self.world)
+        system_prompt(self.world)
     }
 
     fn qa(&mut self, builder: &str, source: &str, title: &str, question: String, answer: String) {
@@ -136,7 +147,7 @@ impl Maker<'_> {
                 Message { role: "user".into(), content: question },
                 Message { role: "assistant".into(), content: answer.trim().to_string() },
             ],
-            status: Status::Keep, edited: false,
+            status: Status::Keep, edited: false, check: None, note: None,
         });
     }
 }
@@ -164,7 +175,7 @@ pub fn generate(l: &Loaded, recipe: &Recipe) -> Vec<Example> {
         for d in articles(l) {
             for (i, piece) in chunk_article(&d.title, &d.article, recipe.max_chunk_tokens).into_iter().enumerate() {
                 let id = hash_hex(&["world_book", &d.source, &i.to_string(), &piece])[..12].to_string();
-                m.out.push(Example { id, builder: "world_book".into(), source: d.source.clone(), source_title: d.title.clone(), text: Some(piece), messages: vec![], status: Status::Keep, edited: false });
+                m.out.push(Example { id, builder: "world_book".into(), source: d.source.clone(), source_title: d.title.clone(), text: Some(piece), messages: vec![], status: Status::Keep, edited: false, check: None, note: None });
             }
         }
     }

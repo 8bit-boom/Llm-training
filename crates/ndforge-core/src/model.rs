@@ -139,7 +139,9 @@ impl AppModel {
         let p = self.project_ref()?;
         let recipe = store::load_recipe(p).unwrap_or_default();
         let builders: Vec<Value> = BUILDERS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect();
-        Ok(json!({"recipe": recipe, "builders": builders, "summary": store::summary(p)?, "versions": store::versions(p)}))
+        let kinds: Vec<Value> = crate::teacher::KINDS.iter().map(|(id, name, help)| json!({"id": id, "name": name, "help": help})).collect();
+        Ok(json!({"recipe": recipe, "builders": builders, "summary": store::summary(p)?, "versions": store::versions(p),
+                  "teacher": {"settings": self.settings.teacher, "has_key": crate::secrets::get("teacher").is_some(), "kinds": kinds, "options": crate::teacher::Options::default()}}))
     }
 
     pub fn dataset_generate(&self, recipe: Value) -> Result<Value> {
@@ -171,6 +173,34 @@ impl AppModel {
     pub fn dataset_set_status_matching(&self, filter: &Value, status: &str) -> Result<Value> {
         let p = self.project_ref()?;
         store::set_status_matching(p, &Self::filter_from(filter), if status == "drop" { Status::Drop } else { Status::Keep })?;
+        Ok(store::summary(p)?.unwrap_or(Value::Null))
+    }
+
+    /// Saves the teacher's address, model and key (an empty key keeps the stored one; "-" removes it).
+    pub fn teacher_set(&mut self, url: &str, model: &str, key: &str, unload_after: bool) -> Result<()> {
+        self.settings.teacher = crate::settings::TeacherSettings { url: url.trim().to_string(), model: model.trim().to_string(), unload_after };
+        self.settings.save();
+        match key.trim() {
+            "" => Ok(()),
+            "-" => crate::secrets::remove("teacher"),
+            k => crate::secrets::set("teacher", k),
+        }
+    }
+
+    pub fn teacher_client(&self) -> crate::teacher::Teacher {
+        let s = &self.settings.teacher;
+        let mut cfg = crate::teacher::TeacherConfig::new(&s.url, &s.model, crate::secrets::get("teacher"));
+        cfg.unload_after = s.unload_after;
+        crate::teacher::Teacher::new(cfg)
+    }
+
+    pub fn teacher_options(v: Value) -> Result<crate::teacher::Options> {
+        serde_json::from_value(v).map_err(|e| Error::new(format!("The options are not valid: {e}")))
+    }
+
+    pub fn teacher_clear(&self, kind: Option<&str>, forget_cache: bool) -> Result<Value> {
+        let p = self.project_ref()?;
+        store::clear_teacher(p, kind, forget_cache)?;
         Ok(store::summary(p)?.unwrap_or(Value::Null))
     }
 

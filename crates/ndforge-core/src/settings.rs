@@ -20,6 +20,22 @@ pub struct TrainServer {
     pub url: String,
 }
 
+/// The model that writes extra training examples (any OpenAI-compatible server; Ollama works). Its access key, if any, is in `secrets` under "teacher".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TeacherSettings {
+    pub url: String,
+    pub model: String,
+    /// the teacher is an Ollama server: take the model out of memory afterwards
+    pub unload_after: bool,
+}
+
+impl Default for TeacherSettings {
+    fn default() -> Self {
+        TeacherSettings { url: "http://localhost:11434".into(), model: String::new(), unload_after: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -30,13 +46,14 @@ pub struct Settings {
     pub theme: String,
     pub ollama_servers: Vec<OllamaServer>,
     pub train_servers: Vec<TrainServer>,
+    pub teacher: TeacherSettings,
     pub recent_projects: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(),
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), recent_projects: Vec::new() }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), teacher: TeacherSettings::default(), recent_projects: Vec::new() }
     }
 }
 

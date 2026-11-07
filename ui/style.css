@@ -85,3 +85,6 @@ button.secondary[disabled] { opacity: .4; }
 code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
 
 .mcard.off, .mcard:disabled { opacity: .45; cursor: not-allowed; }
+.tag.chk.ok { color: var(--ok); }
+.tag.chk.warn { color: var(--warn, #b7791f); }
+.tag.chk.bad { color: var(--err); }

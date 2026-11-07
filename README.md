@@ -19,7 +19,8 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M7 Step 5: GGUF + Modelfile, install into Ollama (PC or TrueNAS), "Retrain with the new export" | built; needs a first run with a real model and Ollama |
 | M8 Train on the TrueNAS server (worker server + client + compose) | built; the container image still has to be built once |
 | M9 Full fine-tune + "world book first, then practice" stages, type cards | built; needs a first run on the RTX 5090 |
-| M10 onward (teacher examples, test page, installers ...) | not started |
+| M10 Teacher-generated examples + checking (Step 2) | built; needs a first run with a real teacher model. "Better scores" can only be shown by the M11 test page |
+| M11 onward (test page, installers ...) | not started |
 
 ## Build and run
 
@@ -88,3 +89,11 @@ Step 3 asks two questions. **How much of the model changes?** LoRA (default), QL
 the whole model is saved in `runs/<name>/model/`, exported without a merge, and a retrain can continue from it). A card that cannot do it is greyed out with the reason: this computer only, a bf16 card (RTX 30 series or newer) is needed,
 memory (an estimate of about 6 bytes per parameter plus activations, replaced by the measured peak after a run), disk for the checkpoints. **What should it learn from?** Both together (default), or two stages: the world book as text, then
 the practice answers (`stages` in the job; the step numbers continue, and Continue skips a finished stage). Details: `crates/ndforge-core/src/train/plan.rs`, `worker/ndforge_worker/trainjob.py`.
+
+## Teacher examples (M10)
+
+On Step 2, after the examples are made, an optional card lets a bigger model (any OpenAI-compatible server: Ollama's `/v1`, LM Studio, llama.cpp, vLLM, a hosted API; the key is kept in `secrets.json`) write deeper questions, rules practice, NPC role-play,
+campaign history, lore search (nd-world's "Relevant world lore" context block), "not in the lore" answers, ~10 % general chat and house-style answers from the world's AI instructions. Every answer is cached in `datasets/teacher_cache/` (a stopped
+or repeated run only pays for what is new), then a **judge** pass compares it with its source: *unsupported* is dropped (reviewable), *partly* is kept and marked, general chat / house style are marked "not checked". "Not in the lore" questions
+use only invented names that appear nowhere in the world; NPC prompts never contain GM secrets. Teacher examples survive "Make the examples again", keep your Drop/Edit decisions, and general chat / house style never go to the test file.
+Code: `crates/ndforge-core/src/teacher/`, tests with a mock server: `crates/ndforge-core/tests/teacher.rs`.

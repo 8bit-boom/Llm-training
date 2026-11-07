@@ -63,6 +63,50 @@ fn save_examples(p: &Project, ex: &[Example]) -> Result<()> {
     write_atomic(&draft_dir(p).join("examples.jsonl"), &to_jsonl(ex)?)
 }
 
+/// Made by the teacher model (builder ids "t_...").
+pub fn is_teacher(e: &Example) -> bool {
+    e.builder.starts_with("t_")
+}
+
+/// Teacher examples never go to the test file when their source is general (general chat, house style): they test nothing about the world.
+fn always_train(e: &Example) -> bool {
+    e.builder == "t_general" || e.builder == "t_style"
+}
+
+pub fn teacher_cache_dir(p: &Project) -> PathBuf {
+    dir(p).join("teacher_cache")
+}
+
+/// Adds new teacher examples to the draft; one that already exists (same id) keeps the user's decisions.
+pub fn merge_teacher(p: &Project, new: Vec<Example>) -> Result<usize> {
+    if new.is_empty() {
+        return Ok(0);
+    }
+    let mut ex = load_examples(p)?;
+    let have: std::collections::HashSet<String> = ex.iter().map(|e| e.id.clone()).collect();
+    let mut n = 0;
+    for e in new {
+        if !have.contains(&e.id) {
+            ex.push(e);
+            n += 1;
+        }
+    }
+    save_examples(p, &ex)?;
+    Ok(n)
+}
+
+/// Removes all teacher examples (`kind` = one of them, or None for all) and, with `forget_cache`, the stored teacher answers.
+pub fn clear_teacher(p: &Project, kind: Option<&str>, forget_cache: bool) -> Result<usize> {
+    let ex = load_examples(p)?;
+    let before = ex.len();
+    let kept: Vec<Example> = ex.into_iter().filter(|e| !(is_teacher(e) && kind.map_or(true, |k| k == e.builder))).collect();
+    save_examples(p, &kept)?;
+    if forget_cache {
+        let _ = std::fs::remove_dir_all(teacher_cache_dir(p));
+    }
+    Ok(before - kept.len())
+}
+
 fn tokens(e: &Example) -> usize {
     e.text.as_deref().map(approx_tokens).unwrap_or(0) + e.messages.iter().map(|m| approx_tokens(&m.content)).sum::<usize>()
 }
@@ -73,7 +117,11 @@ pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
     let bundle = p.current_bundle().ok_or_else(|| Error::new("Import the world data first (Step 1)."))?;
     let loaded = load(&bundle)?;
     let mut fresh = generate(&loaded, recipe);
-    let prior: HashMap<String, Example> = load_examples(p)?.into_iter().map(|e| (e.id.clone(), e)).collect();
+    let prior_all = load_examples(p)?;
+    // teacher examples are not regenerated here: keep those whose source still exists in the world (and the general / style ones)
+    let sources: std::collections::HashSet<String> = super::docs::articles(&loaded).into_iter().map(|d| d.source).collect();
+    let teacher_kept: Vec<Example> = prior_all.iter().filter(|e| is_teacher(e) && (sources.contains(&e.source) || e.source.starts_with("general:") || e.source.starts_with("instruction:"))).cloned().collect();
+    let prior: HashMap<String, Example> = prior_all.into_iter().map(|e| (e.id.clone(), e)).collect();
     for e in &mut fresh {
         if let Some(old) = prior.get(&e.id) {
             e.status = old.status;
@@ -84,6 +132,7 @@ pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
             }
         }
     }
+    fresh.extend(teacher_kept);
     write_atomic(&draft_dir(p).join("recipe.json"), &serde_json::to_vec_pretty(recipe)?)?;
     save_examples(p, &fresh)?;
     write_atomic(&draft_dir(p).join("bundle.txt"), bundle.sha256.as_bytes())?;
@@ -104,7 +153,7 @@ pub fn summary(p: &Project) -> Result<Option<Value>> {
             Status::Drop => c.1 += 1,
         }
     }
-    let name = |id: &str| -> String { if id == "world_book" { "World book (the lore as text)".to_string() } else { BUILDERS.iter().find(|(b, _)| *b == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.to_string()) } };
+    let name = |id: &str| -> String { if id == "world_book" { "World book (the lore as text)".to_string() } else if let Some(k) = crate::teacher::KINDS.iter().find(|k| k.0 == id) { format!("Teacher: {}", k.1) } else { BUILDERS.iter().find(|(b, _)| *b == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.to_string()) } };
     let builders: Vec<Value> = by.iter().map(|(id, (k, d))| json!({"id": id, "name": name(id), "kept": k, "dropped": d})).collect();
     let kept: Vec<&Example> = ex.iter().filter(|e| e.status == Status::Keep).collect();
     let stale = std::fs::read_to_string(draft_dir(p).join("bundle.txt")).ok().zip(p.current_bundle()).map_or(false, |(old, cur)| old != cur.sha256);
@@ -196,7 +245,7 @@ pub fn save_version(p: &Project) -> Result<Value> {
     if kept.is_empty() {
         return Err(Error::new("Every example is dropped; there is nothing to save."));
     }
-    let chat_sources: Vec<String> = kept.iter().filter(|e| e.text.is_none()).map(|e| e.source.clone()).collect();
+    let chat_sources: Vec<String> = kept.iter().filter(|e| e.text.is_none() && !always_train(e)).map(|e| e.source.clone()).collect();
     let held = held_out_sources(&chat_sources, recipe.seed, recipe.test_percent);
     let (mut train, mut test) = (Vec::new(), Vec::new());
     let (mut n_text, mut n_train_chat, mut n_test_chat) = (0, 0, 0);
@@ -204,7 +253,7 @@ pub fn save_version(p: &Project) -> Result<Value> {
         if e.text.is_some() {
             train.extend(jsonl_line(e)?);
             n_text += 1;
-        } else if held.contains(&e.source) {
+        } else if held.contains(&e.source) && !always_train(e) {
             test.extend(jsonl_line(e)?);
             n_test_chat += 1;
         } else {
@@ -224,7 +273,7 @@ pub fn save_version(p: &Project) -> Result<Value> {
         "version": n, "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "world": p.world_name, "bundle_sha256": p.current_bundle().map(|b| b.sha256), "recipe": recipe,
         "counts": {"world_book_texts": n_text, "train_chat": n_train_chat, "test_chat": n_test_chat, "dropped": load_examples(p)?.len() - kept.len(), "edited": kept.iter().filter(|e| e.edited).count()},
-        "tokens": {"train": kept.iter().filter(|e| !held.contains(&e.source) || e.text.is_some()).map(tokens).sum::<usize>(), "test": kept.iter().filter(|e| e.text.is_none() && held.contains(&e.source)).map(tokens).sum::<usize>()},
+        "tokens": {"train": kept.iter().filter(|e| !held.contains(&e.source) || e.text.is_some() || always_train(e)).map(tokens).sum::<usize>(), "test": kept.iter().filter(|e| e.text.is_none() && held.contains(&e.source) && !always_train(e)).map(tokens).sum::<usize>()},
         "builders": builders, "held_out_sources": held_sorted,
     });
     write_atomic(&vdir.join("train.jsonl"), &train)?;

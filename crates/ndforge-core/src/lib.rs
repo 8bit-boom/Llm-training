@@ -15,6 +15,7 @@ pub mod secrets;
 pub mod remote;
 pub mod train;
 pub mod sample;
+pub mod teacher;
 pub mod settings;
 
 pub use error::{Error, Result};
