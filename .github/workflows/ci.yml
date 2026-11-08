@@ -18,6 +18,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf
       - run: cargo test --workspace --no-fail-fast
       - run: cargo build -p nd-lore-forge
+      - name: Install script, prerequisites check (Linux)
+        if: runner.os == 'Linux'
+        run: ./install.sh --check
+      - name: Install script, full run from a clone (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./install.ps1 -Check
+          ./install.ps1
+          if (-not (Test-Path target/release/nd-lore-forge.exe)) { throw "program not built" }
+          if (-not (Test-Path tools/uv.exe)) { throw "uv not fetched" }
   worker:
     runs-on: ubuntu-latest
     steps:
