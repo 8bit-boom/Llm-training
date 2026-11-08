@@ -122,6 +122,13 @@ pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
     let sources: std::collections::HashSet<String> = super::docs::articles(&loaded).into_iter().map(|d| d.source).collect();
     let teacher_kept: Vec<Example> = prior_all.iter().filter(|e| is_teacher(e) && (sources.contains(&e.source) || e.source.starts_with("general:") || e.source.starts_with("instruction:"))).cloned().collect();
     let prior: HashMap<String, Example> = prior_all.into_iter().map(|e| (e.id.clone(), e)).collect();
+    // examples nd-world's own AI model wrote and checked (the bundle's teacher_examples.jsonl): they join the draft like any other; a decision made
+    // on one earlier (dropped, edited) is applied below, so a newer export never undoes the review work
+    let in_fresh: std::collections::HashSet<String> = fresh.iter().map(|e| e.id.clone()).collect();
+    let from_nd: Vec<Example> = bundle.records("teacher_examples.jsonl")?.into_iter().filter_map(|v| serde_json::from_value::<Example>(v).ok())
+        .filter(|e| is_teacher(&e) && !e.messages.is_empty() && !in_fresh.contains(&e.id)).collect();
+    let nd_ids: std::collections::HashSet<String> = from_nd.iter().map(|e| e.id.clone()).collect();
+    fresh.extend(from_nd);
     for e in &mut fresh {
         if let Some(old) = prior.get(&e.id) {
             e.status = old.status;
@@ -132,7 +139,7 @@ pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
             }
         }
     }
-    fresh.extend(teacher_kept);
+    fresh.extend(teacher_kept.into_iter().filter(|e| !nd_ids.contains(&e.id)));
     write_atomic(&draft_dir(p).join("recipe.json"), &serde_json::to_vec_pretty(recipe)?)?;
     save_examples(p, &fresh)?;
     write_atomic(&draft_dir(p).join("bundle.txt"), bundle.sha256.as_bytes())?;
@@ -160,7 +167,7 @@ pub fn summary(p: &Project) -> Result<Option<Value>> {
     Ok(Some(json!({
         "recipe": load_recipe(p), "builders": builders, "total": ex.len(), "kept": kept.len(),
         "edited": ex.iter().filter(|e| e.edited).count(), "tokens": kept.iter().map(|e| tokens(e)).sum::<usize>(),
-        "stale": stale,
+        "stale": stale, "nd_world_examples": p.current_bundle().and_then(|b| b.counts.get("teacher_examples.jsonl").copied()).unwrap_or(0),
     })))
 }
 

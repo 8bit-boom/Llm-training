@@ -110,3 +110,5 @@ Step 4 puts the held-out questions of the run's data version to the **original**
 (`crates/ndforge-core/src/evaluate/`): lore and rules by word overlap with the expected answer (or graded by the teacher model, optional), "made-up answers" with 8 invented names that appear nowhere in the world (did it decline or invent?), and
 6 general-chat prompts (sensible or not). The verdict is plain ("Better than the original on 86 % of lore questions"), with warnings when the model invents lore or forgot general chat. Also: ask both models a free question side by side, save the chat to
 `transcripts/`, and a table comparing every tested run. Results: `runs/<run>/test.json`. The word-overlap score is a rough guide, not a grade.
+
+**From nd-world:** the teacher step can also run inside nd-world (Export & Backup → Better training examples, Python-free image). Its examples travel in the `.ndtrain` file as `teacher_examples.jsonl` and appear in Step 2 already checked; see `docs/BUNDLE_FORMAT.md`.

@@ -273,3 +273,69 @@ fn stop_trial_limit_and_failures() {
     let unreachable = Teacher::new({ let mut c = TeacherConfig::new("http://127.0.0.1:1", "m", None); c.retry_ms = 1; c });
     assert!(unreachable.check().unwrap_err().0.contains("did not answer"));
 }
+
+fn nd_example(id: &str, builder: &str, source: &str, answer: &str, status: &str, check: &str) -> Value {
+    json!({"id": id, "builder": builder, "source": source, "source_title": "Gruff Captain", "status": status, "edited": false, "check": check, "note": "checked",
+           "messages": [{"role": "system", "content": "You are the game master's assistant for the tabletop world \"Ashfall Reach\"."},
+                        {"role": "user", "content": format!("Question for {id}?")}, {"role": "assistant", "content": answer}]})
+}
+
+fn world_file(dir: &std::path::Path, name: &str, examples: Vec<Value>) -> std::path::PathBuf {
+    use ndforge_core::bundle::{write_bundle, Member};
+    let f = dir.join(name);
+    let members = vec![
+        ("entities.jsonl", Member::Records(sample::entities(1))),
+        ("teacher_examples.jsonl", Member::Records(examples)),
+    ];
+    write_bundle(&f, &sample::world(), members, "t", "2026-11-08T12:00:00Z").unwrap();
+    f
+}
+
+#[test]
+fn examples_nd_world_wrote_join_the_draft_with_their_marks_and_survive_a_newer_export() {
+    let d = tempdir().unwrap();
+    let mut p = Project::create(&d.path().join("projects"), "Ashfall Reach").unwrap();
+    let first = vec![
+        nd_example("a1", "t_deeper", "entity:1", "Anders matters because of his role.", "keep", "supported"),
+        nd_example("b2", "t_deeper", "entity:1", "Invented ZZ detail.", "drop", "unsupported"),
+        nd_example("c3", "t_general", "general:pacing", "Alternate tense and quiet scenes.", "keep", "unchecked"),
+    ];
+    let f1 = world_file(d.path(), "one.ndtrain", first.clone());
+    let bundle = open_bundle(&f1).unwrap();
+    assert!(bundle.summary_lines().iter().any(|l| l == "3 ready-made examples from nd-world"), "{:?}", bundle.summary_lines());
+    p.import_bundle(&bundle).unwrap();
+    let sum = store::generate_draft(&p, &Recipe::default()).unwrap();
+    assert_eq!(sum["nd_world_examples"], 3);
+    let ex = store::load_examples(&p).unwrap();
+    let get = |id: &str| ex.iter().find(|e| e.id == id).unwrap();
+    assert_eq!((get("a1").status, get("a1").check.as_deref(), get("a1").note.as_deref()), (Status::Keep, Some("supported"), Some("checked")));
+    assert_eq!((get("b2").status, get("b2").check.as_deref()), (Status::Drop, Some("unsupported")));
+    assert_eq!(get("c3").builder, "t_general");
+    assert!(sum["builders"].as_array().unwrap().iter().any(|b| b["name"] == "Teacher: Deeper questions" && b["kept"] == 1 && b["dropped"] == 1));
+    // the GM reviews: drops one, brings one back, edits one
+    store::set_status(&p, &["a1".into()], Status::Drop).unwrap();
+    store::set_status(&p, &["b2".into()], Status::Keep).unwrap();
+    store::edit(&p, "c3", "My own answer.").unwrap();
+    // a newer export: the same three and a new one; the decisions stay, the new example is added
+    let mut second = first;
+    second.push(nd_example("d4", "t_rules", "entity:1", "Roll and count sixes.", "keep", "partly"));
+    let f2 = world_file(d.path(), "two.ndtrain", second);
+    p.import_bundle(&open_bundle(&f2).unwrap()).unwrap();
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    let ex = store::load_examples(&p).unwrap();
+    let get = |id: &str| ex.iter().find(|e| e.id == id).unwrap();
+    assert_eq!(get("a1").status, Status::Drop);
+    assert_eq!(get("b2").status, Status::Keep);
+    assert_eq!(get("c3").messages.last().unwrap().content, "My own answer.");
+    assert_eq!((get("d4").status, get("d4").check.as_deref()), (Status::Keep, Some("partly")));
+    assert_eq!(ex.iter().filter(|e| e.builder.starts_with("t_")).count(), 4, "no duplicates");
+    // they reach the saved version like any other (dropped ones do not)
+    store::save_version(&p).unwrap();
+    let train = std::fs::read_to_string(p.folder.join("datasets/v1/train.jsonl")).unwrap() + &std::fs::read_to_string(p.folder.join("datasets/v1/test.jsonl")).unwrap();
+    assert!(train.contains("My own answer.") && train.contains("Roll and count sixes.") && !train.contains("Anders matters because of his role."));
+    // a file with a damaged example line is skipped, not fatal
+    let f3 = world_file(d.path(), "three.ndtrain", vec![json!({"id": "x", "builder": "t_deeper"}), nd_example("e5", "t_deeper", "entity:1", "Fine.", "keep", "supported")]);
+    p.import_bundle(&open_bundle(&f3).unwrap()).unwrap();
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    assert!(store::load_examples(&p).unwrap().iter().any(|e| e.id == "e5"));
+}

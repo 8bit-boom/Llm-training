@@ -18,6 +18,8 @@ Step 1 done: the world data of your project is imported.
 6. Press **Save this version**. Training always uses a saved version, so you can later see exactly what a model learned from.
 
 ## Better examples with a teacher model (optional)
+If your world file came from an nd-world that has made **Better training examples** (Export & Backup), they are already in your list: kinds starting with *Teacher:*, with their ✓ / ⚠ / ✗ marks. They stay when you import a newer world file, together with your Drop / Keep / Edit choices. ("Remove all teacher examples" removes them from the list now; they come back the next time you press *Make the examples* while the world file still contains them.)
+
 After you have made the examples, the page shows **Better examples with a teacher model**. A bigger model, for example Gemma 4 running in Ollama on your TrueNAS, reads your world and writes extra practice:
 - **Deeper questions**: why and how questions that need several facts.
 - **Rules practice**: a concrete situation and the ruling, with the steps.
