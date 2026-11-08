@@ -242,7 +242,7 @@ fn a_warm_start_sends_the_earlier_adapter_and_the_server_points_the_job_at_it() 
     job["init_adapter"] = json!(old);
     let mut ev = Vec::new();
     go(&p, &m, job, &srv.target(), Arc::new(AtomicBool::new(false)), false, &mut ev).unwrap();
-    assert!(ev.iter().any(|e| e["kind"] == "log" && e["text"].as_str().unwrap().contains("init=") && e["text"].as_str().unwrap().contains("/jobs/run1/in/init_adapter")), "{ev:?}");
+    assert!(ev.iter().any(|e| e["kind"] == "log" && e["text"].as_str().unwrap().contains("init=") && e["text"].as_str().unwrap().replace('\\', "/").contains("/jobs/run1/in/init_adapter")), "{ev:?}");
     assert_eq!(std::fs::read(srv.data.join("jobs/run1/in/init_adapter/sub/w.bin")).unwrap(), b"OLD");
 }
 

@@ -136,7 +136,7 @@ fn retrain_is_offered_only_for_a_new_world_after_a_finished_run_and_makes_a_new_
     assert_eq!(retrain::info(&p).unwrap()["available"], false);                       // now the data is up to date
     // continue from the previous model: the old adapter is the starting point and the run is shorter
     let warm = m.retrain_job(true).unwrap();
-    assert!(warm.job["init_adapter"].as_str().unwrap().ends_with("runs/run1/adapter"));
+    assert!(warm.job["init_adapter"].as_str().unwrap().replace('\\', "/").ends_with("runs/run1/adapter"));
     assert_eq!(warm.hyper.epochs, 1.0);
     assert_eq!(warm.job["dataset"]["version"], 3);
 }
@@ -215,7 +215,7 @@ fi"#);
     let mut m = AppModel::load();
     m.open_project(p.folder.to_str().unwrap()).unwrap();
     let warm = m.retrain_job(true).unwrap();
-    assert!(warm.job["init_model"].as_str().unwrap().ends_with("runs/full1/model") && warm.job.get("init_adapter").is_none());
+    assert!(warm.job["init_model"].as_str().unwrap().replace('\\', "/").ends_with("runs/full1/model") && warm.job.get("init_adapter").is_none());
     assert_eq!((warm.method, warm.hyper.lr, warm.job["method"].as_str()), (Method::Full, 1e-5, Some("full")));
     let cold = m.retrain_job(false).unwrap();
     assert!(cold.job.get("init_model").is_none() && cold.job.get("init_adapter").is_none());

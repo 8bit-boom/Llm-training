@@ -311,7 +311,7 @@ fn model_train_state_and_jobs() {
     let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None, None).unwrap();
     assert_eq!(job.job["model"]["repo"], "unsloth/Qwen3.5-4B");
     assert_eq!((job.hyper.rank, job.job["hyper"]["max_steps"].as_u64()), (4, Some(60)));
-    assert!(job.job["dataset"]["train"].as_str().unwrap().ends_with("datasets/v1/train.jsonl"));
+    assert!(job.job["dataset"]["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v1/train.jsonl"));
     assert_eq!(job.job["resume"], false);
     // bad settings are plain errors
     assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 0}), None, None).unwrap_err().0.contains("rank"));
