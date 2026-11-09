@@ -24,7 +24,9 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ndforge-uv-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 Write-Host "Fetching uv ..."
 Invoke-WebRequest "$base/$asset" -OutFile "$tmp\$asset"
-$want = ((Invoke-WebRequest "$base/$asset.sha256").Content.ToString().Trim() -split "\s+")[0].ToLower()
+$sumText = (Invoke-WebRequest "$base/$asset.sha256").Content
+if ($sumText -is [byte[]]) { $sumText = [Text.Encoding]::UTF8.GetString($sumText) }   # served as a binary download: bytes, not text
+$want = (($sumText.ToString().Trim()) -split "\s+")[0].ToLower()
 $got = (Get-FileHash "$tmp\$asset" -Algorithm SHA256).Hash.ToLower()
 if ($want -ne $got) { throw "uv checksum mismatch: wanted $want, got $got" }
 Expand-Archive "$tmp\$asset" -DestinationPath "$tmp\x"
