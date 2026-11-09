@@ -130,9 +130,10 @@ fn a_git_clone_has_working_install_scripts_and_the_program_finds_the_tools_they_
     }
     std::env::remove_var("NDFORGE_UV");
     let found = ndforge_core::envmgr::find_uv();
+    let ok = found.as_ref().is_some_and(|p| p.is_file());    // checked before the stand-in file is removed
     if made {
         std::fs::remove_file(tools.join(name)).unwrap();
         let _ = std::fs::remove_dir(&tools);
     }
-    assert!(found.is_some_and(|p| p.is_file()));
+    assert!(ok, "find_uv found {found:?}");
 }
