@@ -104,3 +104,36 @@ fn the_packaging_files_agree_with_the_program() {
     assert!(ok.success());
     assert!(std::process::Command::new("sh").arg("-n").arg(r.join("packaging/linux/build.sh")).status().unwrap().success());
 }
+
+#[test]
+fn a_git_clone_has_working_install_scripts_and_the_program_finds_the_tools_they_fetch() {
+    let r = repo();
+    for f in ["install.sh", "run.sh", "packaging/fetch_uv.sh"] {
+        assert!(std::process::Command::new("sh").arg("-n").arg(r.join(f)).status().unwrap().success(), "{f} has a syntax error");
+    }
+    let sh = std::fs::read_to_string(r.join("install.sh")).unwrap();
+    let ps = std::fs::read_to_string(r.join("install.ps1")).unwrap();
+    // both build with the feature that embeds the window, and both fetch uv into ./tools
+    assert!(sh.contains("--features custom-protocol") && ps.contains("--features custom-protocol"));
+    assert!(sh.contains("$ROOT/tools") && ps.contains("$root\\tools"));
+    assert!(ps.contains("Get-FileHash") && std::fs::read_to_string(r.join("packaging/fetch_uv.sh")).unwrap().contains("sha256sum"));
+    assert!(std::fs::read_to_string(r.join("run.cmd")).unwrap().contains("target\\release\\nd-lore-forge.exe"));
+    assert!(std::fs::read_to_string(r.join("src-tauri/Cargo.toml")).unwrap().contains("custom-protocol = [\"tauri/custom-protocol\"]"));
+    assert!(std::fs::read_to_string(r.join(".gitignore")).unwrap().lines().any(|l| l == "tools/"));
+    // the program looks in <repo>/tools, where the scripts put uv
+    let tools = r.join("tools");
+    let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    let made = !tools.join(name).exists();
+    if made {
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join(name), "x").unwrap();
+    }
+    std::env::remove_var("NDFORGE_UV");
+    let found = ndforge_core::envmgr::find_uv();
+    let ok = found.as_ref().is_some_and(|p| p.is_file());    // checked before the stand-in file is removed
+    if made {
+        std::fs::remove_file(tools.join(name)).unwrap();
+        let _ = std::fs::remove_dir(&tools);
+    }
+    assert!(ok, "find_uv found {found:?}");
+}

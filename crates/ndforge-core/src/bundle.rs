@@ -13,17 +13,17 @@ pub const FORMAT: &str = "nd-training-bundle";
 pub const SUPPORTED_VERSION: i64 = 1;
 const REQUIRED: [&str; 2] = ["world.json", "entities.jsonl"];
 /// The order members are written in; also the list of members the reader knows about.
-pub const MEMBER_ORDER: [&str; 13] = [
+pub const MEMBER_ORDER: [&str; 14] = [
     "manifest.json", "world.json", "entities.jsonl", "entity_notes.jsonl", "relations.jsonl", "rules.md", "rules_sheets.jsonl",
-    "sessions.jsonl", "facts.jsonl", "quests.jsonl", "tables.jsonl", "ai_instructions.jsonl", "characters.jsonl",
+    "sessions.jsonl", "facts.jsonl", "quests.jsonl", "tables.jsonl", "ai_instructions.jsonl", "characters.jsonl", "teacher_examples.jsonl",
 ];
 /// Plain-language names for the summary ("312 entities").
-pub const LABELS: [(&str, &str, &str); 10] = [
+pub const LABELS: [(&str, &str, &str); 11] = [
     ("entities.jsonl", "entities", "entity"), ("entity_notes.jsonl", "entity notes", "entity note"),
     ("relations.jsonl", "relations", "relation"), ("rules_sheets.jsonl", "sheet rules", "sheet rules"),
     ("sessions.jsonl", "session recaps", "session recap"), ("facts.jsonl", "facts", "fact"), ("quests.jsonl", "quests", "quest"),
     ("tables.jsonl", "random tables", "random table"), ("ai_instructions.jsonl", "AI instructions", "AI instruction"),
-    ("characters.jsonl", "player characters", "player character"),
+    ("characters.jsonl", "player characters", "player character"), ("teacher_examples.jsonl", "ready-made examples from nd-world", "ready-made example from nd-world"),
 ];
 
 #[derive(Debug, Clone)]

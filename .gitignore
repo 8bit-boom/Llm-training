@@ -4,3 +4,4 @@ dist/
 src-tauri/gen/
 __pycache__/
 .venv/
+tools/

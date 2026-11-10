@@ -23,13 +23,18 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
 
+## Install
+
+- **Installers:** Windows `.exe`, Linux AppImage and `.deb` on the [Releases page](https://github.com/8bit-boom/Llm-training/releases).
+- **From a git clone:** `git clone https://github.com/8bit-boom/Llm-training && cd Llm-training && ./install.sh && ./run.sh` (Linux); on Windows run `install.ps1` in PowerShell, then `run.cmd`. Details and prerequisites: `docs/INSTALL.md`.
+
 ## Build and run
 
 Needs Rust (stable). On Linux also the Tauri libraries: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf`.
 
 ```
 cargo test --workspace            # the core (no window needed)
-cargo run -p nd-lore-forge        # the program
+cargo run -p nd-lore-forge        # the program (development build)
 cargo install tauri-cli --version "^2" && cargo tauri build     # installer (MSI/NSIS, AppImage/deb)
 ```
 
@@ -105,3 +110,5 @@ Step 4 puts the held-out questions of the run's data version to the **original**
 (`crates/ndforge-core/src/evaluate/`): lore and rules by word overlap with the expected answer (or graded by the teacher model, optional), "made-up answers" with 8 invented names that appear nowhere in the world (did it decline or invent?), and
 6 general-chat prompts (sensible or not). The verdict is plain ("Better than the original on 86 % of lore questions"), with warnings when the model invents lore or forgot general chat. Also: ask both models a free question side by side, save the chat to
 `transcripts/`, and a table comparing every tested run. Results: `runs/<run>/test.json`. The word-overlap score is a rough guide, not a grade.
+
+**From nd-world:** the teacher step can also run inside nd-world (Export & Backup → Better training examples, Python-free image). Its examples travel in the `.ndtrain` file as `teacher_examples.jsonl` and appear in Step 2 already checked; see `docs/BUNDLE_FORMAT.md`.

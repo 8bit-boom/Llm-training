@@ -33,6 +33,7 @@ left out when they would be empty.
 | `quests.jsonl` | no | `{"id","title","status","category","summary","body","linked_entities":[…],"parent_id"}` |
 | `tables.jsonl` | no | `{"id","name","category","description","entries":[…]}` (the world's own tables) |
 | `ai_instructions.jsonl` | no | enabled standing AI instructions: `{"id","title","content","applies_to_players"}` |
+| `teacher_examples.jsonl` | no | examples written and checked by nd-world's own AI model (Export & Backup → Better training examples): `{"id","builder":"t_…","source","source_title","messages":[system, user, assistant…],"status":"keep"\|"drop","edited","check":"supported"\|"partly"\|"unsupported"\|"unchecked","note"}`. ND Lore Forge adds them to the Step 2 draft |
 | `characters.jsonl` | no | `{"id","name","race","char_class","level","backstory","notes","equipment":[…],"feats":[…]}` — no owner or account fields |
 
 Normalisation (so Python and Rust agree): `aliases` / `tags` are the comma-separated text split, each part stripped, empty parts

@@ -80,5 +80,10 @@ pub fn find_uv() -> Option<PathBuf> {
     if let Some(p) = find_tool_in(&resource_dirs(), name) {
         return Some(p);
     }
+    // a copy made by install.sh / install.ps1 in the repository's own `tools` folder (a build from a git clone)
+    let repo_tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
+    if let Some(p) = find_tool_in(&[repo_tools], name) {
+        return Some(p);
+    }
     std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|d| d.join(name)).find(|p| p.is_file()))
 }

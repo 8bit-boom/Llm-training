@@ -8,6 +8,15 @@ The in-app **Guide** (📖 in the left column) has the same walkthrough with pic
 - First start: **⚙ Training setup → Install the training software** (several GB, one time; needs internet), then **Test the graphics card**.
 - Where things are: projects in *Documents/ND Lore Forge* (Windows) or the home folder; settings, access keys (`secrets.json`, readable by you only, not encrypted) and the Python environment in the user's settings folder (`%APPDATA%\nd-lore-forge` or `~/.config/nd-lore-forge`). Uninstalling the program leaves projects and the training software; delete the settings folder to remove the latter.
 
+## Install from a git clone
+For people who prefer to build it themselves (or want to follow the latest changes).
+- **Linux:** `git clone https://github.com/8bit-boom/Llm-training && cd Llm-training && ./install.sh`, then `./run.sh`. `./install.sh --check` only checks the prerequisites; `--desktop` adds an application-menu entry.
+- **Windows (PowerShell):** `git clone https://github.com/8bit-boom/Llm-training; cd Llm-training; powershell -ExecutionPolicy Bypass -File install.ps1`, then double-click `run.cmd`. `-Check` only checks; `-Shortcut` adds a desktop shortcut.
+- **You need:** git, [Rust](https://rustup.rs) (on Windows also the Visual Studio C++ Build Tools, which rustup asks for), and on Linux the window libraries: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev build-essential curl pkg-config`. The script tells you what is missing.
+- **What it does:** downloads `uv` (checksum-verified) into `tools/`, then `cargo build --release -p nd-lore-forge --features custom-protocol` (the feature embeds the window's files in the program). The program finds the worker in `worker/` and `uv` in `tools/` inside the clone, so keep the clone where it is.
+- **Update:** `git pull` and run the install script again. Then, in the program, **Training setup** installs the Python training software as usual (first start only).
+- macOS is not supported (no NVIDIA graphics cards).
+
 ## For whoever builds the installers
 Both builds are in `.github/workflows/release.yml` (tag `v*` or run by hand) and can be run locally:
 - **Linux:** `cargo install tauri-cli --version "^2" --locked`, install the Tauri system libraries (see `ci.yml`), then `packaging/linux/build.sh` -> `dist/ND-Lore-Forge-<version>.AppImage` and `.deb`.
