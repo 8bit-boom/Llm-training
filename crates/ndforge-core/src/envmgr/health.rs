@@ -33,6 +33,8 @@ pub struct Facts {
     pub env_installed: bool,
     /// the GPU self-test passed in this environment
     pub selftest_passed: bool,
+    /// the environment was made by a setup that did not yet check PyTorch for CUDA (its PyTorch may be the CPU-only build)
+    pub env_cuda_unchecked: bool,
 }
 
 const DISK_FAIL_GB: f64 = 15.0;
@@ -80,7 +82,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         check("uv", "Installer tool (uv)", Light::Fail, "The tool that installs the training software (uv) was not found.",
               "Install it from https://docs.astral.sh/uv/ (one command), then press \"Check again\".")
     });
-    out.push(if f.env_installed {
+    out.push(if f.env_installed && f.env_cuda_unchecked {
+        check("env", "Training software", Light::Warn, "Installed, but PyTorch was not checked for the graphics card when it was installed.",
+              "Press \"Install the training software\" once more: it checks PyTorch and, if it is the CPU-only build, replaces it with the NVIDIA build (downloads are reused).")
+    } else if f.env_installed {
         check("env", "Training software", Light::Ok, "Installed.", "")
     } else {
         check("env", "Training software", Light::Warn, "Not installed yet.", "Press \"Install the training software\" (several GB, one time).")
@@ -116,6 +121,11 @@ pub fn env_installed(env: &Path) -> bool {
     env.join("ndforge_env.json").is_file()
 }
 
+/// A marker from before the setup checked PyTorch for CUDA (no `"cuda_torch": true` in it).
+pub fn env_cuda_unchecked(env: &Path) -> bool {
+    env.join("ndforge_env.json").is_file() && !std::fs::read_to_string(env.join("ndforge_env.json")).map(|t| t.contains("\"cuda_torch\": true")).unwrap_or(false)
+}
+
 pub fn selftest_passed(env: &Path) -> bool {
     env.join("selftest.json").is_file()
 }
@@ -128,5 +138,6 @@ pub fn gather() -> Facts {
         uv_found: super::find_uv().is_some(),
         env_installed: env_installed(&env),
         selftest_passed: selftest_passed(&env),
+        env_cuda_unchecked: env_cuda_unchecked(&env),
     }
 }

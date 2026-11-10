@@ -22,7 +22,13 @@ def run(job: dict) -> int:
     protocol.progress("detect", 0.1, "Looking for the graphics card")
     if not torch.cuda.is_available():
         if job.get("require_gpu", True):
-            protocol.error("no_cuda", "PyTorch cannot see an NVIDIA graphics card. Update the NVIDIA driver and run the setup again.")
+            built = f"(PyTorch {info['torch']}, CUDA {info['cuda_version']})"
+            if not info["cuda_version"]:
+                protocol.error("cpu_torch", f"The PyTorch in the training software is the CPU-only build {built}, so it cannot use the graphics card even though the driver is fine. "
+                                            "Press \"Install the training software\" again: it puts the NVIDIA build of PyTorch back.")
+            else:
+                protocol.error("no_cuda", f"PyTorch {built} cannot see an NVIDIA graphics card. If you updated the NVIDIA driver, restart the computer; "
+                                          "close programs that reserve the card; then run the test again. If it still fails, update the driver and run the setup again.")
             return 1
         protocol.result({**info, "train_ok": False, "note": "CPU only"})
         return 0
