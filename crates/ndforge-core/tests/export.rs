@@ -155,7 +155,7 @@ fn model_settings_for_ollama_servers_and_the_probe_question() {
     sample::build(&f, 1, None).unwrap();
     m.apply_bundle(f.to_str().unwrap()).unwrap();
     let st = m.export_state().unwrap();
-    assert_eq!((st["suggested_name"].as_str(), st["servers"][0]["url"].as_str(), st["quants"].as_array().unwrap().len()), (Some("ashfall-reach-gm"), Some("http://localhost:11434"), 4));
+    assert_eq!((st["suggested_name"].as_str(), st["servers"][0]["url"].as_str(), st["quants"].as_array().unwrap().len()), (Some("ashfall-reach-gm"), Some("http://localhost:11434"), 5));
     m.add_ollama_server("TrueNAS", "truenas:11434").unwrap();
     assert!(m.add_ollama_server("", "x").is_err());
     assert_eq!(m.export_state().unwrap()["servers"].as_array().unwrap().len(), 2);
@@ -272,4 +272,46 @@ echo "{\"type\":\"result\",\"data\":{\"gguf\":$g,\"merged_dir\":$m,\"quant\":\"$
     std::fs::create_dir_all(full.join("model")).unwrap();
     std::fs::write(full.join("model/config.json"), "{}").unwrap();
     assert!(exports::copy_adapter(&p, "full1", &dest).unwrap_err().0.contains("full fine-tune"));
+}
+
+#[cfg(unix)]
+#[test]
+fn several_sizes_come_from_one_job_and_each_becomes_its_own_export() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // the fake worker makes one file per wanted size (and counts how often it was started), plus the merged folder when it is kept
+    fake_worker(d.path(), r#"echo x >> "$out/../starts.txt"
+qs=$(sed -n 's/.*"quants":\[\([^]]*\)\].*/\1/p' "$5" | tr -d '"' | tr ',' ' ')
+map=""
+for q in $qs; do printf "GGUF-$q" > "$out/model-$q.gguf"; map="$map\"$q\":\"$out/model-$q.gguf\","; done
+if grep -q '"keep_merged":true' "$5"; then mkdir -p "$out/merged"; echo '{}' > "$out/merged/config.json"; m="\"$out/merged\""; else m=null; fi
+echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m}}""#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let q = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let metas = exports::execute_many(&p, "run1", &q(&["q8_0", "q6_k", "q4_k_m", "q6_k"]), 8192, "gguf_merged", &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(metas.iter().map(|m| m["name"].as_str().unwrap()).collect::<Vec<_>>(), ["run1-q8_0", "run1-q6_k", "run1-q4_k_m"], "in the order asked, each once");
+    assert_eq!(std::fs::read_to_string(p.folder.join("exports/starts.txt")).unwrap().lines().count(), 1, "one worker job for all sizes");
+    for (name, quant) in [("run1-q8_0", "q8_0"), ("run1-q6_k", "q6_k"), ("run1-q4_k_m", "q4_k_m")] {
+        let dir = p.folder.join("exports").join(name);
+        assert_eq!(std::fs::read_to_string(dir.join(format!("model-{quant}.gguf"))).unwrap(), format!("GGUF-{quant}"));
+        assert!(std::fs::read_to_string(dir.join("Modelfile")).unwrap().starts_with(&format!("FROM ./model-{quant}.gguf")), "{name}");
+        assert!(dir.join("MODEL_CARD.md").is_file() && dir.join("meta.json").is_file());
+    }
+    // the merged model is kept once, in the first export; the work folder is gone
+    assert!(p.folder.join("exports/run1-q8_0/merged/config.json").is_file() && !p.folder.join("exports/run1-q6_k/merged").exists());
+    assert!(metas[0]["merged_dir"].as_str().unwrap().ends_with("run1-q8_0/merged") && metas[1]["merged_dir"].is_null());
+    assert!(!p.folder.join("exports/run1-gguf-work").exists());
+    let list = exports::list_exports(&p);
+    assert_eq!(list.len(), 3);
+    assert!(list.iter().all(|e| e["gguf_exists"] == true));
+    assert!(exports::find_export(&p, "run1-q6_k").is_ok());
+    // one size still goes straight into its export, and q6_k is a known size
+    let one = exports::execute_what(&p, "run1", "q6_k", 8192, "gguf", &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(one["name"], "run1-q6_k");
+    assert!(exports::QUANTS.iter().any(|(id, _)| *id == "q6_k"));
+    assert!(exports::execute_many(&p, "run1", &[], 8192, "gguf", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("at least one"));
+    assert!(exports::execute_many(&p, "run1", &q(&["q4_k_m", "q2"]), 8192, "gguf", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("Unknown file size"));
 }

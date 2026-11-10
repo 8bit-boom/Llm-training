@@ -412,3 +412,20 @@ def test_a_generic_family_model_trains_and_is_tested_with_its_own_chat_template(
     assert p2.returncode == 0, p2.stderr[-3000:]
     ans = json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))
     assert set(ans) == {"original", "trained"} and ans["original"]["a"] != ans["trained"]["a"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake llama-quantize is a shell script")
+def test_several_gguf_sizes_are_made_from_one_conversion(tmp_path):
+    p, ev, run_out = run_job(tmp_path, "qwen3_5")
+    assert p.returncode == 0
+    _fake_llama_cpp(tmp_path / "lcpp")
+    out = tmp_path / "exp"
+    p2, ev2 = run_export(tmp_path, "qwen3_5", run_out, env={"LLAMA_CPP_DIR": str(tmp_path / "lcpp")}, gguf=True, quant="q8_0", quants=["q8_0", "q6_k", "q4_k_m"])
+    assert p2.returncode == 0, p2.stderr[-2000:] + p2.stdout[-1000:]
+    res = ev2[-1]["data"]
+    assert sorted(res["ggufs"]) == ["q4_k_m", "q6_k", "q8_0"]
+    for q in res["ggufs"]:
+        assert (out / f"model-{q}.gguf").read_bytes() == f"GGUF-{q.upper()}".encode()
+    assert Path(res["gguf"]) == out / "model-q8_0.gguf"                       # the first size stays the main one
+    assert sum(1 for e in ev2 if e["type"] == "log" and "converted" in e["text"]) == 1, "converted once"
+    assert not (out / "model-f16.gguf").exists() and not (out / "merged").exists()

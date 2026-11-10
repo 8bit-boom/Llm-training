@@ -11,7 +11,8 @@ Turns a trained run into a file nd-world can use, puts it into **Ollama** (on th
 ## What to do
 1. **Make the files.** Choose the run and the **file size**:
    - **Q4_K_M** is the smallest and good for almost everything (recommended).
-   - **Q5_K_M** and **Q8_0** are larger and a little closer to the original; **F16** is the original precision.
+   - **Q5_K_M**, **Q6_K** and **Q8_0** are larger and a little closer to the original; **F16** is the original precision.
+   - You can tick **several sizes** at once (for example Q4, Q5, Q6 and Q8). The model is merged and converted once and then shrunk to each size, so the extra sizes cost little time. Every size becomes its own entry under *Your files* (and can be installed into Ollama under its own name).
    - **Context** is how much text the model reads at once (8192 is a good start; more needs more memory).
    Press **Make the files**. This joins your trained add-on into the model and makes a **GGUF** file, a **Modelfile** and a short model card in `exports/`.
    - **Make** chooses what comes out: *GGUF + Modelfile* (for Ollama, the default), *GGUF + the merged model* (also keeps the add-on baked into the model as ordinary safetensors files, 10 to 20 GB more) or *Only the merged model* (no GGUF; it loads in Unsloth, Transformers, vLLM and so on without the add-on, but Ollama cannot use it).
