@@ -24,8 +24,8 @@ fn the_settings_that_are_compared() {
     let x2 = variants(&h, false, false).into_iter().find(|v| v.id == "batch_x2").unwrap();
     assert_eq!(x2.overrides, json!({"batch": 4, "grad_accum": 4}));
     // advanced options only in the deep run and only where they would be used (not with Unsloth)
-    assert_eq!(ids(&variants(&h, false, true))[5..], ["compile", "liger", "padding_free"]);
-    assert_eq!(variants(&h, true, true).len(), 5);
+    assert_eq!(ids(&variants(&h, false, true))[5..], ["attn_sdpa", "attn_flash", "attn_flex", "compile", "liger", "padding_free"]);
+    assert_eq!(ids(&variants(&h, true, true))[5..], ["attn_sdpa", "attn_flash", "attn_flex"], "attention applies to Unsloth too");
     // a setting that is already explicit is not compared with itself; no accumulation steps to trade, a batch that is already big
     h.bucket = "off".into();
     assert!(!ids(&variants(&h, false, false)).contains(&"bucket_off"));
@@ -45,7 +45,7 @@ import json, sys
 job = json.load(open(sys.argv[1], encoding="utf-8"))
 h = job["hyper"]
 open({seen:?}, "a").write(json.dumps({{"max_steps": h["max_steps"], "save_steps": h["save_steps"], "probes": job["probes"], "stages": "stages" in job, "resume": job["resume"], "out": job["out"],
-    "bucket": h["bucket"], "batch": h["batch"]}}) + "\n")
+    "bucket": h["bucket"], "batch": h["batch"], "attention": h.get("attention")}}) + "\n")
 def out(**e): print(json.dumps(e), flush=True)
 if h["batch"] == 8:
     out(type="error", code="train_failed", message="The graphics card ran out of memory.")
@@ -81,7 +81,7 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     let r = run(&p, &m, Method::Lora, &base_job, &h, 16, true, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
     // every run was short, wrote no checkpoints, made no sample answers, was a single stage, started fresh, in a folder of its own
     let seen: Vec<Value> = std::fs::read_to_string(&seen).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(seen.len(), 8, "{seen:?}");
+    assert_eq!(seen.len(), 11, "{seen:?}");
     for s in &seen {
         assert_eq!((s["max_steps"].as_u64(), s["probes"].as_array().map(|a| a.len()), s["stages"].as_bool(), s["resume"].as_bool()), (Some(16), Some(0), Some(false), Some(false)));
         assert!(s["save_steps"].as_u64().unwrap() > 100_000 && s["out"].as_str().unwrap().contains("benchmarks") && s["out"] != "/should/be/replaced");
@@ -93,6 +93,7 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     assert_eq!(row("current")["ok"], true);
     assert_eq!((row("current")["tok_s"].as_u64(), row("bucket_off")["tok_s"].as_u64(), row("bucket_on")["tok_s"].as_u64()), (Some(1500), Some(1000), Some(1600)));
     assert_eq!((row("current")["peak_gb"].as_f64(), row("current")["vs_current"].as_f64(), row("bucket_off")["vs_current"].as_f64(), row("bucket_on")["vs_current"].as_f64()), (Some(10.0), Some(1.0), Some(0.67), Some(1.07)));
+    assert!(seen.iter().any(|s| s["attention"] == "flash_attention_2") && seen.iter().any(|s| s["attention"] == "flex_attention"), "attention variants are sent to the worker");
     assert_eq!(row("compile")["tok_s"].as_u64(), Some(1200));
     assert!(row("padding_free")["notes"][0].as_str().unwrap().contains("asked for but is off"), "an option that stayed off says why in its row");
     // the fastest, kept on disk, no leftovers

@@ -43,6 +43,14 @@ pub fn variants(base: &Hyper, unsloth: bool, deep: bool) -> Vec<Variant> {
             out.push(v(&format!("batch_x{f}"), &format!("Batch of {} instead of {}", base.batch * f, base.batch), json!({"batch": base.batch * f, "grad_accum": base.grad_accum / f})));
         }
     }
+    if deep {
+        // attention kernels work with both engines (Unsloth keeps its own default under "auto")
+        for (id, mode, name) in [("attn_sdpa", "sdpa", "Attention: PyTorch sdpa"), ("attn_flash", "flash_attention_2", "Attention: FlashAttention-2"), ("attn_flex", "flex_attention", "Attention: flex attention")] {
+            if base.attention != mode {
+                out.push(v(id, name, json!({"attention": mode})));
+            }
+        }
+    }
     if deep && !unsloth {
         out.push(v("compile", "torch.compile", json!({"compile": "on"})));
         out.push(v("liger", "Liger kernels", json!({"liger": "on"})));

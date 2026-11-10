@@ -165,6 +165,37 @@ def padding_free_status(family: str, backend: str, cuda: bool, capability):
     return True, ""
 
 
+ATTENTION_CHOICES = ("auto", "sdpa", "flash_attention_2", "flex_attention")
+
+
+def attention_request(choice: str, cuda: bool, capability) -> tuple:
+    """(attn_implementation to ask for or None, note or ""). "auto" leaves the choice to the library (Unsloth picks its own, Transformers uses sdpa).
+    An explicit choice that cannot work here is dropped with a reason instead of failing the run."""
+    choice = choice or "auto"
+    if choice == "auto":
+        return None, ""
+    if choice not in ATTENTION_CHOICES:
+        return None, f"unknown attention setting \"{choice}\", using the default"
+    if choice == "sdpa":
+        return "sdpa", ""
+    if not cuda:
+        return None, f"{choice} needs a graphics card; using the default attention"
+    if choice == "flash_attention_2":
+        if capability is None or capability[0] < 8:
+            return None, "FlashAttention-2 needs a graphics card of the RTX 30 series or newer; using the default attention"
+        if not _have("flash_attn"):
+            return None, "FlashAttention-2 needs the flash-attn package, which is not installed (on Windows only community builds exist); using the default attention"
+        return "flash_attention_2", ""
+    try:
+        import torch
+        major, minor = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+        if (major, minor) < (2, 5):
+            return None, "flex attention needs PyTorch 2.5 or newer; using the default attention"
+    except Exception:
+        return None, "flex attention could not be checked; using the default attention"
+    return "flex_attention", ""
+
+
 def liger_status(model_type: str, backend: str):
     """(possible, reason) for the fused Liger kernels (they save memory and time on the loss with huge vocabularies)."""
     if backend != "hf":

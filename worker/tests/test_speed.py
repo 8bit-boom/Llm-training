@@ -222,3 +222,33 @@ def test_an_explicit_unsloth_choice_without_unsloth_says_what_to_do_instead(tmp_
     assert p.returncode == 1 and ev[-1]["type"] == "error"
     msg = ev[-1]["message"]
     assert "Unsloth could not be loaded" in msg and "standard" in msg and "Training engine" in msg, msg
+
+
+def test_attention_request_drops_what_cannot_work_with_a_reason(monkeypatch):
+    assert speed.attention_request("auto", True, (12, 0)) == (None, "")
+    assert speed.attention_request("sdpa", False, None) == ("sdpa", "")
+    attn, why = speed.attention_request("flash_attention_2", False, None)
+    assert attn is None and "graphics card" in why
+    attn, why = speed.attention_request("flash_attention_2", True, (7, 5))
+    assert attn is None and "RTX 30" in why
+    monkeypatch.setattr(speed, "_have", lambda m: False)
+    attn, why = speed.attention_request("flash_attention_2", True, (12, 0))
+    assert attn is None and "flash-attn" in why
+    monkeypatch.setattr(speed, "_have", lambda m: True)
+    assert speed.attention_request("flash_attention_2", True, (12, 0)) == ("flash_attention_2", "")
+    assert speed.attention_request("bogus", True, (12, 0))[0] is None
+
+
+def test_a_refused_attention_loads_again_with_the_default():
+    from ndforge_worker import backends
+    calls = []
+
+    def load(**kw):
+        calls.append(kw)
+        if "attn_implementation" in kw:
+            raise ValueError("does not support flash")
+        return "model"
+    assert backends._load_with_attention(load, {"a": 1}, "flash_attention_2") == "model"
+    assert calls == [{"attn_implementation": "flash_attention_2", "a": 1}, {"a": 1}]
+    calls.clear()
+    assert backends._load_with_attention(load, {"a": 1}, None) == "model" and calls == [{"a": 1}]

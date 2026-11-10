@@ -289,6 +289,7 @@ function renderTrain() {
         ["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
         ["compile", "torch.compile", ["off", "on"], "Experimental, plain-libraries path with a graphics card and Triton only. The first steps are slow."],
         ["liger", "Liger kernels", ["off", "on"], "Plain-libraries path, if the liger-kernel package is installed and supports the model."],
+        ["attention", "Attention kernel", ["auto", "sdpa", "flash_attention_2", "flex_attention"], "auto = the library's choice (Unsloth picks its own). FlashAttention-2 needs the flash-attn package and an RTX 30 series or newer; flex attention needs PyTorch 2.5+. One that cannot work is dropped with a reason. Use \"Find the fastest settings\" to compare."],
         ["padding_free", "Padding-free batching", ["off", "on"], "Needs the flash-attn package and a model whose attention layers support it (not Qwen3.5 or Gemma 4 yet)."]].map(([k, l, opts, tip]) =>
       `<label title="${esc(tip)}">${l}<select class="ovs" data-key="${k}">${opts.map((o) => `<option ${(tr.over[k] ?? pl.hyper[k] ?? opts[0]) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>`).join("")}</div></div>` : "";
   const planHtml = pl ? `<div class="card wide"><h2>The plan</h2>${pl.hyper.stages === "book_first" ? `<p>Two stages: the <strong>world book</strong> (${v.counts.world_book_texts} texts, ${pl.hyper.book_epochs} passes), then the <strong>practice answers</strong> (${v.counts.train_chat} examples, ${pl.hyper.epochs} passes).</p>` : ""}<p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
@@ -382,7 +383,7 @@ function onTrainEvent(p) {
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; tr.stopping = false; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
   if (tr.preset !== "quick") over.stages = tr.stages;
   if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
@@ -428,7 +429,7 @@ function wireTrain() {
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   const bd = $("bn-deep"); if (bd) bd.onchange = () => { tr.bench.deep = bd.checked; };
   on("bn-start", async () => {
-    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
     tr.bench.running = true; tr.bench.error = null; tr.bench.text = "Starting…"; tr.bench.progress = 0; render();
     try { await invoke("bench_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, deep: tr.bench.deep }); } catch (e) { tr.bench.running = false; tr.bench.error = String(e); render(); }
   });
