@@ -209,6 +209,23 @@ fn run_training(job: &ndforge_core::model::TrainJob, stop: Arc<AtomicBool>, emit
     }
 }
 
+/// The speed benchmark: short real runs with several settings (this computer only). Progress and the result arrive on "bench-event".
+#[tauri::command]
+fn bench_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, method: String, preset: String, overrides: Value, deep: bool) -> Out<()> {
+    let (method, preset) = parse_choice(&method, &preset)?;
+    let job = lock(&s).bench_job(&model, method, preset, &overrides).map_err(|e| e.to_string())?;
+    let stop = tasks.cancel.clone();     // the Stop button of the running job
+    spawn_task(app, &tasks, "bench-event", move |_cancel, emit| {
+        ndforge_core::train::bench::run(&job.project, &job.model, job.method, &job.job, &job.hyper, 16, deep, stop, emit).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn bench_last(s: State<App>, model: String, method: String) -> Out<Value> {
+    let (method, _) = parse_choice(&method, "quick")?;
+    lock(&s).bench_last(&model, method).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn train_state(s: State<App>, server: Option<String>) -> Out<Value> {
     lock(&s).train_state(server.as_deref()).map_err(|e| e.to_string())
@@ -458,7 +475,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

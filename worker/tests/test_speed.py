@@ -144,3 +144,66 @@ def test_the_checkpointing_switch_works_on_a_real_model_with_the_memory_probe_st
     monkeypatch.setattr(trainjob.speed, "probe_checkpointing", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
     use, peak = trainjob._decide_checkpointing(model, rows, 2, 0, False)
     assert use is True and model.base_model.model.is_gradient_checkpointing
+
+
+# ---------------------------------------------------------------------------------------------------------------- advanced options
+FIELDS = {"torch_compile", "use_liger_kernel"}
+
+
+def test_advanced_options_are_off_unless_asked_for_and_say_why_when_they_cannot_be_on(monkeypatch):
+    off = {"compile": "off", "liger": "off", "padding_free": "off"}
+    assert speed.advanced_options(off, "generic", "llama", "hf", True, (12, 0), FIELDS) == ({}, False, [])
+    monkeypatch.setattr(speed, "_have", lambda m: False)
+    ask = {"compile": "on", "liger": "on", "padding_free": "on"}
+    kw, pf, notes = speed.advanced_options(ask, "generic", "llama", "hf", True, (12, 0), FIELDS)
+    assert kw == {} and pf is False and len(notes) == 3
+    assert "Triton" in notes[0] and "liger-kernel package is not installed" in notes[1] and "flash-attn package" in notes[2] and all("asked for but" in n for n in notes)
+    # Unsloth manages these itself; no card: no compile
+    assert all("plain-libraries path" in n for n in speed.advanced_options(ask, "generic", "llama", "unsloth", True, (12, 0), FIELDS)[2])
+    assert "only with a graphics card" in speed.advanced_options({"compile": "on"}, "generic", "llama", "hf", False, None, FIELDS)[2][0]
+
+
+def test_advanced_options_turn_on_when_everything_they_need_is_there(monkeypatch):
+    import types
+    monkeypatch.setattr(speed, "_have", lambda m: True)
+    mod = types.ModuleType("liger_kernel.transformers.monkey_patch")
+    mod.MODEL_TYPE_TO_APPLY_LIGER_FN = {"llama": object()}
+    for name in ("liger_kernel", "liger_kernel.transformers"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "liger_kernel.transformers.monkey_patch", mod)
+    ask = {"compile": "on", "liger": "on", "padding_free": "on"}
+    kw, pf, notes = speed.advanced_options(ask, "generic", "llama", "hf", True, (12, 0), FIELDS)
+    assert kw == {"torch_compile": True, "use_liger_kernel": True} and pf is True and len(notes) == 3
+    # a model type Liger has no kernels for, an old Transformers without the setting
+    assert "no kernels for the model type \"qwen3_5\"" in speed.advanced_options({"liger": "on"}, "qwen3_5", "qwen3_5", "hf", True, (12, 0), FIELDS)[2][0]
+    assert "no such setting" in speed.advanced_options({"liger": "on"}, "generic", "llama", "hf", True, (12, 0), set())[2][0]
+    # padding-free: not on a card before the RTX 30 series, and not for the families whose attention layers have not been checked
+    assert "RTX 30 series" in speed.advanced_options({"padding_free": "on"}, "generic", "llama", "hf", True, (7, 5), FIELDS)[2][0]
+    for fam in ("qwen3_5", "gemma4"):
+        kw, pf, notes = speed.advanced_options({"padding_free": "on"}, fam, "x", "hf", True, (12, 0), FIELDS)
+        assert pf is False and "has not been checked" in notes[0]
+
+
+def test_padding_free_batches_put_examples_end_to_end_with_restarting_positions_and_no_label_across_a_boundary():
+    torch = pytest.importorskip("torch")
+    rows = [{"input_ids": [10, 11, 12, 13], "completion_mask": [False, False, True, True]}, {"input_ids": [20, 21, 22], "completion_mask": [True, True, True]}]
+    out = speed.flatten_collator(0)(rows)
+    assert set(out) == {"input_ids", "labels", "position_ids"} and out["input_ids"].shape == (1, 7)
+    assert out["input_ids"][0].tolist() == [10, 11, 12, 13, 20, 21, 22]
+    assert out["position_ids"][0].tolist() == [0, 1, 2, 3, 0, 1, 2]
+    # only the answer is learned, and the first token of an example is never predicted from the example before it
+    assert out["labels"][0].tolist() == [-100, -100, 12, 13, -100, 21, 22]
+    c = speed.TokenCounter()
+    c.wrap(speed.flatten_collator(0))(rows)
+    assert (c.real, c.padded) == (7, 7)
+
+
+def test_asking_for_everything_on_a_cpu_machine_trains_normally_and_says_what_stayed_off(tmp_path):
+    pytest.importorskip("trl")
+    from test_train_cpu import run_job
+    p, ev, out = run_job(tmp_path, "qwen3_5", "llama", hyper={"max_steps": 4, "compile": "on", "liger": "on", "padding_free": "on"})
+    assert p.returncode == 0, p.stderr[-2000:]
+    sp = [e for e in ev if e["type"] == "speed"][0]
+    assert sp["options"] == [] and sp["padding_free"] is False
+    assert len([n for n in sp["notes"] if "asked for but" in n]) == 3, sp["notes"]
+    assert [e for e in ev if e["type"] == "metric"] and ev[-1]["type"] == "result"

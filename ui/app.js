@@ -191,7 +191,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { bench: { running: false, text: "", progress: null, result: null, deep: false, error: null, used: null }, speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -220,6 +220,23 @@ function samplesHtml() {
     return `<div class="sample"><div class="q">${esc(q)}</div><div class="cols"><div><span class="tag">before training</span><div class="ans">${esc(first.answer) || "<em>(empty)</em>"}</div></div>
       ${list.length > 1 ? `<div><span class="tag">now (step ${last.step})</span><div class="ans">${esc(last.answer) || "<em>(empty)</em>"}</div></div>` : ""}</div></div>`;
   }).join("");
+}
+
+function benchHtml(st) {
+  const b = tr.bench, r = b.result;
+  const local = !tr.server;
+  const rows = r ? r.rows.map((x) => `<tr class="${r.best === x.id ? "best" : ""}"><td>${r.best === x.id ? "★ " : ""}${esc(x.name)}${x.notes && x.notes.length ? `<div class="dim small">${x.notes.map(esc).join(" ")}</div>` : ""}</td>
+      ${x.ok ? `<td>${x.tok_s ? x.tok_s.toLocaleString() : "–"}</td><td>${x.vs_current != null ? "×" + x.vs_current : ""}</td><td>${x.peak_gb != null ? x.peak_gb + " GB" : "–"}</td>` : `<td colspan="3" class="err">${esc(x.error || "failed")}</td>`}</tr>`).join("") : "";
+  const best = r && r.rows.find((x) => x.id === r.best);
+  const useless = !best || best.id === "current";
+  return `<div class="card wide"><h2>Find the fastest settings <span class="tag">optional</span></h2>
+    <p>Runs a few short real training runs (${16} steps each) with different settings and shows tokens per second and memory for each. Every run loads the model again, so it takes several minutes. Nothing from these runs is kept except the table.</p>
+    ${local ? `<div class="row"><label class="opt"><input type="checkbox" id="bn-deep" ${b.deep ? "checked" : ""} ${b.running ? "disabled" : ""}> Also try torch.compile, Liger kernels and padding-free batching (slower; plain-libraries path only: they are ignored with Unsloth)</label></div>
+    <div class="row"><button class="secondary" id="bn-start" ${b.running || !st.env_ready || tr.running ? "disabled" : ""}>Run the benchmark</button>${b.running ? `<button class="secondary" id="bn-stop">Stop</button>` : ""}</div>` : `<p class="dim">Choose "This computer" under "Where to train": a server's card is tried by training there.</p>`}
+    ${b.running || b.text ? `<div class="stepline">${esc(b.text)}</div>${b.progress != null ? `<progress max="1" value="${b.progress}"></progress>` : ""}` : ""}${b.error ? `<div class="err">${esc(b.error)}</div>` : ""}
+    ${r ? `<table class="tbl"><tr><th>Setting</th><th>Tokens/s</th><th>vs current</th><th>Memory peak</th></tr>${rows}</table>
+      <p class="dim small">${esc(r.model)} · ${r.method} · ${r.steps} steps each · ${esc(r.created)}${r.stopped ? " · stopped early" : ""}. Start-up time is part of every number alike; a short run can only show big differences. ${r.unsloth ? "Unsloth is installed here, so the advanced options were not tried." : ""}</p>
+      <div class="row"><button class="primary" id="bn-use" ${useless ? "disabled" : ""}>Use the fastest settings</button>${useless ? `<span class="dim">${best ? "Your current settings are already the fastest." : "No run finished."}</span>` : ""}${b.used ? `<span class="ok">Will be used for the next run: ${esc(b.used)}</span>` : ""}</div>` : ""}</div>`;
 }
 
 function speedHtml() {
@@ -268,7 +285,11 @@ function renderTrain() {
     ...(tr.method === "full" ? [] : [["rank", "LoRA rank", pl.hyper.rank]]), ["lr", "Learning rate", pl.hyper.lr], ...(pl.hyper.stages === "book_first" ? [["book_epochs", "Passes over the world book", pl.hyper.book_epochs]] : []), ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
     ["batch", "Batch size", pl.hyper.batch], ["grad_accum", "Gradient accumulation", pl.hyper.grad_accum], ["max_seq", "Sequence length (tokens)", pl.hyper.max_seq]].map(([k, l, val]) =>
       `<label>${l}<input type="text" class="ov" data-key="${k}" value="${tr.over[k] ?? val}"></label>`).join("")}
-    <label title="Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step.">Batches by length<select class="ovs" data-key="bucket">${["auto", "on", "off"].map((o) => `<option ${(tr.over.bucket ?? pl.hyper.bucket) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label></div></div>` : "";
+    ${[["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
+        ["compile", "torch.compile", ["off", "on"], "Experimental, plain-libraries path with a graphics card and Triton only. The first steps are slow."],
+        ["liger", "Liger kernels", ["off", "on"], "Plain-libraries path, if the liger-kernel package is installed and supports the model."],
+        ["padding_free", "Padding-free batching", ["off", "on"], "Needs the flash-attn package and a model whose attention layers support it (not Qwen3.5 or Gemma 4 yet)."]].map(([k, l, opts, tip]) =>
+      `<label title="${esc(tip)}">${l}<select class="ovs" data-key="${k}">${opts.map((o) => `<option ${(tr.over[k] ?? pl.hyper[k] ?? opts[0]) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>`).join("")}</div></div>` : "";
   const planHtml = pl ? `<div class="card wide"><h2>The plan</h2>${pl.hyper.stages === "book_first" ? `<p>Two stages: the <strong>world book</strong> (${v.counts.world_book_texts} texts, ${pl.hyper.book_epochs} passes), then the <strong>practice answers</strong> (${v.counts.train_chat} examples, ${pl.hyper.epochs} passes).</p>` : ""}<p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
     ${pl.notes.length ? `<ul>${pl.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>` : "";
   const TYPES = [["lora", "LoRA, 16-bit", "Trains a small add-on; the original model stays safe. Recommended whenever it fits."],
@@ -308,7 +329,7 @@ function renderTrain() {
       <label class="opt"><input type="radio" name="tr-stages" value="mixed" ${tr.stages === "mixed" || tr.preset === "quick" ? "checked" : ""}> <strong>The world book and the practice answers together</strong> (default)</label>
       <label class="opt"><input type="radio" name="tr-stages" value="book_first" ${tr.stages === "book_first" && tr.preset !== "quick" ? "checked" : ""} ${tr.preset === "quick" ? "disabled" : ""}> <strong>The world book first, then the practice answers</strong> (two stages; better at remembering facts, takes longer${tr.preset === "quick" ? "; not for the quick test" : ""})</label>
       <div class="row" style="margin-top:10px"><label>Preset <select id="tr-preset"><option value="quick" ${tr.preset === "quick" ? "selected" : ""}>Quick test (minutes)</option><option value="normal" ${tr.preset === "normal" ? "selected" : ""}>Normal</option><option value="best" ${tr.preset === "best" ? "selected" : ""}>Best quality (slower)</option></select></label></div></div>
-    ${planHtml}${exp}<div class="card wide"><h2>3 · Train</h2>${ctrl}</div>${live}${runs}`;
+    ${planHtml}${exp}${benchHtml(st)}<div class="card wide"><h2>3 · Train</h2>${ctrl}</div>${live}${runs}`;
 }
 
 async function trRefresh() {
@@ -324,8 +345,17 @@ async function trRefresh() {
       const cur = tr.state.models.find((c) => c.model.id === tr.model);
       if (cur && tr.method === "full" && !cur.full.available && !tr.tryAnyway) tr.method = cur.recommended;
       tr.plan = await invoke("train_plan", { model: tr.model, method: tr.method, preset: tr.preset, server: tr.server || null, stages: tr.preset === "quick" ? null : tr.stages });
+      if (!tr.bench.running) { try { tr.bench.result = await invoke("bench_last", { model: tr.model, method: tr.method }); } catch (_) { tr.bench.result = null; } }
     }
   } catch (e) { tr.error = String(e); }
+  if (page === "train") render();
+}
+
+function onBenchEvent(p) {
+  const b = tr.bench;
+  if (p.kind === "bench") { b.text = `Setting ${p.index + 1} of ${p.total}: ${p.name}`; b.progress = p.index / Math.max(1, p.total); if (p.row && b.result) { /* shown when the whole run ends */ } }
+  else if (p.kind === "error") { b.running = false; b.text = ""; b.progress = null; b.error = p.text; }
+  else if (p.kind === "done") { b.running = false; b.text = ""; b.progress = null; b.result = p.data; b.used = null; }
   if (page === "train") render();
 }
 
@@ -351,7 +381,7 @@ function onTrainEvent(p) {
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = k === "bucket" ? v : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
   if (tr.preset !== "quick") over.stages = tr.stages;
   if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
@@ -394,6 +424,19 @@ function wireTrain() {
   const any = $("tr-anyway"); if (any) any.onchange = () => { tr.tryAnyway = any.checked; trRefresh(); };
   const pr = $("tr-preset"); if (pr) pr.onchange = () => { tr.preset = pr.value; tr.over = {}; trRefresh(); };
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
+  const bd = $("bn-deep"); if (bd) bd.onchange = () => { tr.bench.deep = bd.checked; };
+  on("bn-start", async () => {
+    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+    tr.bench.running = true; tr.bench.error = null; tr.bench.text = "Starting…"; tr.bench.progress = 0; render();
+    try { await invoke("bench_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, deep: tr.bench.deep }); } catch (e) { tr.bench.running = false; tr.bench.error = String(e); render(); }
+  });
+  on("bn-stop", () => invoke("env_cancel"));
+  on("bn-use", () => {
+    const r = tr.bench.result, best = r && r.rows.find((x) => x.id === r.best);
+    if (!best) return;
+    Object.assign(tr.over, best.overrides);
+    tr.bench.used = best.name; render();
+  });
   document.querySelectorAll(".ovs").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   on("tr-start", () => trStart(null));
   on("tr-resume", () => trStart($("tr-resume").dataset.run));
@@ -841,6 +884,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("bench-event", (e) => onBenchEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }

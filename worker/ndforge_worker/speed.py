@@ -91,9 +91,13 @@ class TokenCounter:
     def wrap(self, collate):
         def counted(batch):
             out = collate(batch)
-            mask = out["attention_mask"]
-            self.real += int(mask.sum())
-            self.padded += int(mask.numel())
+            mask = out.get("attention_mask")
+            if mask is None:      # padding-free: every token is real
+                self.real += int(out["input_ids"].numel())
+                self.padded += int(out["input_ids"].numel())
+            else:
+                self.real += int(mask.sum())
+                self.padded += int(mask.numel())
             return out
         return counted
 
@@ -139,3 +143,95 @@ def probe_checkpointing(model, batch_of_longest, bf16: bool):
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+
+# ------------------------------------------------------------------------------------------------------------ advanced options (all off by default)
+def _have(module: str) -> bool:
+    return importlib.util.find_spec(module) is not None
+
+
+def padding_free_status(family: str, backend: str, cuda: bool, capability):
+    """(possible, reason). Padding-free batching puts the examples of a batch end to end in ONE row and tells FlashAttention-2 where each begins, so no
+    padding is computed at all. It needs the flash-attn package, an Ampere or newer card and a model whose layers all understand that. Qwen3.5 (linear
+    attention) and Gemma 4 (sliding-window attention) have not been checked for it, so it stays off for them."""
+    if backend != "hf":
+        return False, "padding-free batching works only on the plain-libraries path (Unsloth manages its own batching)"
+    if not cuda or capability is None or capability[0] < 8:
+        return False, "padding-free batching needs a graphics card of the RTX 30 series or newer"
+    if not _have("flash_attn"):
+        return False, "padding-free batching needs the flash-attn package, which is not installed (on Windows only community builds exist)"
+    if family in ("qwen3_5", "gemma4"):
+        return False, "padding-free batching has not been checked for this model family's attention layers, so it stays off"
+    return True, ""
+
+
+def liger_status(model_type: str, backend: str):
+    """(possible, reason) for the fused Liger kernels (they save memory and time on the loss with huge vocabularies)."""
+    if backend != "hf":
+        return False, "Liger kernels are for the plain-libraries path (Unsloth has its own)"
+    if not _have("liger_kernel"):
+        return False, "the liger-kernel package is not installed"
+    try:
+        from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
+        if model_type not in MODEL_TYPE_TO_APPLY_LIGER_FN:
+            return False, f"Liger has no kernels for the model type \"{model_type}\""
+    except Exception:
+        return False, "the installed liger-kernel could not be asked which models it supports"
+    return True, ""
+
+
+def compile_status(backend: str, cuda: bool):
+    """(possible, reason) for torch.compile. It needs Triton on a graphics card; batches of changing length make it compile again, so it is for experiments."""
+    if backend != "hf":
+        return False, "torch.compile is for the plain-libraries path (Unsloth compiles its own parts)"
+    if not cuda:
+        return False, "torch.compile is used only with a graphics card here"
+    if not _have("triton"):
+        return False, "torch.compile needs Triton, which is not installed (on Windows only community builds exist)"
+    return True, ""
+
+
+def advanced_options(h: dict, family: str, model_type: str, backend: str, cuda: bool, capability, fields) -> tuple:
+    """(extra keyword arguments for the trainer's config, padding_free active, [plain-language notes]) for the settings compile / liger / padding_free."""
+    kwargs, notes, pf = {}, [], False
+    if h.get("compile") == "on":
+        ok, why = compile_status(backend, cuda)
+        if ok and "torch_compile" in fields:
+            kwargs["torch_compile"] = True
+            notes.append("torch.compile is on: the first steps are slow while it compiles, and batches of a new length compile again.")
+        else:
+            notes.append(f"torch.compile was asked for but is off: {why or 'this version of Transformers has no such setting'}.")
+    if h.get("liger") == "on":
+        ok, why = liger_status(model_type, backend)
+        if ok and "use_liger_kernel" in fields:
+            kwargs["use_liger_kernel"] = True
+            notes.append("Liger kernels are on.")
+        else:
+            notes.append(f"Liger kernels were asked for but are off: {why or 'this version of Transformers has no such setting'}.")
+    if h.get("padding_free") == "on":
+        ok, why = padding_free_status(family, backend, cuda, capability)
+        if ok:
+            pf = True
+            notes.append("Padding-free batching is on: no padding is computed.")
+        else:
+            notes.append(f"Padding-free batching was asked for but is off: {why}.")
+    return kwargs, pf, notes
+
+
+def flatten_collator(pad_id):
+    """A collator for padding-free batches: the examples end to end in one row, with position ids that restart for each example (that is how
+    FlashAttention-2 finds the boundaries) and no label across a boundary (the first token of an example is never predicted from the last token of the one before)."""
+    import torch
+
+    def collate(batch):
+        ids, labels, pos = [], [], []
+        for b in batch:
+            t = torch.tensor(b["input_ids"], dtype=torch.long)
+            m = torch.tensor(b["completion_mask"], dtype=torch.bool)
+            lab = torch.where(m, t, torch.full_like(t, -100))
+            lab[0] = -100
+            ids.append(t)
+            labels.append(lab)
+            pos.append(torch.arange(len(t)))
+        return {"input_ids": torch.cat(ids)[None], "labels": torch.cat(labels)[None], "position_ids": torch.cat(pos)[None]}
+    return collate

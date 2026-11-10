@@ -95,3 +95,4 @@ code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
 .guide img { max-width: 100%; border: 1px solid var(--line, #d6d9e0); border-radius: 8px; margin: 6px 0 14px; }
 .guide h2 { margin-top: 26px; }
 textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.tbl tr.best td { font-weight: 600; }
