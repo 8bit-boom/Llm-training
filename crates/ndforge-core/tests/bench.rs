@@ -24,8 +24,8 @@ fn the_settings_that_are_compared() {
     let x2 = variants(&h, false, false).into_iter().find(|v| v.id == "batch_x2").unwrap();
     assert_eq!(x2.overrides, json!({"batch": 4, "grad_accum": 4}));
     // advanced options only in the deep run and only where they would be used (not with Unsloth)
-    assert_eq!(ids(&variants(&h, false, true))[5..], ["attn_sdpa", "attn_flash", "attn_flex", "compile", "liger", "padding_free"]);
-    assert_eq!(ids(&variants(&h, true, true))[5..], ["attn_sdpa", "attn_flash", "attn_flex"], "attention applies to Unsloth too");
+    assert_eq!(ids(&variants(&h, false, true))[5..], ["attn_sdpa", "attn_cudnn", "attn_flash", "attn_flex", "compile", "liger", "padding_free"]);
+    assert_eq!(ids(&variants(&h, true, true))[5..], ["attn_sdpa", "attn_cudnn", "attn_flash", "attn_flex"], "attention applies to Unsloth too");
     // a setting that is already explicit is not compared with itself; no accumulation steps to trade, a batch that is already big
     h.bucket = "off".into();
     assert!(!ids(&variants(&h, false, false)).contains(&"bucket_off"));
@@ -81,7 +81,7 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     let r = run(&p, &m, Method::Lora, &base_job, &h, 16, true, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
     // every run was short, wrote no checkpoints, made no sample answers, was a single stage, started fresh, in a folder of its own
     let seen: Vec<Value> = std::fs::read_to_string(&seen).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(seen.len(), 11, "{seen:?}");
+    assert_eq!(seen.len(), 12, "{seen:?}");
     for s in &seen {
         assert_eq!((s["max_steps"].as_u64(), s["probes"].as_array().map(|a| a.len()), s["stages"].as_bool(), s["resume"].as_bool()), (Some(16), Some(0), Some(false), Some(false)));
         assert!(s["save_steps"].as_u64().unwrap() > 100_000 && s["out"].as_str().unwrap().contains("benchmarks") && s["out"] != "/should/be/replaced");

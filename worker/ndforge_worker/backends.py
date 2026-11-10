@@ -36,7 +36,10 @@ def _attention(cfg: dict):
     import torch
     from . import speed
     cuda = torch.cuda.is_available()
-    attn, note = speed.attention_request(cfg["hyper"].get("attention", "auto"), cuda, torch.cuda.get_device_capability(0) if cuda else None)
+    choice = cfg["hyper"].get("attention", "auto")
+    attn, note = speed.attention_request(choice, cuda, torch.cuda.get_device_capability(0) if cuda else None)
+    if choice == "cudnn" and attn:
+        note = speed.enable_cudnn()
     if note:
         protocol.log("Attention: " + note + ".")
     return attn

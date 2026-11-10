@@ -205,7 +205,7 @@ def run(cfg: dict) -> int:
         notes = speed.kernel_notes(cfg["model"]["family"], backend, cuda, torch.cuda.get_device_capability(0) if cuda else None) + adv_notes
         protocol.emit("speed", stage=name, bucketed=bucket, pad_random_pct=round(100 * pad_random, 1), pad_bucketed_pct=round(100 * pad_bucketed, 1),
                       mean_len=round(sum(lengths) / len(lengths)), max_len=max(lengths), batch=h["batch"], checkpointing=ck_state, checkpointing_note=ck_note, engine=backend, padding_free=padding_free, options=sorted(extra) + (["padding_free"] if padding_free else []),
-                      attn=getattr(getattr(model, "config", None), "_attn_implementation", None), notes=notes)
+                      attn=(getattr(getattr(model, "config", None), "_attn_implementation", None) or "") + (" + cuDNN first" if speed._cudnn_stack is not None else "") or None, notes=notes)
         ds = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in sr])
         trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": counter.wrap(speed.flatten_collator(pad_id) if padding_free else _collator(pad_id)), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer

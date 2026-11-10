@@ -252,3 +252,9 @@ def test_a_refused_attention_loads_again_with_the_default():
     assert calls == [{"attn_implementation": "flash_attention_2", "a": 1}, {"a": 1}]
     calls.clear()
     assert backends._load_with_attention(load, {"a": 1}, None) == "model" and calls == [{"a": 1}]
+
+
+def test_cudnn_attention_is_sdpa_with_the_cudnn_backend_and_needs_a_card():
+    attn, why = speed.attention_request("cudnn", False, None)
+    assert attn is None and "graphics card" in why
+    assert speed.cudnn_status(False)[0] is False

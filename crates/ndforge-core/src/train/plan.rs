@@ -71,7 +71,7 @@ pub struct Hyper {
     pub liger: String,
     #[serde(default = "off")]
     pub padding_free: String,
-    /// attention kernel: "auto" (the library's own choice), "sdpa", "flash_attention_2" or "flex_attention". One that cannot work here is dropped with a reason.
+    /// attention kernel: "auto" (the library's own choice), "sdpa", "cudnn" (sdpa with the cuDNN backend first), "flash_attention_2" or "flex_attention". One that cannot work here is dropped with a reason.
     #[serde(default = "auto")]
     pub attention: String,
     /// "auto" (Unsloth when it is installed, else the standard libraries), "unsloth" or "standard" (Transformers + PEFT + TRL only)

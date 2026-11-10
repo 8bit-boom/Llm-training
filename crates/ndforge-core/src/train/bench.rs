@@ -45,7 +45,7 @@ pub fn variants(base: &Hyper, unsloth: bool, deep: bool) -> Vec<Variant> {
     }
     if deep {
         // attention kernels work with both engines (Unsloth keeps its own default under "auto")
-        for (id, mode, name) in [("attn_sdpa", "sdpa", "Attention: PyTorch sdpa"), ("attn_flash", "flash_attention_2", "Attention: FlashAttention-2"), ("attn_flex", "flex_attention", "Attention: flex attention")] {
+        for (id, mode, name) in [("attn_sdpa", "sdpa", "Attention: PyTorch sdpa"), ("attn_cudnn", "cudnn", "Attention: cuDNN (through PyTorch sdpa)"), ("attn_flash", "flash_attention_2", "Attention: FlashAttention-2"), ("attn_flex", "flex_attention", "Attention: flex attention")] {
             if base.attention != mode {
                 out.push(v(id, name, json!({"attention": mode})));
             }
