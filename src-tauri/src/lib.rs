@@ -16,6 +16,22 @@ struct App(Mutex<AppModel>);
 struct Tasks {
     busy: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    /// the window was asked to close while a job runs: the job is being stopped (and saved) first
+    closing: Arc<AtomicBool>,
+}
+
+/// Asks the running job to stop and waits until it has ended, at most `max`. A training run saves a checkpoint when it is stopped, so it can be
+/// continued later. true = it ended in time.
+fn stop_and_wait(busy: &AtomicBool, cancel: &AtomicBool, max: std::time::Duration) -> bool {
+    cancel.store(true, Ordering::SeqCst);
+    let start = std::time::Instant::now();
+    while busy.load(Ordering::SeqCst) {
+        if start.elapsed() > max {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
 }
 
 type Out<T> = Result<T, String>;
@@ -474,9 +490,53 @@ fn env_cancel(tasks: State<Tasks>) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            // closing the window while something runs (training above all): stop it and let it save first, so training can be continued later
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let tasks = window.state::<Tasks>();
+                if tasks.busy.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    if !tasks.closing.swap(true, Ordering::SeqCst) {
+                        let _ = window.emit("closing", serde_json::json!({"text": "Stopping and saving what is running, then closing\u{2026}"}));
+                        let (busy, cancel, handle) = (tasks.busy.clone(), tasks.cancel.clone(), window.app_handle().clone());
+                        std::thread::spawn(move || {
+                            stop_and_wait(&busy, &cancel, std::time::Duration::from_secs(170));
+                            handle.exit(0);
+                        });
+                    }
+                }
+            }
+        })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn closing_stops_the_job_and_waits_for_it_to_save() {
+        let (busy, cancel) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        // a job that notices the stop request after a moment and then ends
+        let (b2, c2) = (busy.clone(), cancel.clone());
+        let job = std::thread::spawn(move || {
+            while !c2.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));    // saving the checkpoint
+            b2.store(false, Ordering::SeqCst);
+        });
+        let t = std::time::Instant::now();
+        assert!(stop_and_wait(&busy, &cancel, std::time::Duration::from_secs(5)));
+        assert!(cancel.load(Ordering::SeqCst) && !busy.load(Ordering::SeqCst) && t.elapsed() >= std::time::Duration::from_millis(150), "it waited for the save");
+        job.join().unwrap();
+        // nothing running: nothing to wait for; a job that never ends: gives up after the time allowed
+        assert!(stop_and_wait(&AtomicBool::new(false), &AtomicBool::new(false), std::time::Duration::from_millis(50)));
+        assert!(!stop_and_wait(&AtomicBool::new(true), &AtomicBool::new(false), std::time::Duration::from_millis(250)));
+    }
 }

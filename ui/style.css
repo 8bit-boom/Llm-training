@@ -96,3 +96,4 @@ code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
 .guide h2 { margin-top: 26px; }
 textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .tbl tr.best td { font-weight: 600; }
+#closing { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; background: rgba(20, 22, 30, 0.82); color: #fff; font-size: 20px; text-align: center; padding: 24px; }

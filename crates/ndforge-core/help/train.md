@@ -21,7 +21,7 @@ Teaches the chosen model your world. It uses the **newest saved version** from S
    - **Quick test** trains 60 steps in a few minutes: use it first to prove everything works (the model will not have learned much; it is always one stage). **Normal** (2 passes over the data) is for real use; **Best quality** is slower with a longer memory span.
 3. Read **The plan**: the number of steps, the memory estimate and any notes. If your card is short of memory the plan lowers the batch size or the sequence length for you and says so.
 4. Press **Start training**. Watch the **loss** chart (it should go down) and the **sample answers**: the same few questions are answered before training and then again every few minutes, so you can see the model learning your world.
-5. **Stop** saves the current point and ends cleanly after the current step. **Continue the last run** picks up from the saved point. The graphics card is free again as soon as training ends.
+5. **Stop and save** saves the current point and ends cleanly after the current step. Every stopped, failed or interrupted run in the list has its own **Continue** button that picks up from the saved point with the same settings. If you close the program while training, it first stops and saves (up to about two minutes); if the computer shuts down or the program crashes, the run shows as *interrupted* next time and can still be continued from the last automatic checkpoint (only the steps since then are repeated). The graphics card is free again as soon as training ends.
 
 ## Good to know
 - **Loss numbers:** a loss of 13–15 for Gemma 4 E2B/E4B is normal (a quirk of these multimodal models). What matters is that it goes **down**.

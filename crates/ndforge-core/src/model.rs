@@ -69,6 +69,7 @@ impl AppModel {
     fn adopt(&mut self, project: Project) {
         self.settings.remember_project(&project.folder);
         self.settings.save();
+        crate::train::runs::mark_interrupted(&project);   // a run left "running" by a closed program or a crash can be continued
         self.project = Some(project);
     }
 
