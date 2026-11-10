@@ -38,3 +38,7 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 
 ## Sources
 Unsloth docs (Blackwell / RTX 50, Qwen3.5, Gemma 4, FP8 RL); NVIDIA developer blog on Unsloth for Blackwell; VeOmni and ms-swift Qwen3.5 guides; IBM / Hugging Face on padding-free packing; TRL "reducing memory usage"; the SageAttention3 / SageBwd paper (arXiv 2505.11594); the Chronicals preprint (arXiv 2601.02609, self-reported); community notes on FlashAttention-4 for sm_120 and Windows wheels; Turing / T4 notes on FlashAttention and bf16.
+
+## Benchmark: how the numbers are made (and why)
+
+A first table showed all attention kernels within 1 % of each other and every one 15 % above "current" although `sdpa` is Unsloth's default: the first run paid for kernel compilation. So: (1) speeds are the tokens per second **between a point after the first quarter of the steps and the last step** (the worker sends cumulative `tokens_real` and `elapsed_s` with every metric line); (2) one-change-at-a-time is round 1; with the extra options ticked, round 2 runs the best batch size (and grouping by length when it was more than 3 % faster) with every attention kernel that worked in round 1, **each twice**; (3) a setting within 3 % of the best, or within the spread of the two runs, is marked *within noise*. Tested with a fake worker (slow start, known speeds, a 1 % run-to-run difference); **not run on a graphics card**. Round 2 takes about twice as long per setting as round 1.

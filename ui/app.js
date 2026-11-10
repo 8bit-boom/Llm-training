@@ -229,17 +229,24 @@ function samplesHtml() {
 function benchHtml(st) {
   const b = tr.bench, r = b.result;
   const local = !tr.server;
-  const rows = r ? r.rows.map((x) => `<tr class="${r.best === x.id ? "best" : ""}"><td>${r.best === x.id ? "★ " : ""}${esc(x.name)}${x.notes && x.notes.length ? `<div class="dim small">${x.notes.map(esc).join(" ")}</div>` : ""}</td>
-      ${x.ok ? `<td>${x.tok_s ? x.tok_s.toLocaleString() : "–"}</td><td>${x.vs_current != null ? "×" + x.vs_current : ""}</td><td>${x.peak_gb != null ? x.peak_gb + " GB" : "–"}</td>` : `<td colspan="3" class="err">${esc(x.error || "failed")}</td>`}</tr>`).join("") : "";
+  const tied = (r && r.tied) || [];
+  let sawRound2 = false;
+  const rows = r ? r.rows.map((x) => {
+    const head = x.round === 2 && !sawRound2 ? (sawRound2 = true, `<tr><td colspan="4"><strong>Round 2</strong> <span class="dim small">· the best batch size of round 1 with each attention kernel, every setting run twice (both speeds shown) so that noise is visible</span></td></tr>`) : "";
+    const runs = x.tok_s_runs && x.tok_s_runs.length > 1 ? `<div class="dim small">${x.tok_s_runs.map((n) => n.toLocaleString()).join(" / ")}</div>` : "";
+    const tie = tied.includes(x.id) ? `<div class="dim small">within noise of the best</div>` : "";
+    return head + `<tr class="${r.best === x.id ? "best" : ""}"><td>${r.best === x.id ? "★ " : ""}${esc(x.name)}${x.notes && x.notes.length ? `<div class="dim small">${x.notes.map(esc).join(" ")}</div>` : ""}</td>
+      ${x.ok ? `<td>${x.tok_s ? x.tok_s.toLocaleString() : "–"}${runs}${tie}</td><td>${x.vs_current != null ? "×" + x.vs_current : ""}</td><td>${x.peak_gb != null ? x.peak_gb + " GB" : "–"}</td>` : `<td colspan="3" class="err">${esc(x.error || "failed")}</td>`}</tr>`;
+  }).join("") : "";
   const best = r && r.rows.find((x) => x.id === r.best);
   const useless = !best || best.id === "current";
   return `<div class="card wide"><h2>Find the fastest settings <span class="tag">optional</span></h2>
     <p>Runs a few short real training runs (${16} steps each) with different settings and shows tokens per second and memory for each. Every run loads the model again, so it takes several minutes. Nothing from these runs is kept except the table.</p>
-    ${local ? `<div class="row"><label class="opt"><input type="checkbox" id="bn-deep" ${b.deep ? "checked" : ""} ${b.running ? "disabled" : ""}> Also try torch.compile, Liger kernels and padding-free batching (slower; plain-libraries path only: they are ignored with Unsloth)</label></div>
+    ${local ? `<div class="row"><label class="opt"><input type="checkbox" id="bn-deep" ${b.deep ? "checked" : ""} ${b.running ? "disabled" : ""}> Also try the attention kernels (with Unsloth too) in a second round with the best batch size, each run twice, and torch.compile, Liger kernels and padding-free batching (much slower; the last three are ignored with Unsloth)</label></div>
     <div class="row"><button class="secondary" id="bn-start" ${b.running || !st.env_ready || tr.running ? "disabled" : ""}>Run the benchmark</button>${b.running ? `<button class="secondary" id="bn-stop">Stop</button>` : ""}</div>` : `<p class="dim">Choose "This computer" under "Where to train": a server's card is tried by training there.</p>`}
     ${b.running || b.text ? `<div class="stepline">${esc(b.text)}</div>${b.progress != null ? `<progress max="1" value="${b.progress}"></progress>` : ""}` : ""}${b.error ? `<div class="err">${esc(b.error)}</div>` : ""}
     ${r ? `<table class="tbl"><tr><th>Setting</th><th>Tokens/s</th><th>vs current</th><th>Memory peak</th></tr>${rows}</table>
-      <p class="dim small">${esc(r.model)} · ${r.method} · ${r.steps} steps each · ${esc(r.created)}${r.stopped ? " · stopped early" : ""}. Start-up time is part of every number alike; a short run can only show big differences. ${r.unsloth ? "Unsloth is installed here, so the advanced options were not tried." : ""}</p>
+      <p class="dim small">${esc(r.model)} · ${r.method} · ${r.steps} steps each · ${esc(r.created)}${r.stopped ? " · stopped early" : ""}. Speeds are measured after the start-up (the first quarter of the steps is left out). A short run can only show big differences${tied.length ? `; ${tied.length} setting${tied.length > 1 ? "s are" : " is"} within noise of the ★` : ""}. ${r.unsloth ? "Unsloth is installed here, so compile, Liger and padding-free were not tried." : ""}</p>
       <div class="row"><button class="primary" id="bn-use" ${useless ? "disabled" : ""}>Use the fastest settings</button>${useless ? `<span class="dim">${best ? "Your current settings are already the fastest." : "No run finished."}</span>` : ""}${b.used ? `<span class="ok">Will be used for the next run: ${esc(b.used)}</span>` : ""}</div>` : ""}</div>`;
 }
 

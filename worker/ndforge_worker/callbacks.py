@@ -76,11 +76,12 @@ class LiveCallback(TrainerCallback):
         per_step = (time.time() - self.t0) / done if self.t0 else 0
         step = self.offset + state.global_step
         # a running average since the stage began (the Trainer fetches the next batch before it finishes the step, so counts per log line are skewed)
-        tok_s = pad_pct = None
+        tok_s = pad_pct = tokens_real = elapsed_s = None
         if self.counter is not None and self.t0 and self.counter.padded > 0:
             elapsed = max(time.time() - self.t0, 1e-6)
             tok_s, pad_pct = int(self.counter.real / elapsed), round(100 * (1 - self.counter.real / self.counter.padded), 1)
-        protocol.emit("metric", step=step, tok_s=tok_s, pad_pct=pad_pct, total_steps=self.total, stage=self.stage, stage_index=self.stage_index, stage_count=self.stage_count, loss=logs.get("loss"), lr=logs.get("learning_rate"),
+            tokens_real, elapsed_s = int(self.counter.real), round(elapsed, 3)   # cumulative: the benchmark takes the speed between two points, leaving out the start-up
+        protocol.emit("metric", step=step, tok_s=tok_s, tokens_real=tokens_real, elapsed_s=elapsed_s, pad_pct=pad_pct, total_steps=self.total, stage=self.stage, stage_index=self.stage_index, stage_count=self.stage_count, loss=logs.get("loss"), lr=logs.get("learning_rate"),
                       grad_norm=logs.get("grad_norm"), epoch=logs.get("epoch"), vram_mb=self._vram(), gpu_temp=gpu_temperature(),
                       seconds_per_step=round(per_step, 3), eta_s=int(per_step * max(0, self.total - step)))
         protocol.progress("train", step / max(1, self.total), f"Step {step} of {self.total}")

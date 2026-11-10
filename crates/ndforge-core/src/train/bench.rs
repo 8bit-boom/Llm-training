@@ -92,64 +92,179 @@ fn job_for(base: &Value, variant: &Variant, steps: u32, out: &Path) -> Value {
     job
 }
 
-/// Runs the benchmark. `emit` gets {"kind": "bench", "index", "total", "name", "row"?}. Stopping (`stop`) ends it after the variant that is running and keeps the rows made so far.
-pub fn run(p: &Project, m: &ModelEntry, method: Method, base_job: &Value, base: &Hyper, steps: u32, deep: bool, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> Result<Value> {
-    let py = python_path(&env_dir());
-    if !py.is_file() {
-        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
-    }
-    let list = variants(base, env_has_unsloth() && base.engine != "standard", deep);
-    let tmp = p.folder.join("benchmarks").join("tmp");
-    let mut rows: Vec<Value> = Vec::new();
-    let mut stopped = false;
-    for (i, var) in list.iter().enumerate() {
-        if stop.load(Ordering::SeqCst) {
-            stopped = true;
-            break;
+/// Tokens per second between a point after the start-up and the last one (the first quarter of the steps, at least two, is left out: Unsloth compiles its
+/// kernels and the first batches load then). Falls back to the running average the worker reports when there are too few points.
+pub fn steady_tok_s(metrics: &[Value]) -> Option<f64> {
+    let pts: Vec<(f64, f64)> = metrics.iter().filter_map(|m| Some((m["tokens_real"].as_f64()?, m["elapsed_s"].as_f64()?))).collect();
+    if pts.len() >= 4 {
+        let (a, b) = (pts[(pts.len() / 4).max(2).min(pts.len() - 2)], pts[pts.len() - 1]);
+        if b.1 > a.1 && b.0 >= a.0 {
+            return Some((b.0 - a.0) / (b.1 - a.1));
         }
-        emit(json!({"kind": "bench", "index": i, "total": list.len(), "name": var.name}));
-        let dir = tmp.join(&var.id);
+    }
+    metrics.last().and_then(|m| m["tok_s"].as_f64())
+}
+
+fn speed(r: &Value) -> f64 {
+    r["tok_s"].as_f64().unwrap_or(0.0)
+}
+
+fn merge(a: &Value, b: &Value) -> Value {
+    let mut out = a.as_object().cloned().unwrap_or_default();
+    if let Some(o) = b.as_object() {
+        for (k, v) in o {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// The second round: the best batch size (and grouping by length when it clearly helped) of the first round, with each attention kernel that ran in it.
+/// Empty when no attention kernel ran. `rows` are the finished rows of the first round.
+pub fn round2_variants(rows: &[Value]) -> Vec<Variant> {
+    let ok = |id: &str| rows.iter().find(|r| r["id"] == id && r["ok"] == true && speed(r) > 0.0);
+    let attn: Vec<&Value> = rows.iter().filter(|r| r["ok"] == true && r["id"].as_str().is_some_and(|i| i.starts_with("attn_"))).collect();
+    let Some(current) = ok("current") else { return vec![] };
+    if attn.is_empty() {
+        return vec![];
+    }
+    let batch_best = ["current", "batch_x2", "batch_x4"].iter().filter_map(|i| ok(i)).max_by(|a, b| speed(a).partial_cmp(&speed(b)).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(current);
+    let mut base = batch_best["overrides"].clone();
+    let bucket = ["bucket_on", "bucket_off"].iter().filter_map(|i| ok(i)).max_by(|a, b| speed(a).partial_cmp(&speed(b)).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(b) = bucket.filter(|b| speed(b) > speed(current) * 1.03) {
+        base = merge(&base, &b["overrides"]);
+    }
+    let what = if base.as_object().map_or(true, |o| o.is_empty()) { "your settings".to_string() } else {
+        let batch = base["batch"].as_u64().map(|b| format!("batch of {b}"));
+        let bucket = base["bucket"].as_str().map(|m| format!("grouping {m}"));
+        [batch, bucket].into_iter().flatten().collect::<Vec<_>>().join(", ")
+    };
+    let mut out = vec![v("r2_default", &format!("Round 2 · {what}, default attention"), base.clone())];
+    for r in attn {
+        let id = r["id"].as_str().unwrap_or("attn_");
+        out.push(v(&format!("r2_{id}"), &format!("Round 2 · {what}, {}", r["name"].as_str().unwrap_or(id).trim_start_matches("Attention: ")), merge(&base, &r["overrides"])));
+    }
+    out
+}
+
+/// Which round-2 rows are within noise of the fastest: closer than 3 % or than the spread between their own two runs.
+pub fn tied_with_best(rows: &[Value]) -> Vec<String> {
+    let ok: Vec<&Value> = rows.iter().filter(|r| r["round"] == 2 && r["ok"] == true && speed(r) > 0.0).collect();
+    let Some(best) = ok.iter().max_by(|a, b| speed(a).partial_cmp(&speed(b)).unwrap_or(std::cmp::Ordering::Equal)) else { return vec![] };
+    let noise = |r: &Value| r["spread"].as_f64().unwrap_or(0.0);
+    ok.iter().filter(|r| r["id"] != best["id"] && (speed(best) - speed(r)) / speed(best) <= 0.03f64.max(noise(best)).max(noise(r))).map(|r| r["id"].as_str().unwrap_or("").to_string()).collect()
+}
+
+/// One setting measured `times` times (separate worker processes). Err(()) = stopped by the user.
+fn measure(py: &Path, tmp: &Path, base_job: &Value, var: &Variant, steps: u32, times: usize, round: u32, stop: &Arc<AtomicBool>) -> std::result::Result<Value, ()> {
+    let (mut speeds, mut peaks, mut notes, mut last) = (Vec::<f64>::new(), Vec::<f64>::new(), Vec::<String>::new(), Value::Null);
+    for n in 0..times {
+        if stop.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        let dir = tmp.join(format!("{}-{n}", var.id));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Ok(json!({"id": var.id, "name": var.name, "overrides": var.overrides, "round": round, "ok": false, "error": "Could not make a folder for the run.", "notes": notes}));
+        }
         let job = job_for(base_job, var, steps, &dir);
-        let (mut metric, mut notes) = (Value::Null, Vec::<String>::new());
-        let outcome = drive(&py, &dir, &job, stop.clone(), Duration::from_secs(60), &mut |e| {
+        let mut metrics: Vec<Value> = Vec::new();
+        let outcome = drive(py, &dir, &job, stop.clone(), Duration::from_secs(60), &mut |e| {
             if let WorkerEvent::Other(ev) = e {
                 match ev["type"].as_str() {
-                    Some("metric") => metric = ev,
-                    Some("speed") => notes = ev["notes"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default(),
+                    Some("metric") => metrics.push(ev),
+                    Some("speed") => {
+                        notes = ev["notes"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()).unwrap_or_default();
+                        last = ev;
+                    }
                     _ => {}
                 }
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
-        let row = match outcome {
-            Ok(res) if res["stopped"] != true => json!({"id": var.id, "name": var.name, "overrides": var.overrides, "ok": true, "tok_s": metric["tok_s"], "pad_pct": metric["pad_pct"],
-                "seconds_per_step": metric["seconds_per_step"], "peak_gb": res["peak_vram_mb"].as_f64().map(|mb| (mb / 1024.0 * 10.0).round() / 10.0), "notes": notes}),
+        match outcome {
+            Ok(res) if res["stopped"] != true => {
+                speeds.push(steady_tok_s(&metrics).unwrap_or(0.0));
+                peaks.push(res["peak_vram_mb"].as_f64().unwrap_or(0.0));
+            }
             other => {
                 if stop.load(Ordering::SeqCst) {
-                    stopped = true;
-                    break;
+                    return Err(());
                 }
                 let why = match other { Err(e) => e.0, Ok(_) => "The run ended early.".to_string() };
-                json!({"id": var.id, "name": var.name, "overrides": var.overrides, "ok": false, "error": why, "notes": notes})
+                return Ok(json!({"id": var.id, "name": var.name, "overrides": var.overrides, "round": round, "ok": false, "error": why, "notes": notes}));
             }
-        };
-        emit(json!({"kind": "bench", "index": i, "total": list.len(), "name": var.name, "row": row}));
-        rows.push(row);
+        }
+    }
+    let mean = speeds.iter().sum::<f64>() / speeds.len().max(1) as f64;
+    let spread = if speeds.len() > 1 && mean > 0.0 { (speeds.iter().cloned().fold(f64::MIN, f64::max) - speeds.iter().cloned().fold(f64::MAX, f64::min)) / mean } else { 0.0 };
+    let peak = peaks.iter().cloned().fold(0.0, f64::max);
+    let attn = last["attn"].clone();
+    Ok(json!({"id": var.id, "name": var.name, "overrides": var.overrides, "round": round, "ok": true, "tok_s": mean.round() as u64, "tok_s_runs": speeds.iter().map(|s| s.round() as u64).collect::<Vec<_>>(),
+              "spread": (spread * 1000.0).round() / 1000.0, "pad_pct": last["pad_pct"], "attn": attn, "peak_gb": Some(peak).filter(|p| *p > 0.0).map(|mb| (mb / 1024.0 * 10.0).round() / 10.0), "notes": notes}))
+}
+
+/// Runs the benchmark. `emit` gets {"kind": "bench", "index", "total", "name", "row"?}. Stopping (`stop`) ends it after the variant that is running and keeps the rows made so far.
+///
+/// Round 1 changes one thing at a time (each run once). Speeds are measured after the start-up, so the first run is not punished for compiling kernels.
+/// Round 2 (only with the attention kernels, i.e. `deep`): the best batch size of round 1 with every attention kernel that worked, each run twice, so that
+/// differences smaller than the run-to-run noise are not read as a ranking.
+pub fn run(p: &Project, m: &ModelEntry, method: Method, base_job: &Value, base: &Hyper, steps: u32, deep: bool, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> Result<Value> {
+    let py = python_path(&env_dir());
+    if !py.is_file() {
+        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+    }
+    let mut list = variants(base, env_has_unsloth() && base.engine != "standard", deep);
+    let tmp = p.folder.join("benchmarks").join("tmp");
+    let mut rows: Vec<Value> = Vec::new();
+    let mut stopped = false;
+    let mut i = 0;
+    let mut round = 1;
+    let mut total = list.len();
+    'all: loop {
+        while i < list.len() {
+            let var = list[i].clone();
+            if stop.load(Ordering::SeqCst) {
+                stopped = true;
+                break 'all;
+            }
+            emit(json!({"kind": "bench", "index": i, "total": total, "name": var.name}));
+            let row = match measure(&py, &tmp, base_job, &var, steps, if round == 2 { 2 } else { 1 }, round, &stop) {
+                Ok(r) => r,
+                Err(()) => {
+                    stopped = true;
+                    break 'all;
+                }
+            };
+            emit(json!({"kind": "bench", "index": i, "total": total, "name": var.name, "row": row}));
+            rows.push(row);
+            i += 1;
+        }
+        if round == 1 && deep {
+            let more = round2_variants(&rows);
+            if !more.is_empty() {
+                total += more.len();
+                list.extend(more);
+                round = 2;
+                continue;
+            }
+        }
+        break;
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    let speed = |r: &Value| r["tok_s"].as_f64().unwrap_or(0.0);
     let ok: Vec<&Value> = rows.iter().filter(|r| r["ok"] == true && speed(r) > 0.0).collect();
     let baseline = ok.iter().find(|r| r["id"] == "current").map(|r| speed(r));
-    let best = ok.iter().max_by(|a, b| speed(a).partial_cmp(&speed(b)).unwrap_or(std::cmp::Ordering::Equal)).map(|r| r["id"].clone());
+    // the winner comes from round 2 when it ran (its numbers are the better measured), else from round 1
+    let pool: Vec<&&Value> = if ok.iter().any(|r| r["round"] == 2) { ok.iter().filter(|r| r["round"] == 2).collect() } else { ok.iter().collect() };
+    let best = pool.iter().max_by(|a, b| speed(a).partial_cmp(&speed(b)).unwrap_or(std::cmp::Ordering::Equal)).map(|r| r["id"].clone());
+    let tied = tied_with_best(&rows);
     for r in rows.iter_mut() {
         if let (Some(b), true) = (baseline, r["ok"] == true) {
             r["vs_current"] = json!(((speed(r) / b) * 100.0).round() / 100.0);
         }
     }
     let result = json!({"created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "model": m.name, "method": method.key(), "steps": steps, "deep": deep, "stopped": stopped,
-                        "unsloth": env_has_unsloth(), "rows": rows, "best": best});
+                        "unsloth": env_has_unsloth(), "rows": rows, "best": best, "tied": tied, "rounds": round});
     if !rows.is_empty() {
         let f = file(p, m, method);
         if let Some(d) = f.parent() {
