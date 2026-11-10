@@ -12,9 +12,10 @@ use crate::error::{Error, Result};
 use crate::project::Project;
 use crate::train::runs::runs_dir;
 
-pub const QUANTS: [(&str, &str); 4] = [
+pub const QUANTS: [(&str, &str); 5] = [
     ("q4_k_m", "Q4_K_M: smallest, good quality (recommended)"),
     ("q5_k_m", "Q5_K_M: a little larger, a little better"),
+    ("q6_k", "Q6_K: larger again, very close to Q8"),
     ("q8_0", "Q8_0: large, very close to the original"),
     ("f16", "F16: the original precision (very large)"),
 ];
@@ -61,12 +62,28 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
 pub const WHAT: [&str; 3] = ["gguf", "gguf_merged", "merged"];
 
 pub fn execute_what(p: &Project, run: &str, quant: &str, num_ctx: u32, what: &str, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let mut v = execute_many(p, run, &[quant.to_string()], num_ctx, what, kill, on_event)?;
+    Ok(v.remove(0))
+}
+
+/// Several GGUF sizes of one run in one go: the model is merged and converted once, then shrunk to each size. Every size becomes its own export
+/// (`exports/<run>-<size>/`, with its own Modelfile and meta). With "gguf_merged" the merged model is kept in the first one. Returns the metas.
+pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, what: &str, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
     if !WHAT.contains(&what) {
         return Err(Error::new(format!("Unknown export kind: {what}")));
     }
     let (want_gguf, keep_merged) = (what != "merged", what != "gguf");
-    if !QUANTS.iter().any(|(q, _)| *q == quant) {
-        return Err(Error::new(format!("Unknown file size: {quant}")));
+    let mut list: Vec<String> = Vec::new();
+    for q in quants {
+        if !QUANTS.iter().any(|(id, _)| id == q) {
+            return Err(Error::new(format!("Unknown file size: {q}")));
+        }
+        if !list.contains(q) {
+            list.push(q.clone());
+        }
+    }
+    if list.is_empty() {
+        return Err(Error::new("Choose at least one file size."));
     }
     let py = python_path(&env_dir());
     if !py.is_file() {
@@ -82,10 +99,14 @@ pub fn execute_what(p: &Project, run: &str, quant: &str, num_ctx: u32, what: &st
     let cfg = read_json(&rdir.join("config.json")).ok_or_else(|| Error::new("The settings of this run are missing."))?;
     let summary = read_json(&rdir.join("summary.json")).unwrap_or(Value::Null);
     let (repo, family) = (cfg["model"]["repo"].as_str().unwrap_or("").to_string(), cfg["model"]["family"].as_str().unwrap_or("generic").to_string());
-    let name = if want_gguf { format!("{run}-{quant}") } else { format!("{run}-merged") };
-    let out = exports_dir(p).join(&name);
+    // one size: the worker writes straight into its export; several: into a work folder, from which each size moves into its own export
+    let list = if want_gguf { list } else { list[..1].to_vec() };
+    let many = want_gguf && list.len() > 1;
+    let name_of = |q: &str| if want_gguf { format!("{run}-{q}") } else { format!("{run}-merged") };
+    let out = if many { exports_dir(p).join(format!("{run}-gguf-work")) } else { exports_dir(p).join(name_of(&list[0])) };
+    let _ = std::fs::remove_dir_all(if many { out.clone() } else { out.join("__none__") });
     std::fs::create_dir_all(&out)?;
-    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": quant, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
+    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
                      "max_seq": cfg["hyper"]["max_seq"]});
     // a full fine-tune saved the whole model (nothing to merge); a LoRA run saved an adapter
     if is_full {
@@ -99,29 +120,53 @@ pub fn execute_what(p: &Project, run: &str, quant: &str, num_ctx: u32, what: &st
         WorkerEvent::Other(v) => v,
     }))?;
     let oname = ollama_name(&p.model_label(), "");
-    let merged_dir = result["merged_dir"].as_str().filter(|_| keep_merged).map(String::from);
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut merged_dir = result["merged_dir"].as_str().filter(|_| keep_merged).map(String::from);
     if !want_gguf {
         if merged_dir.is_none() {
             return Err(Error::new("No merged model was made."));
         }
-        let meta = json!({"name": name, "run": run, "quant": null, "family": family, "base_repo": repo, "gguf_file": null, "merged_dir": merged_dir, "ollama_name": oname, "num_ctx": num_ctx,
-                          "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.display_name(), "installed": []});
+        let meta = json!({"name": name_of(""), "run": run, "quant": null, "family": family, "base_repo": repo, "gguf_file": null, "merged_dir": merged_dir, "ollama_name": oname, "num_ctx": num_ctx,
+                          "created": created, "world": p.display_name(), "installed": []});
         write_json(&out.join("meta.json"), &meta)?;
-        return Ok(meta);
+        return Ok(vec![meta]);
     }
-    let gguf = result["gguf"].as_str().map(PathBuf::from).ok_or_else(|| Error::new("No GGUF file was made."))?;
-    let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
-    std::fs::write(out.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
     let license = crate::train::catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.license).unwrap_or_else(|| "see the model page for its licence".to_string());
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
-    std::fs::write(out.join("MODEL_CARD.md"), model_card(&CardInfo {
-        world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
-        dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
-    }))?;
-    let meta = json!({"name": name, "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "merged_dir": merged_dir, "ollama_name": oname, "num_ctx": num_ctx,
-                      "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.display_name(), "installed": []});
-    write_json(&out.join("meta.json"), &meta)?;
-    Ok(meta)
+    let mut metas = Vec::new();
+    for (i, quant) in list.iter().enumerate() {
+        let gguf = result["ggufs"][quant.as_str()].as_str().or_else(|| if list.len() == 1 { result["gguf"].as_str() } else { None }).map(PathBuf::from)
+            .ok_or_else(|| Error::new(format!("No GGUF file was made for {quant}.")))?;
+        let dir = exports_dir(p).join(name_of(quant));
+        if dir != out {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+        }
+        let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
+        if dir != out {
+            std::fs::rename(&gguf, dir.join(&gguf_file))?;
+        }
+        // the merged model stays once: in the first export
+        if let (true, Some(m)) = (i == 0 && dir != out, merged_dir.as_ref()) {
+            let to = dir.join("merged");
+            std::fs::rename(m, &to)?;
+            merged_dir = Some(to.display().to_string());
+        }
+        let keep_here = if i == 0 { merged_dir.clone() } else { None };
+        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
+        std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
+            world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
+            dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
+        }))?;
+        let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
+                          "created": created, "world": p.display_name(), "installed": []});
+        write_json(&dir.join("meta.json"), &meta)?;
+        metas.push(meta);
+    }
+    if many {
+        let _ = std::fs::remove_dir_all(&out);
+    }
+    Ok(metas)
 }
 
 /// Remember that an export was installed into a server under a name.

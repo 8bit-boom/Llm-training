@@ -1,6 +1,6 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
-Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q8_0", "f16"), backend (auto|unsloth|hf), gguf (bool),
+Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
 keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept)."""
 import json
 import os
@@ -12,7 +12,7 @@ from pathlib import Path
 from . import backends, protocol
 from .families import default_non_thinking
 
-QUANTS = ("q4_k_m", "q5_k_m", "q8_0", "f16")
+QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
 
 
 def find_llama_cpp():
@@ -71,7 +71,9 @@ def merge_hf(cfg, merged: Path):
     patch_template_dir(merged, cfg["base"]["family"])
 
 
-def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quant: str) -> Path:
+def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants) -> dict:
+    """Converts once to f16, then makes every wanted size from it. Returns {quant: file}."""
+    quants = [quants] if isinstance(quants, str) else list(quants)
     conv, quantize = find_llama_cpp()
     if conv is None:
         raise RuntimeError("To make a GGUF file without Unsloth, llama.cpp is needed (convert_hf_to_gguf.py and llama-quantize). Install it from "
@@ -80,21 +82,26 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quant: str) -> Path:
     f16 = out / "model-f16.gguf"
     protocol.progress("gguf", 0.2, "Converting to GGUF")
     _run([sys.executable, conv, merged, "--outfile", f16, "--outtype", "f16"], "The GGUF conversion")
-    final = out / f"model-{quant}.gguf"
-    if quant == "f16":
-        f16.rename(final)
-    else:
-        protocol.progress("gguf", 0.6, f"Shrinking to {quant.upper()}")
+    files = {}
+    others = [q for q in quants if q != "f16"]
+    for i, quant in enumerate(others):
+        final = out / f"model-{quant}.gguf"
+        protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}")
         _run([quantize, f16, final, quant.upper()], "The quantisation")
+        files[quant] = final
+    if "f16" in quants:
+        final = out / "model-f16.gguf"
+        files["f16"] = final            # the converter's own output, kept as it is
+    else:
         f16.unlink(missing_ok=True)
-    return final
+    return {q: files[q] for q in quants}
 
 
-def find_gguf(dirs, quant: str):
-    """Unsloth's save_pretrained_gguf writes into its own folder; pick the file of the wanted quantisation."""
+def find_gguf(dirs, quant: str, strict: bool = False):
+    """Unsloth's save_pretrained_gguf writes into its own folder; pick the file of the wanted quantisation (strict: only a file that names it)."""
     files = [f for d in dirs if Path(d).exists() for f in Path(d).rglob("*.gguf")]
     want = [f for f in files if quant.lower() in f.name.lower()]
-    pool = want or [f for f in files if "mmproj" not in f.name.lower()]
+    pool = want if strict else (want or [f for f in files if "mmproj" not in f.name.lower()])
     pool = [f for f in pool if "mmproj" not in f.name.lower()]
     return max(pool, key=lambda f: f.stat().st_mtime) if pool else None
 
@@ -103,13 +110,16 @@ def run(cfg: dict) -> int:
     protocol.reserve_stdout()
     out = Path(cfg["out"])
     out.mkdir(parents=True, exist_ok=True)
-    quant = cfg.get("quant", "q4_k_m").lower()
-    if quant not in QUANTS:
-        raise ValueError(f"Unknown quantisation: {quant}")
+    quants = [q.lower() for q in (cfg.get("quants") or [cfg.get("quant", "q4_k_m")])]
+    for q in quants:
+        if q not in QUANTS:
+            raise ValueError(f"Unknown quantisation: {q}")
+    quant = quants[0]
     backend = backends.prepare(cfg.get("backend", "auto"))
     full_model = cfg.get("full_model")
     merged = Path(full_model) if full_model else out / "merged"
     gguf_path = None
+    ggufs = {}
     note = ""
     if backend == "unsloth" and cfg.get("gguf", True):
         from unsloth import FastLanguageModel, FastModel
@@ -119,13 +129,16 @@ def run(cfg: dict) -> int:
         model, tokenizer = loader.from_pretrained(model_name=full_model or cfg["adapter"], max_seq_length=cfg.get("max_seq", 2048), dtype=None, load_in_4bit=False, load_in_16bit=True)
         tmp = out / "unsloth_gguf"
         protocol.progress("gguf", 0.3, "Merging and converting to GGUF (Unsloth)")
-        model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=quant)
-        gguf_path = find_gguf([tmp, str(tmp) + "_gguf", out], quant)
-        if gguf_path is None:
-            raise RuntimeError("Unsloth finished but no GGUF file was found.")
-        final = out / f"model-{quant}.gguf"
-        shutil.move(str(gguf_path), str(final))
-        gguf_path = final
+        model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=quants if len(quants) > 1 else quant)
+        for q in quants:
+            found = find_gguf([tmp, str(tmp) + "_gguf", out], q, strict=len(quants) > 1)
+            if found is None:
+                raise RuntimeError(f"Unsloth finished but no GGUF file for {q} was found.")
+            final = out / f"model-{q}.gguf"
+            if Path(found) != final:
+                shutil.move(str(found), str(final))
+            ggufs[q] = final
+        gguf_path = ggufs[quant]
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(str(tmp) + "_gguf", ignore_errors=True)
         if cfg.get("keep_merged") and not full_model:   # the GGUF path above leaves no merged model behind: save it too, from the loaded model
@@ -139,13 +152,14 @@ def run(cfg: dict) -> int:
         else:
             merge_hf(cfg, merged)
         if cfg.get("gguf", True):
-            gguf_path = gguf_with_llama_cpp(cfg, merged, out, quant)
+            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants)
+            gguf_path = ggufs[quant]
     if gguf_path and not cfg.get("keep_merged") and not full_model and merged.exists():
         shutil.rmtree(merged, ignore_errors=True)
     elif not gguf_path:
         note = "Merged 16-bit model only (no GGUF requested)."
     protocol.progress("done", 1.0, "Export ready")
-    summary = {"gguf": str(gguf_path) if gguf_path else None, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
+    summary = {"gguf": str(gguf_path) if gguf_path else None, "ggufs": {q: str(f) for q, f in ggufs.items()}, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
                "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)

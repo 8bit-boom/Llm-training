@@ -258,3 +258,36 @@ def test_cudnn_attention_is_sdpa_with_the_cudnn_backend_and_needs_a_card():
     attn, why = speed.attention_request("cudnn", False, None)
     assert attn is None and "graphics card" in why
     assert speed.cudnn_status(False)[0] is False
+
+
+def test_gguf_with_llama_cpp_converts_once_and_shrinks_to_every_size(tmp_path, monkeypatch):
+    import sys as _sys
+    from ndforge_worker import exportjob
+    calls = []
+
+    def fake_run(cmd, what):
+        calls.append([str(c) for c in cmd])
+        if "--outfile" in [str(c) for c in cmd]:
+            Path(cmd[cmd.index("--outfile") + 1]).write_bytes(b"F16")
+        else:
+            Path(cmd[2]).write_bytes(b"Q-" + str(cmd[3]).encode())
+    monkeypatch.setattr(exportjob, "_run", fake_run)
+    monkeypatch.setattr(exportjob, "find_llama_cpp", lambda: ("convert.py", "llama-quantize"))
+    out = tmp_path
+    files = exportjob.gguf_with_llama_cpp({}, tmp_path / "merged", out, ["q8_0", "q6_k", "q4_k_m"])
+    assert list(files) == ["q8_0", "q6_k", "q4_k_m"]
+    assert [c[-1] for c in calls if "--outfile" not in c] == ["Q8_0", "Q6_K", "Q4_K_M"] and sum("--outfile" in c for c in calls) == 1
+    assert all(f.exists() for f in files.values()) and not (out / "model-f16.gguf").exists()
+    # f16 asked for: the converter's file is kept; one size as a plain string still works
+    calls.clear()
+    files = exportjob.gguf_with_llama_cpp({}, tmp_path / "merged", out, ["f16", "q5_k_m"])
+    assert (out / "model-f16.gguf").exists() and list(files) == ["f16", "q5_k_m"]
+    assert list(exportjob.gguf_with_llama_cpp({}, tmp_path / "merged", out, "q5_k_m")) == ["q5_k_m"]
+    # an Unsloth folder holding several sizes: each is found by its own name, never by a lucky fallback
+    d = tmp_path / "u"
+    d.mkdir()
+    (d / "model.Q8_0.gguf").write_bytes(b"1")
+    (d / "model.Q4_K_M.gguf").write_bytes(b"2")
+    assert exportjob.find_gguf([d], "q8_0", strict=True).name == "model.Q8_0.gguf"
+    assert exportjob.find_gguf([d], "q6_k", strict=True) is None
+    assert exportjob.find_gguf([d], "q6_k") is not None     # one size: the old fallback
