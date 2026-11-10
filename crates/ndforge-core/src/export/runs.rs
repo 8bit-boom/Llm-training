@@ -87,16 +87,16 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
     }))?;
     let gguf = result["gguf"].as_str().map(PathBuf::from).ok_or_else(|| Error::new("No GGUF file was made."))?;
     let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
-    let oname = ollama_name(&p.world_name, "");
+    let oname = ollama_name(&p.model_label(), "");
     std::fs::write(out.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
     let license = crate::train::catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.license).unwrap_or_else(|| "see the model page for its licence".to_string());
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
     std::fs::write(out.join("MODEL_CARD.md"), model_card(&CardInfo {
-        world: &p.world_name, model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
+        world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
         dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
     }))?;
     let meta = json!({"name": name, "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "ollama_name": oname, "num_ctx": num_ctx,
-                      "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.world_name, "installed": []});
+                      "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.display_name(), "installed": []});
     write_json(&out.join("meta.json"), &meta)?;
     Ok(meta)
 }

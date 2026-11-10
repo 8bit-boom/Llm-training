@@ -89,16 +89,26 @@ pub fn build(p: &Project, version: u64, per_category: usize) -> Result<Vec<Quest
         out.extend(pick_stable(held.iter().filter(|q| q.category == cat).cloned().collect(), per_category));
     }
     // made-up probes and general chat need no data
-    let bundle = p.current_bundle().ok_or_else(|| Error::new("The world data is missing."))?;
-    let loaded = load(&bundle)?;
-    let corpus = articles(&loaded).iter().map(|d| d.article.to_lowercase()).collect::<Vec<_>>().join("\n");
-    let sys = system_prompt(&loaded.world_name);
+    // with several worlds the probes are spread over them, each with its own world's system prompt
+    let bundles = p.bundles();
+    if bundles.is_empty() {
+        return Err(Error::new("The world data is missing."));
+    }
+    let mut corpus = String::new();
+    let mut systems = Vec::new();
+    for (_, bundle) in &bundles {
+        let loaded = load(bundle)?;
+        corpus.push_str(&articles(&loaded).iter().map(|d| d.article.to_lowercase()).collect::<Vec<_>>().join("\n"));
+        corpus.push('\n');
+        systems.push(system_prompt(&loaded.world_name));
+    }
     let shapes = ["Tell me about {n}.", "Who is {n}?", "What do the rules say about {n}?", "Where can I find {n}?"];
     for (i, name) in invented_names(&corpus, 8, 7).into_iter().enumerate() {
-        let q = shapes[i % shapes.len()].replace("{n}", &name);
+        let (q, sys) = (shapes[i % shapes.len()].replace("{n}", &name), &systems[i % systems.len()]);
         out.push(Question { id: format!("probe-m{i}"), category: "made_up", messages: vec![json!({"role": "system", "content": sys}), json!({"role": "user", "content": q})], question: q, reference: None });
     }
     for (i, q) in GENERAL.iter().enumerate() {
+        let sys = &systems[i % systems.len()];
         out.push(Question { id: format!("probe-g{i}"), category: "general", messages: vec![json!({"role": "system", "content": sys}), json!({"role": "user", "content": q})], question: q.to_string(), reference: None });
     }
     let mut seen = HashSet::new();

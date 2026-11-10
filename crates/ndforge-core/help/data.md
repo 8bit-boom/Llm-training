@@ -16,6 +16,9 @@ A training file from nd-world. If you do not have one yet:
 *The file contains all of the world's text, including GM secrets, but no pictures, no player accounts and no passwords. Keep it
 as private as you would keep a backup.*
 
+## Several worlds in one project
+Choose the training file of **another world** the same way: the program offers to *add* it, and the model is then trained on all the worlds at once. Every example carries the name of its own world, so the model learns which world a question belongs to (and a name that exists in one world only is not mixed into the other). After adding or removing a world, press *Make the examples again* in Step 2; your drops and edits stay. A newer file of a world that is already there updates that world only. The trained model is named after the project when it holds more than one world.
+
 ## What to do
 1. Click **Choose training file...** or drag the file onto this page.
 2. The program checks the file and shows what is inside, for example *312 entities, 27 session recaps, 140 facts*.

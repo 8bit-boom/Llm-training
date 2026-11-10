@@ -38,7 +38,7 @@ pub fn report(project: Option<&Project>, settings: &Settings) -> String {
     match project {
         None => { let _ = writeln!(r, "no project open"); }
         Some(p) => {
-            let _ = writeln!(r, "{} (world: {}) in {}", p.name, p.world_name, p.folder.display());
+            let _ = writeln!(r, "{} (world: {}) in {}", p.name, p.display_name(), p.folder.display());
             let _ = writeln!(r, "steps done: {}", p.progress().iter().map(|(k, d)| format!("{k}={}", if *d { "yes" } else { "no" })).collect::<Vec<_>>().join(", "));
             for run in list_runs(p).into_iter().take(5) {
                 let g = |k: &str| run[k].as_str().unwrap_or("").to_string();

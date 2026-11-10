@@ -106,7 +106,7 @@ pub fn ask(p: &Project, run: &str, system: Option<&str>, question: &str, kill: &
     if question.trim().is_empty() {
         return Err(Error::new("Type a question first."));
     }
-    let q = custom(&p.world_name, system, question.trim());
+    let q = custom(&p.display_name(), system, question.trim());
     let a = answer_with_worker(p, run, &[q], &["original", "trained"], 300, kill, on_event)?;
     Ok(json!({"original": a["original"]["custom"], "trained": a["trained"]["custom"]}))
 }
@@ -121,7 +121,7 @@ pub fn save_transcript(p: &Project, run: &str, items: &[Value]) -> Result<PathBu
         return Err(Error::new("There is nothing to save yet. Ask a question first."));
     }
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let mut md = format!("# {} · run {run}\n\nSaved {stamp}. Left: the original model. Right: the trained model.\n", p.world_name);
+    let mut md = format!("# {} · run {run}\n\nSaved {stamp}. Left: the original model. Right: the trained model.\n", p.display_name());
     for it in items {
         md += &format!("\n## {}\n\n**Original**\n\n{}\n\n**Trained**\n\n{}\n", it["question"].as_str().unwrap_or(""), it["original"].as_str().unwrap_or(""), it["trained"].as_str().unwrap_or(""));
     }

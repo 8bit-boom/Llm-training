@@ -24,13 +24,14 @@ pub fn info(p: &Project) -> Result<Value> {
     let Some(last) = last_done_run(p) else { return Ok(json!({"available": false})) };
     let Some(cur) = p.current_bundle() else { return Ok(json!({"available": false})) };
     let trained_sha = latest_version(p).and_then(|(_, m)| m["bundle_sha256"].as_str().map(String::from));
-    if trained_sha.as_deref() == Some(cur.sha256.as_str()) {
+    if trained_sha.is_some() && trained_sha == p.signature() {
         return Ok(json!({"available": false}));
     }
     // compare with the world data the last dataset version was made from (kept in sources/)
     let prev = p.sources.iter().rev().filter_map(|s| std::fs::read(p.folder.join("sources").join(s)).ok().map(|_| s.clone()))
         .find_map(|s| crate::bundle::open_bundle(p.folder.join("sources").join(&s)).ok().filter(|b| Some(b.sha256.as_str()) == trained_sha.as_deref()));
     let (summary, ratio) = match &prev {
+        _ if p.worlds().len() > 1 => ("The world data of this project (several worlds) changed.".to_string(), 1.0),
         Some(prev) => {
             let d = diff_bundles(prev, &cur)?;
             let total: usize = LABELS.iter().map(|(m, _, _)| cur.counts.get(*m).copied().unwrap_or(0)).sum::<usize>().max(1);
