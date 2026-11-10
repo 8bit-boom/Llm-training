@@ -17,7 +17,8 @@ def prepare(backend: str) -> str:
             return "unsloth"
         except Exception as exc:  # ImportError, or a CUDA/driver problem while importing
             if backend == "unsloth":
-                raise RuntimeError(f"Unsloth could not be loaded: {exc}") from exc
+                raise RuntimeError(f"Unsloth could not be loaded: {exc}. Choose the standard engine instead: Expert mode, \"Training engine\" = standard "
+                                   "(or install the training software without Unsloth in Training setup).") from exc
             protocol.log(f"Unsloth is not available ({type(exc).__name__}: {exc}); using the plain Transformers + PEFT fallback.")
     return "hf"
 

@@ -108,3 +108,22 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     std::env::set_var("NDFORGE_ENV_DIR", d.path().join("missing"));
     assert!(run(&p, &m, Method::Lora, &base_job, &h, 16, false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("Training setup"));
 }
+
+#[test]
+fn the_engine_follows_the_setting_and_what_the_setup_installed() {
+    use ndforge_core::train::runs::backend_for;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_ENV_DIR", d.path().join("env"));
+    // nothing installed: the standard libraries
+    assert_eq!(backend_for("auto"), "hf");
+    std::fs::create_dir_all(d.path().join("env")).unwrap();
+    std::fs::write(d.path().join("env/ndforge_env.json"), "{\"unsloth\": false, \"engine\": \"standard\"}").unwrap();
+    assert_eq!(backend_for("auto"), "hf");
+    // Unsloth installed: auto lets the worker use it (and fall back by itself if it cannot)
+    std::fs::write(d.path().join("env/ndforge_env.json"), "{\"unsloth\": true, \"engine\": \"unsloth\"}").unwrap();
+    assert_eq!(backend_for("auto"), "auto");
+    // the setting wins in both directions
+    assert_eq!(backend_for("standard"), "hf");
+    assert_eq!(backend_for("unsloth"), "unsloth");
+}

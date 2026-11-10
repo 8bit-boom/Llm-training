@@ -95,6 +95,16 @@ pub fn run_name(model_id: &str) -> String {
     format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), model_id)
 }
 
+/// Which library trains: the setting wins; "auto" is Unsloth if it was installed (the worker falls back by itself if it cannot be used), else the standard libraries.
+pub fn backend_for(engine: &str) -> &'static str {
+    match engine {
+        "standard" => "hf",
+        "unsloth" => "unsloth",
+        _ if crate::train::bench::env_has_unsloth() => "auto",
+        _ => "hf",
+    }
+}
+
 /// The job the worker gets.
 pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, version: u32, name: &str, resume: bool) -> Result<Value> {
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
@@ -102,7 +112,7 @@ pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, ver
         return Err(Error::new("The training data is missing. Save a version in Step 2 first."));
     }
     let mut job = json!({
-        "job": "train", "model": {"repo": m.repo, "family": m.family}, "method": method, "backend": "auto",
+        "job": "train", "model": {"repo": m.repo, "family": m.family}, "method": method, "backend": backend_for(&hyper.engine),
         "dataset": {"train": train, "version": version}, "hyper": hyper, "out": runs_dir(p).join(name), "resume": resume,
         "probes": probes_from_dataset(&train, 3), "probe_every": (hyper.save_steps).max(10), "probe_tokens": 120,
     });

@@ -100,6 +100,7 @@ def test_a_real_tiny_run_reports_tokens_per_second_padding_and_the_batching(tmp_
         assert len(sp) == 1
         results[mode] = (sp[0], [e for e in ev if e["type"] == "metric"])
     on, off = results["on"][0], results["off"][0]
+    assert on["engine"] == off["engine"] == "hf", "the standard libraries trained (no Unsloth needed)"
     assert on["bucketed"] is True and off["bucketed"] is False
     assert on["pad_random_pct"] > 30 and on["pad_bucketed_pct"] < on["pad_random_pct"] / 2 and on["max_len"] > on["mean_len"] > 0 and on["batch"] == 4
     for mode, (sp, metrics) in results.items():
@@ -207,3 +208,17 @@ def test_asking_for_everything_on_a_cpu_machine_trains_normally_and_says_what_st
     assert sp["options"] == [] and sp["padding_free"] is False
     assert len([n for n in sp["notes"] if "asked for but" in n]) == 3, sp["notes"]
     assert [e for e in ev if e["type"] == "metric"] and ev[-1]["type"] == "result"
+
+
+def test_an_explicit_unsloth_choice_without_unsloth_says_what_to_do_instead(tmp_path):
+    pytest.importorskip("trl")
+    try:
+        import unsloth  # noqa: F401
+        pytest.skip("Unsloth is installed here")
+    except Exception:
+        pass
+    from test_train_cpu import run_job
+    p, ev, out = run_job(tmp_path, "qwen3_5", "llama", backend="unsloth", hyper={"max_steps": 2})
+    assert p.returncode == 1 and ev[-1]["type"] == "error"
+    msg = ev[-1]["message"]
+    assert "Unsloth could not be loaded" in msg and "standard" in msg and "Training engine" in msg, msg

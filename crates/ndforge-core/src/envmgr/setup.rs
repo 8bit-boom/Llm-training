@@ -16,6 +16,8 @@ pub struct SetupPlan {
     /// "cu128" / "cu126": the PyTorch CUDA build (see gpu::cuda_wheel_for)
     pub wheel: String,
     pub python_version: String,
+    /// try to install Unsloth (faster, less memory); false = the standard libraries only (Transformers + PEFT + TRL), which install everywhere
+    pub unsloth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +29,17 @@ pub enum Event {
 const TOTAL: usize = 5;
 
 /// The libraries the plain Transformers + PEFT + TRL fallback needs (what Unsloth would otherwise bring along).
-const FALLBACK_LIBS: [&str; 6] = ["transformers", "trl", "peft", "datasets", "accelerate", "bitsandbytes"];
+const FALLBACK_LIBS: [&str; 6] = ["transformers>=5", "trl", "peft", "datasets", "accelerate", "bitsandbytes"];
+
+/// Optional extras of the standard path, each tried on its own: a failure never fails the install. (flash-linear-attention: Qwen3.5's fast kernels;
+/// triton-windows: the Triton they need, which PyTorch does not ship for Windows.)
+fn standard_extras() -> Vec<&'static str> {
+    let mut v = vec!["flash-linear-attention"];
+    if cfg!(windows) {
+        v.insert(0, "triton-windows");
+    }
+    v
+}
 
 fn step(on_event: &mut dyn FnMut(Event), index: usize, text: &str) {
     on_event(Event::Step { index, total: TOTAL, text: text.to_string() });
@@ -79,19 +91,35 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
         v
     };
 
-    // Unsloth (fast, small memory) is preferred; if it cannot be installed (it is picky about versions and about Windows) the plain libraries are
-    // installed instead and training still works, only slower and with more memory.
-    let t3 = "Installing Unsloth and the training libraries";
+    // Unsloth (fast, small memory) is preferred when asked for; if it cannot be installed (it is picky about versions and about Windows) or was not wanted,
+    // the standard libraries are installed instead and training still works, only slower and with more memory.
+    let t3 = if plan.unsloth { "Installing Unsloth and the training libraries" } else { "Installing the training libraries (without Unsloth)" };
     step(on_event, 3, t3);
-    let st = run_uv(plan, &with_pins(a(&["pip", "install", "--python", &py, "unsloth"])), cancel, on_event)?;
-    let unsloth = st.success();
+    let unsloth = if plan.unsloth {
+        let st = run_uv(plan, &with_pins(a(&["pip", "install", "--python", &py, "unsloth"])), cancel, on_event)?;
+        if !st.success() {
+            on_event(Event::Log("Unsloth could not be installed. Installing the standard Transformers + PEFT + TRL libraries instead (slower, needs more graphics memory).".into()));
+        }
+        st.success()
+    } else {
+        on_event(Event::Log("Unsloth is skipped, as you chose. Installing the standard Transformers + PEFT + TRL libraries (slower than Unsloth, needs more graphics memory).".into()));
+        false
+    };
+    let mut extras: Vec<String> = Vec::new();
     if !unsloth {
-        on_event(Event::Log("Unsloth could not be installed. Installing the plain Transformers + PEFT + TRL libraries instead (slower, needs more graphics memory).".into()));
         let mut args = a(&["pip", "install", "--python", &py]);
         args.extend(FALLBACK_LIBS.iter().map(|s| s.to_string()));
         let st = run_uv(plan, &with_pins(args), cancel, on_event)?;
         if !st.success() {
             return Err(fail(t3, st.code()));
+        }
+        for extra in standard_extras() {
+            let st = run_uv(plan, &with_pins(a(&["pip", "install", "--python", &py, extra])), cancel, on_event)?;
+            if st.success() {
+                extras.push(extra.to_string());
+            } else {
+                on_event(Event::Log(format!("Optional: {extra} could not be installed. Training works without it; {}.", if extra == "flash-linear-attention" { "Qwen3.5 will be much slower" } else { "some speed-ups are unavailable" })));
+            }
         }
     }
 
@@ -122,7 +150,9 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
     }
 
     std::fs::create_dir_all(&plan.env_dir)?;
-    let marker = format!("{{\"wheel\": \"{}\", \"python\": \"{}\", \"unsloth\": {}, \"cuda_torch\": {}}}\n", plan.wheel, plan.python_version, unsloth, verified.unwrap_or(false));
+    let extras_json = extras.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
+    let marker = format!("{{\"wheel\": \"{}\", \"python\": \"{}\", \"unsloth\": {}, \"engine\": \"{}\", \"extras\": [{}], \"cuda_torch\": {}}}\n",
+                         plan.wheel, plan.python_version, unsloth, if unsloth { "unsloth" } else { "standard" }, extras_json, verified.unwrap_or(false));
     std::fs::write(plan.env_dir.join("ndforge_env.json"), marker)?;
     let _ = std::fs::remove_file(plan.env_dir.join("selftest.json")); // a new environment has to pass the test again
     Ok(())

@@ -126,6 +126,12 @@ pub fn env_cuda_unchecked(env: &Path) -> bool {
     env.join("ndforge_env.json").is_file() && !std::fs::read_to_string(env.join("ndforge_env.json")).map(|t| t.contains("\"cuda_torch\": true")).unwrap_or(false)
 }
 
+/// What the setup installed: "unsloth", "standard" (the standard libraries only) or None.
+pub fn env_engine(env: &Path) -> Option<String> {
+    let t = std::fs::read_to_string(env.join("ndforge_env.json")).ok()?;
+    Some(if t.contains("\"unsloth\": true") { "unsloth" } else { "standard" }.to_string())
+}
+
 pub fn selftest_passed(env: &Path) -> bool {
     env.join("selftest.json").is_file()
 }

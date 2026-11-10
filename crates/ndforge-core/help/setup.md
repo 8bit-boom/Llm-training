@@ -24,3 +24,6 @@ Gets this computer ready to train: it checks your NVIDIA graphics card and the d
 
 ## How long does it take?
 The install: 5 to 20 minutes, depending on your internet. The test: about 30 seconds.
+
+## With or without Unsloth
+**Unsloth** is an add-on library that makes training faster and use less graphics memory. It is picky: on some computers (Windows especially) it does not install or does not start. Tick **Install without Unsloth** before pressing *Install the training software* and the program installs only the **standard libraries** (Transformers, PEFT and TRL, which every computer with an NVIDIA card can use). Nothing else is needed: the program fetches Python and PyTorch itself, and the model is downloaded from Hugging Face the first time, or taken from a folder you already have (Step 3, *Add a model*). The page tells you which one is installed. Without Unsloth, training is slower and can need more graphics memory than the plan's estimate; a Quick test measures the real figure. Qwen3.5 needs two extra kernel packages to run fast without Unsloth; the setup tries to install them and says so in its log when it cannot (training still works, only much slower). You can also choose per run in Expert mode (*Training engine*: auto, unsloth, standard).

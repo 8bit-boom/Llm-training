@@ -12,7 +12,7 @@ let state = null;
 let page = "welcome";
 let pending = null;      // a checked file waiting for the user's confirmation: {path, info}
 let message = null;      // {kind: "err"|"ok", text}
-let env = { status: null, running: false, log: [], step: "", progress: null, result: null, error: null };
+let env = { status: null, running: false, log: [], step: "", progress: null, result: null, error: null, noUnsloth: false };
 const $ = (id) => document.getElementById(id);
 
 async function call(cmd, args) {
@@ -262,8 +262,8 @@ function renderTrain() {
   }).join("");
   const hf = tr.hf, fm = hf.found && hf.found.model;
   const addModel = `<div class="card wide"><div class="row"><button class="secondary" id="hf-open">＋ Add a model from Hugging Face…</button>${st.models.filter((c) => c.model.custom).map((c) => `<button class="secondary" data-hfremove="${esc(c.model.id)}" title="Remove ${esc(c.model.name)} from the list" ${tr.running ? "disabled" : ""}>✕ ${esc(c.model.name)}</button>`).join("")}</div>
-    ${hf.open ? `<p class="dim">Type the model's name as it is on Hugging Face (like <code>unsloth/Qwen3-4B</code>) or paste its address. It must be open (not gated), a chat/instruct model with <code>.safetensors</code> weights.</p>
-      <div class="row"><input type="text" id="hf-input" value="${esc(hf.input)}" placeholder="organisation/model-name" style="min-width:320px" ${hf.busy ? "disabled" : ""}><button class="primary" id="hf-look" ${hf.busy ? "disabled" : ""}>${hf.busy ? "Looking…" : "Look it up"}</button><button class="secondary" id="hf-cancel">Cancel</button></div>
+    ${hf.open ? `<p class="dim">Type the model's name as it is on Hugging Face (like <code>unsloth/Qwen3-4B</code>), paste its address, or choose a <strong>folder on this computer</strong> that already holds the model (the one with <code>config.json</code> and the <code>.safetensors</code> files). It must be an open chat/instruct model; nothing is downloaded for a folder.</p>
+      <div class="row"><input type="text" id="hf-input" value="${esc(hf.input)}" placeholder="organisation/model-name" style="min-width:320px" ${hf.busy ? "disabled" : ""}><button class="secondary" id="hf-folder" ${hf.busy ? "disabled" : ""}>Choose a folder…</button><button class="primary" id="hf-look" ${hf.busy ? "disabled" : ""}>${hf.busy ? "Looking…" : "Look it up"}</button><button class="secondary" id="hf-cancel">Cancel</button></div>
       ${hf.error ? `<div class="err">${esc(hf.error)}</div>` : ""}
       ${fm ? `<div class="card"><h3>${esc(fm.name)}</h3><p>${esc(fm.repo)} · ${fm.params_b.toFixed(1)} B parameters · licence: ${esc(fm.license)} · chat format: ${fm.family === "generic" ? "the model's own" : esc(fm.family)}<br>Memory for training (estimate): LoRA ≈ ${fm.vram_lora_gb} GB, QLoRA ≈ ${fm.vram_qlora_gb} GB</p>
         ${hf.found.warnings.length ? `<ul>${hf.found.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
@@ -285,7 +285,8 @@ function renderTrain() {
     ...(tr.method === "full" ? [] : [["rank", "LoRA rank", pl.hyper.rank]]), ["lr", "Learning rate", pl.hyper.lr], ...(pl.hyper.stages === "book_first" ? [["book_epochs", "Passes over the world book", pl.hyper.book_epochs]] : []), ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
     ["batch", "Batch size", pl.hyper.batch], ["grad_accum", "Gradient accumulation", pl.hyper.grad_accum], ["max_seq", "Sequence length (tokens)", pl.hyper.max_seq]].map(([k, l, val]) =>
       `<label>${l}<input type="text" class="ov" data-key="${k}" value="${tr.over[k] ?? val}"></label>`).join("")}
-    ${[["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
+    ${[["engine", "Training engine", ["auto", "unsloth", "standard"], "auto: Unsloth if it is installed, otherwise the standard libraries. standard: Transformers + PEFT + TRL only (no Unsloth), even when Unsloth is installed."],
+        ["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
         ["compile", "torch.compile", ["off", "on"], "Experimental, plain-libraries path with a graphics card and Triton only. The first steps are slow."],
         ["liger", "Liger kernels", ["off", "on"], "Plain-libraries path, if the liger-kernel package is installed and supports the model."],
         ["padding_free", "Padding-free batching", ["off", "on"], "Needs the flash-attn package and a model whose attention layers support it (not Qwen3.5 or Gemma 4 yet)."]].map(([k, l, opts, tip]) =>
@@ -381,7 +382,7 @@ function onTrainEvent(p) {
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
   if (tr.preset !== "quick") over.stages = tr.stages;
   if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
@@ -399,6 +400,7 @@ function wireTrain() {
     tr.hf.busy = false; render();
   };
   on("hf-look", hfLook);
+  on("hf-folder", async () => { const dir = await tauri.dialog.open({ directory: true, title: "Choose the model's folder" }); if (dir) { tr.hf.input = dir; render(); hfLook(); } });
   const hi = $("hf-input"); if (hi) hi.onkeydown = (e) => { if (e.key === "Enter") hfLook(); };
   on("hf-add", async () => {
     try { const id = await invoke("model_add", { input: tr.hf.input }); tr.model = id; tr.hf = { open: false, input: "", busy: false, found: null, error: null }; tr.over = {}; await trRefresh(); }
@@ -426,7 +428,7 @@ function wireTrain() {
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   const bd = $("bn-deep"); if (bd) bd.onchange = () => { tr.bench.deep = bd.checked; };
   on("bn-start", async () => {
-    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
     tr.bench.running = true; tr.bench.error = null; tr.bench.text = "Starting…"; tr.bench.progress = 0; render();
     try { await invoke("bench_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, deep: tr.bench.deep }); } catch (e) { tr.bench.running = false; tr.bench.error = String(e); render(); }
   });
@@ -604,6 +606,7 @@ function renderSetup() {
   return `<h1>Training setup</h1>
     <p class="lead">Gets this computer ready to train: checks the graphics card and driver, installs the training software, and tests the card. The help panel explains each step.</p>
     <ul class="checks">${checks}</ul>
+    <label class="opt"><input type="checkbox" id="no-unsloth" ${env.noUnsloth ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Install without Unsloth</strong> — only the standard libraries (Transformers, PEFT, TRL). Simpler and it works everywhere, but training is slower and uses more graphics memory.${st && st.engine ? ` <span class="dim">Installed now: ${st.engine === "standard" ? "without Unsloth" : "with Unsloth"}.</span>` : ""}</label>
     <div class="row">
       <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
       <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
@@ -621,10 +624,10 @@ async function refreshEnv() {
   if (page === "setup") render();
 }
 
-async function startEnv(cmd) {
+async function startEnv(cmd, args) {
   env.running = true; env.log = []; env.step = ""; env.progress = null; env.result = null; env.error = null;
   render();
-  try { await invoke(cmd); } catch (e) { env.running = false; env.error = String(e); render(); }
+  try { await invoke(cmd, args); } catch (e) { env.running = false; env.error = String(e); render(); }
 }
 
 function onEnvEvent(p) {
@@ -775,7 +778,8 @@ function wire() {
   wireGuide();
   wireRetrain();
   on("recheck", refreshEnv);
-  on("install", () => startEnv("env_install"));
+  const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
+  on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
   on("selftest", () => startEnv("env_selftest"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);

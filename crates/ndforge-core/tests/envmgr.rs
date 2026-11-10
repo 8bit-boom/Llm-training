@@ -143,7 +143,7 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let uv = d.path().join("uv");
     std::fs::write(&uv, format!("#!/bin/sh\necho \"$@\" >> {}\necho \"running $1\"\nif [ \"$FAIL_AT\" = \"$2\" ]; then exit 2; fi\nexit 0\n", log.display())).unwrap();
     std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let plan = SetupPlan { env_dir: d.path().join("env"), uv: uv.clone(), worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.13".into() };
+    let plan = SetupPlan { env_dir: d.path().join("env"), uv: uv.clone(), worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.13".into(), unsloth: true };
     let mut events = Vec::new();
     run_setup(&plan, &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
     let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
@@ -169,8 +169,10 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let mut ev3 = Vec::new();
     run_setup(&plan3, &AtomicBool::new(false), &mut |e| ev3.push(e)).unwrap();
     let lines3: Vec<String> = std::fs::read_to_string(&log2).unwrap().lines().map(String::from).collect();
-    assert_eq!(lines3.len(), 6);
-    assert!(lines3[4].contains("transformers") && lines3[4].contains("peft") && lines3[4].contains("bitsandbytes") && lines3[5].contains("worker"));
+    // venv, torch, freeze, Unsloth (fails), the standard libraries, their optional extras (flash-linear-attention; on Windows also triton-windows), the worker
+    let n_extras = if cfg!(windows) { 2 } else { 1 };
+    assert_eq!(lines3.len(), 6 + n_extras, "{lines3:?}");
+    assert!(lines3[4].contains("transformers>=5") && lines3[4].contains("peft") && lines3[4].contains("bitsandbytes") && lines3[4 + n_extras].contains("flash-linear-attention") && lines3.last().unwrap().contains("worker"));
     assert!(ev3.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth could not be installed"))));
     assert!(std::fs::read_to_string(plan3.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": false"));
 }
@@ -200,7 +202,7 @@ fn fake_uv(d: &std::path::Path, log: &std::path::Path, python_says: &str, reinst
 #[test]
 fn setup_keeps_the_nvidia_pytorch_and_puts_it_back_when_a_package_replaced_it() {
     use ndforge_core::envmgr::setup::{run_setup, Event, SetupPlan};
-    let plan_for = |d: &std::path::Path, uv: std::path::PathBuf, name: &str| SetupPlan { env_dir: d.join(name), uv, worker_dir: d.join("worker"), wheel: "cu128".into(), python_version: "3.13".into() };
+    let plan_for = |d: &std::path::Path, uv: std::path::PathBuf, name: &str| SetupPlan { env_dir: d.join(name), uv, worker_dir: d.join("worker"), wheel: "cu128".into(), python_version: "3.13".into(), unsloth: true };
     let marker = |p: &SetupPlan| std::fs::read_to_string(p.env_dir.join("ndforge_env.json")).unwrap();
 
     // 1. the installed torch builds are pinned while everything else is installed, and extra packages may come from the NVIDIA index too
@@ -256,4 +258,43 @@ fn an_install_made_before_pytorch_was_checked_is_flagged() {
     assert_eq!(flagged.light, Light::Warn);
     assert!(flagged.detail.contains("not checked") && flagged.fix.contains("CPU-only"), "{flagged:?}");
     assert_eq!(env_check(&facts(false)).light, Light::Ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_without_unsloth_installs_only_the_standard_libraries_and_never_fails_on_the_optional_extras() {
+    use ndforge_core::envmgr::health::env_engine;
+    use ndforge_core::envmgr::setup::{run_setup, Event, SetupPlan};
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("log");
+    let uv = d.path().join("uv");
+    // an optional extra that cannot be installed
+    std::fs::write(&uv, format!("#!/bin/sh\necho \"$@\" >> {}\ncase \"$*\" in *flash-linear-attention*) exit 4;; esac\nexit 0\n", log.display())).unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = SetupPlan { env_dir: d.path().join("env"), uv: uv.clone(), worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.13".into(), unsloth: false };
+    let mut events = Vec::new();
+    run_setup(&plan, &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("unsloth"), "Unsloth must not even be tried:\n{text}");
+    let lib = text.lines().find(|l| l.contains("bitsandbytes")).expect("the standard libraries were installed");
+    assert!(lib.contains("transformers>=5") && lib.contains("trl") && lib.contains("peft") && lib.contains("accelerate") && lib.contains("--extra-index-url https://download.pytorch.org/whl/cu128"));
+    assert!(text.lines().any(|l| l.contains("flash-linear-attention")) && text.lines().last().unwrap().contains("worker"));
+    assert!(events.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth is skipped, as you chose"))));
+    assert!(events.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Optional: flash-linear-attention could not be installed") && l.contains("Qwen3.5 will be much slower"))));
+    let marker = std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap();
+    assert!(marker.contains("\"unsloth\": false") && marker.contains("\"engine\": \"standard\"") && marker.contains("\"extras\": []"), "{marker}");
+    assert_eq!(env_engine(&plan.env_dir).as_deref(), Some("standard"));
+    // the libraries themselves cannot be installed: that is an error (an environment without them cannot train)
+    std::fs::write(&uv, "#!/bin/sh\ncase \"$*\" in *bitsandbytes*) exit 5;; esac\nexit 0\n").unwrap();
+    let plan2 = SetupPlan { env_dir: d.path().join("env2"), ..plan.clone() };
+    let e = run_setup(&plan2, &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+    assert!(e.0.contains("without Unsloth") && e.0.contains("exit code 5"), "{e}");
+    assert!(!plan2.env_dir.join("ndforge_env.json").exists());
+    // with Unsloth installed the engine says so
+    std::fs::write(&uv, "#!/bin/sh\nexit 0\n").unwrap();
+    let plan3 = SetupPlan { env_dir: d.path().join("env3"), unsloth: true, ..plan.clone() };
+    run_setup(&plan3, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(env_engine(&plan3.env_dir).as_deref(), Some("unsloth"));
+    assert_eq!(env_engine(&d.path().join("nowhere")), None);
 }

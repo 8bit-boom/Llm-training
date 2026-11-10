@@ -21,12 +21,14 @@ pub fn status() -> Value {
         "can_install": can_install(&checks),
         "gpu": gpu.as_ref().map(|g| json!({"name": g.name, "vram_gb": (g.vram_gb() * 10.0).round() / 10.0, "driver": g.driver, "precision": g.precision(), "blackwell": g.is_blackwell()})),
         "env_installed": facts.env_installed,
+        "engine": super::health::env_engine(&env_dir()),
         "selftest_passed": facts.selftest_passed,
         "env_dir": env_dir(),
     })
 }
 
-pub fn install(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<()> {
+/// `unsloth`: try to install Unsloth (false: the standard libraries only).
+pub fn install(unsloth: bool, cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<()> {
     let facts = gather();
     let checks = evaluate(&facts);
     if let Some(bad) = checks.iter().find(|c| matches!(c.id, "gpu" | "driver" | "vram" | "disk" | "uv") && c.light == super::health::Light::Fail) {
@@ -36,7 +38,7 @@ pub fn install(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<(
     let wheel = cuda_wheel_for(&gpu).map_err(Error::new)?;
     let plan = SetupPlan {
         env_dir: env_dir(), uv: find_uv().ok_or_else(|| Error::new("uv was not found."))?, worker_dir: worker_dir(),
-        wheel: wheel.to_string(), python_version: "3.13".to_string(),
+        wheel: wheel.to_string(), python_version: "3.13".to_string(), unsloth,
     };
     run_setup(&plan, cancel, &mut |e| on_event(match e {
         Event::Step { index, total, text } => json!({"kind": "step", "index": index, "total": total, "text": text}),

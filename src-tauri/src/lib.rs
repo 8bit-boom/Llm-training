@@ -454,9 +454,10 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: 
 }
 
 #[tauri::command]
-fn env_install(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
-    spawn_task(app, &tasks, "env-event", |cancel, emit| {
-        ndforge_core::envmgr::tasks::install(cancel, emit).map(|_| Value::Null).map_err(|e| e.to_string())
+fn env_install(app: tauri::AppHandle, tasks: State<Tasks>, unsloth: Option<bool>) -> Out<()> {
+    let unsloth = unsloth.unwrap_or(true);
+    spawn_task(app, &tasks, "env-event", move |cancel, emit| {
+        ndforge_core::envmgr::tasks::install(unsloth, cancel, emit).map(|_| Value::Null).map_err(|e| e.to_string())
     })
 }
 

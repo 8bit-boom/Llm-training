@@ -313,6 +313,14 @@ fn model_train_state_and_jobs() {
     assert_eq!((job.hyper.rank, job.job["hyper"]["max_steps"].as_u64()), (4, Some(60)));
     assert!(job.job["dataset"]["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v1/train.jsonl"));
     assert_eq!(job.job["resume"], false);
+    // the training engine: automatic unless asked otherwise, reaches the worker as the library to use
+    assert_eq!(job.job["hyper"]["engine"], "auto");
+    let std_job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"engine": "standard"}), None, None).unwrap();
+    assert_eq!((std_job.job["hyper"]["engine"].as_str(), std_job.job["backend"].as_str()), (Some("standard"), Some("hf")));
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"engine": "turbo"}), None, None).unwrap_err().0.contains("training engine"));
+    // the plan says so when this computer trains without Unsloth (nothing is installed in this test)
+    let plan = m.train_plan("qwen3.5-4b", Method::Lora, Preset::Quick, None, None).unwrap();
+    assert!(plan["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("trains without Unsloth")), "{plan}");
     // batches by length: automatic unless asked otherwise, and the choice reaches the worker
     assert_eq!(job.job["hyper"]["bucket"], "auto");
     let off = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"bucket": "off"}), None, None).unwrap();

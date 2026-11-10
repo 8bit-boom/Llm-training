@@ -90,7 +90,7 @@ pub fn run(p: &Project, m: &ModelEntry, method: Method, base_job: &Value, base: 
     if !py.is_file() {
         return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
     }
-    let list = variants(base, env_has_unsloth(), deep);
+    let list = variants(base, env_has_unsloth() && base.engine != "standard", deep);
     let tmp = p.folder.join("benchmarks").join("tmp");
     let mut rows: Vec<Value> = Vec::new();
     let mut stopped = false;
