@@ -317,14 +317,14 @@ def test_a_stopped_two_stage_run_continues_in_the_stage_it_was_in(tmp_path):
 
 
 def test_a_full_model_continues_from_a_saved_full_model_and_is_exported_without_a_merge(tmp_path):
-    p, ev, out = run_job(tmp_path, "qwen3_5", "real", method="full", hyper={"max_steps": 20, "lr": 1e-2, "warmup": 0})
+    p, ev, out = run_job(tmp_path, "qwen3_5", "real", method="full", hyper={"max_steps": 20, "lr": 1e-2, "warmup": 0, "bucket": "off"})
     assert p.returncode == 0, p.stderr[-2000:]
     first = [e for e in ev if e["type"] == "metric"]
     cold, last = first[0]["loss"], first[-1]["loss"]
     assert cold - last > 0.3
     model_dir = ev[-1]["data"]["model_dir"]
     # warm start: the second run loads the first run's model, so it begins near where the first ended
-    p2, ev2, _ = run_job(tmp_path, "qwen3_5", "real", method="full", init_model=model_dir, out=str(tmp_path / "run2"), hyper={"max_steps": 2, "lr": 1e-9, "warmup": 0})
+    p2, ev2, _ = run_job(tmp_path, "qwen3_5", "real", method="full", init_model=model_dir, out=str(tmp_path / "run2"), hyper={"max_steps": 2, "lr": 1e-9, "warmup": 0, "bucket": "off"})
     assert p2.returncode == 0, p2.stderr[-2000:]
     assert abs([e for e in ev2 if e["type"] == "metric"][0]["loss"] - last) < 0.5 * (cold - last)
     # export: nothing to merge; the template of the model folder is the non-thinking one; a GGUF comes from the model folder itself

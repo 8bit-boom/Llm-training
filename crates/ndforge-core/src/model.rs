@@ -277,6 +277,9 @@ impl AppModel {
         if !["mixed", "book_first"].contains(&h.stages.as_str()) {
             return Err(Error::new("The stages setting must be \"mixed\" or \"book_first\"."));
         }
+        if !["auto", "on", "off"].contains(&h.bucket.as_str()) {
+            return Err(Error::new("The batching setting must be \"auto\", \"on\" or \"off\"."));
+        }
         if h.stages == "book_first" && h.max_steps.is_some() {
             h.stages = "mixed".into();   // a fixed number of steps is a single stage (the quick test)
         }
