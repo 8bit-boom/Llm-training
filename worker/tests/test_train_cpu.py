@@ -393,3 +393,22 @@ def test_evaluate_a_full_model_and_one_side_only_and_a_plain_error(tmp_path):
     assert p3.returncode == 0 and set(json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))) == {"trained"}
     p4, ev4 = run_eval(tmp_path, "qwen3_5")
     assert p4.returncode == 1 and ev4[-1]["type"] == "error" and "no saved model" in ev4[-1]["message"]
+
+
+# ---------------------------------------------------------------------------------------------------------------- a model of an unknown family
+def test_a_generic_family_model_trains_and_is_tested_with_its_own_chat_template(tmp_path):
+    """Models added from Hugging Face that are not Qwen3.5 / Gemma 4 use the family "generic": the tokenizer's own chat template, the end-of-sequence token."""
+    from ndforge_worker import data
+    from tinymodel import build_tokenizer
+    tok = build_tokenizer("qwen3_5")      # any tokenizer with a chat template will do; only the family name differs
+    prompt, full = data.render_chat(tok, sample_rows(1, 0)[0]["messages"], "generic")
+    # the model's own template as it is (Qwen's opens a thinking block when nobody switches it off: the "generic" family does not switch anything), then the answer and eos
+    assert "<|im_start|>assistant\n" in prompt and full.startswith(prompt) and full.endswith("fire.)" + tok.eos_token), (prompt[-40:], full[-30:])
+    p, ev, out = run_job(tmp_path, "qwen3_5", "real", model={"family": "generic"}, hyper={"max_steps": 10, "lr": 2e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-3000:]
+    metrics = [e for e in ev if e["type"] == "metric"]
+    assert metrics and metrics[0]["loss"] > metrics[-1]["loss"] and Path(ev[-1]["data"]["adapter_dir"], "adapter_config.json").exists()
+    p2, ev2 = run_eval(tmp_path, "generic", adapter=str(out / "adapter"))
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    ans = json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))
+    assert set(ans) == {"original", "trained"} and ans["original"]["a"] != ans["trained"]["a"]

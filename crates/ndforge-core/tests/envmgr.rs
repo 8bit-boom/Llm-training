@@ -37,7 +37,7 @@ fn picks_the_cuda_build_from_the_driver() {
 }
 
 fn facts(smi: Result<&str, &str>, disk: Option<f64>, uv: bool, env: bool, test: bool) -> Facts {
-    Facts { gpus: smi.map(parse_nvidia_smi).map_err(String::from), free_disk_gb: disk, uv_found: uv, env_installed: env, selftest_passed: test }
+    Facts { gpus: smi.map(parse_nvidia_smi).map_err(String::from), free_disk_gb: disk, uv_found: uv, env_installed: env, selftest_passed: test, env_cuda_unchecked: false }
 }
 
 fn lights(f: &Facts) -> Vec<(&'static str, Light)> {
@@ -147,9 +147,11 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let mut events = Vec::new();
     run_setup(&plan, &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
     let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
-    assert_eq!(lines.len(), 4);
-    assert!(lines[0].starts_with("venv --python 3.13 --seed") && lines[1].contains("https://download.pytorch.org/whl/cu128") && lines[1].contains("torch") && lines[2].contains("unsloth") && lines[3].contains("worker"));
-    assert_eq!(events.iter().filter(|e| matches!(e, Event::Step { .. })).count(), 4);
+    // venv, PyTorch (with its sister libraries), the freeze that pins them, Unsloth, the worker
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(lines[0].starts_with("venv --python 3.13 --seed") && lines[1].contains("https://download.pytorch.org/whl/cu128") && lines[1].contains("torch torchvision torchaudio")
+            && lines[2].starts_with("pip freeze") && lines[3].contains("unsloth") && lines[4].contains("worker"));
+    assert_eq!(events.iter().filter(|e| matches!(e, Event::Step { total: 5, .. })).count(), 5);
     assert!(std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": true"));
     assert!(events.contains(&Event::Log("running pip".into())));
     assert!(plan.env_dir.join("ndforge_env.json").is_file());
@@ -167,8 +169,91 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let mut ev3 = Vec::new();
     run_setup(&plan3, &AtomicBool::new(false), &mut |e| ev3.push(e)).unwrap();
     let lines3: Vec<String> = std::fs::read_to_string(&log2).unwrap().lines().map(String::from).collect();
-    assert_eq!(lines3.len(), 5);
-    assert!(lines3[3].contains("transformers") && lines3[3].contains("peft") && lines3[3].contains("bitsandbytes") && lines3[4].contains("worker"));
+    assert_eq!(lines3.len(), 6);
+    assert!(lines3[4].contains("transformers") && lines3[4].contains("peft") && lines3[4].contains("bitsandbytes") && lines3[5].contains("worker"));
     assert!(ev3.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth could not be installed"))));
     assert!(std::fs::read_to_string(plan3.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": false"));
+}
+
+/// A fake uv that makes a fake Python in each environment: that Python says "CUDA None" (exit 3) until `fixed` exists; a `--reinstall` creates it
+/// when `reinstall_fixes`. `pip freeze` lists the torch builds and one other package.
+#[cfg(unix)]
+fn fake_uv(d: &std::path::Path, log: &std::path::Path, python_says: &str, reinstall_fixes: bool) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let uv = d.join("uv");
+    let fixed = d.join("fixed");
+    let script = match python_says {
+        "cuda" => "#!/bin/sh\necho 'PyTorch 2.8.0 CUDA 12.8'\nexit 0\n".to_string(),
+        _ => format!("#!/bin/sh\nif [ -f {f} ]; then echo 'PyTorch 2.8.0 CUDA 12.8'; exit 0; fi\necho 'PyTorch 2.8.0 CUDA None'\nexit 3\n", f = fixed.display()),
+    };
+    let python_template = d.join("python_template");
+    std::fs::write(&python_template, script).unwrap();
+    let touch = if reinstall_fixes { format!("case \"$*\" in *--reinstall*) touch {};; esac\n", fixed.display()) } else { String::new() };
+    std::fs::write(&uv, format!(
+        "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$1\" in\n  venv) for last; do :; done; mkdir -p \"$last/bin\"; cp {tpl} \"$last/bin/python\"; chmod +x \"$last/bin/python\";;\n  pip) if [ \"$2\" = freeze ]; then printf 'numpy==2.0.0\\ntorch==2.8.0+cu128\\ntorchvision==0.23.0+cu128\\ntorchaudio==2.8.0+cu128\\n'; fi;;\nesac\n{touch}exit 0\n",
+        log = log.display(), tpl = python_template.display(), touch = touch)).unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+    uv
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_keeps_the_nvidia_pytorch_and_puts_it_back_when_a_package_replaced_it() {
+    use ndforge_core::envmgr::setup::{run_setup, Event, SetupPlan};
+    let plan_for = |d: &std::path::Path, uv: std::path::PathBuf, name: &str| SetupPlan { env_dir: d.join(name), uv, worker_dir: d.join("worker"), wheel: "cu128".into(), python_version: "3.13".into() };
+    let marker = |p: &SetupPlan| std::fs::read_to_string(p.env_dir.join("ndforge_env.json")).unwrap();
+
+    // 1. the installed torch builds are pinned while everything else is installed, and extra packages may come from the NVIDIA index too
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("log");
+    let plan = plan_for(d.path(), fake_uv(d.path(), &log, "cuda", false), "env");
+    run_setup(&plan, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    let pins = std::fs::read_to_string(plan.env_dir.join("constraints.txt")).unwrap();
+    assert_eq!(pins, "torch==2.8.0+cu128\ntorchvision==0.23.0+cu128\ntorchaudio==2.8.0+cu128\n");
+    let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
+    for l in lines.iter().filter(|l| l.contains("unsloth") || l.contains("worker")) {
+        assert!(l.contains("--constraint") && l.contains("constraints.txt") && l.contains("--extra-index-url https://download.pytorch.org/whl/cu128") && l.contains("--index-strategy unsafe-best-match"), "{l}");
+    }
+    assert!(!lines.iter().any(|l| l.contains("--reinstall")), "PyTorch was fine: nothing to put back");
+    assert!(marker(&plan).contains("\"cuda_torch\": true"));
+
+    // 2. a package replaced PyTorch by the CPU-only build: it is found and put back
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("log");
+    let plan = plan_for(d.path(), fake_uv(d.path(), &log, "cpu", true), "env");
+    let mut ev = Vec::new();
+    run_setup(&plan, &AtomicBool::new(false), &mut |e| ev.push(e)).unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let re = text.lines().find(|l| l.contains("--reinstall")).expect("reinstalled");
+    assert!(re.contains("torch torchvision torchaudio") && re.contains("--index-url https://download.pytorch.org/whl/cu128"), "{re}");
+    assert!(ev.iter().any(|e| matches!(e, Event::Log(l) if l.contains("CPU-only build"))) && ev.iter().any(|e| matches!(e, Event::Log(l) if l == "PyTorch 2.8.0 CUDA 12.8")));
+    assert!(marker(&plan).contains("\"cuda_torch\": true"));
+
+    // 3. reinstalling does not help (for example the NVIDIA index cannot be reached): a plain message, no marker, so the page does not say "Installed"
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("log");
+    let plan = plan_for(d.path(), fake_uv(d.path(), &log, "cpu", false), "env");
+    let e = run_setup(&plan, &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+    assert!(e.0.contains("still the CPU-only build") && e.0.contains("download.pytorch.org"), "{e}");
+    assert!(!plan.env_dir.join("ndforge_env.json").exists());
+}
+
+#[test]
+fn an_install_made_before_pytorch_was_checked_is_flagged() {
+    use ndforge_core::envmgr::health::{env_cuda_unchecked, evaluate, Light};
+    use ndforge_core::envmgr::gpu::parse_nvidia_smi;
+    let d = tempfile::tempdir().unwrap();
+    let env = d.path().join("env");
+    std::fs::create_dir_all(&env).unwrap();
+    assert!(!env_cuda_unchecked(&env), "no environment, nothing to flag");
+    std::fs::write(env.join("ndforge_env.json"), "{\"wheel\": \"cu128\", \"python\": \"3.13\", \"unsloth\": true}\n").unwrap();
+    assert!(env_cuda_unchecked(&env));
+    std::fs::write(env.join("ndforge_env.json"), "{\"wheel\": \"cu128\", \"unsloth\": true, \"cuda_torch\": true}\n").unwrap();
+    assert!(!env_cuda_unchecked(&env));
+    let facts = |unchecked| ndforge_core::envmgr::health::Facts { gpus: Ok(parse_nvidia_smi("NVIDIA GeForce RTX 5090, 32607, 576.80, 12.0")), free_disk_gb: Some(100.0), uv_found: true, env_installed: true, selftest_passed: false, env_cuda_unchecked: unchecked };
+    let env_check = |f: &ndforge_core::envmgr::health::Facts| evaluate(f).into_iter().find(|c| c.id == "env").unwrap();
+    let flagged = env_check(&facts(true));
+    assert_eq!(flagged.light, Light::Warn);
+    assert!(flagged.detail.contains("not checked") && flagged.fix.contains("CPU-only"), "{flagged:?}");
+    assert_eq!(env_check(&facts(false)).light, Light::Ok);
 }

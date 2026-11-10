@@ -57,6 +57,8 @@ pub fn spec_for(family: &str, num_ctx: u32) -> OllamaSpec {
             // Gemma 4's recommended sampling (Unsloth guide)
             options: vec![("temperature", 1.0), ("top_p", 0.95), ("top_k", 64.0), ("num_ctx", num_ctx as f64)],
         },
+        // a model the program has no hand-written template for: no TEMPLATE at all, so Ollama uses the chat template stored inside the GGUF
+        "generic" => OllamaSpec { template: String::new(), stop: vec![], options: vec![("temperature", 0.7), ("num_ctx", num_ctx as f64)] },
         _ => OllamaSpec {
             template: QWEN_TEMPLATE.to_string(), stop: vec!["<|im_end|>".into()],
             options: vec![("temperature", 0.7), ("top_p", 0.8), ("top_k", 20.0), ("num_ctx", num_ctx as f64)],
@@ -70,7 +72,10 @@ fn num(v: f64) -> String {
 
 /// The Modelfile to keep next to the GGUF (works with `ollama create <name> -f Modelfile`).
 pub fn modelfile_text(gguf_file: &str, spec: &OllamaSpec) -> String {
-    let mut t = format!("FROM ./{gguf_file}\n\nTEMPLATE \"\"\"{}\"\"\"\n\n", spec.template);
+    let mut t = format!("FROM ./{gguf_file}\n\n");
+    if !spec.template.is_empty() {
+        t += &format!("TEMPLATE \"\"\"{}\"\"\"\n\n", spec.template);
+    }
     for s in &spec.stop {
         t += &format!("PARAMETER stop \"{s}\"\n");
     }
@@ -83,11 +88,17 @@ pub fn modelfile_text(gguf_file: &str, spec: &OllamaSpec) -> String {
 /// The JSON body of Ollama's `POST /api/create` for a GGUF already uploaded as a blob.
 pub fn create_body(model: &str, gguf_file: &str, digest: &str, spec: &OllamaSpec) -> Value {
     let mut params = serde_json::Map::new();
-    params.insert("stop".into(), json!(spec.stop));
+    if !spec.stop.is_empty() {
+        params.insert("stop".into(), json!(spec.stop));
+    }
     for (k, v) in &spec.options {
         params.insert((*k).into(), if v.fract() == 0.0 { json!(*v as i64) } else { json!(*v) });
     }
-    json!({"model": model, "files": {gguf_file: digest}, "template": spec.template, "parameters": params, "stream": false})
+    let mut body = json!({"model": model, "files": {gguf_file: digest}, "parameters": params, "stream": false});
+    if !spec.template.is_empty() {
+        body["template"] = json!(spec.template);
+    }
+    body
 }
 
 /// A name Ollama accepts: lower case letters, digits, "-", "_", "." (and an optional ":tag").
@@ -101,6 +112,7 @@ pub struct CardInfo<'a> {
     pub world: &'a str,
     pub model_name: &'a str,
     pub base_repo: &'a str,
+    pub license: &'a str,
     pub method: &'a str,
     pub quant: &'a str,
     pub dataset_version: u64,
@@ -116,7 +128,7 @@ pub fn model_card(c: &CardInfo) -> String {
 
 Made with ND Lore Forge.
 
-- Base model: {base} (Apache-2.0; the tuned model keeps that licence)
+- Base model: {base} ({license}; the tuned model keeps that licence)
 - Training: {method}, SFT on saved data version {ver}{steps}{loss}
 - Format: GGUF {quant}
 - Audience: **the game master only**. It was trained on ALL of the world's text, including GM secrets, and it repeats them.
@@ -126,7 +138,7 @@ Made with ND Lore Forge.
 - Keep nd-world's lore search switched on: the model was trained to use the context nd-world gives it.
 - Do not let players use AI chat with this model.
 ",
-        name = c.model_name, world = c.world, base = c.base_repo, method = c.method, ver = c.dataset_version, quant = c.quant, oname = c.ollama_name,
+        name = c.model_name, world = c.world, base = c.base_repo, license = c.license, method = c.method, ver = c.dataset_version, quant = c.quant, oname = c.ollama_name,
         steps = c.steps.map(|s| format!(", {s} steps")).unwrap_or_default(),
         loss = c.final_loss.map(|l| format!(", final loss {l:.3}")).unwrap_or_default())
 }

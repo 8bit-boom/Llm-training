@@ -117,7 +117,22 @@ fn a_git_clone_has_working_install_scripts_and_the_program_finds_the_tools_they_
     assert!(sh.contains("--features custom-protocol") && ps.contains("--features custom-protocol"));
     assert!(sh.contains("$ROOT/tools") && ps.contains("$root\\tools"));
     assert!(ps.contains("Get-FileHash") && std::fs::read_to_string(r.join("packaging/fetch_uv.sh")).unwrap().contains("sha256sum"));
-    assert!(std::fs::read_to_string(r.join("run.cmd")).unwrap().contains("target\\release\\nd-lore-forge.exe"));
+    // the Windows batch files: CRLF line endings, they call the PowerShell script, ask for a key on failure, and update.bat keeps what follows the pull in
+    // one parenthesised block (git rewrites the file while it runs and cmd reads a batch file as it goes)
+    let bat = |n: &str| std::fs::read_to_string(r.join(n)).unwrap();
+    for n in ["install.bat", "run.bat", "update.bat"] {
+        let t = bat(n);
+        assert!(t.contains("\r\n") && !t.replace("\r\n", "").contains('\n'), "{n} must have CRLF line endings only");
+        assert!(t.contains("cd /d \"%~dp0\""), "{n} must work from any current folder");
+    }
+    assert!(bat("run.bat").contains("target\\release\\nd-lore-forge.exe") && !r.join("run.cmd").exists());
+    assert!(bat("install.bat").contains("-ExecutionPolicy Bypass -File \"%~dp0install.ps1\"") && bat("install.bat").contains("pause"));
+    let up = bat("update.bat");
+    assert!(up.contains("git pull --ff-only") && up.contains("call \"%~dp0install.bat\""));
+    assert!(!up.contains("%errorlevel%"), "%errorlevel% inside a block is read too early");
+    let after_pull = &up[up.find("(\r\n  git pull").expect("the pull and the build are in one block")..];
+    assert!(after_pull.contains("call \"%~dp0install.bat\"") && after_pull.trim_end().ends_with(")"));
+    assert!(std::fs::read_to_string(r.join(".gitattributes")).unwrap().contains("*.bat text eol=crlf"));
     assert!(std::fs::read_to_string(r.join("src-tauri/Cargo.toml")).unwrap().contains("custom-protocol = [\"tauri/custom-protocol\"]"));
     assert!(std::fs::read_to_string(r.join(".gitignore")).unwrap().lines().any(|l| l == "tools/"));
     // the program looks in <repo>/tools, where the scripts put uv

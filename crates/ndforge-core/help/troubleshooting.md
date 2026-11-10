@@ -16,6 +16,8 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 
 **The install fails halfway.** Press **Install the training software** again: it continues. Typical causes: no internet, a proxy, or too little disk space. The log under the button shows the last lines.
 
+**"PyTorch cannot see an NVIDIA graphics card" (or "the CPU-only build") although the driver is new.** Most often the training software has the CPU-only PyTorch: another package replaced the NVIDIA build while it was being installed. Press **Install the training software** again: the setup now keeps the NVIDIA build, checks it, and puts it back if it was replaced. To look yourself, run this in a terminal, with the path of the environment shown on the setup page (on Windows it is under *AppData\Roaming\NDLoreForge\env*): `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`. A version ending in `+cpu`, or `None` for CUDA, is the CPU-only build. `True` means PyTorch is fine and the graphics card test should pass. If the CUDA version is shown but the card is not available, restart the computer after a driver update and close programs that reserve the card.
+
 **The graphics-card test fails.** Close games and other programs that use the card, update the driver, run the test again.
 
 ## Training

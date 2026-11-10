@@ -1,6 +1,6 @@
 # Install ND Lore Forge from a git clone (Windows, PowerShell):
 #   git clone https://github.com/8bit-boom/Llm-training; cd Llm-training; powershell -ExecutionPolicy Bypass -File install.ps1
-# Checks what is needed, fetches the `uv` tool into .\tools, builds the program and leaves run.cmd to start it.
+# Checks what is needed, fetches the `uv` tool into .\tools, builds the program and leaves run.bat to start it.
 #   -Check      only check the prerequisites
 #   -Shortcut   also put a shortcut on the desktop
 # To update: git pull; then run this again.
@@ -44,5 +44,5 @@ if ($Shortcut) {
   Write-Host "Shortcut added to the desktop."
 }
 Write-Host ""
-Write-Host "Done. Start it with run.cmd (double-click it)."
+Write-Host "Done. Start it with run.bat (double-click it)."
 Write-Host "First start: open `"Training setup`" and press `"Install the training software`"."
