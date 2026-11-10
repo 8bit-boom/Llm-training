@@ -1,4 +1,5 @@
 //! Training (step 3): the model catalog, presets and memory estimates (`plan`), and runs (`runs`).
+pub mod bench;
 pub mod catalog;
 pub mod hub;
 pub mod plan;

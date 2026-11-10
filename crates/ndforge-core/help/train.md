@@ -44,3 +44,9 @@ Good to know:
 - Only Qwen3.5 and Gemma 4 have been checked in detail. For any other model the program uses the model's **own chat template**: do a **Quick test** first, then look at the sample answers. The memory figure is an estimate until a run has measured it.
 - Installing such a model into Ollama uses the template stored in the GGUF file instead of a hand-written one.
 - A model's licence is its own: read the model page before you share the trained model.
+
+## Speed numbers while training
+The training card shows **Speed** (tokens per second, counting only real text) and **Padding** (the share of the computed tokens that is wasted filling to make every example in a batch equally long). Below it one line says how batches were made: when many examples differ a lot in length, the program puts examples of similar length together, which cuts the padding and the time. Warnings appear there too, for example when Qwen3.5's fast kernels are missing (training then runs much slower) or when the graphics card has no bf16. Details and what was looked at: `docs/TRAINING_SPEED.md`.
+
+## Find the fastest settings
+Under the plan, **Find the fastest settings** runs a few short real training runs (16 steps each) with different settings and shows tokens per second and memory for each: your current settings, batches grouped by length or not, and larger batches. Every run loads the model again, so it takes several minutes; **Stop** ends it and keeps the rows made so far. A row that runs out of memory says so and does not stop the others. **Use the fastest settings** applies the winner to the next run. Tick *Also try torch.compile, Liger kernels and padding-free batching* to compare those too; they exist only on the plain-libraries path (not with Unsloth), and each one switches itself off with a reason when it cannot work. In Expert mode the same options are dropdowns. Only clear differences mean something: start-up time is part of every number.

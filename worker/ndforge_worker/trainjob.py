@@ -12,7 +12,7 @@ import os
 import time
 from pathlib import Path
 
-from . import backends, protocol
+from . import backends, protocol, speed
 
 
 def _collator(pad_id: int):
@@ -32,6 +32,36 @@ def _collator(pad_id: int):
             lab[i, :L] = torch.where(m, t, torch.full_like(t, -100))
         return {"input_ids": ids, "attention_mask": att, "labels": lab}
     return collate
+
+
+def _trainer_class(base, sampler_factory):
+    """The trainer with batches of similar length (see speed.py)."""
+    class BucketedTrainer(base):
+        def _get_train_sampler(self, *args, **kwargs):
+            return sampler_factory()
+    return BucketedTrainer
+
+
+def _decide_checkpointing(model, rows, batch, pad_id, bf16):
+    """Plain-libraries path only (Unsloth manages its own): gradient checkpointing saves memory but costs about a third more time, so it is switched off when the
+    longest batch runs without it and leaves memory to spare. Returns (checkpointing on, peak bytes or None)."""
+    import torch
+    longest = sorted(rows, key=lambda r: len(r["input_ids"]), reverse=True)[:batch]
+    total = torch.cuda.get_device_properties(0).total_memory
+    try:
+        model.gradient_checkpointing_disable()
+        peak, oom = speed.probe_checkpointing(model, _collator(pad_id)(longest), bf16)
+    except Exception as exc:   # whatever goes wrong, the safe setting stays
+        protocol.log(f"Could not test training without checkpointing ({type(exc).__name__}: {exc}); keeping it on.")
+        peak, oom = None, True
+    use = speed.checkpointing_choice(peak, total, oom)
+    if use:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        try:
+            model.enable_input_require_grads()
+        except Exception:
+            pass
+    return use, peak
 
 
 def _make_answer_fn(model, tokenizer, fam_name, backend, loader, max_new):
@@ -115,6 +145,16 @@ def run(cfg: dict) -> int:
     done_stages = {} if single else {c["name"]: c["steps"] for c in prior["completed"]}
     probes = cfg.get("probes") or []
     answer_fn = _make_answer_fn(model, tokenizer, cfg["model"]["family"], backend, loader, cfg.get("probe_tokens", 120)) if probes else None
+    ck_note, ck_state = None, None
+    if backend == "unsloth":
+        ck_state = "unsloth"
+    elif cuda and not full:
+        use, peak = _decide_checkpointing(model, rows, h["batch"], pad_id, bf16)
+        ck_state = "on" if use else "off"
+        gb = lambda b: f"{b / 1024 ** 3:.1f} GB"
+        ck_note = (f"Gradient checkpointing is on: the longest batch needs more than 85 % of the card's memory without it." if use and peak
+                   else "Gradient checkpointing is on: the longest batch did not fit without it." if use else f"Gradient checkpointing is off (faster): the longest batch needs {gb(peak)} without it.")
+        protocol.log(ck_note)
     resumed_any = False
     t0 = time.time()
     if cuda:
@@ -151,13 +191,25 @@ def run(cfg: dict) -> int:
             kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
         if "packing" in fields:
             kwargs["packing"] = False
+        model_type = getattr(getattr(model, "config", None), "model_type", "") or ""
+        extra, padding_free, adv_notes = speed.advanced_options(h, cfg["model"]["family"], model_type, backend, cuda, torch.cuda.get_device_capability(0) if cuda else None, fields)
+        kwargs.update(extra)
         args = SFTConfig(**kwargs)
         steps_after = sum(estimates[i + 1:])
         live = LiveCallback(str(stop_file), answer_fn, probes, cfg.get("probe_every", 0), stage=name, stage_index=i, stage_count=len(stages), offset=offset, steps_after=steps_after)
+        lengths = [len(r["input_ids"]) for r in sr]
+        pad_random, pad_bucketed = speed.padding_estimate(lengths, h["batch"], h["seed"])
+        bucket = speed.should_bucket(h.get("bucket", "auto"), pad_random, len(sr), h["batch"]) and not padding_free
+        counter = speed.TokenCounter()
+        live.counter = counter
+        notes = speed.kernel_notes(cfg["model"]["family"], backend, cuda, torch.cuda.get_device_capability(0) if cuda else None) + adv_notes
+        protocol.emit("speed", stage=name, bucketed=bucket, pad_random_pct=round(100 * pad_random, 1), pad_bucketed_pct=round(100 * pad_bucketed, 1),
+                      mean_len=round(sum(lengths) / len(lengths)), max_len=max(lengths), batch=h["batch"], checkpointing=ck_state, checkpointing_note=ck_note, padding_free=padding_free, options=sorted(extra) + (["padding_free"] if padding_free else []),
+                      attn=getattr(getattr(model, "config", None), "_attn_implementation", None), notes=notes)
         ds = Dataset.from_list([{"input_ids": r["input_ids"], "completion_mask": r["completion_mask"]} for r in sr])
-        trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": _collator(pad_id), "callbacks": [live]}
+        trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": counter.wrap(speed.flatten_collator(pad_id) if padding_free else _collator(pad_id)), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
-        trainer = SFTTrainer(**trainer_kw)
+        trainer = (_trainer_class(SFTTrainer, lambda: speed.make_sampler(lengths, h["batch"], h["seed"])) if bucket else SFTTrainer)(**trainer_kw)
         ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
         resume = bool(cfg.get("resume")) and bool(ckpts)
         if cfg.get("resume") and not ckpts and not resumed_any:

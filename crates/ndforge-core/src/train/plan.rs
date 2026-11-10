@@ -60,6 +60,25 @@ pub struct Hyper {
     /// passes over the world book in the first stage of "book_first"
     #[serde(default = "two")]
     pub book_epochs: f64,
+    /// batches of examples of similar length (less padding, faster): "auto" (when the padding is 8 % or more), "on" or "off"
+    #[serde(default = "auto")]
+    pub bucket: String,
+    /// optional speed features of the plain-libraries path, each "off" (default) or "on": torch.compile, Liger kernels, padding-free batching.
+    /// A feature that cannot work is switched off by the worker with a reason (see docs/TRAINING_SPEED.md).
+    #[serde(default = "off")]
+    pub compile: String,
+    #[serde(default = "off")]
+    pub liger: String,
+    #[serde(default = "off")]
+    pub padding_free: String,
+}
+
+fn off() -> String {
+    "off".into()
+}
+
+fn auto() -> String {
+    "auto".into()
 }
 
 fn mixed() -> String {
@@ -112,7 +131,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     if method == Method::Full {
         let f = |epochs: f64, max_steps, seq, warmup| Hyper {
             rank: 0, alpha: 0, lr: 1e-5, epochs, max_steps, batch: 1, grad_accum: 16, max_seq: seq, warmup, weight_decay: 0.01, scheduler: "linear".into(),
-            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0,
+            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(),
         };
         return match preset {
             Preset::Quick => Hyper { grad_accum: 4, ..f(1.0, Some(60), 1024, 5) },
@@ -122,7 +141,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     }
     let common = |rank, alpha, lr, epochs: f64, max_steps, batch, accum, seq, warmup| Hyper {
         rank, alpha, lr, epochs, max_steps, batch, grad_accum: accum, max_seq: seq, warmup, weight_decay: 0.001, scheduler: "linear".into(),
-        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0,
+        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(),
     };
     match preset {
         // proves the whole chain works in minutes; the model will not have learned much

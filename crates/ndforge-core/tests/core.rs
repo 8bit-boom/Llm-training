@@ -313,6 +313,11 @@ fn model_train_state_and_jobs() {
     assert_eq!((job.hyper.rank, job.job["hyper"]["max_steps"].as_u64()), (4, Some(60)));
     assert!(job.job["dataset"]["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v1/train.jsonl"));
     assert_eq!(job.job["resume"], false);
+    // batches by length: automatic unless asked otherwise, and the choice reaches the worker
+    assert_eq!(job.job["hyper"]["bucket"], "auto");
+    let off = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"bucket": "off"}), None, None).unwrap();
+    assert_eq!(off.job["hyper"]["bucket"], "off");
+    assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"bucket": "sideways"}), None, None).unwrap_err().0.contains("batching setting"));
     // bad settings are plain errors
     assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 0}), None, None).unwrap_err().0.contains("rank"));
     assert!(m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"nonsense": 1}), None, None).unwrap_err().0.contains("Unknown setting"));

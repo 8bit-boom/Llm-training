@@ -277,6 +277,14 @@ impl AppModel {
         if !["mixed", "book_first"].contains(&h.stages.as_str()) {
             return Err(Error::new("The stages setting must be \"mixed\" or \"book_first\"."));
         }
+        if !["auto", "on", "off"].contains(&h.bucket.as_str()) {
+            return Err(Error::new("The batching setting must be \"auto\", \"on\" or \"off\"."));
+        }
+        for (name, v) in [("torch.compile", &h.compile), ("Liger", &h.liger), ("padding-free batching", &h.padding_free)] {
+            if !["off", "on"].contains(&v.as_str()) {
+                return Err(Error::new(format!("The {name} setting must be \"off\" or \"on\".")));
+            }
+        }
         if h.stages == "book_first" && h.max_steps.is_some() {
             h.stages = "mixed".into();   // a fixed number of steps is a single stage (the quick test)
         }
@@ -362,6 +370,16 @@ impl AppModel {
         let name = runs::run_name(&m.id);
         let job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
         Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
+    }
+
+    /// The settings the benchmark starts from (this computer only: a server's card is benchmarked by training there).
+    pub fn bench_job(&self, model_id: &str, method: Method, preset: Preset, overrides: &Value) -> Result<TrainJob> {
+        self.train_job(model_id, method, preset, overrides, None, None)
+    }
+
+    pub fn bench_last(&self, model_id: &str, method: Method) -> Result<Value> {
+        let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
+        Ok(crate::train::bench::last(self.project_ref()?, &m, method).unwrap_or(Value::Null))
     }
 
     pub fn train_metrics(&self, run: &str) -> Result<Value> {
