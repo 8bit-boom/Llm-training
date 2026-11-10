@@ -51,10 +51,18 @@ if h["batch"] == 8:
     out(type="error", code="train_failed", message="The graphics card ran out of memory.")
     sys.exit(1)
 tok = {{"off": 1000, "on": 1600}}.get(h["bucket"], 1500)
+if h["batch"] == 4: tok *= 1.2
+tok *= {{"cudnn": 1.1, "flash_attention_2": 1.04, "flex_attention": 0.7}}.get(h.get("attention"), 1.0)
+if "r2_" in job["out"] and job["out"].endswith("-1"): tok *= 1.01      # run-to-run noise: the second run of a round-2 setting is 1 % faster
 if h.get("compile") == "on": tok = 1200
 notes = ["Padding-free batching was asked for but is off: no flash-attn."] if h.get("padding_free") == "on" else []
-out(type="speed", stage="all", notes=notes)
-out(type="metric", step=h["max_steps"], total_steps=h["max_steps"], loss=1.0, tok_s=tok, pad_pct=12.5, seconds_per_step=0.8, vram_mb=9000)
+out(type="speed", stage="all", notes=notes, attn=h.get("attention") or "sdpa", pad_pct=12.5)
+# the first steps are slow (kernels compile): the running average starts low, the speed after the start-up is `tok`
+tokens = elapsed = 0.0
+for step in range(1, h["max_steps"] + 1):
+    rate = tok * 0.4 if step <= 4 else tok
+    tokens += rate; elapsed += 1.0
+    out(type="metric", step=step, total_steps=h["max_steps"], loss=1.0, tok_s=int(tokens / elapsed), tokens_real=int(tokens), elapsed_s=elapsed, pad_pct=12.5, seconds_per_step=0.8, vram_mb=9000)
 out(type="result", data={{"steps": h["max_steps"], "stopped": False, "peak_vram_mb": 10240, "final_loss": 1.0}})
 "#, seen = seen.to_string_lossy())).unwrap();
     let py = root.join("env/bin/python");
@@ -81,7 +89,7 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     let r = run(&p, &m, Method::Lora, &base_job, &h, 16, true, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
     // every run was short, wrote no checkpoints, made no sample answers, was a single stage, started fresh, in a folder of its own
     let seen: Vec<Value> = std::fs::read_to_string(&seen).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(seen.len(), 12, "{seen:?}");
+    assert_eq!(seen.len(), 22, "12 single runs and 5 settings twice: {seen:?}");
     for s in &seen {
         assert_eq!((s["max_steps"].as_u64(), s["probes"].as_array().map(|a| a.len()), s["stages"].as_bool(), s["resume"].as_bool()), (Some(16), Some(0), Some(false), Some(false)));
         assert!(s["save_steps"].as_u64().unwrap() > 100_000 && s["out"].as_str().unwrap().contains("benchmarks") && s["out"] != "/should/be/replaced");
@@ -96,15 +104,26 @@ fn a_benchmark_runs_short_runs_names_the_fastest_and_a_failing_setting_fails_onl
     assert!(seen.iter().any(|s| s["attention"] == "flash_attention_2") && seen.iter().any(|s| s["attention"] == "flex_attention"), "attention variants are sent to the worker");
     assert_eq!(row("compile")["tok_s"].as_u64(), Some(1200));
     assert!(row("padding_free")["notes"][0].as_str().unwrap().contains("asked for but is off"), "an option that stayed off says why in its row");
+    // speeds leave out the slow start (the fake worker's first 4 steps run at 40 %): 1500 is the speed after it, not the running average
+    // round 2: the best batch size and grouping of round 1 with every attention kernel, each run twice, so the noise shows
+    let r2 = |id: &str| row(&format!("r2_{id}"));
+    assert_eq!(r["rounds"], 2);
+    assert_eq!(r2("default")["overrides"], json!({"batch": 4, "grad_accum": 4, "bucket": "on"}));
+    assert!(r2("default")["name"].as_str().unwrap().contains("batch of 4"), "{}", r2("default")["name"]);
+    assert_eq!(r2("attn_cudnn")["overrides"]["attention"], "cudnn");
+    assert_eq!(r2("attn_cudnn")["tok_s_runs"].as_array().unwrap().len(), 2);
+    assert_eq!(r2("attn_cudnn")["tok_s_runs"], json!([2112, 2133]), "the second run is 1 % faster: noise is visible");
+    assert!(r2("attn_cudnn")["spread"].as_f64().unwrap() > 0.009 && r["tied"].as_array().unwrap().is_empty(), "{}", r["tied"]);
+    assert!(r2("attn_flex")["tok_s"].as_f64().unwrap() < r2("default")["tok_s"].as_f64().unwrap());
     // the fastest, kept on disk, no leftovers
-    assert_eq!((r["best"].as_str(), r["stopped"].as_bool(), r["steps"].as_u64()), (Some("bucket_on"), Some(false), Some(16)));
-    assert_eq!(last(&p, &m, Method::Lora).unwrap()["best"], "bucket_on");
+    assert_eq!((r["best"].as_str(), r["stopped"].as_bool(), r["steps"].as_u64()), (Some("r2_attn_cudnn"), Some(false), Some(16)));
+    assert_eq!(last(&p, &m, Method::Lora).unwrap()["best"], "r2_attn_cudnn");
     assert!(last(&p, &m, Method::Qlora).is_none() && !p.folder.join("benchmarks/tmp").exists());
     assert!(events.iter().any(|e| e["kind"] == "bench" && e["row"].is_object()) && events.iter().any(|e| e["kind"] == "bench" && e["name"] == "Batches grouped by length" && e["row"].is_null()));
     // the Stop button before the first run: nothing is run and nothing is saved over the earlier result
     let stopped = run(&p, &m, Method::Lora, &base_job, &h, 16, false, Arc::new(AtomicBool::new(true)), &mut |_| {}).unwrap();
     assert_eq!((stopped["stopped"].as_bool(), stopped["rows"].as_array().unwrap().len()), (Some(true), 0));
-    assert_eq!(last(&p, &m, Method::Lora).unwrap()["best"], "bucket_on");
+    assert_eq!(last(&p, &m, Method::Lora).unwrap()["best"], "r2_attn_cudnn");
     // no training software: a plain message
     std::env::set_var("NDFORGE_ENV_DIR", d.path().join("missing"));
     assert!(run(&p, &m, Method::Lora, &base_job, &h, 16, false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("Training setup"));
@@ -127,4 +146,25 @@ fn the_engine_follows_the_setting_and_what_the_setup_installed() {
     // the setting wins in both directions
     assert_eq!(backend_for("standard"), "hf");
     assert_eq!(backend_for("unsloth"), "unsloth");
+}
+
+#[test]
+fn speeds_skip_the_start_up_and_close_results_are_called_a_tie() {
+    use ndforge_core::train::bench::{steady_tok_s, tied_with_best};
+    // 12 log lines: the first three slow (compiling), then 1000 tokens per second
+    let m: Vec<Value> = (1..=12).map(|i| {
+        let (tokens, secs) = if i <= 3 { (100.0 * i as f64, i as f64) } else { (300.0 + 1000.0 * (i - 3) as f64, 3.0 + (i - 3) as f64) };
+        json!({"tokens_real": tokens, "elapsed_s": secs, "tok_s": (tokens / secs) as u64})
+    }).collect();
+    let steady = steady_tok_s(&m).unwrap();
+    assert!((steady - 1000.0).abs() < 1.0, "{steady}");
+    assert!(m.last().unwrap()["tok_s"].as_u64().unwrap() < 900, "the running average is held back by the start");
+    // too few points: the running average is all there is
+    assert_eq!(steady_tok_s(&m[..2]), Some(100.0));
+    assert!(steady_tok_s(&[]).is_none());
+    let row = |id: &str, tok: f64, spread: f64| json!({"id": id, "round": 2, "ok": true, "tok_s": tok, "spread": spread});
+    // 1.5 % apart: a tie; 8 % apart: not; a noisy pair (6 % spread between its own runs) ties with something 5 % behind
+    assert_eq!(tied_with_best(&[row("a", 2000.0, 0.005), row("b", 1970.0, 0.005), row("c", 1840.0, 0.005)]), ["b"]);
+    assert_eq!(tied_with_best(&[row("a", 2000.0, 0.06), row("b", 1900.0, 0.005)]), ["b"]);
+    assert!(tied_with_best(&[json!({"id": "x", "round": 1, "ok": true, "tok_s": 5.0}), row("a", 2000.0, 0.0)]).is_empty());
 }
