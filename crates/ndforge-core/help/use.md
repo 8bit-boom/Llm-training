@@ -14,6 +14,8 @@ Turns a trained run into a file nd-world can use, puts it into **Ollama** (on th
    - **Q5_K_M** and **Q8_0** are larger and a little closer to the original; **F16** is the original precision.
    - **Context** is how much text the model reads at once (8192 is a good start; more needs more memory).
    Press **Make the files**. This joins your trained add-on into the model and makes a **GGUF** file, a **Modelfile** and a short model card in `exports/`.
+   - **Make** chooses what comes out: *GGUF + Modelfile* (for Ollama, the default), *GGUF + the merged model* (also keeps the add-on baked into the model as ordinary safetensors files, 10 to 20 GB more) or *Only the merged model* (no GGUF; it loads in Unsloth, Transformers, vLLM and so on without the add-on, but Ollama cannot use it).
+   - **Save the LoRA add-on…** copies the small add-on of the chosen run (and its tokenizer) to a folder you pick, with a `README.md` that says which base model it needs and how to load it in Unsloth or PEFT or merge it yourself. It needs no training software. A full fine-tune has no separate add-on: its whole model is in the run's folder.
 2. **Put it into Ollama.** Pick the server (add the TrueNAS one with its address, for example `http://truenas:11434`), check the model name, then press **Install into Ollama**. Big files take a while: the file is checked, sent and registered.
 3. **Test it.** Press **Test it with a question**: one of the questions from the training is asked. You should get an answer that fits your world. If the answer is empty or strange, do not use the model yet.
 4. **Use it in nd-world.** Follow the numbered list on the page (it contains the exact setting to copy).

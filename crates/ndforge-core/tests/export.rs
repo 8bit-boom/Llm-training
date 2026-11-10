@@ -220,3 +220,56 @@ fi"#);
     let cold = m.retrain_job(false).unwrap();
     assert!(cold.job.get("init_model").is_none() && cold.job.get("init_adapter").is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn an_export_can_keep_the_merged_model_or_make_only_that_and_the_lora_can_be_copied() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // the fake worker makes what the job asks for: a GGUF when "gguf":true, the merged folder when it is kept (or no GGUF was asked for)
+    fake_worker(d.path(), r#"cp "$5" "$out/job.json"
+if grep -q '"gguf":true' "$5"; then printf 'GGUF' > "$out/model-$quant.gguf"; g="\"$out/model-$quant.gguf\""; else g=null; fi
+if grep -q '"keep_merged":true' "$5"; then mkdir -p "$out/merged"; echo '{}' > "$out/merged/config.json"; m="\"$out/merged\""; else m=null; fi
+echo "{\"type\":\"result\",\"data\":{\"gguf\":$g,\"merged_dir\":$m,\"quant\":\"$quant\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    std::fs::write(truns::runs_dir(&p).join("run1/adapter/adapter_model.safetensors"), "W").unwrap();
+    std::fs::create_dir_all(truns::runs_dir(&p).join("run1/adapter/sub")).unwrap();
+    std::fs::write(truns::runs_dir(&p).join("run1/adapter/sub/tokenizer.json"), "T").unwrap();
+    let no = |what: &str| exports::execute_what(&p, "run1", "q4_k_m", 8192, what, &AtomicBool::new(false), &mut |_| {});
+
+    // the default: a GGUF and no merged model
+    let m = no("gguf").unwrap();
+    assert!(m["gguf_file"].is_string() && m["merged_dir"].is_null());
+    // GGUF and the merged model
+    let m = no("gguf_merged").unwrap();
+    assert!(m["gguf_file"].is_string() && m["merged_dir"].is_string());
+    assert!(std::fs::read_to_string(p.folder.join("exports/run1-q4_k_m/job.json")).unwrap().contains("\"keep_merged\":true"));
+    // only the merged model: its own folder, no Modelfile, listed, and Ollama refuses it in plain words
+    let m = no("merged").unwrap();
+    assert!(m["gguf_file"].is_null() && m["merged_dir"].is_string() && m["name"] == "run1-merged");
+    let dir = p.folder.join("exports/run1-merged");
+    assert!(dir.join("meta.json").is_file() && !dir.join("Modelfile").exists());
+    let list = exports::list_exports(&p);
+    let merged = list.iter().find(|e| e["name"] == "run1-merged").unwrap();
+    assert_eq!((merged["gguf_exists"].clone(), merged["merged_exists"].clone(), merged["size_mb"].is_null()), (json!(false), json!(true), true));
+    assert!(exports::find_export(&p, "run1-merged").unwrap_err().0.contains("only the merged model"));
+    assert!(no("everything").unwrap_err().0.contains("Unknown export kind"));
+
+    // the LoRA add-on is copied with its tokenizer and a README that names the base model and says how to load and merge it
+    let dest = d.path().join("elsewhere");
+    std::fs::create_dir_all(&dest).unwrap();
+    let to = exports::copy_adapter(&p, "run1", &dest).unwrap();
+    assert!(to.ends_with("run1-lora") && to.join("adapter_config.json").is_file() && to.join("adapter_model.safetensors").is_file() && to.join("sub/tokenizer.json").is_file());
+    let readme = std::fs::read_to_string(to.join("README.md")).unwrap();
+    assert!(readme.contains("unsloth/Qwen3.5-4B") && readme.contains("FastModel") && readme.contains("PeftModel") && readme.contains("merge_and_unload") && readme.contains("GM secrets"), "{readme}");
+    assert!(exports::copy_adapter(&p, "run1", &dest).unwrap_err().0.contains("already exists"));
+    assert!(exports::copy_adapter(&p, "../x", &dest).is_err() && exports::copy_adapter(&p, "nope", &dest).unwrap_err().0.contains("no saved LoRA"));
+    // a full fine-tune has no separate add-on
+    let full = truns::runs_dir(&p).join("full1");
+    std::fs::create_dir_all(full.join("model")).unwrap();
+    std::fs::write(full.join("model/config.json"), "{}").unwrap();
+    assert!(exports::copy_adapter(&p, "full1", &dest).unwrap_err().0.contains("full fine-tune"));
+}

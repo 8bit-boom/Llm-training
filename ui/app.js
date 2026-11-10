@@ -465,7 +465,7 @@ function wireTrain() {
 }
 
 // ------------------------------------------------------------------------------------------------ step 5: use in nd-world
-let us = { state: null, run: "", quant: "q4_k_m", numCtx: 8192, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", numCtx: 8192, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
 
 function renderUse() {
@@ -482,15 +482,17 @@ function renderUse() {
   const files = `<div class="card wide"><h2>1 · Make the files</h2>
     <div class="row"><label>Run <select id="us-run">${runOpts}</select></label><label>File size <select id="us-quant">${quantOpts}</select></label>
       <label>Context <select id="us-ctx">${[4096, 8192, 16384, 32768].map((n) => `<option ${us.numCtx === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
-    <p class="dim">Joins the trained add-on into the model and makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; the file is 1 to 6 GB).</p>
-    <button class="primary" id="us-make" ${busy || !st.env_ready ? "disabled" : ""}>Make the files</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first.</span>` : ""}</div>`;
-  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.size_mb != null ? e.size_mb + " MB" : "file missing"}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
+    <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
+    <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; the file is 1 to 6 GB)." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div></div>`;
+  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
   const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
-  const exOpts = st.exports.map((e) => `<option value="${esc(e.name)}" ${us.exp === e.name ? "selected" : ""}>${esc(e.name)}</option>`).join("");
-  if (!us.exp && st.exports.length) us.exp = st.exports[0].name;
-  const install = st.exports.length ? `<div class="card wide"><h2>2 · Put it into Ollama</h2>
+  const exOpts = st.exports.filter((e) => e.gguf_file !== null).map((e) => `<option value="${esc(e.name)}" ${us.exp === e.name ? "selected" : ""}>${esc(e.name)}</option>`).join("");
+  const ggufExports = st.exports.filter((e) => e.gguf_file !== null);
+  if ((!us.exp || !ggufExports.some((e) => e.name === us.exp)) && ggufExports.length) us.exp = ggufExports[0].name;
+  const install = ggufExports.length ? `<div class="card wide"><h2>2 · Put it into Ollama</h2>
     <div class="row"><label>Files <select id="us-exp">${exOpts}</select></label><label>Ollama server <select id="us-server">${srvOpts}</select></label>
       <button class="secondary" id="us-addsrv">Add a server…</button></div>
     ${us.adding ? `<div class="row"><input type="text" id="srv-name" placeholder="Name, e.g. TrueNAS"><input type="text" id="srv-url" placeholder="Address, e.g. http://truenas:11434"><button class="primary" id="srv-save">Add</button><button class="secondary" id="srv-cancel">Cancel</button></div>` : ""}
@@ -500,7 +502,7 @@ function renderUse() {
     ${us.probe ? `<div class="sample"><div class="q">${esc(us.probe.question)}</div><div class="ans">${esc(us.probe.answer) || "<em>(no answer)</em>"}</div><div class="dim">One of the training's own questions. If the answer is empty or nonsense, something is wrong with how Ollama runs the model: tell me what you see.</div></div>` : ""}</div>` : "";
   const name = us.modelName || st.suggested_name;
   const env = `${name}`;
-  const how = st.exports.length ? `<div class="card wide"><h2>3 · Use it in nd-world</h2>
+  const how = ggufExports.length ? `<div class="card wide"><h2>3 · Use it in nd-world</h2>
     <p><strong>nd-world with Ollama</strong> (the legacy AI back-end):</p>
     <ol><li>On the computer where nd-world runs, set <code>OLLAMA_MODEL=${esc(env)}</code> ${copyBtn("OLLAMA_MODEL=" + env)} in <code>.env</code> (or in the compose file), and <code>OLLAMA_URL</code> to the Ollama server you installed it into.</li>
     <li>Restart nd-world. Or, without restarting: AI → Models tab → pick <strong>${esc(env)}</strong> → ✓ Use.</li>
@@ -530,7 +532,7 @@ function onExportEvent(p) {
     if (d.probe) us.probe = d.probe;
     else if (d.ollama_version) us.check = { ok: true, text: `Ollama ${d.ollama_version} is running. Models there: ${d.models.length ? d.models.join(", ") : "none yet"}.` };
     else if (d.installed) us.ok = `Installed as "${d.installed}" at ${d.url}.`;
-    else if (d.gguf_file) us.ok = `Files made: ${d.name}.`;
+    else if (d.name && d.run) us.ok = `Files made: ${d.name}.${d.merged_dir ? " Merged model: " + d.merged_dir : ""}`;
     usRefresh(); setState_(); 
   } else if (p.kind === "error") {
     us.running = false; us.progress = null; us.step = "";
@@ -553,10 +555,17 @@ function wireUse() {
   if (page !== "use" || !us.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
   const bind = (id, key, num) => { const e = $(id); if (e) e.onchange = () => { us[key] = num ? Number(e.value) : e.value; }; };
-  bind("us-run", "run"); bind("us-quant", "quant"); bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
+  bind("us-run", "run"); bind("us-quant", "quant"); const wh = $("us-what"); if (wh) wh.onchange = () => { us.what = wh.value; render(); }; bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
-  on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx }));
+  on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what }));
+  on("us-lora", async () => {
+    const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
+    if (!dest) return;
+    us.error = null; us.ok = null;
+    try { us.ok = "LoRA add-on saved to " + await invoke("copy_adapter", { run: us.run, dest }) + " (the README there says how to load or merge it)."; } catch (e) { us.error = String(e); }
+    render();
+  });
   on("us-check", () => usRun("check", "ollama_check", { url: us.server }));
   on("us-install", () => usRun("install", "ollama_install", { export: us.exp, url: us.server, name: us.modelName || us.state.suggested_name }));
   on("us-probe", () => usRun("probe", "ollama_probe", { url: us.server, name: us.modelName || us.state.suggested_name }));
