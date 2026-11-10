@@ -40,10 +40,12 @@ pub fn exportable_runs(p: &Project) -> Vec<Value> {
 pub fn list_exports(p: &Project) -> Vec<Value> {
     let mut out: Vec<Value> = std::fs::read_dir(exports_dir(p)).map(|d| d.flatten().filter_map(|e| {
         let mut meta = read_json(&e.path().join("meta.json"))?;
-        let gguf = e.path().join(meta["gguf_file"].as_str()?);
-        meta["gguf_exists"] = json!(gguf.is_file());
+        // a "merged model only" export has no GGUF
+        let gguf = meta["gguf_file"].as_str().map(|f| e.path().join(f));
+        meta["gguf_exists"] = json!(gguf.as_ref().is_some_and(|g| g.is_file()));
         meta["dir"] = json!(e.path());
-        meta["size_mb"] = json!(std::fs::metadata(&gguf).map(|m| (m.len() as f64 / 1048576.0 * 10.0).round() / 10.0).ok());
+        meta["size_mb"] = json!(gguf.as_ref().and_then(|g| std::fs::metadata(g).ok()).map(|m| (m.len() as f64 / 1048576.0 * 10.0).round() / 10.0));
+        meta["merged_exists"] = json!(meta["merged_dir"].as_str().is_some_and(|d| std::path::Path::new(d).join("config.json").is_file()));
         Some(meta)
     }).collect()).unwrap_or_default();
     out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
@@ -52,6 +54,17 @@ pub fn list_exports(p: &Project) -> Vec<Value> {
 
 /// Makes the GGUF of a run in the worker and writes the Modelfile and the model card next to it.
 pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    execute_what(p, run, quant, num_ctx, "gguf", kill, on_event)
+}
+
+/// What an export makes: "gguf" (GGUF + Modelfile), "gguf_merged" (also keeps the merged 16-bit model as safetensors, 10 to 20 GB) or "merged" (only that model).
+pub const WHAT: [&str; 3] = ["gguf", "gguf_merged", "merged"];
+
+pub fn execute_what(p: &Project, run: &str, quant: &str, num_ctx: u32, what: &str, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    if !WHAT.contains(&what) {
+        return Err(Error::new(format!("Unknown export kind: {what}")));
+    }
+    let (want_gguf, keep_merged) = (what != "merged", what != "gguf");
     if !QUANTS.iter().any(|(q, _)| *q == quant) {
         return Err(Error::new(format!("Unknown file size: {quant}")));
     }
@@ -69,10 +82,10 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
     let cfg = read_json(&rdir.join("config.json")).ok_or_else(|| Error::new("The settings of this run are missing."))?;
     let summary = read_json(&rdir.join("summary.json")).unwrap_or(Value::Null);
     let (repo, family) = (cfg["model"]["repo"].as_str().unwrap_or("").to_string(), cfg["model"]["family"].as_str().unwrap_or("generic").to_string());
-    let name = format!("{run}-{quant}");
+    let name = if want_gguf { format!("{run}-{quant}") } else { format!("{run}-merged") };
     let out = exports_dir(p).join(&name);
     std::fs::create_dir_all(&out)?;
-    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": quant, "backend": "auto", "gguf": true,
+    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": quant, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
                      "max_seq": cfg["hyper"]["max_seq"]});
     // a full fine-tune saved the whole model (nothing to merge); a LoRA run saved an adapter
     if is_full {
@@ -85,9 +98,19 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
     }))?;
+    let oname = ollama_name(&p.model_label(), "");
+    let merged_dir = result["merged_dir"].as_str().filter(|_| keep_merged).map(String::from);
+    if !want_gguf {
+        if merged_dir.is_none() {
+            return Err(Error::new("No merged model was made."));
+        }
+        let meta = json!({"name": name, "run": run, "quant": null, "family": family, "base_repo": repo, "gguf_file": null, "merged_dir": merged_dir, "ollama_name": oname, "num_ctx": num_ctx,
+                          "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.display_name(), "installed": []});
+        write_json(&out.join("meta.json"), &meta)?;
+        return Ok(meta);
+    }
     let gguf = result["gguf"].as_str().map(PathBuf::from).ok_or_else(|| Error::new("No GGUF file was made."))?;
     let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
-    let oname = ollama_name(&p.model_label(), "");
     std::fs::write(out.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
     let license = crate::train::catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.license).unwrap_or_else(|| "see the model page for its licence".to_string());
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
@@ -95,7 +118,7 @@ pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicB
         world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
         dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
     }))?;
-    let meta = json!({"name": name, "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "ollama_name": oname, "num_ctx": num_ctx,
+    let meta = json!({"name": name, "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "merged_dir": merged_dir, "ollama_name": oname, "num_ctx": num_ctx,
                       "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), "world": p.display_name(), "installed": []});
     write_json(&out.join("meta.json"), &meta)?;
     Ok(meta)
@@ -118,9 +141,53 @@ pub fn find_export(p: &Project, export: &str) -> Result<(PathBuf, Value)> {
     }
     let dir = exports_dir(p).join(export);
     let meta = read_json(&dir.join("meta.json")).ok_or_else(|| Error::new("That export no longer exists."))?;
-    let gguf = dir.join(meta["gguf_file"].as_str().unwrap_or("model.gguf"));
+    let Some(file) = meta["gguf_file"].as_str() else { return Err(Error::new("That export has only the merged model, no GGUF file: Ollama needs a GGUF. Make the files with a GGUF.")) };
+    let gguf = dir.join(file);
     if !gguf.is_file() {
         return Err(Error::new("The GGUF file of that export is missing."));
     }
     Ok((gguf, meta))
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &target)?;
+        } else {
+            std::fs::copy(e.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies the LoRA adapter of a run (adapter files + tokenizer) to `<dest>/<run>-lora/` with a short README that says which base model it belongs to and how to
+/// load it in Unsloth and in plain PEFT. Returns the new folder. A full fine-tune has no adapter.
+pub fn copy_adapter(p: &Project, run: &str, dest: &std::path::Path) -> Result<PathBuf> {
+    if run.contains(['/', '\\']) || run.contains("..") {
+        return Err(Error::new("Unknown run."));
+    }
+    let rdir = runs_dir(p).join(run);
+    let adapter = rdir.join("adapter");
+    if !adapter.join("adapter_config.json").is_file() {
+        return Err(Error::new(if rdir.join("model").join("config.json").is_file() { "A full fine-tune has no separate LoRA add-on: the whole model is saved in the run's folder." } else { "This run has no saved LoRA add-on." }));
+    }
+    let to = dest.join(format!("{run}-lora"));
+    if to.exists() {
+        return Err(Error::new(format!("{} already exists. Choose another folder or remove it.", to.display())));
+    }
+    copy_dir(&adapter, &to)?;
+    let cfg = read_json(&rdir.join("config.json")).unwrap_or(Value::Null);
+    let (repo, family) = (cfg["model"]["repo"].as_str().unwrap_or("(see adapter_config.json)"), cfg["model"]["family"].as_str().unwrap_or("generic"));
+    let loader = if family == "qwen3_5" || family == "gemma4" { "FastModel" } else { "FastLanguageModel" };
+    let readme = format!("# LoRA add-on of {run}\n\nTrained for the world \"{world}\" on **{repo}** (use exactly this base model, not a different one).\n\n\
+## Unsloth\n```python\nfrom unsloth import {loader}\nmodel, tokenizer = {loader}.from_pretrained(model_name=\"{path}\", max_seq_length=4096, load_in_4bit=False)\n{loader}.for_inference(model)\n```\n\n\
+## Plain PEFT\n```python\nfrom transformers import AutoModelForCausalLM, AutoTokenizer\nfrom peft import PeftModel\nbase = AutoModelForCausalLM.from_pretrained(\"{repo}\", dtype=\"auto\")\nmodel = PeftModel.from_pretrained(base, \"{path}\")\ntokenizer = AutoTokenizer.from_pretrained(\"{path}\")\n```\n\n\
+## Bake it into the model (merge)\n```python\nmerged = model.merge_and_unload()   # PEFT\nmerged.save_pretrained(\"merged\"); tokenizer.save_pretrained(\"merged\")\n# Unsloth: model.save_pretrained_merged(\"merged\", tokenizer, save_method=\"merged_16bit\")\n```\n\n\
+Ask questions the way the training did: the same kind of system message, and for Qwen3.5 / Gemma 4 with thinking off. This add-on knows everything in the world, including GM secrets.\n",
+        world = p.display_name(), path = to.display());
+    std::fs::write(to.join("README.md"), readme)?;
+    Ok(to)
 }

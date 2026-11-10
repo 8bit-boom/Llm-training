@@ -1,7 +1,7 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
 Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q8_0", "f16"), backend (auto|unsloth|hf), gguf (bool),
-keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF)."""
+keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept)."""
 import json
 import os
 import shutil
@@ -128,6 +128,10 @@ def run(cfg: dict) -> int:
         gguf_path = final
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(str(tmp) + "_gguf", ignore_errors=True)
+        if cfg.get("keep_merged") and not full_model:   # the GGUF path above leaves no merged model behind: save it too, from the loaded model
+            protocol.progress("merge", 0.85, "Saving the merged 16-bit model")
+            model.save_pretrained_merged(str(merged), tokenizer, save_method="merged_16bit")
+            patch_template_dir(merged, cfg["base"]["family"])
     else:
         if full_model:
             protocol.progress("merge", 0.5, "Using the fully trained model")
