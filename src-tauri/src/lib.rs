@@ -59,6 +59,14 @@ fn open_project(s: State<App>, folder: String) -> Out<Value> {
     Ok(m.state())
 }
 
+/// Takes a world out of a project that holds several. Returns the new state.
+#[tauri::command]
+fn remove_world(s: State<App>, slug: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.remove_world(&slug).map_err(|e| e.to_string())?;
+    Ok(m.state())
+}
+
 #[tauri::command]
 fn check_bundle(s: State<App>, path: String) -> Out<Value> {
     lock(&s).check_bundle(&path).map_err(|e| e.to_string())
@@ -509,7 +517,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

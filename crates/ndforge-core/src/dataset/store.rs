@@ -113,20 +113,44 @@ fn tokens(e: &Example) -> usize {
 
 /// Builds the draft from the project's current world data. Decisions made on an earlier draft (dropped, edited) are kept for every example
 /// that still exists, so updating the world data does not lose the review work.
+/// Makes the examples of a second (third ...) world distinct from the others: its sources and ids carry the world's suffix (empty for the first world).
+pub fn tag_world(examples: &mut [Example], suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    for e in examples {
+        e.source.push_str(suffix);
+        e.id = super::builders::hash_hex(&[&e.id, suffix])[..12].to_string();
+    }
+}
+
 pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
-    let bundle = p.current_bundle().ok_or_else(|| Error::new("Import the world data first (Step 1)."))?;
-    let loaded = load(&bundle)?;
-    let mut fresh = generate(&loaded, recipe);
+    let bundles = p.bundles();
+    if bundles.is_empty() {
+        return Err(Error::new("Import the world data first (Step 1)."));
+    }
     let prior_all = load_examples(p)?;
+    let mut fresh: Vec<Example> = Vec::new();
+    let mut sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut nd_examples: Vec<Example> = Vec::new();
+    for (w, bundle) in &bundles {
+        let loaded = load(bundle)?;
+        let mut mine = generate(&loaded, recipe);
+        tag_world(&mut mine, &w.suffix);
+        fresh.extend(mine);
+        sources.extend(super::docs::articles(&loaded).into_iter().map(|d| format!("{}{}", d.source, w.suffix)));
+        // examples nd-world's own AI model wrote and checked (the bundle's teacher_examples.jsonl)
+        let mut nd: Vec<Example> = bundle.records("teacher_examples.jsonl")?.into_iter().filter_map(|v| serde_json::from_value::<Example>(v).ok())
+            .filter(|e| is_teacher(&e) && !e.messages.is_empty()).collect();
+        tag_world(&mut nd, &w.suffix);
+        nd_examples.extend(nd);
+    }
     // teacher examples are not regenerated here: keep those whose source still exists in the world (and the general / style ones)
-    let sources: std::collections::HashSet<String> = super::docs::articles(&loaded).into_iter().map(|d| d.source).collect();
     let teacher_kept: Vec<Example> = prior_all.iter().filter(|e| is_teacher(e) && (sources.contains(&e.source) || e.source.starts_with("general:") || e.source.starts_with("instruction:"))).cloned().collect();
     let prior: HashMap<String, Example> = prior_all.into_iter().map(|e| (e.id.clone(), e)).collect();
-    // examples nd-world's own AI model wrote and checked (the bundle's teacher_examples.jsonl): they join the draft like any other; a decision made
-    // on one earlier (dropped, edited) is applied below, so a newer export never undoes the review work
+    // they join the draft like any other; a decision made on one earlier (dropped, edited) is applied below, so a newer export never undoes the review work
     let in_fresh: std::collections::HashSet<String> = fresh.iter().map(|e| e.id.clone()).collect();
-    let from_nd: Vec<Example> = bundle.records("teacher_examples.jsonl")?.into_iter().filter_map(|v| serde_json::from_value::<Example>(v).ok())
-        .filter(|e| is_teacher(&e) && !e.messages.is_empty() && !in_fresh.contains(&e.id)).collect();
+    let from_nd: Vec<Example> = nd_examples.into_iter().filter(|e| !in_fresh.contains(&e.id)).collect();
     let nd_ids: std::collections::HashSet<String> = from_nd.iter().map(|e| e.id.clone()).collect();
     fresh.extend(from_nd);
     for e in &mut fresh {
@@ -142,7 +166,7 @@ pub fn generate_draft(p: &Project, recipe: &Recipe) -> Result<Value> {
     fresh.extend(teacher_kept.into_iter().filter(|e| !nd_ids.contains(&e.id)));
     write_atomic(&draft_dir(p).join("recipe.json"), &serde_json::to_vec_pretty(recipe)?)?;
     save_examples(p, &fresh)?;
-    write_atomic(&draft_dir(p).join("bundle.txt"), bundle.sha256.as_bytes())?;
+    write_atomic(&draft_dir(p).join("bundle.txt"), p.signature().unwrap_or_default().as_bytes())?;
     Ok(summary(p)?.unwrap_or(Value::Null))
 }
 
@@ -163,11 +187,11 @@ pub fn summary(p: &Project) -> Result<Option<Value>> {
     let name = |id: &str| -> String { if id == "world_book" { "World book (the lore as text)".to_string() } else if let Some(k) = crate::teacher::KINDS.iter().find(|k| k.0 == id) { format!("Teacher: {}", k.1) } else { BUILDERS.iter().find(|(b, _)| *b == id).map(|(_, n)| n.to_string()).unwrap_or_else(|| id.to_string()) } };
     let builders: Vec<Value> = by.iter().map(|(id, (k, d))| json!({"id": id, "name": name(id), "kept": k, "dropped": d})).collect();
     let kept: Vec<&Example> = ex.iter().filter(|e| e.status == Status::Keep).collect();
-    let stale = std::fs::read_to_string(draft_dir(p).join("bundle.txt")).ok().zip(p.current_bundle()).map_or(false, |(old, cur)| old != cur.sha256);
+    let stale = std::fs::read_to_string(draft_dir(p).join("bundle.txt")).ok().zip(p.signature()).map_or(false, |(old, cur)| old != cur);
     Ok(Some(json!({
         "recipe": load_recipe(p), "builders": builders, "total": ex.len(), "kept": kept.len(),
         "edited": ex.iter().filter(|e| e.edited).count(), "tokens": kept.iter().map(|e| tokens(e)).sum::<usize>(),
-        "stale": stale, "nd_world_examples": p.current_bundle().and_then(|b| b.counts.get("teacher_examples.jsonl").copied()).unwrap_or(0),
+        "stale": stale, "nd_world_examples": p.bundles().iter().map(|(_, b)| b.counts.get("teacher_examples.jsonl").copied().unwrap_or(0)).sum::<usize>(), "worlds": p.worlds().len(),
     })))
 }
 
@@ -278,7 +302,7 @@ pub fn save_version(p: &Project) -> Result<Value> {
     held_sorted.sort();
     let manifest = json!({
         "version": n, "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        "world": p.world_name, "bundle_sha256": p.current_bundle().map(|b| b.sha256), "recipe": recipe,
+        "world": p.display_name(), "bundle_sha256": p.signature(), "recipe": recipe,
         "counts": {"world_book_texts": n_text, "train_chat": n_train_chat, "test_chat": n_test_chat, "dropped": load_examples(p)?.len() - kept.len(), "edited": kept.iter().filter(|e| e.edited).count()},
         "tokens": {"train": kept.iter().filter(|e| !held.contains(&e.source) || e.text.is_some() || always_train(e)).map(tokens).sum::<usize>(), "test": kept.iter().filter(|e| e.text.is_none() && held.contains(&e.source) && !always_train(e)).map(tokens).sum::<usize>()},
         "builders": builders, "held_out_sources": held_sorted,

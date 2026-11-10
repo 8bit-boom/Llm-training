@@ -53,7 +53,11 @@ function renderWelcome() {
 
 function bundleCard() {
   if (!state.bundle) return "";
-  return `<div class="card"><h2>World: ${esc(state.bundle.world)}</h2>This project contains:<ul>${state.bundle.lines.map((l) => `<li>${esc(l)}</li>`).join("") || "<li>(no records)</li>"}</ul></div>`;
+  const ws = state.worlds && state.worlds.length ? state.worlds : [{ world: state.bundle.world, slug: "", lines: state.bundle.lines }];
+  const many = ws.length > 1;
+  const cards = ws.map((w) => `<div class="card"><h2>World: ${esc(w.world)}</h2>This project contains:<ul>${w.lines.map((l) => `<li>${esc(l)}</li>`).join("") || "<li>(no records)</li>"}</ul>${many ? `<button class="secondary rmworld" data-slug="${esc(w.slug)}">Remove this world from the project</button>` : ""}</div>`).join("");
+  const note = many ? `<p class="lead">The model will be trained on all ${ws.length} worlds at once. Every example carries its own world's name, so the model learns which world a question is about. After adding or removing a world, make the examples again in Step 2.</p>` : "";
+  return note + cards;
 }
 
 function pendingCard() {
@@ -62,16 +66,16 @@ function pendingCard() {
   const kind = info.check.kind;
   const lines = `<ul>${info.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>`;
   if (kind === "refused") return `<div class="card"><h2>This file cannot be used</h2><div class="err">${esc(info.check.text)}</div><button class="secondary" id="cancel">OK</button></div>`;
-  const title = kind === "update" ? "Update the world data?" : "Use this file?";
+  const title = kind === "update" ? "Update the world data?" : kind === "add" ? "Add another world?" : "Use this file?";
   return `<div class="card"><h2>${title} (${esc(info.world)})</h2>${lines}<p>${kind === "update" ? "<strong>What changed:</strong> " : ""}${esc(info.check.text)}</p>
-    <div class="row"><button class="primary" id="apply">${kind === "update" ? "Use this file" : "Import"}</button><button class="secondary" id="cancel">Cancel</button></div></div>`;
+    <div class="row"><button class="primary" id="apply">${kind === "update" ? "Use this file" : kind === "add" ? "Add this world" : "Import"}</button><button class="secondary" id="cancel">Cancel</button></div></div>`;
 }
 
 function renderData() {
   return `<h1>Step 1 · Get world data</h1>
     <p class="lead">Export a <strong>Training bundle</strong> from nd-world (Tools → Export &amp; Backup), then choose the file here or drag it onto this page. The help panel explains how.</p>
     <div class="drop" id="drop">Drag a <code>.ndtrain</code> file here</div>
-    <div class="row"><button class="primary" id="choose">${state.bundle ? "Choose a newer training file…" : "Choose training file…"}</button></div>
+    <div class="row"><button class="primary" id="choose">${state.bundle ? "Choose a training file (another world, or a newer file)…" : "Choose training file…"}</button></div>
     ${msgHtml()}${pendingCard()}${retrainCard()}${bundleCard()}`;
 }
 
@@ -785,6 +789,12 @@ function wire() {
   on("selftest", () => startEnv("env_selftest"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
+  document.querySelectorAll(".rmworld").forEach((b) => b.onclick = async () => {
+    if (!confirm("Remove this world from the project? Its files stay on disk; make the examples again in Step 2.")) return;
+    const s = await call("remove_world", { slug: b.dataset.slug });
+    if (s) { setState(s); message = { kind: "ok", text: "World removed. Make the examples again in Step 2." }; }
+    render();
+  });
   on("cancel", () => { pending = null; render(); });
 }
 

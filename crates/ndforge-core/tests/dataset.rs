@@ -198,3 +198,71 @@ fn a_big_world_with_odd_data_is_fast_and_never_fails() {
     assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
     assert_eq!(articles(&l).len(), 2000 + 1);
 }
+
+fn other_world(dir: &std::path::Path, file: &str, name: &str, slug: &str, created_later: bool) -> std::path::PathBuf {
+    let f = dir.join(file);
+    let mut w = sample::world();
+    w["name"] = json!(name);
+    w["slug"] = json!(slug);
+    sample::build(&f, if created_later { 2 } else { 1 }, Some(w)).unwrap();
+    f
+}
+
+#[test]
+fn several_worlds_in_one_project_train_together_without_mixing_up() {
+    use ndforge_core::project::BundleCheck;
+    let d = tempdir().unwrap();
+    let mut p = project_with_world(d.path(), 1); // "Ashfall Reach"
+    let sole_ids: std::collections::HashSet<String> = {
+        store::generate_draft(&p, &Recipe::default()).unwrap();
+        store::load_examples(&p).unwrap().into_iter().map(|e| e.id).collect()
+    };
+    // a different world is offered to be added, not refused; the same file twice is refused
+    let b = open_bundle(other_world(d.path(), "b.ndtrain", "Brightwater", "brightwater", false)).unwrap();
+    assert!(matches!(p.check_new_bundle(&b).unwrap(), BundleCheck::AddWorld(t) if t.contains("Ashfall Reach") && t.contains("Brightwater")));
+    p.import_bundle(&b).unwrap();
+    assert!(matches!(p.check_new_bundle(&b).unwrap(), BundleCheck::Refused(_)));
+    assert_eq!(p.worlds().len(), 2);
+    assert_eq!(p.display_name(), "Ashfall Reach and Brightwater");
+    assert_eq!(p.model_label(), p.name);
+    // reopening keeps both
+    let p2 = Project::open(&p.folder).unwrap();
+    assert_eq!(p2.worlds().len(), 2);
+    assert_eq!(p2.signature(), p.signature());
+
+    // both worlds' examples are there; ids and sources never collide, each world keeps its own name in the prompts
+    let sum = store::generate_draft(&p, &Recipe::default()).unwrap();
+    assert_eq!(sum["worlds"], 2);
+    let all = store::load_examples(&p).unwrap();
+    let ids: std::collections::HashSet<&String> = all.iter().map(|e| &e.id).collect();
+    assert_eq!(ids.len(), all.len(), "ids are unique across worlds");
+    assert!(sole_ids.iter().all(|i| ids.contains(i)), "the first world's examples keep their ids, so earlier review work stays");
+    let brightwater: Vec<_> = all.iter().filter(|e| e.source.ends_with("@brightwater")).collect();
+    let ashfall = all.len() - brightwater.len();
+    assert!(!brightwater.is_empty() && ashfall == sole_ids.len(), "{} vs {}", ashfall, sole_ids.len());
+    let sys = |e: &&ndforge_core::dataset::builders::Example| e.messages.first().map(|m| m.content.clone()).unwrap_or_default();
+    assert!(brightwater.iter().filter(|e| !e.messages.is_empty()).all(|e| sys(e).contains("Brightwater")));
+    assert!(all.iter().filter(|e| !e.source.ends_with("@brightwater") && !e.messages.is_empty()).all(|e| sys(&e).contains("Ashfall Reach")));
+    assert!(!sum["stale"].as_bool().unwrap());
+
+    // a decision made on an example of the second world survives making the examples again
+    let victim = brightwater.iter().find(|e| e.builder == "identity").unwrap().id.clone();
+    store::set_status(&p, &[victim.clone()], Status::Drop).unwrap();
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    assert_eq!(store::load_examples(&p).unwrap().into_iter().find(|e| e.id == victim).unwrap().status, Status::Drop);
+
+    // updating one world touches only that world; the signature changes
+    let sig = p.signature();
+    let b2 = open_bundle(other_world(d.path(), "b2.ndtrain", "Brightwater", "brightwater", true)).unwrap();
+    assert!(matches!(p.check_new_bundle(&b2).unwrap(), BundleCheck::Update(_)));
+    p.import_bundle(&b2).unwrap();
+    assert_eq!(p.worlds().len(), 2);
+    assert_ne!(p.signature(), sig);
+    assert_eq!(store::summary(&p).unwrap().unwrap()["stale"], true);
+
+    // removing the first world makes the other the first one, with its suffix kept (so its ids stay)
+    assert_eq!(p.remove_world("ashfall-reach").unwrap(), "Ashfall Reach");
+    assert_eq!((p.worlds().len(), p.world_name.as_str(), p.world_suffix.as_str()), (1, "Brightwater", "@brightwater"));
+    assert!(p.remove_world("brightwater").is_err(), "the last world stays");
+    assert_eq!(p.model_label(), "Brightwater");
+}

@@ -339,3 +339,31 @@ fn examples_nd_world_wrote_join_the_draft_with_their_marks_and_survive_a_newer_e
     store::generate_draft(&p, &Recipe::default()).unwrap();
     assert!(store::load_examples(&p).unwrap().iter().any(|e| e.id == "e5"));
 }
+
+#[test]
+fn every_world_of_a_project_gets_its_teacher_examples_and_they_do_not_mix() {
+    let d = tempdir().unwrap();
+    let mut p = project(d.path());
+    let f = d.path().join("b.ndtrain");
+    let mut w = sample::world();
+    w["name"] = json!("Brightwater");
+    w["slug"] = json!("brightwater");
+    let members = vec![("entities.jsonl", Member::Records(vec![
+        ent(1, "character", "Gruff Captain", "gruff, terse", true, &long("Captain")),
+        ent(2, "location", "Dockside", "", true, &long("Dockside")),
+    ]))];
+    write_bundle(&f, &w, members, "t", "2026-11-01T12:00:00Z").unwrap();
+    p.import_bundle(&open_bundle(f).unwrap()).unwrap();
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    let (url, _) = mock(false);
+    let rep = go(&p, &teacher(&url, None), &Options::default());
+    assert_eq!(rep["stopped"], false, "{rep}");
+    let ex = store::load_examples(&p).unwrap();
+    let mine = |suffix: bool| ex.iter().filter(|e| e.builder.starts_with("t_") && e.builder != "t_general" && e.source.ends_with("@brightwater") == suffix).count();
+    assert!(mine(true) > 0 && mine(false) > 0, "both worlds have teacher examples: {rep}");
+    let ids: std::collections::HashSet<&String> = ex.iter().map(|e| &e.id).collect();
+    assert_eq!(ids.len(), ex.len(), "ids are unique across worlds, although both worlds have an entity with the same id and name");
+    // a second run costs nothing: everything already exists
+    let again = go(&p, &teacher(&url, None), &Options::default());
+    assert_eq!(again["added"], 0, "{again}");
+}

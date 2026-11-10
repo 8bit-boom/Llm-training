@@ -56,8 +56,12 @@ impl AppModel {
         let recent: Vec<Value> = self.settings.existing_recent().iter().map(|f| {
             json!({"folder": f, "name": Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f)})
         }).collect();
+        let worlds: Vec<Value> = self.project.as_ref().map(|p| p.bundles().into_iter().map(|(w, b)| {
+            json!({"world": w.name, "slug": w.slug, "lines": b.summary_lines(), "created": b.created()})
+        }).collect()).unwrap_or_default();
         json!({
-            "project": self.project.as_ref().map(|p| json!({"name": p.name, "folder": p.folder, "world": p.world_name})),
+            "project": self.project.as_ref().map(|p| json!({"name": p.name, "folder": p.folder, "world": p.display_name()})),
+            "worlds": worlds,
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
@@ -92,6 +96,7 @@ impl AppModel {
         let check = match project.check_new_bundle(&bundle)? {
             BundleCheck::First => json!({"kind": "first", "text": "This will be the world data of the project."}),
             BundleCheck::Update(d) => json!({"kind": "update", "text": d.summary()}),
+            BundleCheck::AddWorld(text) => json!({"kind": "add", "text": text}),
             BundleCheck::Refused(why) => json!({"kind": "refused", "text": why}),
         };
         Ok(json!({"world": bundle.world_name(), "lines": bundle.summary_lines(), "check": check}))
@@ -107,6 +112,12 @@ impl AppModel {
         };
         project.import_bundle(&bundle)?;
         Ok(summary)
+    }
+
+    /// Takes a world out of the project. Returns its name. The data made from it stays in the saved dataset versions; make the examples again in Step 2.
+    pub fn remove_world(&mut self, slug: &str) -> Result<String> {
+        let project = self.project.as_mut().ok_or_else(|| Error::new("Create or open a project first (Welcome page)."))?;
+        project.remove_world(slug)
     }
 
     /// "auto", "light" or "dark".
@@ -406,8 +417,8 @@ impl AppModel {
             "exports": exports::list_exports(p),
             "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
             "servers": self.settings.ollama_servers,
-            "suggested_name": ollama_name(&p.world_name, ""),
-            "world": p.world_name,
+            "suggested_name": ollama_name(&p.model_label(), ""),
+            "world": p.display_name(),
             "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
         }))
     }
@@ -420,8 +431,8 @@ impl AppModel {
         let t = &self.settings.teacher;
         Ok(json!({
             "runs": runs, "compare": crate::evaluate::runs::compare(p), "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
-            "teacher_ready": !t.url.trim().is_empty() && !t.model.trim().is_empty(), "teacher_model": t.model, "world": p.world_name,
-            "default_system": crate::dataset::builders::system_prompt(&p.world_name),
+            "teacher_ready": !t.url.trim().is_empty() && !t.model.trim().is_empty(), "teacher_model": t.model, "world": p.display_name(),
+            "default_system": crate::dataset::builders::system_prompt(&p.display_name()),
         }))
     }
 
@@ -495,7 +506,7 @@ impl AppModel {
                 return Ok((first["system"].as_str().unwrap_or("").to_string(), first["question"].as_str().unwrap_or("").to_string()));
             }
         }
-        Ok((format!("You are the game master's assistant for the tabletop world \"{}\".", p.world_name), "Tell me about this world.".to_string()))
+        Ok((format!("You are the game master's assistant for the tabletop world \"{}\".", p.display_name()), "Tell me about this world.".to_string()))
     }
 
     // ------------------------------------------------------------------ training servers

@@ -178,7 +178,12 @@ fn reimport_rules() {
     w["name"] = json!("Other");
     let op = d.path().join("o.ndtrain");
     sample::build(&op, 1, Some(w)).unwrap();
-    assert!(p.import_bundle(&open_bundle(op).unwrap()).unwrap_err().0.contains("for the world"));
+    // another world is no longer refused: it is added (see tests/dataset.rs for what that does)
+    let ob = open_bundle(op).unwrap();
+    assert!(matches!(p.check_new_bundle(&ob).unwrap(), BundleCheck::AddWorld(_)));
+    p.import_bundle(&ob).unwrap();
+    assert_eq!(p.worlds().len(), 2);
+    assert_eq!(p.sources.len(), 2, "the first world's own files are untouched");
 }
 
 #[test]
@@ -245,6 +250,20 @@ fn model_flow_matches_the_window() {
     assert_eq!(chk["check"]["kind"], "update");
     assert!(chk["check"]["text"].as_str().unwrap().contains("1 new, 1 changed, 1 removed"));
     assert!(m.apply_bundle(two.to_str().unwrap()).unwrap().contains("1 new, 1 changed, 1 removed"));
+    // a file of another world is offered as an addition and the window lists both worlds
+    let mut other = sample::world();
+    other["name"] = json!("Brightwater");
+    other["slug"] = json!("brightwater");
+    let three = d.path().join("3.ndtrain");
+    sample::build(&three, 1, Some(other)).unwrap();
+    let chk = m.check_bundle(three.to_str().unwrap()).unwrap();
+    assert_eq!(chk["check"]["kind"], "add");
+    m.apply_bundle(three.to_str().unwrap()).unwrap();
+    let s = m.state();
+    assert_eq!(s["worlds"].as_array().unwrap().len(), 2);
+    assert_eq!(s["project"]["world"], "Ashfall Reach and Brightwater");
+    assert_eq!(m.remove_world("brightwater").unwrap(), "Brightwater");
+    assert_eq!(m.state()["worlds"].as_array().unwrap().len(), 1);
     // settings
     m.set_setting("show_help_panel", false).unwrap();
     assert_eq!(m.state()["settings"]["show_help_panel"], false);

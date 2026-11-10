@@ -22,6 +22,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M10 Teacher-generated examples + checking (Step 2) | built; needs a first run with a real teacher model. "Better scores" can only be shown by the M11 test page |
 | M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
+| Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ## Install
 

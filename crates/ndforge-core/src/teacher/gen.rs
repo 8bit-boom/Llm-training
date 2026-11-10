@@ -325,11 +325,31 @@ pub fn run(p: &Project, t: &Teacher, opt: &Options, cancel: &AtomicBool, emit: &
     if !t.cfg.is_set() {
         return Err(Error::new("Choose the teacher first: its address and the model name."));
     }
-    let bundle = p.current_bundle().ok_or_else(|| Error::new("Import the world data first (Step 1)."))?;
-    let l = load(&bundle)?;
-    let docs = articles(&l);
-    let corpus = docs.iter().map(|d| d.article.to_lowercase()).collect::<Vec<_>>().join("\n");
-    let jobs = make_jobs(&l, &docs, opt);
+    let bundles = p.bundles();
+    if bundles.is_empty() {
+        return Err(Error::new("Import the world data first (Step 1)."));
+    }
+    // every world of the project gets its own pieces of text; sources carry the world's suffix so that worlds never mix up
+    let mut worlds: Vec<Loaded> = Vec::new();
+    let mut jobs: Vec<(usize, Job)> = Vec::new();
+    let mut corpus = String::new();
+    for (wi, (w, bundle)) in bundles.iter().enumerate() {
+        let l = load(bundle)?;
+        let docs = articles(&l);
+        for d in &docs {
+            corpus.push_str(&d.article.to_lowercase());
+            corpus.push('\n');
+        }
+        for mut j in make_jobs(&l, &docs, opt) {
+            j.source.push_str(&w.suffix);
+            jobs.push((wi, j));
+        }
+        worlds.push(l);
+    }
+    if let Some(limit) = opt.limit {
+        jobs.truncate(limit);
+    }
+    let l = &worlds[0];
     let mut rep = Report { jobs: jobs.len(), ..Default::default() };
     let existing: HashSet<String> = store::load_examples(p)?.into_iter().map(|e| e.id).collect();
     let mut fresh: Vec<Example> = Vec::new();
@@ -372,13 +392,13 @@ pub fn run(p: &Project, t: &Teacher, opt: &Options, cancel: &AtomicBool, emit: &
         Ok(Some(ex))
     };
 
-    for (i, job) in jobs.iter().enumerate() {
+    for (i, (wi, job)) in jobs.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             rep.stopped = true;
             break;
         }
         emit(json!({"kind": "progress", "done": i, "total": jobs.len(), "text": format!("{}: {}", KINDS.iter().find(|k| k.0 == job.kind).map(|k| k.1).unwrap_or(job.kind), job.title)}));
-        match candidates(t, p, &l, &corpus, job, opt, &mut rep) {
+        match candidates(t, p, &worlds[*wi], &corpus, job, opt, &mut rep) {
             Ok(cands) => {
                 consecutive_failures = 0;
                 for (ex, src) in cands {
