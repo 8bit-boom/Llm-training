@@ -12,7 +12,7 @@ let state = null;
 let page = "welcome";
 let pending = null;      // a checked file waiting for the user's confirmation: {path, info}
 let message = null;      // {kind: "err"|"ok", text}
-let env = { status: null, running: false, log: [], step: "", progress: null, result: null, error: null };
+let env = { status: null, running: false, log: [], step: "", progress: null, result: null, error: null, noUnsloth: false };
 const $ = (id) => document.getElementById(id);
 
 async function call(cmd, args) {
@@ -191,7 +191,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { bench: { running: false, text: "", progress: null, result: null, deep: false, error: null, used: null }, speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { stopping: false, bench: { running: false, text: "", progress: null, result: null, deep: false, error: null, used: null }, speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -262,8 +262,8 @@ function renderTrain() {
   }).join("");
   const hf = tr.hf, fm = hf.found && hf.found.model;
   const addModel = `<div class="card wide"><div class="row"><button class="secondary" id="hf-open">＋ Add a model from Hugging Face…</button>${st.models.filter((c) => c.model.custom).map((c) => `<button class="secondary" data-hfremove="${esc(c.model.id)}" title="Remove ${esc(c.model.name)} from the list" ${tr.running ? "disabled" : ""}>✕ ${esc(c.model.name)}</button>`).join("")}</div>
-    ${hf.open ? `<p class="dim">Type the model's name as it is on Hugging Face (like <code>unsloth/Qwen3-4B</code>) or paste its address. It must be open (not gated), a chat/instruct model with <code>.safetensors</code> weights.</p>
-      <div class="row"><input type="text" id="hf-input" value="${esc(hf.input)}" placeholder="organisation/model-name" style="min-width:320px" ${hf.busy ? "disabled" : ""}><button class="primary" id="hf-look" ${hf.busy ? "disabled" : ""}>${hf.busy ? "Looking…" : "Look it up"}</button><button class="secondary" id="hf-cancel">Cancel</button></div>
+    ${hf.open ? `<p class="dim">Type the model's name as it is on Hugging Face (like <code>unsloth/Qwen3-4B</code>), paste its address, or choose a <strong>folder on this computer</strong> that already holds the model (the one with <code>config.json</code> and the <code>.safetensors</code> files). It must be an open chat/instruct model; nothing is downloaded for a folder.</p>
+      <div class="row"><input type="text" id="hf-input" value="${esc(hf.input)}" placeholder="organisation/model-name" style="min-width:320px" ${hf.busy ? "disabled" : ""}><button class="secondary" id="hf-folder" ${hf.busy ? "disabled" : ""}>Choose a folder…</button><button class="primary" id="hf-look" ${hf.busy ? "disabled" : ""}>${hf.busy ? "Looking…" : "Look it up"}</button><button class="secondary" id="hf-cancel">Cancel</button></div>
       ${hf.error ? `<div class="err">${esc(hf.error)}</div>` : ""}
       ${fm ? `<div class="card"><h3>${esc(fm.name)}</h3><p>${esc(fm.repo)} · ${fm.params_b.toFixed(1)} B parameters · licence: ${esc(fm.license)} · chat format: ${fm.family === "generic" ? "the model's own" : esc(fm.family)}<br>Memory for training (estimate): LoRA ≈ ${fm.vram_lora_gb} GB, QLoRA ≈ ${fm.vram_qlora_gb} GB</p>
         ${hf.found.warnings.length ? `<ul>${hf.found.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
@@ -285,9 +285,11 @@ function renderTrain() {
     ...(tr.method === "full" ? [] : [["rank", "LoRA rank", pl.hyper.rank]]), ["lr", "Learning rate", pl.hyper.lr], ...(pl.hyper.stages === "book_first" ? [["book_epochs", "Passes over the world book", pl.hyper.book_epochs]] : []), ["epochs", "Epochs", pl.hyper.epochs], ["max_steps", "Fixed steps (empty = use epochs)", pl.hyper.max_steps ?? ""],
     ["batch", "Batch size", pl.hyper.batch], ["grad_accum", "Gradient accumulation", pl.hyper.grad_accum], ["max_seq", "Sequence length (tokens)", pl.hyper.max_seq]].map(([k, l, val]) =>
       `<label>${l}<input type="text" class="ov" data-key="${k}" value="${tr.over[k] ?? val}"></label>`).join("")}
-    ${[["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
+    ${[["engine", "Training engine", ["auto", "unsloth", "standard"], "auto: Unsloth if it is installed, otherwise the standard libraries. standard: Transformers + PEFT + TRL only (no Unsloth), even when Unsloth is installed."],
+        ["bucket", "Batches by length", ["auto", "on", "off"], "Examples of similar length go into the same batch: less wasted padding, faster. Batches then hold examples of one kind more often, so the loss moves more from step to step."],
         ["compile", "torch.compile", ["off", "on"], "Experimental, plain-libraries path with a graphics card and Triton only. The first steps are slow."],
         ["liger", "Liger kernels", ["off", "on"], "Plain-libraries path, if the liger-kernel package is installed and supports the model."],
+        ["attention", "Attention kernel", ["auto", "sdpa", "cudnn", "flash_attention_2", "flex_attention"], "auto = the library's choice (Unsloth picks its own). cudnn = PyTorch's sdpa with NVIDIA's cuDNN attention tried first (PyTorch 2.5+; others behind it if it cannot do a case). FlashAttention-2 needs the flash-attn package and an RTX 30 series or newer; flex attention needs PyTorch 2.5+. One that cannot work is dropped with a reason. Use \"Find the fastest settings\" to compare."],
         ["padding_free", "Padding-free batching", ["off", "on"], "Needs the flash-attn package and a model whose attention layers support it (not Qwen3.5 or Gemma 4 yet)."]].map(([k, l, opts, tip]) =>
       `<label title="${esc(tip)}">${l}<select class="ovs" data-key="${k}">${opts.map((o) => `<option ${(tr.over[k] ?? pl.hyper[k] ?? opts[0]) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>`).join("")}</div></div>` : "";
   const planHtml = pl ? `<div class="card wide"><h2>The plan</h2>${pl.hyper.stages === "book_first" ? `<p>Two stages: the <strong>world book</strong> (${v.counts.world_book_texts} texts, ${pl.hyper.book_epochs} passes), then the <strong>practice answers</strong> (${v.counts.train_chat} examples, ${pl.hyper.epochs} passes).</p>` : ""}<p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
@@ -305,10 +307,10 @@ function renderTrain() {
   const typeWhy = fullInfo && !fullInfo.available ? `<div class="dim">Full fine-tune is not available here: ${fullInfo.reasons.map(esc).join(" ")}</div>
     ${state.settings.expert_mode && !tr.server && fullInfo.reasons.length === 1 && fullInfo.reasons[0].includes("needs about") ? `<label class="opt"><input type="checkbox" id="tr-anyway" ${tr.tryAnyway ? "checked" : ""}> Try anyway (the memory figure is an estimate; it may run out of memory)</label>` : ""}` : "";
   const last = st.runs[0];
-  const canResume = last && (last.status === "stopped" || last.status === "failed") && !tr.running;
+  const canResume = last && last.resumable && !tr.running;
   const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
-    <button class="secondary" id="tr-stop" ${tr.running ? "" : "disabled"}>Stop</button>
-    ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)})</button>` : ""}</div>`;
+    <button class="secondary" id="tr-stop" title="Finishes the current step, saves a checkpoint and stops. The run can be continued later, even after closing the program." ${tr.running && !tr.stopping ? "" : "disabled"}>${tr.stopping ? "Stopping…" : "Stop and save"}</button>
+    ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)}${last.step ? `, from step ${last.step}${last.total_steps ? " of " + last.total_steps : ""}` : ""})</button>` : ""}</div>`;
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
   const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
     ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
@@ -317,7 +319,7 @@ function renderTrain() {
     ${speedHtml()}${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
     ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
   const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Type</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th>Where</th><th></th></tr>${st.runs.map((r) =>
-    `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
+    `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}${r.status === "interrupted" ? `<div class="dim small" title="${esc(r.error || "")}">cut off (program closed or crash)</div>` : ""}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button>${r.resumable && !tr.running ? ` <button class="link" data-continue="${esc(r.name)}" title="Carry on from the last saved point">Continue</button>` : (r.status === "interrupted" || r.status === "stopped" || r.status === "failed") && !r.resumable && !r.server ? ` <span class="dim small" title="It was cut off before the first saved point">no saved point</span>` : ""}</td></tr>`).join("")}</table></div>` : "";
   return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
     <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${tr.server ? "" : env}${where}
     <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>${addModel}
@@ -373,15 +375,15 @@ function onTrainEvent(p) {
   else if (p.kind === "start" && p.stage_count > 1) tr.stepText = `Stage ${p.stage_index + 1} of ${p.stage_count}: ${p.stage === "world_book" ? "reading the world book" : "practising answers"}`;
   else if (p.kind === "progress") { if (p.step !== "train" || tr.progress == null) { tr.stepText = p.text || p.step; tr.progress = p.value; } }
   else if (p.kind === "log") tr.log.push(p.text);
-  else if (p.kind === "done") { tr.running = false; tr.notice = p.data.stopped ? `Stopped at step ${p.data.steps}. You can continue this run later.` : `Finished: ${p.data.steps} steps, final loss ${p.data.final_loss != null ? (+p.data.final_loss).toFixed(3) : "–"}.`; trRefresh(); }
-  else if (p.kind === "error") { tr.running = false; tr.error = p.text; trRefresh(); }
+  else if (p.kind === "done") { tr.running = false; tr.stopping = false; tr.notice = p.data.stopped ? `Stopped and saved at step ${p.data.steps}. Press "Continue" to carry on from here, now or after closing the program.` : `Finished: ${p.data.steps} steps, final loss ${p.data.final_loss != null ? (+p.data.final_loss).toFixed(3) : "–"}.`; trRefresh(); }
+  else if (p.kind === "error") { tr.running = false; tr.stopping = false; tr.error = p.text; trRefresh(); }
   if (page === "train") { render(); const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight; }
 }
 
 async function trStart(resume) {
-  tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; render();
+  tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; tr.stopping = false; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
   if (tr.preset !== "quick") over.stages = tr.stages;
   if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
@@ -399,6 +401,7 @@ function wireTrain() {
     tr.hf.busy = false; render();
   };
   on("hf-look", hfLook);
+  on("hf-folder", async () => { const dir = await tauri.dialog.open({ directory: true, title: "Choose the model's folder" }); if (dir) { tr.hf.input = dir; render(); hfLook(); } });
   const hi = $("hf-input"); if (hi) hi.onkeydown = (e) => { if (e.key === "Enter") hfLook(); };
   on("hf-add", async () => {
     try { const id = await invoke("model_add", { input: tr.hf.input }); tr.model = id; tr.hf = { open: false, input: "", busy: false, found: null, error: null }; tr.over = {}; await trRefresh(); }
@@ -426,7 +429,7 @@ function wireTrain() {
   document.querySelectorAll(".ov").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   const bd = $("bn-deep"); if (bd) bd.onchange = () => { tr.bench.deep = bd.checked; };
   on("bn-start", async () => {
-    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["bucket", "compile", "liger", "padding_free"].includes(k) ? v : Number(v); });
+    const over = {}; Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
     tr.bench.running = true; tr.bench.error = null; tr.bench.text = "Starting…"; tr.bench.progress = 0; render();
     try { await invoke("bench_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, deep: tr.bench.deep }); } catch (e) { tr.bench.running = false; tr.bench.error = String(e); render(); }
   });
@@ -440,7 +443,8 @@ function wireTrain() {
   document.querySelectorAll(".ovs").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   on("tr-start", () => trStart(null));
   on("tr-resume", () => trStart($("tr-resume").dataset.run));
-  on("tr-stop", () => { tr.stepText = "Stopping after this step…"; invoke("train_stop"); render(); });
+  on("tr-stop", () => { tr.stopping = true; tr.stepText = "Stopping: finishing this step and saving a checkpoint…"; tr.progress = null; invoke("train_stop"); render(); });
+  document.querySelectorAll("[data-continue]").forEach((b) => b.onclick = () => trStart(b.dataset.continue));
   document.querySelectorAll("[data-showrun]").forEach((b) => b.onclick = async () => {
     const ev = await invoke("train_metrics", { run: b.dataset.showrun });
     tr.metrics = ev.filter((e) => e.type === "metric").map((e) => ({ ...e, kind: "metric" }));
@@ -604,6 +608,7 @@ function renderSetup() {
   return `<h1>Training setup</h1>
     <p class="lead">Gets this computer ready to train: checks the graphics card and driver, installs the training software, and tests the card. The help panel explains each step.</p>
     <ul class="checks">${checks}</ul>
+    <label class="opt"><input type="checkbox" id="no-unsloth" ${env.noUnsloth ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Install without Unsloth</strong> — only the standard libraries (Transformers, PEFT, TRL). Simpler and it works everywhere, but training is slower and uses more graphics memory.${st && st.engine ? ` <span class="dim">Installed now: ${st.engine === "standard" ? "without Unsloth" : "with Unsloth"}.</span>` : ""}</label>
     <div class="row">
       <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
       <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
@@ -621,10 +626,10 @@ async function refreshEnv() {
   if (page === "setup") render();
 }
 
-async function startEnv(cmd) {
+async function startEnv(cmd, args) {
   env.running = true; env.log = []; env.step = ""; env.progress = null; env.result = null; env.error = null;
   render();
-  try { await invoke(cmd); } catch (e) { env.running = false; env.error = String(e); render(); }
+  try { await invoke(cmd, args); } catch (e) { env.running = false; env.error = String(e); render(); }
 }
 
 function onEnvEvent(p) {
@@ -775,7 +780,8 @@ function wire() {
   wireGuide();
   wireRetrain();
   on("recheck", refreshEnv);
-  on("install", () => startEnv("env_install"));
+  const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
+  on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
   on("selftest", () => startEnv("env_selftest"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
@@ -884,6 +890,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("closing", (e) => { const d = document.createElement("div"); d.id = "closing"; d.textContent = (e.payload && e.payload.text) || "Saving, then closing…"; document.body.appendChild(d); }); } catch (_) { /* previews */ }
   try { await tauri.event.listen("bench-event", (e) => onBenchEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }

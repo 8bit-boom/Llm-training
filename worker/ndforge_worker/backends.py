@@ -17,7 +17,8 @@ def prepare(backend: str) -> str:
             return "unsloth"
         except Exception as exc:  # ImportError, or a CUDA/driver problem while importing
             if backend == "unsloth":
-                raise RuntimeError(f"Unsloth could not be loaded: {exc}") from exc
+                raise RuntimeError(f"Unsloth could not be loaded: {exc}. Choose the standard engine instead: Expert mode, \"Training engine\" = standard "
+                                   "(or install the training software without Unsloth in Training setup).") from exc
             protocol.log(f"Unsloth is not available ({type(exc).__name__}: {exc}); using the plain Transformers + PEFT fallback.")
     return "hf"
 
@@ -28,6 +29,36 @@ def _precision():
         major, _ = torch.cuda.get_device_capability(0)
         return ("bf16", torch.bfloat16) if major >= 8 else ("fp16", torch.float16)
     return "fp32", torch.float32
+
+
+def _attention(cfg: dict):
+    """The attn_implementation to ask for (None = library default); a note about a refused choice goes to the log."""
+    import torch
+    from . import speed
+    cuda = torch.cuda.is_available()
+    choice = cfg["hyper"].get("attention", "auto")
+    attn, note = speed.attention_request(choice, cuda, torch.cuda.get_device_capability(0) if cuda else None)
+    if choice == "cudnn" and attn:
+        note = speed.enable_cudnn()
+    if note:
+        protocol.log("Attention: " + note + ".")
+    return attn
+
+
+def _load_with_attention(load, kwargs: dict, attn):
+    """load(**kwargs, attn_implementation=attn); when the library refuses that attention for this model, load again with its default."""
+    if not attn:
+        return load(**kwargs)
+    try:
+        return load(attn_implementation=attn, **kwargs)
+    except Exception as exc:
+        protocol.log(f"Attention \"{attn}\" could not be used for this model ({type(exc).__name__}: {str(exc)[:200]}); loading again with the default attention.")
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return load(**kwargs)
 
 
 def load_unsloth(cfg: dict):
@@ -45,7 +76,7 @@ def load_unsloth(cfg: dict):
     if init:   # continue from an earlier LoRA: Unsloth loads a LoRA folder as the model (base model + trainable adapter)
         kw["model_name"] = init
     protocol.progress("load", 0.05, "Loading the model")
-    model, tokenizer = loader.from_pretrained(**kw)
+    model, tokenizer = _load_with_attention(loader.from_pretrained, kw, _attention(cfg))
     if init or full:   # a loaded adapter, or full fine-tuning: every weight is trained, no LoRA layers to add
         return model, tokenizer, loader
     protocol.progress("load", 0.8, "Adding the LoRA layers")
@@ -75,6 +106,9 @@ def load_hf(cfg: dict):
         tokenizer.pad_token = tokenizer.eos_token
     kwargs = {}
     from . import speed
+    attn = _attention(cfg)
+    if attn:
+        kwargs["attn_implementation"] = attn
     if h.get("padding_free") == "on" and speed.padding_free_status(cfg["model"]["family"], "hf", torch.cuda.is_available(), torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)[0]:
         kwargs["attn_implementation"] = "flash_attention_2"     # padding-free batching tells FlashAttention-2 where each example starts
     if cfg["method"] == "qlora":
@@ -82,10 +116,13 @@ def load_hf(cfg: dict):
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
     if torch.cuda.is_available():
         kwargs["device_map"] = {"": 0}
-    try:
-        model = AutoModelForCausalLM.from_pretrained(repo, dtype=dtype, **kwargs)
-    except TypeError:  # an older transformers still calls it torch_dtype
-        model = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dtype, **kwargs)
+    def load(**kw):
+        try:
+            return AutoModelForCausalLM.from_pretrained(repo, dtype=dtype, **kw)
+        except TypeError:  # an older transformers still calls it torch_dtype
+            return AutoModelForCausalLM.from_pretrained(repo, torch_dtype=dtype, **kw)
+    ask = kwargs.pop("attn_implementation", None)
+    model = _load_with_attention(load, kwargs, ask)
     if full:
         # every weight is trained: nothing to attach; checkpointing keeps the activations small
         if torch.cuda.is_available():

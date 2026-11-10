@@ -95,6 +95,16 @@ pub fn run_name(model_id: &str) -> String {
     format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), model_id)
 }
 
+/// Which library trains: the setting wins; "auto" is Unsloth if it was installed (the worker falls back by itself if it cannot be used), else the standard libraries.
+pub fn backend_for(engine: &str) -> &'static str {
+    match engine {
+        "standard" => "hf",
+        "unsloth" => "unsloth",
+        _ if crate::train::bench::env_has_unsloth() => "auto",
+        _ => "hf",
+    }
+}
+
 /// The job the worker gets.
 pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, version: u32, name: &str, resume: bool) -> Result<Value> {
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
@@ -102,7 +112,7 @@ pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, ver
         return Err(Error::new("The training data is missing. Save a version in Step 2 first."));
     }
     let mut job = json!({
-        "job": "train", "model": {"repo": m.repo, "family": m.family}, "method": method, "backend": "auto",
+        "job": "train", "model": {"repo": m.repo, "family": m.family}, "method": method, "backend": backend_for(&hyper.engine),
         "dataset": {"train": train, "version": version}, "hyper": hyper, "out": runs_dir(p).join(name), "resume": resume,
         "probes": probes_from_dataset(&train, 3), "probe_every": (hyper.save_steps).max(10), "probe_tokens": 120,
     });
@@ -171,6 +181,49 @@ impl Recorder {
     }
 }
 
+fn active_runs() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static A: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    A.get_or_init(Default::default)
+}
+
+/// Marks a run folder as training in THIS program while it is alive, so that opening a project never mistakes it for a run that was cut off.
+pub struct ActiveRun(PathBuf);
+
+impl ActiveRun {
+    pub fn begin(dir: &Path) -> ActiveRun {
+        if let Ok(mut a) = active_runs().lock() {
+            a.insert(dir.to_path_buf());
+        }
+        ActiveRun(dir.to_path_buf())
+    }
+}
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        if let Ok(mut a) = active_runs().lock() {
+            a.remove(&self.0);
+        }
+    }
+}
+
+/// A run still marked "running" when a project is opened was cut off: the program was closed, the computer restarted or something crashed. It becomes
+/// "interrupted", which can be continued from its last saved point like a stopped one. Runs on a server (they go on without this program) and runs
+/// training in this very program are left alone. Returns how many were marked.
+pub fn mark_interrupted(p: &Project) -> usize {
+    let mut n = 0;
+    let Ok(rd) = std::fs::read_dir(runs_dir(p)) else { return 0 };
+    for e in rd.flatten() {
+        let dir = e.path();
+        let Some(st) = read_json(&dir.join("state.json")) else { continue };
+        let live = active_runs().lock().map(|a| a.contains(&dir)).unwrap_or(false);
+        if st["status"] == "running" && !st["server"].is_string() && !live {
+            set_state(&dir, json!({"status": "interrupted", "error": "The program was closed or the computer restarted while this run was training. It can be continued from its last saved point."}));
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Runs a training job with the worker until it ends. `stop` (the Stop button) asks the worker to finish the current step, save a checkpoint and
 /// exit (a STOP file in `out_dir`); after `grace` it is killed. Returns the worker's result, or an error (a kill is "Cancelled.").
 pub fn drive(py: &Path, out_dir: &Path, job: &Value, stop: Arc<AtomicBool>, grace: Duration, on_worker: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
@@ -208,6 +261,7 @@ pub fn execute(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name:
     }
     let dir = runs_dir(p).join(name);
     std::fs::create_dir_all(&dir)?;
+    let _active = ActiveRun::begin(&dir);
     write_json(&dir.join("config.json"), &job)?;
     set_state(&dir, json!({"name": name, "model_id": m.id, "model": m.name, "method": method, "status": "running", "created": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                            "seq": hyper.max_seq, "batch": hyper.batch, "error": null}));
@@ -257,6 +311,8 @@ pub fn list_runs(p: &Project) -> Vec<Value> {
         let mut st = read_json(&e.path().join("state.json"))?;
         st["has_adapter"] = json!(e.path().join("adapter").join("adapter_config.json").is_file());
         st["has_model"] = json!(e.path().join("model").join("config.json").is_file());
+        // stopped, interrupted or failed with a saved point: can be continued
+        st["resumable"] = json!(matches!(st["status"].as_str(), Some("stopped" | "failed" | "interrupted")) && e.file_name().to_str().is_some_and(|n| resumable(p, n)));
         Some(st)
     }).collect()).unwrap_or_default();
     out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));

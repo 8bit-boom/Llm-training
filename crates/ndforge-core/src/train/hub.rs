@@ -60,9 +60,14 @@ pub fn estimate_vram(params_b: f64) -> (f64, f64) {
     (((params_b * 2.2 + 1.0) * 10.0).round() / 10.0, ((params_b * 0.7 + 2.0) * 10.0).round() / 10.0)
 }
 
-/// Looks a repository up and builds its entry; Err(plain message) when it cannot be trained here.
+/// Looks a model up and builds its entry; Err(plain message) when it cannot be trained here. `input`: a Hugging Face name or address, or a folder on this computer
+/// that holds the model (the one with `config.json` in it).
 pub fn lookup(input: &str) -> Result<Found> {
-    let repo = parse_repo(input)?;
+    let t = input.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if let Some(dir) = local_dir(t)? {
+        return lookup_local(&dir);
+    }
+    let repo = parse_repo(t)?;
     let existing = models();
     if let Some(m) = existing.iter().find(|m| m.repo.eq_ignore_ascii_case(&repo) || m.official.eq_ignore_ascii_case(&repo)) {
         return Err(Error::new(format!("{repo} is already in the list as \"{}\".", m.name)));
@@ -76,37 +81,106 @@ pub fn lookup(input: &str) -> Result<Found> {
         Err(ureq::Error::Status(code, _)) => return Err(Error::new(format!("Hugging Face answered with an error ({code}). Try again in a moment."))),
         Err(ureq::Error::Transport(t)) => return Err(Error::new(format!("Hugging Face could not be reached. Check the internet connection. [{t}]"))),
     };
+    let name = repo.split('/').nth(1).unwrap_or(&repo).replace(['_', '-'], " ");
+    evaluate(&Ident { repo: repo.clone(), id: slug(&repo), name }, &info)
+}
+
+/// A folder on this computer: it counts when it has a config.json; a path without one says what to pick.
+fn local_dir(t: &str) -> Result<Option<std::path::PathBuf>> {
+    let p = std::path::Path::new(t);
+    if p.join("config.json").is_file() {
+        return Ok(Some(p.canonicalize().unwrap_or_else(|_| p.to_path_buf())));
+    }
+    let looks_like_path = t.starts_with('/') || t.starts_with('.') || t.starts_with('~') || t.contains('\\') || t.chars().nth(1) == Some(':');
+    if looks_like_path {
+        return Err(Error::new(if p.is_dir() {
+            format!("There is no config.json in {t}. Choose the model's own folder (the one that holds config.json and the .safetensors files).")
+        } else {
+            format!("The folder {t} was not found.")
+        }));
+    }
+    Ok(None)
+}
+
+/// What the Hugging Face model page would say about a folder: its files with sizes, config.json, the chat template, the licence in README.md.
+fn describe_folder(dir: &std::path::Path) -> Result<Value> {
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let mut config: Value = serde_json::from_str(&read("config.json").unwrap_or_default()).map_err(|_| Error::new("config.json of that folder is not readable."))?;
+    let mut tok: Value = read("tokenizer_config.json").and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| Value::Null);
+    // newer models keep the chat template in a file of its own
+    let template = read("chat_template.jinja").or_else(|| read("chat_template.json").and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["chat_template"].as_str().map(String::from)));
+    if tok.is_null() && template.is_some() {
+        tok = serde_json::json!({});
+    }
+    if let (Some(t), Some(o)) = (template, tok.as_object_mut()) {
+        o.insert("chat_template".into(), Value::String(t));
+    }
+    if !tok.is_null() {
+        config["tokenizer_config"] = tok;
+    }
+    let siblings: Vec<Value> = std::fs::read_dir(dir).map_err(|e| Error::new(format!("The folder could not be read: {e}")))?.flatten()
+        .filter(|e| e.path().is_file()).map(|e| serde_json::json!({"rfilename": e.file_name().to_string_lossy(), "size": e.metadata().map(|m| m.len()).unwrap_or(0)})).collect();
+    let only_gguf = !siblings.iter().any(|f| f["rfilename"].as_str().is_some_and(|n| n.ends_with(".safetensors"))) && siblings.iter().any(|f| f["rfilename"].as_str().is_some_and(|n| n.ends_with(".gguf")));
+    // the licence from the YAML header of README.md
+    let license = read("README.md").and_then(|t| t.strip_prefix("---").map(String::from)).and_then(|t| t.split("---").next().map(String::from))
+        .and_then(|head| head.lines().find_map(|l| l.trim().strip_prefix("license:").map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string()))).filter(|l| !l.is_empty());
+    Ok(serde_json::json!({"siblings": siblings, "config": config, "library_name": if only_gguf { "gguf" } else { "" }, "cardData": {"license": license}, "tags": []}))
+}
+
+fn lookup_local(dir: &std::path::Path) -> Result<Found> {
+    let path = dir.to_string_lossy().to_string();
+    if let Some(m) = models().iter().find(|m| m.repo == path) {
+        return Err(Error::new(format!("That folder is already in the list as \"{}\".", m.name)));
+    }
+    let info = describe_folder(dir)?;
+    let folder = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "model".into());
+    let short: String = crate::dataset::builders::hash_hex(&[&path])[..6].to_string();
+    let mut found = evaluate(&Ident { repo: path, id: format!("{}-{short}", slug(&folder)).replacen("custom-", "custom-local-", 1), name: folder.replace(['_', '-'], " ") }, &info)?;
+    found.warnings.insert(0, "This model is a folder on this computer: it cannot be trained on a server, and the program must be able to read it whenever you train or export.".to_string());
+    Ok(found)
+}
+
+struct Ident {
+    repo: String,
+    id: String,
+    name: String,
+}
+
+/// The checks and the entry, from what the model page (or the folder) says.
+fn evaluate(ident: &Ident, info: &Value) -> Result<Found> {
+    let repo = ident.repo.clone();
+    let label = if std::path::Path::new(&repo).is_absolute() { ident.name.clone() } else { repo.clone() };
     let mut warnings: Vec<String> = Vec::new();
     if truthy(&info["private"]) || truthy(&info["gated"]) {
-        return Err(Error::new(format!("{repo} is gated or private: it needs a Hugging Face login, which ND Lore Forge cannot use yet. Choose an open copy (for example from unsloth/...).")));
+        return Err(Error::new(format!("{label} is gated or private: it needs a Hugging Face login, which ND Lore Forge cannot use yet. Choose an open copy (for example from unsloth/...).")));
     }
     let tags: Vec<String> = info["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_lowercase)).collect()).unwrap_or_default();
     let files: Vec<(String, f64)> = info["siblings"].as_array().map(|a| a.iter().filter_map(|f| Some((f["rfilename"].as_str()?.to_string(), f["size"].as_f64().unwrap_or(0.0)))).collect()).unwrap_or_default();
     let safetensors_bytes: f64 = files.iter().filter(|(n, _)| n.ends_with(".safetensors")).map(|(_, s)| *s).sum();
     let has_safetensors = files.iter().any(|(n, _)| n.ends_with(".safetensors")) || info["safetensors"].is_object();
     if info["library_name"] == "gguf" || (!has_safetensors && files.iter().any(|(n, _)| n.ends_with(".gguf"))) {
-        return Err(Error::new(format!("{repo} contains GGUF files for running, not the original weights that training needs. Look for the same model without \"GGUF\" in its name.")));
+        return Err(Error::new(format!("{label} contains GGUF files for running, not the original weights that training needs. Look for the same model without \"GGUF\" in its name.")));
     }
     if !has_safetensors {
-        return Err(Error::new(format!("{repo} has no .safetensors weights, so it cannot be trained here.")));
+        return Err(Error::new(format!("{label} has no .safetensors weights, so it cannot be trained here.")));
     }
     if let Some(tag) = info["pipeline_tag"].as_str() {
         if !["text-generation", "image-text-to-text", "any-to-any", "text2text-generation"].contains(&tag) {
-            return Err(Error::new(format!("{repo} is a \"{tag}\" model, not a language model for chat.")));
+            return Err(Error::new(format!("{label} is a \"{tag}\" model, not a language model for chat.")));
         }
     }
     let cfg = &info["config"];
     if cfg["auto_map"].is_object() {
-        return Err(Error::new(format!("{repo} needs its own program code to load (trust_remote_code). For safety ND Lore Forge does not run downloaded code; choose a model the standard libraries support.")));
+        return Err(Error::new(format!("{label} needs its own program code to load (trust_remote_code). For safety ND Lore Forge does not run downloaded code; choose a model the standard libraries support.")));
     }
     if cfg["quantization_config"].is_object() || tags.iter().any(|t| ["gptq", "awq", "bitsandbytes", "4-bit", "8-bit"].contains(&t.as_str())) {
-        return Err(Error::new(format!("{repo} is already shrunk (quantized). Training needs the original 16-bit weights; ND Lore Forge shrinks the model itself when you choose QLoRA. Choose the original model.")));
+        return Err(Error::new(format!("{label} is already shrunk (quantized). Training needs the original 16-bit weights; ND Lore Forge shrinks the model itself when you choose QLoRA. Choose the original model.")));
     }
     // a chat template is what turns the practice conversations into the model's own format
     let template_text = cfg["tokenizer_config"]["chat_template"].as_str().unwrap_or("").to_string();
     match cfg["tokenizer_config"].as_object() {
         Some(t) if t.get("chat_template").is_none_or(|c| c.is_null() || c.as_str() == Some("")) => {
-            return Err(Error::new(format!("{repo} has no chat template, so it is a base model that does not know the system / user / assistant format. Choose its Instruct (chat) version.")));
+            return Err(Error::new(format!("{label} has no chat template, so it is a base model that does not know the system / user / assistant format. Choose its Instruct (chat) version.")));
         }
         None => warnings.push("Its chat template could not be checked from here. If the Quick test fails with a message about a chat template, choose the Instruct version of the model.".to_string()),
         _ => {}
@@ -126,7 +200,7 @@ pub fn lookup(input: &str) -> Result<Found> {
             warnings.push("Its size was estimated from the file sizes (assuming 16-bit weights).".to_string());
             safetensors_bytes / 2.0 / 1e9
         }
-        None => return Err(Error::new(format!("The size of {repo} could not be found."))),
+        None => return Err(Error::new(format!("The size of {label} could not be found."))),
     };
     let params = (params * 100.0).round() / 100.0;
     if params > 14.0 {
@@ -138,9 +212,8 @@ pub fn lookup(input: &str) -> Result<Found> {
         warnings.push("Its licence is not stated clearly on Hugging Face. Read the model page before you share the trained model.".to_string());
     }
     let (lora, qlora) = estimate_vram(params);
-    let name = repo.split('/').nth(1).unwrap_or(&repo).replace(['_', '-'], " ");
     let entry = ModelEntry {
-        id: slug(&repo), name, family: family.to_string(), repo: repo.clone(), official: repo.clone(), params_b: params, license, vram_lora_gb: lora, vram_qlora_gb: qlora,
+        id: ident.id.clone(), name: ident.name.clone(), family: family.to_string(), repo: repo.clone(), official: repo.clone(), params_b: params, license, vram_lora_gb: lora, vram_qlora_gb: qlora,
         good_for: "Added by you from Hugging Face.".to_string(),
         note: "Memory figures are estimates from the model's size until a run has measured them.".to_string(), custom: true,
     };

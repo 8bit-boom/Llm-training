@@ -43,6 +43,14 @@ pub fn variants(base: &Hyper, unsloth: bool, deep: bool) -> Vec<Variant> {
             out.push(v(&format!("batch_x{f}"), &format!("Batch of {} instead of {}", base.batch * f, base.batch), json!({"batch": base.batch * f, "grad_accum": base.grad_accum / f})));
         }
     }
+    if deep {
+        // attention kernels work with both engines (Unsloth keeps its own default under "auto")
+        for (id, mode, name) in [("attn_sdpa", "sdpa", "Attention: PyTorch sdpa"), ("attn_cudnn", "cudnn", "Attention: cuDNN (through PyTorch sdpa)"), ("attn_flash", "flash_attention_2", "Attention: FlashAttention-2"), ("attn_flex", "flex_attention", "Attention: flex attention")] {
+            if base.attention != mode {
+                out.push(v(id, name, json!({"attention": mode})));
+            }
+        }
+    }
     if deep && !unsloth {
         out.push(v("compile", "torch.compile", json!({"compile": "on"})));
         out.push(v("liger", "Liger kernels", json!({"liger": "on"})));
@@ -90,7 +98,7 @@ pub fn run(p: &Project, m: &ModelEntry, method: Method, base_job: &Value, base: 
     if !py.is_file() {
         return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
     }
-    let list = variants(base, env_has_unsloth(), deep);
+    let list = variants(base, env_has_unsloth() && base.engine != "standard", deep);
     let tmp = p.folder.join("benchmarks").join("tmp");
     let mut rows: Vec<Value> = Vec::new();
     let mut stopped = false;

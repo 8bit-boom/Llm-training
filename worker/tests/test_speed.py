@@ -100,6 +100,7 @@ def test_a_real_tiny_run_reports_tokens_per_second_padding_and_the_batching(tmp_
         assert len(sp) == 1
         results[mode] = (sp[0], [e for e in ev if e["type"] == "metric"])
     on, off = results["on"][0], results["off"][0]
+    assert on["engine"] == off["engine"] == "hf", "the standard libraries trained (no Unsloth needed)"
     assert on["bucketed"] is True and off["bucketed"] is False
     assert on["pad_random_pct"] > 30 and on["pad_bucketed_pct"] < on["pad_random_pct"] / 2 and on["max_len"] > on["mean_len"] > 0 and on["batch"] == 4
     for mode, (sp, metrics) in results.items():
@@ -207,3 +208,53 @@ def test_asking_for_everything_on_a_cpu_machine_trains_normally_and_says_what_st
     assert sp["options"] == [] and sp["padding_free"] is False
     assert len([n for n in sp["notes"] if "asked for but" in n]) == 3, sp["notes"]
     assert [e for e in ev if e["type"] == "metric"] and ev[-1]["type"] == "result"
+
+
+def test_an_explicit_unsloth_choice_without_unsloth_says_what_to_do_instead(tmp_path):
+    pytest.importorskip("trl")
+    try:
+        import unsloth  # noqa: F401
+        pytest.skip("Unsloth is installed here")
+    except Exception:
+        pass
+    from test_train_cpu import run_job
+    p, ev, out = run_job(tmp_path, "qwen3_5", "llama", backend="unsloth", hyper={"max_steps": 2})
+    assert p.returncode == 1 and ev[-1]["type"] == "error"
+    msg = ev[-1]["message"]
+    assert "Unsloth could not be loaded" in msg and "standard" in msg and "Training engine" in msg, msg
+
+
+def test_attention_request_drops_what_cannot_work_with_a_reason(monkeypatch):
+    assert speed.attention_request("auto", True, (12, 0)) == (None, "")
+    assert speed.attention_request("sdpa", False, None) == ("sdpa", "")
+    attn, why = speed.attention_request("flash_attention_2", False, None)
+    assert attn is None and "graphics card" in why
+    attn, why = speed.attention_request("flash_attention_2", True, (7, 5))
+    assert attn is None and "RTX 30" in why
+    monkeypatch.setattr(speed, "_have", lambda m: False)
+    attn, why = speed.attention_request("flash_attention_2", True, (12, 0))
+    assert attn is None and "flash-attn" in why
+    monkeypatch.setattr(speed, "_have", lambda m: True)
+    assert speed.attention_request("flash_attention_2", True, (12, 0)) == ("flash_attention_2", "")
+    assert speed.attention_request("bogus", True, (12, 0))[0] is None
+
+
+def test_a_refused_attention_loads_again_with_the_default():
+    from ndforge_worker import backends
+    calls = []
+
+    def load(**kw):
+        calls.append(kw)
+        if "attn_implementation" in kw:
+            raise ValueError("does not support flash")
+        return "model"
+    assert backends._load_with_attention(load, {"a": 1}, "flash_attention_2") == "model"
+    assert calls == [{"attn_implementation": "flash_attention_2", "a": 1}, {"a": 1}]
+    calls.clear()
+    assert backends._load_with_attention(load, {"a": 1}, None) == "model" and calls == [{"a": 1}]
+
+
+def test_cudnn_attention_is_sdpa_with_the_cudnn_backend_and_needs_a_card():
+    attn, why = speed.attention_request("cudnn", False, None)
+    assert attn is None and "graphics card" in why
+    assert speed.cudnn_status(False)[0] is False

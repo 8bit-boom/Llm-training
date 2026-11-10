@@ -69,6 +69,7 @@ impl AppModel {
     fn adopt(&mut self, project: Project) {
         self.settings.remember_project(&project.folder);
         self.settings.save();
+        crate::train::runs::mark_interrupted(&project);   // a run left "running" by a closed program or a crash can be continued
         self.project = Some(project);
     }
 
@@ -280,6 +281,9 @@ impl AppModel {
         if !["auto", "on", "off"].contains(&h.bucket.as_str()) {
             return Err(Error::new("The batching setting must be \"auto\", \"on\" or \"off\"."));
         }
+        if !["auto", "unsloth", "standard"].contains(&h.engine.as_str()) {
+            return Err(Error::new("The training engine must be \"auto\", \"unsloth\" or \"standard\"."));
+        }
         for (name, v) in [("torch.compile", &h.compile), ("Liger", &h.liger), ("padding-free batching", &h.padding_free)] {
             if !["off", "on"].contains(&v.as_str()) {
                 return Err(Error::new(format!("The {name} setting must be \"off\" or \"on\".")));
@@ -310,6 +314,9 @@ impl AppModel {
         let stats = runs::latest_version(p).map(|(_, mf)| runs::data_stats(&mf)).unwrap_or_default();
         let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
         let mut pl = plan(&m, method, preset, vram, stats, measured);
+        if server.is_none() && measured.is_none() && runs::backend_for("auto") == "hf" {
+            pl.notes.push("This computer trains without Unsloth (the standard libraries). The memory figure above comes from Unsloth's guides; without it the program can use more, and a run is slower. A Quick test measures the real figure.".to_string());
+        }
         // the stage choice changes only the number of steps (a fixed-step quick test is always one stage)
         if stages == Some("book_first") && pl.hyper.max_steps.is_none() {
             pl.hyper.stages = "book_first".into();
@@ -335,6 +342,9 @@ impl AppModel {
             return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job, remote });
         }
         let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
+        if server.is_some() && std::path::Path::new(&m.repo).is_absolute() {
+            return Err(Error::new(format!("{} is a folder on this computer, so it cannot be trained on a server. Train it on this computer, or add the model from Hugging Face instead.", m.name)));
+        }
         let (version, manifest) = runs::latest_version(&p).ok_or_else(|| Error::new("Save a version of the training data first (Step 2)."))?;
         let remote = match server { Some(u) => Some(self.target_for(u)?), None => None };
         if method == Method::Full {

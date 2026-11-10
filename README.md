@@ -120,3 +120,7 @@ Step 3 has **＋ Add a model from Hugging Face…**: a name like `unsloth/Qwen3-
 ## Training speed
 
 What was researched (FlashAttention, SageAttention, `torch.compile`, quantization, FP8 and others), what is built (batches of similar length, tokens-per-second and padding numbers, a warning when Qwen3.5's fast kernels are missing, gradient checkpointing only when memory needs it on the plain-libraries path) and what is next: `docs/TRAINING_SPEED.md`. Not yet measured on the RTX 5090.
+
+## Without Unsloth
+
+Training setup has **Install without Unsloth** (standard libraries only; the program fetches Python and PyTorch itself) and Expert mode has *Training engine* (auto / unsloth / standard). A model can also be a folder on this computer (Step 3, *Add a model from Hugging Face…* → *Choose a folder…*; checked like a Hugging Face model, trained on this computer only). Details: `docs/INSTALL.md`, `docs/TRAINING_SPEED.md`.

@@ -166,3 +166,68 @@ fn a_model_of_an_unknown_family_is_installed_with_the_template_inside_its_file()
         assert!(modelfile_text("m.gguf", &s).contains("TEMPLATE") && create_body("x", "m.gguf", "d", &s)["template"].is_string());
     }
 }
+
+// ------------------------------------------------------------------------------------------------------------ a model that is a folder on this computer
+fn model_folder(root: &std::path::Path, name: &str, extra: &[(&str, &str)], weights: &[(&str, u64)]) -> std::path::PathBuf {
+    let d = root.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("config.json"), json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}).to_string()).unwrap();
+    std::fs::write(d.join("tokenizer_config.json"), json!({"chat_template": "{{ messages }}"}).to_string()).unwrap();
+    for (f, text) in extra {
+        std::fs::write(d.join(f), text).unwrap();
+    }
+    for (f, size) in weights {
+        std::fs::File::create(d.join(f)).unwrap().set_len(*size).unwrap();      // a sparse file: only its size matters here
+    }
+    d
+}
+
+#[test]
+fn a_folder_with_a_model_is_read_like_a_hugging_face_page() {
+    let (_g, d) = setup();
+    let ok = model_folder(d.path(), "My_Llama-3B", &[("README.md", "---\nlicense: llama3.2\nlanguage: en\n---\n# Model\n")], &[("model.safetensors", 6_400_000_000)]);
+    let f = lookup(&ok.to_string_lossy()).unwrap();
+    let m = &f.entry;
+    assert_eq!((m.family.as_str(), m.license.as_str(), m.custom), ("generic", "llama3.2", true));
+    assert_eq!(m.repo, ok.canonicalize().unwrap().to_string_lossy());
+    assert!(m.id.starts_with("custom-local-my-llama-3b-") && m.name == "My Llama 3B" && (m.params_b - 3.2).abs() < 0.01, "{m:?}");
+    assert!(f.warnings[0].contains("a folder on this computer") && f.warnings[0].contains("cannot be trained on a server"), "{:?}", f.warnings);
+    assert!(f.warnings.iter().any(|w| w.contains("estimated from the file sizes")));
+    // quotes around the path (as Windows gives it), and the model type is understood from config.json
+    assert!(lookup(&format!("\"{}\"", ok.display())).is_ok());
+    let qwen = model_folder(d.path(), "q", &[("config.json", &json!({"model_type": "qwen3_5", "architectures": ["Qwen3_5ForCausalLM"]}).to_string()), ("chat_template.jinja", "{{ x }}")], &[("model-00001.safetensors", 2_000_000_000)]);
+    std::fs::remove_file(qwen.join("tokenizer_config.json")).unwrap();      // the template lives in its own file
+    assert_eq!(lookup(&qwen.to_string_lossy()).unwrap().entry.family, "qwen3_5");
+    // refused, with the reason
+    let err = |p: &std::path::Path| lookup(&p.to_string_lossy()).unwrap_err().0;
+    assert!(err(&model_folder(d.path(), "g", &[("m.gguf", "x")], &[])).contains("GGUF"));
+    assert!(err(&model_folder(d.path(), "n", &[], &[])).contains("no .safetensors"));
+    let no_tpl = model_folder(d.path(), "t", &[], &[("m.safetensors", 1_000_000_000)]);
+    std::fs::write(no_tpl.join("tokenizer_config.json"), "{}").unwrap();
+    assert!(err(&no_tpl).contains("no chat template"));
+    assert!(err(&model_folder(d.path(), "c", &[("config.json", &json!({"auto_map": {"A": "b"}}).to_string())], &[("m.safetensors", 1_000_000_000)])).contains("trust_remote_code"));
+    assert!(err(&model_folder(d.path(), "qq", &[("config.json", &json!({"quantization_config": {"quant_method": "gptq"}}).to_string())], &[("m.safetensors", 1_000_000_000)])).contains("quantized"));
+    // a folder without config.json, a folder that does not exist
+    std::fs::create_dir_all(d.path().join("empty")).unwrap();
+    assert!(err(&d.path().join("empty")).contains("no config.json") && err(&d.path().join("empty")).contains("Choose the model's own folder"));
+    assert!(err(&d.path().join("missing")).contains("was not found"));
+    assert!(lookup("./nothing/here").unwrap_err().0.contains("was not found"));
+    // kept like a Hugging Face model; the same folder is not added twice
+    let id = AppModel::custom_model_add(&ok.to_string_lossy()).unwrap();
+    assert_eq!(find(&id).unwrap().repo, ok.canonicalize().unwrap().to_string_lossy());
+    assert!(lookup(&ok.to_string_lossy()).unwrap_err().0.contains("already in the list"));
+}
+
+#[test]
+fn a_model_that_is_a_folder_is_trained_on_this_computer_only() {
+    let (_g, d) = setup();
+    std::env::set_var("NDFORGE_PROJECTS_DIR", d.path().join("projects"));
+    let ok = model_folder(d.path(), "local", &[], &[("model.safetensors", 6_400_000_000)]);
+    let id = AppModel::custom_model_add(&ok.to_string_lossy()).unwrap();
+    let mut m = AppModel::load();
+    m.create_project("P").unwrap();
+    let e = m.train_job(&id, Method::Lora, Preset::Quick, &json!({}), None, Some("http://truenas:8765")).unwrap_err();
+    assert!(e.0.contains("is a folder on this computer") && e.0.contains("cannot be trained on a server"), "{e}");
+    // on this computer it gets as far as the data (there is none yet)
+    assert!(m.train_job(&id, Method::Lora, Preset::Quick, &json!({}), None, None).unwrap_err().0.contains("Save a version"));
+}

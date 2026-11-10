@@ -281,3 +281,36 @@ fn run_folders_know_about_full_models_and_two_stage_checkpoints() {
     h.max_steps = Some(30);
     assert!(runs::build_job(&p, &m, Method::Lora, &h, 1, "r", false).unwrap().get("stages").is_none());
 }
+
+#[test]
+fn a_run_left_running_becomes_interrupted_and_can_be_continued() {
+    let d = tempdir().unwrap();
+    let p = Project::create(d.path(), "I").unwrap();
+    let mk = |name: &str, state: Value, ckpt: bool| {
+        let dir = runs::runs_dir(&p).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = state; state["name"] = json!(name);
+        std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+        if ckpt {
+            std::fs::create_dir_all(dir.join("checkpoints").join("checkpoint-10")).unwrap();
+        }
+        dir
+    };
+    mk("stale", json!({"status": "running"}), true);
+    mk("nockpt", json!({"status": "running"}), false);
+    mk("remote", json!({"status": "running", "server": "nas"}), false);
+    let live = mk("live", json!({"status": "running"}), true);
+    mk("done", json!({"status": "done"}), true);
+    let _guard = runs::ActiveRun::begin(&live);
+
+    assert_eq!(runs::mark_interrupted(&p), 2);
+    let by = |n: &str| runs::list_runs(&p).into_iter().find(|r| r["name"] == n).unwrap_or_else(|| panic!("no run {n}"));
+    assert_eq!(by("stale")["status"], "interrupted");
+    assert_eq!(by("stale")["resumable"], true);
+    assert_eq!(by("nockpt")["status"], "interrupted");
+    assert_eq!(by("nockpt")["resumable"], false);
+    assert_eq!(by("remote")["status"], "running");
+    assert_eq!(by("live")["status"], "running");
+    assert_eq!(by("done")["resumable"], false);
+    assert_eq!(runs::mark_interrupted(&p), 0, "idempotent");
+}
