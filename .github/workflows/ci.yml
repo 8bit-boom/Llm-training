@@ -29,6 +29,14 @@ jobs:
           ./install.ps1
           if (-not (Test-Path target/release/nd-lore-forge.exe)) { throw "program not built" }
           if (-not (Test-Path tools/uv.exe)) { throw "uv not fetched" }
+      - name: Batch files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # install.bat hands over to install.ps1 and keeps its exit code; "< NUL" answers its final "pause"
+          cmd /c "install.bat -Check < NUL"
+          if ($LASTEXITCODE -ne 0) { throw "install.bat -Check failed ($LASTEXITCODE)" }
+          if (-not (Test-Path run.bat)) { throw "run.bat missing" }
   worker:
     runs-on: ubuntu-latest
     steps:

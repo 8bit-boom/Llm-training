@@ -11,10 +11,10 @@ The in-app **Guide** (📖 in the left column) has the same walkthrough with pic
 ## Install from a git clone
 For people who prefer to build it themselves (or want to follow the latest changes).
 - **Linux:** `git clone https://github.com/8bit-boom/Llm-training && cd Llm-training && ./install.sh`, then `./run.sh`. `./install.sh --check` only checks the prerequisites; `--desktop` adds an application-menu entry.
-- **Windows (PowerShell):** `git clone https://github.com/8bit-boom/Llm-training; cd Llm-training; powershell -ExecutionPolicy Bypass -File install.ps1`, then double-click `run.cmd`. `-Check` only checks; `-Shortcut` adds a desktop shortcut.
+- **Windows:** `git clone https://github.com/8bit-boom/Llm-training`, then in the folder double-click **`install.bat`** (checks git and Rust, fetches `uv`, builds the program; the first time takes several minutes), then **`run.bat`** to start it. **`update.bat`** later: `git pull`, then the same build. The batch files start `install.ps1` for you; from PowerShell the same thing is `powershell -ExecutionPolicy Bypass -File .\install.ps1` (`-Check` only checks; `-Shortcut` adds a desktop shortcut). Note the `.\`: PowerShell does not run a script from the current folder by name alone.
 - **You need:** git, [Rust](https://rustup.rs) (on Windows also the Visual Studio C++ Build Tools, which rustup asks for), and on Linux the window libraries: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev build-essential curl pkg-config`. The script tells you what is missing.
 - **What it does:** downloads `uv` (checksum-verified) into `tools/`, then `cargo build --release -p nd-lore-forge --features custom-protocol` (the feature embeds the window's files in the program). The program finds the worker in `worker/` and `uv` in `tools/` inside the clone, so keep the clone where it is.
-- **Update:** `git pull` and run the install script again. Then, in the program, **Training setup** installs the Python training software as usual (first start only).
+- **Update:** `git pull` and run the install script again (Windows: `update.bat`). Then, in the program, **Training setup** installs the Python training software as usual (first start only).
 - macOS is not supported (no NVIDIA graphics cards).
 
 ## For whoever builds the installers

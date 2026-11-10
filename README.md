@@ -26,7 +26,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 ## Install
 
 - **Installers:** Windows `.exe`, Linux AppImage and `.deb` on the [Releases page](https://github.com/8bit-boom/Llm-training/releases).
-- **From a git clone:** `git clone https://github.com/8bit-boom/Llm-training && cd Llm-training && ./install.sh && ./run.sh` (Linux); on Windows run `install.ps1` in PowerShell, then `run.cmd`. Details and prerequisites: `docs/INSTALL.md`.
+- **From a git clone:** `git clone https://github.com/8bit-boom/Llm-training && cd Llm-training && ./install.sh && ./run.sh` (Linux); on Windows double-click `install.bat`, then `run.bat` (and `update.bat` later to get the newest version). Details and prerequisites: `docs/INSTALL.md`.
 
 ## Build and run
 
