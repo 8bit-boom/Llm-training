@@ -78,6 +78,23 @@ fn problem_report(s: State<App>) -> String {
     lock(&s).problem_report()
 }
 
+/// Looks a Hugging Face model up (a network call, so off the window's thread).
+#[tauri::command]
+async fn model_lookup(input: String) -> Out<Value> {
+    tauri::async_runtime::spawn_blocking(move || AppModel::custom_model_lookup(&input).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
+}
+
+/// Adds it to the list; answers with its id.
+#[tauri::command]
+async fn model_add(input: String) -> Out<String> {
+    tauri::async_runtime::spawn_blocking(move || AppModel::custom_model_add(&input).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn model_remove(id: String) -> Out<()> {
+    AppModel::custom_model_remove(&id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn test_state(s: State<App>) -> Out<Value> {
     lock(&s).test_state().map_err(|e| e.to_string())
@@ -441,7 +458,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

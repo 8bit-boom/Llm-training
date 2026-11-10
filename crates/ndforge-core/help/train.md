@@ -34,3 +34,13 @@ Teaches the chosen model your world. It uses the **newest saved version** from S
 - *"ran out of memory"*: pick a smaller model, QLoRA, or lower the sequence length in Expert mode.
 - *"could not be downloaded"*: check the internet connection and try again.
 - *The loss stays flat or becomes `nan`*: lower the learning rate (Expert mode) and try again.
+
+## Adding a model of your own from Hugging Face
+Under the model cards press **＋ Add a model from Hugging Face…**, type the model's name as it appears on <https://huggingface.co> (like `unsloth/Qwen3-4B`) or paste its address, and press **Look it up**. The program reads the model's public description and tells you what it found: size, licence, chat format and a memory estimate. Then **Add it to the list**; it appears as a card marked *added* and works like the five built-in ones. The **✕** button next to the list removes it again.
+
+What can be added: an **open** model (not gated, no login) with **.safetensors** weights that is a **chat / instruct** model (it has a chat template). What is refused, with the reason: gated or private models, GGUF-only repositories (those are for running, not training), base models without a chat template, models that need to run their own code to load, models already shrunk by someone else (GPTQ / AWQ / bitsandbytes), and models that are not language models.
+
+Good to know:
+- Only Qwen3.5 and Gemma 4 have been checked in detail. For any other model the program uses the model's **own chat template**: do a **Quick test** first, then look at the sample answers. The memory figure is an estimate until a run has measured it.
+- Installing such a model into Ollama uses the template stored in the GGUF file instead of a hand-written one.
+- A model's licence is its own: read the model page before you share the trained model.

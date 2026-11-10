@@ -112,3 +112,7 @@ Step 4 puts the held-out questions of the run's data version to the **original**
 `transcripts/`, and a table comparing every tested run. Results: `runs/<run>/test.json`. The word-overlap score is a rough guide, not a grade.
 
 **From nd-world:** the teacher step can also run inside nd-world (Export & Backup → Better training examples, Python-free image). Its examples travel in the `.ndtrain` file as `teacher_examples.jsonl` and appear in Step 2 already checked; see `docs/BUNDLE_FORMAT.md`.
+
+## Your own models from Hugging Face
+
+Step 3 has **＋ Add a model from Hugging Face…**: a name like `unsloth/Qwen3-4B` or a pasted address. `crates/ndforge-core/src/train/hub.rs` reads `GET /api/models/<repo>` and refuses what cannot be trained (gated / private, GGUF-only, no chat template, needs `trust_remote_code`, pre-quantized, not a language model); otherwise it works out size, licence, a memory estimate and the chat-format family (Qwen3.5, Gemma 4, or `generic` = the model's own chat template). Added models are kept in `custom_models.json` in the settings folder. For `generic` models the Ollama install leaves the template to the GGUF. Tested with a stand-in Hugging Face server (`NDFORGE_HF_URL`) and a tiny model through the real worker; not tried against real Hugging Face repositories or real large models.

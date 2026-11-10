@@ -191,7 +191,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -231,9 +231,17 @@ function renderTrain() {
   const gpu = st.gpu ? `${esc(st.gpu.name)} · ${st.gpu.vram_gb} GB · ${esc(st.gpu.precision)}` : esc(st.gpu_problem || "no graphics card found");
   const cards = st.models.map((c) => {
     const m = c.model, f = c[tr.method], fit = FIT[f.fit] || FIT.unknown;
-    return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}</strong>${c.recommended === tr.method ? "" : ""}
+    return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}${m.custom ? ' <span class="tag">added</span>' : ""}</strong>${c.recommended === tr.method ? "" : ""}
       <span class="dim">${m.params_b.toFixed(1)} B parameters · ${esc(m.license)}</span><span>${fit[0]} ${fit[1]} · ≈ ${f.measured != null ? f.measured + " GB measured" : f.est_vram_gb + " GB"}</span><span class="dim">${esc(m.good_for)}</span></button>`;
   }).join("");
+  const hf = tr.hf, fm = hf.found && hf.found.model;
+  const addModel = `<div class="card wide"><div class="row"><button class="secondary" id="hf-open">＋ Add a model from Hugging Face…</button>${st.models.filter((c) => c.model.custom).map((c) => `<button class="secondary" data-hfremove="${esc(c.model.id)}" title="Remove ${esc(c.model.name)} from the list" ${tr.running ? "disabled" : ""}>✕ ${esc(c.model.name)}</button>`).join("")}</div>
+    ${hf.open ? `<p class="dim">Type the model's name as it is on Hugging Face (like <code>unsloth/Qwen3-4B</code>) or paste its address. It must be open (not gated), a chat/instruct model with <code>.safetensors</code> weights.</p>
+      <div class="row"><input type="text" id="hf-input" value="${esc(hf.input)}" placeholder="organisation/model-name" style="min-width:320px" ${hf.busy ? "disabled" : ""}><button class="primary" id="hf-look" ${hf.busy ? "disabled" : ""}>${hf.busy ? "Looking…" : "Look it up"}</button><button class="secondary" id="hf-cancel">Cancel</button></div>
+      ${hf.error ? `<div class="err">${esc(hf.error)}</div>` : ""}
+      ${fm ? `<div class="card"><h3>${esc(fm.name)}</h3><p>${esc(fm.repo)} · ${fm.params_b.toFixed(1)} B parameters · licence: ${esc(fm.license)} · chat format: ${fm.family === "generic" ? "the model's own" : esc(fm.family)}<br>Memory for training (estimate): LoRA ≈ ${fm.vram_lora_gb} GB, QLoRA ≈ ${fm.vram_qlora_gb} GB</p>
+        ${hf.found.warnings.length ? `<ul>${hf.found.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
+        <div class="row"><button class="primary" id="hf-add">Add it to the list</button></div></div>` : ""}` : ""}</div>`;
   const srv = tr.server ? st.servers.find((x) => x.url === tr.server) : null;
   const srvStatus = srv && srv.status;
   const srvLine = !srv ? `Training on this computer: ${gpu}.` : srvStatus
@@ -281,7 +289,7 @@ function renderTrain() {
     `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button></td></tr>`).join("")}</table></div>` : "";
   return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
     <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${tr.server ? "" : env}${where}
-    <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>
+    <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>${addModel}
     <div class="card wide"><h2>2 · How to train</h2>
       <p class="dim" style="margin-top:0">How much of the model should change?</p>
       <div class="mcards">${typeCards}</div>
@@ -342,6 +350,23 @@ async function trStart(resume) {
 function wireTrain() {
   if (page !== "train" || !tr.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("hf-open", () => { tr.hf.open = true; tr.hf.error = null; render(); const i = $("hf-input"); if (i) i.focus(); });
+  on("hf-cancel", () => { tr.hf = { open: false, input: "", busy: false, found: null, error: null }; render(); });
+  const hfLook = async () => {
+    const input = $("hf-input").value; tr.hf.input = input; tr.hf.busy = true; tr.hf.found = null; tr.hf.error = null; render();
+    try { tr.hf.found = await invoke("model_lookup", { input }); } catch (e) { tr.hf.error = String(e); }
+    tr.hf.busy = false; render();
+  };
+  on("hf-look", hfLook);
+  const hi = $("hf-input"); if (hi) hi.onkeydown = (e) => { if (e.key === "Enter") hfLook(); };
+  on("hf-add", async () => {
+    try { const id = await invoke("model_add", { input: tr.hf.input }); tr.model = id; tr.hf = { open: false, input: "", busy: false, found: null, error: null }; tr.over = {}; await trRefresh(); }
+    catch (e) { tr.hf.error = String(e); render(); }
+  });
+  document.querySelectorAll("[data-hfremove]").forEach((b) => b.onclick = async () => {
+    if (!confirm("Remove this model from the list? (Runs already made with it stay on disk.)")) return;
+    try { await invoke("model_remove", { id: b.dataset.hfremove }); if (tr.model === b.dataset.hfremove) tr.model = null; await trRefresh(); } catch (e) { tr.hf.error = String(e); render(); }
+  });
   document.querySelectorAll("[data-model]").forEach((b) => b.onclick = () => { tr.model = b.dataset.model; tr.over = {}; trRefresh(); });
   const wh = $("tr-where"); if (wh) wh.onchange = () => { tr.server = wh.value; tr.srvCheck = null; tr.over = {}; trRefresh(); if (tr.server && !(tr.state.servers.find((x) => x.url === tr.server) || {}).status) invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); };
   on("srv-test", () => { tr.srvCheck = null; invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); });

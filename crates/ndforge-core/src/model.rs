@@ -410,6 +410,23 @@ impl AppModel {
         crate::diagnose::report(self.project.as_ref(), &self.settings)
     }
 
+    // ------------------------------------------------------------------ models from Hugging Face
+    pub fn custom_model_lookup(input: &str) -> Result<Value> {
+        let f = crate::train::hub::lookup(input)?;
+        Ok(json!({"model": f.entry, "warnings": f.warnings, "input": input.trim()}))
+    }
+
+    /// Adds the model (looked up again, so only a model that passes the checks is ever saved). Returns its id.
+    pub fn custom_model_add(input: &str) -> Result<String> {
+        let f = crate::train::hub::lookup(input)?;
+        crate::train::catalog::add_custom(f.entry.clone())?;
+        Ok(f.entry.id)
+    }
+
+    pub fn custom_model_remove(id: &str) -> Result<()> {
+        crate::train::catalog::remove_custom(id)
+    }
+
     pub fn project_clone(&self) -> Result<Project> {
         Ok(self.project_ref()?.clone())
     }
