@@ -291,3 +291,48 @@ def test_gguf_with_llama_cpp_converts_once_and_shrinks_to_every_size(tmp_path, m
     assert exportjob.find_gguf([d], "q8_0", strict=True).name == "model.Q8_0.gguf"
     assert exportjob.find_gguf([d], "q6_k", strict=True) is None
     assert exportjob.find_gguf([d], "q6_k") is not None     # one size: the old fallback
+
+
+def test_the_base_models_vision_file_is_found_and_copied_and_problems_are_only_notes(tmp_path):
+    from ndforge_worker import vision
+    out = tmp_path / "out"
+    out.mkdir()
+    # what a model understands besides text is read from its config (a local folder or a hub repo)
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(json.dumps({"architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": {}}))
+    assert vision.base_modalities(str(base)) == ["image"]
+    (base / "config.json").write_text(json.dumps({"architectures": ["Qwen3ForCausalLM"]}))
+    assert vision.base_modalities(str(base)) == []
+    assert vision.base_modalities(str(tmp_path / "missing")) == []      # a folder without config.json: nothing is claimed
+    (base / "config.json").write_text(json.dumps({"vision_config": {}, "audio_config": {}}))
+    assert vision.base_modalities(str(base)) == ["image", "audio"]
+    # the official GGUF repos of a model, and which mmproj is preferred
+    assert vision.gguf_repo_candidates("unsloth/Qwen3.5-9B") == ["unsloth/Qwen3.5-9B-GGUF"]
+    assert vision.gguf_repo_candidates("Qwen/Qwen3.5-9B") == ["Qwen/Qwen3.5-9B-GGUF", "unsloth/Qwen3.5-9B-GGUF"]
+    assert vision.gguf_repo_candidates(str(base)) == []
+    assert vision.pick_mmproj(["a.gguf", "mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf"]) == "mmproj-F16.gguf"
+    assert vision.pick_mmproj(["a.gguf", "x/mmproj-F32.gguf"]) == "x/mmproj-F32.gguf" and vision.pick_mmproj(["a.gguf"]) is None
+    # fetching: the first repo without an mmproj is skipped, the next one is used
+    src = tmp_path / "hub" / "mmproj-F16.gguf"
+    src.parent.mkdir()
+    src.write_bytes(b"MMPROJ")
+    files = {"Qwen/Qwen3.5-9B-GGUF": ["model.gguf"], "unsloth/Qwen3.5-9B-GGUF": ["model.gguf", "mmproj-F16.gguf"]}
+    path, note = vision.fetch_mmproj("Qwen/Qwen3.5-9B", out, list_files=lambda r: files[r], hub_download=lambda r, f: str(src))
+    assert path == out / "mmproj-F16.gguf" and path.read_bytes() == b"MMPROJ" and "unsloth/Qwen3.5-9B-GGUF" in note
+    # nothing found, or the hub is unreachable: a note, never an exception
+    path, note = vision.fetch_mmproj("Qwen/Qwen3.5-9B", out / "none", list_files=lambda r: ["model.gguf"], hub_download=lambda r, f: str(src))
+    assert path is None and "text only" in note
+    def boom(r):
+        raise ConnectionError("offline")
+    path, note = vision.fetch_mmproj("unsloth/Qwen3.5-9B", out / "none", list_files=boom, hub_download=lambda r, f: str(src))
+    assert path is None and "ConnectionError" in note and "text only" in note
+    # the image processor files of the base model are copied next to a merged model, never over what is there
+    (base / "preprocessor_config.json").write_text('{"image_mean": [0.5]}')
+    (base / "chat_template.jinja").write_text("base template")
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "chat_template.jinja").write_text("own template")
+    assert vision.copy_processor_files(str(base), merged) == ["preprocessor_config.json"]
+    assert (merged / "chat_template.jinja").read_text() == "own template" and json.loads((merged / "preprocessor_config.json").read_text())["image_mean"] == [0.5]
+    assert vision.adapter_is_for_full_model(tmp_path / "no_adapter") is False

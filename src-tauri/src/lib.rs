@@ -216,6 +216,14 @@ fn dataset_edit(s: State<App>, id: String, text: String) -> Out<()> {
     lock(&s).dataset_edit(&id, &text).map_err(|e| e.to_string())
 }
 
+/// Writes a saved data version as JSONL files for Unsloth Studio's Train page into `dest` (default: the project's exports folder). Returns the summary.
+#[tauri::command]
+fn studio_export(s: State<App>, version: Option<u32>, dest: Option<String>, world_book: bool) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let dest = dest.map(std::path::PathBuf::from).unwrap_or_else(|| ndforge_core::export::studio::default_dest(&project));
+    ndforge_core::export::studio::export(&project, version, &dest, world_book).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn dataset_save(s: State<App>) -> Out<Value> {
     lock(&s).dataset_save().map_err(|e| e.to_string())
@@ -573,7 +581,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -266,3 +266,42 @@ fn several_worlds_in_one_project_train_together_without_mixing_up() {
     assert!(p.remove_world("brightwater").is_err(), "the last world stays");
     assert_eq!(p.model_label(), "Brightwater");
 }
+
+#[test]
+fn a_saved_version_is_exported_as_chatml_files_for_unsloth_studio() {
+    use ndforge_core::export::studio;
+    let d = tempdir().unwrap();
+    let mut p = project_with_world(d.path(), 1);
+    // a second world, so the system message of each example can be checked
+    let b = open_bundle(other_world(d.path(), "b.ndtrain", "Brightwater", "brightwater", false)).unwrap();
+    p.import_bundle(&b).unwrap();
+    assert!(studio::export(&p, None, d.path(), true).unwrap_err().0.contains("Save a data version"));
+    store::generate_draft(&p, &Recipe { test_percent: 30, ..Recipe::default() }).unwrap();
+    store::save_version(&p).unwrap();
+    let dest = d.path().join("out");
+    let r = studio::export(&p, None, &dest, true).unwrap();
+    let dir = std::path::PathBuf::from(r["dir"].as_str().unwrap());
+    assert!(dir.ends_with("Ashfall Reach-v1-unsloth-studio") || dir.to_string_lossy().contains("-v1-unsloth-studio"));
+    let lines = |f: &str| -> Vec<Value> { std::fs::read_to_string(dir.join(f)).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
+    let train = lines("train.jsonl");
+    assert_eq!(train.len() as u64, r["rows"].as_u64().unwrap());
+    for l in &train {
+        assert_eq!(l.as_object().unwrap().keys().collect::<Vec<_>>(), ["messages"], "chatml only: {l}");
+        let m = l["messages"].as_array().unwrap();
+        assert!(m.last().unwrap()["role"] == "assistant" && m.iter().all(|x| x["role"].is_string() && x["content"].is_string()));
+    }
+    assert!(r["world_book"].as_u64().unwrap() > 0, "the world book became answers");
+    let book = train.iter().find(|l| l["messages"][1]["content"].as_str().is_some_and(|c| c.starts_with("Tell me what the lore says about"))).expect("a world-book row");
+    assert!(book["messages"][0]["content"].as_str().unwrap().contains("tabletop world"));
+    // each example speaks of its own world
+    let sys = |l: &Value| l["messages"][0]["content"].as_str().unwrap_or("").to_string();
+    assert!(train.iter().any(|l| sys(l).contains("\"Brightwater\"")) && train.iter().any(|l| sys(l).contains("\"Ashfall Reach\"")));
+    assert!(r["eval"].as_u64().unwrap() > 0 && lines("eval.jsonl").iter().all(|l| l["messages"].is_array()));
+    let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+    assert!(readme.contains("chatml") && readme.contains("Train on Completions") && readme.contains("GM secrets") && readme.contains("Context Length"), "{readme}");
+    // the same folder twice is refused; without the world book only the questions are exported
+    assert!(studio::export(&p, Some(1), &dest, true).unwrap_err().0.contains("already exists"));
+    let r2 = studio::export(&p, Some(1), &d.path().join("out2"), false).unwrap();
+    assert_eq!((r2["world_book"].as_u64(), r2["rows"].as_u64().unwrap() < r["rows"].as_u64().unwrap()), (Some(0), true));
+    assert!(studio::export(&p, Some(9), &d.path().join("out3"), true).is_err());
+}

@@ -140,7 +140,11 @@ def load_hf(cfg: dict):
     if cfg.get("init_adapter"):
         from peft import PeftModel
         return PeftModel.from_pretrained(model, cfg["init_adapter"], is_trainable=True), tokenizer, None
-    lora = LoraConfig(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear")
+    lora_kw = dict(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear")
+    try:   # the image / audio parts of a multimodal model stay as they are: only the language layers learn (so the base model's vision file still fits)
+        lora = LoraConfig(exclude_modules=r".*(vision|visual|audio|image|multi_modal|mm_projector|embed_vision|embed_audio).*", **lora_kw)
+    except TypeError:   # an older PEFT has no exclude_modules
+        lora = LoraConfig(**lora_kw)
     return get_peft_model(model, lora), tokenizer, None
 
 
