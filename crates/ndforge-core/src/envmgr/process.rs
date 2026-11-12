@@ -23,11 +23,26 @@ pub fn quiet(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Starts the program. Linux answers "text file busy" (ETXTBSY) when the program file was written a moment ago while another thread of this program was
+/// starting a process: the child it made inherits the still-open write handle until it executes. It goes away within milliseconds, so wait and retry.
+fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if cfg!(unix) && e.raw_os_error() == Some(26) && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Runs `cmd` to the end (or until `cancel` is set, which kills it). Both output streams arrive in `on_line`.
 pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(Stream, &str)) -> Result<ExitStatus> {
     quiet(&mut cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| Error::new(format!("Could not start {:?}: {e}", cmd.get_program())))?;
+    let mut child = spawn_retrying(&mut cmd).map_err(|e| Error::new(format!("Could not start {:?}: {e}", cmd.get_program())))?;
     let (tx, rx) = mpsc::channel::<(Stream, String)>();
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
