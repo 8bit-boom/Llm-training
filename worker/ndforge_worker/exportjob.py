@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backends, protocol
+from . import backends, protocol, vision
 from .families import default_non_thinking
 
 QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
@@ -57,17 +57,38 @@ def merge_hf(cfg, merged: Path):
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
     dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else (torch.float16 if torch.cuda.is_available() else torch.float32)
+    # an adapter trained on the whole image+text model (Unsloth does that) is merged into that whole model, so the merged model keeps its vision part;
+    # any other adapter was trained on the text model alone
+    loaders = [AutoModelForCausalLM]
+    if vision.adapter_is_for_full_model(cfg["adapter"]):
+        try:
+            from transformers import AutoModelForImageTextToText
+            loaders.insert(0, AutoModelForImageTextToText)
+        except ImportError:
+            pass
     protocol.progress("merge", 0.1, "Loading the base model")
-    try:
-        base = AutoModelForCausalLM.from_pretrained(cfg["base"]["repo"], dtype=dtype)
-    except TypeError:
-        base = AutoModelForCausalLM.from_pretrained(cfg["base"]["repo"], torch_dtype=dtype)
+    base, last = None, None
+    for loader in loaders:
+        try:
+            try:
+                base = loader.from_pretrained(cfg["base"]["repo"], dtype=dtype)
+            except TypeError:
+                base = loader.from_pretrained(cfg["base"]["repo"], torch_dtype=dtype)
+            break
+        except Exception as exc:   # this class cannot load the model: the next one may
+            last = exc
+            protocol.log(f"{loader.__name__} could not load the base model ({type(exc).__name__}); trying another way.")
+    if base is None:
+        raise last
     protocol.progress("merge", 0.4, "Adding the trained layers")
     model = PeftModel.from_pretrained(base, cfg["adapter"]).merge_and_unload()
     protocol.progress("merge", 0.7, "Saving the merged model")
     model.save_pretrained(str(merged), safe_serialization=True)
     tok = AutoTokenizer.from_pretrained(cfg["adapter"] if (Path(cfg["adapter"]) / "tokenizer_config.json").exists() else cfg["base"]["repo"])
     tok.save_pretrained(str(merged))
+    copied = vision.copy_processor_files(cfg["base"]["repo"], merged)
+    if copied:
+        protocol.log("Image processor files copied from the base model: " + ", ".join(copied))
     patch_template_dir(merged, cfg["base"]["family"])
 
 
@@ -154,12 +175,31 @@ def run(cfg: dict) -> int:
         if cfg.get("gguf", True):
             ggufs = gguf_with_llama_cpp(cfg, merged, out, quants)
             gguf_path = ggufs[quant]
+    mmproj, vnote, mods = None, "", []
+    if gguf_path and cfg.get("vision", True):
+        try:
+            mods = vision.base_modalities(cfg["base"]["repo"])
+            if mods and full_model:
+                vnote = "Full fine-tuning changed the vision part of the model too, so the base model's vision file does not fit it. The GGUF understands text only."
+            elif mods:
+                protocol.progress("vision", 0.95, "Adding the vision file")
+                mmproj, vnote = vision.fetch_mmproj(cfg["base"]["repo"], out)
+                if mmproj is None and Path(cfg["base"]["repo"]).is_dir():
+                    conv, _ = find_llama_cpp()
+                    if conv:
+                        target = out / "mmproj-F16.gguf"
+                        _run([sys.executable, conv, cfg["base"]["repo"], "--mmproj", "--outfile", target, "--outtype", "f16"], "The vision conversion")
+                        mmproj, vnote = target, "Vision file converted from the base model with llama.cpp."
+        except Exception as exc:   # the vision file is a bonus: the export itself is done
+            mmproj, vnote = None, f"The vision file could not be added ({type(exc).__name__}: {str(exc)[:200]}). The GGUF understands text only."
+        if vnote:
+            protocol.log(vnote)
     if gguf_path and not cfg.get("keep_merged") and not full_model and merged.exists():
         shutil.rmtree(merged, ignore_errors=True)
     elif not gguf_path:
         note = "Merged 16-bit model only (no GGUF requested)."
     protocol.progress("done", 1.0, "Export ready")
-    summary = {"gguf": str(gguf_path) if gguf_path else None, "ggufs": {q: str(f) for q, f in ggufs.items()}, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
+    summary = {"gguf": str(gguf_path) if gguf_path else None, "ggufs": {q: str(f) for q, f in ggufs.items()}, "mmproj": str(mmproj) if mmproj else None, "modalities": mods, "vision_note": vnote, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
                "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)

@@ -46,6 +46,7 @@ pub fn list_exports(p: &Project) -> Vec<Value> {
         meta["gguf_exists"] = json!(gguf.as_ref().is_some_and(|g| g.is_file()));
         meta["dir"] = json!(e.path());
         meta["size_mb"] = json!(gguf.as_ref().and_then(|g| std::fs::metadata(g).ok()).map(|m| (m.len() as f64 / 1048576.0 * 10.0).round() / 10.0));
+        meta["has_vision"] = json!(meta["mmproj_file"].as_str().is_some_and(|f| e.path().join(f).is_file()));
         meta["merged_exists"] = json!(meta["merged_dir"].as_str().is_some_and(|d| std::path::Path::new(d).join("config.json").is_file()));
         Some(meta)
     }).collect()).unwrap_or_default();
@@ -153,12 +154,28 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
             merged_dir = Some(to.display().to_string());
         }
         let keep_here = if i == 0 { merged_dir.clone() } else { None };
+        // the base model's vision file (images; the language layers are all that training changed): once per export, next to its GGUF
+        let mmproj_file = match result["mmproj"].as_str().map(PathBuf::from).filter(|m| m.is_file()) {
+            Some(m) => {
+                let name = m.file_name().and_then(|n| n.to_str()).unwrap_or("mmproj-F16.gguf").to_string();
+                if dir != out {
+                    if i == list.len() - 1 {
+                        std::fs::rename(&m, dir.join(&name))?;
+                    } else {
+                        std::fs::copy(&m, dir.join(&name))?;
+                    }
+                }
+                std::fs::write(dir.join("VISION.md"), vision_readme(&gguf_file, &name))?;
+                Some(name)
+            }
+            None => None,
+        };
         std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
         std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
             world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
             dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
         }))?;
-        let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
+        let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
                           "created": created, "world": p.display_name(), "installed": []});
         write_json(&dir.join("meta.json"), &meta)?;
         metas.push(meta);
@@ -235,4 +252,12 @@ Ask questions the way the training did: the same kind of system message, and for
         world = p.display_name(), path = to.display());
     std::fs::write(to.join("README.md"), readme)?;
     Ok(to)
+}
+
+/// What to do with the vision file that sits next to the GGUF.
+fn vision_readme(gguf: &str, mmproj: &str) -> String {
+    format!("# Images with this model\n\nThis folder holds the fine-tuned text model (`{gguf}`) and the vision file of its base model (`{mmproj}`). Training only changed the language layers, so the base model's vision part still fits.\n\n\
+## Unsloth Studio / llama.cpp (images work)\n- **Unsloth Studio**: load this folder (or the GGUF; Studio finds the `mmproj` file next to it) and attach pictures in the chat.\n- **llama.cpp**: `llama-server -m {gguf} --mmproj {mmproj}`, or `llama-mtmd-cli -m {gguf} --mmproj {mmproj} --image picture.png -p \"What is in this picture?\"`.\n\n\
+## Ollama (text only)\nOllama's GGUF import takes one file, so the program installs only `{gguf}` and the model answers text. Keep using Unsloth Studio or llama.cpp for pictures, or run a normal vision model next to it in Ollama for the photo tools.\n\n\
+Pictures are not part of the training: the model will not know your world's maps or art, only what it could read from a picture before.\n")
 }

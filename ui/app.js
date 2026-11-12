@@ -159,8 +159,9 @@ function renderDataset() {
       ${items}
       <div class="row"><button class="secondary" id="prev" ${ds.offset === 0 ? "disabled" : ""}>Previous</button><span>Page ${cur} of ${pages}</span><button class="secondary" id="next" ${ds.offset + PAGE >= ds.total ? "disabled" : ""}>Next</button></div></div>`;
   }
-  const vers = st.versions.length ? `<ul>${st.versions.map((v) => `<li><strong>Version ${v.version}</strong> · ${v.counts.world_book_texts} texts, ${v.counts.train_chat} practice, ${v.counts.test_chat} for testing · ${v.created}</li>`).join("")}</ul>` : "<p class=\"dim\">No version saved yet.</p>";
-  const save = sum ? `<div class="card wide"><h2>Save</h2><p>Training uses a saved version. Dropped examples are left out.</p><button class="primary" id="save" ${ds.busy ? "disabled" : ""}>Save this version</button>${vers}</div>` : "";
+  const vers = st.versions.length ? `<ul>${st.versions.map((v) => `<li><strong>Version ${v.version}</strong> · ${v.counts.world_book_texts} texts, ${v.counts.train_chat} practice, ${v.counts.test_chat} for testing · ${v.created} <button class="secondary studio-export" data-ver="${v.version}" title="Writes train.jsonl (and eval.jsonl) in the format Unsloth Studio's Train page reads, with a README of the settings to choose">Export for Unsloth Studio…</button></li>`).join("")}</ul>` : "<p class=\"dim\">No version saved yet.</p>";
+  const save = sum ? `<div class="card wide"><h2>Save</h2><p>Training uses a saved version. Dropped examples are left out.</p><button class="primary" id="save" ${ds.busy ? "disabled" : ""}>Save this version</button>
+    <label class="opt" title="Studio has no plain-text mode: the long world-book texts become answers to 'Tell me what the lore says about …'"><input type="checkbox" id="studio-book" ${ds.studioBook === false ? "" : "checked"}> Include the world book when exporting for Unsloth Studio</label>${vers}</div>` : "";
   return `<h1>Step 2 · Make training data</h1><p class="lead">Turns your world into practice material. The help panel explains every choice.</p>
     ${ds.error ? `<div class="err">${esc(ds.error)}</div>` : ""}${ds.ok ? `<div class="ok">${esc(ds.ok)}</div>` : ""}${recipe}${teacher}${summary}${review}${save}`;
 }
@@ -504,7 +505,7 @@ function renderUse() {
     <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
     <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div></div>`;
-  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
+  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
   const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
@@ -843,6 +844,15 @@ function wireDataset() {
     ds.busy = false;
     if (r) ds.ok = `Made ${r.total} examples (${r.kept} kept).`;
     await dsRefresh(false);
+  });
+  const sb = $("studio-book"); if (sb) sb.onchange = () => { ds.studioBook = sb.checked; };
+  document.querySelectorAll(".studio-export").forEach((b) => b.onclick = async () => {
+    const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the Unsloth Studio files" });
+    if (!dest) return;
+    ds.error = null; ds.ok = null;
+    const r = await dsCall("studio_export", { version: Number(b.dataset.ver), dest, worldBook: ds.studioBook !== false });
+    if (r) ds.ok = `Saved for Unsloth Studio: ${r.dir} (${r.rows} rows${r.eval ? ", " + r.eval + " held-out questions" : ""}). Open its README.md for the settings to choose.`;
+    render();
   });
   on("save", async () => {
     ds.busy = true; render();

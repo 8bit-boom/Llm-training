@@ -39,3 +39,9 @@ Step 3 · Train uses the newest saved version. If you import a newer export of y
 - Your secrets are in the data on purpose. A model trained on it must not be used for your players' AI chat.
 - Examples about the same entry are kept together, either all for training or all for testing.
 - More examples is not always better: if an entry has a thin description, its questions are thin too. Improving the entry in nd-world and exporting again helps more than any setting here.
+
+## Export for Unsloth Studio
+Under **Save**, every saved version has **Export for Unsloth Studio…**. It writes `train.jsonl` (and `eval.jsonl` when the version holds out test questions) in the *chatml* format (`{"messages": [...]}` per line) that the **Train** page of Unsloth Studio / Unsloth Desktop reads, plus a `README.md` with the settings to choose (format chatml, context length, *Train on Completions* on, language layers only). Studio has no plain-text mode, so the world book is turned into answers to "Tell me what the lore says about …" (untick *Include the world book* to leave it out). Several worlds in one project stay together: each example carries its own world's name.
+
+**Train here or in Studio?** Both work on the same data. This program adds what Studio does not: one place for the world data, teacher examples, a test page that scores the model against the original, stop and continue, and a benchmark. Studio is the official tool of the model's makers, so a new model family works there first and its export is the most tested for models with pictures. A good way to decide: train once in each with the same data and compare the two models on the Test page.
+

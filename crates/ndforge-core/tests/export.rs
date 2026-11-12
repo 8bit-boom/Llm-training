@@ -285,7 +285,8 @@ qs=$(sed -n 's/.*"quants":\[\([^]]*\)\].*/\1/p' "$5" | tr -d '"' | tr ',' ' ')
 map=""
 for q in $qs; do printf "GGUF-$q" > "$out/model-$q.gguf"; map="$map\"$q\":\"$out/model-$q.gguf\","; done
 if grep -q '"keep_merged":true' "$5"; then mkdir -p "$out/merged"; echo '{}' > "$out/merged/config.json"; m="\"$out/merged\""; else m=null; fi
-echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m}}""#);
+printf MMPROJ > "$out/mmproj-F16.gguf"
+echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m,\"mmproj\":\"$out/mmproj-F16.gguf\",\"modalities\":[\"image\"],\"vision_note\":\"taken from the official repo\"}}""#);
     let p = project_with_world(d.path(), 1);
     store::generate_draft(&p, &Recipe::default()).unwrap();
     store::save_version(&p).unwrap();
@@ -300,6 +301,15 @@ echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m}}""#
         assert!(std::fs::read_to_string(dir.join("Modelfile")).unwrap().starts_with(&format!("FROM ./model-{quant}.gguf")), "{name}");
         assert!(dir.join("MODEL_CARD.md").is_file() && dir.join("meta.json").is_file());
     }
+    // every size gets the base model's vision file and a note on how to use it (one move, the others copies); Ollama is told it is text only
+    for name in ["run1-q8_0", "run1-q6_k", "run1-q4_k_m"] {
+        let dir = p.folder.join("exports").join(name);
+        assert_eq!(std::fs::read_to_string(dir.join("mmproj-F16.gguf")).unwrap(), "MMPROJ", "{name}");
+        let v = std::fs::read_to_string(dir.join("VISION.md")).unwrap();
+        assert!(v.contains("--mmproj mmproj-F16.gguf") && v.contains("Ollama (text only)") && v.contains("Unsloth Studio"), "{v}");
+    }
+    assert!(metas.iter().all(|m| m["mmproj_file"] == "mmproj-F16.gguf" && m["modalities"] == json!(["image"])));
+    assert!(exports::list_exports(&p).iter().all(|e| e["has_vision"] == true));
     // the merged model is kept once, in the first export; the work folder is gone
     assert!(p.folder.join("exports/run1-q8_0/merged/config.json").is_file() && !p.folder.join("exports/run1-q6_k/merged").exists());
     assert!(metas[0]["merged_dir"].as_str().unwrap().ends_with("run1-q8_0/merged") && metas[1]["merged_dir"].is_null());
