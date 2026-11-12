@@ -12,6 +12,7 @@ pub mod export;
 pub mod help;
 pub mod model;
 pub mod paths;
+pub mod power;
 pub mod project;
 pub mod secrets;
 pub mod remote;

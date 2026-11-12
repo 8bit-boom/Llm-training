@@ -65,7 +65,7 @@ impl AppModel {
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
-            "settings": {"expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme},
+            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme},
             "projects_dir": default_projects_dir(),
         })
     }
@@ -135,6 +135,7 @@ impl AppModel {
             "expert_mode" => self.settings.expert_mode = value,
             "show_help_panel" => self.settings.show_help_panel = value,
             "welcome_seen" => self.settings.welcome_seen = value,
+            "keep_awake" => self.settings.keep_awake = value,
             other => return Err(Error::new(format!("Unknown setting: {other}"))),
         }
         self.settings.save();

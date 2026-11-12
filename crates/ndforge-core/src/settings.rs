@@ -44,6 +44,8 @@ pub struct Settings {
     pub welcome_seen: bool,
     /// "auto" (follow the system), "light" or "dark" (night mode)
     pub theme: String,
+    /// keep the computer awake while training (default on: a computer that falls asleep stops the training)
+    pub keep_awake: bool,
     pub ollama_servers: Vec<OllamaServer>,
     pub train_servers: Vec<TrainServer>,
     pub teacher: TeacherSettings,
@@ -52,7 +54,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(),
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true,
             ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), teacher: TeacherSettings::default(), recent_projects: Vec::new() }
     }
 }
