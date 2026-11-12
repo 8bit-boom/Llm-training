@@ -195,7 +195,7 @@ async function dsRefresh(keepPage) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 3: train
-let tr = { stopping: false, bench: { running: false, text: "", progress: null, result: null, deep: false, error: null, used: null }, speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
+let tr = { shutdownAfter: false, stopping: false, bench: { running: false, text: "", progress: null, result: null, deep: false, error: null, used: null }, speed: null, hf: { open: false, input: "", busy: false, found: null, error: null }, stages: "mixed", tryAnyway: false, server: "", srvCheck: null, adding: false, state: null, model: null, method: "lora", preset: "normal", plan: null, over: {}, running: false, run: null, metrics: [], samples: [], log: [], progress: null, stepText: "", error: null, notice: null };
 const FIT = { yes: ["✓", "fits"], tight: ["⚠", "tight"], no: ["✗", "too big"], unknown: ["?", "unknown card"] };
 
 function fmtEta(s) { if (s == null) return "–"; const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${s} s`; }
@@ -321,7 +321,9 @@ function renderTrain() {
   const canResume = last && last.resumable && !tr.running;
   const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
     <button class="secondary" id="tr-stop" title="Finishes the current step, saves a checkpoint and stops. The run can be continued later, even after closing the program." ${tr.running && !tr.stopping ? "" : "disabled"}>${tr.stopping ? "Stopping…" : "Stop and save"}</button>
-    ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)}${last.step ? `, from step ${last.step}${last.total_steps ? " of " + last.total_steps : ""}` : ""})</button>` : ""}</div>`;
+    ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)}${last.step ? `, from step ${last.step}${last.total_steps ? " of " + last.total_steps : ""}` : ""})</button>` : ""}</div>
+    <div class="row power"><label class="opt" title="Stops the computer from going to sleep while a training runs (the screen may still turn off). Applies from the next start."><input type="checkbox" id="tr-awake" ${state.settings.keep_awake ? "checked" : ""} ${tr.running ? "disabled" : ""}> Keep this computer awake during training</label>
+      <label class="opt" title="When a training has finished normally, the computer is switched off after a 60-second warning that you can cancel. Not after a stop or an error. Switches itself off again after use."><input type="checkbox" id="tr-shutdown" ${tr.shutdownAfter ? "checked" : ""}> Shut down this computer when training has finished</label></div>`;
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
   const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
     ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
@@ -391,6 +393,19 @@ function onTrainEvent(p) {
   if (page === "train") { render(); const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight; }
 }
 
+// the warning before the computer is switched off: a bar on every page with a Cancel button
+function onPowerEvent(p) {
+  let bar = document.getElementById("powerbar");
+  const gone = () => { if (bar) bar.remove(); };
+  if (p.kind === "armed") { tr.shutdownAfter = p.on; if (page === "train") render(); return; }
+  if (p.kind === "cancelled") { gone(); tr.notice = "Shutdown cancelled. The computer stays on."; if (page === "train") render(); return; }
+  if (p.kind === "failed") { gone(); tr.error = p.text; if (page === "train") render(); return; }
+  if (!bar) { bar = document.createElement("div"); bar.id = "powerbar"; document.body.appendChild(bar); }
+  if (p.kind === "shutting_down") { bar.textContent = "Shutting down now…"; return; }
+  bar.innerHTML = `<span>Training finished. This computer shuts down in <strong>${p.left}</strong> s.</span> <button id="pw-cancel">Cancel shutdown</button>`;
+  document.getElementById("pw-cancel").onclick = () => invoke("cancel_shutdown");
+}
+
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; tr.stopping = false; render();
   const over = {};
@@ -453,6 +468,11 @@ function wireTrain() {
   });
   document.querySelectorAll(".ovs").forEach((i) => i.onchange = () => { tr.over[i.dataset.key] = i.value; });
   on("tr-start", () => trStart(null));
+  const aw = $("tr-awake"); if (aw) aw.onchange = async () => { try { setState(await invoke("set_setting", { key: "keep_awake", value: aw.checked })); } catch (e) { tr.error = String(e); render(); } };
+  const sd = $("tr-shutdown"); if (sd) sd.onchange = async () => {
+    tr.shutdownAfter = sd.checked;
+    try { await invoke("set_shutdown_after", { on: sd.checked }); } catch (e) { tr.shutdownAfter = false; tr.error = String(e); render(); }
+  };
   on("tr-resume", () => trStart($("tr-resume").dataset.run));
   on("tr-stop", () => { tr.stopping = true; tr.stepText = "Stopping: finishing this step and saving a checkpoint…"; tr.progress = null; invoke("train_stop"); render(); });
   document.querySelectorAll("[data-continue]").forEach((b) => b.onclick = () => trStart(b.dataset.continue));
@@ -916,6 +936,7 @@ async function init() {
       else if (d) d.classList.remove("over");
     });
   } catch (_) { /* drag and drop is a convenience; the button always works */ }
+  try { await tauri.event.listen("power-event", (e) => onPowerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("closing", (e) => { const d = document.createElement("div"); d.id = "closing"; d.textContent = (e.payload && e.payload.text) || "Saving, then closing…"; document.body.appendChild(d); }); } catch (_) { /* previews */ }
   try { await tauri.event.listen("bench-event", (e) => onBenchEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }

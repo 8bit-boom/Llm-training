@@ -18,6 +18,10 @@ struct Tasks {
     cancel: Arc<AtomicBool>,
     /// the window was asked to close while a job runs: the job is being stopped (and saved) first
     closing: Arc<AtomicBool>,
+    /// "shut the computer down when the training has finished" (the checkbox; not remembered between program starts, on purpose)
+    shutdown_after: Arc<AtomicBool>,
+    /// the Cancel button of the shutdown countdown
+    shutdown_cancel: Arc<AtomicBool>,
 }
 
 /// Asks the running job to stop and waits until it has ended, at most `max`. A training run saves a checkpoint when it is stopped, so it can be
@@ -277,18 +281,60 @@ fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model:
     }
     tasks.cancel.store(false, Ordering::SeqCst);
     let (busy, stop, name) = (tasks.busy.clone(), tasks.cancel.clone(), job.name.clone());
+    let (shutdown_after, shutdown_cancel) = (tasks.shutdown_after.clone(), tasks.shutdown_cancel.clone());
+    let keep_awake = lock(&s).settings.keep_awake;
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
+        // the computer stays awake for as long as the guard lives (this also covers a run on a server: this program fetches the result)
+        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
+        if !awake.note.is_empty() {
+            emit(serde_json::json!({"kind": "log", "text": awake.note}));
+        }
         let r = run_training(&job, stop, &mut emit);
+        drop(awake);
         busy.store(false, Ordering::SeqCst);
+        // only a run that finished (not stopped, not failed) switches the computer off
+        let finished = matches!(&r, Ok(data) if data["stopped"] != true);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
         };
         let _ = app.emit("train-event", end);
+        if finished && shutdown_after.swap(false, Ordering::SeqCst) {
+            shutdown_with_warning(&app, &shutdown_cancel, std::time::Duration::from_secs(1), 60);
+        }
     });
     Ok(name)
+}
+
+/// The warning before the computer is switched off: a countdown the window shows with a Cancel button. Events go to "power-event".
+fn shutdown_with_warning(app: &tauri::AppHandle, cancel: &AtomicBool, step: std::time::Duration, seconds: u32) {
+    cancel.store(false, Ordering::SeqCst);
+    let _ = app.emit("power-event", serde_json::json!({"kind": "armed", "on": false}));
+    let done = ndforge_core::power::countdown(seconds, step, cancel, &mut |left| {
+        let _ = app.emit("power-event", serde_json::json!({"kind": "countdown", "left": left}));
+    });
+    if !done {
+        let _ = app.emit("power-event", serde_json::json!({"kind": "cancelled"}));
+        return;
+    }
+    let _ = app.emit("power-event", serde_json::json!({"kind": "shutting_down"}));
+    if let Err(e) = ndforge_core::power::shutdown_now() {
+        let _ = app.emit("power-event", serde_json::json!({"kind": "failed", "text": e.to_string()}));
+    }
+}
+
+/// The "shut down when training has finished" checkbox. It can be changed while a run is going.
+#[tauri::command]
+fn set_shutdown_after(tasks: State<Tasks>, on: bool) {
+    tasks.shutdown_after.store(on, Ordering::SeqCst);
+}
+
+/// The Cancel button of the shutdown countdown.
+#[tauri::command]
+fn cancel_shutdown(tasks: State<Tasks>) {
+    tasks.shutdown_cancel.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -527,7 +573,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
