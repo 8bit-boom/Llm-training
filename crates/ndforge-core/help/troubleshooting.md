@@ -47,6 +47,18 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 
 **"There is not enough free space".** A made model is a full copy (about 2 GB per billion parameters) and a model that is not on the computer is downloaded first. Free the space or choose a smaller size on the slider.
 
+**"Healing a model of … needs about … GB … this card has …".** The thinned model and the original do not fit this card even when they take turns. Choose a smaller model (a thinner 9 B instead of a 27 B), or heal on a bigger card; thinning and testing still work.
+
+**"The teacher's answers need … GB in … free".** Healing saves the original's answers to disk first (about 4 GB per 20 million tokens). Free the space, choose 10 million tokens, or move the project's folder to a bigger drive.
+
+**"The general text (…) could not be downloaded".** Healing goes on with your world's text only; nothing is lost, but general ability comes back less. Check the internet connection and press *Continue healing* later (the teacher's answers for your text are kept), or untick the general text on the Heal card if you work offline.
+
+**"Healing stopped: the training became unstable".** The error went to infinity. Open Expert mode on the Heal card, lower the learning rate (for example 0.00005) and press *Continue healing*; it goes on from the last checkpoint.
+
+**"The saved teacher answers belong to other data".** The training data or the model changed since the original answered. They are made again (the older answers stay on disk until the model is deleted).
+
+**"The healing result does not fit the slim model".** The saved LoRA does not match the thinner model's layers. Nothing was changed; please make a problem report (Welcome page).
+
 **Ollama or llama.cpp refuses the exported slimmed model.** An unusual number of layers is allowed by the file format, but not every version of Ollama accepts it. Update Ollama, then use *Test it with a question* on Step 5. The text GGUF can also be loaded in llama.cpp directly.
 
 ## TrueNAS server
