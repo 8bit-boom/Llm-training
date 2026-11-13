@@ -9,6 +9,7 @@ Teaches the chosen model your world. It uses the **newest saved version** from S
 
 ## What to do
 0. **Where to train.** On this computer, or on your TrueNAS server's graphics card (add it once with its address and access token; see docs/TRUENAS_WORKER.md). With a server chosen, the cards show what fits *its* card. While it trains there, AI chat, transcription and image generation on that server wait. The trained model is copied back to this computer.
+   A third choice, **Unsloth Desktop**, appears once you have saved it in *Training setup* (see below): the data goes to Unsloth Desktop and the training runs there.
 1. **Choose the model.** Each card shows whether it fits your graphics card (✓ fits, ⚠ tight, ✗ too big) and the memory it needs. Qwen3.5 4B is a good start; on a 32 GB card all five fit.
 2. **Choose how to train.** Two questions:
    - **How much of the model should change?**
@@ -56,3 +57,14 @@ The training card shows **Speed** (tokens per second, counting only real text) a
 
 ## Find the fastest settings
 Under the plan, **Find the fastest settings** runs a few short real training runs (16 steps each) with different settings and shows tokens per second and memory for each: your current settings, batches grouped by length or not, and larger batches. Every run loads the model again, so it takes several minutes; **Stop** ends it and keeps the rows made so far. A row that runs out of memory says so and does not stop the others. **Use the fastest settings** applies the winner to the next run. Tick *Also try torch.compile, Liger kernels and padding-free batching* to compare those too; they exist only on the plain-libraries path (not with Unsloth), and each one switches itself off with a reason when it cannot work. In Expert mode the same options are dropdowns. Speeds are measured after the start-up (the first quarter of the steps is left out), so the first run is not held back by compiling. Tick the extra options and a **second round** follows: the best batch size of the first round with each attention kernel (also with Unsloth), every setting run **twice** with both speeds shown. Settings closer than about 3 % (or than their own two runs) are marked *within noise*: do not read a ranking into them. The ★ is the fastest of round 2.
+
+## Training in Unsloth Desktop
+Unsloth Desktop is a separate app (unsloth.ai) that trains models with its own screens. Lore Forge can hand it your saved data and follow the training, instead of using its own training software. It is never chosen by itself: this computer stays the default.
+1. In Unsloth: your picture, **Settings**, **API**, give a name, **Create**. Copy the key (Unsloth shows it only once).
+2. In Lore Forge, **Training setup**, card **Unsloth Desktop**: press **Find** (it looks on this computer), paste the key, press **Test**, then **Save**.
+3. Step 3, **Where to train**: choose Unsloth Desktop. Press Train. **Keep Unsloth Desktop open** until it finishes.
+- The charts, Stop and the finished run look like a normal run. Unsloth chooses the speed settings itself; Lore Forge sends the rank, learning rate, epochs and context length.
+- When Unsloth runs on **this computer**, the trained adapter is copied into the run, so Step 4 and Step 5 work as usual. When Unsloth is on **another computer**, the adapter stays in Unsloth's folder (the run says which) and cannot be tested or exported here.
+- Not available there: full fine-tuning, two stages (world book first), a model from a folder on this computer, and continuing a run that was stopped (a stop cancels the job in Unsloth; start again).
+- If Unsloth is busy with another job, yours waits in its queue and the page says its place. Closing Unsloth forgets a waiting job; a running one goes on, and **Continue** reconnects to it.
+- The data contains the GM's secrets. It is sent only to the address you saved. Use an address on this computer or your own network.

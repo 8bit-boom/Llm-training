@@ -18,6 +18,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M6 Step 3: PEFT + SFT training (Unsloth), live charts, stop/resume | built; needs a first run on the RTX 5090 |
 | M7 Step 5: GGUF + Modelfile, install into Ollama (PC or TrueNAS), "Retrain with the new export" | built; needs a first run with a real model and Ollama |
 | M8 Train on the TrueNAS server (worker server + client + compose) | built; the container image still has to be built once |
+| M15 Train in Unsloth Desktop (third "Where to train" option, adapter copied back when it runs on this computer) | built and tested against a stand-in Unsloth; not tried with a real Desktop (docs/UNSLOTH_DESKTOP.md, "Not verified yet") |
 | M9 Full fine-tune + "world book first, then practice" stages, type cards | built; needs a first run on the RTX 5090 |
 | M10 Teacher-generated examples + checking (Step 2) | built; needs a first run with a real teacher model. "Better scores" can only be shown by the M11 test page |
 | M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
@@ -91,6 +92,12 @@ Tests: Rust `cargo test --workspace` (the template test uses `go` when installed
 `crates/ndforge-server` is the worker that runs in a container on the server (`Dockerfile.worker`, `truenas-worker-compose.yml`): token-protected HTTP, one job at a time, runs the same
 Python worker as a local run, keeps checkpoints, frees the card by unloading Ollama. In the window, **Step 3 → Where to train** picks this PC or a server; the run looks the same, the finished adapter is copied back.
 Guide: [docs/TRUENAS_WORKER.md](docs/TRUENAS_WORKER.md). Protocol: `crates/ndforge-core/src/remote/mod.rs`.
+
+## Training in Unsloth Desktop (M15)
+
+Step 3 → Where to train can also send the saved data to **Unsloth Desktop** (Training setup: address, API key, Test) and follow the job there with the same charts; the adapter is copied back when
+Unsloth runs on this computer. Local training stays the default. A small client over Unsloth's OpenAI-shaped fine-tuning API: `crates/ndforge-core/src/unsloth/`; what Desktop is, the failure messages and the checklist for a first
+real run: [docs/UNSLOTH_DESKTOP.md](docs/UNSLOTH_DESKTOP.md); the calls both products share with nd-world: [docs/UNSLOTH_API_CONTRACT.md](docs/UNSLOTH_API_CONTRACT.md) with `tests/fixtures/unsloth/`.
 
 ## Full fine-tuning and two stages (M9)
 

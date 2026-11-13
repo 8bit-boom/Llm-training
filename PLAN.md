@@ -465,3 +465,7 @@ test fixture on both sides.
 ## 15. Remaining questions
 
 No blocking questions. Decided: the "Retrain with the new export" button is included (§5.4, milestone M7).
+
+## Addendum: Unsloth Desktop (M15)
+Unsloth Desktop is a third place to train (after this PC and the TrueNAS server), never the default, added after the original milestones. Scope, owner decisions and what is not verified: `docs/UNSLOTH_DESKTOP.md`.
+
