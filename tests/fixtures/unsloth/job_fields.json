@@ -1,0 +1,5 @@
+{"openai": ["model", "training_file", "validation_file", "hyperparameters", "method", "suffix", "seed", "integrations"],
+ "studio": ["training_type", "load_in_4bit", "max_seq_length", "gradient_accumulation_steps", "warmup_steps", "max_steps", "save_steps", "packing", "train_on_completions",
+            "gradient_checkpointing", "lora_r", "lora_alpha", "lora_dropout", "target_modules", "finetune_vision_layers", "finetune_language_layers",
+            "finetune_attention_modules", "finetune_mlp_modules", "eval_steps"],
+ "note": "the fields Lore Forge and nd-world send; Studio refuses any other key with 400 'Unknown parameter(s): ...'. Read from TrainingStartRequest at commit 1bbf9c3f."}

@@ -1,0 +1,4 @@
+{"object": "fine_tuning.job", "id": "ftjob_20261113_101500_ab12", "model": "unsloth/Qwen3.5-2B", "created_at": 1763000200, "finished_at": 1763000500, "status": "succeeded",
+ "fine_tuned_model": "ashfall-test_20261113_101500", "training_file": "file-0123456789abcdef0123456789abcdef", "validation_file": null, "organization_id": "", "result_files": [],
+ "trained_tokens": 1200, "error": null, "hyperparameters": {"n_epochs": 2, "batch_size": 2, "learning_rate_multiplier": 1.0}, "seed": 3407, "suffix": "ashfall-test", "integrations": [],
+ "method": {"type": "supervised"}}

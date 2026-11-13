@@ -1,0 +1,2 @@
+{"status": "healthy", "service": "Unsloth UI Backend", "studio_root_id": "0f3c9d1e5a7b4c28", "desktop_protocol_version": 1, "desktop_manageability_version": 2,
+ "supports_desktop_auth": true, "desktop_owner": {"kind": "tauri", "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "chat_only": false}

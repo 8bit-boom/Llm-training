@@ -1,0 +1,4 @@
+{"outputs_dir": "@OUTPUTS@", "models": [
+ {"name": "ashfall-test_20261113_101500", "base_model": "unsloth/Qwen3.5-2B", "peft_type": "LoRA", "lora_rank": 16, "is_quantized": false,
+  "checkpoints": [{"display_name": "checkpoint-2", "path": "@OUTPUTS@/ashfall-test_20261113_101500/checkpoint-2", "loss": 2.5},
+                  {"display_name": "ashfall-test_20261113_101500", "path": "@OUTPUTS@/ashfall-test_20261113_101500", "loss": 1.5}]}]}
