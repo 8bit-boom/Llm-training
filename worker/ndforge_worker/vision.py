@@ -112,3 +112,23 @@ def adapter_is_for_full_model(adapter_dir: Path) -> bool:
             return any("language_model" in k for k in s.keys())
     except Exception:
         return False
+
+
+def with_base_processor(tokenizer, repo: str, auto_processor=None):
+    """An adapter trained on the text part alone saves a bare tokenizer, but Unsloth's GGUF export builds the vision file from a *processor* (without
+    one it stops with "KeyError: 'image_mean'"). Wrap the tokenizer in the base model's own processor, keeping the tokenizer and its chat template.
+    Anything that goes wrong returns the tokenizer as it was (the export then simply has no vision file). Unsloth Studio does the same."""
+    if tokenizer is None or hasattr(tokenizer, "tokenizer"):
+        return tokenizer
+    try:
+        if auto_processor is None:
+            from transformers import AutoProcessor as auto_processor
+        processor = auto_processor.from_pretrained(repo)
+    except Exception:
+        return tokenizer
+    if not hasattr(processor, "tokenizer"):
+        return tokenizer
+    processor.tokenizer = tokenizer
+    if getattr(tokenizer, "chat_template", None):
+        processor.chat_template = tokenizer.chat_template
+    return processor

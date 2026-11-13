@@ -149,6 +149,11 @@ def run(cfg: dict) -> int:
         protocol.progress("merge", 0.1, "Loading the trained model")
         model, tokenizer = loader.from_pretrained(model_name=full_model or cfg["adapter"], max_seq_length=cfg.get("max_seq", 2048), dtype=None, load_in_4bit=False, load_in_16bit=True)
         tmp = out / "unsloth_gguf"
+        # a text-only adapter comes back with a bare tokenizer; the vision file needs the base model's processor around it
+        wrapped = vision.with_base_processor(tokenizer, cfg["base"]["repo"])
+        if wrapped is not tokenizer:
+            protocol.log("The base model's image processor was added so the vision file can be made.")
+        tokenizer = wrapped
         protocol.progress("gguf", 0.3, "Merging and converting to GGUF (Unsloth)")
         model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=quants if len(quants) > 1 else quant)
         for q in quants:
