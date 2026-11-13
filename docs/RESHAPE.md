@@ -244,7 +244,7 @@ Everything below is **implemented as the plan says and has not been seen working
 - The seven torch tests of the plan, written in `worker/tests/test_reshape_torch.py` (pruned model equals the original with layers skipped; identity grow is
   exact, also through the job's check; copy-grow loads and generates; scoring picks the middle block and reports finite numbers; LoRA run on a pruned base
   then evaluate with `trained_base`; extra targets reach `out_proj`; GGUF with a real llama.cpp). They are skipped here (`importorskip`) and run in CI
-  (`.github/workflows/ci.yml`, job `worker`, CPU torch). **They have never run once.** If one fails in CI, fix the test or the code; do not weaken it.
+  (`.github/workflows/ci.yml`, job `worker`, CPU torch). **They first ran on CI and on a CPU torch 2.15 / transformers 5.22.2 environment after the first push: 4 failed because of test settings (a 64-token sequence length that skipped the chat rows as too long, a config layout, and a seed that made the online rows differ from the cached rows), none because of the code; the thinned-equals-masked tests passed at once.** If one fails in CI, fix the test or the code; do not weaken it.
 - That `save_pretrained` of the tiny Qwen3.5 text model uses key names `LAYER_KEY` knows (`model.layers.N.`; `model.language_model.layers.N.` is also handled).
 - `layers_to_transform` in Unsloth's `get_peft_model` (the code tries it and falls back with a log line); `layers_to_transform` together with
   `target_modules="all-linear"` in PEFT on the plain-libraries path.
@@ -276,7 +276,7 @@ and writing, the whole `reshape` job with a width from a written measurement (ou
 math against an independent numpy version, the data order, the resumable teacher cache, the LoRA merge against `W + (alpha / r) * B @ A`, the Rust plan, the runs and the heal flow with fake workers, and the
 page in a stand-in browser.
 
-**Written but never executed here (they are skipped without torch; CI runs them on CPU and they have never run once; if one fails there, fix the test or the code, do not weaken it):**
+**Torch tests (skipped without torch; they ran on CPU in CI and in a local CPU torch environment: 221 passed, 3 skipped; if one fails, fix the test or the code, do not weaken it). They test tiny random models on a CPU: they prove the logic, not quality or GPU behaviour:**
 - `worker/tests/test_reshape_width_torch.py`: thinned equals original-with-structures-switched-off (MLP; MLP + heads + value heads; each axis alone; depth + width), the measuring (finite, deterministic, cached,
   equal to a hand-computed aggregation), the job measuring by itself and reusing its measurement, the GGUF export with a real llama.cpp (skips without it).
 - `worker/tests/test_distill_math.py` (torch part), `worker/tests/test_distill_torch.py`: the chunked loss equals the full-logits loss with equal gradients, the hidden states through the final norm

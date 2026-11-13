@@ -40,7 +40,7 @@ def write_data(tmp_path):
 def cache_cfg(tmp_path, base, **over):
     train, general = write_data(tmp_path)
     return {"job": "distill_cache", "teacher": {"repo": str(base), "load": "16bit"}, "student": str(base), "model": {"family": "qwen3_5"},
-            "data": {"train": train, "tokens": 2000, "general": {"share": 0.5, "file": general}}, "k": 8, "max_seq": 64, "batch": 2, "chunk": 16, "part_tokens": 300,
+            "data": {"train": train, "tokens": 2000, "general": {"share": 0.5, "file": general}}, "k": 8, "max_seq": 128, "batch": 2, "chunk": 16, "part_tokens": 300,
             "out": str(tmp_path / "distill" / "cache"), "stop_file": str(tmp_path / "STOP"), **over}
 
 
@@ -50,13 +50,13 @@ def test_the_teacher_writes_its_top_k_answers_for_every_row(tmp_path, base, monk
     assert code == 0 and ev[-1]["type"] == "result", ev[-1]
     r = ev[-1]["data"]
     idx = json.loads((tmp_path / "distill" / "cache" / "index.json").read_text())
-    assert idx["rows"] == r["rows"] == idx["done_rows"] and idx["complete"] and idx["k"] == 8 and idx["max_len"] == 64 and len(idx["parts"]) > 1
+    assert idx["rows"] == r["rows"] == idx["done_rows"] and idx["complete"] and idx["k"] == 8 and idx["max_len"] == 128 and len(idx["parts"]) > 1
     assert idx["tokens"] == r["tokens"] and idx["teacher"] == str(base) and len(idx["data_hash"]) == 64 and len(idx["tokenizer_hash"]) == 64
     assert r["stats"]["project_rows"] == 16 and r["stats"]["general_rows"] > 0 and not r["notes"] and r["reused"] is False
     # row 0 against a direct forward pass of the same teacher
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(base))
-    rows, _ = dj.build_rows(tok, cfg["data"], "qwen3_5", 64)
+    rows, _ = dj.build_rows(tok, cfg["data"], "qwen3_5", 128)
     assert dj.data_hash(rows) == idx["data_hash"]
     rd = dj.CacheReader(tmp_path / "distill" / "cache")
     model = load(base)
@@ -134,14 +134,14 @@ def thin_student(tmp_path, teacher):
 
 def distill_cfg(tmp_path, student, teacher, mode, **over):
     train, general = write_data(tmp_path)
-    hyper = {"rank": 8, "alpha": 8, "lr": 3e-3, "max_seq": 64, "batch": 2, "grad_accum": 1, "warmup": 0, "save_steps": 100, "logging_steps": 1, "tokens": 1500,
+    hyper = {"rank": 8, "alpha": 8, "lr": 3e-3, "max_seq": 128, "batch": 2, "grad_accum": 1, "warmup": 0, "save_steps": 100, "logging_steps": 1, "tokens": 1500,
              "max_steps": 20, "seed": 1}
     hyper.update(over.pop("hyper", {}))
     cfg = {"job": "distill", "model": {"repo": str(student), "family": "qwen3_5"}, "method": "lora", "backend": "hf",
            "dataset": {"train": train, "general": {"share": 0.5, "file": general}}, "hyper": hyper,
            "distill": {"mode": mode, "cache": str(tmp_path / "distill" / "cache"), "teacher": {"repo": str(teacher), "load": "16bit"}, "alpha": 1.0, "k": 16, "chunk": 16,
                        "eval_every": 10},
-           "eval": {"calibration": {"train": train, "samples": 8, "max_len": 64, "batch": 2, "version": 1}, "teacher_loss": 1.0}, "out": str(tmp_path / "distill" / "run")}
+           "eval": {"calibration": {"train": train, "samples": 8, "max_len": 128, "batch": 2, "version": 1}, "teacher_loss": 1.0}, "out": str(tmp_path / "distill" / "run")}
     cfg.update(over)
     return cfg
 
@@ -175,11 +175,12 @@ def test_healing_in_cache_mode_lowers_the_kl_and_saves_a_lora(tmp_path, teacher,
 
 def test_the_first_step_loss_is_the_same_in_cache_and_online_mode(tmp_path, teacher, monkeypatch):
     student = thin_student(tmp_path, teacher)
-    V = json.loads((Path(teacher) / "config.json").read_text())["text_config"]["vocab_size"]
+    conf = json.loads((Path(teacher) / "config.json").read_text())
+    V = (conf.get("text_config") or conf)["vocab_size"]                                  # the tiny model's config is flat
     make_cache(tmp_path, student, teacher, monkeypatch, k=V)                               # k = the whole vocabulary: the top-k answer is exact
     first = {}
     for mode in ("cache", "online"):
-        cfg = distill_cfg(tmp_path, student, teacher, mode, hyper={"max_steps": 1}, out=str(tmp_path / f"run-{mode}"))
+        cfg = distill_cfg(tmp_path, student, teacher, mode, hyper={"max_steps": 1, "seed": 3407}, out=str(tmp_path / f"run-{mode}"))      # the cache was built with the default seed: the online rows must be the same rows
         cfg["distill"]["k"] = V
         cfg["distill"]["eval_every"] = 0
         cfg["eval"] = None
@@ -198,7 +199,7 @@ def test_a_cache_of_other_data_is_refused_and_a_stop_file_stops_with_a_saved_ada
     (tmp_path / "distill" / "cache" / "index.json").write_text(json.dumps(idx))
     with pytest.raises(ReshapeError, match="other data"):
         run_in_process(monkeypatch, dj.run, distill_cfg(tmp_path, student, teacher, "cache"))
-    idx["max_len"] = 64
+    idx["max_len"] = 128
     (tmp_path / "distill" / "cache" / "index.json").write_text(json.dumps(idx))
     stop = tmp_path / "run-stop" / "STOP"
     cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "run-stop"), stop_file=str(stop))
