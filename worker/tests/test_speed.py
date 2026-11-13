@@ -336,3 +336,28 @@ def test_the_base_models_vision_file_is_found_and_copied_and_problems_are_only_n
     assert vision.copy_processor_files(str(base), merged) == ["preprocessor_config.json"]
     assert (merged / "chat_template.jinja").read_text() == "own template" and json.loads((merged / "preprocessor_config.json").read_text())["image_mean"] == [0.5]
     assert vision.adapter_is_for_full_model(tmp_path / "no_adapter") is False
+    # a bare tokenizer is wrapped in the base model's processor (Unsloth's vision-file export needs one: "KeyError: 'image_mean'" without it)
+    class Tok:
+        chat_template = "T"
+    class Proc:
+        tokenizer = None
+        chat_template = None
+    class Auto:
+        @staticmethod
+        def from_pretrained(repo):
+            return Proc()
+    tok = Tok()
+    wrapped = vision.with_base_processor(tok, "Qwen/Qwen3.5-9B", auto_processor=Auto)
+    assert isinstance(wrapped, Proc) and wrapped.tokenizer is tok and wrapped.chat_template == "T"
+    already = Proc()
+    assert vision.with_base_processor(already, "x", auto_processor=Auto) is already          # a processor is left alone
+    class Nope:
+        @staticmethod
+        def from_pretrained(repo):
+            raise OSError("offline")
+    assert vision.with_base_processor(tok, "x", auto_processor=Nope) is tok                    # never fails the export
+    class TextOnly:
+        @staticmethod
+        def from_pretrained(repo):
+            return Tok()
+    assert vision.with_base_processor(tok, "x", auto_processor=TextOnly) is tok
