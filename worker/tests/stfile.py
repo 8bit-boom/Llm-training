@@ -48,3 +48,20 @@ def read_folder(folder):
     for p in sorted(Path(folder).glob("*.safetensors")):
         out.update(read_file(p))
     return out
+
+
+def slice_reference(data, shape, width, axis, idx):
+    """pure Python reference for slicing: the bytes of a tensor (shape, `width` bytes per element) keeping only the entries `idx` along `axis`"""
+    elems = [data[i:i + width] for i in range(0, len(data), width)]
+    strides = [numel(shape[k + 1:]) for k in range(len(shape))]
+    out = []
+
+    def walk(dim, base, picked):
+        if dim == len(shape):
+            out.append(elems[base])
+            return
+        rng = idx if dim == axis else range(shape[dim])
+        for i in rng:
+            walk(dim + 1, base + i * strides[dim], picked)
+    walk(0, 0, None)
+    return b"".join(out)

@@ -179,3 +179,46 @@ def test_real_safetensors_library_reads_our_files(tmp_path):
         assert sorted(fh.keys()) == ["a", "b", "z"]
         assert fh.get_tensor("a").tobytes() == fill(0, 48) and fh.get_tensor("b").tobytes() == fill(1, 14)
         assert not fh.get_tensor("z").any()
+
+
+# ---------------------------------------------------------------------------------------- sliced and in-memory tensors (width pruning)
+
+def test_a_sliced_tensor_is_written_in_pieces_and_progress_adds_up(tmp_path):
+    pytest.importorskip("numpy")
+    t = make_source(tmp_path)
+    ref = st.list_tensors(tmp_path)
+    out = tmp_path / "out"
+    seen = []
+    plan = [st.OutTensor("a.weight", "BF16", (3, 2), ref["a.weight"], (1, (3, 0))),            # columns 3 and 0 of a 3 x 4 bf16 matrix
+            st.OutTensor("b.weight", "F32", (5,), ref["b.weight"]),                            # a plain byte copy next to it
+            st.OutTensor("small", "F32", (2,), None, None, b"\x01\x02\x03\x04\x05\x06\x07\x08")]
+    st.write_shards(plan, out, chunk=3, on_progress=lambda d, n: seen.append((d, n)))
+    got = read_file(out / "model.safetensors")
+    a = t[0][3]
+    cols = lambda r, c: a[(r * 4 + c) * 2:(r * 4 + c) * 2 + 2]  # noqa: E731
+    expect = b"".join(cols(r, c) for r in range(3) for c in (3, 0))
+    assert got["a.weight"] == ("BF16", (3, 2), expect)
+    assert got["b.weight"][2] == t[1][3] and got["small"] == ("F32", (2,), b"\x01\x02\x03\x04\x05\x06\x07\x08")
+    assert seen[-1] == (12 + 20 + 8, 40) and [d for d, _ in seen] == sorted(d for d, _ in seen)
+    assert st.list_tensors(out)["a.weight"].shape == (3, 2)
+
+
+def test_a_stop_during_a_sliced_tensor_cancels(tmp_path):
+    pytest.importorskip("numpy")
+    make_source(tmp_path)
+    ref = st.list_tensors(tmp_path)
+    plan = [st.OutTensor("a.weight", "BF16", (3, 2), ref["a.weight"], (1, (0, 1)))]
+    with pytest.raises(st.Cancelled):
+        st.write_shards(plan, tmp_path / "o", should_stop=lambda: True)
+
+
+def test_bad_slice_and_data_plans_are_refused(tmp_path):
+    make_source(tmp_path)
+    ref = st.list_tensors(tmp_path)
+    for bad in (st.OutTensor("x", "BF16", (3, 2), None, (1, (0, 1))), st.OutTensor("x", "F32", (2,), None, None, b"123"),
+                st.OutTensor("x", "BF16", (3, 4), ref["a.weight"], None, b"\0" * 24)):
+        with pytest.raises(ValueError):
+            st.write_shards([bad], tmp_path / "o")
+    if __import__("importlib").util.find_spec("numpy"):
+        with pytest.raises(ValueError, match="produced"):          # a slice that does not produce the promised size
+            st.write_shards([st.OutTensor("a", "BF16", (3, 3), ref["a.weight"], (1, (0, 1)))], tmp_path / "o2")

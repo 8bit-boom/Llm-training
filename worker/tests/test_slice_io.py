@@ -9,7 +9,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from stfile import fill, numel, write_file  # noqa: E402
+from stfile import fill, numel, slice_reference, write_file  # noqa: E402
 
 from ndforge_worker import safetensors_io as st  # noqa: E402
 from ndforge_worker import slice_io  # noqa: E402
@@ -23,23 +23,6 @@ def ref_of(tmp_path, dtype, shape, number=1):
     return st.list_tensors(tmp_path)["w"], data, width
 
 
-def reference_slice(data, shape, width, axis, idx):
-    """pure Python: nested lists of `width`-byte elements"""
-    elems = [data[i:i + width] for i in range(0, len(data), width)]
-    strides = [math.prod(shape[k + 1:]) for k in range(len(shape))]
-    out = []
-
-    def walk(dim, base, picked):
-        if dim == len(shape):
-            out.append(elems[base])
-            return
-        rng = idx if dim == axis else range(shape[dim])
-        for i in rng:
-            walk(dim + 1, base + i * strides[dim], picked)
-    walk(0, 0, None)
-    return b"".join(out)
-
-
 @pytest.mark.parametrize("dtype,shape,axis,idx", [
     ("BF16", (6, 5), 0, [4, 0, 5]), ("BF16", (6, 5), 1, [1, 2, 4]), ("F32", (4, 7), 1, [6, 0]), ("F32", (4, 7), 0, [3]),
     ("BF16", (5, 1, 4), 0, [0, 2, 3]), ("F32", (9,), 0, [8, 7, 1]), ("I64", (3, 2), 0, [2, 0]), ("F16", (3, 4), 1, [3, 3, 0]),
@@ -48,7 +31,7 @@ def test_sliced_bytes_equal_a_pure_python_reference(tmp_path, dtype, shape, axis
     ref, data, width = ref_of(tmp_path, dtype, shape)
     assert ref.shape == shape and ref.dtype == dtype
     got = slice_io.sliced_bytes(ref, axis, idx)
-    assert got == reference_slice(data, shape, width, axis, idx)
+    assert got == slice_reference(data, shape, width, axis, idx)
     assert len(got) == len(data) // shape[axis] * len(idx)
 
 
