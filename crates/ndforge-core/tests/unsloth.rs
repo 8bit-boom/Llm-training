@@ -394,3 +394,17 @@ fn failures_are_explained_and_no_key_reaches_a_message() {
     assert_eq!(explain_failure("boom"), "boom");
     assert!(!explain_failure("zoom room").contains("memory"));
 }
+
+#[test]
+fn the_problem_report_names_unsloth_but_never_shows_a_key_even_inside_a_run_error() {
+    let d = tempdir().unwrap();
+    let (p, _m) = project(d.path());
+    let dir = runs::runs_dir(&p).join("run-key");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), json!({"name": "run-key", "status": "failed", "model": "M", "method": "lora", "error": "Unsloth said: bad key sk-unsloth-SECRET123 given"}).to_string()).unwrap();
+    let mut settings = ndforge_core::settings::Settings::default();
+    settings.unsloth = Some(ndforge_core::settings::UnslothSettings { name: "Desktop".into(), url: "http://127.0.0.1:8888".into() });
+    let report = ndforge_core::diagnose::report(Some(&p), &settings);
+    assert!(report.contains("unsloth: Desktop (http://127.0.0.1:8888)") && report.contains("run-key"), "{report}");
+    assert!(!report.contains("SECRET123") && !report.contains("sk-unsloth-"), "{report}");
+}
