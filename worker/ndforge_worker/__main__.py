@@ -77,6 +77,18 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error({"reshape_inspect": "inspect_failed", "reshape": "reshape_failed", "reshape_measure": "measure_failed"}[kind], _explain(exc))
             return 1
+    if kind in ("distill_cache", "distill", "distill_merge"):
+        from . import distilljob, reshape
+        try:
+            return {"distill_cache": distilljob.run_cache, "distill": distilljob.run, "distill_merge": distilljob.merge}[kind](job)
+        except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
+            protocol.error("distill_unstable" if str(exc) == distilljob.UNSTABLE else "reshape_refused", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain(exc))
+            return 1
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1
 

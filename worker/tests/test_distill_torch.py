@@ -215,3 +215,31 @@ def test_a_cache_of_other_data_is_refused_and_a_stop_file_stops_with_a_saved_ada
     r = ev[-1]["data"]
     assert code == 0 and r["stopped"] is True and r["steps"] == 2 and Path(r["adapter_dir"]).is_dir()
     assert any((tmp_path / "run-stop" / "checkpoints").glob("checkpoint-*"))           # a checkpoint was saved for "Continue"
+
+
+def test_the_numpy_merge_equals_pefts_own_merge(tmp_path):
+    """validates the adapter's key names and the scaling against PEFT's merge_and_unload on a real (tiny) Qwen3.5 text model"""
+    import shutil
+
+    from peft import LoraConfig, get_peft_model
+
+    from ndforge_worker import safetensors_io, slice_io
+    src = build_arch_dir(tmp_path / "b", "qwen3_5", num_layers=4)
+    model = load(src)
+    pm = get_peft_model(model, LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear"))
+    gen = torch.Generator().manual_seed(3)
+    for name, p in pm.named_parameters():
+        if "lora_B" in name:
+            p.data.copy_(torch.randn(p.shape, generator=gen) * 0.05)           # a trained adapter, not the all-zero start
+    pm.save_pretrained(tmp_path / "adapter")
+    reference = pm.merge_and_unload()
+    out = tmp_path / "merged"
+    res = slice_io.merge_lora(safetensors_io.list_tensors(src), tmp_path / "adapter", out)
+    assert res["merged"] > 10 and res["scaling"] == 2.0
+    shutil.copy2(src / "config.json", out / "config.json")
+    ours = load(out)
+    ref_state = reference.state_dict()
+    assert set(ref_state) == set(ours.state_dict())
+    for name, p in ours.state_dict().items():
+        assert torch.allclose(p, ref_state[name], atol=1e-5), name
+    assert torch.allclose(ours(input_ids=IDS, use_cache=False).logits, reference(input_ids=IDS, use_cache=False).logits, atol=1e-4)

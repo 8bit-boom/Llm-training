@@ -803,3 +803,64 @@ def run(cfg: dict) -> int:
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
     return 0
+
+
+# ============================================================================================================ the merge
+
+def merge(cfg: dict) -> int:
+    """job distill_merge: {"base": the thinned model's folder, "adapter": the LoRA folder, "out": ".../healed.partial", "final": ".../healed",
+    "summary": the distill job's result (optional, recorded), "stop_file"}. Adds the LoRA into the weights (numpy, no torch, one tensor at a time) and writes
+    a new, self-contained base model folder. Result: model_dir, merged, bytes_written."""
+    protocol.reserve_stdout()
+    started = time.monotonic()
+    from . import reshapejob, slice_io
+    base, adapter = Path(cfg["base"]), Path(cfg["adapter"])
+    out, final = Path(cfg["out"]), Path(cfg["final"])
+    stop_file = Path(cfg.get("stop_file") or out.parent / "STOP")
+    if final.exists():
+        raise ReshapeError(f"{final} already exists.")
+    tensors = safetensors_io.list_tensors(base)
+    need = sum(t.nbytes for t in tensors.values())
+    free = shutil.disk_usage(out.parent)[2]
+    if free < need * 1.1:
+        protocol.error("disk_full", f"There is not enough free space: {need * 1.1 / 1e9:.1f} GB needed in {out.parent}, {free / 1e9:.1f} GB free.")
+        return 1
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    last = [-1.0]
+
+    def on_progress(done, total):
+        if total and (done / total - last[0] >= 0.01 or done == total):
+            last[0] = done / total
+            protocol.progress("merge", done / total, f"Saving the healed model: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
+
+    try:
+        res = slice_io.merge_lora(tensors, adapter, out, on_progress=on_progress, should_stop=lambda: stop_file.exists())
+        shutil.copy2(base / "config.json", out / "config.json")
+        reshapejob._copy_side_files(base, out)
+        if (base / "width_kept.npz").is_file():
+            shutil.copy2(base / "width_kept.npz", out / "width_kept.npz")
+        try:
+            meta = json.loads((base / "ndforge_reshape.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {"format": 2, "tool": "ND Lore Forge"}
+        s = cfg.get("summary") or {}
+        meta["healed"] = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "from": base.name if base.name != "model" else base.parent.name, "merged_weights": res["merged"],
+                          "lora_rank": res["rank"], "lora_scaling": res["scaling"], **{k: s.get(k) for k in (
+                              "mode", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
+        (out / "ndforge_reshape.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        (out / "README.md").write_text(f"---\n{reshapejob._licence_front_matter(base / 'README.md')}---\n# {out.parent.name} (healed)\n\n"
+                                       f"{base.parent.name}, taught by its original model (distillation).\n\n"
+                                       "Made with ND Lore Forge (Slim or grow a model). See ndforge_reshape.json for the details.\n", encoding="utf-8")
+        out.rename(final)
+    except safetensors_io.Cancelled:
+        shutil.rmtree(out, ignore_errors=True)
+        protocol.result({"stopped": True, "model_dir": None})
+        return 0
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    protocol.progress("done", 1.0, "")
+    protocol.result({"model_dir": str(final), "merged": res["merged"], "bytes_written": need, "seconds": round(time.monotonic() - started, 1), "stopped": False})
+    return 0
