@@ -252,7 +252,7 @@
   "params": 8407396080
  },
  {
-  "name": "9B I 9216 + 24 value heads",
+  "name": "9B I 9216 + 16 value heads",
   "dims": {
    "hidden": 4096,
    "intermediate": 12288,
@@ -272,12 +272,12 @@
   "n_full": 8,
   "width": {
    "intermediate": 9216,
-   "lin_v_heads": 24,
+   "lin_v_heads": 16,
    "heads": 16
   },
   "vision": 456010480,
   "other": 0,
-  "params": 8103734640
+  "params": 7800073200
  },
  {
   "name": "tiny",
