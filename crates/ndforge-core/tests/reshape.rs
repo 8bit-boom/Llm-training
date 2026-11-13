@@ -628,3 +628,76 @@ fn a_run_on_a_made_model_is_tested_against_it_or_against_the_original() {
     assert_eq!((pair.original.as_str(), pair.against, pair.four_bit), ("unsloth/Qwen3.5-4B", "origin", (false, false)));
     assert!(matches!(&pair.trained, eruns::Side::Adapter { base: Some(b), .. } if b == &slim.to_string_lossy()));
 }
+
+// -------------------------------------------------------------------------------------- export and training of runs on made models
+use ndforge_core::export::runs as exports;
+
+/// a made model that was grown from 12 to 16 layers (the second copies of layers 2..5 are the new, switched-off layers)
+fn grown_model(p: &Project, name: &str, zero: bool) -> std::path::PathBuf {
+    let model = made_model(p, name, 1_800_000_000, 2_400_000_000);
+    let src: Vec<u32> = (0..6).chain(2..12).collect();
+    let new: Vec<u32> = (6..10).collect();
+    std::fs::write(model.join("ndforge_reshape.json"), json!({"format": 1, "origin": {"repo": "unsloth/Qwen3.5-4B", "family": "qwen3_5", "layers": 12, "params": 1_800_000_000u64},
+        "mode": "grow", "layers": 16, "params": 2_400_000_000u64, "src_layers": src, "dropped": [], "duplicated": [2, 3, 4, 5], "zero_init": if zero { json!(new) } else { json!([]) }}).to_string()).unwrap();
+    model
+}
+
+#[cfg(unix)]
+#[test]
+fn the_export_of_a_run_on_a_made_model_uses_the_originals_vision_file_and_says_where_the_base_came_from() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    let bin = d.path().join("env/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("python"), "#!/bin/sh\nout=$(sed -n 's/.*\"out\":\"\\([^\"]*\\)\".*/\\1/p' \"$5\")\nquant=$(sed -n 's/.*\"quant\":\"\\([^\"]*\\)\".*/\\1/p' \"$5\")\ncp \"$5\" \"$out/job-seen.json\"\nprintf GGUF > \"$out/model-$quant.gguf\"\necho \"{\\\"type\\\":\\\"result\\\",\\\"data\\\":{\\\"gguf\\\":\\\"$out/model-$quant.gguf\\\",\\\"quant\\\":\\\"$quant\\\"}}\"\n").unwrap();
+    std::fs::set_permissions(bin.join("python"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("NDFORGE_ENV_DIR", d.path().join("env"));
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project_with_test_split(d.path());
+    let slim = made_model(&p, "m1", 1_800_000_000, 1_240_000_000);
+    run_on(&p, "run-slim", &slim);
+    run_on(&p, "run-plain", std::path::Path::new("unsloth/Qwen3.5-4B"));
+    let none = AtomicBool::new(false);
+    exports::execute(&p, "run-slim", "q4_k_m", 8192, &none, &mut |_| {}).unwrap();
+    let dir = p.folder.join("exports/run-slim-q4_k_m");
+    let job = captured(&dir.join("job-seen.json"));
+    assert_eq!((job["base"]["repo"].as_str().unwrap(), job["base"]["vision_repo"].as_str()), (slim.to_string_lossy().as_ref(), Some("unsloth/Qwen3.5-4B")));
+    let card = std::fs::read_to_string(dir.join("MODEL_CARD.md")).unwrap();
+    assert!(card.contains("made from unsloth/Qwen3.5-4B by removing or adding layers"), "{card}");
+    // an ordinary base: nothing changes
+    exports::execute(&p, "run-plain", "q4_k_m", 8192, &none, &mut |_| {}).unwrap();
+    let dir = p.folder.join("exports/run-plain-q4_k_m");
+    assert!(captured(&dir.join("job-seen.json"))["base"].get("vision_repo").is_none());
+    assert!(!std::fs::read_to_string(dir.join("MODEL_CARD.md")).unwrap().contains("made from"));
+}
+
+#[test]
+fn a_grown_base_that_starts_switched_off_also_trains_its_output_projections() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project_with_test_split(d.path());
+    let mut m = catalog::find("qwen3.5-4b").unwrap();
+    let hyper = base_hyper(Preset::Normal);
+    let job_for = |m: &catalog::ModelEntry, h: &ndforge_core::train::plan::Hyper| truns::build_job(&p, m, Method::Lora, h, 1, "r1", false);
+    // an ordinary model: the job is as before
+    let job = job_for(&m, &hyper).unwrap();
+    assert!(job["hyper"].get("extra_targets").is_none() && job["hyper"].get("layers_to_transform").is_none());
+    // a grown model with switched-off layers
+    m.repo = grown_model(&p, "g1", true).to_string_lossy().to_string();
+    let job = job_for(&m, &hyper).unwrap();
+    assert_eq!(job["hyper"]["extra_targets"], json!(["out_proj"]));
+    assert!(job["hyper"].get("layers_to_transform").is_none());
+    // a grown model that was copied (SOLAR style) needs nothing extra
+    m.repo = grown_model(&p, "g2", false).to_string_lossy().to_string();
+    assert!(job_for(&m, &hyper).unwrap()["hyper"].get("extra_targets").is_none());
+    // the expert option: only the new layers
+    let only = ndforge_core::train::plan::Hyper { only_new_layers: true, ..hyper.clone() };
+    assert_eq!(job_for(&m, &only).unwrap()["hyper"]["layers_to_transform"], json!([6, 7, 8, 9]));
+    m.repo = made_model(&p, "slim", 1, 1).to_string_lossy().to_string();           // a slimmed model has no added layers
+    assert!(job_for(&m, &only).unwrap_err().0.contains("grown on the Slim or grow page"));
+    m.repo = "unsloth/Qwen3.5-4B".into();
+    assert!(job_for(&m, &only).is_err());
+    assert_eq!(truns::new_layers(&json!({"src_layers": [0, 1, 2, 1, 2, 3]})), vec![3, 4]);
+}

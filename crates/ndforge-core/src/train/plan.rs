@@ -77,6 +77,9 @@ pub struct Hyper {
     /// "auto" (Unsloth when it is installed, else the standard libraries), "unsloth" or "standard" (Transformers + PEFT + TRL only)
     #[serde(default = "auto")]
     pub engine: String,
+    /// Expert: train LoRA only in the layers a grown model added (a base made on the "Slim or grow a model" page by growing it)
+    #[serde(default)]
+    pub only_new_layers: bool,
 }
 
 fn off() -> String {
@@ -137,7 +140,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     if method == Method::Full {
         let f = |epochs: f64, max_steps, seq, warmup| Hyper {
             rank: 0, alpha: 0, lr: 1e-5, epochs, max_steps, batch: 1, grad_accum: 16, max_seq: seq, warmup, weight_decay: 0.01, scheduler: "linear".into(),
-            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(),
+            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(), only_new_layers: false,
         };
         return match preset {
             Preset::Quick => Hyper { grad_accum: 4, ..f(1.0, Some(60), 1024, 5) },
@@ -147,7 +150,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     }
     let common = |rank, alpha, lr, epochs: f64, max_steps, batch, accum, seq, warmup| Hyper {
         rank, alpha, lr, epochs, max_steps, batch, grad_accum: accum, max_seq: seq, warmup, weight_decay: 0.001, scheduler: "linear".into(),
-        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(),
+        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(), only_new_layers: false,
     };
     match preset {
         // proves the whole chain works in minutes; the model will not have learned much

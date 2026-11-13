@@ -100,6 +100,8 @@ def load_unsloth(cfg: dict):
         model = FastModel.get_peft_model(model, finetune_vision_layers=False, finetune_language_layers=True,
                                          finetune_attention_modules=True, finetune_mlp_modules=True, **common)
     else:
+        if h.get("extra_targets"):
+            protocol.log("Also training: " + ", ".join(h["extra_targets"]) + " (the model has layers that were switched off when it was grown).")
         peft_kw = dict(target_modules=lora_targets(h), use_gradient_checkpointing="unsloth", max_seq_length=h["max_seq"], **common)
         layers = lora_layers(h)
         if layers:
