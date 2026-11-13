@@ -194,3 +194,23 @@ def test_the_job_measures_when_nothing_is_cached_and_reuses_it_next_time(tmp_pat
     code, ev2 = run_job(tmp_path, j2)
     assert code == 0 and any("earlier measurement" in e.get("text", "") for e in ev2 if e["type"] == "log")
     assert ev2[-1]["data"]["chosen_blocks"] == r["chosen_blocks"]
+
+
+# ------------------------------------------------------------------------------------------------ 6: GGUF with a real llama.cpp
+
+def test_a_width_pruned_model_can_be_exported_to_gguf_with_llama_cpp(tmp_path):
+    pytest.importorskip("trl")
+    pytest.importorskip("peft")
+    from ndforge_worker import exportjob
+    if exportjob.find_llama_cpp()[0] is None:
+        pytest.skip("llama.cpp is not installed here (set LLAMA_CPP_DIR)")
+    from test_train_cpu import run_export
+    from test_train_cpu import run_job as run_train
+    original = build_arch_dir(tmp_path / "model", "qwen3_5", num_layers=8, heads=HEADS, kv_heads=KV, lin_v_heads=NV)
+    j, r = run_width(tmp_path, original, {"intermediate_size": 80, "linear_num_value_heads": 4, "num_attention_heads": 4})
+    slim = Path(j["final"])
+    p, ev, out = run_train(tmp_path, "qwen3_5", "real", model={"repo": str(slim)}, hyper={"max_steps": 2})
+    assert p.returncode == 0, p.stderr[-3000:]
+    p2, ev2 = run_export(tmp_path, "qwen3_5", out, base={"repo": str(slim), "family": "qwen3_5"}, gguf=True, quant="q8_0")
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    assert Path(ev2[-1]["data"]["gguf"]).stat().st_size > 0
