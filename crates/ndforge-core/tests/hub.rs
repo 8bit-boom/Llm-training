@@ -236,9 +236,9 @@ fn a_model_that_is_a_folder_is_trained_on_this_computer_only() {
 fn a_folder_made_by_slim_or_grow_has_its_exact_size_and_says_where_it_came_from() {
     let (_g, d) = setup();
     let meta = json!({"format": 1, "origin": {"repo": "acme/Big-27B", "layers": 64, "params": 27_800_000_000u64}, "mode": "prune", "layers": 48, "params": 21_634_000_000u64});
-    let f = model_folder(d.path(), "20261113-slim-48L", &[("README.md", "---\nlicense: apache-2.0\n---\n# Slim\n"), ("ndforge_reshape.json", &meta.to_string())], &[("model.safetensors", 43_000_000_000)]);
+    let f = model_folder(d.path(), "20261113-slim-48L", &[("README.md", "---\nlicense: apache-2.0\n---\n# Slim\n"), ("ndforge_reshape.json", &meta.to_string())], &[("model.safetensors", 50_000_000)]);       // small on purpose: Windows does not make set_len sparse
     let found = lookup(&f.to_string_lossy()).unwrap();
-    assert!((found.entry.params_b - 21.63).abs() < 0.001, "{:?}", found.entry);                    // the exact figure, not file size / 2 (which would be 21.5)
+    assert!((found.entry.params_b - 21.63).abs() < 0.001, "{:?}", found.entry);                    // the exact figure from the metadata, not file size / 2 (which would be 0.03)
     assert!(!found.warnings.iter().any(|w| w.contains("estimated")), "{:?}", found.warnings);
     assert!(found.warnings.iter().any(|w| w.contains("made by Slim or grow from acme/Big-27B")), "{:?}", found.warnings);
     assert_eq!(found.entry.license, "apache-2.0");
