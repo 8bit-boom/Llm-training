@@ -306,7 +306,7 @@ after healing with 20 to 40 million tokens** (NVIDIA used 94 billion for its mod
 | 7 | Merge: loss of the merged healed folder (16-bit) against the adapter on the 4-bit student | not run |
 | 8 | The Expert axes (value heads 48 to 32, attention heads 24 to 20 / 16) on the 9B: quality after healing against MLP-only at the same size; if good, set `EXPERIMENTAL_AXES_PASSED` to true | not run |
 
-**Steps of the plan that were not done:** step 20 (the GPU run itself: this checklist); step 21 *(optional)* hidden-size pruning for a text-only export; step 22 *(optional)* an intermediate-state loss for
+**Steps of the plan that were not done:** the optional Unsloth `extra_targets` for the linear-attention layers when a width model is trained in Step 3 (`train/runs.rs`; the plain-libraries path trains every linear layer with `all-linear` already); step 20 (the GPU run itself: this checklist); step 21 *(optional)* hidden-size pruning for a text-only export; step 22 *(optional)* an intermediate-state loss for
 "Both" with three or more blocks removed.
 
 ## Follow-ups (optional steps 18-20 of the plan of version 1, and the open steps of version 2)

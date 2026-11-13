@@ -6,7 +6,9 @@
 //!                          a project may hold SEVERAL worlds: the first is the main one, further ones are listed under [[worlds]] in project.toml
 //! datasets/vN/             saved training-data versions   (step 2)
 //! runs/<name>/             training runs                  (step 3)
-//! models/<name>/           slimmed or grown models        ("Slim or grow a model": state.json, result.json, test.json, model/)
+//! models/<name>/           slimmed or grown models        ("Slim or grow a model": state.json, result.json, test.json, model/;
+//!                          thinner layers also heal.json, distill/cache/ (the original's answers), distill/run/ (the LoRA), healed/, test_healed.json)
+//! models/_scores/<key>/    one measurement per model, data version and settings (reused for every width of the same model)
 //! exports/                 GGUF / Modelfile               (step 5)
 //! ```
 use std::path::{Path, PathBuf};
