@@ -1,7 +1,7 @@
 //! A training run in Unsloth: send the data, follow the job, bring the adapter back (see `docs/UNSLOTH_DESKTOP.md`).
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +134,19 @@ pub fn fetch_adapter(client: &UnslothClient, fine_tuned_model: &str, dest: &Path
     Ok(FetchOutcome::Copied)
 }
 
+/// Unsloth's failure texts in plain words (the table in the contract document).
+pub fn explain_failure(msg: &str) -> String {
+    let m = scrub(msg);
+    let low = m.to_lowercase();
+    if low.contains("out of memory") || low.split(|c: char| !c.is_alphanumeric()).any(|w| w == "oom") {
+        "Unsloth ran out of graphics memory. Choose QLoRA, a shorter context or a smaller model, and close chat models in Unsloth.".to_string()
+    } else if low.contains("no space left") || low.contains("errno 28") {
+        "The disk is full on the computer where Unsloth runs. Free space and try again.".to_string()
+    } else {
+        m
+    }
+}
+
 /// How many polls may fail in a row before the run is marked interrupted (Unsloth keeps training meanwhile).
 const MAX_POLL_FAILURES: u32 = 180;
 /// How many pages of 100 events are read back when a reattached run missed more than one page.
@@ -170,14 +183,17 @@ fn new_events(client: &UnslothClient, id: &str, seen: &HashSet<String>) -> Resul
         more = m;
         pages += 1;
     }
-    all.retain(|e| e["id"].as_str().is_some_and(|i| !seen.contains(i)));
+    // newest first: keep what comes before the newest event already known
+    if let Some(at) = all.iter().position(|e| e["id"].as_str().is_some_and(|i| seen.contains(i))) {
+        all.truncate(at);
+    }
     all.reverse();
     Ok(all)
 }
 
 /// Trains in Unsloth to the end and keeps the run's state like a local run. `poll` is the pause between asking Unsloth for news.
 /// When Unsloth runs on this computer the adapter is copied into the run's `adapter` folder (`fetch_adapter`); else it stays in Unsloth's run folder.
-pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name: &str, mut job: Value, target: &UnslothTarget, stop: Arc<AtomicBool>, _resume: bool, poll: Duration,
+pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name: &str, mut job: Value, target: &UnslothTarget, stop: Arc<AtomicBool>, resume: bool, poll: Duration,
                        on_event: &mut dyn FnMut(Value)) -> Result<Value> {
     let dir = runs_dir(p).join(name);
     std::fs::create_dir_all(&dir)?;
@@ -189,7 +205,6 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
                                "seq": hyper.max_seq, "batch": hyper.batch, "error": null, "created": prior["created"].as_str().unwrap_or(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())}));
     let client = UnslothClient::new(&target.url, &target.key);
     let mut rec = Recorder::new(&dir)?;
-    let _ = &stop;
 
     let outcome = (|| -> Result<Value> {
         stage(on_event, "Connecting to Unsloth");
@@ -206,34 +221,66 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
         if probe.chat_only == Some(true) && !probe.cpu_training {
             return Err(Error::new("Unsloth reports no usable graphics card for training. Check the card in Unsloth, or train on this computer."));
         }
-        // the data: the same rows as the Studio export
-        let version = job["dataset"]["version"].as_u64().unwrap_or(0) as u32;
-        let (train, eval, _) = chatml_rows(p, version, true);
-        if train.is_empty() {
-            return Err(Error::new("This data version has no examples Unsloth can use."));
+        // continue: reattach to the job Unsloth still has, fetch what it finished, or send the data again
+        let mut id = String::new();
+        let mut reattached = false;
+        if resume {
+            if let Some(old) = prior["unsloth_job"].as_str() {
+                match client.job(old)? {
+                    None => {
+                        set_run_state(&dir, json!({"unsloth_job": null}));
+                        return Err(Error::new("Unsloth no longer knows this job (it was waiting in its queue when Unsloth restarted). Press Continue to send it again."));
+                    }
+                    Some(j) if matches!(j["status"].as_str(), Some("running" | "queued" | "validating_files" | "succeeded")) => {
+                        id = old.to_string();
+                        reattached = true;
+                        stage(on_event, if j["status"] == "succeeded" { "The training had already finished; fetching the result" } else { "Reconnecting to the training that is still running" });
+                    }
+                    Some(_) => {}   // failed or cancelled there: start it again below
+                }
+            }
         }
-        let (train_path, eval_path) = (dir.join("unsloth-train.jsonl"), dir.join("unsloth-eval.jsonl"));
-        std::fs::write(&train_path, train.join("\n") + "\n")?;
-        stage(on_event, "Sending the training data");
-        let up = |text: &'static str| move |v: f64| json!({"kind": "progress", "step": "upload", "value": v, "text": text});
-        let train_id = client.upload_jsonl("train.jsonl", &train_path, &mut |v| on_event(up("Sending the training data")(v)))?;
-        let eval_id = if eval.is_empty() { None } else {
-            std::fs::write(&eval_path, eval.join("\n") + "\n")?;
-            Some(client.upload_jsonl("eval.jsonl", &eval_path, &mut |v| on_event(up("Sending the test questions")(v)))?)
-        };
-        let body = job_body(m, method, hyper, name, &train_id, eval_id.as_deref())?;
-        let started = client.start_job(&body)?;
-        let id = started["id"].as_str().ok_or_else(|| Error::new("Unsloth did not give the job an id."))?.to_string();
-        std::fs::write(dir.join("unsloth.json"), serde_json::to_vec_pretty(&started)?)?;
-        set_run_state(&dir, json!({"unsloth_job": id}));
-        stage(on_event, if started["status"] == "queued" { "Waiting for Unsloth's graphics card (it is busy with another job)" } else { "Training in Unsloth" });
-
+        if !reattached {
+            // the data: the same rows as the Studio export
+            let version = job["dataset"]["version"].as_u64().unwrap_or(0) as u32;
+            let (train, eval, _) = chatml_rows(p, version, true);
+            if train.is_empty() {
+                return Err(Error::new("This data version has no examples Unsloth can use."));
+            }
+            let (train_path, eval_path) = (dir.join("unsloth-train.jsonl"), dir.join("unsloth-eval.jsonl"));
+            std::fs::write(&train_path, train.join("\n") + "\n")?;
+            stage(on_event, "Sending the training data");
+            let up = |text: &'static str| move |v: f64| json!({"kind": "progress", "step": "upload", "value": v, "text": text});
+            let train_id = client.upload_jsonl("train.jsonl", &train_path, &mut |v| on_event(up("Sending the training data")(v)))?;
+            let eval_id = if eval.is_empty() { None } else {
+                std::fs::write(&eval_path, eval.join("\n") + "\n")?;
+                Some(client.upload_jsonl("eval.jsonl", &eval_path, &mut |v| on_event(up("Sending the test questions")(v)))?)
+            };
+            let body = job_body(m, method, hyper, name, &train_id, eval_id.as_deref())?;
+            let started = client.start_job(&body)?;
+            let started_id = started["id"].as_str().ok_or_else(|| Error::new("Unsloth did not give the job an id."))?.to_string();
+            std::fs::write(dir.join("unsloth.json"), serde_json::to_vec_pretty(&started)?)?;
+            set_run_state(&dir, json!({"unsloth_job": started_id, "unsloth_events_seen": null}));
+            stage(on_event, if started["status"] == "queued" { "Waiting for Unsloth's graphics card (it is busy with another job)" } else { "Training in Unsloth" });
+            id = started_id;
+        }
         // follow the job
         let mut seen: HashSet<String> = HashSet::new();
         let (mut last_step, mut total, mut last_loss) = (0u64, 0u64, Value::Null);
+        if reattached {
+            // what the run already showed: the charts keep their lines, only newer events are added
+            if let Some(i) = prior["unsloth_events_seen"].as_str() { seen.insert(i.to_string()); }
+            (last_step, total, last_loss) = (prior["step"].as_u64().unwrap_or(0), prior["total_steps"].as_u64().unwrap_or(0), prior["loss"].clone());
+        }
+        let mut asked_stop = false;
         let mut failures = 0u32;
         let mut shown = String::new();
         loop {
+            if stop.load(Ordering::SeqCst) && !asked_stop {
+                asked_stop = true;
+                stage(on_event, "Stopping the training in Unsloth");
+                let _ = client.cancel(&id);   // already finished is fine: the next poll says so
+            }
             match client.job(&id) {
                 Ok(Some(j)) => {
                     failures = 0;
@@ -241,6 +288,7 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
                         for e in events {
                             if let Some(i) = e["id"].as_str() {
                                 seen.insert(i.to_string());
+                                set_run_state(&dir, json!({"unsloth_events_seen": i}));
                             }
                             if e["type"] == "metrics" {
                                 let ev = metric_of(&e);
@@ -266,16 +314,23 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
                             return Ok(json!({"steps": last_step, "total_steps": total.max(last_step), "final_loss": last_loss, "peak_vram_mb": null, "stopped": false, "backend": "unsloth-desktop",
                                              "fine_tuned_model": folder}));
                         }
-                        "failed" => return Err(Error::new(scrub(j["error"]["message"].as_str().unwrap_or("Unsloth reported that the training failed.")))),
-                        "cancelled" => return Err(Error::new("The job was cancelled in Unsloth.")),
+                        "failed" => return Err(Error::new(explain_failure(j["error"]["message"].as_str().unwrap_or("Unsloth reported that the training failed.")))),
+                        "cancelled" => {
+                            // stopped here, or in Unsloth: the run ends "stopped" (a cancelled job cannot be continued)
+                            return Ok(json!({"steps": last_step, "total_steps": total.max(last_step), "final_loss": last_loss, "peak_vram_mb": null, "stopped": true, "backend": "unsloth-desktop"}));
+                        }
                         _ => {}
                     }
                 }
-                Ok(None) => return Err(Error::new("Unsloth no longer knows this job (it was waiting in its queue when Unsloth restarted). Press Train to send it again.")),
+                Ok(None) => {
+                    set_run_state(&dir, json!({"unsloth_job": null}));
+                    return Err(Error::new("Unsloth no longer knows this job (it was waiting in its queue when Unsloth restarted). Press Continue to send it again."));
+                }
                 Err(e) => {
                     failures += 1;
                     if failures >= MAX_POLL_FAILURES {
-                        return Err(Error::new(format!("Lost the connection to Unsloth. ({})", e.0)));
+                        set_run_state(&dir, json!({"status": "interrupted", "error": e.0}));
+                        return Err(Error::new(format!("Lost the connection to Unsloth. The training may still be running there; press \"Continue\" to reconnect. ({})", e.0)));
                     }
                 }
             }
@@ -283,7 +338,7 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
         }
     })();
     let mut outcome = outcome;
-    if let Ok(r) = outcome.as_mut() {
+    if let Some(r) = outcome.as_mut().ok().filter(|r| r["stopped"] != true) {
         let folder = r["fine_tuned_model"].as_str().unwrap_or("").to_string();
         stage(on_event, "Fetching the trained model");
         let fetched = fetch_adapter(&client, &folder, &dir.join("adapter"), &|d| crate::envmgr::health::free_disk_gb(d));
@@ -303,5 +358,14 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
             }
         }
     }
-    finish(&dir, m, method, hyper, outcome, false)
+    // an interruption keeps its own state (the job goes on in Unsloth); everything else is finished like a local run
+    if std::fs::read(dir.join("state.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|s| s["status"] == "interrupted") {
+        return outcome;
+    }
+    let stopped = matches!(&outcome, Ok(r) if r["stopped"] == true);
+    let end = finish(&dir, m, method, hyper, outcome, false);
+    if stopped {
+        set_run_state(&dir, json!({"resumable": false}));
+    }
+    end
 }

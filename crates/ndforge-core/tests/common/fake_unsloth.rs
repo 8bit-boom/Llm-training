@@ -33,6 +33,9 @@ pub struct State {
     pub fail: Option<(u32, String)>,
     /// the job id answers 404 (a queue lost in a restart)
     pub forget_jobs: bool,
+    /// the job routes answer 500 once this many polls were made (a lost connection); a test can switch it off again
+    pub break_at: Option<u32>,
+    pub broken: bool,
     pub total_steps: u32,
     /// where the adapter lives on "Desktop's" disk (a folder of the test)
     pub outputs_dir: String,
@@ -49,7 +52,7 @@ pub struct State {
 
 impl State {
     fn new(outputs_dir: &str) -> State {
-        State { key: KEY.into(), desktop: true, not_unsloth: false, fine_tuning: true, chat_only: false, queue_polls: 0, hold: false, fail: None, forget_jobs: false, total_steps: 4,
+        State { key: KEY.into(), desktop: true, not_unsloth: false, fine_tuning: true, chat_only: false, queue_polls: 0, hold: false, fail: None, forget_jobs: false, break_at: None, broken: false, total_steps: 4,
                 outputs_dir: outputs_dir.into(), files: vec![], job_bodies: vec![], requests: vec![], authorization: vec![], job_id: None, polls: 0, cancelled: false }
     }
 
@@ -253,6 +256,9 @@ fn handle(state: &Arc<Mutex<State>>, mut req: tiny_http::Request) {
         }
         let rest = rest.trim_start_matches('/');
         let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if s.broken {
+            return error(req, 500, "boom");
+        }
         if s.forget_jobs || s.job_id.as_deref() != Some(id) {
             return error(req, 404, "Job not found");
         }
@@ -260,6 +266,9 @@ fn handle(state: &Arc<Mutex<State>>, mut req: tiny_http::Request) {
         match (method.as_str(), tail) {
             ("GET", "") => {
                 s.polls += 1;
+                if s.break_at == Some(s.polls) {
+                    s.broken = true;
+                }
                 let j = job_object(&s, &b);
                 return reply(req, 200, j);
             }

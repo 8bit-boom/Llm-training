@@ -312,3 +312,85 @@ fn a_full_disk_or_an_old_adapter_folder_is_handled_before_anything_half_written_
     std::fs::remove_dir_all(outputs.join(common::fake_unsloth::RUN_FOLDER)).unwrap();
     assert!(matches!(fetch_adapter(&c, common::fake_unsloth::RUN_FOLDER, &dest, &|_| None).unwrap(), FetchOutcome::NotReachable(_)));
 }
+
+fn state_of(p: &Project, n: &str) -> Value {
+    serde_json::from_slice(&std::fs::read(runs::runs_dir(p).join(n).join("state.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn stop_cancels_the_job_in_unsloth_and_the_run_cannot_be_continued() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let f = Fake::start(&d.path().join("outputs"));
+    f.with(|s| s.hold = true);
+    let (r, events) = run(&p, &m, &f, "run-stop", Arc::new(AtomicBool::new(true)));
+    let r = r.unwrap();
+    assert_eq!(r["stopped"], true);
+    assert_eq!(f.count("/cancel"), 1);
+    assert!(events.iter().any(|e| e["text"] == "Stopping the training in Unsloth"));
+    assert_eq!(state_of(&p, "run-stop")["status"], "stopped");
+    let listed = runs::list_runs(&p);
+    assert_eq!((listed[0]["resumable"].clone(), listed[0]["has_adapter"].clone()), (json!(false), json!(false)));
+    assert!(!runs::resumable(&p, "run-stop"));
+}
+
+#[test]
+fn a_lost_connection_marks_the_run_interrupted_and_continue_reattaches_without_doubling_the_charts() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let outputs = d.path().join("outputs");
+    write_adapter(&outputs);
+    let f = Fake::start(&outputs);
+    f.with(|s| s.break_at = Some(3));
+    let (r, _) = run(&p, &m, &f, "run-int", Arc::new(AtomicBool::new(false)));
+    let e = r.unwrap_err().0;
+    assert!(e.contains("Lost the connection to Unsloth") && e.contains("Continue"), "{e}");
+    assert_eq!(state_of(&p, "run-int")["status"], "interrupted");
+    assert!(runs::resumable(&p, "run-int"));
+    let seen_before = runs::read_metrics(&p, "run-int").iter().filter(|e| e["type"] == "metric").count();
+    assert!(seen_before >= 1 && seen_before < 4);
+    // Unsloth is back: continue
+    f.with(|s| { s.broken = false; s.break_at = None; });
+    let hyper = sample_hyper();
+    let job = runs::build_job(&p, &m, Method::Lora, &hyper, 1, "run-int", true).unwrap();
+    let mut events = vec![];
+    let r = execute_unsloth(&p, &m, Method::Lora, &hyper, "run-int", job, &target(&f), Arc::new(AtomicBool::new(false)), true, Duration::from_millis(5), &mut |e| events.push(e)).unwrap();
+    assert_eq!((r["steps"].as_u64(), r["adapter_remote"].clone()), (Some(4), json!(false)));
+    let steps: Vec<u64> = runs::read_metrics(&p, "run-int").iter().filter(|e| e["type"] == "metric").map(|e| e["step"].as_u64().unwrap()).collect();
+    assert_eq!(steps, [1, 2, 3, 4], "every step once");
+    assert_eq!(f.with(|s| s.job_bodies.len()), 1, "no second job was started");
+    assert_eq!(state_of(&p, "run-int")["status"], "done");
+}
+
+#[test]
+fn a_waiting_job_forgotten_by_unsloth_gives_a_plain_message_and_continue_sends_it_again() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let f = Fake::start(&d.path().join("outputs"));
+    f.with(|s| { s.break_at = Some(1); });
+    let (r, _) = run(&p, &m, &f, "run-lost", Arc::new(AtomicBool::new(false)));
+    assert!(r.is_err());
+    f.with(|s| { s.broken = false; s.break_at = None; s.forget_jobs = true; });
+    let hyper = sample_hyper();
+    let job = runs::build_job(&p, &m, Method::Lora, &hyper, 1, "run-lost", true).unwrap();
+    let e = execute_unsloth(&p, &m, Method::Lora, &hyper, "run-lost", job.clone(), &target(&f), Arc::new(AtomicBool::new(false)), true, Duration::from_millis(5), &mut |_| {}).unwrap_err().0;
+    assert!(e.contains("Unsloth no longer knows this job") && e.contains("restarted"), "{e}");
+    assert_eq!(state_of(&p, "run-lost")["status"], "failed");
+    assert!(state_of(&p, "run-lost")["unsloth_job"].is_null());
+    // Continue now sends the data again as a new job
+    f.with(|s| s.forget_jobs = false);
+    let r = execute_unsloth(&p, &m, Method::Lora, &hyper, "run-lost", job, &target(&f), Arc::new(AtomicBool::new(false)), true, Duration::from_millis(5), &mut |_| {});
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(f.with(|s| s.job_bodies.len()), 2);
+}
+
+#[test]
+fn failures_are_explained_and_no_key_reaches_a_message() {
+    use ndforge_core::unsloth::run::explain_failure;
+    assert!(explain_failure("CUDA out of memory. Tried to allocate 2 GiB").contains("ran out of graphics memory"));
+    assert!(explain_failure("torch.OutOfMemoryError: OOM at step 3").contains("QLoRA"));
+    assert!(explain_failure("OSError: [Errno 28] No space left on device").contains("disk is full"));
+    assert!(!explain_failure("failed with key sk-unsloth-abc123 here").contains("abc123"));
+    assert_eq!(explain_failure("boom"), "boom");
+    assert!(!explain_failure("zoom room").contains("memory"));
+}
