@@ -17,6 +17,7 @@ fn inspect(layers: u32, period: u32, per_layer: u64, other: u64) -> Inspect {
         model_type: "qwen3_5".into(), supported: true, why: None, layers, layer_types: vec![], period, blocks: layers / period,
         layer_params: vec![per_layer; layers as usize], embed_params: other / 2, lm_head_params: 0, vision_params: other / 4, mtp_params: other / 8, other_params: other / 8,
         total_params: per_layer * layers as u64 + other, bytes_per_param: 2.0, has_vision: true, tied: true, source_bytes: 0, local: true,
+        ..Default::default()
     }
 }
 
@@ -171,6 +172,168 @@ fn the_inspect_result_of_the_worker_parses() {
     assert_eq!((ins.layers, ins.blocks, ins.total_params, ins.source_bytes), (8, 2, 21, 42));
     let s: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "x", "mode": "grow", "blocks": 2})).unwrap();
     assert_eq!((s.strategy.as_str(), s.protect_first, s.protect_last, s.init.as_str(), s.calib_samples, s.calib_len, s.load.as_str()), ("contiguous", 1, 1, "identity", 128, 512, "auto"));
+}
+
+// ------------------------------------------------------------------------------------------------------- thinner layers (width)
+
+const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker/tests/data");
+
+fn dims_of(tc: &serde_json::Value) -> WidthDims {
+    let u = |k: &str| tc[k].as_u64().unwrap_or(0) as u32;
+    WidthDims {
+        hidden: u("hidden_size"), intermediate: u("intermediate_size"), heads: u("num_attention_heads"), kv_heads: u("num_key_value_heads"), head_dim: u("head_dim"),
+        lin_k_heads: u("linear_num_key_heads"), lin_v_heads: u("linear_num_value_heads"), lin_k_dim: u("linear_key_head_dim"), lin_v_dim: u("linear_value_head_dim"),
+        conv_kernel: u("linear_conv_kernel_dim"), mtp_layers: u("mtp_num_hidden_layers"), vocab: u("vocab_size"), tied: tc["tie_word_embeddings"].as_bool().unwrap_or(false),
+    }
+}
+
+/// The real Qwen3.5-27B (config from the Hugging Face Hub, in the worker's test data): 64 layers, MLP 17,408, 48 value heads, 24 heads
+fn qwen27() -> Inspect {
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{DATA}/qwen3_5_27b_config.json")).unwrap()).unwrap();
+    let tc = &cfg["text_config"];
+    let d = dims_of(tc);
+    let types: Vec<String> = tc["layer_types"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+    let div = 256;
+    Inspect {
+        model_type: "qwen3_5".into(), supported: true, layers: 64, layer_types: types, period: 4, blocks: 16, vision_params: 460_730_096, other_params: d.hidden as u64,
+        total_params: 27_781_427_952, bytes_per_param: 2.0, has_vision: true, local: true, width_supported: true,
+        width_choices: Some(WidthChoices { intermediate: (34..=68).map(|k| k * div).collect(), lin_v_heads: vec![48, 32], heads: vec![24, 20, 16] }),
+        width_dims: Some(d), ..Default::default()
+    }
+}
+
+fn wspec(blocks: u32, intermediate: u32) -> ReshapeSpec {
+    ReshapeSpec { width: Some(Width { intermediate, lin_v_heads: None, heads: None }), ..spec(Mode::Prune, blocks) }
+}
+
+#[test]
+fn width_parameter_counts_equal_the_workers_table() {
+    let table: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{DATA}/width_params.json")).unwrap()).unwrap();
+    let cases = table.as_array().unwrap();
+    assert!(cases.len() >= 8);
+    for c in cases {
+        let d: WidthDims = serde_json::from_value(c["dims"].clone()).unwrap();
+        let w = WidthSizes { intermediate: c["width"]["intermediate"].as_u64().unwrap() as u32, lin_v_heads: c["width"]["lin_v_heads"].as_u64().unwrap() as u32, heads: c["width"]["heads"].as_u64().unwrap() as u32 };
+        let got = width_params_dims(&d, c["n_lin"].as_u64().unwrap(), c["n_full"].as_u64().unwrap(), &w, c["vision"].as_u64().unwrap(), c["other"].as_u64().unwrap());
+        assert_eq!(got, c["params"].as_u64().unwrap(), "{}", c["name"]);
+    }
+}
+
+#[test]
+fn the_27b_gets_one_exact_stop_per_mlp_width() {
+    let ins = qwen27();
+    let full = Width { intermediate: 17408, lin_v_heads: None, heads: None };
+    assert_eq!(width_params(&ins, &(0..64).collect::<Vec<_>>(), &full), 27_781_427_952, "the original's own size, from the formula");
+    let opts = width_options(&ins, 0, Some(32.0), None, None);
+    assert_eq!(opts.len(), 35);
+    assert_eq!((opts[0].intermediate, opts[34].intermediate), (Some(8704), Some(17408)), "ascending: the thinnest first");
+    let at = |i: u32| opts.iter().find(|o| o.intermediate == Some(i)).unwrap();
+    assert_eq!((at(13312).params_b, at(10752).params_b), (23.69, 21.14));
+    assert!(at(13312).exact && at(10752).layers == 64 && at(10752).blocks == 0);
+    assert!((at(10752).disk_gb - 42.3).abs() < 0.05, "{:?}", at(10752));
+    assert_eq!((at(10752).fits_lora, at(10752).fits_qlora), (Some(false), Some(true)));
+    // both: one block less (60 layers) and 12,288 = 21.46 B; two blocks less and 13,312 = 21.15 B
+    let both = width_options(&ins, 1, None, None, None);
+    let b = both.iter().find(|o| o.intermediate == Some(12288)).unwrap();
+    assert_eq!((b.layers, b.blocks, b.params_b, b.fits_qlora), (60, 1, 21.46, None));
+    assert_eq!(width_options(&ins, 2, None, None, None).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.15);
+    // the Expert axes change the size: 32 value heads and 16 attention heads
+    assert_eq!(width_options(&ins, 0, None, Some(32), Some(16)).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.64);
+    assert_eq!(width_options(&ins, 0, None, Some(32), None).iter().find(|o| o.intermediate == Some(12288)).unwrap().params_b, 21.15);
+    // no options for a model that cannot be thinned
+    let mut no = qwen27();
+    no.width_supported = false;
+    assert!(width_options(&no, 0, None, None, None).is_empty());
+    assert!(width_options(&big(), 0, None, None, None).is_empty());
+}
+
+#[test]
+fn the_suggested_first_position_is_the_mild_cut() {
+    assert_eq!(suggested_widths(&qwen27()), Some((13312, (1, 12288))));
+    assert_eq!(suggested_widths(&big()), None);
+}
+
+#[test]
+fn validate_checks_the_width_in_plain_words() {
+    let ins = qwen27();
+    assert!(validate(&wspec(0, 13312), &ins).is_ok(), "width only: no blocks removed");
+    assert!(validate(&wspec(1, 12288), &ins).is_ok(), "both");
+    let mut s = wspec(0, 13312);
+    s.drop_layers = Some(vec![4, 5, 6, 7]);
+    assert!(validate(&s, &ins).is_ok(), "explicit layers and a width");
+    let e = |s: &ReshapeSpec| validate(s, &ins).unwrap_err().0;
+    assert!(e(&wspec(0, 13313)).contains("multiple of 256 between half and all of 17,408"));
+    assert!(e(&wspec(0, 8192)).contains("multiple of 256"));
+    assert!(e(&wspec(0, 17664)).contains("multiple of 256"));
+    assert!(e(&wspec(0, 17408)).contains("nothing to thin"));
+    assert!(e(&wspec(9, 13312)).contains("at most half"));
+    let mut s = wspec(0, 13312);
+    s.width.as_mut().unwrap().lin_v_heads = Some(40);
+    assert!(e(&s).contains("from 48 to 32"));
+    s.width = Some(Width { intermediate: 17408, lin_v_heads: Some(32), heads: None });
+    assert!(validate(&s, &ins).is_ok(), "an Expert axis alone is allowed");
+    s.width = Some(Width { intermediate: 13312, lin_v_heads: None, heads: Some(18) });
+    assert!(e(&s).contains("multiple of 4 and at least 16"));
+    let g = ReshapeSpec { width: Some(Width { intermediate: 13312, lin_v_heads: None, heads: None }), ..spec(Mode::Grow, 1) };
+    assert!(e(&g).contains("only possible when slimming"));
+    let mut small = wspec(0, 13312);
+    small.width_samples = 2;
+    assert!(e(&small).contains("Measure on"));
+    // a model that cannot be thinned says why; a prune without width still needs blocks
+    let mut no = qwen27();
+    no.width_supported = false;
+    no.width_why = Some("Thinning the layers is only available for dense Qwen3.5 / Qwen3.8 models so far. You can still remove whole layers.".into());
+    assert!(validate(&wspec(0, 13312), &no).unwrap_err().0.contains("dense Qwen3.5"));
+    assert!(e(&spec(Mode::Prune, 0)).contains("at most half"));
+    assert!(validate(&spec(Mode::Prune, 4), &ins).is_ok());
+}
+
+#[test]
+fn width_warnings_are_honest() {
+    let ins = qwen27();
+    let w = warnings(&wspec(0, 10752), &ins, Some(32.0));
+    assert!(w.iter().any(|x| x.contains("Removing 38 % of the MLP") && x.contains("healed")), "{w:?}");
+    assert!(w.iter().any(|x| x.contains("Healing is strongly recommended")));
+    assert!(w.iter().any(|x| x.contains("needs QLoRA")), "{w:?}");
+    assert!(!w.iter().any(|x| x.contains("experimental")));
+    let mild = warnings(&wspec(0, 13312), &ins, None);
+    assert!(!mild.iter().any(|x| x.contains("Removing")) && mild.iter().any(|x| x.contains("Healing is strongly recommended")), "{mild:?}");
+    let mut s = wspec(0, 13312);
+    s.width.as_mut().unwrap().heads = Some(16);
+    assert!(warnings(&s, &ins, None).iter().any(|x| x.contains("experimental")));
+}
+
+#[test]
+fn healing_runs_the_way_that_fits_the_card() {
+    let p = heal_plan(21.1, 27.8, Some(32.0));
+    assert_eq!((p.mode, p.student_method, p.fits), ("cache", "qlora", true), "{p:?}");
+    assert!((p.est_gb - 18.7).abs() < 0.2 && p.why.is_none());
+    let q = heal_plan(8.0, 9.65, Some(32.0));
+    assert_eq!((q.mode, q.student_method, q.teacher_load, q.fits), ("online", "lora", "4bit", true), "{q:?}");
+    let small = heal_plan(21.1, 27.8, Some(16.0));
+    assert!(!small.fits && small.why.as_deref().unwrap().contains("this card has 16 GB") && small.why.as_deref().unwrap().contains("Choose a smaller model"), "{small:?}");
+    assert_eq!(heal_plan(21.1, 27.8, None).mode, "cache");
+    assert!(p.cache_gb_per_10m > 1.9 && p.cache_gb_per_10m < 2.0, "196 bytes per token, 10 M tokens");
+    assert!(p.hours_per_10m.0 > 0.0 && p.hours_per_10m.1 > p.hours_per_10m.0);
+    assert_eq!((default_heal_tokens_m(21.1), default_heal_tokens_m(8.0), default_heal_tokens_m(15.0)), (20, 40, 20));
+    assert_eq!(HEAL_TOKENS_M, [10, 20, 40, 80]);
+}
+
+#[test]
+fn the_width_fields_of_the_worker_parse_and_old_answers_still_do() {
+    let v = json!({"model_type": "qwen3_5", "supported": true, "why": null, "layers": 8, "period": 4, "blocks": 2, "total_params": 21,
+        "width_dims": {"hidden": 8, "intermediate": 32, "heads": 6, "kv_heads": 2, "head_dim": 4, "lin_k_heads": 2, "lin_v_heads": 4, "lin_k_dim": 4, "lin_v_dim": 4,
+                       "conv_kernel": 4, "mtp_layers": 1, "vocab": 16, "tied": false},
+        "width_supported": true, "width_why": null, "width_choices": {"intermediate": [16, 32], "lin_v_heads": [4, 2], "heads": [6, 4]}});
+    let ins: Inspect = serde_json::from_value(v).unwrap();
+    assert!(ins.width_supported && ins.width_dims.as_ref().unwrap().intermediate == 32 && ins.width_choices.as_ref().unwrap().heads == vec![6, 4]);
+    let old: Inspect = serde_json::from_value(json!({"supported": true, "layers": 8, "period": 4, "blocks": 2, "total_params": 21})).unwrap();
+    assert!(!old.width_supported && old.width_dims.is_none() && old.width_choices.is_none());
+    let s: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "x", "mode": "prune", "blocks": 0, "width": {"intermediate": 13312}})).unwrap();
+    assert_eq!((s.width.clone().unwrap(), s.width_samples, shape_of(&s)), (Width { intermediate: 13312, lin_v_heads: None, heads: None }, 256, Shape::Width));
+    assert_eq!(shape_of(&ReshapeSpec { blocks: 1, ..s.clone() }), Shape::Both);
+    assert_eq!(shape_of(&ReshapeSpec { width: None, ..s }), Shape::Depth);
+    assert_eq!(serde_json::to_value(Shape::Both).unwrap(), json!("both"));
 }
 
 // ------------------------------------------------------------------------------------------------------------------ runs

@@ -437,6 +437,13 @@ impl AppModel {
 
     /// `reshape_options` without the project, so the window can run it on a thread of its own.
     pub fn reshape_options_for(model_id: &str, mode: &str) -> Result<Value> {
+        Self::reshape_options_with(model_id, mode, "depth", None, None)
+    }
+
+    /// The same for a way of slimming: `shape` is "depth" (remove whole layers), "width" (thinner layers) or "both". For width the answer also holds
+    /// `width_options`: for every number of removed blocks (0 for width only) one stop per MLP width, with its exact size, disk space and warnings;
+    /// `lin_v_heads` and `heads` are the Expert axes (None = the model's own).
+    pub fn reshape_options_with(model_id: &str, mode: &str, shape: &str, lin_v_heads: Option<u32>, heads: Option<u32>) -> Result<Value> {
         use crate::reshape::{plan, runs as rruns};
         let m = find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
         let mode = match mode {
@@ -444,24 +451,56 @@ impl AppModel {
             "grow" => plan::Mode::Grow,
             other => return Err(Error::new(format!("Unknown mode: {other}"))),
         };
+        let shape = match shape {
+            "depth" => plan::Shape::Depth,
+            "width" => plan::Shape::Width,
+            "both" => plan::Shape::Both,
+            other => return Err(Error::new(format!("Unknown way of slimming: {other}"))),
+        };
         let gpu = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().cloned());
         let vram = gpu.as_ref().map(|g| g.vram_gb());
         let ins = rruns::inspect(&m, &AtomicBool::new(false), &mut |_| {})?;
         let options = plan::options(&ins, mode, vram);
         // the first choice the page offers: a quarter of the blocks (at least one), within what is possible
         let default_blocks = options.last().map(|o| o.blocks.min((ins.blocks / 4).max(1))).unwrap_or(0);
+        let base_spec = |blocks: u32, width: Option<plan::Width>| plan::ReshapeSpec {
+            source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512,
+            load: "auto".into(), drop_layers: None, width, width_samples: 256,
+        };
         // every size comes with the disk space it needs and what to know before choosing it
         let sized: Vec<Value> = options.iter().map(|o| {
-            let spec = plan::ReshapeSpec { source_model_id: m.id.clone(), mode, blocks: o.blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512, load: "auto".into(), drop_layers: None };
+            let spec = base_spec(o.blocks, None);
             let mut v = serde_json::to_value(o).unwrap_or(Value::Null);
             v["disk_needed_gb"] = json!(plan::disk_needed_gb(&ins, mode, o.blocks));
             v["warnings"] = json!(plan::warnings(&spec, &ins, vram));
             v
         }).collect();
-        Ok(json!({
-            "model": {"id": m.id, "name": m.name, "params_b": m.params_b}, "inspect": ins, "mode": mode.key(), "options": sized, "default_blocks": default_blocks,
+        let (suggest_width, suggest_both) = plan::suggested_widths(&ins).map(|(w, (b, i))| (json!(w), json!({"blocks": b, "intermediate": i}))).unwrap_or((Value::Null, Value::Null));
+        let student_b = ins.total_params as f64 / 1e9;
+        let mut out = json!({
+            "model": {"id": m.id, "name": m.name, "params_b": m.params_b}, "inspect": ins, "mode": mode.key(), "shape": shape, "options": sized, "default_blocks": default_blocks,
             "load": plan::scoring_load(ins.total_params, ins.bytes_per_param, vram), "vram_gb": vram.map(|v| (v * 10.0).round() / 10.0),
-        }))
+            "width": {"supported": ins.width_supported, "why": ins.width_why, "choices": ins.width_choices, "dims": ins.width_dims,
+                      "suggested": {"width": suggest_width, "both": suggest_both}, "heal_tokens_m": plan::HEAL_TOKENS_M, "default_heal_tokens_m": plan::default_heal_tokens_m(student_b)},
+        });
+        if shape != plan::Shape::Depth && mode == plan::Mode::Prune && ins.width_supported {
+            let (lo, hi) = plan::limits(&ins, mode, 1, 1);
+            let blocks: Vec<u32> = if shape == plan::Shape::Width { vec![0] } else { (lo..=hi).collect() };
+            let groups: Vec<Value> = blocks.iter().map(|&b| {
+                let opts: Vec<Value> = plan::width_options(&ins, b, vram, lin_v_heads, heads).iter().map(|o| {
+                    let w = plan::Width { intermediate: o.intermediate.unwrap_or(0), lin_v_heads, heads };
+                    let spec = base_spec(b, Some(w));
+                    let mut v = serde_json::to_value(o).unwrap_or(Value::Null);
+                    v["disk_needed_gb"] = json!(((o.params_b * 1e9 * if ins.bytes_per_param > 0.0 { ins.bytes_per_param } else { 2.0 } * 1.1
+                        + if ins.local { 0.0 } else if ins.source_bytes > 0 { ins.source_bytes as f64 } else { ins.total_params as f64 * 2.0 }) / 1e9 * 10.0).round() / 10.0);
+                    v["warnings"] = json!(plan::warnings(&spec, &ins, vram));
+                    v
+                }).collect();
+                json!({"blocks": b, "options": opts})
+            }).collect();
+            out["width_options"] = Value::Array(groups);
+        }
+        Ok(out)
     }
 
     pub fn train_metrics(&self, run: &str) -> Result<Value> {
