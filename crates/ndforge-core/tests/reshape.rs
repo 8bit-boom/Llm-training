@@ -304,6 +304,7 @@ fn a_model_is_made_registered_and_listed() {
     assert_eq!((list[0]["status"].as_str(), list[0]["tested"].clone(), list[0]["has_model"].clone()), (Some("done"), json!(false), json!(true)));
     assert_eq!((list[0]["summary"]["layers_after"].clone(), list[0]["summary"]["dropped"].clone(), list[0]["summary"]["loss_after"].clone()), (json!(8), json!([4, 5, 6, 7]), json!(2.0)));
     assert_eq!(list[0]["scores"]["chosen_blocks"], json!([1]));
+    assert!(list[0]["test"].is_null());
     // what the model was found to be is remembered for the next time
     assert!(d.path().join("cfg/reshape_inspect.json").is_file());
 }
@@ -464,9 +465,11 @@ fn the_page_state_and_options_come_from_the_worker_and_the_plan() {
     assert_eq!(o["options"].as_array().unwrap().len(), 1);                      // 3 blocks: at most 1 (first and last are protected)
     assert_eq!(o["options"][0]["layers"], 8);
     assert_eq!(o["default_blocks"], 1);
+    assert!(o["options"][0]["disk_needed_gb"].as_f64().unwrap() > 0.0);
+    assert!(o["options"][0]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("worse than the original")));
     let g = m.reshape_options("qwen3.5-4b", "grow").unwrap();
     assert_eq!(g["options"][0]["layers"], 16);
-    assert!(g["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("little or no gain")));
+    assert!(g["options"][0]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("little or no gain")));
     assert!(m.reshape_options("qwen3.5-4b", "shrink").is_err() && m.reshape_options("nope", "prune").is_err());
 }
 
@@ -554,7 +557,8 @@ fn a_made_model_is_tested_against_its_original_and_appears_in_the_table() {
     assert_eq!(job["full_model"].as_str().unwrap(), model.to_string_lossy());
     assert!(job.get("adapter").is_none() && job.get("trained_base").is_none() && job.get("load_4bit").is_none());
     assert_eq!(rruns::read_test(&p, "20261113-000000-x-slim-24L").unwrap()["n"], r["n"]);
-    assert!(rruns::list(&p)[0]["tested"] == true);
+    let listed = &rruns::list(&p)[0];
+    assert!(listed["tested"] == true && listed["test"]["verdict"]["headline"].is_string() && listed["test"]["against"] == "origin" && listed["test"].get("questions").is_none());
     // a card too small for 16-bit: the sides that do not fit load in 4-bit, and the result says so
     let r = rruns::test(&p, "20261113-000000-x-slim-24L", None, Some(17.0), &none, &mut |_| {}).unwrap();
     assert_eq!(captured(&cap)["load_4bit"], json!({"original": true, "trained": false}));
@@ -597,6 +601,8 @@ fn a_run_on_a_made_model_is_tested_against_it_or_against_the_original() {
     let slim = made_model(&p, "m1", 9_000_000_000, 6_000_000_000);
     run_on(&p, "run-slim", &slim);
     let none = AtomicBool::new(false);
+    let t = eruns::testable(&p);
+    assert_eq!(t.iter().find(|r| r["name"] == "run-slim").unwrap()["reshaped_from"], "unsloth/Qwen3.5-4B");
     // the default: against the made model (the adapter switched off) - the job is exactly what it was before this feature
     let r = eruns::execute(&p, "run-slim", 30, None, &none, &mut |_| {}).unwrap();
     let job = captured(&cap);

@@ -6,6 +6,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
+  reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
 
 let state = null;
@@ -32,6 +33,7 @@ function setState(s) { if (s) { state = s; } }
 
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
+  items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
@@ -269,7 +271,7 @@ function renderTrain() {
   const gpu = st.gpu ? `${esc(st.gpu.name)} · ${st.gpu.vram_gb} GB · ${esc(st.gpu.precision)}` : esc(st.gpu_problem || "no graphics card found");
   const cards = st.models.map((c) => {
     const m = c.model, f = c[tr.method], fit = FIT[f.fit] || FIT.unknown;
-    return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}${m.custom ? ' <span class="tag">added</span>' : ""}</strong>${c.recommended === tr.method ? "" : ""}
+    return `<button class="mcard ${tr.model === m.id ? "sel" : ""} fit-${f.fit}" data-model="${m.id}"><strong>${esc(m.name)}${m.custom ? ' <span class="tag">added</span>' : ""}</strong>${m.reshape ? `<span class="dim">${esc(m.reshape)}${m.derived_from ? " · from " + esc(String(m.derived_from).split("/").pop()) : ""}</span>` : ""}
       <span class="dim">${m.params_b.toFixed(1)} B parameters · ${esc(m.license)}</span><span>${fit[0]} ${fit[1]} · ≈ ${f.measured != null ? f.measured + " GB measured" : f.est_vram_gb + " GB"}</span><span class="dim">${esc(m.good_for)}</span></button>`;
   }).join("");
   const hf = tr.hf, fm = hf.found && hf.found.model;
@@ -303,7 +305,8 @@ function renderTrain() {
         ["liger", "Liger kernels", ["off", "on"], "Plain-libraries path, if the liger-kernel package is installed and supports the model."],
         ["attention", "Attention kernel", ["auto", "sdpa", "cudnn", "flash_attention_2", "flex_attention"], "auto = the library's choice (Unsloth picks its own). cudnn = PyTorch's sdpa with NVIDIA's cuDNN attention tried first (PyTorch 2.5+; others behind it if it cannot do a case). FlashAttention-2 needs the flash-attn package and an RTX 30 series or newer; flex attention needs PyTorch 2.5+. One that cannot work is dropped with a reason. Use \"Find the fastest settings\" to compare."],
         ["padding_free", "Padding-free batching", ["off", "on"], "Needs the flash-attn package and a model whose attention layers support it (not Qwen3.5 or Gemma 4 yet)."]].map(([k, l, opts, tip]) =>
-      `<label title="${esc(tip)}">${l}<select class="ovs" data-key="${k}">${opts.map((o) => `<option ${(tr.over[k] ?? pl.hyper[k] ?? opts[0]) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>`).join("")}</div></div>` : "";
+      `<label title="${esc(tip)}">${l}<select class="ovs" data-key="${k}">${opts.map((o) => `<option ${(tr.over[k] ?? pl.hyper[k] ?? opts[0]) === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>`).join("")}</div>
+    ${sel && sel.model.reshape && sel.model.reshape.startsWith("grown") ? `<label class="opt" title="LoRA is attached only to the layers that were added when the model was grown. Faster and gentler, but the old layers do not adapt."><input type="checkbox" id="tr-newonly" ${tr.over.only_new_layers ? "checked" : ""}> Train only the new layers (this model was grown)</label>` : ""}</div>` : "";
   const planHtml = pl ? `<div class="card wide"><h2>The plan</h2>${pl.hyper.stages === "book_first" ? `<p>Two stages: the <strong>world book</strong> (${v.counts.world_book_texts} texts, ${pl.hyper.book_epochs} passes), then the <strong>practice answers</strong> (${v.counts.train_chat} examples, ${pl.hyper.epochs} passes).</p>` : ""}<p>About <strong>${pl.steps}</strong> steps · memory ≈ <strong>${pl.est_vram_gb} GB</strong> (${(FIT[pl.fit] || FIT.unknown)[1]}) · sequence ${pl.hyper.max_seq} tokens · batch ${pl.hyper.batch}×${pl.hyper.grad_accum}</p>
     ${pl.notes.length ? `<ul>${pl.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>` : "";
   const TYPES = [["lora", "LoRA, 16-bit", "Trains a small add-on; the original model stays safe. Recommended whenever it fits."],
@@ -410,7 +413,7 @@ function onPowerEvent(p) {
 async function trStart(resume) {
   tr.metrics = []; tr.samples = []; tr.log = []; tr.speed = null; tr.progress = null; tr.stepText = "Starting…"; tr.error = null; tr.notice = null; tr.running = true; tr.stopping = false; render();
   const over = {};
-  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
+  Object.entries(tr.over).forEach(([k, v]) => { if (v !== "" && v != null) over[k] = typeof v === "boolean" || ["engine", "bucket", "compile", "liger", "padding_free", "attention"].includes(k) ? v : Number(v); });
   if (tr.preset !== "quick") over.stages = tr.stages;
   if (tr.method === "full" && tr.tryAnyway) over.try_anyway = true;
   try { await invoke("train_start", { model: tr.model, method: tr.method, preset: tr.preset, overrides: over, resume: resume || null, server: tr.server || null }); }
@@ -420,6 +423,7 @@ async function trStart(resume) {
 function wireTrain() {
   if (page !== "train" || !tr.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const newOnly = $("tr-newonly"); if (newOnly) newOnly.onchange = () => { tr.over.only_new_layers = newOnly.checked; };
   on("hf-open", () => { tr.hf.open = true; tr.hf.error = null; render(); const i = $("hf-input"); if (i) i.focus(); });
   on("hf-cancel", () => { tr.hf = { open: false, input: "", busy: false, found: null, error: null }; render(); });
   const hfLook = async () => {
@@ -683,7 +687,7 @@ function onEnvEvent(p) {
 }
 
 // ------------------------------------------------------------------------------------------------------------ step 4: test
-let te = { state: null, run: "", result: null, running: false, text: "", progress: null, judge: false, chat: [], asking: false, system: "", showQ: "", error: null, ok: null };
+let te = { against: "base", state: null, run: "", result: null, running: false, text: "", progress: null, judge: false, chat: [], asking: false, system: "", showQ: "", error: null, ok: null };
 const CATS = [["lore", "Lore questions", "higher is better"], ["rules", "Rules questions", "higher is better"], ["made_up", "Invents answers about things that do not exist", "lower is better"], ["general", "General chat sensible", "higher is better"]];
 const pc = (x) => x == null ? "–" : Math.round(x * 100) + " %";
 
@@ -695,7 +699,11 @@ function renderTest() {
   if (!st.runs.length) return head + `<div class="card wide"><h2>Nothing to test yet</h2><p>Train a model in Step 3 first. A run that was stopped before its first save cannot be tested.</p></div>`;
   const opts = st.runs.map((r) => `<option value="${esc(r.name)}" ${r.name === te.run ? "selected" : ""}>${esc(r.name)} · ${esc(r.method || "")}${r.tested ? " · tested" : ""}</option>`).join("");
   const busy = te.running || te.asking;
-  const pick = `<div class="card wide"><h2>Choose a run</h2><div class="row"><select id="te-run">${opts}</select>
+  const cur = st.runs.find((r) => r.name === te.run);
+  const origin = cur && cur.reshaped_from;
+  if (!origin) te.against = "base";
+  const against = origin ? `<label>Compare with <select id="te-against"><option value="base" ${te.against === "base" ? "selected" : ""}>the slimmed / grown model it was trained from</option><option value="origin" ${te.against === "origin" ? "selected" : ""}>the original: ${esc(String(origin).split("/").pop())}</option></select></label>` : "";
+  const pick = `<div class="card wide"><h2>Choose a run</h2><div class="row"><select id="te-run">${opts}</select>${against}
       <button class="primary" id="te-go" ${busy || !st.env_ready ? "disabled" : ""}>Test this run</button>${busy ? `<button class="secondary" id="te-stop">Stop</button>` : ""}</div>
       <label class="opt"><input type="checkbox" id="te-judge" ${te.judge ? "checked" : ""} ${st.teacher_ready ? "" : "disabled"}> Grade lore and rules answers with the teacher model${st.teacher_ready ? ` (${esc(st.teacher_model)})` : " (choose a teacher in Step 2 first)"} — more accurate than counting matching words</label>
       ${!st.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
@@ -711,7 +719,7 @@ function renderTest() {
       <p class="verdict ${r.verdict.better === true ? "ok" : r.verdict.better === false ? "err" : ""}"><strong>${esc(r.verdict.headline)}</strong></p>
       ${r.verdict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}
       <table class="tbl"><tr><th>What was checked</th><th>Questions</th><th>Original</th><th>Trained</th></tr>${CATS.map(row).join("")}</table>
-      <p class="dim small">${r.n} questions, graded by ${r.method === "teacher" ? "the teacher model" : "matching words with the expected answer (a rough guide: read the answers below)"} · data version ${r.dataset_version} · ${esc(r.created)}</p>
+      <p class="dim small">${r.against === "origin" ? "Compared with the original model the base was made from. " : ""}${r.loaded && (r.loaded.original === "4-bit" || r.loaded.trained === "4-bit") ? "A big model was loaded in 4-bit to fit the card (original: " + esc(r.loaded.original) + ", trained: " + esc(r.loaded.trained) + "). " : ""}${r.n} questions, graded by ${r.method === "teacher" ? "the teacher model" : "matching words with the expected answer (a rough guide: read the answers below)"} · data version ${r.dataset_version} · ${esc(r.created)}</p>
       <details><summary>Read the answers</summary><div class="row"><select id="te-cat"><option value="">All</option>${CATS.map((c) => `<option value="${c[0]}" ${te.showQ === c[0] ? "selected" : ""}>${c[1]}</option>`).join("")}</select></div>${qs}</details></div>`;
   }
   const chat = `<div class="card wide"><h2>Ask your own question</h2><p>Both models answer the same question. Loading the models takes a moment each time.</p>
@@ -720,7 +728,7 @@ function renderTest() {
       ${te.asking ? `<div class="stepline">${esc(te.text)}</div>` : ""}
       ${te.chat.map((c) => `<div class="ex"><div class="q">${esc(c.question)}</div><div class="two"><div><div class="dim small">Original</div><div class="ans">${esc(c.original)}</div></div><div><div class="dim small">Trained</div><div class="ans">${esc(c.trained)}</div></div></div></div>`).join("")}
       ${te.chat.length ? `<div class="row"><button class="secondary" id="te-save">Save this chat as a file</button></div>` : ""}</div>`;
-  const cmp = st.compare.length ? `<div class="card wide"><h2>Compare runs</h2><table class="tbl"><tr><th>Run</th><th>Model</th><th>Type</th><th>Lore</th><th>Rules</th><th>Invents</th><th>General</th></tr>${st.compare.map((c, i) => `<tr><td>${i === 0 ? "★ " : ""}${esc(c.name)}</td><td>${esc(String(c.model).split("/").pop())}</td><td>${esc(c.method)}, ${esc(c.stages)}</td><td>${pc(c.lore)} <span class="dim">(was ${pc(c.lore_original)})</span></td><td>${pc(c.rules)}</td><td>${pc(c.invented)}</td><td>${pc(c.general)}</td></tr>`).join("")}</table>
+  const cmp = st.compare.length ? `<div class="card wide"><h2>Compare runs</h2><table class="tbl"><tr><th>Run</th><th>Model</th><th>Type</th><th>Lore</th><th>Rules</th><th>Invents</th><th>General</th></tr>${st.compare.map((c, i) => `<tr><td>${i === 0 ? "★ " : ""}${esc(c.name)}</td><td>${esc(String(c.model).split("/").pop())}</td><td>${esc(c.method)}${c.stages ? ", " + esc(c.stages) : ""}</td><td>${pc(c.lore)} <span class="dim">(was ${pc(c.lore_original)})</span></td><td>${pc(c.rules)}</td><td>${pc(c.invented)}</td><td>${pc(c.general)}</td></tr>`).join("")}</table>
       <p class="dim small">★ = best lore score. Runs graded by the teacher and runs graded by matching words are not comparable with each other.</p></div>` : "";
   return head + pick + result + chat + cmp;
 }
@@ -752,18 +760,240 @@ function onTestEvent(p) {
 function wireTest() {
   if (page !== "test" || !te.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
-  const sel = $("te-run"); if (sel) sel.onchange = () => { te.run = sel.value; te.chat = []; te.ok = null; teRefresh(); };
+  const sel = $("te-run"); if (sel) sel.onchange = () => { te.run = sel.value; te.chat = []; te.ok = null; te.against = "base"; teRefresh(); };
+  const ag = $("te-against"); if (ag) ag.onchange = () => { te.against = ag.value; te.chat = []; };
   const j = $("te-judge"); if (j) j.onchange = () => { te.judge = j.checked; };
   const cat = $("te-cat"); if (cat) cat.onchange = () => { te.showQ = cat.value; render(); };
-  on("te-go", async () => { te.running = true; te.ok = null; te.error = null; te.text = "Starting…"; te.progress = null; render(); try { await invoke("test_start", { run: te.run, judge: te.judge }); } catch (e) { te.running = false; te.error = String(e); render(); } });
+  on("te-go", async () => { te.running = true; te.ok = null; te.error = null; te.text = "Starting…"; te.progress = null; render(); try { await invoke("test_start", { run: te.run, judge: te.judge, against: te.against }); } catch (e) { te.running = false; te.error = String(e); render(); } });
   on("te-stop", () => invoke("env_cancel"));
   on("te-ask", async () => {
     const q = $("te-q").value; te.system = $("te-sys").value;
     te.asking = true; te.error = null; te.text = "Loading the models…"; render();
-    try { await invoke("test_ask", { run: te.run, system: te.system === te.state.default_system ? null : te.system, question: q }); } catch (e) { te.asking = false; te.error = String(e); render(); }
+    try { await invoke("test_ask", { run: te.run, system: te.system === te.state.default_system ? null : te.system, question: q, against: te.against }); } catch (e) { te.asking = false; te.error = String(e); render(); }
   });
   const q = $("te-q"); if (q) q.onkeydown = (e) => { if (e.key === "Enter") $("te-ask").click(); };
   on("te-save", async () => { const f = await teCall("test_save_transcript", { run: te.run, items: te.chat }); if (f) te.ok = "Saved: " + f; render(); });
+}
+
+// ------------------------------------------------------------------------------------------ slim or grow a model
+let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
+  dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null };
+
+// "36–51" from [36, 37, ..., 51]; "3, 7–9" for gaps
+function ranges(list) {
+  const out = []; let a = null, b = null;
+  [...(list || [])].sort((x, y) => x - y).forEach((n) => { if (a === null) { a = b = n; } else if (n === b + 1) { b = n; } else { out.push(a === b ? `${a}` : `${a}–${b}`); a = b = n; } });
+  if (a !== null) out.push(a === b ? `${a}` : `${a}–${b}`);
+  return out.join(", ");
+}
+
+// "3,7-9" -> [3, 7, 8, 9]; null when the text is not a list of layer numbers
+function parseLayers(text) {
+  const t = text.trim(); if (!t) return [];
+  const out = [];
+  for (const part of t.split(/[,;\s]+/).filter(Boolean)) {
+    const m = part.match(/^(\d+)(?:\s*[-–]\s*(\d+))?$/); if (!m) return null;
+    const a = +m[1], b = m[2] === undefined ? a : +m[2]; if (b < a || b - a > 4096) return null;
+    for (let i = a; i <= b; i++) out.push(i);
+  }
+  return out;
+}
+
+// one bar per block: how much the text changes inside it (small = the block does little); the blocks that were taken out are coloured
+function barChart(dist, chosen) {
+  if (!dist || !dist.length) return "";
+  const W = 560, H = 150, P = 26, max = Math.max(...dist, 1e-9), bw = (W - P - 8) / dist.length;
+  const bars = dist.map((d, i) => {
+    const h = (d / max) * (H - P - 22), x = P + i * bw + 1;
+    return `<rect x="${x.toFixed(1)}" y="${(H - P - h).toFixed(1)}" width="${Math.max(2, bw - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${chosen.includes(i) ? "var(--err)" : "var(--accent)"}"><title>block ${i} (layers ${i * 4}–${i * 4 + 3} when the blocks have four layers): ${d.toFixed(3)}${chosen.includes(i) ? " · removed" : ""}</title></rect>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="How much each block of layers changes the text">${bars}
+    <line x1="${P}" y1="${H - P}" x2="${W - 8}" y2="${H - P}" stroke="var(--line)"/><text x="${P}" y="${H - 8}" class="axis">block 0</text><text x="${W - 70}" y="${H - 8}" class="axis">block ${dist.length - 1}</text>
+    <text x="${P + 4}" y="14" class="axis">more change ↑ (kept) · red = removed</text></svg>`;
+}
+
+function patternText(ins) {
+  const types = (ins.layer_types || []).slice(0, ins.period);
+  const lin = types.filter((t) => t === "linear_attention").length, full = types.filter((t) => t === "full_attention").length;
+  if (ins.period > 1 && lin && full && lin + full === types.length)
+    return `${lin} fast linear-attention layers + ${full} full-attention layer${full > 1 ? "s" : ""}, repeated ${ins.blocks}×`;
+  return ins.period > 1 ? `blocks of ${ins.period} layers, repeated ${ins.blocks}×` : `${ins.layers} layers of the same kind (a block is one layer)`;
+}
+
+function rsOption() { return rs.options && rs.options.options.find((o) => o.blocks === rs.blocks) || null; }
+
+function rsSizeInfo() {
+  const o = rsOption(), op = rs.options, v = op && op.vram_gb;
+  if (!o) return `<span class="dim">Nothing can be changed in whole blocks for this model.</span>`;
+  const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
+  return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+}
+
+function madeCard(m) {
+  const sm = m.summary;
+  if (!sm) return `<div class="card wide"><h2>${esc(m.name)}</h2><p class="${m.status === "failed" ? "err" : "dim"}">${esc(m.status)}${m.error ? ": " + esc(m.error) : ""}</p></div>`;
+  const slim = sm.mode === "prune";
+  const what = slim ? `Removed layers ${ranges(sm.dropped)} (${(sm.chosen_blocks || []).length || sm.dropped.length} block${(sm.chosen_blocks || []).length === 1 ? "" : "s"})` : `Added ${sm.layers_after - sm.layers_before} layers (copies of layers ${ranges(sm.duplicated)})`;
+  const gb = (n) => (n / 1e9).toFixed(2);
+  let loss = "";
+  if (sm.loss_before != null && sm.loss_after != null) {
+    loss = slim ? `Text-prediction error on your data: ${(+sm.loss_before).toFixed(2)} → ${(+sm.loss_after).toFixed(2)} before training it again (lower is better)`
+      : (Math.abs(sm.loss_after - sm.loss_before) <= 1e-3 * Math.max(1e-9, Math.abs(sm.loss_before)) ? `Unchanged: it starts as an exact copy of the original (error ${(+sm.loss_after).toFixed(2)} both times, checked)` : `Text-prediction error on your data: ${(+sm.loss_before).toFixed(2)} → ${(+sm.loss_after).toFixed(2)}`);
+  } else if (sm.loss_before != null) loss = `Text-prediction error of the original on your data: ${(+sm.loss_before).toFixed(2)}`;
+  const t = m.test;
+  const row = ([id, name]) => { const o = t.scores.original[id], n = t.scores.trained[id]; return o || n ? `<tr><td>${name}</td><td>${pc(o && o.mean)}</td><td><strong>${pc(n && n.mean)}</strong></td></tr>` : ""; };
+  const test = t ? `<h3>Test against the original</h3><p class="verdict ${t.verdict.better === true ? "ok" : t.verdict.better === false ? "err" : ""}"><strong>${esc(t.verdict.headline)}</strong></p>
+      ${t.verdict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}
+      <table class="tbl"><tr><th>What was checked</th><th>Original</th><th>${slim ? "Slimmed" : "Grown"}</th></tr>${CATS.map(row).join("")}</table>
+      <p class="dim small">${t.n} questions · ${t.method === "teacher" ? "graded by the teacher" : "graded by matching words (a rough guide)"} · original loaded in ${esc((t.loaded || {}).original || "16-bit")}, this model in ${esc((t.loaded || {}).trained || "16-bit")} · ${esc(t.created)}</p>` : "";
+  const busy = rs.running || rs.testing;
+  return `<div class="card wide"><h2>${esc(m.name)}</h2>
+    ${slim && m.scores && m.scores.boundary_distance ? barChart(m.scores.boundary_distance, m.scores.chosen_blocks || []) : (sm.boundary_distance ? barChart(sm.boundary_distance, sm.chosen_blocks || []) : "")}
+    <p><strong>${esc(what)}</strong> · ${sm.layers_before} → ${sm.layers_after} layers · ${gb(sm.params_before)} → ${gb(sm.params_after)} billion parameters · ${m.size_gb} GB on disk</p>
+    ${loss ? `<p>${esc(loss)}</p>` : ""}
+    ${slim && sm.stable === false ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
+    ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
+    <p class="dim small">The vision part and the multi-token head were copied unchanged. ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
+    <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
+      <button class="secondary" data-rstrain="${esc(m.model_id || "")}" ${m.model_id ? "" : "disabled"}>Train it on your world (Step 3)</button>
+      <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
+    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}</div>`;
+}
+
+function renderReshape() {
+  const head = `<h1>🧬 Slim or grow a model</h1><p class="lead">Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in. The help panel explains it.</p>`;
+  if (!state.bundle) return head + `<p class="lead">Import your world data first (Step 1).</p>`;
+  const st = rs.state;
+  if (!st) return head + `<p class="lead">Loading…</p>`;
+  const intro = `<div class="card wide"><h2>What this does</h2>
+    <p><strong>Slim</strong> takes whole blocks of layers out where they change the text the least (measured on your own world's text). The model gets smaller, faster and needs less memory, but it answers <strong>worse until you train it again</strong>.</p>
+    <p><strong>Grow</strong> copies a stretch of layers in. It starts out answering exactly like the original, and is then trained. <strong>Honest expectation:</strong> from one world's text the gain is usually small or none, and it needs about 40 % more memory, disk space and time. It pays off with much more training text than a world has.</p>
+    <p>Always test the new model, and usually train it in Step 3 afterwards.</p></div>`;
+  const msg = (rs.error ? `<div class="err">${esc(rs.error)}</div>` : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
+  const modelOpts = st.models.map((m) => `<option value="${esc(m.id)}" ${m.id === rs.model ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("");
+  const op = rs.options, ins = op && op.inspect;
+  let info = "";
+  if (rs.loadingOpts) info = `<p class="dim">Looking at the model… (the first time this can take a moment; nothing is downloaded)</p>`;
+  else if (rs.optErr) info = `<div class="err">${esc(rs.optErr)}</div>`;
+  else if (ins && !ins.supported) info = `<div class="err">${esc(ins.why || "This model cannot be slimmed or grown.")}</div>`;
+  else if (ins) info = `<p>${ins.layers} layers: ${esc(patternText(ins))} · ${(ins.total_params / 1e9).toFixed(2)} B parameters · ${ins.has_vision ? "has a vision part (kept unchanged)" : "text only"}${ins.local ? "" : " · not on this computer yet: it is downloaded first (≈ " + (ins.source_bytes / 1e9).toFixed(0) + " GB)"}</p>`;
+  const pick = `<div class="card wide"><h2>1 · Start from</h2><div class="row"><select id="rs-model" ${rs.running ? "disabled" : ""}>${modelOpts}</select></div>${info}</div>`;
+  const ok = ins && ins.supported && !rs.optErr && op.options.length > 0;
+  const grow = rs.mode === "grow", o = rsOption();
+  const idx = op ? Math.max(0, op.options.findIndex((x) => x.blocks === rs.blocks)) : 0;
+  const warn = o ? o.warnings.map((w) => `<div class="${/little or no gain|worse|quarter|QLoRA|Even/.test(w) ? "warn" : "dim"}">${esc(w)}</div>`).join("") : "";
+  const size = `<div class="card wide"><h2>2 · What to do</h2>
+    <label class="opt"><input type="radio" name="rs-mode" value="prune" ${rs.mode === "prune" ? "checked" : ""} ${rs.running ? "disabled" : ""}> <strong>Slim it</strong> — take blocks of layers out</label>
+    <label class="opt"><input type="radio" name="rs-mode" value="grow" ${grow ? "checked" : ""} ${rs.running ? "disabled" : ""}> <strong>Grow it</strong> — copy a stretch of layers in <span class="dim">(little or no gain from one world's text; about 40 % more memory)</span></label>
+    ${ok ? `<div style="margin-top:12px"><div>${grow ? "Add" : "Remove"} <strong id="rs-blocks-n">${rs.blocks}</strong> block${rs.blocks === 1 ? "" : "s"} of ${ins.period} layers</div>
+      <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${idx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
+      <div id="rs-sizeinfo">${rsSizeInfo()}</div>${warn}</div>` : (ins && ins.supported && !rs.loadingOpts ? `<p class="dim">This model is too small to change in whole blocks.</p>` : "")}
+    ${ok && grow ? `<p style="margin-bottom:4px">How should the new layers start?</p>
+      <label class="opt"><input type="radio" name="rs-init" value="identity" ${rs.init === "identity" ? "checked" : ""}> <strong>As an exact copy of the original</strong> (recommended): the new layers are switched off, so nothing is lost before training</label>
+      <label class="opt"><input type="radio" name="rs-init" value="copy" ${rs.init === "copy" ? "checked" : ""}> <strong>Copy the layers</strong> (SOLAR style): the copied layers work at once, which disturbs the model until it is trained</label>` : ""}
+    ${ok && !grow ? `<p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), <select id="rs-samples">${[64, 128, 256].map((n) => `<option ${rs.samples === n ? "selected" : ""}>${n}</option>`).join("")}</select> samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
+      <p class="dim small">The model is loaded ${op.load === "16bit" ? "in 16-bit" : op.load === "4bit" ? "in 4-bit (NF4) to fit the card; the ranking of the layers hardly changes" : "spread over the card and the computer's memory (slow)"} while measuring.</p>` : ""}
+    ${ok && !grow && state.settings.expert_mode ? `<details open><summary>Expert settings</summary><div class="grid">
+      <label>Which layers<select id="rs-strategy"><option value="contiguous" ${rs.strategy === "contiguous" ? "selected" : ""}>one run of blocks (recommended)</option><option value="separate" ${rs.strategy === "separate" ? "selected" : ""}>separate blocks wherever they matter least</option></select></label>
+      <label>Never remove the first … blocks<input type="text" id="rs-pf" value="${rs.pf}"></label><label>… and the last … blocks<input type="text" id="rs-pl" value="${rs.pl}"></label>
+      <label>Load for measuring<select id="rs-load">${[["auto", "automatic"], ["16bit", "16-bit"], ["4bit", "4-bit"], ["offload", "spread over card and memory"]].map(([k, l]) => `<option value="${k}" ${rs.load === k ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+      <label>Remove exactly these layers (skips the measuring)<input type="text" id="rs-drop" value="${esc(rs.dropText)}" placeholder="for example 36-51"></label></div></details>` : ""}</div>`;
+  const dropList = parseLayers(rs.dropText);
+  const needGb = o ? o.disk_needed_gb : 0;
+  const diskBad = st.free_disk_gb != null && o && st.free_disk_gb < needGb;
+  const noData = !grow && !st.dataset_version && !(dropList && dropList.length);
+  const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : noData ? "Save a training-data version in Step 2 first." : diskBad ? `Not enough free disk space: ${needGb} GB needed, ${st.free_disk_gb} GB free.` : dropList === null ? "The layer list is not valid." : "";
+  const make = `<div class="card wide"><h2>3 · Make the model</h2>
+    <div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
+    ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && o ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
+    ${rs.running ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
+    ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
+  const made = st.made.filter((m) => m.status === "done" && m.summary);
+  const shown = made.find((m) => m.name === rs.view) || made[0];
+  const result = shown ? madeCard(shown) : "";
+  const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
+    `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
+      <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
+  return head + msg + intro + pick + size + make + result + list;
+}
+
+async function rsRefresh() {
+  try {
+    rs.state = await invoke("reshape_state");
+    if (!rs.model && rs.state.models.length) rs.model = (rs.state.models.find((m) => m.id === "qwen3.5-9b") || rs.state.models[0]).id;
+  } catch (e) { rs.error = String(e); }
+  if (page === "reshape") render();
+  if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
+}
+
+async function rsOptions() {
+  const token = ++rs.token;
+  rs.loadingOpts = true; rs.optErr = null; rs.options = null; render();
+  try {
+    const o = await invoke("reshape_options", { model: rs.model, mode: rs.mode });
+    if (token !== rs.token) return;
+    rs.options = o;
+    if (!o.options.some((x) => x.blocks === rs.blocks)) rs.blocks = o.options.length ? o.default_blocks : null;
+  } catch (e) { if (token !== rs.token) return; rs.optErr = String(e); }
+  rs.loadingOpts = false;
+  if (page === "reshape") render();
+}
+
+function onReshapeEvent(p) {
+  if (p.kind === "progress") { rs.text = p.text || p.step; rs.progress = p.value; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "error") { rs.running = false; rs.testing = null; rs.text = ""; rs.progress = null; rs.error = p.text; rsRefresh(); return; }
+  else if (p.kind === "done") {
+    const wasTest = rs.testing;
+    rs.running = false; rs.testing = null; rs.text = ""; rs.progress = null;
+    if (wasTest) rs.ok = "The test is finished. The result is below.";
+    else if (p.data && p.data.stopped) rs.ok = "Stopped. The half-written model was removed.";
+    else if (p.data) { rs.ok = `Done: ${p.data.name} is ready and is in the model list of Step 3.`; rs.view = p.data.name; }
+    setState_(); rsRefresh(); return;
+  }
+  if (page === "reshape") render();
+  const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight;
+}
+
+function rsSpec() {
+  const drop = parseLayers(rs.dropText);
+  return { source_model_id: rs.model, mode: rs.mode, blocks: rs.blocks, strategy: rs.strategy, protect_first: rs.pf, protect_last: rs.pl, init: rs.init, calib_samples: rs.samples, calib_len: 512, load: rs.load,
+    drop_layers: rs.mode === "prune" && drop && drop.length ? drop : null };
+}
+
+function wireReshape() {
+  if (page !== "reshape" || !rs.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const m = $("rs-model"); if (m) m.onchange = () => { rs.model = m.value; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
+  document.querySelectorAll("input[name=rs-mode]").forEach((r) => r.onchange = () => { rs.mode = r.value; rs.blocks = null; rs.options = null; rs.ok = null; rsOptions(); });
+  document.querySelectorAll("input[name=rs-init]").forEach((r) => r.onchange = () => { rs.init = r.value; });
+  const sl = $("rs-slider");
+  if (sl) {
+    sl.oninput = () => { const o = rs.options.options[+sl.value]; rs.blocks = o.blocks; $("rs-blocks-n").textContent = o.blocks; $("rs-sizeinfo").innerHTML = rsSizeInfo(); };
+    sl.onchange = () => render();
+  }
+  const sm = $("rs-samples"); if (sm) sm.onchange = () => { rs.samples = +sm.value; };
+  const stg = $("rs-strategy"); if (stg) stg.onchange = () => { rs.strategy = stg.value; };
+  const ld = $("rs-load"); if (ld) ld.onchange = () => { rs.load = ld.value; };
+  const num = (id, key) => { const e = $(id); if (e) e.onchange = () => { const v = parseInt(e.value, 10); rs[key] = Number.isFinite(v) && v >= 0 && v <= 8 ? v : 1; render(); }; };
+  num("rs-pf", "pf"); num("rs-pl", "pl");
+  const dr = $("rs-drop"); if (dr) dr.onchange = () => { rs.dropText = dr.value; render(); };
+  on("rs-go", async () => {
+    rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_start", { spec: rsSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+  });
+  on("rs-stop", () => { rs.text = "Stopping…"; invoke("reshape_stop"); render(); });
+  document.querySelectorAll("[data-rsshow]").forEach((b) => b.onclick = () => { rs.view = b.dataset.rsshow; render(); });
+  document.querySelectorAll("[data-rstest]").forEach((b) => b.onclick = async () => {
+    rs.testing = b.dataset.rstest; rs.ok = null; rs.error = null; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_test", { name: rs.testing, judge: false }); } catch (e) { rs.testing = null; rs.error = String(e); render(); }
+  });
+  document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
+  document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete this model and its files? A training run that used it must be deleted first.")) return;
+    try { rs.state = await invoke("reshape_remove", { name: b.dataset.rsdelete }); rs.error = null; rs.ok = "Deleted."; if (rs.view === b.dataset.rsdelete) rs.view = null; } catch (e) { rs.error = String(e); }
+    render();
+  });
 }
 
 // ------------------------------------------------------------------------------------------------------------ guide
@@ -792,7 +1022,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "use" ? renderUse() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -818,6 +1048,7 @@ function wire() {
   wireTrain();
   wireUse();
   wireTest();
+  wireReshape();
   wireGuide();
   wireRetrain();
   on("recheck", refreshEnv);
@@ -926,6 +1157,7 @@ async function go(key) {
   if (key === "guide") gdLoad();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
+  if (key === "reshape" && state.bundle) { rs.ok = null; rs.error = null; rsRefresh(); }
   if (key === "use" && state.bundle) usRefresh();
   if (key === "test" && state.bundle) { te.ok = null; teRefresh(); }
   if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
@@ -954,6 +1186,7 @@ async function init() {
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   go("welcome");
 }

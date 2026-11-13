@@ -449,14 +449,18 @@ impl AppModel {
         let ins = rruns::inspect(&m, &AtomicBool::new(false), &mut |_| {})?;
         let options = plan::options(&ins, mode, vram);
         // the first choice the page offers: a quarter of the blocks (at least one), within what is possible
-        let blocks = options.last().map(|o| (o.blocks).min((ins.blocks / 4).max(1))).unwrap_or(0);
-        let spec = plan::ReshapeSpec { source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512, load: "auto".into(), drop_layers: None };
+        let default_blocks = options.last().map(|o| o.blocks.min((ins.blocks / 4).max(1))).unwrap_or(0);
+        // every size comes with the disk space it needs and what to know before choosing it
+        let sized: Vec<Value> = options.iter().map(|o| {
+            let spec = plan::ReshapeSpec { source_model_id: m.id.clone(), mode, blocks: o.blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512, load: "auto".into(), drop_layers: None };
+            let mut v = serde_json::to_value(o).unwrap_or(Value::Null);
+            v["disk_needed_gb"] = json!(plan::disk_needed_gb(&ins, mode, o.blocks));
+            v["warnings"] = json!(plan::warnings(&spec, &ins, vram));
+            v
+        }).collect();
         Ok(json!({
-            "model": {"id": m.id, "name": m.name, "params_b": m.params_b}, "inspect": ins, "mode": mode.key(), "options": options,
-            "load": plan::scoring_load(ins.total_params, ins.bytes_per_param, vram),
-            "disk_gb": options.iter().map(|o| (o.blocks, plan::disk_needed_gb(&ins, mode, o.blocks))).collect::<Vec<_>>(),
-            "default_blocks": blocks,
-            "warnings": if ins.supported && blocks > 0 { plan::warnings(&spec, &ins, vram) } else { Vec::new() },
+            "model": {"id": m.id, "name": m.name, "params_b": m.params_b}, "inspect": ins, "mode": mode.key(), "options": sized, "default_blocks": default_blocks,
+            "load": plan::scoring_load(ins.total_params, ins.bytes_per_param, vram), "vram_gb": vram.map(|v| (v * 10.0).round() / 10.0),
         }))
     }
 

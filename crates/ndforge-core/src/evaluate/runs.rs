@@ -267,6 +267,9 @@ pub fn compare(p: &Project) -> Vec<Value> {
 pub fn testable(p: &Project) -> Vec<Value> {
     crate::train::runs::list_runs(p).into_iter().filter(|r| r["has_adapter"] == true || r["has_model"] == true).map(|mut r| {
         let t = r["name"].as_str().and_then(|n| read_test(p, n));
+        // a run on a slimmed / grown base can also be compared with the model that base was made from
+        r["reshaped_from"] = r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json")))
+            .and_then(|c| c["model"]["repo"].as_str().and_then(reshaped_base)).map(|m| m["origin"]["repo"].clone()).unwrap_or(Value::Null);
         r["tested"] = json!(t.is_some());
         r["headline"] = t.map(|t| t["verdict"]["headline"].clone()).unwrap_or(Value::Null);
         r

@@ -311,7 +311,10 @@ pub fn list(p: &Project) -> Vec<Value> {
             });
         }
         st["scores"] = read_json(&dir.join("scores.json")).unwrap_or(Value::Null);
-        st["tested"] = json!(dir.join("test.json").is_file());
+        let test = read_json(&dir.join("test.json"));
+        st["tested"] = json!(test.is_some());
+        // the headline and the scores (not the hundreds of answers) for the page
+        st["test"] = test.map(|t| json!({"scores": t["scores"], "verdict": t["verdict"], "n": t["n"], "method": t["method"], "created": t["created"], "against": t["against"], "loaded": t["loaded"], "original": t["original"]})).unwrap_or(Value::Null);
         st["has_model"] = json!(dir.join("model").join("config.json").is_file());
         st["size_gb"] = json!(if st["has_model"] == true { (dir_size(&dir.join("model")) as f64 / 1e9 * 10.0).round() / 10.0 } else { 0.0 });
         Some(st)
