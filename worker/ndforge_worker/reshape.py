@@ -73,6 +73,8 @@ def layer_types_of(tc: dict) -> list[str]:
             raise ReshapeError(f"config.json lists {len(lt)} layer types for {n} layers.")
         return [str(x) for x in lt]
     interval = tc.get("full_attention_interval")
+    if interval is None and str(tc.get("model_type") or "").startswith("qwen3_5"):
+        interval = 4          # transformers' default; save_pretrained leaves default values out of config.json
     if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0:
         return ["linear_attention" if (i + 1) % interval else "full_attention" for i in range(n)]
     return ["full_attention"] * n

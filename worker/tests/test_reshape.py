@@ -35,6 +35,7 @@ def test_layer_types_without_the_list_follow_the_interval_rule():
     tc = copy.deepcopy(real_cfg()["text_config"])
     real = tc.pop("layer_types")
     assert rs.layer_types_of(tc) == real
+    assert rs.layer_types_of({"model_type": "qwen3_5_text", "num_hidden_layers": 8}) == types(8)       # config.json without the (default) interval
     plain = {"num_hidden_layers": 5}
     assert rs.layer_types_of(plain) == ["full_attention"] * 5
     with pytest.raises(ReshapeError, match="layer types"):
@@ -592,3 +593,101 @@ def test_an_existing_target_is_not_overwritten(tmp_path):
     Path(j["final"]).mkdir(parents=True)
     code, ev = run_job(tmp_path, j)
     assert code == 1 and "already exists" in ev[-1]["message"]
+
+
+# ---------------------------------------------------------------------------------------------------- 12: scoring flow with stand-ins for torch
+
+def in_process(monkeypatch, j):
+    """runs reshapejob.run with the protocol captured; returns (exit code, events)"""
+    import io
+    from ndforge_worker import protocol, reshapejob
+    buf = io.StringIO()
+    monkeypatch.setattr(protocol, "_out", buf)
+    monkeypatch.setattr(protocol, "reserve_stdout", lambda: None)
+    code = reshapejob.run(j)
+    return code, [json.loads(line) for line in buf.getvalue().splitlines()]
+
+
+def test_prune_flow_with_a_stand_in_for_the_measuring(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_model(tmp_path, 16)                 # 4 blocks; boundaries 0..4
+    D = matrix({(1, 2): 0.1, (2, 3): 0.9, (0, 1): 0.0, (3, 4): 0.0, (1, 3): 0.4, (2, 4): 0.5, (0, 2): 0.8, (1, 4): 0.7, (0, 3): 0.7, (0, 4): 0.9}, 5)
+    seen = {}
+
+    def fake_score(src_dir, cfg, period):
+        seen["period"] = period
+        return D, D, matrix({(1, 2): 0.2, (2, 3): 0.5}, 5), 1.5, {"load": "4bit", "tokens": 1234}
+
+    monkeypatch.setattr(reshapejob, "_require_torch", lambda: None)
+    monkeypatch.setattr(reshapejob, "_score", fake_score)
+    monkeypatch.setattr(reshapejob, "_have_torch", lambda: True)
+    monkeypatch.setattr(reshapejob, "_loss", lambda folder, cfg, mode: (2.0, mode, 99))
+    j = job(tmp_path, src, "prune", blocks=1, check=True, load="4bit", calibration={"train": "x.jsonl", "samples": 64, "max_len": 128, "version": 3})
+    code, ev = in_process(monkeypatch, j)
+    assert code == 0, ev[-1]
+    r = [e for e in ev if e["type"] == "result"][0]["data"]
+    assert seen["period"] == 4 and r["chosen_blocks"] == [1] and r["dropped"] == [4, 5, 6, 7] and r["layers_after"] == 12
+    assert r["boundary_distance"] == [0.0, 0.1, 0.9, 0.0] and r["stable"] is True and r["load"] == "4bit"
+    assert r["loss_before"] == 1.5 and r["loss_after"] == 2.0 and r["ppl_before"] == pytest.approx(4.4817, abs=1e-3) and r["ppl_after"] == pytest.approx(7.389, abs=1e-3)
+    sc = [e for e in ev if e["type"] == "reshape_scores"][0]
+    assert sc["chosen_blocks"] == [1] and sc["period"] == 4 and sc["stable"] is True and sc["matrix"] == D and sc["boundary_distance"] == r["boundary_distance"]
+    meta = json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())
+    assert meta["calibration"] == {"version": 3, "samples": 64, "max_len": 128, "tokens": 1234} and meta["stable"] is True and meta["loss_after"] == 2.0
+    assert "check" in {e["step"] for e in ev if e["type"] == "progress"}
+
+
+def test_an_unstable_measurement_is_reported(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_model(tmp_path, 16)
+    D1 = matrix({(1, 2): 0.1}, 5)
+    D2 = matrix({(2, 3): 0.1}, 5)
+    monkeypatch.setattr(reshapejob, "_require_torch", lambda: None)
+    monkeypatch.setattr(reshapejob, "_score", lambda *a: (D1, D1, D2, 1.0, {"load": "16bit", "tokens": 5}))
+    code, ev = in_process(monkeypatch, job(tmp_path, src, "prune", blocks=1))
+    assert code == 0 and [e for e in ev if e["type"] == "result"][0]["data"]["stable"] is False
+
+
+def test_the_exact_copy_self_test_passes_and_fails(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_model(tmp_path, 8)
+    monkeypatch.setattr(reshapejob, "_have_torch", lambda: True)
+    answers = iter([(1.25, "16bit", 10), (1.25, "16bit", 10)])
+    monkeypatch.setattr(reshapejob, "_loss", lambda folder, cfg, mode: next(answers))
+    j = job(tmp_path, src, "grow", check=True)
+    code, ev = in_process(monkeypatch, j)
+    assert code == 0, ev[-1]
+    r = [e for e in ev if e["type"] == "result"][0]["data"]
+    assert r["loss_before"] == r["loss_after"] == 1.25 and r["ppl_before"] == r["ppl_after"]
+    # a model that does not give the same loss is not kept
+    src2 = fake_model(tmp_path, 8, name="src2")
+    answers2 = iter([(1.25, "16bit", 10), (1.5, "16bit", 10)])
+    monkeypatch.setattr(reshapejob, "_loss", lambda folder, cfg, mode: next(answers2))
+    j2 = job(tmp_path, src2, "grow", check=True, out=str(tmp_path / "m2" / "model.partial"), final=str(tmp_path / "m2" / "model"))
+    Path(j2["out"]).parent.mkdir()
+    code, ev = in_process(monkeypatch, j2)
+    assert code == 1 and ev[-1]["code"] == "grow_check_failed" and "nothing was saved" in ev[-1]["message"]
+    assert not Path(j2["out"]).exists() and not Path(j2["final"]).exists()
+
+
+def test_a_failing_check_does_not_lose_the_model(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_model(tmp_path, 8)
+    monkeypatch.setattr(reshapejob, "_have_torch", lambda: True)
+
+    def boom(*a):
+        raise RuntimeError("something odd")
+
+    monkeypatch.setattr(reshapejob, "_loss", boom)
+    j = job(tmp_path, src, "grow", check=True)
+    code, ev = in_process(monkeypatch, j)
+    r = [e for e in ev if e["type"] == "result"][0]["data"]
+    assert code == 0 and r["loss_after"] is None and any("could not be run" in n for n in r["notes"]) and Path(j["final"]).is_dir()
+
+
+def test_the_check_is_skipped_without_torch(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_model(tmp_path, 8)
+    monkeypatch.setattr(reshapejob, "_have_torch", lambda: False)
+    code, ev = in_process(monkeypatch, job(tmp_path, src, "grow", check=True))
+    r = [e for e in ev if e["type"] == "result"][0]["data"]
+    assert code == 0 and r["loss_before"] is None and any("skipped" in n for n in r["notes"])
