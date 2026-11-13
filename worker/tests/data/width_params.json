@@ -1,0 +1,366 @@
+[
+ {
+  "name": "27B as on the Hub",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 48,
+  "n_full": 16,
+  "width": {
+   "intermediate": 17408,
+   "lin_v_heads": 48,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 27781427952
+ },
+ {
+  "name": "9B as on the Hub",
+  "dims": {
+   "hidden": 4096,
+   "intermediate": 12288,
+   "heads": 16,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 32,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 24,
+  "n_full": 8,
+  "width": {
+   "intermediate": 12288,
+   "lin_v_heads": 32,
+   "heads": 16
+  },
+  "vision": 456010480,
+  "other": 0,
+  "params": 9653104368
+ },
+ {
+  "name": "27B mild (I 13312)",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 48,
+  "n_full": 16,
+  "width": {
+   "intermediate": 13312,
+   "lin_v_heads": 48,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 23691981552
+ },
+ {
+  "name": "27B I 10752",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 48,
+  "n_full": 16,
+  "width": {
+   "intermediate": 10752,
+   "lin_v_heads": 48,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 21136077552
+ },
+ {
+  "name": "27B I 12288 + 32 value heads",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 48,
+  "n_full": 16,
+  "width": {
+   "intermediate": 12288,
+   "lin_v_heads": 32,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 21151411440
+ },
+ {
+  "name": "27B I 13312 + 32 value heads + 16 heads",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 48,
+  "n_full": 16,
+  "width": {
+   "intermediate": 13312,
+   "lin_v_heads": 32,
+   "heads": 16
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 21638999280
+ },
+ {
+  "name": "27B 60 layers + I 12288",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 45,
+  "n_full": 15,
+  "width": {
+   "intermediate": 12288,
+   "lin_v_heads": 48,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 21462117968
+ },
+ {
+  "name": "27B 56 layers + I 13312",
+  "dims": {
+   "hidden": 5120,
+   "intermediate": 17408,
+   "heads": 24,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 48,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 42,
+  "n_full": 14,
+  "width": {
+   "intermediate": 13312,
+   "lin_v_heads": 48,
+   "heads": 24
+  },
+  "vision": 460730096,
+  "other": 0,
+  "params": 21151148464
+ },
+ {
+  "name": "9B I 9216",
+  "dims": {
+   "hidden": 4096,
+   "intermediate": 12288,
+   "heads": 16,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 32,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 24,
+  "n_full": 8,
+  "width": {
+   "intermediate": 9216,
+   "lin_v_heads": 32,
+   "heads": 16
+  },
+  "vision": 456010480,
+  "other": 0,
+  "params": 8407396080
+ },
+ {
+  "name": "9B I 9216 + 24 value heads",
+  "dims": {
+   "hidden": 4096,
+   "intermediate": 12288,
+   "heads": 16,
+   "kv_heads": 4,
+   "head_dim": 256,
+   "lin_k_heads": 16,
+   "lin_v_heads": 32,
+   "lin_k_dim": 128,
+   "lin_v_dim": 128,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 248320,
+   "tied": false
+  },
+  "n_lin": 24,
+  "n_full": 8,
+  "width": {
+   "intermediate": 9216,
+   "lin_v_heads": 24,
+   "heads": 16
+  },
+  "vision": 456010480,
+  "other": 0,
+  "params": 8103734640
+ },
+ {
+  "name": "tiny",
+  "dims": {
+   "hidden": 8,
+   "intermediate": 32,
+   "heads": 6,
+   "kv_heads": 2,
+   "head_dim": 4,
+   "lin_k_heads": 2,
+   "lin_v_heads": 4,
+   "lin_k_dim": 4,
+   "lin_v_dim": 4,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 16,
+   "tied": false
+  },
+  "n_lin": 6,
+  "n_full": 2,
+  "width": {
+   "intermediate": 32,
+   "lin_v_heads": 4,
+   "heads": 6
+  },
+  "vision": 5,
+  "other": 0,
+  "params": 13909
+ },
+ {
+  "name": "tiny thinner",
+  "dims": {
+   "hidden": 8,
+   "intermediate": 32,
+   "heads": 6,
+   "kv_heads": 2,
+   "head_dim": 4,
+   "lin_k_heads": 2,
+   "lin_v_heads": 4,
+   "lin_k_dim": 4,
+   "lin_v_dim": 4,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 16,
+   "tied": false
+  },
+  "n_lin": 6,
+  "n_full": 2,
+  "width": {
+   "intermediate": 16,
+   "lin_v_heads": 2,
+   "heads": 4
+  },
+  "vision": 5,
+  "other": 0,
+  "params": 8317
+ },
+ {
+  "name": "tiny tied",
+  "dims": {
+   "hidden": 8,
+   "intermediate": 32,
+   "heads": 6,
+   "kv_heads": 2,
+   "head_dim": 4,
+   "lin_k_heads": 2,
+   "lin_v_heads": 4,
+   "lin_k_dim": 4,
+   "lin_v_dim": 4,
+   "conv_kernel": 4,
+   "mtp_layers": 1,
+   "vocab": 16,
+   "tied": true
+  },
+  "n_lin": 6,
+  "n_full": 2,
+  "width": {
+   "intermediate": 32,
+   "lin_v_heads": 4,
+   "heads": 6
+  },
+  "vision": 5,
+  "other": 0,
+  "params": 13781
+ }
+]
