@@ -103,7 +103,7 @@ def _read_state(path: Path) -> dict:
 
 
 def run(cfg: dict) -> int:
-    """cfg: {model: {repo, family}, method: lora|qlora|full, backend: auto|unsloth|hf, dataset: {train}, hyper: {rank, alpha, lr, epochs, max_steps,
+    """cfg: {model: {repo, family}, method: lora|qlora|dora|rs_lora|loftq|full, backend: auto|unsloth|hf, dataset: {train}, hyper: {rank, alpha, lr, epochs, max_steps,
     batch, grad_accum, max_seq, warmup, weight_decay, scheduler, seed, save_steps, logging_steps}, out, resume, stages?, probes: [{system, question}],
     probe_every, probe_tokens, optim, init_adapter? (continue a LoRA), init_model? (continue full fine-tuning from a saved model)}"""
     protocol.reserve_stdout()
