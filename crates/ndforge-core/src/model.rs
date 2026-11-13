@@ -1,6 +1,7 @@
 //! The application model behind the window: current project, settings and the actions the pages call. The Tauri shell
 //! (`src-tauri`) only forwards calls to it and shows the JSON it returns, so everything here is testable without a window.
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
@@ -73,6 +74,7 @@ impl AppModel {
     fn adopt(&mut self, project: Project) {
         self.settings.remember_project(&project.folder);
         self.settings.save();
+        crate::reshape::runs::mark_interrupted(&project);   // a model half-made when the program closed is marked failed
         crate::train::runs::mark_interrupted(&project);   // a run left "running" by a closed program or a crash can be continued
         self.project = Some(project);
     }
@@ -402,6 +404,50 @@ impl AppModel {
     pub fn bench_last(&self, model_id: &str, method: Method) -> Result<Value> {
         let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
         Ok(crate::train::bench::last(self.project_ref()?, &m, method).unwrap_or(Value::Null))
+    }
+
+    // ------------------------------------------------------------------ slim or grow a model
+    /// Everything the Slim or grow page shows before a model is chosen: the model list, what was made, and what this PC has.
+    pub fn reshape_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        let gpu = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().cloned());
+        Ok(json!({
+            "models": models().iter().map(|m| json!({"id": m.id, "name": m.name, "family": m.family, "params_b": m.params_b, "custom": m.custom, "reshape": m.reshape, "derived_from": m.derived_from})).collect::<Vec<_>>(),
+            "made": crate::reshape::runs::list(p),
+            "dataset_version": runs::latest_version(p).map(|(n, _)| n),
+            "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "vram_gb": gpu.as_ref().map(|g| (g.vram_gb() * 10.0).round() / 10.0),
+            "gpu": gpu.as_ref().map(|g| g.name.clone()),
+            "free_disk_gb": crate::envmgr::health::free_disk_gb(&p.folder).map(|g| (g * 10.0).round() / 10.0),
+            "unsloth": crate::train::bench::env_has_unsloth(),
+        }))
+    }
+
+    /// What can be done with one model: its layout, every feasible size for `mode` ("prune" or "grow") and what to know first. May ask the worker (and the
+    /// internet) the first time, so the window calls it off the main thread.
+    pub fn reshape_options(&self, model_id: &str, mode: &str) -> Result<Value> {
+        use crate::reshape::{plan, runs as rruns};
+        let _ = self.project_ref()?;
+        let m = find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+        let mode = match mode {
+            "prune" => plan::Mode::Prune,
+            "grow" => plan::Mode::Grow,
+            other => return Err(Error::new(format!("Unknown mode: {other}"))),
+        };
+        let gpu = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().cloned());
+        let vram = gpu.as_ref().map(|g| g.vram_gb());
+        let ins = rruns::inspect(&m, &AtomicBool::new(false), &mut |_| {})?;
+        let options = plan::options(&ins, mode, vram);
+        // the first choice the page offers: a quarter of the blocks (at least one), within what is possible
+        let blocks = options.last().map(|o| (o.blocks).min((ins.blocks / 4).max(1))).unwrap_or(0);
+        let spec = plan::ReshapeSpec { source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512, load: "auto".into(), drop_layers: None };
+        Ok(json!({
+            "model": {"id": m.id, "name": m.name, "params_b": m.params_b}, "inspect": ins, "mode": mode.key(), "options": options,
+            "load": plan::scoring_load(ins.total_params, ins.bytes_per_param, vram),
+            "disk_gb": options.iter().map(|o| (o.blocks, plan::disk_needed_gb(&ins, mode, o.blocks))).collect::<Vec<_>>(),
+            "default_blocks": blocks,
+            "warnings": if ins.supported && blocks > 0 { plan::warnings(&spec, &ins, vram) } else { Vec::new() },
+        }))
     }
 
     pub fn train_metrics(&self, run: &str) -> Result<Value> {

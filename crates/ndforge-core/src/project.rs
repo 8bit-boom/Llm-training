@@ -6,6 +6,7 @@
 //!                          a project may hold SEVERAL worlds: the first is the main one, further ones are listed under [[worlds]] in project.toml
 //! datasets/vN/             saved training-data versions   (step 2)
 //! runs/<name>/             training runs                  (step 3)
+//! models/<name>/           slimmed or grown models        ("Slim or grow a model": state.json, result.json, test.json, model/)
 //! exports/                 GGUF / Modelfile               (step 5)
 //! ```
 use std::path::{Path, PathBuf};
@@ -114,7 +115,7 @@ impl Project {
         if folder.exists() && std::fs::read_dir(&folder)?.next().is_some() {
             return Err(Error::new(format!("The folder {} already exists and is not empty. Choose another name.", folder.display())));
         }
-        for sub in ["sources", "datasets", "runs", "exports"] {
+        for sub in ["sources", "datasets", "runs", "models", "exports"] {
             std::fs::create_dir_all(folder.join(sub))?;
         }
         let p = Project {
