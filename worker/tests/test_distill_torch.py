@@ -113,3 +113,105 @@ def test_a_different_tokenizer_is_refused(tmp_path, base, monkeypatch):
     from ndforge_worker.reshape import ReshapeError
     with pytest.raises(ReshapeError, match="same tokenizer"):
         run_in_process(monkeypatch, dj.run_cache, cache_cfg(tmp_path, base, student=str(other)))
+
+
+# ------------------------------------------------------------------------------------------------------------ the student
+
+from test_reshape_width_torch import perturb, run_width  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def teacher(tmp_path_factory):
+    d = build_arch_dir(tmp_path_factory.mktemp("teacher") / "base", "qwen3_5", num_layers=4)
+    perturb(d)                                   # logits with some spread, so there is something to learn
+    return d
+
+
+def thin_student(tmp_path, teacher):
+    j, _ = run_width(tmp_path / "thin", teacher, {"intermediate_size": 80}, layers=4)
+    return j["final"]
+
+
+def distill_cfg(tmp_path, student, teacher, mode, **over):
+    train, general = write_data(tmp_path)
+    hyper = {"rank": 8, "alpha": 8, "lr": 3e-3, "max_seq": 64, "batch": 2, "grad_accum": 1, "warmup": 0, "save_steps": 100, "logging_steps": 1, "tokens": 1500,
+             "max_steps": 20, "seed": 1}
+    hyper.update(over.pop("hyper", {}))
+    cfg = {"job": "distill", "model": {"repo": str(student), "family": "qwen3_5"}, "method": "lora", "backend": "hf",
+           "dataset": {"train": train, "general": {"share": 0.5, "file": general}}, "hyper": hyper,
+           "distill": {"mode": mode, "cache": str(tmp_path / "distill" / "cache"), "teacher": {"repo": str(teacher), "load": "16bit"}, "alpha": 1.0, "k": 16, "chunk": 16,
+                       "eval_every": 10},
+           "eval": {"calibration": {"train": train, "samples": 8, "max_len": 64, "batch": 2, "version": 1}, "teacher_loss": 1.0}, "out": str(tmp_path / "distill" / "run")}
+    cfg.update(over)
+    return cfg
+
+
+def make_cache(tmp_path, student, teacher, monkeypatch, k=16):
+    cfg = cache_cfg(tmp_path, teacher, student=str(student), k=k)
+    cfg["data"]["tokens"] = 1500
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg)
+    assert code == 0, ev[-1]
+
+
+def metrics(ev, name="distill_metric"):
+    return [e for e in ev if e["type"] == name]
+
+
+def test_healing_in_cache_mode_lowers_the_kl_and_saves_a_lora(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    code, ev = run_in_process(monkeypatch, dj.run, distill_cfg(tmp_path, student, teacher, "cache"))
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    kd = [e["kd"] for e in metrics(ev)]
+    assert len(kd) >= 10 and all(np.isfinite(kd)) and r["kd_first"] == kd[0] and r["kd_last"] == kd[-1] and r["steps"] == 20 and r["mode"] == "cache"
+    assert sum(kd[-5:]) / 5 < 0.95 * sum(kd[:5]) / 5, kd
+    assert r["tokens_seen"] > 0 and r["stopped"] is False and Path(r["adapter_dir"], "adapter_config.json").is_file()
+    cal = [e["calib_loss"] for e in metrics(ev, "distill_eval")]
+    assert len(cal) >= 3 and r["calib_loss_after"] is not None and r["calib_loss_before"] is not None and r["teacher_calib_loss"] == 1.0
+    assert {"metric", "start", "progress"} <= {e["type"] for e in ev}                  # the existing loss chart keeps working
+    assert all(np.isfinite([e["loss"] for e in ev if e["type"] == "metric"]))
+
+
+def test_the_first_step_loss_is_the_same_in_cache_and_online_mode(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    V = json.loads((Path(teacher) / "config.json").read_text())["text_config"]["vocab_size"]
+    make_cache(tmp_path, student, teacher, monkeypatch, k=V)                               # k = the whole vocabulary: the top-k answer is exact
+    first = {}
+    for mode in ("cache", "online"):
+        cfg = distill_cfg(tmp_path, student, teacher, mode, hyper={"max_steps": 1}, out=str(tmp_path / f"run-{mode}"))
+        cfg["distill"]["k"] = V
+        cfg["distill"]["eval_every"] = 0
+        cfg["eval"] = None
+        code, ev = run_in_process(monkeypatch, dj.run, cfg)
+        assert code == 0, ev[-1]
+        first[mode] = metrics(ev)[0]["kd"]
+    assert first["cache"] > 0 and first["online"] == pytest.approx(first["cache"], rel=2e-2)
+
+
+def test_a_cache_of_other_data_is_refused_and_a_stop_file_stops_with_a_saved_adapter(tmp_path, teacher, monkeypatch):
+    from ndforge_worker.reshape import ReshapeError
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    idx = json.loads((tmp_path / "distill" / "cache" / "index.json").read_text())
+    idx["max_len"] = 32
+    (tmp_path / "distill" / "cache" / "index.json").write_text(json.dumps(idx))
+    with pytest.raises(ReshapeError, match="other data"):
+        run_in_process(monkeypatch, dj.run, distill_cfg(tmp_path, student, teacher, "cache"))
+    idx["max_len"] = 64
+    (tmp_path / "distill" / "cache" / "index.json").write_text(json.dumps(idx))
+    stop = tmp_path / "run-stop" / "STOP"
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "run-stop"), stop_file=str(stop))
+    from ndforge_worker import callbacks
+    real = callbacks.LiveCallback.on_step_end
+
+    def stop_after_two(self, args, state, control, **kw):
+        if state.global_step == 2:
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text("")
+        return real(self, args, state, control, **kw)
+    monkeypatch.setattr(callbacks.LiveCallback, "on_step_end", stop_after_two)
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    r = ev[-1]["data"]
+    assert code == 0 and r["stopped"] is True and r["steps"] == 2 and Path(r["adapter_dir"]).is_dir()
+    assert any((tmp_path / "run-stop" / "checkpoints").glob("checkpoint-*"))           # a checkpoint was saved for "Continue"

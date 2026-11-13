@@ -331,6 +331,32 @@ class CacheWriter:
             self._write_index()
 
 
+def save_rows(folder, rows: list) -> None:
+    """rows.npz next to the cache: the token ids of the rows the teacher answered, so the student learns from exactly these rows without making them again
+    (and without a second download of the general text). Needs numpy."""
+    from . import slice_io
+    np = slice_io.np()
+    lens = np.array([len(r["input_ids"]) for r in rows], dtype=np.int64)
+    kinds = sorted({str(r.get("kind", "")) for r in rows})
+    np.savez(Path(folder) / "rows.partial.npz", ids=np.array([x for r in rows for x in r["input_ids"]], dtype=np.int32),
+             mask=np.array([x for r in rows for x in r["completion_mask"]], dtype=np.uint8), offsets=np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
+             general=np.array([r.get("source") == "general" for r in rows], dtype=np.uint8), kind=np.array([kinds.index(str(r.get("kind", ""))) for r in rows], dtype=np.int16),
+             kinds=np.array(kinds))
+    os.replace(Path(folder) / "rows.partial.npz", Path(folder) / "rows.npz")
+
+
+def load_rows(folder) -> list:
+    from . import slice_io
+    np = slice_io.np()
+    try:
+        with np.load(Path(folder) / "rows.npz") as z:
+            ids, mask, off, gen, kind, kinds = (z[k] for k in ("ids", "mask", "offsets", "general", "kind", "kinds"))
+    except (OSError, ValueError, KeyError):
+        raise ReshapeError("The teacher's saved answers are missing or unreadable; they will be made again.") from None
+    return [{"input_ids": ids[off[i]:off[i + 1]].tolist(), "completion_mask": mask[off[i]:off[i + 1]].tolist(), "kind": str(kinds[kind[i]]),
+             "source": "general" if gen[i] else "project"} for i in range(len(off) - 1)]
+
+
 def read_cache_index(folder):
     try:
         idx = json.loads((Path(folder) / "index.json").read_text(encoding="utf-8"))
@@ -422,6 +448,7 @@ def run_cache(cfg: dict) -> int:
     meta = {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
             "project_rows": stats["project_rows"], "general_rows": stats["general_rows"]}
     writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
+    save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
     total_tokens = sum(len(r["input_ids"]) for r in rows)
     result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
@@ -475,3 +502,304 @@ def run_cache(cfg: dict) -> int:
 
 def _dir_bytes(folder) -> int:
     return sum(f.stat().st_size for f in Path(folder).glob("*") if f.is_file())
+
+
+# ============================================================================================================ the student
+
+DEFAULT_HYPER = {"rank": 64, "alpha": 64, "lr": 1e-4, "max_seq": 2048, "batch": 4, "grad_accum": 8, "warmup": 30, "weight_decay": 0.0, "scheduler": "cosine",
+                 "seed": 3407, "save_steps": 50, "logging_steps": 1, "tokens": 20_000_000}
+
+
+def _distill_collator(pad_id: int, reader):
+    """Batches of rows: ids, attention mask, labels (as in training) and, with a cache, the teacher's answers for every real position, in row order."""
+    import numpy as np
+    import torch
+
+    def collate(batch):
+        n = max(len(b["input_ids"]) for b in batch)
+        ids = torch.full((len(batch), n), pad_id, dtype=torch.long)
+        att = torch.zeros((len(batch), n), dtype=torch.long)
+        lab = torch.full((len(batch), n), -100, dtype=torch.long)
+        for i, b in enumerate(batch):
+            L = len(b["input_ids"])
+            t = torch.tensor(b["input_ids"], dtype=torch.long)
+            ids[i, :L] = t
+            att[i, :L] = 1
+            lab[i, :L] = torch.where(torch.tensor(b["completion_mask"], dtype=torch.bool), t, torch.full_like(t, -100))
+        out = {"input_ids": ids, "attention_mask": att, "labels": lab}
+        if reader is not None:
+            parts = [reader.get(int(b["row"])) for b in batch]
+            for b, (tid, _, _) in zip(batch, parts):
+                if len(tid) != len(b["input_ids"]):
+                    raise ReshapeError("The teacher's saved answers do not fit the rows; they will be made again.")
+            out["t_ids"] = torch.from_numpy(np.concatenate([p[0] for p in parts]))
+            out["t_logp"] = torch.from_numpy(np.concatenate([p[1] for p in parts]).astype("float32"))
+            out["t_resid"] = torch.from_numpy(np.concatenate([p[2] for p in parts]))
+        return out
+    return collate
+
+
+def _teacher_targets(teacher, ids, att, k: int, chunk: int):
+    """the same (ids, logp, resid) for the real positions of a batch, made now by the teacher (online mode)"""
+    import torch
+    with torch.no_grad():
+        hidden, _ = forward_hidden(teacher, ids.to(next(teacher.parameters()).device), att.to(next(teacher.parameters()).device))
+        h = hidden[att.bool().to(hidden.device)]
+        weight = teacher.get_output_embeddings().weight
+        parts = [topk_from_logits(h[a:a + chunk] @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+    return tuple(torch.cat([p[j] for p in parts]).to(ids.device) for j in range(3))
+
+
+def student_loss(model, inputs, targets_fn, alpha: float, chunk: int):
+    """(loss, kd mean, ce mean) of a batch. The student's hidden states of the real positions go through the output layer in chunks; the teacher's answers
+    come from targets_fn(inputs) -> (ids, logp, resid) for those positions. alpha = 1: only the KL term."""
+    import torch
+    att = inputs["attention_mask"]
+    hidden, _ = forward_hidden(model, inputs["input_ids"], att)
+    sel = att.bool().to(hidden.device)
+    h = hidden[sel]
+    weight = model.get_output_embeddings().weight
+    targets = tuple(t.to(h.device) for t in targets_fn(inputs))
+    labels = lab_mask = None
+    if alpha < 1.0:
+        nxt = torch.cat([inputs["labels"][:, 1:], torch.full_like(inputs["labels"][:, :1], -100)], dim=1).to(h.device)[sel]
+        lab_mask, labels = nxt != -100, nxt.clamp(min=0)
+    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask)
+    kd_mean = kd / n.clamp(min=1)
+    ce_mean = ce / n_lab.clamp(min=1) if labels is not None else kd_mean.new_zeros(())
+    loss = alpha * kd_mean + (1.0 - alpha) * ce_mean if alpha < 1.0 else kd_mean
+    return loss, kd_mean, ce_mean
+
+
+UNSTABLE = "Healing stopped: the training became unstable (the error went to infinity). Lower the learning rate (Expert) and continue."
+
+
+def _trainer_class(base):
+    class DistillTrainer(base):
+        """SFTTrainer with the distillation loss. self.distill = {"targets": fn, "alpha", "chunk", "kd": [...], "ce": [...]}"""
+
+        def _get_train_sampler(self, *args, **kwargs):
+            from torch.utils.data import SequentialSampler
+            return SequentialSampler(self.train_dataset)       # the order was made by training_order (shuffled in blocks, close rows share a cache file)
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            import torch
+            d = self.distill
+            loss, kd, ce = student_loss(model, inputs, d["targets"], d["alpha"], d["chunk"])
+            if not torch.isfinite(loss):
+                raise ReshapeError(UNSTABLE)
+            d["kd"].append(float(kd))
+            d["ce"].append(float(ce))
+            d["tokens"] += int(inputs["attention_mask"].sum())
+            return (loss, None) if return_outputs else loss
+    return DistillTrainer
+
+
+def calib_loss(model, batches: list, chunk: int = 256):
+    """Mean next-token cross-entropy of a model on the measuring batches (the number the thinned model's result card shows as "before healing"),
+    computed from the hidden states in chunks, so that no full logits exist. The model is put back into training mode afterwards."""
+    import torch
+    import torch.nn.functional as F
+    was_training = model.training
+    model.eval()
+    total, count = 0.0, 0
+    try:
+        with torch.no_grad():
+            dev = next(model.parameters()).device
+            for b in batches:
+                ids, mask = b["input_ids"].to(dev), b["attention_mask"].to(dev)
+                hidden, _ = forward_hidden(model, ids, mask)
+                weight = model.get_output_embeddings().weight
+                for i in range(ids.shape[0]):
+                    n = int(mask[i].sum())
+                    if n < 2:
+                        continue
+                    for a in range(0, n - 1, chunk):
+                        c = min(chunk, n - 1 - a)
+                        logits = (hidden[i, a:a + c] @ weight.t()).float()
+                        total += float(F.cross_entropy(logits, ids[i, a + 1:a + 1 + c], reduction="sum"))
+                    count += n - 1
+    finally:
+        if was_training:
+            model.train()
+    return total / count if count else None
+
+
+def _callback_class():
+    from .callbacks import LiveCallback
+
+    class HealCallback(LiveCallback):
+        """LiveCallback (metrics, stop file) plus the distillation numbers and the calibration loss every `eval_every` steps."""
+
+        def __init__(self, *args, eval_fn=None, eval_every: int = 0, distill=None, **kw):
+            super().__init__(*args, **kw)
+            self.eval_fn, self.eval_every, self.distill = eval_fn, eval_every, distill
+            self.history: list = []          # (step, kd, ce)
+            self.calib: list = []            # (step, loss)
+            self._seen = 0
+
+        def on_log(self, args, state, control, logs=None, **kw):
+            super().on_log(args, state, control, logs=logs, **kw)
+            d = self.distill
+            if d is None or not logs or "loss" not in logs:
+                return
+            kd, ce = d["kd"][self._seen:], d["ce"][self._seen:]
+            self._seen = len(d["kd"])
+            if kd:
+                row = (self.offset + state.global_step, sum(kd) / len(kd), sum(ce) / len(ce))
+                self.history.append(row)
+                protocol.emit("distill_metric", step=row[0], kd=row[1], ce=row[2], tokens=d["tokens"], total_steps=self.total)
+
+        def _evaluate(self, step):
+            if self.eval_fn is None:
+                return
+            try:
+                v = self.eval_fn()
+            except Exception as exc:         # noqa: BLE001 - the measurement must never stop the healing
+                protocol.log(f"The check on your text was skipped: {type(exc).__name__}: {exc}")
+                return
+            if v is not None:
+                self.calib.append((step, v))
+                protocol.emit("distill_eval", step=step, calib_loss=v)
+
+        def on_step_end(self, args, state, control, **kw):
+            super().on_step_end(args, state, control, **kw)
+            if self.eval_every and not self.stopped and state.global_step % self.eval_every == 0:
+                self._evaluate(self.offset + state.global_step)
+    return HealCallback
+
+
+def run(cfg: dict) -> int:
+    """job distill: {"model": {"repo": the thinned model's folder, "family"}, "method": "lora|qlora", "backend": "hf", "dataset": {"train", "general": {...}},
+    "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?},
+    "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50},
+    "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path}.
+    Writes the LoRA to out/adapter. Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss, adapter_dir, stopped."""
+    protocol.reserve_stdout()
+    from . import backends
+    out = Path(cfg["out"])
+    out.mkdir(parents=True, exist_ok=True)
+    stop_file = Path(cfg.get("stop_file") or out / "STOP")
+    stop_file.unlink(missing_ok=True)
+    d = cfg["distill"]
+    mode = d.get("mode", "cache")
+    if mode not in ("cache", "online"):
+        raise ReshapeError(f"Unknown way of healing: {mode!r}.")
+    if cfg.get("backend", "hf") not in ("hf", None):
+        protocol.log("Healing uses the standard engine (Transformers + PEFT): the fused loss of the faster engine was not checked for this loss.")
+    backends.prepare("hf")
+    import torch
+    from datasets import Dataset
+    from transformers import set_seed
+    from trl import SFTConfig, SFTTrainer
+    from . import data, reshapejob
+
+    h = {**DEFAULT_HYPER, **(cfg.get("hyper") or {})}
+    k, chunk, alpha = int(d.get("k", 32)), int(d.get("chunk", 256)), float(d.get("alpha", 1.0))
+    set_seed(h["seed"])
+    protocol.log(f"Healing: {mode} mode, precision {backends.precision_name()}, LoRA rank {h['rank']}, learning rate {h['lr']}, KL loss weight {alpha}.")
+    student_dir = cfg["model"]["repo"]
+    reader = teacher = None
+    if mode == "cache":
+        reader = CacheReader(d["cache"])
+        idx = reader.index
+        rows = load_rows(d["cache"])
+        if (idx["tokenizer_hash"] != tokenizer_hash(student_dir) or idx["max_len"] != h["max_seq"] or idx["rows"] != len(rows)
+                or data_hash(rows) != idx["data_hash"] or reader.done_rows < idx["rows"]):
+            raise ReshapeError("The saved teacher answers belong to other data; they will be made again.")
+        share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
+    else:
+        share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
+    lcfg = {"model": cfg["model"], "method": cfg["method"], "hyper": h}
+    model, tokenizer, _ = backends.load(lcfg, "hf")
+    if mode == "online":
+        dcfg = {"train": cfg["dataset"]["train"], "tokens": int(h["tokens"]), "general": (cfg["dataset"] or {}).get("general")}
+        rows, stats = build_rows(tokenizer, dcfg, cfg["model"].get("family", "generic"), int(h["max_seq"]), int(h["seed"]))
+        if stats["general_error"]:
+            share = 0.0
+        t_dir = reshapejob._resolve_source(d["teacher"]["repo"])
+        if tokenizer_hash(t_dir) != tokenizer_hash(student_dir):
+            raise ReshapeError("The original model and the thinned model do not use the same tokenizer, so the original's answers cannot be used to teach it.")
+        est = sum(r.nbytes for r in safetensors_io.list_tensors(t_dir).values())
+        teacher = reshapejob._load(t_dir, reshapejob._choose_load(d["teacher"].get("load", "auto"), est))
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+    elif not any(r.get("source") == "general" for r in rows):
+        share = 0.0
+    order = training_order(rows, int(h["tokens"]), share, int(h["seed"]))
+    if not order:
+        raise ReshapeError("There is nothing to learn from: the training data is empty.")
+    ds = Dataset.from_list([{"input_ids": rows[i]["input_ids"], "completion_mask": rows[i]["completion_mask"], "row": i} for i in order])
+    per_step = max(1, int(h["batch"]) * int(h["grad_accum"]))
+    steps = int(h["max_steps"]) if h.get("max_steps") else max(1, -(-len(order) // per_step))
+    tokens_planned = sum(len(rows[i]["input_ids"]) for i in order)
+    protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text).")
+
+    inner = data._inner(tokenizer)
+    pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
+    cuda = torch.cuda.is_available()
+    bf16 = cuda and torch.cuda.get_device_capability(0)[0] >= 8
+    optim = "adamw_8bit" if cuda else "adamw_torch"
+    if optim == "adamw_8bit":
+        try:
+            import bitsandbytes  # noqa: F401
+        except Exception:
+            optim = "adamw_torch"
+    fields = getattr(SFTConfig, "__dataclass_fields__", {})
+    ckdir = out / "checkpoints"
+    kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(h["batch"]), gradient_accumulation_steps=int(h["grad_accum"]), learning_rate=float(h["lr"]),
+                  warmup_steps=int(h["warmup"]), weight_decay=float(h["weight_decay"]), lr_scheduler_type=h["scheduler"], logging_steps=int(h["logging_steps"]),
+                  save_strategy="steps", save_steps=int(h["save_steps"]), save_total_limit=2, optim=optim, seed=int(h["seed"]), report_to="none", disable_tqdm=True,
+                  bf16=bf16, fp16=cuda and not bf16, remove_unused_columns=False, gradient_checkpointing=False, dataloader_num_workers=0, use_cpu=not cuda,
+                  max_steps=steps)
+    kwargs["max_length" if "max_length" in fields else "max_seq_length"] = int(h["max_seq"])
+    if "dataset_kwargs" in fields:
+        kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
+    if "packing" in fields:
+        kwargs["packing"] = False
+    args = SFTConfig(**kwargs)
+
+    ev = cfg.get("eval") or None
+    eval_fn = None
+    if ev and ev.get("calibration"):
+        batches = reshapejob._calibration(tokenizer, ev["calibration"], cfg["model"].get("family", "generic"))
+        eval_fn = lambda: calib_loss(model, batches, chunk)  # noqa: E731
+    state = {"kd": [], "ce": [], "tokens": 0}
+    Heal = _callback_class()
+    live = Heal(str(stop_file), None, [], 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state)
+    trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
+    trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
+    trainer = _trainer_class(SFTTrainer)(**trainer_kw)
+    trainer.model_accepts_loss_kwargs = False           # the trainer then divides the loss by the gradient accumulation itself
+    targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, chunk))
+    trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": chunk}
+    live.distill = trainer.distill
+    before = ev.get("slim_loss") if ev else None
+    if before is None and eval_fn is not None:
+        before = eval_fn()
+        if before is not None:
+            protocol.emit("distill_eval", step=0, calib_loss=before)
+    ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
+    resume = bool(cfg.get("resume")) and bool(ckpts)
+    if cfg.get("resume") and not ckpts:
+        protocol.log("No checkpoint to continue from; starting from the beginning.")
+    t0 = time.time()
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+    trainer.train(resume_from_checkpoint=True if resume else None)
+    after = None
+    if eval_fn is not None and not live.stopped:
+        after = eval_fn()
+        if after is not None:
+            protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
+    target = out / "adapter"
+    trainer.model.save_pretrained(str(target))
+    hist = live.history
+    summary = {"backend": "hf", "method": cfg["method"], "mode": mode, "steps": trainer.state.global_step, "total_steps": steps, "tokens_seen": trainer.distill["tokens"],
+               "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": before,
+               "calib_loss_after": after if after is not None else (live.calib[-1][1] if live.calib else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
+               "train_seconds": round(time.time() - t0, 1), "peak_vram_mb": live._vram(), "adapter_dir": str(target), "stopped": live.stopped,
+               "rows": len(order), "tokens_planned": tokens_planned}
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    protocol.result(summary)
+    return 0

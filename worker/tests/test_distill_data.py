@@ -166,3 +166,13 @@ def test_an_unreadable_cache_says_it_will_be_made_again(tmp_path):
     (tmp_path / "index.json").write_text("{not json")
     with pytest.raises(ReshapeError, match="made again"):
         dj.CacheReader(tmp_path)
+
+
+def test_rows_are_saved_next_to_the_cache_and_come_back_unchanged(tmp_path):
+    rows = [{"input_ids": [5, 6, 7], "completion_mask": [0, 1, 1], "kind": "chat", "source": "project"},
+            {"input_ids": [8], "completion_mask": [1], "kind": "text", "source": "project"},
+            {"input_ids": [9, 10], "completion_mask": [1, 1], "kind": "general", "source": "general"}]
+    dj.save_rows(tmp_path, rows)
+    assert dj.load_rows(tmp_path) == rows and dj.data_hash(dj.load_rows(tmp_path)) == dj.data_hash(rows)
+    with pytest.raises(ReshapeError, match="made again"):
+        dj.load_rows(tmp_path / "nothing")
