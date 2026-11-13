@@ -105,3 +105,6 @@ textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace
 .warn { background: #fff6dd; color: #6b4e00; border: 1px solid #e6c866; border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
 :root[data-theme="dark"] .warn { background: #3b3216; color: #f1d98a; border-color: #7a6320; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .warn { background: #3b3216; color: #f1d98a; border-color: #7a6320; } }
+
+/* a section inside a card (the Heal card under the result of a made model) */
+.card-in { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
