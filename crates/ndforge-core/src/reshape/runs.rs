@@ -744,3 +744,62 @@ pub fn heal_metrics(p: &Project, name: &str) -> Vec<Value> {
     }
     std::fs::read_to_string(models_dir(p).join(name).join("heal_metrics.jsonl")).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
+
+// ----------------------------------------------------------------------------------------------------------------- measure
+
+/// What is kept of an earlier measurement of this model on this data with these settings (None when there is none yet).
+pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str) -> Value {
+    let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
+    let key = scores_key(&m.repo, version, samples, len, load);
+    let meta = read_json(&scores_dir(p, &key).join("scores.json"));
+    json!({"key": key, "exists": meta.is_some(), "tokens": meta.as_ref().map(|x| x["tokens"].clone()), "load": meta.as_ref().map(|x| x["load"].clone()),
+           "created": meta.as_ref().map(|x| x["created"].clone()), "data_version": version})
+}
+
+/// "Measure now" (Expert: also "measure again"): measures the model once and keeps the result for every later size choice on the same data. Making a
+/// thinner model measures by itself when nothing is kept, so this is optional. Returns the worker's result.
+pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, force: bool, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    if !["auto", "16bit", "4bit", "offload"].contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
+        return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
+    }
+    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the layers are measured on your own text."))?;
+    let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
+    if !train.is_file() {
+        return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
+    }
+    let py = python()?;
+    let key = scores_key(&m.repo, Some(version), samples, len, load);
+    let folder = scores_dir(p, &key);
+    let _active = Active::begin(&folder)?;
+    let job = json!({
+        "job": "reshape_measure", "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
+        "calibration": {"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version},
+    });
+    let stop_dir = models_dir(p).join("_scores");
+    let mut result = crate::train::runs::drive(&py, &stop_dir, &job, stop, Duration::from_secs(60), &mut |e| on_event(event_json(e)))?;
+    result["key"] = json!(key);
+    Ok(result)
+}
+
+/// What the Heal card shows for a made model: how it would run on this card, the budgets with the disk and time they need, and where it stands.
+pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Value> {
+    valid_name(name)?;
+    let dir = models_dir(p).join(name);
+    let meta = read_json(&dir.join("model").join("ndforge_reshape.json")).ok_or_else(|| Error::new("This model has no ndforge_reshape.json, so its original is unknown."))?;
+    let student_b = meta["params"].as_f64().unwrap_or(0.0) / 1e9;
+    let teacher_b = meta["origin"]["params"].as_f64().map(|x| x / 1e9).unwrap_or(student_b * 1.3);
+    let hp = plan::heal_plan(student_b, teacher_b, vram_gb);
+    let tokens: Vec<Value> = plan::HEAL_TOKENS_M.iter().map(|&t| {
+        let m = t as f64 / 10.0;
+        json!({"tokens_m": t, "cache_gb": (hp.cache_gb_per_10m * m * 10.0).round() / 10.0, "hours": [((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0]})
+    }).collect();
+    let heal = read_json(&dir.join("heal.json"));
+    Ok(json!({
+        "name": name, "plan": hp, "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
+        "teacher": meta["origin"]["repo"], "general_dataset": DEFAULT_GENERAL_DATASET, "has_data": crate::train::runs::latest_version(p).is_some(),
+        "healed": dir.join("healed").join("config.json").is_file(), "heal": heal, "metrics": heal_metrics(p, name), "vram_gb": vram_gb,
+        "free_disk_gb": crate::envmgr::health::free_disk_gb(&dir).map(|g| (g * 10.0).round() / 10.0),
+        "calibration": meta["calibration"], "loss": {"original": meta["loss_before"], "thinned": meta["loss_after"]},
+    }))
+}

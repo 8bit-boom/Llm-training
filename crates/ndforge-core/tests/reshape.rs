@@ -982,6 +982,11 @@ def out(**kw): print(json.dumps(kw), flush=True)
 def marker(n):
     return os.path.exists(os.path.join(root, n))
 kind = job["job"]
+if kind == "reshape_measure":
+    os.makedirs(job["out_dir"], exist_ok=True)
+    json.dump({{"format": 1, "tokens": 4321, "load": "4bit", "created": "2026-11-13T00:00:00Z"}}, open(os.path.join(job["out_dir"], "scores.json"), "w"))
+    out(type="progress", step="score", value=0.5, text="Measuring")
+    out(type="result", data={{"tokens": 4321, "load": "4bit", "loss": 2.0, "stable_depth": True}}); sys.exit(0)
 if kind == "distill_cache":
     if marker("stop-cache"):
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
@@ -1247,4 +1252,92 @@ fn the_table_has_a_row_for_the_thinned_and_one_for_the_healed_model() {
     let none = std::sync::atomic::AtomicBool::new(false);
     assert!(rruns::test_target(&p, "slim", "healed", None, Some(32.0), &none, &mut |_| {}).unwrap_err().0.contains("not been healed"));
     assert!(rruns::test_target(&p, "slim", "other", None, Some(32.0), &none, &mut |_| {}).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_model_is_measured_once_and_the_measurement_is_found_again() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let m = catalog::find("qwen3.5-4b").unwrap();
+    let info = rruns::measurement_info(&p, &m, 256, 512, "auto");
+    assert_eq!((info["exists"].clone(), info["key"].as_str(), info["data_version"].clone()), (json!(false), Some("unsloth-qwen3.5-4b-v1-256x512-auto"), json!(1)));
+    let mut events = Vec::new();
+    let r = rruns::measure(&p, "qwen3.5-4b", 256, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
+    assert_eq!((r["key"].as_str(), r["tokens"].clone(), r["stable_depth"].clone()), (Some("unsloth-qwen3.5-4b-v1-256x512-auto"), json!(4321), json!(true)));
+    let job = &jobs_seen(d.path())[0];
+    assert_eq!((job["job"].as_str(), job["force"].clone(), job["load"].as_str(), job["calibration"]["samples"].clone(), job["calibration"]["version"].clone()), (Some("reshape_measure"), json!(false), Some("auto"), json!(256), json!(1)));
+    assert_eq!(job["out_dir"].as_str().unwrap(), rruns::scores_dir(&p, "unsloth-qwen3.5-4b-v1-256x512-auto").to_string_lossy());
+    assert!(job["calibration"]["train"].as_str().unwrap().ends_with("train.jsonl") && events.iter().any(|e| e["kind"] == "progress" && e["step"] == "score"));
+    let info = rruns::measurement_info(&p, &m, 256, 512, "auto");
+    assert_eq!((info["exists"].clone(), info["tokens"].clone(), info["load"].clone()), (json!(true), json!(4321), json!("4bit")));
+    assert_eq!(rruns::measurement_info(&p, &m, 128, 512, "auto")["exists"], false, "other settings, other measurement");
+    rruns::measure(&p, "qwen3.5-4b", 256, 512, "auto", true, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert_eq!(jobs_seen(d.path())[1]["force"], true);
+    for (samples, len, load) in [(2, 512, "auto"), (256, 8, "auto"), (256, 512, "8bit")] {
+        assert!(rruns::measure(&p, "qwen3.5-4b", samples, len, load, false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("Measure on"));
+    }
+    assert!(rruns::measure(&p, "nope", 256, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).is_err());
+    let q = project(&d.path().join("empty"));
+    assert!(rruns::measure(&q, "qwen3.5-4b", 256, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("training-data version"));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_heal_card_knows_the_way_the_budgets_and_the_state() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let o = rruns::heal_options(&p, "slim", Some(32.0)).unwrap();
+    assert_eq!((o["plan"]["mode"].clone(), o["plan"]["student_method"].clone(), o["plan"]["fits"].clone()), (json!("cache"), json!("qlora"), json!(true)));
+    assert_eq!((o["default_tokens_m"].clone(), o["healed"].clone(), o["has_data"].clone(), o["teacher"].clone()), (json!(20), json!(false), json!(true), json!("unsloth/Qwen3.5-4B")));
+    let t = o["tokens"].as_array().unwrap();
+    assert_eq!(t.iter().map(|x| x["tokens_m"].as_u64().unwrap()).collect::<Vec<_>>(), [10, 20, 40, 80]);
+    assert_eq!(t[1]["cache_gb"], 3.9, "20 M tokens x 196 bytes");
+    assert!(t[3]["hours"][0].as_f64().unwrap() > t[0]["hours"][0].as_f64().unwrap());
+    assert_eq!((o["loss"]["original"].clone(), o["loss"]["thinned"].clone(), o["general_dataset"].clone()), (json!(2.0), json!(3.1), json!("nvidia/Nemotron-Pretraining-SFT-v1")));
+    assert!(o["metrics"].as_array().unwrap().is_empty() && o["heal"].is_null());
+    rruns::heal(&p, "slim", &heal_spec(20), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    let o = rruns::heal_options(&p, "slim", Some(32.0)).unwrap();
+    assert_eq!((o["healed"].clone(), o["heal"]["status"].clone(), o["metrics"].as_array().unwrap().len()), (json!(true), json!("done"), 2));
+    assert!(rruns::heal_options(&p, "nope", None).is_err());
+    assert_eq!(rruns::heal_options(&p, "slim", Some(16.0)).unwrap()["plan"]["fits"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_page_gets_width_options_for_every_way_of_slimming() {
+    use ndforge_core::model::AppModel;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker_with(d.path(), &inspect_width(), MAKES_A_THIN_MODEL);
+    std::env::set_var("NDFORGE_PROJECTS_DIR", d.path().join("projects"));
+    let depth = AppModel::reshape_options_for("qwen3.5-4b", "prune").unwrap();
+    assert_eq!(depth["shape"], "depth");
+    assert!(depth.get("width_options").is_none(), "layers only: as before");
+    assert_eq!((depth["width"]["supported"].clone(), depth["width"]["suggested"]["width"].clone(), depth["width"]["suggested"]["both"]["blocks"].clone()), (json!(true), json!(7168), json!(1)));
+    assert_eq!((depth["width"]["default_heal_tokens_m"].clone(), depth["width"]["heal_tokens_m"].clone()), (json!(40), json!([10, 20, 40, 80])));
+    let w = AppModel::reshape_options_with("qwen3.5-4b", "prune", "width", None, None).unwrap();
+    let groups = w["width_options"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["blocks"], 0);
+    let opts = groups[0]["options"].as_array().unwrap();
+    assert_eq!(opts.len(), 19);
+    assert_eq!((opts[0]["intermediate"].clone(), opts[18]["intermediate"].clone(), opts[0]["layers"].clone()), (json!(4608), json!(9216), json!(12)));
+    assert!(opts[0]["params_b"].as_f64().unwrap() < opts[18]["params_b"].as_f64().unwrap() && opts[0]["exact"] == true && opts[0]["disk_needed_gb"].as_f64().unwrap() > 0.0);
+    assert!(opts[0]["warnings"].as_array().unwrap().iter().any(|x| x.as_str().unwrap().contains("Removing 50 % of the MLP")));
+    // both: a group for every number of blocks that can go (3 blocks: one)
+    let b = AppModel::reshape_options_with("qwen3.5-4b", "prune", "both", Some(16), Some(12)).unwrap();
+    let groups = b["width_options"].as_array().unwrap();
+    assert_eq!(groups.iter().map(|g| g["blocks"].as_u64().unwrap()).collect::<Vec<_>>(), [1]);
+    assert_eq!(groups[0]["options"][0]["layers"], 8);
+    assert!(groups[0]["options"][0]["warnings"].as_array().unwrap().iter().any(|x| x.as_str().unwrap().contains("experimental")));
+    // grow has no width; unknown shapes are refused
+    assert!(AppModel::reshape_options_with("qwen3.5-4b", "grow", "width", None, None).unwrap().get("width_options").is_none());
+    assert!(AppModel::reshape_options_with("qwen3.5-4b", "prune", "tall", None, None).is_err());
 }
