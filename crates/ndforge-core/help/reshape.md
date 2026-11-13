@@ -26,7 +26,7 @@ The program runs a sample of **your own world's text** (the saved data version o
 
 ## After it is made
 1. **Test against the original.** The same questions as Step 4, asked to the original and to the new model. Big models are loaded in 4-bit so both fit the card; the result says so.
-2. **Train it on your world** (Step 3). Big slimmed models usually need QLoRA on a 32 GB card. Unsloth advises against 4-bit for Qwen3.5, so quality after training is something to check with the test, not to assume.
+2. **Train it on your world** (Step 3). Big slimmed models usually need QLoRA on a 32 GB card. 4-bit training is fine for dense Qwen3.5 models (Unsloth's caution is about the MoE ones), but it loses a little more quality than 16-bit, so check the result with the test.
 3. In Step 4 a run on a made model can be compared with the made model or with the **original** it was made from.
 4. **Step 5** exports it like any model. The picture (vision) file of the original is reused, because the vision part is unchanged. A model with an unusual number of layers (48 instead of 64) is something llama.cpp and Ollama may or may not accept: check with *Test it* on Step 5.
 

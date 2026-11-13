@@ -129,7 +129,7 @@ Everything below is **implemented as the plan says and has not been seen working
 | 6 | Speed in tokens/s against the original (the benchmark on the made model) | not run |
 
 **Assumptions the plan marked [A] / [GPU] that remain open:** Unsloth loads a 48-layer local Qwen3.5 folder; Unsloth's bundled llama.cpp and Ollama's
-Qwen3.5 engine accept 48 layers; 4-bit measuring ranks blocks like 16-bit; the quality after healing (QLoRA on Qwen3.5 is discouraged by Unsloth); the
+Qwen3.5 engine accept 48 layers; 4-bit measuring ranks blocks like 16-bit; the quality after healing (QLoRA is fine for dense Qwen3.5, Unsloth's caution is for MoE; it still loses a little more than 16-bit); the
 estimated sizes (a 27B slimmed by 4 blocks is about 21.6 B; the 9B grown by 4 blocks about 13.1 B; the page computes them from the real tensor shapes, the
 plan's figures were estimates); measuring time and memory; whether a world's text gives any gain from growing (expected: no).
 

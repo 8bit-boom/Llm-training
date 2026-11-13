@@ -45,7 +45,7 @@ fn a_16_gb_card_gets_4_bit_for_the_big_ones_and_lower_settings() {
     let q9 = find("qwen3.5-9b").unwrap();
     let p = plan(&q9, Method::Qlora, Preset::Best, Some(12.5), DATA, None);
     assert!(p.hyper.batch == 1 && p.hyper.max_seq < 4096 && p.notes.iter().any(|n| n.contains("lowered")), "{p:?}");
-    assert!(p.notes.iter().any(|n| n.contains("advises against 4-bit")));   // Unsloth's caution for Qwen3.5
+    assert!(p.notes.iter().any(|n| n.contains("loses a little more quality")));   // 4-bit on Qwen3.5: fine for dense, a bit worse than 16-bit
     let tiny = plan(&q9, Method::Qlora, Preset::Quick, Some(4.0), DATA, None);
     assert_eq!(tiny.fit, Fit::No);
     assert_eq!(plan(&q9, Method::Lora, Preset::Normal, None, DATA, None).fit, Fit::Unknown);

@@ -249,7 +249,7 @@ pub fn plan(m: &ModelEntry, method: Method, preset: Preset, vram_gb: Option<f64>
         notes.push(format!("It needs about {:.0} GB of free disk space for checkpoints, and the result is a full copy of the model (about {:.0} GB) instead of a small add-on.", full_disk_gb(m), m.params_b * 2.0));
     }
     if method == Method::Qlora && m.family == "qwen3_5" {
-        notes.push("Unsloth advises against 4-bit training for Qwen3.5 (more quality loss than usual). Use 16-bit LoRA if it fits.".into());
+        notes.push("4-bit training works for the dense Qwen3.5 models (Unsloth's caution is about the MoE ones), but it loses a little more quality than 16-bit. Use 16-bit LoRA if it fits.".into());
     }
     if m.family == "gemma4" {
         notes.push("A training loss of 13-15 is normal for Gemma 4 E2B/E4B; it is not a problem.".into());

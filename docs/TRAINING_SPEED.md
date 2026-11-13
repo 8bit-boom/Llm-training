@@ -12,7 +12,7 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 | FlashAttention | Not worth chasing on the 5090 | PyTorch's built-in attention is already close to the card's limit; FlashAttention-4 targets datacenter Blackwell (sm_100/103), not sm_120; FlashAttention-2 wheels for Windows are community builds (CUDA 13 / nightly). Its real value for us is padding-free batching. |
 | SageAttention | Skip | Mainly an inference tool; its 8-bit training variant (SageBwd) is research code, not in Hugging Face or Unsloth. |
 | `torch.compile` | Low priority | Unsloth already compiles its hot paths; Windows needs community Triton builds; varying shapes recompile unless lengths are bucketed. |
-| QLoRA / 4-bit | Not for speed | Slower than 16-bit LoRA (one anecdote: ~23 %) and Unsloth advises against 4-bit for Qwen3.5. All five models fit the 5090 in 16-bit. |
+| QLoRA / 4-bit | Not for speed | Slower than 16-bit LoRA (one anecdote: ~23 %) and 4-bit loses a little more quality than 16-bit on Qwen3.5 (fine for the dense models, Unsloth's caution is about the MoE ones). All five models fit the 5090 in 16-bit. |
 | FP8 / NVFP4 | Not now | Unsloth reports its first FP8 LoRA was ~4x slower than BF16 on an H100, ~80 % of BF16 after rework: a memory saving. FP4 training on consumer cards is poorly documented. |
 | Fused / chunked cross-entropy (Liger, cut cross-entropy) | Later, plain-libraries path only | ~250k-token vocabularies make the logits large; Unsloth already handles it. Liger support for Qwen3.5 / Gemma 4 not confirmed. |
 | Tesla T10 | Few options | No bf16, no FlashAttention (needs sm_80+): fp16 and PyTorch's memory-efficient attention. Gemma in fp16 stability: unverified. |
