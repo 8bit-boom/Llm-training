@@ -642,6 +642,62 @@ function wireRetrain() {
   });
 }
 
+// ------------------------------------------------------------------------------------------------ Unsloth Desktop (Training setup)
+let un = { url: "", key: "", name: "Unsloth Desktop", busy: false, result: null, error: null, ack: false, init: false };
+
+// an address that is not this computer, not a private network and not https: the data would cross the internet unencrypted
+function unRisk(url) {
+  const u = (url || "").trim();
+  if (!u || /^https:/i.test(u)) return false;
+  const rest = u.replace(/^http:\/\//i, "");
+  const host = (rest.startsWith("[") ? rest.slice(0, rest.indexOf("]") + 1) : rest.split(/[\/:]/)[0]).toLowerCase();
+  if (host === "localhost" || host === "[::1]" || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) return false;
+  return host.includes(".") || host.startsWith("[");
+}
+
+function renderUnsloth() {
+  const saved = state.settings && state.settings.unsloth;
+  if (!un.init) { un.init = true; if (saved) { un.url = saved.url; un.name = saved.name; } }
+  const risk = unRisk(un.url);
+  return `<div class="card wide" id="un-card"><h2>Unsloth Desktop (optional)</h2>
+    <p class="dim">Lets you choose <strong>Unsloth Desktop</strong> under "Where to train" in Step 3: Lore Forge sends the training data to Unsloth and follows the training there, instead of using its own training software. Unsloth Desktop must be open while it trains. Create an API key in Unsloth: your picture, Settings, API, a name, Create (Unsloth shows the key only once).</p>
+    ${saved ? `<div class="ok">Saved: ${esc(saved.name)} at ${esc(saved.url)}. The API key is kept on this computer.</div>` : ""}
+    <div class="row"><input type="text" id="un-url" value="${esc(un.url)}" placeholder="Address, e.g. http://127.0.0.1:8888" style="min-width:260px" ${un.busy ? "disabled" : ""}><button class="secondary" id="un-find" ${un.busy ? "disabled" : ""}>Find</button>
+      <input type="password" id="un-key" value="${esc(un.key)}" placeholder="${saved ? "API key (leave empty to keep the saved one)" : "API key (sk-unsloth-…)"}" style="min-width:260px" ${un.busy ? "disabled" : ""}><button class="secondary" id="un-test" ${un.busy ? "disabled" : ""}>Test</button></div>
+    ${risk ? `<label class="opt"><input type="checkbox" id="un-ack" ${un.ack ? "checked" : ""}> This address is on the internet and not encrypted: the training data (with the GM's secrets) would cross it in plain text. I understand and want to use it anyway.</label>` : ""}
+    <div class="row"><button class="primary" id="un-save" ${un.busy || (!un.key.trim() && !saved) ? "disabled" : ""}>Save</button>${saved ? `<button class="secondary" id="un-remove" ${un.busy ? "disabled" : ""}>Remove</button>` : ""}</div>
+    ${un.busy ? `<div class="stepline">Asking Unsloth…</div>` : ""}${un.result ? `<div class="ok">${esc(un.result)}</div>` : ""}${un.error ? `<div class="err">${esc(un.error)}</div>` : ""}</div>`;
+}
+
+function wireUnsloth() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, k) => { const e = $(id); if (e) e.oninput = () => { un[k] = e.value; if (k === "url") { const a = $("un-ack"); if (!unRisk(un.url) && a) un.ack = false; } }; };
+  bind("un-url", "url"); bind("un-key", "key");
+  const ack = $("un-ack"); if (ack) ack.onchange = () => { un.ack = ack.checked; };
+  const ask = (find) => { un.busy = true; un.result = null; un.error = null; render(); invoke("unsloth_check", { url: un.url, key: un.key, find }).catch((e) => { un.busy = false; un.error = String(e); render(); }); };
+  on("un-find", () => ask(true));
+  on("un-test", () => ask(false));
+  on("un-save", async () => {
+    un.error = null; un.result = null;
+    if (unRisk(un.url) && !un.ack) { un.error = "Tick the box about the unencrypted address first, or use an address on this computer or your own network."; render(); return; }
+    try { setState(await invoke("unsloth_set", { name: un.name, url: un.url, key: un.key })); un.key = ""; const s = state.settings.unsloth; if (s) un.url = s.url; un.result = "Saved. Choose \"Unsloth Desktop\" under \"Where to train\" in Step 3."; }
+    catch (e) { un.error = String(e); }
+    render();
+  });
+  on("un-remove", async () => {
+    if (!confirm("Forget the address and the API key of Unsloth?")) return;
+    try { setState(await invoke("unsloth_remove")); un.url = ""; un.key = ""; un.result = null; un.init = false; } catch (e) { un.error = String(e); }
+    render();
+  });
+}
+
+function onUnslothEvent(p) {
+  un.busy = false;
+  if (p.kind === "done") { un.result = p.data.summary; if (p.data.url) un.url = p.data.url; un.error = null; }
+  else { un.error = p.text; un.result = null; }
+  if (page === "setup") render();
+}
+
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
 function renderSetup() {
@@ -663,7 +719,8 @@ function renderSetup() {
     ${env.step ? `<div class="stepline">${esc(env.step)}</div>` : ""}
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
-    ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}`;
+    ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderUnsloth()}`;
 }
 
 async function refreshEnv() {
@@ -1314,6 +1371,7 @@ function wire() {
   wireReshape();
   wireGuide();
   wireRetrain();
+  wireUnsloth();
   on("recheck", refreshEnv);
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
@@ -1446,6 +1504,7 @@ async function init() {
   try { await tauri.event.listen("bench-event", (e) => onBenchEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("unsloth-event", (e) => onUnslothEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }

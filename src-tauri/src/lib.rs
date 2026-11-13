@@ -517,14 +517,14 @@ fn train_server_check(app: tauri::AppHandle, s: State<App>, url: String) -> Out<
 fn unsloth_set(s: State<App>, name: String, url: String, key: String) -> Out<Value> {
     let mut m = lock(&s);
     m.set_unsloth(&name, &url, &key).map_err(|e| e.to_string())?;
-    m.train_state(None).map_err(|e| e.to_string())
+    Ok(m.state())
 }
 
 #[tauri::command]
 fn unsloth_remove(s: State<App>) -> Out<Value> {
     let mut m = lock(&s);
     m.remove_unsloth().map_err(|e| e.to_string())?;
-    m.train_state(None).map_err(|e| e.to_string())
+    Ok(m.state())
 }
 
 /// "Test" (and "Find" when `find` is true) in Training setup. `url` and `key` are what is typed in the form; an empty key means the saved one for that address.

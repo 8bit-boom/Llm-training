@@ -67,7 +67,7 @@ impl AppModel {
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
-            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme},
+            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth},
             "projects_dir": default_projects_dir(),
         })
     }
