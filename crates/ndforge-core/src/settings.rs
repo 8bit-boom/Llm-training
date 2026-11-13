@@ -20,6 +20,13 @@ pub struct TrainServer {
     pub url: String,
 }
 
+/// The Unsloth Desktop (or Studio) that can train for us. Its API key is in `secrets` under `unsloth:<url>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnslothSettings {
+    pub name: String,
+    pub url: String,
+}
+
 /// The model that writes extra training examples (any OpenAI-compatible server; Ollama works). Its access key, if any, is in `secrets` under "teacher".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -48,6 +55,8 @@ pub struct Settings {
     pub keep_awake: bool,
     pub ollama_servers: Vec<OllamaServer>,
     pub train_servers: Vec<TrainServer>,
+    /// Unsloth Desktop as a place to train (one connection)
+    pub unsloth: Option<UnslothSettings>,
     pub teacher: TeacherSettings,
     pub recent_projects: Vec<String>,
 }
@@ -55,7 +64,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true,
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), teacher: TeacherSettings::default(), recent_projects: Vec::new() }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, teacher: TeacherSettings::default(), recent_projects: Vec::new() }
     }
 }
 

@@ -85,3 +85,22 @@ fn an_upload_arrives_whole_as_a_fine_tune_file_and_a_job_id_is_checked() {
     assert!(c.hardware().unwrap()["gpu"]["name"].as_str().unwrap().contains("5090"));
     assert!(candidate_urls().iter().any(|u| u == "http://127.0.0.1:8888"));
 }
+
+#[test]
+fn test_and_find_describe_the_connection_in_plain_words() {
+    use ndforge_core::unsloth::client::{check, find};
+    let d = tempdir().unwrap();
+    let f = Fake::start(d.path());
+    let r = check(&f.url, KEY).unwrap();
+    let s = r["summary"].as_str().unwrap();
+    assert!(s.contains("Unsloth Desktop 2026.11.1 on this computer") && s.contains("5090") && s.contains("training API: yes"), "{s}");
+    assert_eq!(r["hardware"]["gpu"]["precision"], "bf16");
+    assert!(check(&f.url, "sk-unsloth-nope").unwrap_err().0.contains("refused the API key"));
+    f.with(|s| s.not_unsloth = true);
+    assert!(check(&f.url, KEY).unwrap_err().0.contains("not Unsloth"));
+    f.with(|s| s.not_unsloth = false);
+    let dead = "http://127.0.0.1:1".to_string();
+    let (url, p) = find(&[dead, f.url.clone()]).unwrap();
+    assert!(url == f.url && p.unsloth && p.desktop);
+    assert!(find(&["http://127.0.0.1:1".to_string()]).is_none());
+}

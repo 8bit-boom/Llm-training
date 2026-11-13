@@ -239,3 +239,30 @@ impl UnslothClient {
         self.json(self.req("GET", "/api/models/checkpoints", true).call())
     }
 }
+
+/// "Test" in Training setup: is it Unsloth, does the key work, can it train, what is its card. Errors say what to do.
+/// Returns {"probe", "hardware" (the server-status shape: {"gpu": ...}), "summary"}.
+pub fn check(url: &str, key: &str) -> Result<Value> {
+    let c = UnslothClient::new(url, key);
+    let p = c.probe()?;
+    if !p.unsloth {
+        return Err(Error::new(format!("Something else answers at {} (not Unsloth). Check the address in Unsloth -> Settings -> API.", c.base())));
+    }
+    if p.key_ok != Some(true) {
+        return Err(Error::new("Unsloth refused the API key. Create a new one in Unsloth (Settings -> API) and paste it here; Unsloth shows it only once."));
+    }
+    let hardware = c.hardware().unwrap_or_else(|_| serde_json::json!({"gpu": null}));
+    let card = match (hardware["gpu"]["name"].as_str(), hardware["gpu"]["vram_gb"].as_f64()) {
+        (Some(n), Some(gb)) => format!("{n} {gb} GB"),
+        (Some(n), None) => n.to_string(),
+        _ => "no graphics card reported".to_string(),
+    };
+    let summary = format!("Unsloth {}{} {}, {card}, training API: {}", if p.desktop { "Desktop" } else { "Studio" }, p.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default(),
+        if is_local(c.base()) { "on this computer" } else { "on another computer" }, if p.fine_tuning { "yes" } else { "no (too old)" });
+    Ok(serde_json::json!({"probe": p, "hardware": hardware, "summary": summary, "url": c.base()}))
+}
+
+/// The first of `urls` where Unsloth answers (the "Find" button).
+pub fn find(urls: &[String]) -> Option<(String, Probe)> {
+    urls.iter().find_map(|u| UnslothClient::new(u, "").probe().ok().filter(|p| p.unsloth).map(|p| (normalize_url(u), p)))
+}

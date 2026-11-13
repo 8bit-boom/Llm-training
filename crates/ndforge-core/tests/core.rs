@@ -390,3 +390,31 @@ fn model_train_state_and_jobs() {
     assert_eq!((r.job["resume"].clone(), r.model.id.as_str(), r.hyper.rank), (json!(true), "qwen3.5-4b", 4));
     assert!(m.train_job("", Method::Lora, Preset::Quick, &json!({}), Some("missing"), None).is_err());
 }
+
+#[test]
+fn unsloth_is_remembered_with_its_key_in_the_secrets_and_an_old_settings_file_still_loads() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    let cfg = d.path().join("cfg-unsloth");
+    std::env::set_var("NDFORGE_CONFIG_DIR", &cfg);
+    // a settings file from before Unsloth existed
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("settings.json"), r#"{"expert_mode": true, "train_servers": [{"name": "TrueNAS", "url": "http://truenas:8765"}]}"#).unwrap();
+    let mut m = ndforge_core::model::AppModel::load();
+    assert!(m.settings.expert_mode && m.settings.unsloth.is_none() && m.settings.train_servers.len() == 1);
+    assert!(m.unsloth_target().is_err() && m.set_unsloth("Desktop", "127.0.0.1:8888", "  ").is_err());
+    m.set_unsloth("Desktop", "127.0.0.1:8888", " sk-unsloth-abc ").unwrap();
+    let t = m.unsloth_target().unwrap();
+    assert_eq!((t.name.as_str(), t.url.as_str(), t.key.as_str()), ("Desktop", "http://127.0.0.1:8888", "sk-unsloth-abc"));
+    // the key is in secrets.json under unsloth:<address>, not in settings.json
+    let secrets = std::fs::read_to_string(cfg.join("secrets.json")).unwrap();
+    assert!(secrets.contains("unsloth:http://127.0.0.1:8888") && secrets.contains("sk-unsloth-abc"));
+    assert!(!std::fs::read_to_string(cfg.join("settings.json")).unwrap().contains("sk-unsloth-"));
+    assert_eq!(ndforge_core::model::AppModel::load().settings.unsloth.unwrap().url, "http://127.0.0.1:8888");
+    // another address replaces the first one and its key
+    m.set_unsloth("Desktop", "http://127.0.0.1:8000", "sk-unsloth-def").unwrap();
+    let secrets = std::fs::read_to_string(cfg.join("secrets.json")).unwrap();
+    assert!(!secrets.contains("sk-unsloth-abc") && secrets.contains("sk-unsloth-def"));
+    m.remove_unsloth().unwrap();
+    assert!(m.unsloth_target().is_err() && !std::fs::read_to_string(cfg.join("secrets.json")).unwrap().contains("sk-unsloth-"));
+}
