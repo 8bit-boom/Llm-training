@@ -327,7 +327,7 @@ fn model_train_state_and_jobs() {
     m.dataset_generate(json!({})).unwrap();
     m.dataset_save().unwrap();
     let st = m.train_state(None).unwrap();
-    assert_eq!(st["models"].as_array().unwrap().len(), 5);
+    assert_eq!(st["models"].as_array().unwrap().len(), 6);
     assert_eq!(st["version"]["number"], 1);
     assert_eq!(st["env_ready"], false);
     let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None, None).unwrap();

@@ -12,9 +12,11 @@ use tempfile::tempdir;
 static ENV: Mutex<()> = Mutex::new(());
 
 #[test]
-fn catalog_has_the_five_models_with_their_repos() {
+fn catalog_has_the_six_models_with_their_repos() {
     let m = models();
-    assert_eq!(m.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b", "gemma4-e2b", "gemma4-e4b"]);
+    assert_eq!(m.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b", "gemma4-e2b", "gemma4-e4b", "qwen3.8-27b"]);
+    // Qwen3.8 27B: checked on Hugging Face, same architecture as Qwen3.5
+    assert_eq!((find("qwen3.8-27b").unwrap().repo.as_str(), find("qwen3.8-27b").unwrap().family.as_str()), ("unsloth/Qwen3.8-27B", "qwen3_5"));
     assert_eq!(find("qwen3.5-9b").unwrap().repo, "unsloth/Qwen3.5-9B");
     assert_eq!(find("gemma4-e4b").unwrap().family, "gemma4");
     assert!(m.iter().all(|x| x.license == "Apache-2.0" && x.vram_qlora_gb < x.vram_lora_gb));
@@ -26,8 +28,13 @@ const T10: f64 = 15.6;
 const DATA: DataStats = DataStats { examples: 400, tokens: 200_000, text_examples: 100, chat_examples: 300 };
 
 #[test]
-fn all_five_models_fit_the_5090_with_16_bit_lora() {
-    for m in models() {
+fn the_five_small_models_fit_the_5090_with_16_bit_lora_and_the_27b_needs_4_bit() {
+    // the 27B: 16-bit LoRA needs about 60 GB, QLoRA fits a 24 GB card (Unsloth)
+    let big = find("qwen3.8-27b").unwrap();
+    assert_eq!(recommended_method(&big, Some(RTX5090)), Method::Qlora);
+    assert!(matches!(plan(&big, Method::Qlora, Preset::Normal, Some(RTX5090), DATA, None).fit, Fit::Yes | Fit::Tight));
+    assert_eq!(plan(&big, Method::Lora, Preset::Normal, Some(RTX5090), DATA, None).fit, Fit::No);
+    for m in models().into_iter().filter(|m| m.id != "qwen3.8-27b") {
         for preset in [Preset::Quick, Preset::Normal, Preset::Best] {
             let p = plan(&m, Method::Lora, preset, Some(RTX5090), DATA, None);
             assert!(matches!(p.fit, Fit::Yes | Fit::Tight), "{} {:?}: {:.1} GB {:?} {:?}", m.name, preset, p.est_vram_gb, p.fit, p.notes);

@@ -126,12 +126,12 @@ fn what_cannot_be_trained_is_refused_in_plain_words() {
 #[test]
 fn added_models_are_kept_listed_planned_and_removable() {
     let (_g, _d) = setup();
-    assert_eq!(models().len(), 5);
+    assert_eq!(models().len(), 6);
     let id = AppModel::custom_model_add("acme/Llama-3.2-3B-Instruct").unwrap();
     assert_eq!(id, "custom-acme-llama-3.2-3b-instruct");
     // only a model that passes the checks is ever saved
     assert!(AppModel::custom_model_add("acme/gated").is_err() && custom_models().len() == 1);
-    assert_eq!((models().len(), models()[5].custom, models()[0].custom), (6, true, false));
+    assert_eq!((models().len(), models()[6].custom, models()[0].custom), (7, true, false));
     let m = find(&id).unwrap();
     assert_eq!((m.family.as_str(), m.params_b), ("generic", 3.21));
     // it is planned like any other model
@@ -145,12 +145,12 @@ fn added_models_are_kept_listed_planned_and_removable() {
     // adding twice keeps one; built-in models cannot be removed; removing works and is remembered
     add_custom(m.clone()).unwrap();
     assert_eq!(custom_models().len(), 1);
-    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 6);
+    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 7);
     remove_custom(&id).unwrap();
-    assert_eq!((models().len(), find(&id).is_none()), (5, true));
+    assert_eq!((models().len(), find(&id).is_none()), (6, true));
     // a damaged file counts as no models
     std::fs::write(std::path::Path::new(&std::env::var("NDFORGE_CONFIG_DIR").unwrap()).join("custom_models.json"), "{ not json").unwrap();
-    assert_eq!(models().len(), 5);
+    assert_eq!(models().len(), 6);
 }
 
 #[test]

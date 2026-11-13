@@ -233,7 +233,7 @@ impl AppModel {
     }
 
     // ------------------------------------------------------------------ step 3: training
-    /// Everything the Train page shows: the five models with fit marks for this card, the newest saved data version, the runs.
+    /// Everything the Train page shows: the six models with fit marks for this card, the newest saved data version, the runs.
     pub fn train_state(&self, server: Option<&str>) -> Result<Value> {
         let p = self.project_ref()?;
         let gpus = crate::envmgr::gpu::detect_gpus();

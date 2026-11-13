@@ -23,7 +23,7 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 ## Training
 **"Out of memory".** Choose a smaller model, **QLoRA**, or the Quick preset; close other programs that use the card (also Ollama: it keeps models in memory, `ollama stop <model>`).
 
-**The model cannot be downloaded.** The first run downloads it from Hugging Face (2 to 20 GB). Check the internet connection and disk space. The five models are not gated; no account is needed.
+**The model cannot be downloaded.** The first run downloads it from Hugging Face (2 to 60 GB). Check the internet connection and disk space. The six models are not gated; no account is needed.
 
 **Full fine-tune is greyed out.** The reason is written on the card: it needs a bf16 card (RTX 30 series or newer), enough memory (small models only) and disk space. This computer only, not the server.
 
