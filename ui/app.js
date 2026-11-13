@@ -777,7 +777,15 @@ function wireTest() {
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
-  dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null };
+  dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
+  // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
+  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, rank: 64, lr: 0.0001, mode: "" } };
+
+// Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
+// labelled experimental, and stays switched off until the measurements on a real graphics card (docs/RESHAPE.md, "Not verified yet") are done:
+// then this is set to true.
+const EXPERIMENTAL_AXES_PASSED = false;
 
 // "36–51" from [36, 37, ..., 51]; "3, 7–9" for gaps
 function ranges(list) {
@@ -829,11 +837,152 @@ function rsSizeInfo() {
   return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
 }
 
+const thou = (n) => Number(n).toLocaleString("en-US");
+
+// "How": whole layers, thinner layers, or both (only for models that allow thinning; the others get the reason)
+function rsHowUi(op) {
+  const w = op.width;
+  if (rs.mode !== "prune" || !w) return "";
+  if (!w.supported) return w.why ? `<p class="dim small">${esc(w.why)}</p>` : "";
+  const r = (v, label) => `<label class="opt"><input type="radio" name="rs-shape" value="${v}" ${rs.shape === v ? "checked" : ""} ${rs.running ? "disabled" : ""}> ${label}</label>`;
+  return `<p style="margin:10px 0 4px">How:</p>${r("depth", "<strong>Remove whole layers</strong> — the result runs faster")}${r("width", "<strong>Make every layer thinner</strong> — keeps more quality for the same size (needs healing)")}${r("both", "<strong>Both</strong> — remove a block and make the rest thinner")}`;
+}
+
+// the width options of the chosen way: the group for the number of blocks that go (0 = width only), and the stop for the chosen MLP width
+function rsWidthOn() { return rs.mode === "prune" && rs.shape !== "depth" && !!(rs.options && rs.options.width_options); }
+function rsWidthGroup() {
+  const g = rs.options && rs.options.width_options;
+  return g ? g.find((x) => x.blocks === (rs.shape === "width" ? 0 : rs.blocks)) || null : null;
+}
+function rsWidthOption() { const g = rsWidthGroup(); return g ? g.options.find((o) => o.intermediate === rs.wi) || null : null; }
+
+// the stop to start on: the owner's decision is the mild cut (13/17 of the MLP, "Both": one block and 12/17)
+function rsPickWidth() {
+  const w = rs.options && rs.options.width;
+  if (!w || !rs.options.width_options) return;
+  const sug = w.suggested || {};
+  if (rs.shape === "both" && sug.both && (rs.blocks == null || !rs.options.options.some((x) => x.blocks === rs.blocks))) rs.blocks = sug.both.blocks;
+  const g = rsWidthGroup();
+  if (g && !g.options.some((o) => o.intermediate === rs.wi)) rs.wi = (rs.shape === "both" && sug.both ? sug.both.intermediate : sug.width) || (g.options.length ? g.options[g.options.length - 1].intermediate : null);
+}
+
+function rsWidthInfo() {
+  const o = rsWidthOption(), op = rs.options, v = op && op.vram_gb, full = op && op.width && op.width.dims ? op.width.dims.intermediate : null;
+  if (!o) return `<span class="dim">Choose how thin the layers become.</span>`;
+  const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
+  const cut = full ? Math.round(100 * (1 - o.intermediate / full)) : null;
+  return `MLP ${thou(o.intermediate)}${full ? " of " + thou(full) + " (−" + cut + " %)" : ""} · <strong>${o.layers} layers · ${o.params_b} B parameters${o.exact ? " (exact)" : ""}</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+}
+
+// the part of "2 · What to do" for thinner layers: the way, the width slider(s), the Expert axes and the measuring
+function rsWidthUi(op, st) {
+  const w = op.width || {}, g = rsWidthGroup(), ch = w.choices || {}, d = w.dims || {};
+  if (!g) return `<p class="dim">Looking at the sizes…</p>`;
+  const idx = Math.max(0, g.options.findIndex((o) => o.intermediate === rs.wi));
+  const o = rsWidthOption();
+  const warn = o ? (o.warnings || []).map((x) => `<div class="${/worse|Removing|QLoRA|Even|experimental/.test(x) ? "warn" : "dim"}">${esc(x)}</div>`).join("") : "";
+  const both = rs.shape === "both";
+  const bidx = Math.max(0, op.options.findIndex((x) => x.blocks === rs.blocks));
+  const expert = state.settings.expert_mode;
+  const lv2 = (ch.lin_v_heads || [])[1], hs = (ch.heads || []).slice(1);
+  const axes = expert ? `<details open><summary>Experimental: thin the attention layers as well</summary>
+      ${EXPERIMENTAL_AXES_PASSED ? "" : `<p class="dim small">Switched off for now: nobody has published how well this works for this kind of model, and it has not been tried on a real graphics card yet. It is switched on when that has been done (docs/RESHAPE.md).</p>`}
+      <label class="opt"><input type="checkbox" id="rs-lv" ${rs.lv ? "checked" : ""} ${EXPERIMENTAL_AXES_PASSED && lv2 ? "" : "disabled"}> Also thin the linear-attention layers (${d.lin_v_heads} → ${lv2 || "–"} value heads) <span class="tag">experimental</span></label>
+      <label class="opt">Also remove attention heads <select id="rs-hh" ${EXPERIMENTAL_AXES_PASSED && hs.length ? "" : "disabled"}><option value="">no</option>${hs.map((h) => `<option value="${h}" ${rs.hh === h ? "selected" : ""}>${d.heads} → ${h} heads</option>`).join("")}</select> <span class="tag">experimental</span></label></details>` : "";
+  const meas = rs.meas && rs.meas.exists ? `Measured earlier on this data (${thou(rs.meas.tokens || 0)} tokens${rs.meas.load ? ", loaded as " + esc(rs.meas.load) : ""}): <strong>reused</strong>. <button class="link" id="rs-measure-again" ${rs.running ? "disabled" : ""}>Measure again</button>`
+    : `Not measured yet: it is measured first (a few minutes), then kept for every other size on this data. <button class="link" id="rs-measure-now" ${rs.running || !st.dataset_version ? "disabled" : ""}>Measure now</button>`;
+  return `<div style="margin-top:12px">
+    <div>Make every layer thinner: MLP <strong id="rs-w-n">${o ? thou(o.intermediate) : "–"}</strong> of ${thou(d.intermediate || 0)}</div>
+    <input type="range" id="rs-wslider" min="0" max="${g.options.length - 1}" step="1" value="${idx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
+    <div id="rs-wsizeinfo">${rsWidthInfo()}</div>
+    ${both ? `<div style="margin-top:10px">and remove <strong id="rs-blocks-n">${rs.blocks}</strong> block${rs.blocks === 1 ? "" : "s"} of ${op.inspect.period} layers</div>
+      <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${bidx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
+      <div id="rs-sizeinfo" class="dim small">${rsSizeInfo()}</div>` : ""}${warn}</div>
+    <p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), ${expert ? `<select id="rs-wsamples">${[128, 256, 512, 1024].map((n) => `<option ${rs.wsamples === n ? "selected" : ""}>${n}</option>`).join("")}</select>` : rs.wsamples} samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
+    <p class="dim small" id="rs-measinfo">${meas}</p>${axes}`;
+}
+
+// a small line chart: the points as a line, the first and the last value written out
+function lineChart(points, label, lower) {
+  if (!points || points.length < 2) return "";
+  const W = 560, H = 120, P = 34, ys = points.map((q) => q[1]), lo = Math.min(...ys), hi = Math.max(...ys, lo + 1e-9);
+  const x0 = points[0][0], x1 = Math.max(points[points.length - 1][0], x0 + 1);
+  const X = (x) => P + ((x - x0) / (x1 - x0)) * (W - P - 10), Y = (y) => H - 18 - ((y - lo) / (hi - lo)) * (H - 36);
+  const pts = points.map((q) => `${X(q[0]).toFixed(1)},${Y(q[1]).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="${esc(label)}"><polyline fill="none" stroke="var(--accent)" stroke-width="2" points="${pts}"/>
+    <line x1="${P}" y1="${H - 18}" x2="${W - 10}" y2="${H - 18}" stroke="var(--line)"/><text x="${P}" y="12" class="axis">${esc(label)}${lower ? " (lower is better)" : ""}: ${points[0][1].toFixed(3)} → ${points[points.length - 1][1].toFixed(3)}</text>
+    <text x="${P}" y="${H - 4}" class="axis">step ${points[0][0]}</text><text x="${W - 70}" y="${H - 4}" class="axis">step ${points[points.length - 1][0]}</text></svg>`;
+}
+
+const HEAL_STEPS = { cache: "1 of 3 · The original model answers your texts", train: "2 of 3 · The thinner model learns from the original", merge: "3 of 3 · Saving the healed model" };
+
+// the measured numbers of a healing run (saved ones, then the live ones of this session), as chart points
+function healSeries() {
+  const ev = ((rs.hl && rs.hl.opts && rs.hl.opts.metrics) || []).concat((rs.hlRun && rs.hlRun.live) || []);
+  const seen = new Set(), kd = [], cal = [];
+  ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") cal.push([e.step, e.calib_loss]); });
+  return { kd, cal };
+}
+
+// "Heal it": the original teaches the thinner model to answer like it did
+function healCard(m) {
+  const sm = m.summary;
+  if (!sm || sm.mode !== "prune") return "";
+  const h = rs.hl && rs.hl.name === m.name ? rs.hl.opts : null, run = rs.hlRun;
+  const wide = sm.shape === "width" || sm.shape === "both";
+  const head = `<h3>Heal it ${wide ? "(recommended)" : "(optional)"}</h3>`;
+  if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
+  if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
+  const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, plan = h.plan || {}, st = (h.heal && h.heal.status) || null;
+  const t = (h.tokens || []).find((x) => x.tokens_m === tk) || {};
+  const expert = state.settings.expert_mode;
+  const dataset = sp.dataset || h.general_dataset;
+  const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>`
+    : `<p class="dim small">${plan.mode === "online" ? "The original and the thinner model run at the same time" : "The original answers first and saves its answers to disk, then the thinner model learns (they take turns)"}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. The thinner model is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>`;
+  const busy = rs.running || rs.testing || (run && run.running);
+  const prog = run && run.running ? `<div class="stepline">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
+  const series = healSeries();
+  const charts = lineChart(series.kd, "How far the thinner model's answers are from the original's (KL)", true) + lineChart(series.cal, "Text-prediction error on your data", true);
+  const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : "";
+  const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}</p>` : "";
+  const resume = st === "stopped" || st === "failed";
+  return `<div class="card-in">${head}
+    <p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>
+    <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (${esc(dataset)}) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
+    <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
+      <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
+    ${mem}${loss}${note}
+    ${expert ? `<details><summary>Expert settings</summary><div class="grid">
+      <label>General text (Hugging Face dataset)<input type="text" id="hl-dataset" value="${esc(sp.dataset)}" placeholder="${esc(h.general_dataset)}"></label>
+      <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
+      <label>Weight of copying the original (1 = only copy it)<input type="text" id="hl-alpha" value="${sp.alpha}"></label>
+      <label>LoRA size (rank)<input type="text" id="hl-rank" value="${sp.rank}"></label><label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
+      <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready ? "disabled" : ""}>${resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    ${resume && h.heal ? `<p class="dim small">${st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${h.heal.step ? " during step " + esc(h.heal.step) : ""}. Continue goes on where it stopped.</p>` : ""}
+    ${prog}${charts}</div>`;
+}
+
+// original · thinned · healed, side by side: what the tests found and the text-prediction error
+function sideBySide(m) {
+  const t = m.test, th = m.test_healed, sm = m.summary;
+  if (!t && !th) return "";
+  const hr = (rs.hl && rs.hl.name === m.name && rs.hl.opts && rs.hl.opts.heal && rs.hl.opts.heal.result) || (m.heal && m.heal.result) || {};
+  const cell = (side, id, x) => { const v = x && x.scores && x.scores[side] && x.scores[side][id]; return v ? pc(v.mean) : "–"; };
+  const base = t || th;
+  const rows = CATS.map(([id, name]) => `<tr><td>${name}</td><td>${cell("original", id, base)}</td><td>${t ? cell("trained", id, t) : "–"}</td><td><strong>${th ? cell("trained", id, th) : "–"}</strong></td></tr>`).join("");
+  const err = (v) => v == null ? "–" : (+v).toFixed(2);
+  return `<h3>Original · thinner · healed</h3><table class="tbl"><tr><th>What was checked</th><th>Original</th><th>Thinner</th><th>Healed</th></tr>${rows}
+    <tr><td>Text-prediction error on your data (lower is better)</td><td>${err(sm.loss_before)}</td><td>${err(sm.loss_after)}</td><td><strong>${err(hr.calib_loss_after)}</strong></td></tr></table>
+    <p class="dim small">${th ? esc(th.verdict.headline) : "The healed model has not been tested yet."}</p>`;
+}
+
 function madeCard(m) {
   const sm = m.summary;
   if (!sm) return `<div class="card wide"><h2>${esc(m.name)}</h2><p class="${m.status === "failed" ? "err" : "dim"}">${esc(m.status)}${m.error ? ": " + esc(m.error) : ""}</p></div>`;
   const slim = sm.mode === "prune";
-  const what = slim ? `Removed layers ${ranges(sm.dropped)} (${(sm.chosen_blocks || []).length || sm.dropped.length} block${(sm.chosen_blocks || []).length === 1 ? "" : "s"})` : `Added ${sm.layers_after - sm.layers_before} layers (copies of layers ${ranges(sm.duplicated)})`;
+  const wd = sm.width, wide = !!wd;
+  const what = slim && wide && !(sm.dropped || []).length ? `Made every layer thinner (MLP ${thou(wd.before.intermediate_size)} → ${thou(wd.after.intermediate_size)})` : slim && wide ? `Removed layers ${ranges(sm.dropped)} and made every layer thinner (MLP ${thou(wd.before.intermediate_size)} → ${thou(wd.after.intermediate_size)})` : slim ? `Removed layers ${ranges(sm.dropped)} (${(sm.chosen_blocks || []).length || sm.dropped.length} block${(sm.chosen_blocks || []).length === 1 ? "" : "s"})` : `Added ${sm.layers_after - sm.layers_before} layers (copies of layers ${ranges(sm.duplicated)})`;
   const gb = (n) => (n / 1e9).toFixed(2);
   let loss = "";
   if (sm.loss_before != null && sm.loss_after != null) {
@@ -844,20 +993,23 @@ function madeCard(m) {
   const row = ([id, name]) => { const o = t.scores.original[id], n = t.scores.trained[id]; return o || n ? `<tr><td>${name}</td><td>${pc(o && o.mean)}</td><td><strong>${pc(n && n.mean)}</strong></td></tr>` : ""; };
   const test = t ? `<h3>Test against the original</h3><p class="verdict ${t.verdict.better === true ? "ok" : t.verdict.better === false ? "err" : ""}"><strong>${esc(t.verdict.headline)}</strong></p>
       ${t.verdict.lines.map((l) => `<p>${esc(l)}</p>`).join("")}
-      <table class="tbl"><tr><th>What was checked</th><th>Original</th><th>${slim ? "Slimmed" : "Grown"}</th></tr>${CATS.map(row).join("")}</table>
+      <table class="tbl"><tr><th>What was checked</th><th>Original</th><th>${slim ? (wide ? "Thinner" : "Slimmed") : "Grown"}</th></tr>${CATS.map(row).join("")}</table>
       <p class="dim small">${t.n} questions · ${t.method === "teacher" ? "graded by the teacher" : "graded by matching words (a rough guide)"} · original loaded in ${esc((t.loaded || {}).original || "16-bit")}, this model in ${esc((t.loaded || {}).trained || "16-bit")} · ${esc(t.created)}</p>` : "";
-  const busy = rs.running || rs.testing;
+  const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running);
+  const ws = m.width_scores, meanChart = ws && ws.mlp_mean ? `<p class="dim small">How much each layer's MLP does (the average of its measured scores); the neurons that did least were taken out of every layer. ${ws.kept_share != null ? "The neurons that stayed hold " + Math.round(ws.kept_share * 100) + " % of the total score." : ""}</p>${barChart(ws.mlp_mean, [])}` : "";
+  const stab = wide && wd.stable_overlap != null ? (wd.stable_overlap >= 0.9 ? `<p class="dim small">The choice of neurons was stable (${Math.round(wd.stable_overlap * 100)} % the same when chosen from either half of your text).</p>` : `<p class="warn">The measurement was not very stable: choosing from either half of your text gave only ${Math.round(wd.stable_overlap * 100)} % the same neurons. Measure on more samples (Expert).</p>`) : "";
   return `<div class="card wide"><h2>${esc(m.name)}</h2>
-    ${slim && m.scores && m.scores.boundary_distance ? barChart(m.scores.boundary_distance, m.scores.chosen_blocks || []) : (sm.boundary_distance ? barChart(sm.boundary_distance, sm.chosen_blocks || []) : "")}
+    ${slim && m.scores && m.scores.boundary_distance ? barChart(m.scores.boundary_distance, m.scores.chosen_blocks || []) : (sm.boundary_distance ? barChart(sm.boundary_distance, sm.chosen_blocks || []) : "")}${meanChart}
     <p><strong>${esc(what)}</strong> · ${sm.layers_before} → ${sm.layers_after} layers · ${gb(sm.params_before)} → ${gb(sm.params_after)} billion parameters · ${m.size_gb} GB on disk</p>
-    ${loss ? `<p>${esc(loss)}</p>` : ""}
-    ${slim && sm.stable === false ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
+    ${loss ? `<p>${esc(loss)}</p>` : ""}${stab}
+    ${slim && sm.stable === false && !wide ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
     ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
     <p class="dim small">The vision part and the multi-token head were copied unchanged. ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
     <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
-      <button class="secondary" data-rstrain="${esc(m.model_id || "")}" ${m.model_id ? "" : "disabled"}>Train it on your world (Step 3)</button>
+      ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
+      <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}</div>`;
 }
 
 function renderReshape() {
@@ -868,6 +1020,7 @@ function renderReshape() {
   const intro = `<div class="card wide"><h2>What this does</h2>
     <p><strong>Slim</strong> takes whole blocks of layers out where they change the text the least (measured on your own world's text). The model gets smaller, faster and needs less memory, but it answers <strong>worse until you train it again</strong>.</p>
     <p><strong>Grow</strong> copies a stretch of layers in. It starts out answering exactly like the original, and is then trained. <strong>Honest expectation:</strong> from one world's text the gain is usually small or none, and it needs about 40 % more memory, disk space and time. It pays off with much more training text than a world has.</p>
+    <p><strong>Thinner layers</strong> (Qwen3.5 and 3.8 only) keep every layer but make each one narrower: the neurons that matter least, measured on your own text, are taken out of the MLP of every layer. This usually keeps more quality than removing whole layers for the same size, but it is slower to run, and it needs <strong>healing</strong>: the original model teaches the thinner one to answer like it did, which takes hours.</p>
     <p>Always test the new model, and usually train it in Step 3 afterwards.</p></div>`;
   const msg = (rs.error ? `<div class="err">${esc(rs.error)}</div>` : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
   const modelOpts = st.models.map((m) => `<option value="${esc(m.id)}" ${m.id === rs.model ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("");
@@ -878,68 +1031,132 @@ function renderReshape() {
   else if (ins && !ins.supported) info = `<div class="err">${esc(ins.why || "This model cannot be slimmed or grown.")}</div>`;
   else if (ins) info = `<p>${ins.layers} layers: ${esc(patternText(ins))} · ${(ins.total_params / 1e9).toFixed(2)} B parameters · ${ins.has_vision ? "has a vision part (kept unchanged)" : "text only"}${ins.local ? "" : " · not on this computer yet: it is downloaded first (≈ " + (ins.source_bytes / 1e9).toFixed(0) + " GB)"}</p>`;
   const pick = `<div class="card wide"><h2>1 · Start from</h2><div class="row"><select id="rs-model" ${rs.running ? "disabled" : ""}>${modelOpts}</select></div>${info}</div>`;
-  const ok = ins && ins.supported && !rs.optErr && op.options.length > 0;
+  const ok = ins && ins.supported && !rs.optErr && (op.options.length > 0 || (op.width && op.width.supported && rs.mode === "prune"));
   const grow = rs.mode === "grow", o = rsOption();
   const idx = op ? Math.max(0, op.options.findIndex((x) => x.blocks === rs.blocks)) : 0;
   const warn = o ? o.warnings.map((w) => `<div class="${/little or no gain|worse|quarter|QLoRA|Even/.test(w) ? "warn" : "dim"}">${esc(w)}</div>`).join("") : "";
   const size = `<div class="card wide"><h2>2 · What to do</h2>
     <label class="opt"><input type="radio" name="rs-mode" value="prune" ${rs.mode === "prune" ? "checked" : ""} ${rs.running ? "disabled" : ""}> <strong>Slim it</strong> — take blocks of layers out</label>
     <label class="opt"><input type="radio" name="rs-mode" value="grow" ${grow ? "checked" : ""} ${rs.running ? "disabled" : ""}> <strong>Grow it</strong> — copy a stretch of layers in <span class="dim">(little or no gain from one world's text; about 40 % more memory)</span></label>
-    ${ok ? `<div style="margin-top:12px"><div>${grow ? "Add" : "Remove"} <strong id="rs-blocks-n">${rs.blocks}</strong> block${rs.blocks === 1 ? "" : "s"} of ${ins.period} layers</div>
+    ${ok && !grow && op.width ? rsHowUi(op) : ""}
+    ${ok && rsWidthOn() ? rsWidthUi(op, st) : ""}
+    ${ok && !rsWidthOn() ? `<div style="margin-top:12px"><div>${grow ? "Add" : "Remove"} <strong id="rs-blocks-n">${rs.blocks}</strong> block${rs.blocks === 1 ? "" : "s"} of ${ins.period} layers</div>
       <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${idx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
-      <div id="rs-sizeinfo">${rsSizeInfo()}</div>${warn}</div>` : (ins && ins.supported && !rs.loadingOpts ? `<p class="dim">This model is too small to change in whole blocks.</p>` : "")}
+      <div id="rs-sizeinfo">${rsSizeInfo()}</div>${warn}</div>` : ""}
+    ${ok ? "" : (ins && ins.supported && !rs.loadingOpts ? `<p class="dim">This model is too small to change in whole blocks.</p>` : "")}
     ${ok && grow ? `<p style="margin-bottom:4px">How should the new layers start?</p>
       <label class="opt"><input type="radio" name="rs-init" value="identity" ${rs.init === "identity" ? "checked" : ""}> <strong>As an exact copy of the original</strong> (recommended): the new layers are switched off, so nothing is lost before training</label>
       <label class="opt"><input type="radio" name="rs-init" value="copy" ${rs.init === "copy" ? "checked" : ""}> <strong>Copy the layers</strong> (SOLAR style): the copied layers work at once, which disturbs the model until it is trained</label>` : ""}
-    ${ok && !grow ? `<p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), <select id="rs-samples">${[64, 128, 256].map((n) => `<option ${rs.samples === n ? "selected" : ""}>${n}</option>`).join("")}</select> samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
+    ${ok && !grow && !rsWidthOn() ? `<p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), <select id="rs-samples">${[64, 128, 256].map((n) => `<option ${rs.samples === n ? "selected" : ""}>${n}</option>`).join("")}</select> samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
       <p class="dim small">The model is loaded ${op.load === "16bit" ? "in 16-bit" : op.load === "4bit" ? "in 4-bit (NF4) to fit the card; the ranking of the layers hardly changes" : "spread over the card and the computer's memory (slow)"} while measuring.</p>` : ""}
-    ${ok && !grow && state.settings.expert_mode ? `<details open><summary>Expert settings</summary><div class="grid">
+    ${ok && !grow && !rsWidthOn() && state.settings.expert_mode ? `<details open><summary>Expert settings</summary><div class="grid">
       <label>Which layers<select id="rs-strategy"><option value="contiguous" ${rs.strategy === "contiguous" ? "selected" : ""}>one run of blocks (recommended)</option><option value="separate" ${rs.strategy === "separate" ? "selected" : ""}>separate blocks wherever they matter least</option></select></label>
       <label>Never remove the first … blocks<input type="text" id="rs-pf" value="${rs.pf}"></label><label>… and the last … blocks<input type="text" id="rs-pl" value="${rs.pl}"></label>
       <label>Load for measuring<select id="rs-load">${[["auto", "automatic"], ["16bit", "16-bit"], ["4bit", "4-bit"], ["offload", "spread over card and memory"]].map(([k, l]) => `<option value="${k}" ${rs.load === k ? "selected" : ""}>${l}</option>`).join("")}</select></label>
       <label>Remove exactly these layers (skips the measuring)<input type="text" id="rs-drop" value="${esc(rs.dropText)}" placeholder="for example 36-51"></label></div></details>` : ""}</div>`;
   const dropList = parseLayers(rs.dropText);
-  const needGb = o ? o.disk_needed_gb : 0;
-  const diskBad = st.free_disk_gb != null && o && st.free_disk_gb < needGb;
-  const noData = !grow && !st.dataset_version && !(dropList && dropList.length);
-  const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : noData ? "Save a training-data version in Step 2 first." : diskBad ? `Not enough free disk space: ${needGb} GB needed, ${st.free_disk_gb} GB free.` : dropList === null ? "The layer list is not valid." : "";
+  const wo = rsWidthOn() ? rsWidthOption() : null;
+  const needGb = wo ? wo.disk_needed_gb : o ? o.disk_needed_gb : 0;
+  const diskBad = st.free_disk_gb != null && (o || wo) && st.free_disk_gb < needGb;
+  const noData = !grow && !st.dataset_version && (rs.shape !== "depth" || !(dropList && dropList.length));
+  const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : noData ? "Save a training-data version in Step 2 first." : diskBad ? `Not enough free disk space: ${needGb} GB needed, ${st.free_disk_gb} GB free.` : dropList === null ? "The layer list is not valid." : rsWidthOn() && !wo ? "Choose how thin the layers become." : "";
   const make = `<div class="card wide"><h2>3 · Make the model</h2>
     <div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
-    ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && o ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
+    ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && (wo || (!rsWidthOn() && o)) ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
     ${rs.running ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
     ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
   const made = st.made.filter((m) => m.status === "done" && m.summary);
   const shown = made.find((m) => m.name === rs.view) || made[0];
   const result = shown ? madeCard(shown) : "";
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
-    `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
+    `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
   return head + msg + intro + pick + size + make + result + list;
 }
 
-async function rsRefresh() {
+async function rsRefresh(stale) {
   try {
     rs.state = await invoke("reshape_state");
     if (!rs.model && rs.state.models.length) rs.model = (rs.state.models.find((m) => m.id === "qwen3.5-9b") || rs.state.models[0]).id;
   } catch (e) { rs.error = String(e); }
   if (page === "reshape") render();
   if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
+  if (stale && rs.hl) rs.hl.stale = true;
+  rsAfterState();
 }
 
 async function rsOptions() {
   const token = ++rs.token;
   rs.loadingOpts = true; rs.optErr = null; rs.options = null; render();
   try {
-    const o = await invoke("reshape_options", { model: rs.model, mode: rs.mode });
+    const shape = rs.mode === "prune" ? rs.shape : "depth";
+    const args = { model: rs.model, mode: rs.mode };
+    if (shape !== "depth") {
+      args.shape = shape;
+      if (rs.lv) args.lin_v_heads = rsAxis("lin_v_heads");
+      if (rs.hh) args.heads = rs.hh;
+    }
+    const o = await invoke("reshape_options", args);
     if (token !== rs.token) return;
     rs.options = o;
+    if (o.width && !o.width.supported && rs.shape !== "depth") rs.shape = "depth";
     if (!o.options.some((x) => x.blocks === rs.blocks)) rs.blocks = o.options.length ? o.default_blocks : null;
+    rsPickWidth();
   } catch (e) { if (token !== rs.token) return; rs.optErr = String(e); }
   rs.loadingOpts = false;
+  if (page === "reshape") render();
+  rsMeasInfo();
+}
+
+// the second step of a way with two value heads: 48 -> 32 (one step only)
+function rsAxis(which) { const c = rs.options && rs.options.width && rs.options.width.choices; return c && c[which] && c[which][1] != null ? c[which][1] : null; }
+
+// is there an earlier measurement of this model on the saved data with these settings? (for "measured earlier — reused")
+async function rsMeasInfo() {
+  if (!rs.model || !rs.state || !rs.state.dataset_version || rs.shape === "depth") return;
+  try {
+    const meas = await invoke("reshape_measurement", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load });
+    rs.meas = meas || null;
+  } catch (_) { rs.meas = null; }
+  if (page === "reshape") render();
+}
+
+// the person's Heal card needs the options of the model that is shown
+function rsAfterState() {
+  const st = rs.state; if (!st) return;
+  const made = st.made.filter((m) => m.status === "done" && m.summary);
+  const shown = made.find((m) => m.name === rs.view) || made[0];
+  if (shown && shown.summary.mode === "prune" && (!rs.hl || rs.hl.name !== shown.name || rs.hl.stale)) rsLoadHeal(shown.name);
+}
+
+async function rsLoadHeal(name) {
+  rs.hl = { name, opts: null };
+  try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
+  if (page === "reshape") render();
+}
+
+function onHealEvent(p) {
+  const run = rs.hlRun || (rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] });
+  if (p.kind === "progress") { run.step = p.heal_step || run.step; run.text = p.text || ""; run.progress = p.value; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "distill_metric" || p.kind === "distill_eval") { run.step = p.heal_step || run.step; run.live.push(p); }
+  else if (p.kind === "error") { run.running = false; rs.error = p.text; rsRefresh(true); return; }
+  else if (p.kind === "done") {
+    run.running = false;
+    if (p.data && p.data.stopped) rs.ok = "Stopped. Healing can be continued where it stopped.";
+    else if (p.data) rs.ok = `Healed: ${p.data.name} now has a healed version, and it is in the model list of Step 3.`;
+    setState_(); rsRefresh(true); return;
+  }
   if (page === "reshape") render();
 }
 
 function onReshapeEvent(p) {
+  if (p.phase === "heal") return onHealEvent(p);
+  if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
+    rs.running = false; rs.text = ""; rs.progress = null;
+    if (p.kind === "error") rs.error = p.text; else rs.ok = "Measured. The result is kept for every size on this data.";
+    rsMeasInfo(); return;
+  }
   if (p.kind === "progress") { rs.text = p.text || p.step; rs.progress = p.value; }
   else if (p.kind === "log") rs.log.push(p.text);
   else if (p.kind === "error") { rs.running = false; rs.testing = null; rs.text = ""; rs.progress = null; rs.error = p.text; rsRefresh(); return; }
@@ -957,8 +1174,21 @@ function onReshapeEvent(p) {
 
 function rsSpec() {
   const drop = parseLayers(rs.dropText);
-  return { source_model_id: rs.model, mode: rs.mode, blocks: rs.blocks, strategy: rs.strategy, protect_first: rs.pf, protect_last: rs.pl, init: rs.init, calib_samples: rs.samples, calib_len: 512, load: rs.load,
+  const spec = { source_model_id: rs.model, mode: rs.mode, blocks: rs.blocks, strategy: rs.strategy, protect_first: rs.pf, protect_last: rs.pl, init: rs.init, calib_samples: rs.samples, calib_len: 512, load: rs.load,
     drop_layers: rs.mode === "prune" && drop && drop.length ? drop : null };
+  if (rs.mode === "prune" && rs.shape !== "depth" && rs.wi != null) {          // thinner layers: width only has no blocks
+    spec.blocks = rs.shape === "width" ? 0 : rs.blocks;
+    spec.width = { intermediate: rs.wi, lin_v_heads: rs.lv ? rsAxis("lin_v_heads") : null, heads: rs.hh || null };
+    spec.width_samples = rs.wsamples;
+    if (rs.shape === "width") spec.drop_layers = null;
+  }
+  return spec;
+}
+
+// what the Heal card sends
+function rsHealSpec() {
+  const sp = rs.hlSpec, o = rs.hl && rs.hl.opts;
+  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general_dataset: sp.dataset || null, alpha: +sp.alpha, rank: +sp.rank, lr: +sp.lr, mode: sp.mode || null };
 }
 
 function wireReshape() {
@@ -967,11 +1197,29 @@ function wireReshape() {
   const m = $("rs-model"); if (m) m.onchange = () => { rs.model = m.value; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
   document.querySelectorAll("input[name=rs-mode]").forEach((r) => r.onchange = () => { rs.mode = r.value; rs.blocks = null; rs.options = null; rs.ok = null; rsOptions(); });
   document.querySelectorAll("input[name=rs-init]").forEach((r) => r.onchange = () => { rs.init = r.value; });
+  document.querySelectorAll("input[name=rs-shape]").forEach((r) => r.onchange = () => { rs.shape = r.value; rs.wi = null; rs.ok = null; rs.options = null; rsOptions(); });
   const sl = $("rs-slider");
   if (sl) {
-    sl.oninput = () => { const o = rs.options.options[+sl.value]; rs.blocks = o.blocks; $("rs-blocks-n").textContent = o.blocks; $("rs-sizeinfo").innerHTML = rsSizeInfo(); };
+    sl.oninput = () => {
+      const o = rs.options.options[+sl.value]; rs.blocks = o.blocks; $("rs-blocks-n").textContent = o.blocks;
+      if (rsWidthOn()) { rsPickWidth(); $("rs-sizeinfo").innerHTML = rsSizeInfo(); $("rs-wsizeinfo").innerHTML = rsWidthInfo(); } else $("rs-sizeinfo").innerHTML = rsSizeInfo();
+    };
     sl.onchange = () => render();
   }
+  const ws = $("rs-wslider");
+  if (ws) {
+    ws.oninput = () => { const g = rsWidthGroup(); rs.wi = g.options[+ws.value].intermediate; $("rs-w-n").textContent = thou(rs.wi); $("rs-wsizeinfo").innerHTML = rsWidthInfo(); };
+    ws.onchange = () => render();
+  }
+  const lv = $("rs-lv"); if (lv) lv.onchange = () => { rs.lv = lv.checked; rs.options = null; rsOptions(); };
+  const hh = $("rs-hh"); if (hh) hh.onchange = () => { rs.hh = hh.value ? +hh.value : null; rs.options = null; rsOptions(); };
+  const wsm = $("rs-wsamples"); if (wsm) wsm.onchange = () => { rs.wsamples = +wsm.value; rsMeasInfo(); };
+  const measure = async (force) => {
+    rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_measure", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load, force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+  };
+  on("rs-measure-now", () => measure(false));
+  on("rs-measure-again", () => measure(true));
   const sm = $("rs-samples"); if (sm) sm.onchange = () => { rs.samples = +sm.value; };
   const stg = $("rs-strategy"); if (stg) stg.onchange = () => { rs.strategy = stg.value; };
   const ld = $("rs-load"); if (ld) ld.onchange = () => { rs.load = ld.value; };
@@ -983,11 +1231,26 @@ function wireReshape() {
     try { await invoke("reshape_start", { spec: rsSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
   });
   on("rs-stop", () => { rs.text = "Stopping…"; invoke("reshape_stop"); render(); });
-  document.querySelectorAll("[data-rsshow]").forEach((b) => b.onclick = () => { rs.view = b.dataset.rsshow; render(); });
-  document.querySelectorAll("[data-rstest]").forEach((b) => b.onclick = async () => {
-    rs.testing = b.dataset.rstest; rs.ok = null; rs.error = null; rs.text = "Starting…"; rs.progress = null; render();
-    try { await invoke("reshape_test", { name: rs.testing, judge: false }); } catch (e) { rs.testing = null; rs.error = String(e); render(); }
+  document.querySelectorAll("[data-rsshow]").forEach((b) => b.onclick = () => { rs.view = b.dataset.rsshow; rsAfterState(); render(); });
+  const runTest = (name, target) => async () => {
+    rs.testing = name; rs.ok = null; rs.error = null; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_test", { name, judge: false, target }); } catch (e) { rs.testing = null; rs.error = String(e); render(); }
+  };
+  document.querySelectorAll("[data-rstest]").forEach((b) => b.onclick = runTest(b.dataset.rstest, "slim"));
+  document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
+  // healing
+  const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); }; };
+  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); hv("hl-dataset", (e) => { hs.dataset = e.value.trim(); });
+  hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; });
+  hv("hl-alpha", (e) => { const v = parseFloat(e.value); hs.alpha = Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; });
+  hv("hl-rank", (e) => { const v = parseInt(e.value, 10); hs.rank = Number.isFinite(v) && v >= 4 && v <= 256 ? v : 64; });
+  hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
+  hv("hl-mode", (e) => { hs.mode = e.value; });
+  on("hl-go", async () => {
+    rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }; rs.ok = null; rs.error = null; rs.log = []; render();
+    try { await invoke("heal_start", { name: rs.hl.name, spec: rsHealSpec() }); } catch (e) { rs.hlRun.running = false; rs.error = String(e); render(); }
   });
+  on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
     if (!confirm("Delete this model and its files? A training run that used it must be deleted first.")) return;

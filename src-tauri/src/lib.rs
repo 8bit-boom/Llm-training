@@ -535,10 +535,89 @@ fn reshape_state(s: State<App>) -> Out<Value> {
 }
 
 /// The sizes a model can be slimmed or grown to. The first look at a model may ask the worker (and the internet), so it runs on its own thread.
+/// `shape`: "depth" (default), "width" or "both"; `lin_v_heads` / `heads`: the Expert axes of thinner layers.
 #[tauri::command]
-async fn reshape_options(s: State<'_, App>, model: String, mode: String) -> Out<Value> {
+async fn reshape_options(s: State<'_, App>, model: String, mode: String, shape: Option<String>, lin_v_heads: Option<u32>, heads: Option<u32>) -> Out<Value> {
     lock(&s).reshape_options_ready().map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || AppModel::reshape_options_for(&model, &mode).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
+    let shape = shape.unwrap_or_else(|| "depth".into());
+    tauri::async_runtime::spawn_blocking(move || AppModel::reshape_options_with(&model, &mode, &shape, lin_v_heads, heads).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
+}
+
+/// What an earlier measurement of a model on the saved data looks like (is there one to reuse?).
+#[tauri::command]
+fn reshape_measurement(s: State<App>, model: String, samples: u32, len: u32, load: String) -> Out<Value> {
+    let m = ndforge_core::train::catalog::find(&model).ok_or("That model is not in the list any more.")?;
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    Ok(ndforge_core::reshape::runs::measurement_info(&p, &m, samples, len, &load))
+}
+
+/// Measures a model on the project's text now and keeps the result (optional: making a thinner model measures by itself). Events on "reshape-event".
+#[tauri::command]
+fn reshape_measure(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, samples: u32, len: u32, load: String, force: Option<bool>) -> Out<()> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
+        let r = ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, &mut emit);
+        busy.store(false, Ordering::SeqCst);
+        let end = match r {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "measure"}),
+            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "measure"}),
+        };
+        let _ = app.emit("reshape-event", end);
+    });
+    Ok(())
+}
+
+/// What the Heal card shows: how healing would run on this card, the budgets and where it stands.
+#[tauri::command]
+fn heal_options(s: State<App>, name: String) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::reshape::runs::heal_options(&p, &name, card_vram_gb()).map_err(|e| e.to_string())
+}
+
+/// Heals a made model (or continues where a stopped heal was). Events on "reshape-event" tagged {"phase": "heal"}; the end is {"kind": "done", "data": {...}}.
+#[tauri::command]
+fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: String, spec: Value) -> Out<()> {
+    let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let m = lock(&s);
+    let p = m.project_clone().map_err(|e| e.to_string())?;
+    let keep_awake = m.settings.keep_awake;
+    drop(m);
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
+        // healing takes hours: the computer stays awake, like during training
+        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
+        if !awake.note.is_empty() {
+            emit(serde_json::json!({"kind": "log", "text": awake.note}));
+        }
+        let r = ndforge_core::reshape::runs::heal(&p, &name, &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
+        drop(awake);
+        busy.store(false, Ordering::SeqCst);
+        let end = match r {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
+            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
+        };
+        let _ = app.emit("reshape-event", end);
+    });
+    Ok(())
+}
+
+/// The Stop button of healing: the worker saves a checkpoint and stops; healing continues from it later.
+#[tauri::command]
+fn heal_stop(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
 }
 
 /// Makes the model. Events on "reshape-event"; the end is {"kind": "done", "data": {... "name", "model_id"}} (or "stopped": true in data).
@@ -582,14 +661,15 @@ fn reshape_stop(tasks: State<Tasks>) {
 
 /// Tests a made model against the model it was made from. Events on "reshape-event".
 #[tauri::command]
-fn reshape_test(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: String, judge: bool) -> Out<()> {
+fn reshape_test(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: String, judge: bool, target: Option<String>) -> Out<()> {
     let m = lock(&s);
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let teacher = if judge { Some(m.teacher_client()) } else { None };
     drop(m);
     spawn_task(app, &tasks, "reshape-event", move |cancel, emit| {
         if let Some(t) = &teacher { if !t.cfg.is_set() { return Err("Choose the teacher in Step 2 first, or untick the teacher grading.".to_string()); } }
-        let r = ndforge_core::reshape::runs::test(&p, &name, teacher.as_ref(), card_vram_gb(), cancel, emit).map_err(|e| e.to_string())?;
+        let target = target.unwrap_or_else(|| "slim".into());
+        let r = ndforge_core::reshape::runs::test_target(&p, &name, &target, teacher.as_ref(), card_vram_gb(), cancel, emit).map_err(|e| e.to_string())?;
         if let Some(t) = &teacher { if t.cfg.unload_after { let _ = ndforge_core::export::ollama::Ollama::new(&t.cfg.ollama_base()).unload(&t.cfg.model); } }
         Ok(serde_json::json!({"test": r, "name": name}))
     })
@@ -663,7 +743,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_start, reshape_stop, reshape_test, reshape_remove])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

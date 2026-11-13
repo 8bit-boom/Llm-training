@@ -12,6 +12,8 @@ def _explain(exc: Exception) -> str:
         return "The disk is full. Free some space (or choose another folder) and try again. (" + text[:200] + ")"
     if "out of memory" in low:
         return "The graphics card ran out of memory. Use a smaller sequence length, LoRA 4-bit (QLoRA), or a smaller model. (" + text[:200] + ")"
+    if "no module named 'numpy'" in low:
+        return "The training software is incomplete (numpy). Run Training setup again."
     if "no module named" in low:
         return "A training library is missing in the training software. Run the training setup again. (" + text[:200] + ")"
     if "401" in low or "gated" in low or "repository not found" in low:
@@ -63,17 +65,29 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("evaluate_failed", _explain(exc))
             return 1
-    if kind in ("reshape_inspect", "reshape"):
+    if kind in ("reshape_inspect", "reshape", "reshape_measure"):
         from . import reshape, reshapejob
         try:
-            return reshapejob.run_inspect(job) if kind == "reshape_inspect" else reshapejob.run(job)
+            return {"reshape_inspect": reshapejob.run_inspect, "reshape": reshapejob.run, "reshape_measure": reshapejob.run_measure}[kind](job)
         except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
             protocol.error("reshape_refused", str(exc))
             return 1
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            protocol.error("inspect_failed" if kind == "reshape_inspect" else "reshape_failed", _explain(exc))
+            protocol.error({"reshape_inspect": "inspect_failed", "reshape": "reshape_failed", "reshape_measure": "measure_failed"}[kind], _explain(exc))
+            return 1
+    if kind in ("distill_cache", "distill", "distill_merge"):
+        from . import distilljob, reshape
+        try:
+            return {"distill_cache": distilljob.run_cache, "distill": distilljob.run, "distill_merge": distilljob.merge}[kind](job)
+        except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
+            protocol.error("distill_unstable" if str(exc) == distilljob.UNSTABLE else "reshape_refused", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain(exc))
             return 1
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1

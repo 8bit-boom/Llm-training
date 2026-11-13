@@ -23,6 +23,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
 | M13 Slim or grow a model: layer pruning and depth up-scaling as a new base model | built and tested without a GPU (worker on stand-ins, a fake worker in the Rust tests, the page in a stand-in browser); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
+| M14 Thinner layers (width pruning) + healing by distillation | built and tested without a GPU or torch (numpy stand-ins, fake workers, the page in a stand-in browser; the CPU torch tests are written and have never run); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ## Install
@@ -129,6 +130,14 @@ The sidebar item **🧬 Slim or grow a model** makes a new base model from one y
 - Unsloth Studio can only prune MoE experts (REAP), not layers, and not dense or hybrid Qwen3.5: that is why this is built here (docs/RESHAPE.md, section "Could Unsloth Studio do it?").
 
 Code: worker `reshape.py`, `reshapejob.py`, `safetensors_io.py`; Rust `crates/ndforge-core/src/reshape/`; page `ui/app.js` (smoke test `ui/smoke/`). Method, file formats, deviations from the plan and the list of what **has not been verified without a GPU**: `docs/RESHAPE.md`.
+
+### Thinner layers and healing (M14, version 2)
+
+The same page can also make **every layer thinner** (width pruning, the Minitron method: NVIDIA, arXiv 2407.14679 / 2408.11796): the neurons of each layer's MLP that matter least on the project's own text are taken out, in every layer by the same number (Qwen3.5 / 3.8 only). For the 27B the slider starts on **MLP 13,312 = 23.7 B parameters**; 21.1 B is on the same slider, and **Both** removes a block and thins the rest. The sizes are exact before anything is measured.
+
+- **Healing** (the *Heal it* card): the original model teaches the thinner one to answer like it did (KL on its top-32 next-token probabilities, LoRA / QLoRA, 20 M tokens for 15 B and up, 40 M below, 10 to 80 M on offer; the original answers first and saves its answers to disk when both do not fit the card). About half of the text is general text **downloaded from Hugging Face** (switch off in Expert mode; offline falls back to the project's text). The LoRA is merged into a new base model folder (`models/<name>/healed`, numpy, no torch); the checkpoints are deleted, the teacher's answers kept until the model is deleted. Step 4's table shows **original · thinner · healed**.
+- **Honest expectation:** a thinned model is clearly weaker until healed, and 20 to 40 M tokens is a small fraction of the 94 B NVIDIA used; expect a usable model, not one as good as the original. Thinning the attention layers is offered in Expert mode, labelled experimental, and stays off until the GPU checklist is done.
+- Code: worker `reshape_width.py`, `slice_io.py`, `distilljob.py`; Rust `reshape/plan.rs`, `reshape/runs.rs`. Plan: `docs/RESHAPE_V2_PLAN.md`; what was built, owner decisions, deviations and the **not verified yet** list: `docs/RESHAPE.md`; the practical guide: `docs/PRUNE_QWEN38_27B.md`.
 
 ## Training speed
 

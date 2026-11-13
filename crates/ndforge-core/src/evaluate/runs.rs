@@ -245,18 +245,29 @@ pub fn compare(p: &Project) -> Vec<Value> {
             "general": mean("trained", "general"), "headline": t["verdict"]["headline"], "n": t["n"],
         }))
     }).collect();
-    // slimmed / grown models tested on their own (original against the made model)
+    // slimmed / grown models tested on their own (original against the made model), and the healed version of a thinned model
     if let Ok(rd) = std::fs::read_dir(p.folder.join("models")) {
         for e in rd.flatten() {
-            let (Some(t), Some(name)) = (read_json(&e.path().join("test.json")), e.file_name().to_str().map(String::from)) else { continue };
+            let Some(name) = e.file_name().to_str().map(String::from) else { continue };
             let state = read_json(&e.path().join("state.json")).unwrap_or(Value::Null);
-            let mean = |side: &str, cat: &str| t["scores"][side][cat]["mean"].as_f64();
-            rows.push(json!({
-                "name": format!("model:{name}"), "model": state["spec"]["source_model_id"], "method": state["spec"]["mode"].as_str().map(|m| if m == "prune" { "slim" } else { "grow" }),
-                "stages": Value::Null, "version": t["dataset_version"], "steps": Value::Null, "final_loss": Value::Null, "tested": t["created"], "grading": t["method"],
-                "lore": mean("trained", "lore"), "lore_original": mean("original", "lore"), "rules": mean("trained", "rules"), "invented": mean("trained", "made_up"),
-                "general": mean("trained", "general"), "headline": t["verdict"]["headline"], "n": t["n"],
-            }));
+            // "slim" (whole layers removed: as before), "slim-width" (every layer thinner), "slim-both", "grow"; the healed model is "healed"
+            let spec = &state["spec"];
+            let method = match spec["mode"].as_str() {
+                Some("prune") if spec["width"].is_object() => if spec["blocks"].as_u64().unwrap_or(0) > 0 || spec["drop_layers"].is_array() { "slim-both" } else { "slim-width" },
+                Some("prune") => "slim",
+                Some(_) => "grow",
+                None => "",
+            };
+            for (file, label, method) in [("test.json", format!("model:{name}"), method), ("test_healed.json", format!("model:{name}-healed"), "healed")] {
+                let Some(t) = read_json(&e.path().join(file)) else { continue };
+                let mean = |side: &str, cat: &str| t["scores"][side][cat]["mean"].as_f64();
+                rows.push(json!({
+                    "name": label, "model": state["spec"]["source_model_id"], "method": if method.is_empty() { Value::Null } else { json!(method) },
+                    "stages": Value::Null, "version": t["dataset_version"], "steps": Value::Null, "final_loss": Value::Null, "tested": t["created"], "grading": t["method"],
+                    "lore": mean("trained", "lore"), "lore_original": mean("original", "lore"), "rules": mean("trained", "rules"), "invented": mean("trained", "made_up"),
+                    "general": mean("trained", "general"), "headline": t["verdict"]["headline"], "n": t["n"],
+                }));
+            }
         }
     }
     rows.sort_by(|a, b| b["lore"].as_f64().unwrap_or(-1.0).partial_cmp(&a["lore"].as_f64().unwrap_or(-1.0)).unwrap_or(std::cmp::Ordering::Equal));

@@ -385,7 +385,7 @@ def run_job(tmp_path, job):
 
 
 INSPECT_KEYS = {"model_type", "supported", "why", "layers", "layer_types", "period", "blocks", "layer_params", "embed_params", "lm_head_params", "vision_params",
-                "mtp_params", "other_params", "total_params", "bytes_per_param", "has_vision", "tied", "source_bytes", "local"}
+                "mtp_params", "other_params", "total_params", "bytes_per_param", "has_vision", "tied", "source_bytes", "local", "width_dims", "width_supported", "width_why", "width_choices"}
 
 
 def test_inspect_job_on_a_fake_qwen_folder(tmp_path):
@@ -453,7 +453,7 @@ from stfile import fill, read_folder  # noqa: E402
 
 RESULT_KEYS = {"model_dir", "mode", "layers_before", "layers_after", "src_layers", "dropped", "duplicated", "zero_init", "params_before", "params_after",
                "bytes_written", "loss_before", "loss_after", "ppl_before", "ppl_after", "stable", "boundary_distance", "chosen_blocks", "load", "seconds",
-               "notes", "stopped"}
+               "notes", "stopped", "shape", "width"}
 
 
 def job(tmp_path, src, mode, **kw):

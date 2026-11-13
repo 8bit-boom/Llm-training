@@ -126,7 +126,9 @@ class OutTensor:
     name: str
     dtype: str
     shape: tuple
-    source: TensorRef | None    # None => write zeros
+    source: TensorRef | None    # None => write zeros (or `data`)
+    slice: tuple | None = None  # (axis, kept indices): write only these entries of the source along `axis` (width pruning; `shape` is the new shape)
+    data: object = None         # bytes made by the caller, or a function returning them when the tensor is written (one tensor in memory at a time); source must be None
 
     @property
     def nbytes(self) -> int:
@@ -170,7 +172,11 @@ def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30
     if len(set(names)) != len(names):
         raise ValueError("two output tensors have the same name")
     for t in tensors:
-        if t.source is not None and t.source.nbytes != t.nbytes:
+        if t.slice is not None and t.source is None:
+            raise ValueError(f"tensor {t.name!r}: a slice needs a source")
+        if t.data is not None and (t.source is not None or (not callable(t.data) and len(t.data) != t.nbytes)):
+            raise ValueError(f"tensor {t.name!r}: data must have exactly {t.nbytes} bytes and no source")
+        if t.source is not None and t.slice is None and t.source.nbytes != t.nbytes:
             raise ValueError(f"tensor {t.name!r}: source has {t.source.nbytes} bytes, expected {t.nbytes}")
     chunk = max(1, int(chunk))
     total = sum(t.nbytes for t in tensors)
@@ -188,7 +194,24 @@ def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30
                 dst.write(header)
                 for t in shard:
                     left = t.nbytes
-                    if t.source is None:
+                    if t.slice is not None or t.data is not None:
+                        if t.slice is not None:
+                            from . import slice_io          # numpy is needed only for width pruning
+                            blob = slice_io.sliced_bytes(t.source, t.slice[0], t.slice[1])
+                        else:
+                            blob = t.data() if callable(t.data) else t.data
+                        if len(blob) != t.nbytes:
+                            raise ValueError(f"tensor {t.name!r}: produced {len(blob)} bytes, expected {t.nbytes}")
+                        for pos in range(0, len(blob), chunk):
+                            if should_stop and should_stop():
+                                raise Cancelled()
+                            piece = blob[pos:pos + chunk]
+                            dst.write(piece)
+                            done += len(piece)
+                            if on_progress:
+                                on_progress(done, total)
+                        del blob
+                    elif t.source is None:
                         while left > 0:
                             if should_stop and should_stop():
                                 raise Cancelled()

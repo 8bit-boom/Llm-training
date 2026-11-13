@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, "..", "app.js"), "utf8");
 
-function browser(answers = {}) {
+function browser(answers = {}, code = source) {
   const els = {};
   const el = (id) => (els[id] ??= { id, innerHTML: "", textContent: "", checked: false, value: "", classList: { toggle() {} }, querySelectorAll: () => [], onclick: null, onchange: null, oninput: null, onkeydown: null, scrollTop: 0 });
   const calls = [];
@@ -24,7 +24,7 @@ function browser(answers = {}) {
   const win = { __TAURI__: { core: { invoke }, dialog: {}, event: { listen: async () => {} }, webview: { getCurrentWebview: () => ({ onDragDropEvent: async () => {} }) } }, matchMedia: () => ({ matches: false }) };
   const doc = { getElementById: el, querySelectorAll: () => [], querySelector: () => null, createElement: () => el("tmp"), body: { appendChild() {} }, documentElement: { setAttribute() {}, removeAttribute() {} } };
   const ctx = vm.createContext({ window: win, document: doc, console, confirm: () => true, setTimeout, clearTimeout });
-  vm.runInContext(source, ctx);
+  vm.runInContext(code, ctx);
   return { ctx, els, calls, run: (code) => vm.runInContext(code, ctx) };
 }
 
@@ -248,4 +248,305 @@ test("the start button sends the choice to the program", async () => {
   assert.equal(sent.length, 1);
   assert.equal(sent[0].spec.mode, "prune"); assert.equal(sent[0].spec.blocks, 4);
   assert.equal(b.run("rs.running"), true);
+});
+
+// ------------------------------------------------------------------------------------------------------------- thinner layers and healing
+
+const FULL = 17408;
+const widthOption = (i, blocks = 0) => { const params = +(27.78 - (FULL - i) * 3 * 5120 * 64 / 1e9 - blocks * 1.4).toFixed(2); return option(blocks, 64 - 4 * blocks, params, { intermediate: i, exact: true, warnings: i < 13000 ? ["Removing 38 % of the MLP: answers get clearly worse until the model is healed (Heal step).", "Healing is strongly recommended for width slimming: the original model teaches the thinner one to answer like it did."] : ["Healing is strongly recommended for width slimming: the original model teaches the thinner one to answer like it did."] }); };
+const widths = Array.from({ length: 35 }, (_, k) => (34 + k) * 256);
+const widthMeta = (over = {}) => ({ supported: true, why: null, dims: { hidden: 5120, intermediate: FULL, heads: 24, kv_heads: 4, lin_v_heads: 48 }, choices: { intermediate: widths, lin_v_heads: [48, 32], heads: [24, 20, 16] },
+  suggested: { width: 13312, both: { blocks: 1, intermediate: 12288 } }, heal_tokens_m: [10, 20, 40, 80], default_heal_tokens_m: 20, ...over });
+const optionsWidth = (shape) => ({ ...optionsFor("prune"), shape, width: widthMeta(),
+  width_options: shape === "width" ? [{ blocks: 0, options: widths.map((i) => widthOption(i)) }] : [1, 2, 3, 4, 5].map((b) => ({ blocks: b, options: widths.map((i) => widthOption(i, b)) })) });
+
+function openWidth(b, rsState, shape = "width", over = "") {
+  b.run(`state = ${JSON.stringify(baseState())}; page = "reshape"; rs.state = ${JSON.stringify(rsState)}; rs.model = "qwen3.5-27b"; rs.mode = "prune"; rs.shape = ${JSON.stringify(shape)}; rs.options = ${JSON.stringify(optionsWidth(shape))}; rs.blocks = 4; rs.wi = null; rsPickWidth(); ${over}`);
+}
+
+test("a model that allows it offers three ways, and the others only say why not", () => {
+  const b = browser();
+  open(b, pageState());
+  assert.doesNotMatch(b.run("renderReshape()"), /name="rs-shape"/);                         // an answer without width info: as before
+  b.run(`rs.options = ${JSON.stringify({ ...optionsFor("prune"), width: widthMeta() })}`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /name="rs-shape" value="depth" checked/);
+  assert.match(html, /Remove whole layers<\/strong> — the result runs faster/);
+  assert.match(html, /Make every layer thinner<\/strong> — keeps more quality for the same size \(needs healing\)/);
+  assert.match(html, /Both<\/strong> — remove a block and make the rest thinner/);
+  assert.match(html, /Thinner layers<\/strong> \(Qwen3.5 and 3.8 only\)/);
+  b.run(`rs.options = ${JSON.stringify({ ...optionsFor("prune"), width: widthMeta({ supported: false, why: "Thinning the layers is only available for dense Qwen3.5 / Qwen3.8 models so far. You can still remove whole layers." }) })}`);
+  const no = b.run("renderReshape()");
+  assert.doesNotMatch(no, /name="rs-shape"/);
+  assert.match(no, /only available for dense Qwen3.5 \/ Qwen3.8 models so far/);
+  b.run(`rs.mode = "grow"; rs.options = ${JSON.stringify({ ...optionsFor("grow"), width: widthMeta() })}`);
+  assert.doesNotMatch(b.run("renderReshape()"), /name="rs-shape"/);                         // growing has no width
+});
+
+test("thinner layers start on the mild cut and show the exact size", () => {
+  const b = browser();
+  openWidth(b, pageState());
+  assert.equal(b.run("rs.wi"), 13312);                                                       // the owner's decision: 23.7 B first
+  const html = b.run("renderReshape()");
+  assert.match(html, /name="rs-shape" value="width" checked/);
+  assert.match(html, /MLP <strong id="rs-w-n">13,312<\/strong> of 17,408/);
+  assert.match(html, /<input type="range" id="rs-wslider" min="0" max="34" step="1" value="18"/);
+  assert.match(html, /MLP 13,312 of 17,408 \(−24 %\) · <strong>64 layers · [\d.]+ B parameters \(exact\)<\/strong>/);
+  assert.match(html, /Healing is strongly recommended for width slimming/);
+  assert.doesNotMatch(html, /id="rs-slider"/);                                               // width only: no block slider
+  assert.match(html, /Make the model/);
+  assert.doesNotMatch(html, /id="rs-go" disabled/);
+  b.run("rs.wi = 10752");
+  const thin = b.run("renderReshape()");
+  assert.match(thin, /MLP 10,752 of 17,408 \(−38 %\)/);
+  assert.match(thin, /Removing 38 % of the MLP: answers get clearly worse until the model is healed/);
+  assert.match(thin, /Measure on: data version v3 \(world book \+ practice answers\), 256 samples/);
+});
+
+test("Both: one block and 12,288 first, and a second slider for the blocks", () => {
+  const b = browser();
+  openWidth(b, pageState(), "both", `rs.blocks = null; rs.wi = null; rsPickWidth();`);
+  assert.equal(b.run("rs.blocks"), 1);
+  assert.equal(b.run("rs.wi"), 12288);
+  const html = b.run("renderReshape()");
+  assert.match(html, /name="rs-shape" value="both" checked/);
+  assert.match(html, /and remove <strong id="rs-blocks-n">1<\/strong> block of 4 layers/);
+  assert.match(html, /<input type="range" id="rs-slider"/);
+  assert.match(html, /MLP 12,288 of 17,408 \(−29 %\) · <strong>60 layers/);
+  b.run("rs.blocks = 2; rsPickWidth()");
+  assert.match(b.run("renderReshape()"), /<strong>56 layers/);
+});
+
+test("the Expert axes are labelled experimental and stay off until the graphics-card checks are done", () => {
+  const b = browser();
+  openWidth(b, pageState());
+  assert.doesNotMatch(b.run("renderReshape()"), /thin the attention layers as well/);       // normal mode: not shown at all
+  b.run(`state.settings.expert_mode = true`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /Experimental: thin the attention layers as well/);
+  assert.match(html, /Switched off for now: nobody has published how well this works/);
+  assert.match(html, /id="rs-lv" +disabled/);
+  assert.match(html, /48 → 32 value heads\) <span class="tag">experimental<\/span>/);
+  assert.match(html, /<select id="rs-hh" disabled>/);
+  assert.match(html, /id="rs-wsamples"/);
+  assert.equal(b.run("EXPERIMENTAL_AXES_PASSED"), false);
+  assert.equal(b.run("rsSpec().width.lin_v_heads"), null);
+});
+
+test("with the checks done, the axes are enabled and go into the job", () => {
+  // the flag is a const of the page: a copy of the page with it switched on stands in for "the checklist is passed"
+  const flipped = source.replace("const EXPERIMENTAL_AXES_PASSED = false;", "const EXPERIMENTAL_AXES_PASSED = true;");
+  assert.notEqual(flipped, source);
+  const b = browser({}, flipped);
+  openWidth(b, pageState());
+  b.run(`state.settings.expert_mode = true`);
+  const html = b.run("renderReshape()");
+  assert.doesNotMatch(html, /Switched off for now/);
+  assert.doesNotMatch(html, /id="rs-lv" +disabled/);
+  assert.match(html, /<select id="rs-hh" ><option value="">no<\/option><option value="20" >24 → 20 heads<\/option><option value="16" >24 → 16 heads<\/option>/);
+  b.run(`rs.lv = true; rs.hh = 16`);
+  assert.deepEqual(JSON.parse(JSON.stringify(b.run("rsSpec().width"))), { intermediate: 13312, lin_v_heads: 32, heads: 16 });
+});
+
+test("the job for thinner layers: width only has no blocks, both keeps them", () => {
+  const b = browser();
+  openWidth(b, pageState());
+  let spec = JSON.parse(JSON.stringify(b.run("rsSpec()")));
+  assert.equal(spec.blocks, 0);
+  assert.deepEqual(spec.width, { intermediate: 13312, lin_v_heads: null, heads: null });
+  assert.equal(spec.width_samples, 256);
+  assert.equal(spec.drop_layers, null);
+  b.run(`rs.shape = "both"; rs.blocks = 1; rs.wi = 12288; rs.wsamples = 512; rs.dropText = "36-39"`);
+  spec = JSON.parse(JSON.stringify(b.run("rsSpec()")));
+  assert.equal(spec.blocks, 1);
+  assert.deepEqual(spec.drop_layers, [36, 37, 38, 39]);
+  assert.equal(spec.width.intermediate, 12288);
+  assert.equal(spec.width_samples, 512);
+  // plain layer removal sends exactly what it always did
+  b.run(`rs.shape = "depth"`);
+  assert.equal(JSON.parse(JSON.stringify(b.run("'width' in rsSpec()"))), false);
+});
+
+test("measuring: reused when it exists, and the button needs a data version", () => {
+  const b = browser();
+  openWidth(b, pageState());
+  b.run(`rs.meas = { exists: false }`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Not measured yet: it is measured first/);
+  assert.match(html, /id="rs-measure-now"/);
+  b.run(`rs.meas = { exists: true, tokens: 131072, load: "4bit" }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /Measured earlier on this data \(131,072 tokens, loaded as 4bit\): <strong>reused<\/strong>/);
+  assert.match(html, /id="rs-measure-again"/);
+  openWidth(b, pageState({ dataset_version: null }));
+  html = b.run("renderReshape()");
+  assert.match(html, /Save a training-data version in Step 2 first/);
+  assert.match(html, /id="rs-go" disabled/);
+  // explicit layers do not make width skip the measuring
+  b.run(`state.settings.expert_mode = true; rs.dropText = "36-51"`);
+  assert.match(b.run("renderReshape()"), /id="rs-go" disabled/);
+});
+
+test("the start button sends the thinner-layers choice", async () => {
+  const sent = [];
+  const b = browser({ reshape_start: (a) => { sent.push(a); return null; } });
+  openWidth(b, pageState());
+  b.run(`renderReshape(); wireReshape();`);
+  await b.els["rs-go"].onclick();
+  assert.equal(sent[0].spec.width.intermediate, 13312);
+  assert.equal(sent[0].spec.blocks, 0);
+});
+
+const thinModel = (over = {}) => doneModel({ name: "20261113-150000-qwen3.5-27b-slim-w10752", model_id: "custom-w", healed: false, healed_model_id: null, heal: null, test_healed: null, cache_gb: 0, healed_size_gb: 0,
+  summary: { mode: "prune", shape: "width", layers_before: 64, layers_after: 64, dropped: [], duplicated: [], params_before: 27.8e9, params_after: 21.1e9, loss_before: 2.0, loss_after: 3.1, stable: null, chosen_blocks: [], boundary_distance: null, notes: ["The multi-token head was cut to fit but was not measured or healed; do not use it for speculative decoding."], load: "4bit",
+    width: { before: { intermediate_size: 17408 }, after: { intermediate_size: 10752 }, stable_overlap: 0.93, scores_key: "k", mtp: "sliced by weight size, not measured" } },
+  width_scores: { layers: 64, mlp_mean: Array.from({ length: 64 }, (_, i) => 0.2 + (i % 7) * 0.05), kept_share: 0.81, stable_overlap: 0.93 }, ...over });
+
+const healOpts = (over = {}) => ({ name: "20261113-150000-qwen3.5-27b-slim-w10752", plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: true, why: null }, default_tokens_m: 20, general_dataset: "nvidia/Nemotron-Pretraining-SFT-v1", has_data: true, vram_gb: 32, healed: false, heal: null, metrics: [], loss: { original: 2.0, thinned: 3.1 },
+  tokens: [{ tokens_m: 10, cache_gb: 2, hours: [3.1, 5.9] }, { tokens_m: 20, cache_gb: 3.9, hours: [6.2, 11.8] }, { tokens_m: 40, cache_gb: 7.8, hours: [12.4, 23.6] }, { tokens_m: 80, cache_gb: 15.7, hours: [24.8, 47.2] }], ...over });
+
+test("the result card of a thinner model: the neurons chart, the stability and the honest numbers", () => {
+  const b = browser();
+  open(b, pageState({ made: [thinModel()] }));
+  const html = b.run("renderReshape()");
+  assert.equal((html.match(/<rect /g) || []).length, 64);                                   // one bar per layer: the mean MLP score
+  assert.match(html, /Made every layer thinner \(MLP 17,408 → 10,752\)/);
+  assert.match(html, /64 → 64 layers · 27.80 → 21.10 billion parameters/);
+  assert.match(html, /Text-prediction error on your data: 1.92? → 3.10|Text-prediction error on your data: 2.00 → 3.10/);
+  assert.match(html, /The choice of neurons was stable \(93 % the same/);
+  assert.match(html, /hold 81 % of the total score/);
+  assert.match(html, /do not use it for speculative decoding/);
+  assert.match(html, /Layers<\/th>/);
+  assert.match(html, /MLP 17,408 → 10,752/);
+  b.run(`rs.state.made[0].summary.width.stable_overlap = 0.6`);
+  assert.match(b.run("renderReshape()"), /only 60 % the same neurons/);
+});
+
+test("the Heal card: explicit about the download, the budgets, the memory and the Expert settings", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Heal it \(recommended\)/);
+  assert.match(html, /The original model teaches the thinner one to answer like it did/);
+  assert.match(html, /id="hl-general" checked/);                                             // owner decision: general text on by default
+  assert.match(html, /It is downloaded from Hugging Face<\/strong> \(nvidia\/Nemotron-Pretraining-SFT-v1\)/);
+  assert.match(html, /Without it, or with this box unticked, healing uses your world's text only/);
+  assert.match(html, /<option value="20" selected>20 million tokens<\/option>/);              // 20 M for a student of 15 B or more
+  assert.match(html, /<option value="80" >80 million tokens<\/option>/);
+  assert.match(html, /about 6.2–11.8 hours \(an estimate until this card has been measured\) · 3.9 GB of disk for the original's saved answers/);
+  assert.match(html, /they take turns\): about 18.7 GB of memory \(this card has 32 GB\)/);
+  assert.match(html, /trained as QLoRA/);
+  assert.match(html, /Before healing: error 3.10 on your data; the original has 2.00/);
+  assert.match(html, /id="hl-go" >Start healing/);
+  assert.doesNotMatch(html, /id="hl-dataset"/);                                              // Expert only
+  b.run(`state.settings.expert_mode = true`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-dataset" value="" placeholder="nvidia\/Nemotron-Pretraining-SFT-v1"/);
+  assert.match(html, /id="hl-rank" value="64"/);
+  assert.match(html, /id="hl-lr" value="0.0001"/);
+  // a 9B-sized student: 40 M by default, and LoRA in 16-bit
+  b.run(`rs.hl.opts.default_tokens_m = 40; rs.hl.opts.plan = { mode: "online", student_method: "lora", est_gb: 28.4, fits: true }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /<option value="40" selected>/);
+  assert.match(html, /run at the same time/);
+  assert.match(html, /trained as LoRA/);
+});
+
+test("healing that does not fit says so and cannot be started; offline general text is shown plainly", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: false, why: "Healing a model of 21 B parameters needs about 19 GB with the teacher's answers saved first; this card has 16 GB. Choose a smaller model or heal on a bigger card." } }))} }`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /this card has 16 GB\. Choose a smaller model or heal on a bigger card/);
+  assert.match(html, /id="hl-go" disabled/);
+  b.run(`rs.hl.opts.plan.fits = true; rs.hl.opts.heal = { status: "stopped", step: "train", note: "The general text (org/x) could not be downloaded: offline. Healing goes on with your world's text only; try again later for better results." }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /could not be downloaded: offline/);
+  assert.match(html, /Continue healing/);
+  assert.match(html, /Healing was stopped during step train\. Continue goes on where it stopped\./);
+  b.run(`rs.hl.opts.heal.status = "failed"; rs.hl.opts.heal.error = "Healing stopped: the training became unstable."`);
+  assert.match(b.run("renderReshape()"), /Healing stopped with an error: Healing stopped: the training became unstable/);
+});
+
+test("healing events: the three steps, the charts and the end", async () => {
+  const b = browser({ reshape_state: pageState({ made: [thinModel({ healed: true, healed_model_id: "custom-w-healed", healed_size_gb: 42.3 })] }), get_state: baseState(), heal_options: healOpts() });
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())}, stale: false }; rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }`);
+  b.run(`onReshapeEvent({ kind: "progress", phase: "heal", heal_step: "cache", step: "cache", value: 0.25, text: "The original model answers your texts: 5 of 20" })`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /1 of 3 · The original model answers your texts · The original model answers your texts: 5 of 20/);
+  assert.match(html, /<progress max="1" value="0.25">/);
+  assert.match(html, /id="hl-stop" >Stop/);
+  for (let i = 1; i <= 6; i++) b.run(`onReshapeEvent({ kind: "distill_metric", phase: "heal", heal_step: "train", step: ${i * 10}, kd: ${1.2 - i * 0.1}, ce: 0, tokens: ${i * 1000}, total_steps: 60 })`);
+  b.run(`onReshapeEvent({ kind: "distill_eval", phase: "heal", heal_step: "train", step: 0, calib_loss: 3.1 })`);
+  b.run(`onReshapeEvent({ kind: "distill_eval", phase: "heal", heal_step: "train", step: 50, calib_loss: 2.4 })`);
+  html = b.run("renderReshape()");
+  assert.match(html, /2 of 3 · The thinner model learns from the original/);
+  assert.match(html, /How far the thinner model&#39;s answers are from the original&#39;s \(KL\) \(lower is better\): 1.100 → 0.600/);
+  assert.match(html, /Text-prediction error on your data \(lower is better\): 3.100 → 2.400/);
+  b.run(`onReshapeEvent({ kind: "progress", phase: "heal", heal_step: "merge", step: "merge", value: 0.5, text: "Saving the healed model: 20 of 42 GB" })`);
+  assert.match(b.run("renderReshape()"), /3 of 3 · Saving the healed model/);
+  b.run(`onReshapeEvent({ kind: "log", phase: "heal", text: "Healing: cache mode" })`);
+  assert.match(b.run("rs.log.join('|')"), /Healing: cache mode/);
+  b.run(`onReshapeEvent({ kind: "done", phase: "heal", data: { name: ${JSON.stringify(m.name)}, model_id: "custom-w-healed" } })`);
+  assert.equal(b.run("rs.hlRun.running"), false);
+  assert.match(b.run("rs.ok"), /Healed: .* now has a healed version/);
+  b.run(`rs.hlRun.running = true; onReshapeEvent({ kind: "error", phase: "heal", text: "The teacher's answers need 15.7 GB in x; 1.5 GB free." })`);
+  assert.equal(b.run("rs.hlRun.running"), false);
+  assert.match(b.run("rs.error"), /1.5 GB free/);
+  b.run(`rs.hlRun.running = true; onReshapeEvent({ kind: "done", phase: "heal", data: { stopped: true, name: "x" } })`);
+  assert.match(b.run("rs.ok"), /Stopped\. Healing can be continued/);
+});
+
+test("the Heal buttons send the choice, and the measure events end quietly", async () => {
+  const sent = [];
+  const m = thinModel();
+  const b = browser({ heal_start: (a) => { sent.push(a); return null; }, heal_stop: () => { sent.push("stop"); return null; } });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; renderReshape(); wireReshape();`);
+  await b.els["hl-go"].onclick();
+  assert.equal(sent[0].name, m.name);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general_dataset: null, alpha: 1, rank: 64, lr: 0.0001, mode: null });
+  assert.equal(b.run("rs.hlRun.running"), true);
+  b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
+  assert.equal(b.run("rsHealSpec().general_share"), 0);
+  assert.equal(b.run("rsHealSpec().tokens_m"), 40);
+  b.run(`rs.running = true; onReshapeEvent({ kind: "done", phase: "measure", data: { key: "k" } })`);
+  assert.equal(b.run("rs.running"), false);
+  assert.match(b.run("rs.ok"), /Measured/);
+});
+
+test("the table of the three models: original, thinner, healed", () => {
+  const t = (lore, general) => ({ n: 40, method: "overlap", created: "2026-11-13", against: "origin", loaded: {}, verdict: { headline: lore > 0.6 ? "Close to the original." : "Worse than the original.", better: false, lines: [] },
+    scores: { original: { lore: { mean: 0.8 }, rules: { mean: 0.7 }, general: { mean: 1 } }, trained: { lore: { mean: lore }, rules: { mean: lore - 0.1 }, general: { mean: general } } } });
+  const b = browser();
+  const m = thinModel({ healed: true, healed_model_id: "custom-w-healed", healed_size_gb: 42.3, cache_gb: 3.9, test: t(0.3, 0.6), test_healed: t(0.7, 0.95),
+    heal: { status: "done", result: { calib_loss_after: 2.4 } } });
+  open(b, pageState({ made: [m], models: [{ id: "custom-w-healed", name: "Qwen3.5 27B · slim MLP 10,752 · healed", params_b: 21.1, custom: true }] }));
+  const html = b.run("renderReshape()");
+  assert.match(html, /Original · thinner · healed/);
+  assert.match(html, /<td>Lore questions[^<]*<\/td><td>80 %<\/td><td>30 %<\/td><td><strong>70 %<\/strong><\/td>/);
+  assert.match(html, /<td>General chat sensible<\/td><td>100 %<\/td><td>60 %<\/td><td><strong>95 %<\/strong><\/td>/);
+  assert.match(html, /error on your data \(lower is better\)[^<]*<\/td><td>2.00<\/td><td>3.10<\/td><td><strong>2.40<\/strong><\/td>/i);
+  assert.match(html, /Close to the original\./);
+  assert.match(html, /Healed: <strong>Qwen3.5 27B · slim MLP 10,752 · healed<\/strong> is in the model list of Step 3 \(42.3 GB\)\. The original's saved answers \(3.9 GB\)/);
+  assert.match(html, /data-rstest-healed=/);
+  assert.match(html, /data-rstrain="custom-w-healed"[^>]*>Train the healed model on your world/);
+  assert.match(html, /<span class="tag">healed<\/span>/);
+  assert.doesNotMatch(html, /id="hl-go"/);
+});
+
+test("a depth-only model gets an optional Heal card; a grown one gets none", () => {
+  const b = browser();
+  const m = doneModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ name: m.name }))} }`);
+  assert.match(b.run("renderReshape()"), /Heal it \(optional\)/);
+  open(b, pageState({ made: [doneModel({ summary: { ...m.summary, mode: "grow", duplicated: [8, 9] } })] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ name: m.name }))} }`);
+  assert.doesNotMatch(b.run("renderReshape()"), /Heal it/);
 });
