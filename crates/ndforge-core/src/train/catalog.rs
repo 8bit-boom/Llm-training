@@ -18,6 +18,12 @@ pub struct ModelEntry {
     /// added by the user from Hugging Face (not one of the five tested models)
     #[serde(default)]
     pub custom: bool,
+    /// the model this one was cut from / grown from (Hugging Face name or folder), for models made on the "Slim or grow a model" page
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
+    /// one line for the model list, e.g. "slimmed: 64 → 48 layers"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reshape: Option<String>,
 }
 
 #[derive(Deserialize)]
