@@ -1,37 +1,13 @@
 //! Export a saved data version for Unsloth Studio's Train page (Unsloth Desktop): plain JSONL files in the "chatml" format (one `{"messages": [...]}` per line,
 //! which Studio reads with Format = chatml or auto), a README with the settings to choose, and nothing else.
 //!
-//! The world book (long texts) has no counterpart in Studio's formats, so by default it becomes answers to "Tell me what the lore says about <title>".
+//! The rows come from `unsloth::chatml`. The world book (long texts) has no counterpart in Studio's formats, so by default it becomes answers to "Tell me what the lore says about <title>".
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::dataset::builders::system_prompt;
 use crate::error::{Error, Result};
 use crate::project::Project;
-
-fn read_lines(path: &Path) -> Vec<Value> {
-    std::fs::read_to_string(path).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
-}
-
-/// The title of a world-book piece: its first markdown heading, else the source label.
-fn title_of(text: &str, source: &str) -> String {
-    text.lines().map(str::trim).find_map(|l| l.strip_prefix("# ")).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
-        .unwrap_or_else(|| source.split(['@', ':']).nth(1).unwrap_or(source).to_string())
-}
-
-/// Which world a source belongs to (its suffix names it), for the system message.
-fn world_of(p: &Project, source: &str) -> String {
-    let worlds = p.worlds();
-    worlds.iter().filter(|w| !w.suffix.is_empty() && source.ends_with(&w.suffix)).map(|w| w.name.clone()).next()
-        .or_else(|| worlds.iter().find(|w| w.suffix.is_empty()).map(|w| w.name.clone()))
-        .unwrap_or_else(|| p.display_name())
-}
-
-fn chatml(messages: &[Value]) -> Option<String> {
-    let msgs: Vec<Value> = messages.iter().filter(|m| m["role"].is_string() && m["content"].is_string()).cloned().collect();
-    if msgs.iter().any(|m| m["role"] == "assistant") { serde_json::to_string(&json!({"messages": msgs})).ok() } else { None }
-}
 
 /// Writes `<dest>/<project>-v<N>-unsloth-studio/` with train.jsonl, eval.jsonl (when the version holds out test questions) and README.md.
 /// `version` None = the newest saved one. Returns {"dir", "train", "eval", "world_book", "version"}.
@@ -42,7 +18,6 @@ pub fn export(p: &Project, version: Option<u32>, dest: &Path, world_book: bool) 
         None => versions.iter().max_by_key(|v| v["version"].as_u64().unwrap_or(0)),
     }.ok_or_else(|| Error::new("Save a data version first (Step 2: \"Save these examples\")."))?.clone();
     let n = manifest["version"].as_u64().unwrap_or(0);
-    let vdir = p.folder.join("datasets").join(format!("v{n}"));
     let safe: String = p.name.chars().map(|c| if c.is_alphanumeric() || "-_".contains(c) { c } else { '_' }).collect();
     let out = dest.join(format!("{safe}-v{n}-unsloth-studio"));
     if out.exists() {
@@ -50,28 +25,8 @@ pub fn export(p: &Project, version: Option<u32>, dest: &Path, world_book: bool) 
     }
     std::fs::create_dir_all(&out)?;
 
-    let (mut train, mut chats, mut book, mut longest) = (Vec::<String>::new(), 0usize, 0usize, 0usize);
-    for v in read_lines(&vdir.join("train.jsonl")) {
-        let line = if v["type"] == "text" {
-            if !world_book {
-                continue;
-            }
-            let text = v["text"].as_str().unwrap_or("");
-            let src = v["source"].as_str().unwrap_or("");
-            let title = title_of(text, src);
-            book += 1;
-            chatml(&[json!({"role": "system", "content": system_prompt(&world_of(p, src))}), json!({"role": "user", "content": format!("Tell me what the lore says about {title}.")}),
-                     json!({"role": "assistant", "content": text})])
-        } else {
-            chats += 1;
-            chatml(v["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]))
-        };
-        if let Some(l) = line {
-            longest = longest.max(l.len());
-            train.push(l);
-        }
-    }
-    let eval: Vec<String> = read_lines(&vdir.join("test.jsonl")).into_iter().filter_map(|v| chatml(v["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]))).collect();
+    let (train, eval, stats) = crate::unsloth::chatml::chatml_rows(p, n as u32, world_book);
+    let (chats, book, longest) = (stats.chats, stats.book, stats.longest);
     if train.is_empty() {
         let _ = std::fs::remove_dir_all(&out);
         return Err(Error::new("This version has no examples Studio can use."));

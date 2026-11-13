@@ -20,6 +20,7 @@ pub mod reshape;
 pub mod train;
 pub mod sample;
 pub mod teacher;
+pub mod unsloth;
 pub mod settings;
 
 pub use error::{Error, Result};
