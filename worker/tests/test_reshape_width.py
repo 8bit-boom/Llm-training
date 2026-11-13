@@ -410,3 +410,196 @@ def test_inspect_says_why_width_is_not_possible(tmp_path):
     (gemma / "config.json").write_bytes((DATA / "gemma4_config.json").read_bytes())
     r = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(gemma)}})[1][-1]["data"]
     assert r["supported"] is False and r["width_supported"] is False and r["width_why"] == r["why"]
+
+
+# ----------------------------------------------------------------------------------------------------- 8: the job (no torch)
+
+def write_scores(folder, src_repo, layers=8, data_version=3, **over):
+    """a cached measurement for the fake model (8 or 16 layers), deterministic random scores; returns the arrays"""
+    np = pytest.importorskip("numpy")
+    d = fake_dims()
+    types = fake_types(layers)
+    n_full = types.count("full_attention")
+    r = np.random.default_rng(7)
+    shapes = {"mlp": (layers, d["intermediate"]), "attn": (n_full, d["heads"]), "gdn": (layers - n_full, d["lin_v_heads"])}
+    arrays = {}
+    for k, sh in shapes.items():
+        base = r.random(sh).astype(np.float32)
+        arrays[k] = base
+        arrays[k + "_h1"] = (base + 0.01 * r.random(sh)).astype(np.float32)          # nearly the same ranking in both halves
+        arrays[k + "_h2"] = (base + 0.01 * r.random(sh)).astype(np.float32)
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    np.savez(Path(folder) / "scores.npz", **arrays)
+    nb = layers // 4
+    D = [[abs(a - b) * 0.2 + (-0.05 if {a, b} == {1, 2} else 0.0) for b in range(nb + 1)] for a in range(nb + 1)]
+    meta = {"format": 1, "source": src_repo, "key": Path(folder).name, "data_version": data_version, "samples": 16, "max_len": 32, "seed": 3407, "load": "16bit",
+            "tokens": 777, "period": 4, "boundary_distance": [D[k][k + 1] for k in range(nb)], "matrix": D, "matrix_h1": D, "matrix_h2": D, "loss_before": 1.5,
+            "created": "2026-11-13T00:00:00Z", **over}
+    (Path(folder) / "scores.json").write_text(json.dumps(meta), encoding="utf-8")
+    return arrays
+
+
+def wjob(tmp_path, src, width, **kw):
+    d = tmp_path / "models" / "m1"
+    d.mkdir(parents=True, exist_ok=True)
+    return {"job": "reshape", "source": {"repo": str(src), "family": "qwen3_5"}, "mode": "prune", "blocks": 0, "strategy": "contiguous", "protect": {"first": 1, "last": 1},
+            "drop_layers": None, "load": "auto", "check": False, "shard_gb": 5, "out": str(d / "model.partial"), "final": str(d / "model"), "ffn_divisor": 4,
+            "width": width, "scores_dir": str(tmp_path / "models" / "_scores" / "k1"), "calibration": {"version": 3, "samples": 16, "max_len": 32}, **kw}
+
+
+def in_process(monkeypatch, j):
+    import io
+    from ndforge_worker import protocol, reshapejob
+    buf = io.StringIO()
+    monkeypatch.setattr(protocol, "_out", buf)
+    monkeypatch.setattr(protocol, "reserve_stdout", lambda: None)
+    code = reshapejob.run(j)
+    return code, [json.loads(line) for line in buf.getvalue().splitlines()]
+
+
+def test_width_only_job_from_a_cached_measurement(tmp_path):
+    np = pytest.importorskip("numpy")
+    src = fake_qwen_width(tmp_path)
+    arrays = write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
+    j = wjob(tmp_path, src, {"intermediate_size": 20, "linear_num_value_heads": None, "num_attention_heads": 4})
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    final = Path(j["final"])
+    assert r["shape"] == "width" and r["layers_after"] == 8 and r["dropped"] == [] and r["chosen_blocks"] == []
+    assert r["width"]["before"] == {"intermediate_size": 32, "linear_num_value_heads": 4, "num_attention_heads": 6}
+    assert r["width"]["after"] == {"intermediate_size": 20, "linear_num_value_heads": 4, "num_attention_heads": 4}
+    assert r["width"]["scores_key"] == "k1" and r["width"]["stable_overlap"] > 0.8 and "weight size" in r["width"]["mtp"]
+    assert any("multi-token head" in n for n in r["notes"]) and r["load"] == "16bit" and r["loss_before"] == 1.5
+    assert {e["type"] for e in ev} >= {"width_scores", "progress", "log"} and "reshape_scores" not in {e["type"] for e in ev}
+    wsc = [e for e in ev if e["type"] == "width_scores"][0]
+    assert wsc["layers"] == 8 and len(wsc["mlp_mean"]) == 8 and 0.5 < wsc["kept_share"] < 1.0
+    cfg = json.loads((final / "config.json").read_text())["text_config"]
+    assert (cfg["intermediate_size"], cfg["num_attention_heads"], cfg["linear_num_value_heads"], cfg["head_dim"], cfg["num_hidden_layers"]) == (20, 4, 4, 4, 8)
+    meta = json.loads((final / "ndforge_reshape.json").read_text())
+    assert meta["format"] == 2 and meta["shape"] == "width" and meta["width"]["intermediate_size"] == [32, 20] and meta["width"]["kept"] == "width_kept.npz"
+    assert meta["params"] == r["params_after"] and meta["calibration"]["tokens"] == 777 and meta["vision"].startswith("unchanged")
+    # the result is a model folder whose parameter count is the formula's
+    refs = st.list_tensors(final)
+    g = rs.group_params({k: (x.dtype, x.shape) for k, x in refs.items()}, 8)
+    d = fake_dims()
+    assert g["total"] == r["params_after"] == rw.params_for(d, fake_types(), {"intermediate": 20, "lin_v_heads": 4, "heads": 4}, g["vision"], g["other"] - d["hidden"])
+    assert refs["model.language_model.layers.0.mlp.gate_proj.weight"].shape == (20, 8) and refs["model.language_model.layers.3.self_attn.q_proj.weight"].shape == (32, 8)
+    assert refs["mtp.layers.0.mlp.down_proj.weight"].shape == (8, 20) and refs["mtp.layers.0.self_attn.o_proj.weight"].shape == (8, 16)
+    # the kept neurons are the ones with the highest scores, and they are recorded
+    kept = np.load(final / "width_kept.npz")
+    for j_ in range(8):
+        assert kept[f"mlp_{j_}"].tolist() == rw.keep_top([float(x) for x in arrays["mlp"][j_]], 20)
+    assert kept["src"].tolist() == list(range(8)) and "heads_3" in kept.files and "gdn_0" not in kept.files and "mtp_mlp_0" in kept.files
+    data = read_folder(final)
+    w0 = data["model.language_model.layers.0.mlp.gate_proj.weight"]
+    from stfile import fill
+    idx = kept["mlp_0"].tolist()
+    from fakemodel import width_tensor_numbers
+    nums = width_tensor_numbers(8)
+    assert w0[2] == slice_reference(fill(nums["model.language_model.layers.0.mlp.gate_proj.weight"], 32 * 8 * 2), (32, 8), 2, 0, idx)
+    assert (final / "tokenizer.json").is_file() and (final / "README.md").is_file() and not Path(j["out"]).exists()
+
+
+def test_depth_and_width_together_use_the_cached_layer_distances(tmp_path):
+    pytest.importorskip("numpy")
+    src = fake_qwen_width(tmp_path, layers=16)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src), layers=16)
+    j = wjob(tmp_path, src, {"intermediate_size": 16}, blocks=1)
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    r = ev[-1]["data"]
+    assert r["shape"] == "both" and r["chosen_blocks"] == [1] and r["dropped"] == [4, 5, 6, 7] and r["layers_after"] == 12
+    assert [e for e in ev if e["type"] == "reshape_scores"][0]["chosen_blocks"] == [1] and r["stable"] is True
+    cfg = json.loads((Path(j["final"]) / "config.json").read_text())["text_config"]
+    assert cfg["num_hidden_layers"] == 12 and cfg["intermediate_size"] == 16 and len(cfg["layer_types"]) == 12
+    kept = __import__("numpy").load(Path(j["final"]) / "width_kept.npz")
+    assert kept["src"].tolist() == [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15]
+    refs = st.list_tensors(j["final"])
+    g = rs.group_params({k: (x.dtype, x.shape) for k, x in refs.items()}, 12)
+    assert g["total"] == r["params_after"]
+
+
+def test_an_explicit_layer_list_with_width_and_the_expert_axes(tmp_path):
+    pytest.importorskip("numpy")
+    src = fake_qwen_width(tmp_path, layers=16)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src), layers=16)
+    j = wjob(tmp_path, src, {"intermediate_size": 24, "linear_num_value_heads": 2, "num_attention_heads": 4}, drop_layers=[8, 9, 10, 11])
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    r = ev[-1]["data"]
+    assert r["shape"] == "both" and r["dropped"] == [8, 9, 10, 11]
+    refs = st.list_tensors(j["final"])
+    assert refs["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"].shape == (16 + 2 * 4, 8)
+    assert refs["model.language_model.layers.0.linear_attn.conv1d.weight"].shape == (24, 1, 4)
+    assert refs["model.language_model.layers.0.linear_attn.A_log"].shape == (2,) and refs["model.language_model.layers.0.linear_attn.A_log"].dtype == "F32"
+    assert refs["model.language_model.layers.0.linear_attn.norm.weight"].shape == (4,) and refs["model.language_model.layers.0.linear_attn.out_proj.weight"].shape == (8, 8)
+    assert refs["model.language_model.layers.3.self_attn.k_proj.weight"].shape == (8, 8)
+
+
+def test_the_job_refuses_without_a_measurement_and_without_torch(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_qwen_width(tmp_path)
+    j = wjob(tmp_path, src, {"intermediate_size": 20})
+    monkeypatch.setattr(reshapejob, "_require_torch", lambda: (_ for _ in ()).throw(ReshapeError("Measuring the layers needs the training software (Training setup).")))
+    with pytest.raises(ReshapeError, match="needs the training software"):
+        in_process(monkeypatch, j)
+    assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
+    if __import__("importlib").util.find_spec("torch") is None:               # the same through the real worker
+        code, ev = run_job(tmp_path, j)
+        assert code == 1 and ev[-1]["code"] == "reshape_refused" and "Training setup" in ev[-1]["message"]
+
+
+def test_a_measurement_of_other_data_or_another_model_is_not_used(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    src = fake_qwen_width(tmp_path)
+    monkeypatch.setattr(reshapejob, "_require_torch", lambda: (_ for _ in ()).throw(ReshapeError("needs the training software")))
+    for over, why in (({"data_version": 2}, "data version v2"), ({"source": "other/model"}, "another model"), ({"samples": 99}, "number of samples"),
+                      ({"format": 7}, "another model")):
+        write_scores(tmp_path / "models" / "_scores" / "k1", str(src), **over)
+        code_events = []
+        with pytest.raises(ReshapeError, match="needs the training software"):
+            import io
+            from ndforge_worker import protocol
+            buf = io.StringIO()
+            monkeypatch.setattr(protocol, "_out", buf)
+            monkeypatch.setattr(protocol, "reserve_stdout", lambda: None)
+            reshapejob.run(wjob(tmp_path, src, {"intermediate_size": 20}))
+        assert why in buf.getvalue(), (over, buf.getvalue())
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src))          # right data, but for a model with other layers
+    import numpy as np
+    z = dict(np.load(tmp_path / "models" / "_scores" / "k1" / "scores.npz"))
+    z["mlp"] = z["mlp"][:, :10]
+    np.savez(tmp_path / "models" / "_scores" / "k1" / "scores.npz", **z)
+    with pytest.raises(ReshapeError, match="needs the training software"):
+        in_process(monkeypatch, wjob(tmp_path, src, {"intermediate_size": 20}))
+
+
+def test_width_requests_that_make_no_sense_are_refused_with_plain_text(tmp_path):
+    pytest.importorskip("numpy")
+    from fakemodel import fake_model
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
+    for width, text in (({"intermediate_size": 13}, "multiple of 256"), ({"linear_num_value_heads": 3}, "value heads"), ({"num_attention_heads": 5}, "Attention heads"), ({"intermediate_size": 32}, "nothing to thin")):
+        j = wjob(tmp_path, src, width, ffn_divisor=256)
+        code, ev = run_job(tmp_path, j)
+        assert code == 1 and ev[-1]["code"] == "reshape_refused" and text in ev[-1]["message"], (width, ev[-1])
+    code, ev = run_job(tmp_path, wjob(tmp_path, src, {"intermediate_size": 20}, mode="grow", blocks=1))
+    assert code == 1 and "only possible when slimming" in ev[-1]["message"]
+    llama = fake_model(tmp_path, 8, "llama", name="ll")
+    code, ev = run_job(tmp_path, wjob(tmp_path, llama, {"intermediate_size": 20}))
+    assert code == 1 and "dense Qwen3.5" in ev[-1]["message"]
+    code, ev = run_job(tmp_path, wjob(tmp_path, src, None, blocks=0))
+    assert code == 1 and "Slim at most half" in ev[-1]["message"]            # without width a prune still needs at least one block
+    assert not (tmp_path / "models" / "m1" / "model").exists()
+
+
+def test_a_stop_file_cancels_a_width_job(tmp_path):
+    pytest.importorskip("numpy")
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
+    j = wjob(tmp_path, src, {"intermediate_size": 20})
+    (Path(j["out"]).parent / "STOP").write_text("")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None}
+    assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
