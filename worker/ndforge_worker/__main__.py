@@ -8,6 +8,8 @@ from . import __version__, protocol
 def _explain(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
+    if "no space left" in low:
+        return "The disk is full. Free some space (or choose another folder) and try again. (" + text[:200] + ")"
     if "out of memory" in low:
         return "The graphics card ran out of memory. Use a smaller sequence length, LoRA 4-bit (QLoRA), or a smaller model. (" + text[:200] + ")"
     if "no module named" in low:
@@ -60,6 +62,18 @@ def main(argv: list) -> int:
             import traceback
             traceback.print_exc()
             protocol.error("evaluate_failed", _explain(exc))
+            return 1
+    if kind in ("reshape_inspect", "reshape"):
+        from . import reshape, reshapejob
+        try:
+            return reshapejob.run_inspect(job) if kind == "reshape_inspect" else reshapejob.run(job)
+        except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
+            protocol.error("reshape_refused", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("inspect_failed" if kind == "reshape_inspect" else "reshape_failed", _explain(exc))
             return 1
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1

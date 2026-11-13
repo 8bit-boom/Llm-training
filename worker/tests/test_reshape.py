@@ -364,3 +364,82 @@ def test_describe():
     d = rs.describe(g, 8, [0, 1, 2, 3, 2, 3, 4, 5], ["a", "a", "b", "b"] * 2)
     assert d["layers_before"] == 8 and d["layers_after"] == 8 and d["dropped"] == [6, 7] and d["duplicated"] == [2, 3] and d["period"] == 4
     assert d["params_before"] == g["total"] and d["params_after"] == rs.params_after(g, [0, 1, 2, 3, 2, 3, 4, 5])
+
+
+# ---------------------------------------------------------------------------------------------------- 12: inspect job
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from fakemodel import fake_model  # noqa: E402
+
+WORKER = Path(__file__).resolve().parent.parent
+
+
+def run_job(tmp_path, job):
+    f = tmp_path / "job.json"
+    f.write_text(json.dumps(job), encoding="utf-8")
+    p = subprocess.run([sys.executable, "-m", "ndforge_worker", str(f)], cwd=WORKER, capture_output=True, text=True, timeout=120)
+    return p.returncode, [json.loads(line) for line in p.stdout.splitlines()]
+
+
+INSPECT_KEYS = {"model_type", "supported", "why", "layers", "layer_types", "period", "blocks", "layer_params", "embed_params", "lm_head_params", "vision_params",
+                "mtp_params", "other_params", "total_params", "bytes_per_param", "has_vision", "tied", "source_bytes", "local"}
+
+
+def test_inspect_job_on_a_fake_qwen_folder(tmp_path):
+    d = fake_model(tmp_path, 8)
+    code, ev = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d)}})
+    assert code == 0 and ev[-1]["type"] == "result"
+    r = ev[-1]["data"]
+    assert set(r) == INSPECT_KEYS
+    assert r["supported"] and r["why"] is None and r["local"] and r["model_type"] == "qwen3_5"
+    assert (r["layers"], r["period"], r["blocks"]) == (8, 4, 2) and r["layer_types"] == types(8)
+    per_layer = 8 + 64 + 128 + 128
+    assert r["layer_params"] == [per_layer] * 8
+    assert (r["embed_params"], r["lm_head_params"], r["vision_params"], r["mtp_params"], r["other_params"]) == (80, 80, 24, 128 + 64, 0)
+    assert r["total_params"] == 8 * per_layer + 80 + 80 + 24 + 192 and r["bytes_per_param"] == 2.0
+    assert r["has_vision"] and not r["tied"] and r["source_bytes"] == 2 * r["total_params"]
+
+
+def test_inspect_job_llama_without_layer_types(tmp_path):
+    d = fake_model(tmp_path, 6, "llama")
+    code, ev = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d)}})
+    r = ev[-1]["data"]
+    assert code == 0 and r["supported"] and r["period"] == 1 and r["blocks"] == 6 and r["layer_types"] == ["full_attention"] * 6
+    assert not r["has_vision"] and r["vision_params"] == 0 and r["mtp_params"] == 0
+
+
+def test_inspect_says_why_a_model_is_not_supported(tmp_path):
+    d = tmp_path / "gemma"
+    d.mkdir()
+    (d / "config.json").write_bytes((DATA / "gemma4_config.json").read_bytes())
+    code, ev = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d)}})
+    r = ev[-1]["data"]
+    assert code == 0 and r["supported"] is False and r["why"] == rs.REFUSED["gemma4"] and set(r) == INSPECT_KEYS and r["blocks"] == 0
+    d2 = fake_model(tmp_path, 8, name="q")
+    cfg = json.loads((d2 / "config.json").read_text())
+    cfg["text_config"]["layer_types"][0] = "full_attention"           # breaks the attention interval
+    (d2 / "config.json").write_text(json.dumps(cfg))
+    r = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d2)}})[1][-1]["data"]
+    assert r["supported"] is False and "interval" in r["why"]
+
+
+def test_inspect_errors_are_plain(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    code, ev = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(empty)}})
+    assert code == 1 and ev[-1]["type"] == "error" and ev[-1]["code"] == "reshape_refused" and "config.json" in ev[-1]["message"]
+
+
+def test_inspect_of_a_hub_model_reads_headers_only(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    d = fake_model(tmp_path, 8)
+    from ndforge_worker import safetensors_io as st
+    refs = st.list_tensors(d)
+    monkeypatch.setattr(reshapejob, "_hub_config", lambda repo: json.loads((d / "config.json").read_text()))
+    monkeypatch.setattr(reshapejob, "_hub_tensors", lambda repo: {k: (r.dtype, r.shape) for k, r in refs.items()})
+    r = reshapejob.inspect_model("org/Fake-8L")
+    local = reshapejob.inspect_model(str(d))
+    assert r["local"] is False and local["local"] is True
+    assert {k: v for k, v in r.items() if k != "local"} == {k: v for k, v in local.items() if k != "local"}
