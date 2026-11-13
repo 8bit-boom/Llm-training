@@ -145,6 +145,11 @@ impl AppModel {
     }
 
     // ------------------------------------------------------------------ step 2: training data
+    /// Fails with "open a project first" when there is none (for the window's off-thread calls).
+    pub fn reshape_options_ready(&self) -> Result<()> {
+        self.project_ref().map(|_| ())
+    }
+
     fn project_ref(&self) -> Result<&Project> {
         self.project.as_ref().ok_or_else(|| Error::new("Create or open a project first (Welcome page)."))
     }
@@ -426,8 +431,13 @@ impl AppModel {
     /// What can be done with one model: its layout, every feasible size for `mode` ("prune" or "grow") and what to know first. May ask the worker (and the
     /// internet) the first time, so the window calls it off the main thread.
     pub fn reshape_options(&self, model_id: &str, mode: &str) -> Result<Value> {
+        self.project_ref()?;
+        Self::reshape_options_for(model_id, mode)
+    }
+
+    /// `reshape_options` without the project, so the window can run it on a thread of its own.
+    pub fn reshape_options_for(model_id: &str, mode: &str) -> Result<Value> {
         use crate::reshape::{plan, runs as rruns};
-        let _ = self.project_ref()?;
         let m = find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
         let mode = match mode {
             "prune" => plan::Mode::Prune,
