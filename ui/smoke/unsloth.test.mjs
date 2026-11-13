@@ -79,3 +79,17 @@ test("Test and Find call the right command with what was typed; an address on th
   assert.equal(set[1].key, "sk-unsloth-abc");
   assert.equal(b.run("un.key"), "", "the key is dropped from the page once saved");
 });
+
+test("Where to train offers Unsloth Desktop when it is saved, and describes its card", () => {
+  const b = browser();
+  const st = { models: [], gpu: null, servers: [], runs: [], version: { number: 1, counts: {}, tokens: {} }, env_ready: true, unsloth: { name: "Unsloth Desktop", url: "http://127.0.0.1:8888", status: { gpu: { name: "NVIDIA GeForce RTX 5090", vram_gb: 31.8, precision: "bf16" } } } };
+  b.run(`state = ${JSON.stringify(baseState())}; page = "train"; tr.state = ${JSON.stringify(st)}; tr.server = "unsloth";`);
+  const html = b.run("renderTrain()");
+  assert.match(html, /<option value="unsloth" selected>Unsloth Desktop \(Unsloth Desktop\)<\/option>/);
+  assert.match(html, /RTX 5090/);
+  assert.match(html, /must stay open while it trains/);
+  assert.doesNotMatch(html, /Remove this server/);
+  // not saved: no such option
+  b.run(`tr.state = ${JSON.stringify({ ...st, unsloth: null })}; tr.server = "";`);
+  assert.doesNotMatch(b.run("renderTrain()"), /value="unsloth"/);
+});

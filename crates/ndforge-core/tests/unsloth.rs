@@ -158,3 +158,99 @@ fn full_fine_tuning_and_two_stages_are_refused_for_unsloth() {
     assert_eq!(suffix_of(&"é".repeat(60)).len() <= 40, true);
     assert_eq!(suffix_of("20261113-101500-qwen3.5-2b"), "20261113-101500-qwen3-5-2b");
 }
+
+use ndforge_core::dataset::builders::Recipe;
+use ndforge_core::dataset::store;
+use ndforge_core::project::Project;
+use ndforge_core::train::plan::Method;
+use ndforge_core::train::runs;
+use ndforge_core::unsloth::run::{execute_unsloth, UnslothTarget};
+use serde_json::{json, Value};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn project(root: &std::path::Path) -> (Project, ndforge_core::train::catalog::ModelEntry) {
+    let mut p = Project::create(&root.join("projects"), "Ashfall Reach").unwrap();
+    let f = root.join("w.ndtrain");
+    ndforge_core::sample::build(&f, 1, None).unwrap();
+    p.import_bundle(&ndforge_core::bundle::open_bundle(&f).unwrap()).unwrap();
+    store::generate_draft(&p, &Recipe { test_percent: 30, ..Recipe::default() }).unwrap();
+    store::save_version(&p).unwrap();
+    (p, sample_model())
+}
+
+fn target(f: &Fake) -> UnslothTarget {
+    UnslothTarget { name: "Unsloth Desktop".into(), url: f.url.clone(), key: KEY.into() }
+}
+
+/// (the run's result or error, every event)
+fn run(p: &Project, m: &ndforge_core::train::catalog::ModelEntry, f: &Fake, name: &str, stop: Arc<AtomicBool>) -> (ndforge_core::Result<Value>, Vec<Value>) {
+    let hyper = sample_hyper();
+    let job = runs::build_job(p, m, Method::Lora, &hyper, 1, name, false).unwrap();
+    let mut events = vec![];
+    let r = execute_unsloth(p, m, Method::Lora, &hyper, name, job, &target(f), stop, false, Duration::from_millis(5), &mut |e| events.push(e));
+    (r, events)
+}
+
+#[test]
+fn a_run_in_unsloth_follows_the_job_into_the_charts_and_ends_done() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let f = Fake::start(&d.path().join("outputs"));
+    let (r, events) = run(&p, &m, &f, "run-a", Arc::new(AtomicBool::new(false)));
+    let r = r.unwrap();
+    assert_eq!((r["steps"].as_u64(), r["total_steps"].as_u64(), r["final_loss"].as_f64(), r["adapter_remote"].as_bool()), (Some(4), Some(4), Some(1.0), Some(true)));
+    let dir = runs::runs_dir(&p).join("run-a");
+    let metrics = runs::read_metrics(&p, "run-a");
+    assert_eq!(metrics.iter().filter(|e| e["type"] == "metric").map(|e| e["step"].as_u64().unwrap()).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert!(events.iter().any(|e| e["kind"] == "stage" && e["text"] == "Training in Unsloth") && events.iter().any(|e| e["kind"] == "progress" && e["step"] == "upload"));
+    let state: Value = serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!((state["status"].as_str(), state["server"].as_str(), state["backend"].as_str(), state["step"].as_u64()), (Some("done"), Some("Unsloth Desktop"), Some("unsloth"), Some(4)));
+    assert!(state["note"].as_str().unwrap().contains("ashfall-test_20261113_101500"));
+    let listed = runs::list_runs(&p);
+    assert_eq!((listed.len(), listed[0]["has_adapter"].clone()), (1, json!(false)));
+    // Unsloth got the rows and one job with the model and a clean suffix
+    f.with(|s| {
+        assert_eq!(s.files.len(), 2, "train and eval");
+        assert_eq!(s.job_bodies[0]["suffix"], "run-a");
+        assert_eq!(s.job_bodies[0]["load_in_4bit"], false);
+        assert!(String::from_utf8_lossy(&s.files[0].2).lines().all(|l| l.contains("\"messages\"")));
+    });
+    // the key is nowhere in the run folder
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        if e.path().is_file() {
+            assert!(!std::fs::read_to_string(e.path()).unwrap_or_default().contains("sk-unsloth-"), "key in {:?}", e.path());
+        }
+    }
+    assert!(!serde_json::to_string(&events).unwrap().contains("sk-unsloth-"));
+    assert!(std::fs::read_to_string(dir.join("config.json")).unwrap().contains("\"unsloth\""));
+}
+
+#[test]
+fn a_queued_job_shows_where_it_waits_then_trains() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let f = Fake::start(&d.path().join("outputs"));
+    f.with(|s| s.queue_polls = 2);
+    let (r, events) = run(&p, &m, &f, "run-q", Arc::new(AtomicBool::new(false)));
+    assert!(r.is_ok(), "{r:?}");
+    let stages: Vec<&str> = events.iter().filter(|e| e["kind"] == "stage").filter_map(|e| e["text"].as_str()).collect();
+    assert!(stages.iter().any(|t| t.contains("Waiting for Unsloth's graphics card (position 1)")), "{stages:?}");
+    assert!(stages.contains(&"Training in Unsloth"));
+}
+
+#[test]
+fn old_unsloth_a_refused_key_and_a_failed_job_end_the_run_with_a_plain_message() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let f = Fake::start(&d.path().join("outputs"));
+    f.with(|s| s.fine_tuning = false);
+    let e = run(&p, &m, &f, "run-old", Arc::new(AtomicBool::new(false))).0.unwrap_err().0;
+    assert!(e.contains("no training API for other programs"), "{e}");
+    f.with(|s| { s.fine_tuning = true; s.fail = Some((2, "boom".into())); });
+    let e = run(&p, &m, &f, "run-fail", Arc::new(AtomicBool::new(false))).0.unwrap_err().0;
+    assert_eq!(e, "boom");
+    let st = |n: &str| -> Value { serde_json::from_slice(&std::fs::read(runs::runs_dir(&p).join(n).join("state.json")).unwrap()).unwrap() };
+    assert_eq!((st("run-old")["status"].clone(), st("run-fail")["status"].clone(), st("run-fail")["error"].clone()), (json!("failed"), json!("failed"), json!("boom")));
+}

@@ -237,8 +237,12 @@ fn set_theme(s: State<App>, theme: String) -> Out<Value> {
     Ok(m.state())
 }
 
-/// Trains on this PC, or on the server the job names.
+/// Trains on this PC, on the server the job names, or in Unsloth Desktop.
 fn run_training(job: &ndforge_core::model::TrainJob, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> ndforge_core::Result<Value> {
+    if let Some(target) = &job.unsloth {
+        return ndforge_core::unsloth::run::execute_unsloth(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), target, stop,
+            job.job["resume"] == true, std::time::Duration::from_secs(3), emit);
+    }
     match &job.remote {
         None => ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), stop, std::time::Duration::from_secs(120), emit),
         Some(target) => ndforge_core::remote::run::execute_remote(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), target, stop,
