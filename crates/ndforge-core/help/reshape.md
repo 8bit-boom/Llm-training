@@ -38,3 +38,11 @@ The new model is a full copy: about 2 bytes per parameter (a 21 B model is about
 - **Not enough disk space.** The message says how much is needed and where.
 - **"This model cannot be slimmed or grown".** The page says why. Today: Qwen3.5 and plain Llama / Qwen / Mistral-style models in 16-bit. Gemma 4 and compressed (quantized) models are not supported.
 - **The measurement was not stable.** The two halves of your text chose different layers. Use 256 samples, or choose the layers yourself in Expert mode.
+
+## Recommended: Qwen3.8 27B
+A step-by-step guide is in the program's folder under `docs/PRUNE_QWEN38_27B.md`. The short version:
+- **The 27B already fits most cards** (QLoRA from 24 GB, a 4-bit GGUF runs on about 17 GB). Slim it only if you need the smaller size; the result is never better than the original.
+- **Start with 2 blocks removed (56 layers, about 24.7 B)**, test, and only then try 4 (48 layers, about 21.6 B). More than a quarter of the model is the edge of what makes sense.
+- **Measure in 4-bit with 128 samples** of your own text; **heal with QLoRA** and keep the general chat share of the training data higher than usual. To keep a model thinking, keep at least 75 % reasoning-style examples.
+- **Test the original first**, write down its three numbers, and compare every step against them.
+- You need about 120 GB of free disk (the original and the new model).

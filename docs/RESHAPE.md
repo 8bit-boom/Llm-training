@@ -140,3 +140,5 @@ plan's figures were estimates); measuring time and memory; whether a world's tex
 - **MoE expert pruning (REAP)** for `qwen3_5_moe` bases through `FastLanguageModel.reap_prune`, when Unsloth is installed. The dataset format Core expects
   is not in the sparse clone and has to be read first.
 - **Gemma 4**: slice `embed_tokens_per_layer` / `per_layer_model_projection` by layer and keep `num_kv_shared_layers` consistent. Refused with a reason until then.
+
+A practical guide with recommendations for Qwen3.8 27B: `docs/PRUNE_QWEN38_27B.md`.
