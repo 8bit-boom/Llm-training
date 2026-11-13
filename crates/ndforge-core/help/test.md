@@ -14,7 +14,8 @@ A finished run from Step 3 and the training software (Training setup). If you tr
    - **General chat sensible**: ordinary game-master questions. If this drops a lot, the model forgot how to talk: train fewer steps or add general chat examples.
 3. Open **Read the answers**. The scores are only a guide: your own reading is the real test.
 4. **Ask your own question**: both models answer it side by side. **Save this chat as a file** keeps it in the project's *transcripts* folder.
-5. **Compare runs** shows every tested run in one table (for example LoRA against full fine-tuning); the best lore score has a star.
+5. **A run on a slimmed or grown model** (made on the *Slim or grow a model* page) has a **Compare with** choice: *the slimmed / grown model it was trained from* (the default) or *the original* that model was made from. The second shows whether training won back what slimming cost. Big models are loaded in 4-bit so that both fit the card; the result says so.
+6. **Compare runs** shows every tested run in one table (for example LoRA against full fine-tuning); the best lore score has a star. Slimmed or grown models that were tested on their own page appear there too (*model:…*, type *slim* or *grow*).
 
 ## What happens next
 Step 5 · Use puts the model you like into Ollama for nd-world.

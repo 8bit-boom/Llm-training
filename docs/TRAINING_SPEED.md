@@ -31,6 +31,9 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 ## Engine: with or without Unsloth
 `engine` (Expert mode, *Training engine*): `auto` = Unsloth when the setup installed it (the worker falls back by itself if it cannot be used), `unsloth`, or `standard` = Transformers + PEFT + TRL only. The setup's *Install without Unsloth* installs only the standard libraries (`transformers>=5`, trl, peft, datasets, accelerate, bitsandbytes) and then tries two optional extras one by one, each allowed to fail: flash-linear-attention (Qwen3.5's fast kernels) and, on Windows, triton-windows (the Triton they need). The speed options above (bucketing, checkpointing probe, advanced options) apply to this path. The plan's memory figures come from Unsloth's guides, so without Unsloth the plan says that the real need can be higher. How much slower or hungrier the standard path is on a 5090 has not been measured.
 
+## Slimmed and grown models
+A **slimmed** model (whole blocks of layers removed on the *Slim or grow a model* page) has fewer layers, so it trains and answers faster and needs less memory per token; the saving is roughly the share of layers removed (the embeddings and the output layer do not shrink). A **grown** model is slower and bigger in the same proportion (about 40 % for 32 → 48 layers). None of this is measured yet: use the benchmark (*Find the fastest settings*) on the made model, like on any other. See docs/RESHAPE.md.
+
 ## Next
 1. Run a Quick test on the 5090 and read the `speed` line: how much padding, which attention backend, are the Qwen3.5 kernels active.
 2. Run the benchmark on the 5090 (also with the advanced options if the plain-libraries path is in use) and make the winning settings the defaults.

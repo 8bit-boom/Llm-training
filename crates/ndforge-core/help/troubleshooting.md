@@ -42,6 +42,13 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 
 **The installed model answers strangely in nd-world.** Use the check question on Step 5. The template shipped with the model is meant to answer without thinking; if you installed through other tools, install through this page instead.
 
+## Slim or grow a model
+**Out of memory while measuring the layers.** Open Expert mode on the page and choose "4-bit" for loading, or measure on fewer samples (64).
+
+**"There is not enough free space".** A made model is a full copy (about 2 GB per billion parameters) and a model that is not on the computer is downloaded first. Free the space or choose a smaller size on the slider.
+
+**Ollama or llama.cpp refuses the exported slimmed model.** An unusual number of layers is allowed by the file format, but not every version of Ollama accepts it. Update Ollama, then use *Test it with a question* on Step 5. The text GGUF can also be loaded in llama.cpp directly.
+
 ## TrueNAS server
 **"Cannot connect".** The address needs the port (`http://truenas:8765`); the container must be running; the token must match. See `docs/TRUENAS_WORKER.md`.
 

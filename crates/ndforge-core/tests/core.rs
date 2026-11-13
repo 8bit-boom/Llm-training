@@ -206,11 +206,14 @@ fn settings_roundtrip_and_recent() {
 
 #[test]
 fn help_pages_render() {
-    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup"] {
+    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape"] {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));
     assert!(help_html("nope").contains("No help text"));
+    // the Slim or grow page has its own text, not the fallback, and it carries the honest expectations
+    let r = help_markdown("reshape");
+    assert!(!r.contains("No help text") && r.contains("little or no gain") && r.contains("worse than the original") && r.contains("exactly like the original"));
 }
 
 #[test]
