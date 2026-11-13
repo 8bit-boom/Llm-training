@@ -4,7 +4,7 @@ import json
 import struct
 from pathlib import Path
 
-BYTES = {"BF16": 2, "F16": 2, "F32": 4}
+BYTES = {"BF16": 2, "F16": 2, "F32": 4, "I64": 8}
 
 
 def numel(shape):
