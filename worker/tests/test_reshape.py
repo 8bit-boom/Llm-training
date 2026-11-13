@@ -281,3 +281,86 @@ def test_check_supported():
         rs.check_supported({"model_type": "gpt2", "num_hidden_layers": 4})
     with pytest.raises(ReshapeError, match="num_hidden_layers"):
         rs.check_supported({"model_type": "llama"})
+
+
+# ---------------------------------------------------------------------------------------------------- 11: tensor plan
+
+def refs_for(n_layers=8):
+    """TensorRef stand-ins for a Qwen3.5-like model: embed, per-layer tensors by layer type, vision, mtp, lm_head"""
+    from ndforge_worker.safetensors_io import TensorRef
+    out, pos = {}, 0
+
+    def add(name, shape, dtype="BF16"):
+        nonlocal pos
+        n = 1
+        for d in shape:
+            n *= d
+        out[name] = TensorRef("/x/model.safetensors", dtype, tuple(shape), pos, pos + n * 2)
+        pos += n * 2
+
+    add("model.language_model.embed_tokens.weight", (10, 4))
+    for i in range(n_layers):
+        p = f"model.language_model.layers.{i}."
+        add(p + "input_layernorm.weight", (4,))
+        if i % 4 == 3:
+            add(p + "self_attn.o_proj.weight", (4, 4))
+        else:
+            add(p + "linear_attn.out_proj.weight", (4, 4))
+        add(p + "mlp.up_proj.weight", (6, 4))
+        add(p + "mlp.down_proj.weight", (4, 6))
+    add("model.visual.blocks.0.attn.qkv.weight", (3, 4))
+    add("mtp.fc.weight", (4, 8))
+    add("mtp.layers.0.mlp.down_proj.weight", (4, 4))
+    add("lm_head.weight", (10, 4))
+    return out
+
+
+def test_plan_tensors_renames_layers_and_keeps_the_rest_first():
+    refs = refs_for(8)
+    src = rs.prune_src(8, [4, 5, 6, 7])
+    plan = rs.plan_tensors(refs, src, None)
+    names = [t.name for t in plan]
+    non_layer = [n for n in refs if rs.split_key(n) is None]
+    assert names[:len(non_layer)] == non_layer and names[0] == "model.language_model.embed_tokens.weight"
+    assert all(t.source is refs[t.name] for t in plan[:len(non_layer)])                 # vision, mtp, embed, lm_head untouched
+    assert names[len(non_layer):] == [n for n in refs if rs.split_key(n)][:16]           # layers 0..3 keep their names (16 tensors)
+    # grow: new layer 4 is old layer 0, new layer 8 is old layer 4
+    plan = rs.plan_tensors(refs, [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7], None)
+    by = {t.name: t for t in plan}
+    assert by["model.language_model.layers.4.mlp.up_proj.weight"].source is refs["model.language_model.layers.0.mlp.up_proj.weight"]
+    assert by["model.language_model.layers.11.self_attn.o_proj.weight"].source is refs["model.language_model.layers.7.self_attn.o_proj.weight"]
+    assert len(plan) == len(refs) + 16 and len({t.name for t in plan}) == len(plan)
+
+
+def test_plan_tensors_zero_only_the_output_projections_of_flagged_layers():
+    refs = refs_for(8)
+    src, zero = rs.grow_src(8, 4, 1)           # 0..5 + 2..7 -> 12 layers, second copies of 2..5 zeroed
+    plan = rs.plan_tensors(refs, src, zero)
+    by = {t.name: t for t in plan}
+    for j, z in enumerate(zero):
+        p = f"model.language_model.layers.{j}."
+        out_name = "self_attn.o_proj.weight" if src[j] % 4 == 3 else "linear_attn.out_proj.weight"
+        assert (by[p + out_name].source is None) == z
+        assert (by[p + "mlp.down_proj.weight"].source is None) == z
+        assert by[p + "mlp.up_proj.weight"].source is not None and by[p + "input_layernorm.weight"].source is not None
+    assert sum(1 for t in plan if t.source is None) == 2 * 4
+    assert by["model.language_model.layers.6.linear_attn.out_proj.weight"].shape == (4, 4)       # zeros keep dtype and shape
+    assert by["model.language_model.layers.6.linear_attn.out_proj.weight"].nbytes == 32
+
+
+def test_plan_tensors_refuses_a_layer_that_cannot_be_zeroed_or_is_missing():
+    refs = refs_for(4)
+    del refs["model.language_model.layers.1.mlp.down_proj.weight"]
+    with pytest.raises(ReshapeError, match="invisible layer"):
+        rs.plan_tensors(refs, [0, 1, 1], [False, False, True])
+    with pytest.raises(ReshapeError, match="no tensors for layer 9"):
+        rs.plan_tensors(refs, [0, 9], None)
+    with pytest.raises(ReshapeError, match="zero mask"):
+        rs.plan_tensors(refs, [0, 1], [False])
+
+
+def test_describe():
+    g = rs.group_params(tiny_tensors(), 8)
+    d = rs.describe(g, 8, [0, 1, 2, 3, 2, 3, 4, 5], ["a", "a", "b", "b"] * 2)
+    assert d["layers_before"] == 8 and d["layers_after"] == 8 and d["dropped"] == [6, 7] and d["duplicated"] == [2, 3] and d["period"] == 4
+    assert d["params_before"] == g["total"] and d["params_after"] == rs.params_after(g, [0, 1, 2, 3, 2, 3, 4, 5])

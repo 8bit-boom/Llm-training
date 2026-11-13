@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import re
 
-from .safetensors_io import DTYPE_BYTES
+from .safetensors_io import DTYPE_BYTES, OutTensor, TensorRef
 
 SUPPORTED_TYPES = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "llama", "mistral", "qwen2", "qwen3", "qwen3_moe"}
 REFUSED = {"gemma4": "Gemma 4 stores per-layer inputs for all layers in one table and shares attention memory between its last layers; "
@@ -315,3 +315,46 @@ def fix_config(cfg: dict, src: list[int], notes: list | None = None) -> dict:
             notes.append(f"config.json list {key!r} has one entry per layer and was remapped like layer_types.")
     tc["num_hidden_layers"] = len(src)
     return new
+
+
+# ------------------------------------------------------------------------------------------------------- the tensor plan
+
+def plan_tensors(tensors: dict, src: list[int], zero_mask: list | None) -> list:
+    """The tensors of the new model, in file order: everything that is not a decoder layer first (original order), then new layers 0..N-1;
+    every tensor of old layer src[j] is renamed to index j. Where zero_mask[j] is true the layer's output projections (ZERO_SUFFIXES) become zeros
+    (source None), which makes the layer an exact identity (residual + 0). tensors: {name: TensorRef}."""
+    if zero_mask is not None and len(zero_mask) != len(src):
+        raise ReshapeError("Internal error: the zero mask does not match the layer list.")
+    out: list[OutTensor] = []
+    layers: dict[int, list] = {}
+    for name, ref in tensors.items():
+        sp = split_key(name)
+        if sp is None:
+            out.append(OutTensor(name, ref.dtype, ref.shape, ref))
+        else:
+            layers.setdefault(sp[1], []).append((sp[0], sp[2], ref))
+    for j, s in enumerate(src):
+        if s not in layers:
+            raise ReshapeError(f"The weights have no tensors for layer {s}.")
+        zero = bool(zero_mask and zero_mask[j])
+        rests = {rest for _, rest, _ in layers[s]}
+        if zero:
+            mixer = rests & {"linear_attn.out_proj.weight", "self_attn.o_proj.weight"}
+            down = rests & {"mlp.down_proj.weight"}
+            if not mixer or not down:
+                raise ReshapeError(f"Layer {s} has no plain attention-output and MLP-output weight to set to zero, so it cannot be added as an invisible layer. "
+                                   "Use 'copy the layers' instead.")
+        for prefix, rest, ref in layers[s]:
+            out.append(OutTensor(f"{prefix}{j}.{rest}", ref.dtype, ref.shape, None if zero and rest in ZERO_SUFFIXES else ref))
+    return out
+
+
+def describe(groups: dict, src_before_len: int, src: list[int], types: list[str]) -> dict:
+    """Summary numbers for the result and for ndforge_reshape.json."""
+    counts: dict[int, int] = {}
+    for s in src:
+        counts[s] = counts.get(s, 0) + 1
+    return {"layers_before": src_before_len, "layers_after": len(src), "src_layers": list(src),
+            "dropped": [i for i in range(src_before_len) if i not in counts],
+            "duplicated": sorted(i for i, c in counts.items() if c > 1),
+            "period": pattern_period(types), "params_before": groups["total"], "params_after": params_after(groups, src)}
