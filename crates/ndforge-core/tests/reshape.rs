@@ -469,3 +469,162 @@ fn the_page_state_and_options_come_from_the_worker_and_the_plan() {
     assert!(g["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("little or no gain")));
     assert!(m.reshape_options("qwen3.5-4b", "shrink").is_err() && m.reshape_options("nope", "prune").is_err());
 }
+
+// ------------------------------------------------------------------------------------------------------- testing made models
+use ndforge_core::evaluate::runs as eruns;
+use ndforge_core::train::plan::{base_hyper, Method, Preset};
+
+fn project_with_test_split(root: &std::path::Path) -> Project {
+    let mut p = project(root);
+    let f = root.join("w.ndtrain");
+    sample::build(&f, 1, None).unwrap();
+    p.import_bundle(&open_bundle(&f).unwrap()).unwrap();
+    store::generate_draft(&p, &Recipe { test_percent: 30, ..Recipe::default() }).unwrap();
+    store::save_version(&p).unwrap();
+    p
+}
+
+/// A fake Python that answers every question with a fixed text and keeps the job it was given in `capture.json`
+#[cfg(unix)]
+fn fake_answers(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("env/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let capture = root.join("capture.json");
+    std::fs::write(root.join("fake.py"), format!(r#"
+import json, sys
+job = json.load(open(sys.argv[1], encoding="utf-8"))
+json.dump(job, open({cap:?}, "w", encoding="utf-8"))
+out = {{s: {{q["id"]: ("trained says hi" if s == "trained" else "original says hi") for q in job["questions"]}} for s in job["which"]}}
+json.dump(out, open(job["out"], "w", encoding="utf-8"))
+print(json.dumps({{"type": "result", "data": {{"out": job["out"], "n": len(job["questions"])}}}}), flush=True)
+"#, cap = capture.to_string_lossy())).unwrap();
+    let py = bin.join("python");
+    std::fs::write(&py, format!("#!/bin/sh\nexec python3 -I {} \"$5\"\n", root.join("fake.py").display())).unwrap();
+    std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("NDFORGE_ENV_DIR", root.join("env"));
+    std::env::set_var("NDFORGE_CONFIG_DIR", root.join("cfg"));
+    capture
+}
+
+fn captured(f: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap()
+}
+
+/// A finished made model on disk (what `reshape::runs::execute` leaves behind); returns its model folder
+fn made_model(p: &Project, name: &str, origin_params: u64, params: u64) -> std::path::PathBuf {
+    let dir = p.folder.join("models").join(name);
+    let model = dir.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("config.json"), "{}").unwrap();
+    std::fs::write(model.join("ndforge_reshape.json"), json!({"format": 1, "origin": {"repo": "unsloth/Qwen3.5-4B", "family": "qwen3_5", "layers": 32, "params": origin_params},
+        "mode": "prune", "layers": 24, "params": params}).to_string()).unwrap();
+    std::fs::write(dir.join("state.json"), json!({"name": name, "status": "done", "spec": {"source_model_id": "qwen3.5-4b", "mode": "prune"}}).to_string()).unwrap();
+    model
+}
+
+/// A trained run (adapter) whose base model is `repo`
+fn run_on(p: &Project, name: &str, repo: &std::path::Path) {
+    let rdir = truns::runs_dir(p).join(name);
+    std::fs::create_dir_all(rdir.join("adapter")).unwrap();
+    std::fs::write(rdir.join("adapter/adapter_config.json"), "{}").unwrap();
+    let m = catalog::find("qwen3.5-4b").unwrap();
+    let mut job = truns::build_job(p, &m, Method::Lora, &base_hyper(Preset::Normal), 1, name, false).unwrap();
+    job["model"]["repo"] = json!(repo);
+    std::fs::write(rdir.join("config.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+    std::fs::write(rdir.join("summary.json"), json!({"steps": 40, "final_loss": 0.8}).to_string()).unwrap();
+    std::fs::write(rdir.join("state.json"), json!({"name": name, "status": "done", "model": m.name, "method": "lora", "step": 40, "total_steps": 40}).to_string()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_made_model_is_tested_against_its_original_and_appears_in_the_table() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    let cap = fake_answers(d.path());
+    let p = project_with_test_split(d.path());
+    let model = made_model(&p, "20261113-000000-x-slim-24L", 9_000_000_000, 6_000_000_000);
+    assert!(rruns::read_test(&p, "20261113-000000-x-slim-24L").is_none());
+    let none = AtomicBool::new(false);
+    let r = rruns::test(&p, "20261113-000000-x-slim-24L", None, Some(32.0), &none, &mut |_| {}).unwrap();
+    assert_eq!((r["run"].as_str(), r["against"].as_str()), (Some("model:20261113-000000-x-slim-24L"), Some("origin")));
+    assert_eq!(r["loaded"], json!({"original": "16-bit", "trained": "16-bit"}));
+    let job = captured(&cap);
+    assert_eq!((job["model"]["repo"].as_str(), job["model"]["family"].as_str()), (Some("unsloth/Qwen3.5-4B"), Some("qwen3_5")));
+    assert_eq!(job["full_model"].as_str().unwrap(), model.to_string_lossy());
+    assert!(job.get("adapter").is_none() && job.get("trained_base").is_none() && job.get("load_4bit").is_none());
+    assert_eq!(rruns::read_test(&p, "20261113-000000-x-slim-24L").unwrap()["n"], r["n"]);
+    assert!(rruns::list(&p)[0]["tested"] == true);
+    // a card too small for 16-bit: the sides that do not fit load in 4-bit, and the result says so
+    let r = rruns::test(&p, "20261113-000000-x-slim-24L", None, Some(17.0), &none, &mut |_| {}).unwrap();
+    assert_eq!(captured(&cap)["load_4bit"], json!({"original": true, "trained": false}));
+    assert_eq!(r["loaded"], json!({"original": "4-bit", "trained": "16-bit"}));
+    // the comparison table has a row for it
+    let table = eruns::compare(&p);
+    let row = table.iter().find(|x| x["name"] == "model:20261113-000000-x-slim-24L").expect("a row");
+    assert_eq!((row["method"].as_str(), row["steps"].clone(), row["model"].as_str()), (Some("slim"), serde_json::Value::Null, Some("qwen3.5-4b")));
+    assert!(row["headline"].is_string() && row["n"].as_u64().unwrap() > 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn testing_a_made_model_needs_data_and_a_finished_model() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_answers(d.path());
+    let none = AtomicBool::new(false);
+    let bare = project(d.path());
+    made_model(&bare, "m1", 9, 6);
+    assert!(rruns::test(&bare, "m1", None, None, &none, &mut |_| {}).unwrap_err().0.contains("Save a training-data version in Step 2 first"));
+    let p = project_with_test_split(&d.path().join("second"));
+    std::fs::create_dir_all(p.folder.join("models/half")).unwrap();
+    assert!(rruns::test(&p, "half", None, None, &none, &mut |_| {}).unwrap_err().0.contains("not ready"));
+    for bad in ["../x", "a/b", ""] {
+        assert!(rruns::test(&p, bad, None, None, &none, &mut |_| {}).is_err());
+    }
+    let model = made_model(&p, "noorigin", 9, 6);
+    std::fs::remove_file(model.join("ndforge_reshape.json")).unwrap();
+    assert!(rruns::test(&p, "noorigin", None, None, &none, &mut |_| {}).unwrap_err().0.contains("original is unknown"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_on_a_made_model_is_tested_against_it_or_against_the_original() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    let cap = fake_answers(d.path());
+    let p = project_with_test_split(d.path());
+    let slim = made_model(&p, "m1", 9_000_000_000, 6_000_000_000);
+    run_on(&p, "run-slim", &slim);
+    let none = AtomicBool::new(false);
+    // the default: against the made model (the adapter switched off) - the job is exactly what it was before this feature
+    let r = eruns::execute(&p, "run-slim", 30, None, &none, &mut |_| {}).unwrap();
+    let job = captured(&cap);
+    assert_eq!((r["against"].as_str(), job["model"]["repo"].as_str().unwrap()), (Some("base"), slim.to_string_lossy().as_ref()));
+    assert!(job.get("trained_base").is_none() && job.get("load_4bit").is_none() && job["adapter"].is_string());
+    assert_eq!(r["loaded"], json!({"original": "16-bit", "trained": "16-bit"}));
+    assert!(eruns::read_test(&p, "run-slim").is_some());
+    // against the original it was made from: the real original answers one side, the adapter on the made model the other
+    let r = eruns::execute_against(&p, "run-slim", 30, None, true, Some(32.0), &none, &mut |_| {}).unwrap();
+    let job = captured(&cap);
+    assert_eq!(r["against"], "origin");
+    assert_eq!((job["model"]["repo"].as_str(), job["model"]["family"].as_str()), (Some("unsloth/Qwen3.5-4B"), Some("qwen3_5")));
+    assert_eq!(job["trained_base"].as_str().unwrap(), slim.to_string_lossy());
+    assert!(job["adapter"].as_str().unwrap().ends_with("run-slim/adapter") && job.get("load_4bit").is_none());
+    // on a smaller card the 9 B original loads in 4-bit (and the 6 B made model too)
+    eruns::execute_against(&p, "run-slim", 30, None, true, Some(12.0), &none, &mut |_| {}).unwrap();
+    assert_eq!(captured(&cap)["load_4bit"], json!({"original": true, "trained": true}));
+    // the free chat can ask both as well
+    let a = eruns::ask_against(&p, "run-slim", None, "Who is Anders?", true, None, &none, &mut |_| {}).unwrap();
+    assert_eq!((a["original"].as_str(), a["trained"].as_str()), (Some("original says hi"), Some("trained says hi")));
+    assert_eq!(captured(&cap)["trained_base"].as_str().unwrap(), slim.to_string_lossy());
+    // a run on an ordinary base has no origin: asking for it changes nothing
+    run_on(&p, "run-plain", std::path::Path::new("unsloth/Qwen3.5-4B"));
+    let r = eruns::execute_against(&p, "run-plain", 30, None, true, Some(32.0), &none, &mut |_| {}).unwrap();
+    assert_eq!(r["against"], "base");
+    assert!(captured(&cap).get("trained_base").is_none());
+    // pair_for_run says the same in data
+    let pair = eruns::pair_for_run(&p, "run-slim", true, Some(32.0)).unwrap();
+    assert_eq!((pair.original.as_str(), pair.against, pair.four_bit), ("unsloth/Qwen3.5-4B", "origin", (false, false)));
+    assert!(matches!(&pair.trained, eruns::Side::Adapter { base: Some(b), .. } if b == &slim.to_string_lossy()));
+}

@@ -365,3 +365,31 @@ pub fn mark_interrupted(p: &Project) -> usize {
     }
     n
 }
+
+// -------------------------------------------------------------------------------------------------------------------- test
+
+/// Tests a made model against the model it was made from: the same questions as Step 4 (about the project's own world), both answered by the worker
+/// (a model too big for the card loads in 4-bit), scored the same way. Saved as `models/<name>/test.json`.
+pub fn test(p: &Project, name: &str, judge: Option<&crate::teacher::Teacher>, vram_gb: Option<f64>, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    use crate::evaluate::runs::{execute_pair, Pair, Side};
+    valid_name(name)?;
+    let dir = models_dir(p).join(name);
+    let model = dir.join("model");
+    if !model.join("config.json").is_file() {
+        return Err(Error::new("That model is not ready (it was stopped or failed)."));
+    }
+    let meta = read_json(&model.join("ndforge_reshape.json")).ok_or_else(|| Error::new("This model has no ndforge_reshape.json, so its original is unknown."))?;
+    let origin = meta["origin"]["repo"].as_str().ok_or_else(|| Error::new("This model's original is unknown."))?.to_string();
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the test asks questions about your world."))?;
+    let big = |params: Option<f64>| vram_gb.zip(params).is_some_and(|(v, b)| b * 2.0 + 3.0 > v * 0.9);
+    let pair = Pair {
+        original: origin, family: meta["origin"]["family"].as_str().unwrap_or("generic").to_string(), trained: Side::Full(model.clone()),
+        four_bit: (big(meta["origin"]["params"].as_f64().map(|x| x / 1e9)), big(meta["params"].as_f64().map(|x| x / 1e9))), against: "origin",
+    };
+    execute_pair(p, &pair, version, &format!("model:{name}"), &dir.join("test.json"), 30, judge, kill, on_event)
+}
+
+pub fn read_test(p: &Project, name: &str) -> Option<Value> {
+    valid_name(name).ok()?;
+    read_json(&models_dir(p).join(name).join("test.json"))
+}
