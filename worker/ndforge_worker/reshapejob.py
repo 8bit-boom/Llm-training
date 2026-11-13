@@ -112,6 +112,37 @@ def run_inspect(cfg: dict) -> int:
     return 0
 
 
+def run_measure(cfg: dict) -> int:
+    """job reshape_measure: measure a model once (layer distances and width scores in one pass) and keep the result in cfg["out_dir"]; a measurement that
+    is already there for the same model, data and sizes is reused unless cfg["force"] is set."""
+    protocol.reserve_stdout()
+    src_dir = _resolve_source(cfg["source"]["repo"])
+    config = json.loads((src_dir / "config.json").read_text(encoding="utf-8"))
+    reshape.check_supported(config)
+    why = reshape_width.width_supported(config)
+    if why:
+        raise ReshapeError(why)
+    tc = reshape.text_config(config)
+    types = reshape.layer_types_of(tc)
+    period = check_period(config, types)
+    dims = reshape_width.width_dims(config)
+    folder = Path(cfg["out_dir"])
+    if cfg.get("force") and folder.is_dir():
+        shutil.rmtree(folder)
+    sc = _scores_for({**cfg, "scores_dir": str(folder)}, src_dir, period, config, dims, types, True)
+    m = sc["meta"]
+    stable = None
+    try:
+        nb = len(types) // period
+        n = max(1, nb // 4)
+        stable = reshape.halves_agree(m["matrix_h1"], m["matrix_h2"], n, "contiguous", 1, 1)
+    except (KeyError, TypeError, ReshapeError):
+        pass
+    protocol.progress("done", 1.0, "")
+    protocol.result({"key": folder.name, "tokens": m.get("tokens"), "load": m.get("load"), "loss": m.get("loss_before"), "stable_depth": stable, "dir": str(folder)})
+    return 0
+
+
 # ------------------------------------------------------------------------------------------------------------------- the job
 
 def _resolve_source(repo: str) -> Path:
@@ -290,8 +321,9 @@ def _is_oom(exc: BaseException) -> bool:
     return "out of memory" in str(exc).lower()
 
 
-def _measure(model, layers, period: int, batches: list, mode: str):
-    """One forward pass per batch with hooks on the block boundaries. Returns (D, D_half1, D_half2, mean loss, tokens)."""
+def _measure(model, layers, period: int, batches: list, mode: str, on_batch=None):
+    """One forward pass per batch with hooks on the block boundaries. Returns (D, D_half1, D_half2, mean loss, tokens).
+    on_batch(index, input_ids, attention_mask), when given, is called before each forward pass (the width measuring uses it to learn the batch)."""
     import math
     import torch
     import torch.nn.functional as F
@@ -321,6 +353,8 @@ def _measure(model, layers, period: int, batches: list, mode: str):
             for bi, b in enumerate(batches):
                 held.clear()
                 ids, mask = b["input_ids"].to(dev), b["attention_mask"].to(dev)
+                if on_batch:
+                    on_batch(bi, ids, mask)
                 out = model(input_ids=ids, attention_mask=mask, use_cache=False)
                 ls, ln = _token_losses(out.logits, ids, mask)
                 loss_sum += ls
@@ -444,7 +478,7 @@ def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict,
         protocol.log("Using the earlier measurement of this model on your data.")
         return sc
     _require_torch()
-    raise ReshapeError("Measuring the width of the layers is not available yet.")
+    return _measure_and_save(cfg, src_dir, period, config, dims, types)
 
 
 def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
@@ -509,6 +543,135 @@ def _save_kept(path: Path, src: list, keep: dict, mtp_keep) -> None:
         for i, v in d.items():
             arrays[f"mtp_{part}_{i}"] = np.array(v, dtype=np.int32)
     np.savez(path, **arrays)
+
+
+# ----------------------------------------------------------------------------------- measuring the width (needs torch)
+
+def _measure_all(model, layers, period: int, batches: list, mode: str, types: list, dims: dict):
+    """One pass over the batches that measures what the layer cut needs (block-boundary distances, as _measure) and what the width cut needs.
+    Width importance (NVIDIA Model-Optimizer's aggregation): a hook on the INPUT of each output projection (mlp.down_proj, self_attn.o_proj,
+    linear_attn.out_proj) takes |activation|, averages it over the real tokens of every text, squares it, and sums over the texts; the score of a channel is the
+    square root of that sum. A head's score is the L2 norm of its channels' scores. Kept for all texts and separately for the two halves (by batch parity).
+    Returns ((D, D1, D2, loss, tokens), scores) with scores = {"mlp": [L, I], "attn": [n_full, nh], "gdn": [n_lin, nv]} (+ "_h1", "_h2") as float32 numpy arrays."""
+    import numpy as np
+    import torch
+    sizes = {"mlp": dims["intermediate"], "attn": dims["heads"] * dims["head_dim"], "gdn": dims["lin_v_heads"] * dims["lin_v_dim"]}
+    state = {"mask": None, "batch": 0}
+    acc: dict = {}            # (kind, ordinal, part) -> float32 [C], part 0 = all texts, 1 / 2 = the halves
+    ordinals = {"mlp": {}, "attn": {}, "gdn": {}}
+    handles = []
+
+    def hook_for(kind, k):
+        def hook(module, args):
+            x = args[0] if args else None
+            if x is None or x.shape[-1] != sizes[kind]:
+                raise ReshapeError("The layers of this model do not have the sizes config.json promises, so they cannot be measured.")
+            a = x.detach().float().abs()
+            if a.dim() == 2:
+                a = a[None]
+            m = state["mask"].to(a.device).float()
+            per = (a * m[..., None]).sum(1) / m.sum(1).clamp(min=1.0)[:, None]
+            sq = (per ** 2).sum(0)
+            for part in (0, 1 + state["batch"] % 2):
+                key = (kind, k, part)
+                acc[key] = sq.clone() if key not in acc else acc[key] + sq
+        return hook
+
+    for i, layer in enumerate(layers):
+        full = types[i] == "full_attention"
+        for kind, mod in (("mlp", getattr(getattr(layer, "mlp", None), "down_proj", None)),
+                          ("attn" if full else "gdn", getattr(getattr(layer, "self_attn" if full else "linear_attn", None), "o_proj" if full else "out_proj", None))):
+            if mod is None:
+                raise ReshapeError(f"Layer {i} has no plain {'MLP' if kind == 'mlp' else 'attention'} output projection, so it cannot be measured.")
+            k = i if kind == "mlp" else len(ordinals[kind])
+            ordinals[kind][i] = k
+            handles.append(mod.register_forward_pre_hook(hook_for(kind, k)))
+
+    def on_batch(bi, ids, mask):
+        state["mask"], state["batch"] = mask, bi
+
+    try:
+        depth = _measure(model, layers, period, batches, mode, on_batch)
+    finally:
+        for h in handles:
+            h.remove()
+    scores: dict = {}
+    per_head = {"attn": dims["head_dim"], "gdn": dims["lin_v_dim"]}
+    for kind in ("mlp", "attn", "gdn"):
+        n = len(ordinals[kind])
+        for part, suffix in ((0, ""), (1, "_h1"), (2, "_h2")):
+            rows = []
+            for k in range(n):
+                v = acc.get((kind, k, part))
+                if v is None and part == 2:
+                    v = acc.get((kind, k, 1))            # a single batch: both halves are the same measurement
+                if v is None:
+                    raise ReshapeError("Nothing was measured; the measuring text is empty.")
+                s = v.sqrt()
+                if kind != "mlp":
+                    s = s.reshape(-1, per_head[kind]).pow(2).sum(1).sqrt()
+                rows.append(s.cpu().numpy().astype(np.float32))
+            scores[kind + suffix] = np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
+    return depth, scores
+
+
+def _write_scores(folder: Path, meta: dict, scores: dict) -> None:
+    """scores.npz first, scores.json last: a folder with a scores.json is complete"""
+    import os
+    np = slice_io.np()
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / "scores.partial.npz"
+    np.savez(tmp, **scores)
+    os.replace(tmp, folder / "scores.npz")
+    tmp_json = folder / "scores.partial.json"
+    tmp_json.write_text(json.dumps(meta), encoding="utf-8")
+    os.replace(tmp_json, folder / "scores.json")
+
+
+def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list) -> dict:
+    """Measures the model on the project's training text (needs torch), keeps the result in cfg["scores_dir"] and returns it like _read_scores."""
+    from transformers import AutoTokenizer
+    calib = cfg.get("calibration") or {}
+    train = calib.get("train")
+    if not (train and Path(train).is_file()):
+        raise ReshapeError("Thinning the layers is measured on your own text. Save a training-data version in Step 2 first.")
+    n_layers = int(reshape.text_config(config)["num_hidden_layers"])
+    est = sum(r.nbytes for r in safetensors_io.list_tensors(src_dir).values())
+    mode = _choose_load(cfg.get("load", "auto"), est)
+    protocol.progress("calibrate", 0.0, "Preparing the measuring text")
+    tok = AutoTokenizer.from_pretrained(str(src_dir))
+    batches = _calibration(tok, calib, (cfg.get("source") or {}).get("family", "generic"))
+    n_tokens = sum(int(b["attention_mask"].sum()) for b in batches)
+    protocol.log(f"Measuring on {len(batches)} batches ({n_tokens:,} tokens), model loaded as {mode}.")
+    protocol.progress("calibrate", 1.0, "")
+    protocol.progress("score", 0.0, f"Loading the model ({mode})")
+    model = _load(src_dir, mode)
+    layers = _find_layers(model, n_layers)
+    try:
+        try:
+            (D, D1, D2, loss, tokens), scores = _measure_all(model, layers, period, batches, mode, types, dims)
+        except RuntimeError as exc:
+            if not _is_oom(exc):
+                raise
+            protocol.log("Out of memory; trying again with one text at a time.")
+            _free()
+            (D, D1, D2, loss, tokens), scores = _measure_all(model, layers, period, _split_single(batches), mode, types, dims)
+    except RuntimeError as exc:
+        if _is_oom(exc):
+            raise ReshapeError("The graphics card ran out of memory while measuring the layers. Choose 4-bit measuring (Expert mode) or fewer samples.") from None
+        raise
+    finally:
+        del layers
+        del model
+        _free()
+    meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
+            "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
+            "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
+            "loss_before": loss, "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if cfg.get("scores_dir"):
+        _write_scores(Path(cfg["scores_dir"]), meta, scores)
+    protocol.progress("score", 1.0, "")
+    return {"meta": meta, **scores}
 
 
 def _loss(folder, cfg: dict, mode: str):

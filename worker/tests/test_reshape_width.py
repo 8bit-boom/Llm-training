@@ -414,10 +414,10 @@ def test_inspect_says_why_width_is_not_possible(tmp_path):
 
 # ----------------------------------------------------------------------------------------------------- 8: the job (no torch)
 
-def write_scores(folder, src_repo, layers=8, data_version=3, **over):
-    """a cached measurement for the fake model (8 or 16 layers), deterministic random scores; returns the arrays"""
+def write_scores(folder, src_repo, layers=8, data_version=3, dims=None, **over):
+    """a cached measurement for the fake model (8 or 16 layers) or, with `dims`, for another Qwen3.5 model; deterministic random scores; returns the arrays"""
     np = pytest.importorskip("numpy")
-    d = fake_dims()
+    d = dims or fake_dims()
     types = fake_types(layers)
     n_full = types.count("full_attention")
     r = np.random.default_rng(7)
