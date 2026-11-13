@@ -62,7 +62,7 @@ The wording lives in `unsloth/client.rs::failure`, `unsloth/run.rs::explain_fail
 - A failed or interrupted run in Unsloth counts as continuable (Continue reattaches or sends the data again); only a stopped (cancelled) one does not.
 - The fixtures live in `tests/fixtures/unsloth/` at the repository root (as in the plan); the golden files of the Studio export are in `crates/ndforge-core/tests/fixtures/studio_golden/`.
 - The events of a reattached run are cut at the newest event already shown (the plan paged until it found one; the cut avoids re-sending older lines).
-- The Tauri crate (`src-tauri`) was **not compiled** in the session that wrote this (disk space and no desktop libraries): the three commands and the `run_training` arm follow the existing ones and need a `cargo check -p` on a normal machine.
+- The Tauri crate passes `cargo check -p nd-lore-forge` (the window itself was never started, so the three commands and the page are only tested through the stand-in browser).
 - `cargo test -p ndforge-core --test remote` has a timing test (`a_second_job_is_refused_while_one_runs_and_a_lost_client_can_reconnect`) that failed once while the whole suite ran in parallel and passed alone; it is older than this work.
 
 ## Not verified yet (needs a real Desktop and a GPU)
