@@ -208,6 +208,7 @@ fn a_run_in_unsloth_follows_the_job_into_the_charts_and_ends_done() {
     let state: Value = serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
     assert_eq!((state["status"].as_str(), state["server"].as_str(), state["backend"].as_str(), state["step"].as_u64()), (Some("done"), Some("Unsloth Desktop"), Some("unsloth"), Some(4)));
     assert!(state["note"].as_str().unwrap().contains("ashfall-test_20261113_101500"));
+    // Unsloth's run folder is not on this computer in this test: the run is done and says where the adapter is
     let listed = runs::list_runs(&p);
     assert_eq!((listed.len(), listed[0]["has_adapter"].clone()), (1, json!(false)));
     // Unsloth got the rows and one job with the model and a clean suffix
@@ -253,4 +254,61 @@ fn old_unsloth_a_refused_key_and_a_failed_job_end_the_run_with_a_plain_message()
     assert_eq!(e, "boom");
     let st = |n: &str| -> Value { serde_json::from_slice(&std::fs::read(runs::runs_dir(&p).join(n).join("state.json")).unwrap()).unwrap() };
     assert_eq!((st("run-old")["status"].clone(), st("run-fail")["status"].clone(), st("run-fail")["error"].clone()), (json!("failed"), json!("failed"), json!("boom")));
+}
+
+fn write_adapter(outputs: &std::path::Path) {
+    let run = outputs.join(common::fake_unsloth::RUN_FOLDER);
+    std::fs::create_dir_all(run.join("checkpoint-2")).unwrap();
+    std::fs::write(run.join("adapter_config.json"), "{\"r\": 16}").unwrap();
+    std::fs::write(run.join("adapter_model.safetensors"), b"WEIGHTS").unwrap();
+    std::fs::write(run.join("tokenizer.json"), "{}").unwrap();
+    std::fs::write(run.join("chat_template.jinja"), "{{ x }}").unwrap();
+    std::fs::write(run.join("optimizer.pt"), b"NOT-COPIED").unwrap();
+    std::fs::write(run.join("checkpoint-2").join("adapter_config.json"), "{}").unwrap();
+}
+
+#[test]
+fn the_adapter_is_copied_back_when_unsloth_runs_on_this_computer_and_the_run_can_be_tested_and_exported() {
+    let d = tempdir().unwrap();
+    let (p, m) = project(d.path());
+    let outputs = d.path().join("outputs");
+    write_adapter(&outputs);
+    let f = Fake::start(&outputs);
+    let (r, _) = run(&p, &m, &f, "run-copy", Arc::new(AtomicBool::new(false)));
+    let r = r.unwrap();
+    assert_eq!(r["adapter_remote"], false);
+    let adapter = runs::runs_dir(&p).join("run-copy").join("adapter");
+    let mut names: Vec<String> = std::fs::read_dir(&adapter).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    assert_eq!(names, ["adapter_config.json", "adapter_model.safetensors", "chat_template.jinja", "tokenizer.json"], "the adapter and the tokenizer, not the optimizer or the checkpoints");
+    assert!(!runs::runs_dir(&p).join("run-copy").join("adapter.partial").exists());
+    let listed = runs::list_runs(&p);
+    assert_eq!(listed[0]["has_adapter"], true);
+    assert!(ndforge_core::evaluate::runs::testable(&p).iter().any(|r| r["name"] == "run-copy"));
+    assert!(ndforge_core::export::runs::exportable_runs(&p).iter().any(|r| r["name"] == "run-copy"));
+}
+
+#[test]
+fn a_full_disk_or_an_old_adapter_folder_is_handled_before_anything_half_written_is_left() {
+    use ndforge_core::unsloth::run::{fetch_adapter, FetchOutcome};
+    let d = tempdir().unwrap();
+    let outputs = d.path().join("outputs");
+    write_adapter(&outputs);
+    let f = Fake::start(&outputs);
+    let c = UnslothClient::new(&f.url, KEY);
+    let dest = d.path().join("run").join("adapter");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    // too little space: a plain message and nothing written
+    let e = fetch_adapter(&c, common::fake_unsloth::RUN_FOLDER, &dest, &|_| Some(0.0)).unwrap_err().0;
+    assert!(e.contains("disk is full on this computer"), "{e}");
+    assert!(!dest.exists() && !dest.with_file_name("adapter.partial").exists());
+    // an older adapter is replaced whole
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("old.txt"), "x").unwrap();
+    assert_eq!(fetch_adapter(&c, common::fake_unsloth::RUN_FOLDER, &dest, &|_| None).unwrap(), FetchOutcome::Copied);
+    assert!(!dest.join("old.txt").exists() && dest.join("adapter_model.safetensors").is_file());
+    // a run folder Unsloth does not list, or one that is not here
+    assert!(matches!(fetch_adapter(&c, "other-run", &dest, &|_| None).unwrap(), FetchOutcome::NotReachable(_)));
+    std::fs::remove_dir_all(outputs.join(common::fake_unsloth::RUN_FOLDER)).unwrap();
+    assert!(matches!(fetch_adapter(&c, common::fake_unsloth::RUN_FOLDER, &dest, &|_| None).unwrap(), FetchOutcome::NotReachable(_)));
 }

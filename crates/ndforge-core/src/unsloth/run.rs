@@ -1,5 +1,6 @@
 //! A training run in Unsloth: send the data, follow the job, bring the adapter back (see `docs/UNSLOTH_DESKTOP.md`).
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,65 @@ pub fn job_body(m: &ModelEntry, method: Method, hyper: &Hyper, suffix: &str, tra
     Ok(b)
 }
 
+/// What `fetch_adapter` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// the adapter files were copied into the run's `adapter` folder
+    Copied,
+    /// Unsloth's run folder is not on this computer (or holds no adapter): why
+    NotReachable(String),
+}
+
+/// Files of Unsloth's run folder that make a usable adapter folder: the adapter itself and what the tokenizer and the chat format need.
+fn wanted_file(name: &str) -> bool {
+    matches!(name, "adapter_config.json" | "adapter_model.safetensors" | "special_tokens_map.json" | "added_tokens.json" | "vocab.json" | "merges.txt" | "preprocessor_config.json" | "chat_template.json")
+        || name.starts_with("tokenizer") || name.starts_with("chat_template")
+}
+
+/// Copies the finished adapter out of Unsloth's run folder `fine_tuned_model` into `dest` (the run's `adapter` folder) when that folder is on THIS computer.
+/// Unsloth's `/api/models/checkpoints` names the folder's path; only the folder Lore Forge's own job made is read, only regular files directly inside it.
+/// The copy goes to `<dest>.partial` first and replaces `dest` by a rename, so a half copy is never taken for an adapter. `free_gb` measures the free disk space.
+pub fn fetch_adapter(client: &UnslothClient, fine_tuned_model: &str, dest: &Path, free_gb: &dyn Fn(&Path) -> Option<f64>) -> Result<FetchOutcome> {
+    let listing = client.checkpoints_listing()?;
+    let path = listing["models"].as_array().and_then(|ms| ms.iter().find(|m| m["name"] == fine_tuned_model))
+        .and_then(|m| m["checkpoints"].as_array()).and_then(|cs| cs.iter().filter_map(|c| c["path"].as_str()).find(|p| Path::new(p).file_name().and_then(|n| n.to_str()) == Some(fine_tuned_model)))
+        .map(PathBuf::from);
+    let Some(src) = path else { return Ok(FetchOutcome::NotReachable("Unsloth does not list the run folder.".into())) };
+    let has = |n: &str| std::fs::symlink_metadata(src.join(n)).map(|m| m.is_file()).unwrap_or(false);
+    if !(has("adapter_config.json") && has("adapter_model.safetensors")) {
+        return Ok(FetchOutcome::NotReachable("The run folder is not on this computer (or holds no adapter).".into()));
+    }
+    let files: Vec<(PathBuf, String, u64)> = std::fs::read_dir(&src)?.flatten().filter_map(|e| {
+        let md = std::fs::symlink_metadata(e.path()).ok()?;
+        let name = e.file_name().to_str()?.to_string();
+        (md.is_file() && wanted_file(&name)).then(|| (e.path(), name, md.len()))
+    }).collect();
+    let bytes: u64 = files.iter().map(|f| f.2).sum();
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    if let Some(free) = free_gb(parent) {
+        let need = bytes as f64 * 1.1 / 1e9;
+        if free < need {
+            return Err(Error::new(format!("The disk is full on this computer: the adapter needs about {need:.1} GB and {free:.1} GB are free. Free space and copy the folder \"{fine_tuned_model}\" from Unsloth's outputs by hand.")));
+        }
+    }
+    let partial = dest.with_file_name(format!("{}.partial", dest.file_name().and_then(|n| n.to_str()).unwrap_or("adapter")));
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir_all(&partial)?;
+    let copy = || -> Result<()> {
+        for (from, name, _) in &files {
+            std::fs::copy(from, partial.join(name))?;
+        }
+        let _ = std::fs::remove_dir_all(dest);
+        std::fs::rename(&partial, dest)?;
+        Ok(())
+    };
+    if let Err(e) = copy() {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(e);
+    }
+    Ok(FetchOutcome::Copied)
+}
+
 /// How many polls may fail in a row before the run is marked interrupted (Unsloth keeps training meanwhile).
 const MAX_POLL_FAILURES: u32 = 180;
 /// How many pages of 100 events are read back when a reattached run missed more than one page.
@@ -116,7 +176,7 @@ fn new_events(client: &UnslothClient, id: &str, seen: &HashSet<String>) -> Resul
 }
 
 /// Trains in Unsloth to the end and keeps the run's state like a local run. `poll` is the pause between asking Unsloth for news.
-/// The adapter stays in Unsloth's run folder here (the copy back is `fetch_adapter`).
+/// When Unsloth runs on this computer the adapter is copied into the run's `adapter` folder (`fetch_adapter`); else it stays in Unsloth's run folder.
 pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, name: &str, mut job: Value, target: &UnslothTarget, stop: Arc<AtomicBool>, _resume: bool, poll: Duration,
                        on_event: &mut dyn FnMut(Value)) -> Result<Value> {
     let dir = runs_dir(p).join(name);
@@ -224,13 +284,24 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
     })();
     let mut outcome = outcome;
     if let Ok(r) = outcome.as_mut() {
-        // the adapter stays in Unsloth's own folder in this version: say where
         let folder = r["fine_tuned_model"].as_str().unwrap_or("").to_string();
-        let note = format!("Trained in Unsloth on {}. The adapter is in Unsloth's folder \"{folder}\" on that computer: export it there, or copy that folder into this run's adapter folder.", target.name);
-        r["adapter_remote"] = json!(true);
-        r["note"] = json!(note);
-        set_run_state(&dir, json!({"adapter_remote": true, "note": note}));
-        stage(on_event, &note);
+        stage(on_event, "Fetching the trained model");
+        let fetched = fetch_adapter(&client, &folder, &dir.join("adapter"), &|d| crate::envmgr::health::free_disk_gb(d));
+        match fetched {
+            Ok(FetchOutcome::Copied) => {
+                r["adapter_remote"] = json!(false);
+                set_run_state(&dir, json!({"adapter_remote": false, "note": null}));
+            }
+            other => {
+                // the training is done either way; the adapter stays in Unsloth's folder
+                let why = match other { Ok(FetchOutcome::NotReachable(w)) => w, Err(e) => e.0, _ => String::new() };
+                let note = format!("Trained in Unsloth on {}. The adapter is in Unsloth's folder \"{folder}\" on that computer: export it there, or copy that folder into this run's adapter folder. ({why})", target.name);
+                r["adapter_remote"] = json!(true);
+                r["note"] = json!(note);
+                set_run_state(&dir, json!({"adapter_remote": true, "note": note}));
+                stage(on_event, &note);
+            }
+        }
     }
     finish(&dir, m, method, hyper, outcome, false)
 }
