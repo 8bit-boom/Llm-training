@@ -22,6 +22,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M10 Teacher-generated examples + checking (Step 2) | built; needs a first run with a real teacher model. "Better scores" can only be shown by the M11 test page |
 | M11 Step 4 Test: scores, side-by-side chat, transcripts, run comparison | built; needs a first run with a real model |
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
+| M13 Slim or grow a model: layer pruning and depth up-scaling as a new base model | built and tested without a GPU (worker on stand-ins, a fake worker in the Rust tests, the page in a stand-in browser); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ## Install
@@ -61,7 +62,7 @@ Code: `crates/ndforge-core/src/dataset/` (`markup`, `docs`, `chunk`, `builders`,
 ## Training (M6)
 
 Step 3 trains a model with **LoRA** (16-bit by default; 4-bit QLoRA when memory is short) on the newest saved data version. `catalog/models.toml` lists the
-five models (repos checked on Hugging Face). The Rust program plans the run (`train/plan.rs`: presets Quick / Normal / Best, memory estimate, lowers batch and
+six models (repos checked on Hugging Face). The Rust program plans the run (`train/plan.rs`: presets Quick / Normal / Best, memory estimate, lowers batch and
 sequence length to fit, replaces the estimate with the peak measured on this PC) and starts the Python worker (`worker/ndforge_worker/trainjob.py`), which
 reports JSON lines: `start`, `metric` (loss, learning rate, memory, GPU temperature, time left), `sample` (answers to fixed questions before/during/after
 training), `progress`, `log`, `result`. **Stop** writes a STOP file; the worker saves a checkpoint after the current step and exits (killed after 2 minutes
@@ -117,6 +118,17 @@ Step 4 puts the held-out questions of the run's data version to the **original**
 ## Your own models from Hugging Face
 
 Step 3 has **＋ Add a model from Hugging Face…**: a name like `unsloth/Qwen3-4B` or a pasted address. `crates/ndforge-core/src/train/hub.rs` reads `GET /api/models/<repo>` and refuses what cannot be trained (gated / private, GGUF-only, no chat template, needs `trust_remote_code`, pre-quantized, not a language model); otherwise it works out size, licence, a memory estimate and the chat-format family (Qwen3.5, Gemma 4, or `generic` = the model's own chat template). Added models are kept in `custom_models.json` in the settings folder. For `generic` models the Ollama install leaves the template to the GGUF. Tested with a stand-in Hugging Face server (`NDFORGE_HF_URL`) and a tiny model through the real worker; not tried against real Hugging Face repositories or real large models.
+
+## Slim or grow a model (M13)
+
+The sidebar item **🧬 Slim or grow a model** makes a new base model from one you have, by cutting **whole blocks of layers out** (slim, for example Qwen3.5 27B: 64 → 48 layers, about 21.6 B) or **copying a stretch in** (grow, for example Qwen3.5 9B: 32 → 48 layers). It appears in Step 3's model list; Step 4 can compare a run on it with the original; Step 5 reuses the original's vision file.
+
+- **Slim** measures, on a sample of the project's own training text, how much each block of layers changes the hidden state (the angular distance between block boundaries, Gromov et al. 2024, "The Unreasonable Ineffectiveness of the Deeper Layers"; ShortGPT's Block Influence for separate blocks) and removes the least useful run of blocks. Big models are measured in 4-bit. **A slimmed model answers worse until it is trained again** (Step 3); the page, the help and the test say so.
+- **Grow** is depth up-scaling (SOLAR 10.7B, mergekit "passthrough"). New layers start with zeroed output weights (LLaMA-Pro style), so the grown model first answers **exactly like the original**; the program checks this on the project's text and refuses to keep a model that fails. **Honest expectation: little or no gain from one world's text, about 40 % more memory, disk space and time.**
+- Layers are moved as raw bytes between safetensors files (no model load), whole pattern periods only (Qwen3.5: 4 layers), so old and new Transformers / llama.cpp agree on the layer pattern. Gemma 4 and quantized models are refused with the reason.
+- Unsloth Studio can only prune MoE experts (REAP), not layers, and not dense or hybrid Qwen3.5: that is why this is built here (docs/RESHAPE.md, section "Could Unsloth Studio do it?").
+
+Code: worker `reshape.py`, `reshapejob.py`, `safetensors_io.py`; Rust `crates/ndforge-core/src/reshape/`; page `ui/app.js` (smoke test `ui/smoke/`). Method, file formats, deviations from the plan and the list of what **has not been verified without a GPU**: `docs/RESHAPE.md`.
 
 ## Training speed
 

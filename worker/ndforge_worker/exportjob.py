@@ -1,6 +1,6 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
-Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
+Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
 keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept)."""
 import json
 import os
@@ -26,6 +26,12 @@ def find_llama_cpp():
         if conv.is_file() and quant:
             return conv, quant
     return None, None
+
+
+def _vision_source(cfg: dict) -> str:
+    """Whose picture abilities (and official vision file) the exported model keeps. Normally the base model itself; for a base that was made by
+    "Slim or grow a model" (vision part copied unchanged) it is the original model it was made from (`base.vision_repo`), which has the official GGUF repo."""
+    return cfg["base"].get("vision_repo") or cfg["base"]["repo"]
 
 
 def _run(cmd, label):
@@ -183,12 +189,12 @@ def run(cfg: dict) -> int:
     mmproj, vnote, mods = None, "", []
     if gguf_path and cfg.get("vision", True):
         try:
-            mods = vision.base_modalities(cfg["base"]["repo"])
+            mods = vision.base_modalities(_vision_source(cfg))
             if mods and full_model:
                 vnote = "Full fine-tuning changed the vision part of the model too, so the base model's vision file does not fit it. The GGUF understands text only."
             elif mods:
                 protocol.progress("vision", 0.95, "Adding the vision file")
-                mmproj, vnote = vision.fetch_mmproj(cfg["base"]["repo"], out)
+                mmproj, vnote = vision.fetch_mmproj(_vision_source(cfg), out)
                 if mmproj is None and Path(cfg["base"]["repo"]).is_dir():
                     conv, _ = find_llama_cpp()
                     if conv:

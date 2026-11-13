@@ -1,5 +1,5 @@
-# The five models ND Lore Forge trains. Repos checked on Hugging Face (2026-11-07): all exist, are not gated and are Apache-2.0.
-# vram_*: GB for training at about 2048 tokens, from Unsloth's guides (bf16 LoRA: Qwen3.5 2B 5 / 4B 10 / 9B 22; Gemma 4 E2B 8-10, E4B 17 / 10 with 4-bit);
+# The six models ND Lore Forge trains. Repos checked on Hugging Face (2026-11-07): all exist, are not gated and are Apache-2.0.
+# vram_*: GB for training at about 2048 tokens, from Unsloth's guides (bf16 LoRA: Qwen3.5 2B 5 / 4B 10 / 9B 22, Qwen3.8 27B over 36 with QLoRA on 24; Gemma 4 E2B 8-10, E4B 17 / 10 with 4-bit);
 # values marked "estimate" are ours. The window shows the peak memory MEASURED on this PC once a run has finished, and prefers it.
 # params_b = parameters in the checkpoint (Gemma 4 "E" sizes count their per-layer embeddings, so E2B is 5.1B and E4B 8.0B on disk).
 
@@ -14,7 +14,7 @@ license = "Apache-2.0"
 vram_lora_gb = 5.0
 vram_qlora_gb = 3.5      # estimate
 good_for = "Fast first tries and weaker graphics cards."
-note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual."
+note = "16-bit LoRA is the first choice when it fits; 4-bit works for this dense model too but loses a little more quality."
 
 [[model]]
 id = "qwen3.5-4b"
@@ -27,7 +27,7 @@ license = "Apache-2.0"
 vram_lora_gb = 10.0
 vram_qlora_gb = 6.5      # estimate
 good_for = "A good balance of quality and speed."
-note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual."
+note = "16-bit LoRA is the first choice when it fits; 4-bit works for this dense model too but loses a little more quality."
 
 [[model]]
 id = "qwen3.5-9b"
@@ -39,8 +39,8 @@ params_b = 9.65
 license = "Apache-2.0"
 vram_lora_gb = 22.0
 vram_qlora_gb = 12.0     # estimate
-good_for = "The best quality of the five."
-note = "Unsloth advises 16-bit LoRA for Qwen3.5: 4-bit training loses more quality than usual. 16-bit LoRA fits a 32 GB card."
+good_for = "The best quality of the small ones."
+note = "16-bit LoRA fits a 32 GB card and is the first choice; 4-bit works for this dense model too but loses a little more quality."
 
 [[model]]
 id = "gemma4-e2b"
@@ -67,3 +67,16 @@ vram_lora_gb = 17.0
 vram_qlora_gb = 10.0
 good_for = "A good balance, Gemma family. Unsloth suggests E4B with 4-bit over E2B with 16-bit when memory is short."
 note = "A training loss of 13-15 is normal for Gemma 4 E2B/E4B (a quirk of multimodal models), not a problem."
+
+[[model]]
+id = "qwen3.8-27b"
+name = "Qwen3.8 27B"
+family = "qwen3_5"                 # Qwen3.8 uses the qwen3_5 architecture (checked in its config.json)
+repo = "unsloth/Qwen3.8-27B"
+official = "Qwen/Qwen3.8-27B"
+params_b = 27.78
+license = "Apache-2.0"
+vram_lora_gb = 60.0                # 16-bit weights alone are about 56 GB (Unsloth says "over 36 GB", a lower bound); our rule 2.2 x B + 1
+vram_qlora_gb = 20.0               # estimate; Unsloth: QLoRA works with 24 GB
+good_for = "The strongest model here: a dense 27B with images. Needs a big card (QLoRA from 24 GB, 16-bit LoRA needs about 60 GB)."
+note = "Unsloth recommends 4-bit QLoRA for this one (unsloth/Qwen3.8-27B-unsloth-bnb-4bit), then export to GGUF or NVFP4. If it should keep reasoning, mix reasoning-style examples with direct answers and keep at least 75 % reasoning data."

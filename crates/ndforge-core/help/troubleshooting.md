@@ -23,7 +23,7 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 ## Training
 **"Out of memory".** Choose a smaller model, **QLoRA**, or the Quick preset; close other programs that use the card (also Ollama: it keeps models in memory, `ollama stop <model>`).
 
-**The model cannot be downloaded.** The first run downloads it from Hugging Face (2 to 20 GB). Check the internet connection and disk space. The five models are not gated; no account is needed.
+**The model cannot be downloaded.** The first run downloads it from Hugging Face (2 to 60 GB). Check the internet connection and disk space. The six models are not gated; no account is needed.
 
 **Full fine-tune is greyed out.** The reason is written on the card: it needs a bf16 card (RTX 30 series or newer), enough memory (small models only) and disk space. This computer only, not the server.
 
@@ -41,6 +41,13 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 **Ollama cannot be reached.** Is it running (`ollama serve`)? For a server on another computer Ollama must listen on the network (`OLLAMA_HOST=0.0.0.0`). Check the address in Step 5 (default `http://localhost:11434`).
 
 **The installed model answers strangely in nd-world.** Use the check question on Step 5. The template shipped with the model is meant to answer without thinking; if you installed through other tools, install through this page instead.
+
+## Slim or grow a model
+**Out of memory while measuring the layers.** Open Expert mode on the page and choose "4-bit" for loading, or measure on fewer samples (64).
+
+**"There is not enough free space".** A made model is a full copy (about 2 GB per billion parameters) and a model that is not on the computer is downloaded first. Free the space or choose a smaller size on the slider.
+
+**Ollama or llama.cpp refuses the exported slimmed model.** An unusual number of layers is allowed by the file format, but not every version of Ollama accepts it. Update Ollama, then use *Test it with a question* on Step 5. The text GGUF can also be loaded in llama.cpp directly.
 
 ## TrueNAS server
 **"Cannot connect".** The address needs the port (`http://truenas:8765`); the container must be running; the token must match. See `docs/TRUENAS_WORKER.md`.

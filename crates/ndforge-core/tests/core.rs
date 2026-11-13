@@ -206,11 +206,14 @@ fn settings_roundtrip_and_recent() {
 
 #[test]
 fn help_pages_render() {
-    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup"] {
+    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape"] {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));
     assert!(help_html("nope").contains("No help text"));
+    // the Slim or grow page has its own text, not the fallback, and it carries the honest expectations
+    let r = help_markdown("reshape");
+    assert!(!r.contains("No help text") && r.contains("little or no gain") && r.contains("worse than the original") && r.contains("exactly like the original"));
 }
 
 #[test]
@@ -324,7 +327,7 @@ fn model_train_state_and_jobs() {
     m.dataset_generate(json!({})).unwrap();
     m.dataset_save().unwrap();
     let st = m.train_state(None).unwrap();
-    assert_eq!(st["models"].as_array().unwrap().len(), 5);
+    assert_eq!(st["models"].as_array().unwrap().len(), 6);
     assert_eq!(st["version"]["number"], 1);
     assert_eq!(st["env_ready"], false);
     let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None, None).unwrap();

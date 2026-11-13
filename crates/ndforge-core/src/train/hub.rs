@@ -124,7 +124,15 @@ fn describe_folder(dir: &std::path::Path) -> Result<Value> {
     // the licence from the YAML header of README.md
     let license = read("README.md").and_then(|t| t.strip_prefix("---").map(String::from)).and_then(|t| t.split("---").next().map(String::from))
         .and_then(|head| head.lines().find_map(|l| l.trim().strip_prefix("license:").map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string()))).filter(|l| !l.is_empty());
-    Ok(serde_json::json!({"siblings": siblings, "config": config, "library_name": if only_gguf { "gguf" } else { "" }, "cardData": {"license": license}, "tags": []}))
+    let mut info = serde_json::json!({"siblings": siblings, "config": config, "library_name": if only_gguf { "gguf" } else { "" }, "cardData": {"license": license}, "tags": []});
+    // a model made on the "Slim or grow a model" page says exactly how big it is (no estimate from file sizes)
+    if let Some(meta) = read("ndforge_reshape.json").and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        if let Some(total) = meta["params"].as_u64().filter(|p| *p > 0) {
+            info["safetensors"] = serde_json::json!({ "total": total });
+        }
+        info["ndforge_reshape"] = meta;
+    }
+    Ok(info)
 }
 
 fn lookup_local(dir: &std::path::Path) -> Result<Found> {
@@ -137,6 +145,9 @@ fn lookup_local(dir: &std::path::Path) -> Result<Found> {
     let short: String = crate::dataset::builders::hash_hex(&[&path])[..6].to_string();
     let mut found = evaluate(&Ident { repo: path, id: format!("{}-{short}", slug(&folder)).replacen("custom-", "custom-local-", 1), name: folder.replace(['_', '-'], " ") }, &info)?;
     found.warnings.insert(0, "This model is a folder on this computer: it cannot be trained on a server, and the program must be able to read it whenever you train or export.".to_string());
+    if let Some(origin) = info["ndforge_reshape"]["origin"]["repo"].as_str() {
+        found.warnings.insert(1, format!("This model was made by Slim or grow from {origin}."));
+    }
     Ok(found)
 }
 
@@ -216,6 +227,7 @@ fn evaluate(ident: &Ident, info: &Value) -> Result<Found> {
         id: ident.id.clone(), name: ident.name.clone(), family: family.to_string(), repo: repo.clone(), official: repo.clone(), params_b: params, license, vram_lora_gb: lora, vram_qlora_gb: qlora,
         good_for: "Added by you from Hugging Face.".to_string(),
         note: "Memory figures are estimates from the model's size until a run has measured them.".to_string(), custom: true,
+        derived_from: None, reshape: None,
     };
     Ok(Found { entry, warnings })
 }

@@ -107,8 +107,13 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
     let out = if many { exports_dir(p).join(format!("{run}-gguf-work")) } else { exports_dir(p).join(name_of(&list[0])) };
     let _ = std::fs::remove_dir_all(if many { out.clone() } else { out.join("__none__") });
     std::fs::create_dir_all(&out)?;
+    // a base made by "Slim or grow a model" keeps the original's vision part: its vision file comes from the original model
+    let origin = read_json(&std::path::Path::new(&repo).join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
                      "max_seq": cfg["hyper"]["max_seq"]});
+    if let Some(o) = &origin {
+        job["base"]["vision_repo"] = json!(o);
+    }
     // a full fine-tune saved the whole model (nothing to merge); a LoRA run saved an adapter
     if is_full {
         job["full_model"] = json!(full);
@@ -173,7 +178,7 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
         std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
         std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
             world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
-            dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname,
+            dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname, derived_from: origin.as_deref(),
         }))?;
         let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
                           "created": created, "world": p.display_name(), "installed": []});

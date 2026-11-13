@@ -126,12 +126,12 @@ fn what_cannot_be_trained_is_refused_in_plain_words() {
 #[test]
 fn added_models_are_kept_listed_planned_and_removable() {
     let (_g, _d) = setup();
-    assert_eq!(models().len(), 5);
+    assert_eq!(models().len(), 6);
     let id = AppModel::custom_model_add("acme/Llama-3.2-3B-Instruct").unwrap();
     assert_eq!(id, "custom-acme-llama-3.2-3b-instruct");
     // only a model that passes the checks is ever saved
     assert!(AppModel::custom_model_add("acme/gated").is_err() && custom_models().len() == 1);
-    assert_eq!((models().len(), models()[5].custom, models()[0].custom), (6, true, false));
+    assert_eq!((models().len(), models()[6].custom, models()[0].custom), (7, true, false));
     let m = find(&id).unwrap();
     assert_eq!((m.family.as_str(), m.params_b), ("generic", 3.21));
     // it is planned like any other model
@@ -145,12 +145,12 @@ fn added_models_are_kept_listed_planned_and_removable() {
     // adding twice keeps one; built-in models cannot be removed; removing works and is remembered
     add_custom(m.clone()).unwrap();
     assert_eq!(custom_models().len(), 1);
-    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 6);
+    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 7);
     remove_custom(&id).unwrap();
-    assert_eq!((models().len(), find(&id).is_none()), (5, true));
+    assert_eq!((models().len(), find(&id).is_none()), (6, true));
     // a damaged file counts as no models
     std::fs::write(std::path::Path::new(&std::env::var("NDFORGE_CONFIG_DIR").unwrap()).join("custom_models.json"), "{ not json").unwrap();
-    assert_eq!(models().len(), 5);
+    assert_eq!(models().len(), 6);
 }
 
 #[test]
@@ -230,4 +230,42 @@ fn a_model_that_is_a_folder_is_trained_on_this_computer_only() {
     assert!(e.0.contains("is a folder on this computer") && e.0.contains("cannot be trained on a server"), "{e}");
     // on this computer it gets as far as the data (there is none yet)
     assert!(m.train_job(&id, Method::Lora, Preset::Quick, &json!({}), None, None).unwrap_err().0.contains("Save a version"));
+}
+
+#[test]
+fn a_folder_made_by_slim_or_grow_has_its_exact_size_and_says_where_it_came_from() {
+    let (_g, d) = setup();
+    let meta = json!({"format": 1, "origin": {"repo": "acme/Big-27B", "layers": 64, "params": 27_800_000_000u64}, "mode": "prune", "layers": 48, "params": 21_634_000_000u64});
+    let f = model_folder(d.path(), "20261113-slim-48L", &[("README.md", "---\nlicense: apache-2.0\n---\n# Slim\n"), ("ndforge_reshape.json", &meta.to_string())], &[("model.safetensors", 50_000_000)]);       // small on purpose: Windows does not make set_len sparse
+    let found = lookup(&f.to_string_lossy()).unwrap();
+    assert!((found.entry.params_b - 21.63).abs() < 0.001, "{:?}", found.entry);                    // the exact figure from the metadata, not file size / 2 (which would be 0.03)
+    assert!(!found.warnings.iter().any(|w| w.contains("estimated")), "{:?}", found.warnings);
+    assert!(found.warnings.iter().any(|w| w.contains("made by Slim or grow from acme/Big-27B")), "{:?}", found.warnings);
+    assert_eq!(found.entry.license, "apache-2.0");
+    assert!(found.entry.derived_from.is_none() && found.entry.reshape.is_none());                  // `reshape::runs::register` fills these in
+}
+
+#[test]
+fn old_custom_model_files_still_load_and_new_fields_are_kept() {
+    let (_g, d) = setup();
+    let cfg = d.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // a file written before derived_from / reshape existed
+    let old = json!([{"id": "custom-x", "name": "X", "family": "generic", "repo": "a/b", "official": "a/b", "params_b": 1.0, "license": "mit", "vram_lora_gb": 3.0,
+        "vram_qlora_gb": 2.7, "good_for": "g", "note": "n", "custom": true}]);
+    std::fs::write(cfg.join("custom_models.json"), old.to_string()).unwrap();
+    let list = custom_models();
+    assert_eq!(list.len(), 1);
+    assert!(list[0].derived_from.is_none() && list[0].reshape.is_none());
+    let mut e = list[0].clone();
+    e.id = "custom-y".into();
+    e.derived_from = Some("a/b".into());
+    e.reshape = Some("slimmed: 64 → 48 layers".into());
+    add_custom(e).unwrap();
+    let text = std::fs::read_to_string(cfg.join("custom_models.json")).unwrap();
+    let back = custom_models();
+    assert_eq!(back.len(), 2);
+    assert_eq!(back[1].derived_from.as_deref(), Some("a/b"));
+    assert_eq!(back[1].reshape.as_deref(), Some("slimmed: 64 → 48 layers"));
+    assert_eq!(text.matches("derived_from").count(), 1, "entries without the field do not write it");
 }

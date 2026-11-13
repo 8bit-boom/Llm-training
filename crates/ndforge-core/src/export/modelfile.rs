@@ -119,6 +119,8 @@ pub struct CardInfo<'a> {
     pub steps: Option<u64>,
     pub final_loss: Option<f64>,
     pub ollama_name: &'a str,
+    /// the model the base model was made from, when the base is a slimmed or grown one (Slim or grow a model)
+    pub derived_from: Option<&'a str>,
 }
 
 /// A short README that travels with the model files.
@@ -128,7 +130,7 @@ pub fn model_card(c: &CardInfo) -> String {
 
 Made with ND Lore Forge.
 
-- Base model: {base} ({license}; the tuned model keeps that licence)
+- Base model: {base} ({license}; the tuned model keeps that licence){derived}
 - Training: {method}, SFT on saved data version {ver}{steps}{loss}
 - Format: GGUF {quant}
 - Audience: **the game master only**. It was trained on ALL of the world's text, including GM secrets, and it repeats them.
@@ -139,6 +141,7 @@ Made with ND Lore Forge.
 - Do not let players use AI chat with this model.
 ",
         name = c.model_name, world = c.world, base = c.base_repo, license = c.license, method = c.method, ver = c.dataset_version, quant = c.quant, oname = c.ollama_name,
+        derived = c.derived_from.map(|o| format!("\n- The base model was made from {o} by removing or adding layers (ND Lore Forge, Slim or grow a model)")).unwrap_or_default(),
         steps = c.steps.map(|s| format!(", {s} steps")).unwrap_or_default(),
         loss = c.final_loss.map(|l| format!(", final loss {l:.3}")).unwrap_or_default())
 }

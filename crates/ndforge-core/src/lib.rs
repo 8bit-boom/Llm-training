@@ -16,6 +16,7 @@ pub mod power;
 pub mod project;
 pub mod secrets;
 pub mod remote;
+pub mod reshape;
 pub mod train;
 pub mod sample;
 pub mod teacher;

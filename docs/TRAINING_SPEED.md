@@ -12,7 +12,7 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 | FlashAttention | Not worth chasing on the 5090 | PyTorch's built-in attention is already close to the card's limit; FlashAttention-4 targets datacenter Blackwell (sm_100/103), not sm_120; FlashAttention-2 wheels for Windows are community builds (CUDA 13 / nightly). Its real value for us is padding-free batching. |
 | SageAttention | Skip | Mainly an inference tool; its 8-bit training variant (SageBwd) is research code, not in Hugging Face or Unsloth. |
 | `torch.compile` | Low priority | Unsloth already compiles its hot paths; Windows needs community Triton builds; varying shapes recompile unless lengths are bucketed. |
-| QLoRA / 4-bit | Not for speed | Slower than 16-bit LoRA (one anecdote: ~23 %) and Unsloth advises against 4-bit for Qwen3.5. All five models fit the 5090 in 16-bit. |
+| QLoRA / 4-bit | Not for speed | Slower than 16-bit LoRA (one anecdote: ~23 %) and 4-bit loses a little more quality than 16-bit on Qwen3.5 (fine for the dense models, Unsloth's caution is about the MoE ones). All five models fit the 5090 in 16-bit. |
 | FP8 / NVFP4 | Not now | Unsloth reports its first FP8 LoRA was ~4x slower than BF16 on an H100, ~80 % of BF16 after rework: a memory saving. FP4 training on consumer cards is poorly documented. |
 | Fused / chunked cross-entropy (Liger, cut cross-entropy) | Later, plain-libraries path only | ~250k-token vocabularies make the logits large; Unsloth already handles it. Liger support for Qwen3.5 / Gemma 4 not confirmed. |
 | Tesla T10 | Few options | No bf16, no FlashAttention (needs sm_80+): fp16 and PyTorch's memory-efficient attention. Gemma in fp16 stability: unverified. |
@@ -30,6 +30,9 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 
 ## Engine: with or without Unsloth
 `engine` (Expert mode, *Training engine*): `auto` = Unsloth when the setup installed it (the worker falls back by itself if it cannot be used), `unsloth`, or `standard` = Transformers + PEFT + TRL only. The setup's *Install without Unsloth* installs only the standard libraries (`transformers>=5`, trl, peft, datasets, accelerate, bitsandbytes) and then tries two optional extras one by one, each allowed to fail: flash-linear-attention (Qwen3.5's fast kernels) and, on Windows, triton-windows (the Triton they need). The speed options above (bucketing, checkpointing probe, advanced options) apply to this path. The plan's memory figures come from Unsloth's guides, so without Unsloth the plan says that the real need can be higher. How much slower or hungrier the standard path is on a 5090 has not been measured.
+
+## Slimmed and grown models
+A **slimmed** model (whole blocks of layers removed on the *Slim or grow a model* page) has fewer layers, so it trains and answers faster and needs less memory per token; the saving is roughly the share of layers removed (the embeddings and the output layer do not shrink). A **grown** model is slower and bigger in the same proportion (about 40 % for 32 → 48 layers). None of this is measured yet: use the benchmark (*Find the fastest settings*) on the made model, like on any other. See docs/RESHAPE.md.
 
 ## Next
 1. Run a Quick test on the 5090 and read the `speed` line: how much padding, which attention backend, are the Qwen3.5 kernels active.

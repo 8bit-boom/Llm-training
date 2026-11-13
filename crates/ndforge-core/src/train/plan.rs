@@ -77,6 +77,9 @@ pub struct Hyper {
     /// "auto" (Unsloth when it is installed, else the standard libraries), "unsloth" or "standard" (Transformers + PEFT + TRL only)
     #[serde(default = "auto")]
     pub engine: String,
+    /// Expert: train LoRA only in the layers a grown model added (a base made on the "Slim or grow a model" page by growing it)
+    #[serde(default)]
+    pub only_new_layers: bool,
 }
 
 fn off() -> String {
@@ -137,7 +140,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     if method == Method::Full {
         let f = |epochs: f64, max_steps, seq, warmup| Hyper {
             rank: 0, alpha: 0, lr: 1e-5, epochs, max_steps, batch: 1, grad_accum: 16, max_seq: seq, warmup, weight_decay: 0.01, scheduler: "linear".into(),
-            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(),
+            seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(), only_new_layers: false,
         };
         return match preset {
             Preset::Quick => Hyper { grad_accum: 4, ..f(1.0, Some(60), 1024, 5) },
@@ -147,7 +150,7 @@ pub fn base_hyper_for(method: Method, preset: Preset) -> Hyper {
     }
     let common = |rank, alpha, lr, epochs: f64, max_steps, batch, accum, seq, warmup| Hyper {
         rank, alpha, lr, epochs, max_steps, batch, grad_accum: accum, max_seq: seq, warmup, weight_decay: 0.001, scheduler: "linear".into(),
-        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(),
+        seed: 3407, save_steps: 50, logging_steps: 1, stages: "mixed".into(), book_epochs: 2.0, bucket: "auto".into(), compile: "off".into(), liger: "off".into(), padding_free: "off".into(), attention: "auto".into(), engine: "auto".into(), only_new_layers: false,
     };
     match preset {
         // proves the whole chain works in minutes; the model will not have learned much
@@ -246,7 +249,7 @@ pub fn plan(m: &ModelEntry, method: Method, preset: Preset, vram_gb: Option<f64>
         notes.push(format!("It needs about {:.0} GB of free disk space for checkpoints, and the result is a full copy of the model (about {:.0} GB) instead of a small add-on.", full_disk_gb(m), m.params_b * 2.0));
     }
     if method == Method::Qlora && m.family == "qwen3_5" {
-        notes.push("Unsloth advises against 4-bit training for Qwen3.5 (more quality loss than usual). Use 16-bit LoRA if it fits.".into());
+        notes.push("4-bit training works for the dense Qwen3.5 models (Unsloth's caution is about the MoE ones), but it loses a little more quality than 16-bit. Use 16-bit LoRA if it fits.".into());
     }
     if m.family == "gemma4" {
         notes.push("A training loss of 13-15 is normal for Gemma 4 E2B/E4B; it is not a problem.".into());

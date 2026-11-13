@@ -1,4 +1,4 @@
-//! The five models (catalog/models.toml, compiled in) and the ones the user adds from Hugging Face (`hub.rs` looks them up).
+//! The six models (catalog/models.toml, compiled in) and the ones the user adds from Hugging Face (`hub.rs` looks them up).
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,9 +15,15 @@ pub struct ModelEntry {
     pub vram_qlora_gb: f64,
     pub good_for: String,
     pub note: String,
-    /// added by the user from Hugging Face (not one of the five tested models)
+    /// added by the user from Hugging Face (not one of the six tested models)
     #[serde(default)]
     pub custom: bool,
+    /// the model this one was cut from / grown from (Hugging Face name or folder), for models made on the "Slim or grow a model" page
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
+    /// one line for the model list, e.g. "slimmed: 64 → 48 layers"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reshape: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -25,7 +31,7 @@ struct File {
     model: Vec<ModelEntry>,
 }
 
-/// The five models that ship with the program.
+/// The six models that ship with the program.
 pub fn builtin_models() -> Vec<ModelEntry> {
     toml::from_str::<File>(include_str!("../../../../catalog/models.toml")).expect("catalog/models.toml is valid").model
 }

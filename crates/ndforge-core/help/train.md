@@ -38,6 +38,9 @@ Teaches the chosen model your world. It uses the **newest saved version** from S
 - *"could not be downloaded"*: check the internet connection and try again.
 - *The loss stays flat or becomes `nan`*: lower the learning rate (Expert mode) and try again.
 
+## Slimmed and grown models
+A model made on **🧬 Slim or grow a model** is in the list too (marked *added*, with a line such as *slimmed: 64 → 48 layers*). Train it like any other. A slimmed model answers worse than the original until it has been trained; a big one usually needs QLoRA on a 32 GB card. A grown model that started as an exact copy also trains its switched-off layers' output weights automatically; Expert mode has *Train only the new layers*.
+
 ## Adding a model of your own from Hugging Face
 Under the model cards press **＋ Add a model from Hugging Face…**, type the model's name as it appears on <https://huggingface.co> (like `unsloth/Qwen3-4B`) or paste its address, and press **Look it up**. The program reads the model's public description and tells you what it found: size, licence, chat format and a memory estimate. Then **Add it to the list**; it appears as a card marked *added* and works like the five built-in ones. The **✕** button next to the list removes it again.
 

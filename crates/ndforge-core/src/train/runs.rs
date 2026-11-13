@@ -123,7 +123,32 @@ pub fn build_job(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper, ver
             {"name": "practice", "filter": "chat", "epochs": hyper.epochs},
         ]);
     }
+    reshaped_base_options(m, hyper, &mut job)?;
     Ok(job)
+}
+
+/// The layers a grown model added: the second copy of every layer that appears twice in `src_layers` (the same rule the worker used for "zero_init").
+pub fn new_layers(meta: &Value) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::new();
+    meta["src_layers"].as_array().map(|a| a.iter().enumerate().filter_map(|(j, s)| (!seen.insert(s.as_u64()?)).then_some(j as u32)).collect()).unwrap_or_default()
+}
+
+/// A base model made by "Slim or grow a model" may need more than the usual LoRA: a grown model that started as an exact copy has switched-off layers
+/// (output weights zero) whose output projection must be trained too (`hyper.extra_targets`), and the expert option "train only the new layers" becomes
+/// `hyper.layers_to_transform`. Both go into the job only, not into the saved settings.
+fn reshaped_base_options(m: &ModelEntry, hyper: &Hyper, job: &mut Value) -> Result<()> {
+    let meta = read_json(&Path::new(&m.repo).join("ndforge_reshape.json"));
+    if hyper.only_new_layers {
+        let new = meta.as_ref().map(new_layers).unwrap_or_default();
+        if new.is_empty() {
+            return Err(Error::new("\"Train only the new layers\" needs a model that was grown on the Slim or grow page."));
+        }
+        job["hyper"]["layers_to_transform"] = json!(new);
+    }
+    if meta.as_ref().is_some_and(|mt| mt["zero_init"].as_array().is_some_and(|z| !z.is_empty())) {
+        job["hyper"]["extra_targets"] = json!(["out_proj"]);
+    }
+    Ok(())
 }
 
 fn set_state(dir: &Path, patch: Value) {
