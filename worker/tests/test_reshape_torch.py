@@ -98,3 +98,57 @@ def test_scoring_chooses_the_middle_block_and_reports_numbers(tmp_path, base12):
     meta = json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())
     assert meta["calibration"]["version"] == 1 and meta["calibration"]["tokens"] > 0 and meta["loss_after"] == r["loss_after"]
     assert load(j["final"]).config.num_hidden_layers == 8
+
+
+# ------------------------------------------------------------------------- healing: training and testing on a reshaped base
+
+def reshaped_base(tmp_path, mode="prune", **over):
+    """a 12-layer original in tmp_path/model (where the training helpers expect it) and the reshaped copy; returns (original, reshaped)"""
+    original = build_arch_dir(tmp_path / "model", "qwen3_5", num_layers=12)
+    j = job(tmp_path, original, mode, **({"drop_layers": [4, 5, 6, 7]} if mode == "prune" else {"blocks": 1}), **over)
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    return original, Path(j["final"])
+
+
+def test_a_lora_run_on_the_pruned_base_is_tested_against_the_original(tmp_path):
+    pytest.importorskip("trl")
+    pytest.importorskip("peft")
+    from test_train_cpu import run_eval
+    from test_train_cpu import run_job as run_train
+    original, slim = reshaped_base(tmp_path)
+    p, ev, out = run_train(tmp_path, "qwen3_5", "real", model={"repo": str(slim)}, hyper={"max_steps": 6})
+    assert p.returncode == 0, p.stderr[-3000:]
+    p2, ev2 = run_eval(tmp_path, "qwen3_5", adapter=str(out / "adapter"), trained_base=str(slim), load_4bit={"original": False, "trained": False})
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    ans = json.loads((tmp_path / "answers.json").read_text(encoding="utf-8"))
+    assert set(ans) == {"original", "trained"} and set(ans["original"]) == {"a", "b"} == set(ans["trained"])
+    assert ev2[-1]["data"]["loaded"] == {"original": "16-bit", "trained": "16-bit"}
+
+
+def test_training_a_grown_identity_model_reaches_the_switched_off_output_projections(tmp_path):
+    pytest.importorskip("trl")
+    pytest.importorskip("peft")
+    from safetensors.torch import load_file
+    from test_train_cpu import run_job as run_train
+    original, grown = reshaped_base(tmp_path, "grow")
+    p, ev, out = run_train(tmp_path, "qwen3_5", "real", model={"repo": str(grown)}, hyper={"max_steps": 4, "extra_targets": ["out_proj"]})
+    assert p.returncode == 0, p.stderr[-3000:]
+    keys = list(load_file(str(Path(ev[-1]["data"]["adapter_dir"]) / "adapter_model.safetensors")))
+    assert any("linear_attn.out_proj" in k for k in keys), keys[:10]
+
+
+def test_a_pruned_model_can_be_exported_to_gguf_with_llama_cpp(tmp_path):
+    pytest.importorskip("trl")
+    pytest.importorskip("peft")
+    from ndforge_worker import exportjob
+    if exportjob.find_llama_cpp()[0] is None:
+        pytest.skip("llama.cpp is not installed here (set LLAMA_CPP_DIR)")
+    from test_train_cpu import run_export
+    from test_train_cpu import run_job as run_train
+    original, slim = reshaped_base(tmp_path)
+    p, ev, out = run_train(tmp_path, "qwen3_5", "real", model={"repo": str(slim)}, hyper={"max_steps": 2})
+    assert p.returncode == 0, p.stderr[-3000:]
+    p2, ev2 = run_export(tmp_path, "qwen3_5", out, base={"repo": str(slim), "family": "qwen3_5"}, gguf=True, quant="q8_0")
+    assert p2.returncode == 0, p2.stderr[-3000:]
+    assert Path(ev2[-1]["data"]["gguf"]).stat().st_size > 0

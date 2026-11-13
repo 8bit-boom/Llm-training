@@ -61,6 +61,21 @@ def _load_with_attention(load, kwargs: dict, attn):
         return load(**kwargs)
 
 
+def lora_targets(h: dict) -> list:
+    """The LoRA target modules: the standard list plus `hyper.extra_targets` (a grown model's switched-off layers need their output projection trained)."""
+    out = list(QWEN_TARGETS)
+    for t in h.get("extra_targets") or []:
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def lora_layers(h: dict):
+    """`hyper.layers_to_transform` (indices of the layers LoRA is attached to) as a list, or None for every layer."""
+    layers = h.get("layers_to_transform")
+    return [int(i) for i in layers] if layers else None
+
+
 def load_unsloth(cfg: dict):
     from unsloth import FastLanguageModel, FastModel
     fam = family(cfg["model"]["family"])
@@ -85,8 +100,14 @@ def load_unsloth(cfg: dict):
         model = FastModel.get_peft_model(model, finetune_vision_layers=False, finetune_language_layers=True,
                                          finetune_attention_modules=True, finetune_mlp_modules=True, **common)
     else:
-        model = FastLanguageModel.get_peft_model(model, target_modules=QWEN_TARGETS, use_gradient_checkpointing="unsloth",
-                                                 max_seq_length=h["max_seq"], **common)
+        peft_kw = dict(target_modules=lora_targets(h), use_gradient_checkpointing="unsloth", max_seq_length=h["max_seq"], **common)
+        layers = lora_layers(h)
+        if layers:
+            try:
+                return FastLanguageModel.get_peft_model(model, layers_to_transform=layers, **peft_kw), tokenizer, loader
+            except TypeError:
+                protocol.log("Training only some layers is not supported by Unsloth here; training all layers.")
+        model = FastLanguageModel.get_peft_model(model, **peft_kw)
     return model, tokenizer, loader
 
 
@@ -141,6 +162,8 @@ def load_hf(cfg: dict):
         from peft import PeftModel
         return PeftModel.from_pretrained(model, cfg["init_adapter"], is_trainable=True), tokenizer, None
     lora_kw = dict(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear")
+    if lora_layers(h):
+        lora_kw.update(layers_to_transform=lora_layers(h), layers_pattern="layers")
     try:   # the image / audio parts of a multimodal model stay as they are: only the language layers learn (so the base model's vision file still fits)
         lora = LoraConfig(exclude_modules=r".*(vision|visual|audio|image|multi_modal|mm_projector|embed_vision|embed_audio).*", **lora_kw)
     except TypeError:   # an older PEFT has no exclude_modules
