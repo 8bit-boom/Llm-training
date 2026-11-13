@@ -385,7 +385,7 @@ def run_job(tmp_path, job):
 
 
 INSPECT_KEYS = {"model_type", "supported", "why", "layers", "layer_types", "period", "blocks", "layer_params", "embed_params", "lm_head_params", "vision_params",
-                "mtp_params", "other_params", "total_params", "bytes_per_param", "has_vision", "tied", "source_bytes", "local"}
+                "mtp_params", "other_params", "total_params", "bytes_per_param", "has_vision", "tied", "source_bytes", "local", "width_dims", "width_supported", "width_why", "width_choices"}
 
 
 def test_inspect_job_on_a_fake_qwen_folder(tmp_path):

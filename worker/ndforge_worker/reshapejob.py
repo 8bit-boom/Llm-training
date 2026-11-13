@@ -12,7 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import protocol, reshape, safetensors_io, vision
+from . import protocol, reshape, reshape_width, safetensors_io, vision
 from .reshape import ReshapeError
 
 # copied byte for byte from the source folder when present (the weights and the index are written, never copied)
@@ -49,10 +49,20 @@ def check_period(cfg: dict, types: list) -> int:
 def _empty(mt: str, why: str, layers: int = 0, local: bool = False) -> dict:
     return {"model_type": mt, "supported": False, "why": why, "layers": layers, "layer_types": [], "period": 1, "blocks": 0, "layer_params": [],
             "embed_params": 0, "lm_head_params": 0, "vision_params": 0, "mtp_params": 0, "other_params": 0, "total_params": 0, "bytes_per_param": 2.0,
-            "has_vision": False, "tied": False, "source_bytes": 0, "local": local}
+            "has_vision": False, "tied": False, "source_bytes": 0, "local": local,
+            "width_dims": None, "width_supported": False, "width_why": why, "width_choices": None}
 
 
-def inspect_model(repo: str) -> dict:
+def _width_info(cfg: dict, divisor: int) -> dict:
+    """What the page needs to offer "thinner layers": the sizes, whether this model allows it, and why not."""
+    why = reshape_width.width_supported(cfg)
+    if why:
+        return {"width_dims": None, "width_supported": False, "width_why": why, "width_choices": None}
+    dims = reshape_width.width_dims(cfg)
+    return {"width_dims": dims, "width_supported": True, "width_why": None, "width_choices": reshape_width.width_choices(dims, divisor)}
+
+
+def inspect_model(repo: str, divisor: int = reshape_width.FFN_DIVISOR) -> dict:
     local = Path(repo).is_dir()
     if local:
         f = Path(repo) / "config.json"
@@ -83,7 +93,7 @@ def inspect_model(repo: str) -> dict:
             "layer_params": groups["layers"], "embed_params": groups["embed"], "lm_head_params": groups["lm_head"], "vision_params": groups["vision"],
             "mtp_params": groups["mtp"], "other_params": groups["other"], "total_params": groups["total"], "bytes_per_param": groups["bytes_per_param"],
             "has_vision": groups["vision"] > 0 or cfg.get("vision_config") is not None, "tied": groups["lm_head"] == 0,
-            "source_bytes": source_bytes, "local": local}
+            "source_bytes": source_bytes, "local": local, **_width_info(cfg, divisor)}
 
 
 def reshape_numel(shape) -> int:
@@ -96,7 +106,7 @@ def reshape_numel(shape) -> int:
 def run_inspect(cfg: dict) -> int:
     protocol.reserve_stdout()
     protocol.progress("inspect", 0.0, "Reading the model's layout")
-    out = inspect_model(cfg["source"]["repo"])
+    out = inspect_model(cfg["source"]["repo"], int(cfg.get("ffn_divisor", reshape_width.FFN_DIVISOR)))
     protocol.progress("inspect", 1.0, "")
     protocol.result(out)
     return 0

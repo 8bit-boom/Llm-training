@@ -371,3 +371,42 @@ def test_plan_width_refuses_what_it_cannot_do_safely():
     tiny_src = [st.OutTensor("model.language_model.layers.0.mlp.down_proj.weight", "BF16", (8, 8), st.TensorRef("f", "BF16", (8, 8), 0, 128))]
     with pytest.raises(ReshapeError, match="smaller than"):
         rw.plan_width(tiny_src, list(range(8)), fake_types(), dims, width, keep, None)
+
+
+# ----------------------------------------------------------------------------------------------------- 6: inspect
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+WORKER = Path(__file__).resolve().parents[1]
+
+
+def run_job(tmp_path, job):
+    f = tmp_path / "job.json"
+    f.write_text(json.dumps(job), encoding="utf-8")
+    p = subprocess.run([sys.executable, "-m", "ndforge_worker", str(f)], cwd=WORKER, capture_output=True, text=True, timeout=120)
+    return p.returncode, [json.loads(line) for line in p.stdout.splitlines()]
+
+
+def test_inspect_job_reports_the_width_options(tmp_path):
+    d = fake_qwen_width(tmp_path)
+    code, ev = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d)}, "ffn_divisor": 4})
+    r = ev[-1]["data"]
+    assert code == 0 and r["supported"] and r["width_supported"] is True and r["width_why"] is None
+    assert r["width_dims"] == fake_dims()
+    assert r["width_choices"] == {"intermediate": [16, 20, 24, 28, 32], "lin_v_heads": [4, 2], "heads": [6, 4]}
+    # the real divisor leaves a tiny model without choices rather than offering sizes the GGUF export dislikes
+    r = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(d)}})[1][-1]["data"]
+    assert r["width_supported"] is True and r["width_choices"]["intermediate"] == []
+
+
+def test_inspect_says_why_width_is_not_possible(tmp_path):
+    from fakemodel import fake_model
+    llama = fake_model(tmp_path, 6, "llama")
+    r = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(llama)}})[1][-1]["data"]
+    assert r["supported"] and r["width_supported"] is False and r["width_why"] == rw.NOT_DENSE and r["width_dims"] is None and r["width_choices"] is None
+    gemma = tmp_path / "gemma"
+    gemma.mkdir()
+    (gemma / "config.json").write_bytes((DATA / "gemma4_config.json").read_bytes())
+    r = run_job(tmp_path, {"job": "reshape_inspect", "source": {"repo": str(gemma)}})[1][-1]["data"]
+    assert r["supported"] is False and r["width_supported"] is False and r["width_why"] == r["why"]
