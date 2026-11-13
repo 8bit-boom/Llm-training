@@ -443,3 +443,152 @@ def test_inspect_of_a_hub_model_reads_headers_only(tmp_path, monkeypatch):
     local = reshapejob.inspect_model(str(d))
     assert r["local"] is False and local["local"] is True
     assert {k: v for k, v in r.items() if k != "local"} == {k: v for k, v in local.items() if k != "local"}
+
+
+# ---------------------------------------------------------------------------------------------------- 12: the reshape job
+
+from fakemodel import tensor_numbers  # noqa: E402
+from stfile import fill, read_folder  # noqa: E402
+
+RESULT_KEYS = {"model_dir", "mode", "layers_before", "layers_after", "src_layers", "dropped", "duplicated", "zero_init", "params_before", "params_after",
+               "bytes_written", "loss_before", "loss_after", "ppl_before", "ppl_after", "stable", "boundary_distance", "chosen_blocks", "load", "seconds",
+               "notes", "stopped"}
+
+
+def job(tmp_path, src, mode, **kw):
+    d = tmp_path / "models" / "m1"
+    d.mkdir(parents=True, exist_ok=True)
+    return {"job": "reshape", "source": {"repo": str(src), "family": "qwen3_5"}, "mode": mode, "blocks": 1, "strategy": "contiguous",
+            "protect": {"first": 1, "last": 1}, "drop_layers": None, "grow": {"layout": "solar", "init": "identity"}, "load": "auto", "check": False,
+            "shard_gb": 5, "out": str(d / "model.partial"), "final": str(d / "model"), **kw}
+
+
+def test_grow_with_identity_start(tmp_path):
+    src = fake_model(tmp_path, 8)
+    j = job(tmp_path, src, "grow")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    assert set(r) == RESULT_KEYS and r["stopped"] is False
+    final = Path(j["final"])
+    assert final.is_dir() and not Path(j["out"]).exists()
+    cfg = json.loads((final / "config.json").read_text())
+    assert cfg["text_config"]["num_hidden_layers"] == 12 and cfg["text_config"]["layer_types"] == types(12) and cfg["vision_config"] == json.loads((src / "config.json").read_text())["vision_config"]
+    assert r["layers_before"] == 8 and r["layers_after"] == 12 and r["src_layers"] == list(range(4)) + list(range(8)) and r["zero_init"] == [4, 5, 6, 7]
+    assert r["dropped"] == [] and r["duplicated"] == [0, 1, 2, 3] and r["params_after"] > r["params_before"] and r["notes"]
+    # side files, the licence, the description
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json"):
+        assert (final / name).read_bytes() == (src / name).read_bytes()
+    assert (final / "README.md").read_text().startswith("---\nlicense: apache-2.0\n---\n")
+    meta = json.loads((final / "ndforge_reshape.json").read_text())
+    assert meta["format"] == 1 and meta["origin"]["layers"] == 8 and meta["layers"] == 12 and meta["period"] == 4 and meta["zero_init"] == [4, 5, 6, 7]
+    assert meta["src_layers"] == r["src_layers"] and meta["params"] == r["params_after"] and meta["mode"] == "grow" and meta["vision"].startswith("unchanged")
+    # the weights: the folder reads back, bytes are those of the source, zeroed outputs are zero
+    from ndforge_worker import safetensors_io
+    refs = safetensors_io.list_tensors(final)
+    assert sum(r_.numel for r_ in refs.values()) == r["params_after"]
+    nums = tensor_numbers(8, "qwen3_5")
+    data = read_folder(final)
+    pre = "model.language_model.layers."
+    assert data[pre + "5.mlp.up_proj.weight"][2] == fill(nums[pre + "1.mlp.up_proj.weight"], 16 * 8 * 2)
+    assert data[pre + "5.mlp.down_proj.weight"][2] == bytes(8 * 16 * 2) and data[pre + "5.linear_attn.out_proj.weight"][2] == bytes(8 * 8 * 2)
+    assert data[pre + "7.self_attn.o_proj.weight"][2] == bytes(8 * 8 * 2)
+    assert data[pre + "11.self_attn.o_proj.weight"][2] == fill(nums[pre + "7.self_attn.o_proj.weight"], 8 * 8 * 2)
+    assert data["lm_head.weight"][2] == fill(nums["lm_head.weight"], 10 * 8 * 2) and data["mtp.fc.weight"][2] == fill(nums["mtp.fc.weight"], 8 * 16 * 2)
+    # progress was reported
+    steps = {e["step"] for e in ev if e["type"] == "progress"}
+    assert {"inspect", "write", "done"} <= steps
+
+
+def test_grow_by_copying_keeps_every_weight(tmp_path):
+    src = fake_model(tmp_path, 8)
+    code, ev = run_job(tmp_path, job(tmp_path, src, "grow", grow={"layout": "solar", "init": "copy"}))
+    r = ev[-1]["data"]
+    assert code == 0 and r["zero_init"] == [] and r["notes"] == []
+    data = read_folder(Path(job(tmp_path, src, "grow")["final"]))
+    assert data["model.language_model.layers.5.mlp.down_proj.weight"][2] == data["model.language_model.layers.1.mlp.down_proj.weight"][2] != bytes(8 * 16 * 2)
+
+
+def test_prune_with_an_explicit_layer_list(tmp_path):
+    src = fake_model(tmp_path, 12)
+    j = job(tmp_path, src, "prune", drop_layers=[4, 5, 6, 7])
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    r = ev[-1]["data"]
+    assert set(r) == RESULT_KEYS and r["layers_after"] == 8 and r["dropped"] == [4, 5, 6, 7] and r["chosen_blocks"] == [1] and r["src_layers"] == [0, 1, 2, 3, 8, 9, 10, 11]
+    final = Path(j["final"])
+    cfg = json.loads((final / "config.json").read_text())
+    assert cfg["text_config"]["num_hidden_layers"] == 8 and cfg["text_config"]["layer_types"] == types(8)
+    data = read_folder(final)
+    nums = tensor_numbers(12, "qwen3_5")
+    pre = "model.language_model.layers."
+    assert not any(k.startswith(pre + "8.") for k in data)
+    assert data[pre + "4.mlp.up_proj.weight"][2] == fill(nums[pre + "8.mlp.up_proj.weight"], 16 * 8 * 2)
+    meta = json.loads((final / "ndforge_reshape.json").read_text())
+    assert meta["dropped"] == [4, 5, 6, 7] and meta["strategy"] == "explicit" and meta["layers"] == 8
+
+
+def test_prune_refuses_layers_that_are_not_whole_blocks(tmp_path):
+    src = fake_model(tmp_path, 12)
+    code, ev = run_job(tmp_path, job(tmp_path, src, "prune", drop_layers=[3, 4, 5, 6]))
+    assert code == 1 and ev[-1]["code"] == "reshape_refused" and "do not form whole blocks of 4" in ev[-1]["message"]
+    assert not (tmp_path / "models" / "m1" / "model").exists()
+
+
+def test_prune_needing_scores_without_torch_says_so(tmp_path):
+    try:
+        import torch  # noqa: F401
+        pytest.skip("torch is installed: the scoring path is tested in test_reshape_torch.py")
+    except ImportError:
+        pass
+    src = fake_model(tmp_path, 12)
+    code, ev = run_job(tmp_path, job(tmp_path, src, "prune"))
+    assert code == 1 and ev[-1]["code"] == "reshape_refused" and "Training setup" in ev[-1]["message"]
+
+
+def test_out_of_range_blocks_are_refused(tmp_path):
+    src = fake_model(tmp_path, 8)
+    code, ev = run_job(tmp_path, job(tmp_path, src, "grow", blocks=3))
+    assert code == 1 and ev[-1]["code"] == "reshape_refused" and "at most half" in ev[-1]["message"]
+
+
+def test_not_enough_disk_space_is_reported_before_anything_is_written(tmp_path, monkeypatch):
+    import io
+    import shutil
+    from ndforge_worker import protocol, reshapejob
+    buf = io.StringIO()
+    monkeypatch.setattr(protocol, "_out", buf)
+    monkeypatch.setattr(protocol, "reserve_stdout", lambda: None)
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: (10, 9, 1))
+    src = fake_model(tmp_path, 8)
+    j = job(tmp_path, src, "grow")
+    assert reshapejob.run(j) == 1
+    ev = [json.loads(line) for line in buf.getvalue().splitlines()]
+    assert ev[-1]["type"] == "error" and ev[-1]["code"] == "disk_full" and "not enough free space" in ev[-1]["message"]
+    assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
+
+
+def test_a_stop_file_cancels_and_cleans_up(tmp_path):
+    src = fake_model(tmp_path, 8)
+    j = job(tmp_path, src, "grow")
+    (Path(j["out"]).parent / "STOP").write_text("")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None}
+    assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
+
+
+def test_a_llama_model_without_layer_types_can_be_cut_and_grown(tmp_path):
+    src = fake_model(tmp_path, 6, "llama")
+    code, ev = run_job(tmp_path, job(tmp_path, src, "prune", drop_layers=[2, 3]))
+    assert code == 0, ev[-1]
+    assert ev[-1]["data"]["layers_after"] == 4
+    cfg = json.loads((Path(job(tmp_path, src, "prune")["final"]) / "config.json").read_text())
+    assert cfg["num_hidden_layers"] == 4 and "layer_types" not in cfg
+
+
+def test_an_existing_target_is_not_overwritten(tmp_path):
+    src = fake_model(tmp_path, 8)
+    j = job(tmp_path, src, "grow")
+    Path(j["final"]).mkdir(parents=True)
+    code, ev = run_job(tmp_path, j)
+    assert code == 1 and "already exists" in ev[-1]["message"]
