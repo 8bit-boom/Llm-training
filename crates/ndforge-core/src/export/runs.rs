@@ -34,11 +34,19 @@ pub struct ImatrixOptions {
     /// where the general text comes from; None = the program's default
     #[serde(default)]
     pub general: Option<crate::general::GeneralSource>,
+    /// also measure the speculative-decoding (MTP) head. On by default: the worker uses it only when the model has a head and llama-imatrix has `--nextn`
+    /// (else it says so in a note); the page shows the tick only for a model with a head.
+    #[serde(default = "default_nextn")]
+    pub nextn: bool,
+}
+
+fn default_nextn() -> bool {
+    true
 }
 
 impl Default for ImatrixOptions {
     fn default() -> Self {
-        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None }
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true }
     }
 }
 
@@ -74,12 +82,88 @@ pub fn saved_imatrices(p: &Project, run: &str) -> Vec<(PathBuf, Value)> {
     found
 }
 
+/// Does this model folder carry a speculative-decoding (MTP / NextN) head? `Some(true)` / `Some(false)`, `None` when the folder tells nothing (no config, no tensors read).
+/// Reads config.json (`mtp_num_hidden_layers` / `num_nextn_predict_layers`, also inside `text_config`), else the tensor names of model.safetensors.index.json or of the
+/// header of each .safetensors file. The worker does the same (imatrix.folder_has_mtp).
+pub fn mtp_head_in(dir: &std::path::Path) -> Option<bool> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let cfg = read_json(&dir.join("config.json"));
+    let key = |v: &Value| ["mtp_num_hidden_layers", "num_nextn_predict_layers"].iter().any(|k| v[*k].as_u64().is_some_and(|n| n > 0));
+    if let Some(c) = &cfg {
+        if key(c) || key(&c["text_config"]) {
+            return Some(true);
+        }
+    }
+    let is_mtp = |n: &str| n.starts_with("mtp.") || n.starts_with("model.mtp.");
+    if let Some(idx) = read_json(&dir.join("model.safetensors.index.json")) {
+        return idx["weight_map"].as_object().map(|m| m.keys().any(|k| is_mtp(k))).or(cfg.as_ref().map(|_| false));
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|f| f.extension().is_some_and(|x| x == "safetensors")).collect();
+    files.sort();
+    if files.is_empty() {
+        return cfg.as_ref().map(|_| false);
+    }
+    for f in files {
+        use std::io::Read;
+        let mut fh = std::fs::File::open(&f).ok()?;
+        let mut len = [0u8; 8];
+        fh.read_exact(&mut len).ok()?;
+        let n = u64::from_le_bytes(len);
+        if n > 1 << 28 {
+            return None;
+        }
+        let mut raw = vec![0u8; n as usize];
+        fh.read_exact(&mut raw).ok()?;
+        let header: Value = serde_json::from_slice(&raw).ok()?;
+        if header.as_object()?.keys().any(|k| is_mtp(k)) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Snapshot folders of a Hugging Face model id in the local cache (HF_HUB_CACHE, HF_HOME/hub, ~/.cache/huggingface/hub), newest first.
+fn hf_cache_snapshots(repo: &str) -> Vec<PathBuf> {
+    if !repo.contains('/') || std::path::Path::new(repo).exists() {
+        return vec![];
+    }
+    let mut roots: Vec<PathBuf> = vec![];
+    if let Ok(v) = std::env::var("HF_HUB_CACHE") { roots.push(PathBuf::from(v)); }
+    if let Ok(v) = std::env::var("HF_HOME") { roots.push(PathBuf::from(v).join("hub")); }
+    if let Some(h) = dirs::home_dir() { roots.push(h.join(".cache").join("huggingface").join("hub")); }
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    for r in roots {
+        let snaps = r.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
+        for e in std::fs::read_dir(snaps).into_iter().flatten().flatten() {
+            if e.path().join("config.json").is_file() {
+                found.push((e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|f| f.1).collect()
+}
+
+/// Does the model of this run have an MTP head? The run's own full model, else its base model (a folder, or the Hugging Face cache); `None` when it cannot be told.
+pub fn run_has_mtp_head(p: &Project, run: &str) -> Option<bool> {
+    let rdir = runs_dir(p).join(run);
+    if let Some(v) = mtp_head_in(&rdir.join("model")) {
+        return Some(v);
+    }
+    let repo = read_json(&rdir.join("config.json"))?["model"]["repo"].as_str()?.to_string();
+    std::iter::once(PathBuf::from(&repo)).chain(hf_cache_snapshots(&repo)).find_map(|d| mtp_head_in(&d))
+}
+
 /// What the export page needs for the importance matrix: the choices, and per run the saved matrix (if any) and the time guesses for each amount of text.
 pub fn imatrix_state(p: &Project) -> Value {
     let mut saved = serde_json::Map::new();
     let mut estimates = serde_json::Map::new();
+    let mut mtp = serde_json::Map::new();
     for r in exportable_runs(p) {
         let Some(run) = r["name"].as_str() else { continue };
+        mtp.insert(run.to_string(), json!(run_has_mtp_head(p, run)));
         if let Some((dir, info)) = saved_imatrices(p, run).into_iter().next() {
             saved.insert(run.to_string(), json!({"dir": dir, "chunks": info["chunks"], "ctx": info["ctx"], "created": info["created"], "general_used": info["general_used"], "data_version": info["data_version"]}));
         }
@@ -91,7 +175,8 @@ pub fn imatrix_state(p: &Project) -> Value {
         estimates.insert(run.to_string(), Value::Object(per));
     }
     json!({"chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
-           "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates, "general": crate::general::state(Some(p))})
+           "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates,
+           "mtp": mtp, "nextn_supported": Value::Null, "general": crate::general::state(Some(p))})
 }
 
 /// The job's "imatrix" block (None when it is off or no GGUF is made). `out` is the folder the worker writes into.
@@ -106,7 +191,7 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
     let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
     let general = crate::general::job_block(&crate::general::resolve(opts.general.as_ref(), true)?, IMATRIX_GENERAL_SHARE);
     Ok(Some(json!({"enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
-                   "reuse": opts.reuse, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
+                   "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
 /// Runs the export job. With the importance matrix the Stop button first writes a STOP file (the worker kills llama-imatrix and ends cleanly) and kills the
@@ -322,7 +407,7 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
             dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname, derived_from: origin.as_deref(),
         }))?;
         let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
-                          "created": created, "world": p.display_name(), "installed": []});
+                          "created": created, "world": p.display_name(), "installed": [], "via": result["via"]});
         let mut meta = meta;
         meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, matrix_file);
         write_json(&dir.join("meta.json"), &meta)?;
@@ -340,7 +425,8 @@ fn imatrix_meta(asked: Option<&Value>, report: &Value, quant: &str, file: Option
     let applied = report["applied"].as_array().is_some_and(|a| a.iter().any(|q| q == quant));
     let reason = report["not_applied"][quant].as_str();
     json!({"requested": true, "applied": applied, "made": report["made"] == true, "reused": report["reused"] == true, "file": file, "chunks": asked["chunks"], "ctx": asked["ctx"],
-           "general_used": report["info"]["general_used"], "llama_cpp": report["info"]["llama_cpp"], "reason": reason, "note": report["note"]})
+           "general_used": report["info"]["general_used"], "llama_cpp": report["info"]["llama_cpp"], "reason": reason, "note": report["note"],
+           "nextn": report["nextn"] == true, "nextn_asked": asked["nextn"] == true, "via": report["via"]})
 }
 
 /// Remember that an export was installed into a server under a name.

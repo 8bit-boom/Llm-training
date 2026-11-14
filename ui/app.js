@@ -597,10 +597,24 @@ function gcWire(scope, rerender) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 5: use in nd-world
-let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
 
+function nextnHtml(im) {
+  const n = nextnState(im);
+  if (!n.head) return "";
+  return `<div class="row"><label class="opt ${n.unsupported ? "dim" : ""}" title="This model has a speculative-decoding head (MTP). The matrix can measure that head too (llama-imatrix option --nextn)."><input type="checkbox" id="us-imnextn" ${n.on ? "checked" : ""} ${n.unsupported ? "disabled" : ""}> Include the speculative-decoding head (MTP) in the matrix</label></div>
+    ${n.unsupported ? `<p class="dim small">Not available: ${esc(im.nextn_reason || "this llama.cpp has no --nextn option (an older build)")}. The matrix is made without the head.</p>` : `<p class="dim small">Used only if your llama-imatrix has <code>--nextn</code>; if it refuses, the matrix is made without the head and the page says why.</p>`}`;
+}
+
 // the importance-matrix box of the export page (GGUF exports only): off unless ticked; "Reuse the saved matrix" is on when a matrix of this run exists
+// the speculative-decoding (MTP) head: the tick exists only for a model that has one (`im.mtp[run]` is true); greyed with the reason when llama-imatrix is known not to support it
+function nextnState(im) {
+  const head = ((im && im.mtp) || {})[us.run] === true;
+  const unsupported = head && im.nextn_supported === false;
+  return { head, unsupported, on: head && !unsupported && us.imNextn };
+}
+
 function imatrixBox(st) {
   const im = st.imatrix;
   if (!im || us.what === "merged") return "";
@@ -612,7 +626,7 @@ function imatrixBox(st) {
   const names = { 64: "64 chunks (quick)", 128: "128 chunks (recommended)", 256: "256 chunks (thorough)" };
   const detail = us.im ? `<div class="row"><label>Calibration text <select id="us-imchunks">${im.chunks.map((n) => `<option value="${n}" ${us.imChunks === n ? "selected" : ""}>${names[n] || n + " chunks"}</option>`).join("")}</select></label>
       <span class="dim">${est ? `${est.tokens.toLocaleString("en")} tokens, about ${est.gpu_minutes} min on a graphics card (up to ${est.cpu_minutes} min on the processor): a rough guess, the log shows the real progress` : ""}</span></div>
-    ${gcHtml("imatrix")}<p class="dim small">About ${Math.round((im.general_share || 0.2) * 100)} % of the calibration text is general text from the dataset above; the rest is your own data. A matrix is only reused for the same dataset.</p>
+    ${nextnHtml(im)}${gcHtml("imatrix")}<p class="dim small">About ${Math.round((im.general_share || 0.2) * 100)} % of the calibration text is general text from the dataset above; the rest is your own data. A matrix is only reused for the same dataset.</p>
     ${saved ? `<label class="opt" title="${esc(saved.dir)}"><input type="checkbox" id="us-imreuse" ${reuse ? "checked" : ""}> Reuse the saved matrix (${saved.chunks} chunks, made ${esc(String(saved.created || "").slice(0, 10))}, if it still fits this model and data)</label>` : `<p class="dim">No saved matrix of this run yet: it will be made now and kept next to the files.</p>`}
     ${helps ? "" : `<p class="dim">None of the chosen sizes is below Q8_0, so there is nothing to improve: the matrix would not be made.</p>`}` : "";
   return `<div class="row imatrix"><label class="opt" title="llama.cpp reads about ${im.ctx * im.default_chunks} tokens of your data and some general text and learns which weights matter most; the small sizes then keep those more exactly"><input type="checkbox" id="us-im" ${us.im ? "checked" : ""}> Better small sizes (importance matrix)</label></div>
@@ -713,13 +727,14 @@ function wireUse() {
   document.querySelectorAll(".us-q").forEach((c) => c.onchange = () => { us.quants = [...document.querySelectorAll(".us-q")].filter((x) => x.checked).map((x) => x.value); render(); }); const wh = $("us-what"); if (wh) wh.onchange = () => { us.what = wh.value; render(); }; bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
   const imx = $("us-im"); if (imx) imx.onchange = () => { us.im = imx.checked; render(); };
   const imc = $("us-imchunks"); if (imc) imc.onchange = () => { us.imChunks = Number(imc.value); render(); };
+  const imn = $("us-imnextn"); if (imn) imn.onchange = () => { us.imNextn = imn.checked; render(); };
   const imr = $("us-imreuse"); if (imr) imr.onchange = () => { us.imReuse = imr.checked; render(); };
   if (us.im && us.what !== "merged") gcWire("imatrix", render);
   on("us-cancel", () => invoke("env_cancel"));
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
   on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
-    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, general: gcSource("imatrix") } : null }));
+    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix") } : null }));
   on("us-lora", async () => {
     const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
     if (!dest) return;

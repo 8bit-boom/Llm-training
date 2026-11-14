@@ -365,8 +365,15 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
     let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
-    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None });
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true });
     assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
+    // the speculative-decoding head: on by default (the worker uses it only when there is one and llama-imatrix knows --nextn); an old spec without the field loads as on
+    assert!(o.nextn && sent.nextn);
+    assert!(!serde_json::from_value::<exports::ImatrixOptions>(json!({"enabled": true, "nextn": false})).unwrap().nextn);
+    let old = json!({"enabled": true, "chunks": 64, "reuse": false});
+    let old: exports::ImatrixOptions = serde_json::from_value(old).unwrap();
+    assert_eq!((old.enabled, old.chunks, old.reuse, old.nextn), (true, 64, false, true));
+    assert_eq!(serde_json::to_value(&o).unwrap()["nextn"], json!(true));
     assert_eq!(exports::IMATRIX_CHUNKS, [64, 128, 256]);
     assert!(exports::imatrix_helps("q4_k_m") && exports::imatrix_helps("q6_k") && !exports::imatrix_helps("q8_0") && !exports::imatrix_helps("f16") && !exports::imatrix_helps("bf16"));
     assert!(exports::QUANTS.iter().filter(|(q, _)| exports::imatrix_helps(q)).count() == 3);
@@ -379,6 +386,8 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
                (json!(true), json!("run1"), json!(2), json!(128), json!(512), json!(0.2), json!(true)));
     assert_eq!((b["train"].clone(), b["reuse_dirs"].clone()), (json!("/data/v2/train.jsonl"), json!([])));
     assert_eq!(b["stop_file"], json!(out.join("STOP")));
+    assert_eq!(b["nextn"], json!(true));
+    assert_eq!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { nextn: false, ..on() }, &out).unwrap().unwrap()["nextn"], json!(false));
     // the general text: the open default, with its split; another dataset is passed on as chosen; an acknowledgement is needed where the preset says so
     assert_eq!((b["general"]["id"].clone(), b["general"]["split"].clone(), b["general"]["share"].clone(), b["seed"].clone()), (json!("mlabonne/open-perfectblend"), json!("train"), json!(0.2), json!(3407)));
     let own = exports::ImatrixOptions { general: Some(ndforge_core::general::GeneralSource { file: Some("notes.jsonl".into()), ..Default::default() }), ..on() };
@@ -390,6 +399,79 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     let b = exports::imatrix_block(&p, "run1", &json!({"dataset": {"version": 3}}), &exports::ImatrixOptions { chunks: 64, reuse: false, ..on() }, &out).unwrap().unwrap();
     assert!(b["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v3/train.jsonl") && b["chunks"] == 64 && b["reuse"] == false);
     assert!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { chunks: 100, ..on() }, &out).unwrap_err().0.contains("64, 128 or 256"));
+}
+
+fn st_file(path: &std::path::Path, names: &[&str]) {
+    let mut header = serde_json::Map::new();
+    for (i, n) in names.iter().enumerate() {
+        header.insert(n.to_string(), json!({"dtype": "F16", "shape": [1], "data_offsets": [i * 2, i * 2 + 2]}));
+    }
+    let raw = serde_json::to_vec(&header).unwrap();
+    let mut blob = (raw.len() as u64).to_le_bytes().to_vec();
+    blob.extend(raw);
+    blob.extend(vec![0u8; names.len() * 2]);
+    std::fs::write(path, blob).unwrap();
+}
+
+#[test]
+fn a_model_folder_is_checked_for_a_speculative_decoding_head() {
+    let d = tempdir().unwrap();
+    let f = |n: &str| { let x = d.path().join(n); std::fs::create_dir_all(&x).unwrap(); x };
+    assert_eq!(exports::mtp_head_in(&d.path().join("nowhere")), None);
+    assert_eq!(exports::mtp_head_in(&f("empty")), None);                       // no config, no tensors: cannot tell
+    let plain = f("plain");
+    std::fs::write(plain.join("config.json"), "{}").unwrap();
+    assert_eq!(exports::mtp_head_in(&plain), Some(false));
+    st_file(&plain.join("model.safetensors"), &["model.layers.0.w", "lm_head.weight"]);
+    assert_eq!(exports::mtp_head_in(&plain), Some(false));
+    let cfg = f("cfg");
+    std::fs::write(cfg.join("config.json"), json!({"text_config": {"mtp_num_hidden_layers": 1}}).to_string()).unwrap();
+    assert_eq!(exports::mtp_head_in(&cfg), Some(true));
+    std::fs::write(cfg.join("config.json"), json!({"mtp_num_hidden_layers": 0}).to_string()).unwrap();
+    assert_eq!(exports::mtp_head_in(&cfg), Some(false));
+    let t = f("tensors");
+    std::fs::write(t.join("config.json"), "{}").unwrap();
+    st_file(&t.join("model.safetensors"), &["model.layers.0.w", "mtp.layers.0.w"]);
+    assert_eq!(exports::mtp_head_in(&t), Some(true));
+    let idx = f("index");
+    std::fs::write(idx.join("model.safetensors.index.json"), json!({"weight_map": {"mtp.fc.weight": "a.safetensors"}}).to_string()).unwrap();
+    assert_eq!(exports::mtp_head_in(&idx), Some(true));
+}
+
+#[test]
+fn the_page_learns_per_run_whether_the_model_has_a_head() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    fake_done_run(&p, "run2", 1);
+    // run1's base model is a folder with a head; run2's cannot be found (a Hub id that is not cached here)
+    let base = d.path().join("base");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("config.json"), json!({"mtp_num_hidden_layers": 1}).to_string()).unwrap();
+    let cfg1 = truns::runs_dir(&p).join("run1/config.json");
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(&cfg1).unwrap()).unwrap();
+    c["model"]["repo"] = json!(base);
+    std::fs::write(&cfg1, c.to_string()).unwrap();
+    std::env::set_var("HF_HUB_CACHE", d.path().join("empty-hub"));
+    let st = exports::imatrix_state(&p);
+    assert_eq!(st["mtp"]["run1"], json!(true));
+    assert!(st["mtp"]["run2"].is_null());
+    assert!(st["nextn_supported"].is_null());
+    // a base model in the Hub cache
+    let snap = d.path().join("hub/models--org--base/snapshots/abc");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::write(snap.join("config.json"), "{}").unwrap();
+    std::env::set_var("HF_HUB_CACHE", d.path().join("hub"));
+    let cfg2 = truns::runs_dir(&p).join("run2/config.json");
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(&cfg2).unwrap()).unwrap();
+    c["model"]["repo"] = json!("org/base");
+    std::fs::write(&cfg2, c.to_string()).unwrap();
+    assert_eq!(exports::imatrix_state(&p)["mtp"]["run2"], json!(false));
+    std::env::remove_var("HF_HUB_CACHE");
 }
 
 #[test]
@@ -437,9 +519,9 @@ map=""
 for q in $qs; do printf "GGUF-$q" > "$out/model-$q.gguf"; map="$map\"$q\":\"$out/model-$q.gguf\","; done
 if grep -q '"imatrix":{' "$5"; then
   printf IMATRIX > "$out/imatrix.gguf"; echo '{"model":"run1","chunks":64,"ctx":512,"general_used":false,"created":"2026-05-01T00:00:00Z"}' > "$out/imatrix.json"
-  im="{\"made\":true,\"reused\":false,\"file\":\"$out/imatrix.gguf\",\"applied\":[\"q4_k_m\"],\"not_applied\":{\"q8_0\":\"high precision\"},\"note\":\"The general text could not be read.\",\"info\":{\"general_used\":false,\"llama_cpp\":\"version: 1\"}}"
+  im="{\"made\":true,\"reused\":false,\"file\":\"$out/imatrix.gguf\",\"applied\":[\"q4_k_m\"],\"not_applied\":{\"q8_0\":\"high precision\"},\"note\":\"The general text could not be read.\",\"nextn\":true,\"via\":\"unsloth\",\"info\":{\"general_used\":false,\"llama_cpp\":\"version: 1\"}}"
 else im=null; fi
-echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":null,\"imatrix\":$im}}""#);
+echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":null,\"via\":\"unsloth\",\"imatrix\":$im}}""#);
     let p = project_with_world(d.path(), 1);
     store::generate_draft(&p, &Recipe::default()).unwrap();
     store::save_version(&p).unwrap();
@@ -464,6 +546,9 @@ echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":null,\"
     assert_eq!((a["requested"].clone(), a["applied"].clone(), a["made"].clone(), a["file"].clone(), a["chunks"].clone()), (json!(true), json!(true), json!(true), json!("imatrix.gguf"), json!(64)));
     assert_eq!((b["applied"].clone(), b["reason"].clone()), (json!(false), json!("high precision")));
     assert_eq!((a["note"].clone(), a["general_used"].clone(), a["llama_cpp"].clone()), (json!("The general text could not be read."), json!(false), json!("version: 1")));
+    // how the GGUF was made, and whether the matrix covered the speculative-decoding head
+    assert!(metas.iter().all(|m| m["via"] == "unsloth" && m["imatrix"]["via"] == "unsloth"));
+    assert_eq!((a["nextn"].clone(), a["nextn_asked"].clone()), (json!(true), json!(true)));
     let saved = std::fs::read_to_string(p.folder.join("exports/run1-q8_0/meta.json")).unwrap();
     assert!(saved.contains("\"imatrix\"") && saved.contains("high precision"));
     assert!(exports::list_exports(&p).iter().all(|e| e["imatrix"]["requested"] == true));
