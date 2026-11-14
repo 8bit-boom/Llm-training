@@ -1,0 +1,7 @@
+{"object": "list", "has_more": false, "data": [
+ {"object": "fine_tuning.job.event", "id": "ftevent_20261113_101500_ab12_step4", "created_at": 1763000300, "level": "info", "message": "Step 4/4 loss 1.5", "type": "metrics",
+  "data": {"step": 4, "total_steps": 4, "train_loss": 1.5, "learning_rate": 0.0001, "grad_norm": 0.9, "valid_loss": 1.7, "epoch": 2.0}},
+ {"object": "fine_tuning.job.event", "id": "ftevent_20261113_101500_ab12_step2", "created_at": 1763000250, "level": "info", "message": "Step 2/4 loss 2.5", "type": "metrics",
+  "data": {"step": 2, "total_steps": 4, "train_loss": 2.5, "learning_rate": 0.0002, "grad_norm": 1.4, "valid_loss": null, "epoch": 1.0}},
+ {"object": "fine_tuning.job.event", "id": "ftevent_20261113_101500_ab12_start", "created_at": 1763000210, "level": "info", "message": "Training started", "type": "message", "data": {}}
+]}

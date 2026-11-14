@@ -96,6 +96,10 @@ def load_unsloth(cfg: dict):
         return model, tokenizer, loader
     protocol.progress("load", 0.8, "Adding the LoRA layers")
     common = {"r": h["rank"], "lora_alpha": h["alpha"], "lora_dropout": 0, "bias": "none", "random_state": h["seed"]}
+    if cfg["method"] == "rs_lora":
+        common["use_rslora"] = True   # rank-stabilized: the alpha scale follows the rank
+    if cfg["method"] == "dora":
+        common["use_dora"] = True     # magnitude multipliers on top of the LoRA deltas
     if loader is FastModel:
         model = FastModel.get_peft_model(model, finetune_vision_layers=False, finetune_language_layers=True,
                                          finetune_attention_modules=True, finetune_mlp_modules=True, **common)
@@ -164,6 +168,14 @@ def load_hf(cfg: dict):
         from peft import PeftModel
         return PeftModel.from_pretrained(model, cfg["init_adapter"], is_trainable=True), tokenizer, None
     lora_kw = dict(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear")
+    if cfg["method"] == "rs_lora":
+        lora_kw["use_rslora"] = True   # rank-stabilized: the alpha scale follows the rank
+    if cfg["method"] == "dora":
+        lora_kw["use_dora"] = True     # magnitude multipliers on top of the LoRA deltas
+    if cfg["method"] == "loftq":
+        from peft import LoftQConfig
+        lora_kw["loftq_config"] = LoftQConfig(loftq_bits=4)   # SVD-initialized LoRA: PEFT quantizes the base while building the adapter
+        protocol.log("LoftQ: the adapter's initialization quantizes the base model, so loading takes a moment.")
     if lora_layers(h):
         lora_kw.update(layers_to_transform=lora_layers(h), layers_pattern="layers")
     try:   # the image / audio parts of a multimodal model stay as they are: only the language layers learn (so the base model's vision file still fits)
@@ -174,6 +186,10 @@ def load_hf(cfg: dict):
 
 
 def load(cfg: dict, backend: str):
+    if backend == "unsloth" and cfg.get("method") == "loftq":
+        # LoftQ initializes its 4-bit base through PEFT itself; Unsloth's loader has no LoftQ path
+        protocol.log("LoftQ needs PEFT's own quantization init; training with the standard engine.")
+        return load_hf(cfg)
     if backend == "unsloth":
         return load_unsloth(cfg)
     return load_hf(cfg)

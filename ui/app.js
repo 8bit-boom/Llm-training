@@ -282,17 +282,18 @@ function renderTrain() {
       ${fm ? `<div class="card"><h3>${esc(fm.name)}</h3><p>${esc(fm.repo)} · ${fm.params_b.toFixed(1)} B parameters · licence: ${esc(fm.license)} · chat format: ${fm.family === "generic" ? "the model's own" : esc(fm.family)}<br>Memory for training (estimate): LoRA ≈ ${fm.vram_lora_gb} GB, QLoRA ≈ ${fm.vram_qlora_gb} GB</p>
         ${hf.found.warnings.length ? `<ul>${hf.found.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
         <div class="row"><button class="primary" id="hf-add">Add it to the list</button></div></div>` : ""}` : ""}</div>`;
-  const srv = tr.server ? st.servers.find((x) => x.url === tr.server) : null;
+  const isUn = tr.server === "unsloth" && st.unsloth;
+  const srv = isUn ? { name: st.unsloth.name, url: st.unsloth.url, status: st.unsloth.status, unsloth: true } : tr.server ? st.servers.find((x) => x.url === tr.server) : null;
   const srvStatus = srv && srv.status;
   const srvLine = !srv ? `Training on this computer: ${gpu}.` : srvStatus
     ? (srvStatus.gpu ? `${esc(srv.name)}: ${esc(srvStatus.gpu.name)} · ${srvStatus.gpu.vram_gb} GB · ${esc(srvStatus.gpu.precision)} · ${srvStatus.busy ? "busy with " + esc(srvStatus.job) : "free"}${srvStatus.ollama ? " · Ollama there will be paused while training" : ""}` : `${esc(srv.name)}: no graphics card (${esc(srvStatus.gpu_problem || "none found")})`)
     : "Not checked yet. Press “Test the connection”.";
-  const where = `<div class="card wide"><h2>Where to train</h2><div class="row"><label>Computer <select id="tr-where"><option value="">This computer</option>${st.servers.map((x) => `<option value="${esc(x.url)}" ${tr.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("")}</select></label>
-      ${srv ? `<button class="secondary" id="srv-test" ${tr.running ? "disabled" : ""}>Test the connection</button><button class="secondary" id="srv-remove" ${tr.running ? "disabled" : ""}>Remove this server</button>` : ""}
+  const where = `<div class="card wide"><h2>Where to train</h2><div class="row"><label>Computer <select id="tr-where"><option value="">This computer</option>${st.unsloth ? `<option value="unsloth" ${tr.server === "unsloth" ? "selected" : ""}>Unsloth Desktop (${esc(st.unsloth.name)})</option>` : ""}${st.servers.map((x) => `<option value="${esc(x.url)}" ${tr.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("")}</select></label>
+      ${srv ? `<button class="secondary" id="srv-test" ${tr.running ? "disabled" : ""}>Test the connection</button>${srv.unsloth ? "" : `<button class="secondary" id="srv-remove" ${tr.running ? "disabled" : ""}>Remove this server</button>`}` : ""}
       <button class="secondary" id="srv-add">Add a server…</button></div>
     ${tr.adding ? `<div class="row"><input type="text" id="s-name" placeholder="Name, e.g. TrueNAS"><input type="text" id="s-url" placeholder="Address, e.g. http://truenas:8765"><input type="password" id="s-token" placeholder="Access token (NDFORGE_TOKEN)" style="min-width:220px"><button class="primary" id="s-save">Add</button><button class="secondary" id="s-cancel">Cancel</button></div>` : ""}
     <div class="dim">${srvLine}</div>${tr.srvCheck ? `<div class="${tr.srvCheck.ok ? "ok" : "err"}">${esc(tr.srvCheck.text)}</div>` : ""}
-    ${srv ? `<p class="dim">The server's graphics card is used only by the training until it ends: AI chat, transcription and image generation on that server wait or are unavailable meanwhile. Only LoRA / QLoRA is available there. The trained model is copied back to this computer.</p>` : ""}</div>`;
+    ${srv && srv.unsloth ? `<p class="dim">Unsloth Desktop must stay open while it trains. Unsloth chooses the speed settings itself; Lore Forge sends the rank, learning rate, epochs and context length. Only LoRA / QLoRA, one stage. When Unsloth is on this computer the trained adapter is copied back here; otherwise it stays in Unsloth's folder. A stop in Unsloth cannot be continued.</p>` : srv ? `<p class="dim">The server's graphics card is used only by the training until it ends: AI chat, transcription and image generation on that server wait or are unavailable meanwhile. Only LoRA / QLoRA is available there. The trained model is copied back to this computer.</p>` : ""}</div>`;
   const pl = tr.plan;
   const sel = st.models.find((c) => c.model.id === tr.model);
   const exp = state.settings.expert_mode && pl ? `<div class="card wide"><h2>Settings (Expert)</h2><div class="grid">${[
@@ -336,7 +337,7 @@ function renderTrain() {
     ${speedHtml()}${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
     ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
   const runs = st.runs.length ? `<div class="card wide"><h2>Earlier runs</h2><table class="tbl"><tr><th>Run</th><th>Type</th><th>Status</th><th>Step</th><th>Loss</th><th>Memory</th><th>Where</th><th></th></tr>${st.runs.map((r) =>
-    `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}${r.status === "interrupted" ? `<div class="dim small" title="${esc(r.error || "")}">cut off (program closed or crash)</div>` : ""}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button>${r.resumable && !tr.running ? ` <button class="link" data-continue="${esc(r.name)}" title="Carry on from the last saved point">Continue</button>` : (r.status === "interrupted" || r.status === "stopped" || r.status === "failed") && !r.resumable && !r.server ? ` <span class="dim small" title="It was cut off before the first saved point">no saved point</span>` : ""}</td></tr>`).join("")}</table></div>` : "";
+    `<tr><td>${esc(r.name)}</td><td>${esc(r.method === "full" ? "full" : r.method === "qlora" ? "QLoRA" : "LoRA")}</td><td>${esc(r.status)}${r.status === "interrupted" ? `<div class="dim small" title="${esc(r.error || "")}">cut off (program closed or crash)</div>` : ""}${r.adapter_remote ? `<div class="dim small">${esc(r.note || "The adapter stays in Unsloth.")}</div>` : ""}</td><td>${r.step ?? ""}${r.total_steps ? "/" + r.total_steps : ""}</td><td>${r.loss != null ? (+r.loss).toFixed(3) : ""}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td><td>${esc(r.server || "this computer")}</td><td><button class="link" data-showrun="${esc(r.name)}">Show</button>${r.resumable && !tr.running ? ` <button class="link" data-continue="${esc(r.name)}" title="Carry on from the last saved point">Continue</button>` : (r.status === "interrupted" || r.status === "stopped" || r.status === "failed") && !r.resumable && !r.server ? ` <span class="dim small" title="It was cut off before the first saved point">no saved point</span>` : ""}</td></tr>`).join("")}</table></div>` : "";
   return `<h1>Step 3 · Train</h1><p class="lead">Teaches the model your world with LoRA (a small add-on) and practice answers (SFT). The help panel explains each choice.</p>
     <div class="dim">Training data: version ${v.number} · ${v.counts.world_book_texts} world-book texts, ${v.counts.train_chat} practice examples · Graphics card: ${gpu}</div>${tr.server ? "" : env}${where}
     <div class="card wide"><h2>1 · Choose the model</h2><div class="mcards">${cards}</div></div>${addModel}
@@ -443,8 +444,10 @@ function wireTrain() {
     try { await invoke("model_remove", { id: b.dataset.hfremove }); if (tr.model === b.dataset.hfremove) tr.model = null; await trRefresh(); } catch (e) { tr.hf.error = String(e); render(); }
   });
   document.querySelectorAll("[data-model]").forEach((b) => b.onclick = () => { tr.model = b.dataset.model; tr.over = {}; trRefresh(); });
-  const wh = $("tr-where"); if (wh) wh.onchange = () => { tr.server = wh.value; tr.srvCheck = null; tr.over = {}; trRefresh(); if (tr.server && !(tr.state.servers.find((x) => x.url === tr.server) || {}).status) invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); };
-  on("srv-test", () => { tr.srvCheck = null; invoke("train_server_check", { url: tr.server }).catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); }); });
+  const srvCheck = () => (tr.server === "unsloth" ? invoke("unsloth_check", { url: (tr.state.unsloth || {}).url || "", key: "", find: false }) : invoke("train_server_check", { url: tr.server }))
+    .catch((e) => { tr.srvCheck = { ok: false, text: String(e) }; render(); });
+  const wh = $("tr-where"); if (wh) wh.onchange = () => { tr.server = wh.value; tr.srvCheck = null; tr.over = {}; trRefresh(); const known = tr.server === "unsloth" ? tr.state.unsloth : tr.state.servers.find((x) => x.url === tr.server); if (tr.server && !(known || {}).status) srvCheck(); };
+  on("srv-test", () => { tr.srvCheck = null; srvCheck(); });
   on("srv-remove", async () => { tr.state = await invoke("train_server_remove", { url: tr.server }); tr.server = ""; tr.srvCheck = null; trRefresh(); });
   on("srv-add", () => { tr.adding = true; render(); });
   on("s-cancel", () => { tr.adding = false; render(); });
@@ -642,6 +645,67 @@ function wireRetrain() {
   });
 }
 
+// ------------------------------------------------------------------------------------------------ Unsloth Desktop (Training setup)
+let un = { url: "", key: "", name: "Unsloth Desktop", busy: false, result: null, error: null, ack: false, init: false };
+
+// an address that is not this computer, not a private network and not https: the data would cross the internet unencrypted
+function unRisk(url) {
+  const u = (url || "").trim();
+  if (!u || /^https:/i.test(u)) return false;
+  const rest = u.replace(/^http:\/\//i, "");
+  const host = (rest.startsWith("[") ? rest.slice(0, rest.indexOf("]") + 1) : rest.split(/[\/:]/)[0]).toLowerCase();
+  if (host === "localhost" || host === "[::1]" || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) return false;
+  return host.includes(".") || host.startsWith("[");
+}
+
+function renderUnsloth() {
+  const saved = state.settings && state.settings.unsloth;
+  if (!un.init) { un.init = true; if (saved) { un.url = saved.url; un.name = saved.name; } }
+  const risk = unRisk(un.url);
+  return `<div class="card wide" id="un-card"><h2>Unsloth Desktop (optional)</h2>
+    <p class="dim">Lets you choose <strong>Unsloth Desktop</strong> under "Where to train" in Step 3: Lore Forge sends the training data to Unsloth and follows the training there, instead of using its own training software. Unsloth Desktop must be open while it trains. Create an API key in Unsloth: your picture, Settings, API, a name, Create (Unsloth shows the key only once).</p>
+    ${saved ? `<div class="ok">Saved: ${esc(saved.name)} at ${esc(saved.url)}. The API key is kept on this computer.</div>` : ""}
+    <div class="row"><input type="text" id="un-url" value="${esc(un.url)}" placeholder="Address, e.g. http://127.0.0.1:8888" style="min-width:260px" ${un.busy ? "disabled" : ""}><button class="secondary" id="un-find" ${un.busy ? "disabled" : ""}>Find</button>
+      <input type="password" id="un-key" value="${esc(un.key)}" placeholder="${saved ? "API key (leave empty to keep the saved one)" : "API key (sk-unsloth-…)"}" style="min-width:260px" ${un.busy ? "disabled" : ""}><button class="secondary" id="un-test" ${un.busy ? "disabled" : ""}>Test</button></div>
+    ${risk ? `<label class="opt"><input type="checkbox" id="un-ack" ${un.ack ? "checked" : ""}> This address is on the internet and not encrypted: the training data (with the GM's secrets) would cross it in plain text. I understand and want to use it anyway.</label>` : ""}
+    <div class="row"><button class="primary" id="un-save" ${un.busy || (!un.key.trim() && !saved) ? "disabled" : ""}>Save</button>${saved ? `<button class="secondary" id="un-remove" ${un.busy ? "disabled" : ""}>Remove</button>` : ""}</div>
+    ${un.busy ? `<div class="stepline">Asking Unsloth…</div>` : ""}${un.result ? `<div class="ok">${esc(un.result)}</div>` : ""}${un.error ? `<div class="err">${esc(un.error)}</div>` : ""}</div>`;
+}
+
+function wireUnsloth() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, k) => { const e = $(id); if (e) e.oninput = () => { un[k] = e.value; if (k === "url") { const a = $("un-ack"); if (!unRisk(un.url) && a) un.ack = false; } }; };
+  bind("un-url", "url"); bind("un-key", "key");
+  const ack = $("un-ack"); if (ack) ack.onchange = () => { un.ack = ack.checked; };
+  const ask = (find) => { un.busy = true; un.result = null; un.error = null; render(); invoke("unsloth_check", { url: un.url, key: un.key, find }).catch((e) => { un.busy = false; un.error = String(e); render(); }); };
+  on("un-find", () => ask(true));
+  on("un-test", () => ask(false));
+  on("un-save", async () => {
+    un.error = null; un.result = null;
+    if (unRisk(un.url) && !un.ack) { un.error = "Tick the box about the unencrypted address first, or use an address on this computer or your own network."; render(); return; }
+    try { setState(await invoke("unsloth_set", { name: un.name, url: un.url, key: un.key })); un.key = ""; const s = state.settings.unsloth; if (s) un.url = s.url; un.result = "Saved. Choose \"Unsloth Desktop\" under \"Where to train\" in Step 3."; }
+    catch (e) { un.error = String(e); }
+    render();
+  });
+  on("un-remove", async () => {
+    if (!confirm("Forget the address and the API key of Unsloth?")) return;
+    try { setState(await invoke("unsloth_remove")); un.url = ""; un.key = ""; un.result = null; un.init = false; } catch (e) { un.error = String(e); }
+    render();
+  });
+}
+
+function onUnslothEvent(p) {
+  if (page === "train" && tr.server === "unsloth") {
+    tr.srvCheck = p.kind === "done" ? { ok: true, text: p.data.summary } : { ok: false, text: p.text };
+    trRefresh();
+    return;
+  }
+  un.busy = false;
+  if (p.kind === "done") { un.result = p.data.summary; if (p.data.url) un.url = p.data.url; un.error = null; }
+  else { un.error = p.text; un.result = null; }
+  if (page === "setup") render();
+}
+
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
 function renderSetup() {
@@ -663,7 +727,8 @@ function renderSetup() {
     ${env.step ? `<div class="stepline">${esc(env.step)}</div>` : ""}
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
-    ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}`;
+    ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderUnsloth()}`;
 }
 
 async function refreshEnv() {
@@ -1314,6 +1379,7 @@ function wire() {
   wireReshape();
   wireGuide();
   wireRetrain();
+  wireUnsloth();
   on("recheck", refreshEnv);
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
@@ -1446,6 +1512,7 @@ async function init() {
   try { await tauri.event.listen("bench-event", (e) => onBenchEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("test-event", (e) => onTestEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("teacher-event", (e) => onTeacherEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("unsloth-event", (e) => onUnslothEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }

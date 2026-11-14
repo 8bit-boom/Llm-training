@@ -237,8 +237,12 @@ fn set_theme(s: State<App>, theme: String) -> Out<Value> {
     Ok(m.state())
 }
 
-/// Trains on this PC, or on the server the job names.
+/// Trains on this PC, on the server the job names, or in Unsloth Desktop.
 fn run_training(job: &ndforge_core::model::TrainJob, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> ndforge_core::Result<Value> {
+    if let Some(target) = &job.unsloth {
+        return ndforge_core::unsloth::run::execute_unsloth(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), target, stop,
+            job.job["resume"] == true, std::time::Duration::from_secs(3), emit);
+    }
     match &job.remote {
         None => ndforge_core::train::runs::execute(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), stop, std::time::Duration::from_secs(120), emit),
         Some(target) => ndforge_core::remote::run::execute_remote(&job.project, &job.model, job.method, &job.hyper, &job.name, job.job.clone(), target, stop,
@@ -512,6 +516,64 @@ fn train_server_check(app: tauri::AppHandle, s: State<App>, url: String) -> Out<
     Ok(())
 }
 
+/// Remembers the Unsloth to train in. The key goes to the secrets file only.
+#[tauri::command]
+fn unsloth_set(s: State<App>, name: String, url: String, key: String) -> Out<Value> {
+    let mut m = lock(&s);
+    m.set_unsloth(&name, &url, &key).map_err(|e| e.to_string())?;
+    Ok(m.state())
+}
+
+#[tauri::command]
+fn unsloth_remove(s: State<App>) -> Out<Value> {
+    let mut m = lock(&s);
+    m.remove_unsloth().map_err(|e| e.to_string())?;
+    Ok(m.state())
+}
+
+/// "Test" (and "Find" when `find` is true) in Training setup. `url` and `key` are what is typed in the form; an empty key means the saved one for that address.
+/// The answer arrives as an "unsloth-event": {"kind": "done", "data": {probe, hardware, summary, url}} or {"kind": "error", "text"}. The card is remembered for the plan.
+#[tauri::command]
+fn unsloth_check(app: tauri::AppHandle, s: State<App>, url: String, key: String, find: bool) -> Out<()> {
+    let saved = {
+        let m = lock(&s);
+        m.settings.unsloth.as_ref().and_then(|u| ndforge_core::secrets::get(&format!("unsloth:{}", u.url)).map(|k| (u.url.clone(), k)))
+    };
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> ndforge_core::Result<serde_json::Value> {
+            let url = if find || url.trim().is_empty() {
+                let mut candidates = vec![url.trim().to_string()].into_iter().filter(|u| !u.is_empty()).collect::<Vec<_>>();
+                candidates.extend(ndforge_core::unsloth::client::candidate_urls());
+                ndforge_core::unsloth::client::find(&candidates).map(|(u, _)| u)
+                    .ok_or_else(|| ndforge_core::Error::new("Unsloth does not answer on this computer. Open Unsloth Desktop (it serves only while it is open), then press Find again or type the address from Unsloth -> Settings -> API."))?
+            } else {
+                url
+            };
+            let norm = ndforge_core::export::ollama::normalize_url(&url);
+            let key = if key.trim().is_empty() { saved.filter(|(u, _)| *u == norm).map(|(_, k)| k).unwrap_or_default() } else { key };
+            if key.trim().is_empty() {
+                // found, but no key yet: say what was found
+                let p = ndforge_core::unsloth::client::UnslothClient::new(&norm, "").probe()?;
+                return Ok(serde_json::json!({"probe": p, "url": norm, "summary": format!("Unsloth {} found at {norm}. Create an API key in Unsloth (Settings -> API) and paste it here.", if p.desktop { "Desktop" } else { "Studio" })}));
+            }
+            ndforge_core::unsloth::client::check(&norm, &key)
+        })();
+        let ev = match result {
+            Ok(data) => {
+                if let Some(hw) = data.get("hardware") {
+                    let model: State<App> = handle.state();
+                    lock(&model).set_remote_status(ndforge_core::unsloth::run::SERVER_ID, hw.clone());
+                }
+                serde_json::json!({"kind": "done", "data": data})
+            }
+            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
+        };
+        let _ = handle.emit("unsloth-event", ev);
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn help(key: String) -> String {
     help_html(&key)
@@ -743,7 +805,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

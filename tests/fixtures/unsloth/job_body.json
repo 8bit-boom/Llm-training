@@ -1,0 +1,6 @@
+{"model": "unsloth/Qwen3.5-2B", "training_file": "file-00000000000000000000000000000001", "validation_file": "file-00000000000000000000000000000002",
+ "hyperparameters": {"n_epochs": 2, "batch_size": 2, "learning_rate_multiplier": 1.0}, "method": {"type": "supervised"}, "suffix": "ashfall-test", "seed": 3407,
+ "training_type": "LoRA/QLoRA", "load_in_4bit": false, "max_seq_length": 4096, "gradient_accumulation_steps": 4, "warmup_steps": 10, "max_steps": 0, "save_steps": 100,
+ "packing": false, "train_on_completions": true, "gradient_checkpointing": "unsloth", "lora_r": 16, "lora_alpha": 16, "lora_dropout": 0.0,
+ "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+ "finetune_vision_layers": false, "finetune_language_layers": true, "finetune_attention_modules": true, "finetune_mlp_modules": true, "eval_steps": 0.1}

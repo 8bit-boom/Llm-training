@@ -15,8 +15,9 @@ use crate::train::catalog::{find, models, ModelEntry};
 use crate::train::plan::{full_blockers, full_disk_gb, plan, recommended_method, Hyper, Method, Preset};
 use crate::export::modelfile::ollama_name;
 use crate::export::runs as exports;
-use crate::settings::{OllamaServer, TrainServer};
+use crate::settings::{OllamaServer, TrainServer, UnslothSettings};
 use crate::remote::run::Target;
+use crate::unsloth::run::{UnslothTarget, SERVER_ID as UNSLOTH};
 use crate::train::{retrain, runs};
 use crate::settings::Settings;
 
@@ -66,7 +67,7 @@ impl AppModel {
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
-            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme},
+            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth},
             "projects_dir": default_projects_dir(),
         })
     }
@@ -271,6 +272,7 @@ impl AppModel {
             "gpu": gpu.as_ref().map(|g| json!({"name": g.name, "vram_gb": (g.vram_gb() * 10.0).round() / 10.0, "precision": g.precision()})),
             "gpu_problem": gpus.err(),
             "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "unsloth": self.settings.unsloth.as_ref().map(|u| json!({"name": u.name, "url": u.url, "status": self.remote_status.get(UNSLOTH)})),
             "servers": self.settings.train_servers.iter().map(|s| json!({"name": s.name, "url": s.url, "status": self.remote_status.get(&s.url)})).collect::<Vec<_>>(),
             "version": version.map(|(n, m)| json!({"number": n, "counts": m["counts"], "tokens": m["tokens"], "created": m["created"]})),
             "runs": runs::list_runs(p),
@@ -356,16 +358,27 @@ impl AppModel {
                 Some(url) => Some(self.target_for(url)?),
                 None => None,
             };
+            let unsloth = match cfg["unsloth"]["url"].as_str() {
+                Some(_) => Some(self.unsloth_target()?),
+                None => None,
+            };
             let mut job = cfg;
             job["resume"] = json!(true);
-            return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job, remote });
+            return Ok(TrainJob { project: p, model: m, method, hyper, name: name.to_string(), job, remote, unsloth });
         }
         let m = find(model_id).ok_or_else(|| Error::new("Choose a model first."))?;
+        let unsloth = if server == Some(UNSLOTH) { Some(self.unsloth_target()?) } else { None };
+        if unsloth.is_some() && method == Method::Full {
+            return Err(Error::new("Full fine-tuning runs on this computer only. Choose LoRA or QLoRA, or train on this computer."));
+        }
+        if unsloth.is_some() && std::path::Path::new(&m.repo).is_absolute() {
+            return Err(Error::new(format!("{} is a folder on this computer; Lore Forge trains it on this computer only. Choose another model, or train it on this computer.", m.name)));
+        }
         if server.is_some() && std::path::Path::new(&m.repo).is_absolute() {
             return Err(Error::new(format!("{} is a folder on this computer, so it cannot be trained on a server. Train it on this computer, or add the model from Hugging Face instead.", m.name)));
         }
         let (version, manifest) = runs::latest_version(&p).ok_or_else(|| Error::new("Save a version of the training data first (Step 2)."))?;
-        let remote = match server { Some(u) => Some(self.target_for(u)?), None => None };
+        let remote = match server { Some(u) if u != UNSLOTH => Some(self.target_for(u)?), _ => None };
         if method == Method::Full {
             let try_anyway = overrides["try_anyway"] == true;
             let bf16 = match server {
@@ -398,7 +411,7 @@ impl AppModel {
         let hyper = Self::hyper_with(pl.hyper, overrides)?;
         let name = runs::run_name(&m.id);
         let job = runs::build_job(&p, &m, method, &hyper, version, &name, false)?;
-        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote, unsloth })
     }
 
     /// The settings the benchmark starts from (this computer only: a server's card is benchmarked by training there).
@@ -635,6 +648,37 @@ impl AppModel {
         Ok(Target { name: s.name.clone(), url: s.url.clone(), token })
     }
 
+    // ------------------------------------------------------------------ Unsloth Desktop
+    /// Remembers the Unsloth to train in (one connection). The key is kept in `secrets.json` under `unsloth:<address>` and nowhere else.
+    pub fn set_unsloth(&mut self, name: &str, url: &str, key: &str) -> Result<()> {
+        let (name, url) = (name.trim(), crate::export::ollama::normalize_url(url));
+        if url == "http://" || key.trim().is_empty() {
+            return Err(Error::new("Give the address of Unsloth (Unsloth -> Settings -> API) and an API key."));
+        }
+        if let Some(old) = self.settings.unsloth.take().filter(|o| o.url != url) {
+            let _ = crate::secrets::remove(&format!("unsloth:{}", old.url));
+        }
+        self.settings.unsloth = Some(UnslothSettings { name: if name.is_empty() { "Unsloth Desktop".into() } else { name.to_string() }, url: url.clone() });
+        self.remote_status.remove(UNSLOTH);
+        self.settings.save();
+        crate::secrets::set(&format!("unsloth:{url}"), key.trim())
+    }
+
+    pub fn remove_unsloth(&mut self) -> Result<()> {
+        if let Some(old) = self.settings.unsloth.take() {
+            crate::secrets::remove(&format!("unsloth:{}", old.url))?;
+        }
+        self.remote_status.remove(UNSLOTH);
+        self.settings.save();
+        Ok(())
+    }
+
+    pub fn unsloth_target(&self) -> Result<UnslothTarget> {
+        let s = self.settings.unsloth.as_ref().ok_or_else(|| Error::new("Unsloth is not set up. Add it in \"Training setup\"."))?;
+        let key = crate::secrets::get(&format!("unsloth:{}", s.url)).ok_or_else(|| Error::new("The API key of Unsloth is missing. Enter it again in \"Training setup\"."))?;
+        Ok(UnslothTarget { name: s.name.clone(), url: s.url.clone(), key })
+    }
+
     pub fn set_remote_status(&mut self, url: &str, status: Value) {
         self.remote_status.insert(url.to_string(), status);
     }
@@ -661,7 +705,8 @@ impl AppModel {
         }
         // a run that was made on a server is retrained there
         let remote = match cfg["remote"]["url"].as_str() { Some(url) => Some(self.target_for(url)?), None => None };
-        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote })
+        let unsloth = match cfg["unsloth"]["url"].as_str() { Some(_) => Some(self.unsloth_target()?), None => None };
+        Ok(TrainJob { project: p, model: m, method, hyper, name, job, remote, unsloth })
     }
 }
 
@@ -673,6 +718,8 @@ fn method_needs_rank(h: &Hyper) -> bool {
 #[derive(Debug)]
 pub struct TrainJob {
     pub remote: Option<Target>,
+    /// set instead of `remote` when the run goes to Unsloth Desktop
+    pub unsloth: Option<UnslothTarget>,
     pub project: Project,
     pub model: ModelEntry,
     pub method: Method,

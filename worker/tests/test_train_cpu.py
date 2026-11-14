@@ -429,3 +429,23 @@ def test_several_gguf_sizes_are_made_from_one_conversion(tmp_path):
     assert Path(res["gguf"]) == out / "model-q8_0.gguf"                       # the first size stays the main one
     assert sum(1 for e in ev2 if e["type"] == "log" and "converted" in e["text"]) == 1, "converted once"
     assert not (out / "model-f16.gguf").exists() and not (out / "merged").exists()
+
+
+@pytest.mark.parametrize("method", ["lora", "rs_lora", "dora", "loftq"])
+def test_the_adapter_variants_train_end_to_end(method, tmp_path):
+    """DoRA, RS-LoRA and LoftQ ride the same pipeline as plain LoRA: the flags reach PEFT, the run learns, an adapter
+    is saved (LoftQ initializes its base through PEFT itself, so it takes the standard engine here)."""
+    p, ev, out = run_job(tmp_path, "qwen3_5", "real", method=method, hyper={"max_steps": 4, "lr": 1e-2, "warmup": 0})
+    assert p.returncode == 0, p.stderr[-3000:] + p.stdout[-1000:]
+    res = ev[-1]["data"]
+    assert res["method"] == method and res["backend"] == "hf" and Path(res["adapter_dir"], "adapter_config.json").exists()
+    cfg = json.loads(Path(res["adapter_dir"], "adapter_config.json").read_text(encoding="utf-8"))
+    if method == "rs_lora":
+        assert cfg.get("use_rslora") is True
+    if method == "dora":
+        assert cfg.get("use_dora") is True
+    if method == "loftq":
+        # PEFT serializes loftq_config as {} in the saved config; the worker's own log line says the init ran
+        assert any(e["type"] == "log" and "LoftQ" in e.get("text", "") for e in ev)
+    metrics = [e for e in ev if e["type"] == "metric"]
+    assert metrics and metrics[0]["loss"] > metrics[-1]["loss"], [m["loss"] for m in metrics]

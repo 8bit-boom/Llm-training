@@ -354,6 +354,10 @@ pub fn read_metrics(p: &Project, name: &str) -> Vec<Value> {
 
 /// A run that was stopped or failed after saving a checkpoint can be continued (a remote run keeps its checkpoints on the server).
 pub fn resumable(p: &Project, name: &str) -> bool {
+    // a run in Unsloth: a lost connection or a failure can be taken up again (reattach, or send the data again); a job stopped there is cancelled for good
+    if let Some(st) = read_json(&runs_dir(p).join(name).join("state.json")).filter(|s| s["backend"] == "unsloth") {
+        return matches!(st["status"].as_str(), Some("failed" | "interrupted"));
+    }
     if read_json(&runs_dir(p).join(name).join("state.json")).is_some_and(|s| s["server"].is_string() && matches!(s["status"].as_str(), Some("stopped" | "failed" | "interrupted"))) {
         return true;
     }

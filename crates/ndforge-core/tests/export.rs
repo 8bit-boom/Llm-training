@@ -325,3 +325,27 @@ echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m,\"mm
     assert!(exports::execute_many(&p, "run1", &[], 8192, "gguf", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("at least one"));
     assert!(exports::execute_many(&p, "run1", &q(&["q4_k_m", "q2"]), 8192, "gguf", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("Unknown file size"));
 }
+
+/// The Unsloth Studio export of the sample project is byte-for-byte what the fixtures hold. Set `NDFORGE_BLESS=1` to rewrite the fixtures after a change that is meant.
+/// The Desktop training run sends the same rows (`unsloth::chatml`), so this test guards both.
+#[test]
+fn the_studio_export_of_the_sample_project_matches_the_golden_files() {
+    use ndforge_core::export::studio;
+    let d = tempdir().unwrap();
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe { test_percent: 30, ..Recipe::default() }).unwrap();
+    store::save_version(&p).unwrap();
+    let r = studio::export(&p, None, &d.path().join("out"), true).unwrap();
+    let dir = std::path::PathBuf::from(r["dir"].as_str().unwrap());
+    let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/studio_golden");
+    for f in ["train.jsonl", "eval.jsonl"] {
+        let got = std::fs::read_to_string(dir.join(f)).unwrap();
+        if std::env::var("NDFORGE_BLESS").is_ok() {
+            std::fs::create_dir_all(&golden).unwrap();
+            std::fs::write(golden.join(f), &got).unwrap();
+        }
+        let want = std::fs::read_to_string(golden.join(f)).unwrap_or_else(|_| panic!("missing fixture {f}: run once with NDFORGE_BLESS=1"));
+        // line by line, so a checkout that turned line endings into CRLF does not matter
+        assert_eq!(got.lines().collect::<Vec<_>>(), want.lines().collect::<Vec<_>>(), "{f} differs from the fixture");
+    }
+}

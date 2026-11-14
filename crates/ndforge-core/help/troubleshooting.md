@@ -64,6 +64,13 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 ## TrueNAS server
 **"Cannot connect".** The address needs the port (`http://truenas:8765`); the container must be running; the token must match. See `docs/TRUENAS_WORKER.md`.
 
+## Unsloth Desktop
+**"Unsloth does not answer".** Open Unsloth Desktop (it serves only while it is open) and press *Find* in Training setup, or type the address shown in Unsloth under Settings, API. From another computer, LAN access must be switched on in Unsloth.
+**"Unsloth refused the API key".** Create a new key in Unsloth (Settings, API) and save it again; Unsloth shows a key only once.
+**"This Unsloth has no training API for other programs".** Update Unsloth (Settings, General, Check for updates) or use Export for Unsloth Studio in Step 2.
+**"Unsloth ran out of graphics memory".** Choose QLoRA, a shorter context or a smaller model, and close chat models in Unsloth.
+**The run is done but has no Test / Export.** Unsloth runs on another computer, so the adapter stayed there; see the note on the run. Export it in Unsloth, or copy its folder into the run's *adapter* folder.
+
 ## Teacher
 **The teacher keeps failing.** Test the connection first. For Ollama: the model must be downloaded (`ollama pull <name>`), the address like `http://truenas:11434`.
 
