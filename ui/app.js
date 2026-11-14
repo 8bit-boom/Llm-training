@@ -492,6 +492,110 @@ function wireTrain() {
   });
 }
 
+// ------------------------------------------------------------------------------------------------ the general-text chooser (Heal card and importance-matrix box)
+// One piece of code for both places: `scope` is "heal" or "imatrix". The program's list (presets + the person's own datasets) comes from the core
+// (`general_state`); every change that is saved comes back as the new state.
+let gc = { src: null, state: null, scopes: {}, tokenText: "" };
+const gcKey = (s) => (s.file || s.id || "") + (s.config ? "#" + s.config : "");
+function gcUse(st) { if (st && st !== gc.src) { gc.src = st; gc.state = st; } return gc.state; }
+function gcScope(scope) { return gc.scopes[scope] || (gc.scopes[scope] = { sel: null, own: { mode: "hub", id: "", file: "", config: "", split: "", column: "" }, check: null, busy: false, error: null, project: null }); }
+function gcEntries() { const st = gc.state || { presets: [], custom: [] }; return [...st.presets.map((p) => ({ ...p, preset: true })), ...st.custom.map((c) => ({ ...c, key: gcKey(c), kind: c.kind || "", custom: true }))]; }
+// what is selected: this session's choice, else the project's last choice, else the default
+function gcSel(scope) {
+  const sc = gcScope(scope), st = gc.state;
+  if (!st) return "";
+  const project = state && state.project ? state.project.folder : "";
+  if (sc.sel === null || sc.project !== project) {
+    sc.project = project;
+    const last = (st.choice || {})[scope];
+    const hit = last && gcEntries().find((e) => e.key === gcKey(last));
+    sc.sel = hit ? hit.key : last && (last.id || last.file) ? "own" : st.default;
+    if (sc.sel === "own") sc.own = { mode: last.file ? "file" : "hub", id: last.id || "", file: last.file || "", config: last.config || "", split: last.split || "", column: last.column || "" };
+  }
+  return sc.sel;
+}
+function gcEntry(scope) { const k = gcSel(scope); return gcEntries().find((e) => e.key === k) || null; }
+// the source the job gets (the core fills the config and split of a preset)
+function gcSource(scope) {
+  const sc = gcScope(scope), e = gcEntry(scope), nz = (v) => (v && String(v).trim() ? String(v).trim() : null);
+  if (gcSel(scope) === "own") { const o = sc.own; return o.mode === "file" ? { file: nz(o.file), column: nz(o.column) } : { id: nz(o.id), config: nz(o.config), split: nz(o.split), column: nz(o.column) }; }
+  if (!e) return null;
+  return e.file ? { file: e.file, column: e.column || null } : { id: e.id, config: e.config || null, split: e.split || null, column: e.column || null };
+}
+// why the chosen dataset cannot be used yet ("" = it can)
+function gcBlocked(scope) {
+  const e = gcEntry(scope), st = gc.state;
+  if (e && e.needs_ack && !(st.acknowledged || []).includes(e.key)) return "Tick the box that says you read the licence note, or choose another dataset.";
+  if (gcSel(scope) === "own") { const o = gcScope(scope).own; if (!(o.mode === "file" ? o.file.trim() : o.id.trim())) return "Fill in the dataset or the file of \"My own...\", or choose another dataset."; }
+  return "";
+}
+const GC_VERDICT = { works: "ok", needs_access: "err", not_found: "err", no_column: "err", offline: "err", empty: "err", error: "err" };
+function gcHtml(scope) {
+  const st = gc.state;
+  if (!st) return "";
+  const sc = gcScope(scope), sel = gcSel(scope), e = gcEntry(scope), busy = sc.busy, id = (x) => `gc-${scope}-${x}`;
+  const label = (x) => `${x.name || x.id} · ${x.license || "licence: yours to check"} · ${x.kind || "?"}${x.gated ? " · needs access + your token" : ""}`;
+  const opts = gcEntries().map((x) => `<option value="${esc(x.key)}" ${sel === x.key ? "selected" : ""}>${esc(label(x))}</option>`).join("") + `<option value="own" ${sel === "own" ? "selected" : ""}>My own…</option>`;
+  let info = "";
+  if (e) {
+    info = `<p class="dim small">${esc(e.note || "")}${e.custom ? ` Added by you (${esc(e.file || e.id)}); the licence is yours to check${sc.check && sc.check.license ? "; the Hub says: " + esc(sc.check.license) : ""}.` : ""}</p>
+      <p class="dim small"><strong>Licence:</strong> ${esc(e.license || "yours to check")}${e.license_note ? " · " + esc(e.license_note) : ""}${e.url ? ` · <a href="${esc(e.url)}" target="_blank" rel="noopener">dataset page</a>` : ""}</p>`;
+    if (e.needs_ack) info += `<label class="opt"><input type="checkbox" id="${id("ack")}" ${(st.acknowledged || []).includes(e.key) ? "checked" : ""}> I read this licence note and the dataset's LICENSE, and my use fits it.</label>`;
+    if (e.gated) info += `<p class="warn small">This dataset needs access approval on Hugging Face. Ask for access on its page and add your Hugging Face token below; without both it cannot be downloaded.</p>`;
+  }
+  let own = "";
+  if (sel === "own") {
+    const o = sc.own;
+    own = `<div class="grid"><label>Source <select id="${id("mode")}"><option value="hub" ${o.mode === "hub" ? "selected" : ""}>A Hugging Face dataset</option><option value="file" ${o.mode === "file" ? "selected" : ""}>A file on this computer</option></select></label>
+      ${o.mode === "file" ? `<label>File (.jsonl .json .txt .csv .parquet)<input type="text" id="${id("file")}" value="${esc(o.file)}" placeholder="C:\\texts\\general.jsonl"></label>`
+        : `<label>Dataset (owner/name)<input type="text" id="${id("id")}" value="${esc(o.id)}" placeholder="owner/name"></label><label>Config (optional)<input type="text" id="${id("config")}" value="${esc(o.config)}"></label><label>Split<input type="text" id="${id("split")}" value="${esc(o.split)}" placeholder="train"></label>`}
+      <label>Column (optional, found by itself)<input type="text" id="${id("column")}" value="${esc(o.column)}" placeholder="text, messages, conversations…"></label></div>
+      <p class="dim small">The licence of a dataset you add is yours to check.</p>`;
+  }
+  const c = sc.check;
+  const res = sc.busy ? `<p class="dim small">Reading about 20 rows…</p>` : c ? `<div class="${GC_VERDICT[c.verdict] === "ok" ? "ok" : "err"} small" id="${id("result")}"><strong>${c.verdict === "works" ? "Works." : { needs_access: "Needs access.", not_found: "Not found.", no_column: "No usable column.", offline: "Offline.", empty: "No rows." }[c.verdict] || "Problem."}</strong> ${esc(c.message)}
+      ${c.sample && c.sample.length ? `<pre class="small">${c.sample.map((s) => esc(s)).join("\n———\n")}</pre>` : ""}${c.license ? `<br>Licence on the Hub: ${esc(c.license)}${c.gated ? " (gated)" : ""}` : ""}</div>` : "";
+  const token = `<details ${e && e.gated || (sc.check && sc.check.verdict === "needs_access") ? "open" : ""}><summary>Hugging Face token ${st.has_token ? "(saved)" : "(none)"}</summary>
+      <div class="row"><input type="password" id="gc-token" placeholder="hf_…" value="${esc(gc.tokenText)}" autocomplete="off"> <button class="secondary" id="gc-token-save">Save token</button> ${st.has_token ? `<button class="link" id="gc-token-clear">Remove token</button>` : ""}</div>
+      <p class="dim small">Only for gated datasets (<a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">make a read token</a>). It is kept with your other keys on this computer and handed to the worker as an environment variable; it is never put in a job file or the log.</p></details>`;
+  return `<div class="chooser" data-scope="${scope}"><div class="row"><label>General text <select id="${id("sel")}" ${busy ? "disabled" : ""}>${opts}</select></label>
+      ${e && e.custom ? `<button class="link" id="${id("remove")}">Remove from my list</button>` : ""}</div>${info}${own}
+    <div class="row"><button class="secondary" id="${id("check")}" ${busy ? "disabled" : ""}>Check it</button>${sel === "own" ? `<button class="secondary" id="${id("add")}">Add to my list</button>` : ""}</div>
+    ${sc.error ? `<p class="err small">${esc(sc.error)}</p>` : ""}${res}${token}</div>`;
+}
+async function gcCall(scope, cmd, args) {
+  const sc = gcScope(scope);
+  try { const st = await invoke(cmd, args); if (st && st.presets) { gc.state = st; gc.src = st; } sc.error = null; return st; } catch (e) { sc.error = String(e); return null; }
+}
+function gcPersist(scope) { const s = gcSource(scope); if (s && gcSel(scope)) invoke("general_choose", { scope, source: s }).then((st) => { if (st && st.presets) { gc.state = st; gc.src = st; } }).catch(() => {}); }
+function gcWire(scope, rerender) {
+  const sc = gcScope(scope), id = (x) => `gc-${scope}-${x}`, on = (x, fn) => { const el = $(x); if (el) el.onclick = fn; };
+  const sel = $(id("sel")); if (sel) sel.onchange = () => { sc.sel = sel.value; sc.check = null; sc.error = null; if (sel.value !== "own") gcPersist(scope); rerender(); };
+  const ack = $(id("ack")); if (ack) ack.onchange = async () => { const e = gcEntry(scope); if (e && ack.checked) await gcCall(scope, "general_ack", { key: e.key }); rerender(); };
+  [["mode", "mode"], ["id", "id"], ["file", "file"], ["config", "config"], ["split", "split"], ["column", "column"]].forEach(([x, k]) => { const el = $(id(x)); if (el) el.onchange = () => { sc.own[k] = el.value; sc.check = null; if (k === "mode") rerender(); else gcPersist(scope); }; });
+  on(id("check"), async () => {
+    const src = gcSource(scope);
+    if (!src || !(src.id || src.file)) { sc.error = "Fill in the dataset or the file first."; rerender(); return; }
+    sc.busy = true; sc.check = null; sc.error = null; rerender();
+    try { sc.check = await invoke("general_check", { source: src }); } catch (e) { sc.error = String(e); }
+    sc.busy = false; rerender();
+  });
+  on(id("add"), async () => {
+    const src = gcSource(scope), st = await gcCall(scope, "general_add", { source: src });
+    if (st && st.added) { sc.sel = st.added; sc.check = null; gcPersist(scope); }
+    rerender();
+  });
+  on(id("remove"), async () => {
+    const e = gcEntry(scope); if (!e) return;
+    const st = await gcCall(scope, "general_remove", { key: e.key });
+    if (st) { Object.values(gc.scopes).forEach((s) => { if (s.sel === e.key) s.sel = st.default; }); sc.check = null; gcPersist(scope); }
+    rerender();
+  });
+  const tk = $("gc-token"); if (tk) tk.onchange = () => { gc.tokenText = tk.value; };
+  on("gc-token-save", async () => { const el = $("gc-token"); const v = (el ? el.value : gc.tokenText).trim(); gc.tokenText = ""; if (el) el.value = ""; await gcCall(scope, "hf_token_set", { token: v }); rerender(); });
+  on("gc-token-clear", async () => { await gcCall(scope, "hf_token_clear", {}); rerender(); });
+}
+
 // ------------------------------------------------------------------------------------------------ step 5: use in nd-world
 let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
@@ -500,6 +604,7 @@ const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</b
 function imatrixBox(st) {
   const im = st.imatrix;
   if (!im || us.what === "merged") return "";
+  gcUse(im.general);
   const saved = (im.saved || {})[us.run];
   const reuse = us.imReuse === null ? !!saved : us.imReuse;
   const helps = us.quants.some((q) => !(im.no_matrix_for || []).includes(q));
@@ -507,6 +612,7 @@ function imatrixBox(st) {
   const names = { 64: "64 chunks (quick)", 128: "128 chunks (recommended)", 256: "256 chunks (thorough)" };
   const detail = us.im ? `<div class="row"><label>Calibration text <select id="us-imchunks">${im.chunks.map((n) => `<option value="${n}" ${us.imChunks === n ? "selected" : ""}>${names[n] || n + " chunks"}</option>`).join("")}</select></label>
       <span class="dim">${est ? `${est.tokens.toLocaleString("en")} tokens, about ${est.gpu_minutes} min on a graphics card (up to ${est.cpu_minutes} min on the processor): a rough guess, the log shows the real progress` : ""}</span></div>
+    ${gcHtml("imatrix")}<p class="dim small">About ${Math.round((im.general_share || 0.2) * 100)} % of the calibration text is general text from the dataset above; the rest is your own data. A matrix is only reused for the same dataset.</p>
     ${saved ? `<label class="opt" title="${esc(saved.dir)}"><input type="checkbox" id="us-imreuse" ${reuse ? "checked" : ""}> Reuse the saved matrix (${saved.chunks} chunks, made ${esc(String(saved.created || "").slice(0, 10))}, if it still fits this model and data)</label>` : `<p class="dim">No saved matrix of this run yet: it will be made now and kept next to the files.</p>`}
     ${helps ? "" : `<p class="dim">None of the chosen sizes is below Q8_0, so there is nothing to improve: the matrix would not be made.</p>`}` : "";
   return `<div class="row imatrix"><label class="opt" title="llama.cpp reads about ${im.ctx * im.default_chunks} tokens of your data and some general text and learns which weights matter most; the small sizes then keep those more exactly"><input type="checkbox" id="us-im" ${us.im ? "checked" : ""}> Better small sizes (importance matrix)</label></div>
@@ -529,7 +635,7 @@ function renderUse() {
     <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
     ${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div></div>`;
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && gcBlocked("imatrix")) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
@@ -608,11 +714,12 @@ function wireUse() {
   const imx = $("us-im"); if (imx) imx.onchange = () => { us.im = imx.checked; render(); };
   const imc = $("us-imchunks"); if (imc) imc.onchange = () => { us.imChunks = Number(imc.value); render(); };
   const imr = $("us-imreuse"); if (imr) imr.onchange = () => { us.imReuse = imr.checked; render(); };
+  if (us.im && us.what !== "merged") gcWire("imatrix", render);
   on("us-cancel", () => invoke("env_cancel"));
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
   on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
-    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse } : null }));
+    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, general: gcSource("imatrix") } : null }));
   on("us-lora", async () => {
     const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
     if (!dest) return;
@@ -1027,7 +1134,8 @@ function healCard(m) {
   const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, plan = h.plan || {}, st = (h.heal && h.heal.status) || null;
   const t = (h.tokens || []).find((x) => x.tokens_m === tk) || {};
   const expert = state.settings.expert_mode;
-  const dataset = sp.dataset || h.general_dataset;
+  gcUse(h.general);
+  const blocked = sp.general ? gcBlocked("heal") : "";
   const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>`
     : `<p class="dim small">${plan.mode === "online" ? "The original and the thinner model run at the same time" : "The original answers first and saves its answers to disk, then the thinner model learns (they take turns)"}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. The thinner model is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>`;
   const busy = rs.running || rs.testing || (run && run.running);
@@ -1035,21 +1143,24 @@ function healCard(m) {
   const series = healSeries();
   const charts = lineChart(series.kd, "How far the thinner model's answers are from the original's (KL)", true) + lineChart(series.cal, "Text-prediction error on your data", true);
   const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : "";
-  const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}</p>` : "";
+  const used = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
+  const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
+  const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
   const resume = st === "stopped" || st === "failed";
   return `<div class="card-in">${head}
     <p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>
-    <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (${esc(dataset)}) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
+    <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
+    ${sp.general ? gcHtml("heal") : ""}
     <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
       <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
     ${mem}${loss}${note}
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
-      <label>General text (Hugging Face dataset)<input type="text" id="hl-dataset" value="${esc(sp.dataset)}" placeholder="${esc(h.general_dataset)}"></label>
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
       <label>Weight of copying the original (1 = only copy it)<input type="text" id="hl-alpha" value="${sp.alpha}"></label>
       <label>LoRA size (rank)<input type="text" id="hl-rank" value="${sp.rank}"></label><label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
-    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready ? "disabled" : ""}>${resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked ? "disabled" : ""}>${resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${h.heal.step ? " during step " + esc(h.heal.step) : ""}. Continue goes on where it stopped.</p>` : ""}
     ${prog}${charts}</div>`;
 }
@@ -1279,7 +1390,7 @@ function rsSpec() {
 // what the Heal card sends
 function rsHealSpec() {
   const sp = rs.hlSpec, o = rs.hl && rs.hl.opts;
-  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general_dataset: sp.dataset || null, alpha: +sp.alpha, rank: +sp.rank, lr: +sp.lr, mode: sp.mode || null };
+  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, rank: +sp.rank, lr: +sp.lr, mode: sp.mode || null };
 }
 
 function wireReshape() {
@@ -1331,7 +1442,7 @@ function wireReshape() {
   document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
   // healing
   const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); }; };
-  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); hv("hl-dataset", (e) => { hs.dataset = e.value.trim(); });
+  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); 
   hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; });
   hv("hl-alpha", (e) => { const v = parseFloat(e.value); hs.alpha = Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; });
   hv("hl-rank", (e) => { const v = parseInt(e.value, 10); hs.rank = Number.isFinite(v) && v >= 4 && v <= 256 ? v : 64; });
@@ -1341,6 +1452,8 @@ function wireReshape() {
     rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }; rs.ok = null; rs.error = null; rs.log = []; render();
     try { await invoke("heal_start", { name: rs.hl.name, spec: rsHealSpec() }); } catch (e) { rs.hlRun.running = false; rs.error = String(e); render(); }
   });
+  if (rs.hl && rs.hl.opts && hs.general) gcWire("heal", render);
+  on("hl-usedefault", () => { if (gc.state) { gcScope("heal").sel = gc.state.default; gcScope("heal").check = null; gcPersist("heal"); render(); } });
   on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {

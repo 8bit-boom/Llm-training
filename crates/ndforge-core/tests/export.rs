@@ -358,7 +358,9 @@ fn on() -> exports::ImatrixOptions {
 
 #[test]
 fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg-general"));
     let o = exports::ImatrixOptions::default();
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
@@ -377,6 +379,13 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
                (json!(true), json!("run1"), json!(2), json!(128), json!(512), json!(0.2), json!(true)));
     assert_eq!((b["train"].clone(), b["reuse_dirs"].clone()), (json!("/data/v2/train.jsonl"), json!([])));
     assert_eq!(b["stop_file"], json!(out.join("STOP")));
+    // the general text: the open default, with its split; another dataset is passed on as chosen; an acknowledgement is needed where the preset says so
+    assert_eq!((b["general"]["id"].clone(), b["general"]["split"].clone(), b["general"]["share"].clone(), b["seed"].clone()), (json!("mlabonne/open-perfectblend"), json!("train"), json!(0.2), json!(3407)));
+    let own = exports::ImatrixOptions { general: Some(ndforge_core::general::GeneralSource { file: Some("notes.jsonl".into()), ..Default::default() }), ..on() };
+    let g = exports::imatrix_block(&p, "run1", &cfg, &own, &out).unwrap().unwrap()["general"].clone();
+    assert_eq!((g["file"].clone(), g.get("id").is_none()), (json!("notes.jsonl"), true));
+    let gated = exports::ImatrixOptions { general: Some(ndforge_core::general::GeneralSource::hub("r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation")), ..on() };
+    assert!(exports::imatrix_block(&p, "run1", &cfg, &gated, &out).unwrap_err().0.contains("needs your OK"));
     // no train path in the run settings: the version's own file
     let b = exports::imatrix_block(&p, "run1", &json!({"dataset": {"version": 3}}), &exports::ImatrixOptions { chunks: 64, reuse: false, ..on() }, &out).unwrap().unwrap();
     assert!(b["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v3/train.jsonl") && b["chunks"] == 64 && b["reuse"] == false);
