@@ -647,6 +647,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
     layers = _find_layers(model, n_layers)
+    timer = time.monotonic()
     try:
         try:
             (D, D1, D2, loss, tokens), scores = _measure_all(model, layers, period, batches, mode, types, dims)
@@ -667,7 +668,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
             "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
-            "loss_before": loss, "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            "loss_before": loss, "seconds_per_pass": round(time.monotonic() - timer, 1), "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     if cfg.get("scores_dir"):
         _write_scores(Path(cfg["scores_dir"]), meta, scores)
     protocol.progress("score", 1.0, "")

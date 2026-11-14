@@ -402,7 +402,7 @@ const thinModel = (over = {}) => doneModel({ name: "20261113-150000-qwen3.5-27b-
     width: { before: { intermediate_size: 17408 }, after: { intermediate_size: 10752 }, stable_overlap: 0.93, scores_key: "k", mtp: "sliced by weight size, not measured" } },
   width_scores: { layers: 64, mlp_mean: Array.from({ length: 64 }, (_, i) => 0.2 + (i % 7) * 0.05), kept_share: 0.81, stable_overlap: 0.93 }, ...over });
 
-const healOpts = (over = {}) => ({ name: "20261113-150000-qwen3.5-27b-slim-w10752", plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: true, why: null }, default_tokens_m: 20, general_dataset: "mlabonne/open-perfectblend", has_data: true, vram_gb: 32, healed: false, heal: null, metrics: [], loss: { original: 2.0, thinned: 3.1 },
+const healOpts = (over = {}) => ({ name: "20261113-150000-qwen3.5-27b-slim-w10752", plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: true, why: null }, defaults: { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true }, safer: null, default_tokens_m: 20, general_dataset: "mlabonne/open-perfectblend", has_data: true, vram_gb: 32, healed: false, heal: null, metrics: [], loss: { original: 2.0, thinned: 3.1 },
   tokens: [{ tokens_m: 10, cache_gb: 2, hours: [3.1, 5.9] }, { tokens_m: 20, cache_gb: 3.9, hours: [6.2, 11.8] }, { tokens_m: 40, cache_gb: 7.8, hours: [12.4, 23.6] }, { tokens_m: 80, cache_gb: 15.7, hours: [24.8, 47.2] }], ...over });
 
 test("the result card of a thinner model: the neurons chart, the stability and the honest numbers", () => {
@@ -444,7 +444,7 @@ test("the Heal card: explicit about the download, the budgets, the memory and th
   b.run(`state.settings.expert_mode = true`);
   html = b.run("renderReshape()");
   assert.doesNotMatch(html, /id="hl-dataset"/);                                              // the dataset is chosen in the chooser for everybody, not in Expert
-  assert.match(html, /id="hl-rank" value="64"/);
+  assert.match(html, /id="hl-rank" value="32"/);                                             // the automatic value for a 21 B student
   assert.match(html, /id="hl-lr" value="0.0001"/);
   // a 9B-sized student: 40 M by default, and LoRA in 16-bit
   b.run(`rs.hl.opts.default_tokens_m = 40; rs.hl.opts.plan = { mode: "online", student_method: "lora", est_gb: 28.4, fits: true }`);
@@ -510,7 +510,8 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; renderReshape(); wireReshape();`);
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
-  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general: null, alpha: 1, rank: 64, lr: 0.0001, mode: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
+    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
   assert.equal(b.run("rsHealSpec().general_share"), 0);
@@ -549,4 +550,73 @@ test("a depth-only model gets an optional Heal card; a grown one gets none", () 
   open(b, pageState({ made: [doneModel({ summary: { ...m.summary, mode: "grow", duplicated: [8, 9] } })] }));
   b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ name: m.name }))} }`);
   assert.doesNotMatch(b.run("renderReshape()"), /Heal it/);
+});
+
+const estOf = (over = {}, plan = {}) => ({ plan: { mode: "cache", student_method: "qlora", est_gb: 23.1, fits: true, why: null, verdict: "fits", verdict_text: "Fits: about 23 GB of the 32 GB of this card (an estimate).",
+  breakdown: { weights_gb: 16.4, lora_gb: 2.1, activations_gb: 1.2, kl_gb: 0.3, overhead_gb: 1, total_gb: 23.1 }, ...plan }, knobs: { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true }, ...over });
+
+test("Healing settings: only in Expert mode, with the automatic values shown, the live estimate in plain words and Reset", async () => {
+  const asked = [];
+  const m = thinModel();
+  const b = browser({ heal_estimate: (a) => { asked.push(JSON.parse(JSON.stringify(a.spec))); return a.spec.seq === 4096 ? estOf({}, { fits: false, why: "Healing a model of 16 B parameters needs about 41 GB (an estimate); this card has 32 GB.", verdict: "over", verdict_text: "Will probably run out of memory: about 41 GB needed, this card has 32 GB (an estimate)." }) : estOf(); } });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }`);
+  assert.doesNotMatch(b.run("renderReshape()"), /Healing settings/);                           // the safe defaults apply without Expert mode
+  b.run(`state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /<summary>Healing settings<\/summary>/);
+  assert.match(html, /<option value="1024" selected>1024<\/option>/);
+  assert.match(html, /<option value="2" selected>2<\/option>/);
+  assert.match(html, /id="hl-perupdate" value="32"/);
+  assert.match(html, /= 2 × 16 steps added up/);
+  assert.match(html, /<option value="auto" selected>Auto \(on\)<\/option>/);
+  assert.match(html, /Automatic \(QLoRA 4-bit\)/);
+  assert.match(html, /8-bit AdamW/);
+  assert.match(html, /id="hl-klchunk" value="128"/);
+  assert.match(html, /id="hl-reset"[^>]*>Reset to safe defaults/);
+  b.run(`renderReshape(); wireReshape();`);
+  b.els["hl-seq"].value = "4096";
+  await b.els["hl-seq"].onchange();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(asked.at(-1).seq, 4096);
+  b.run(`state.settings.expert_mode = true`);                                                 // (the page re-render after a change may have reloaded the settings)
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-verdict">Will probably run out of memory: about 41 GB needed/);
+  assert.match(html, /Weights 16.4 GB, LoRA and optimizer 2.1 GB, activations 1.2 GB/);
+  assert.match(html, /<option value="4096" selected>4096<\/option>/);
+  b.run(`state.settings.expert_mode = true; wireReshape()`);
+  await b.els["hl-reset"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.seq"), null);
+  assert.equal(asked.at(-1).seq, null);
+  b.run(`state.settings.expert_mode = true`);
+  assert.match(b.run("renderReshape()"), /id="hl-verdict">Fits: about 23 GB/);
+});
+
+test("After an out-of-memory failure the card offers safer settings instead of a blind Continue", async () => {
+  const m = thinModel();
+  const b = browser({ heal_estimate: () => estOf() });
+  open(b, pageState({ made: [m] }));
+  const heal = { status: "failed", step: "train", oom: true, error: "The graphics card ran out of memory during step train. Settings used: sequence length 1024, batch 2 x 16 steps added up. What to change next, in this order: 1. a shorter sequence length.", retries: [{ attempt: 1, change: "gradient checkpointing" }] };
+  const safer = { label: "a smaller batch (1 per step, 32 steps added up)", checkpointing: "on", batch: 1, per_update: 32, kl_chunk: 128 };
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ heal, safer }))} }`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Healing stopped: The graphics card ran out of memory during step train/);
+  assert.match(html, /Tried automatically: gradient checkpointing\./);
+  assert.match(html, /The next safer setting that keeps what the model learns: <strong>a smaller batch \(1 per step, 32 steps added up\)<\/strong>/);
+  assert.match(html, /id="hl-safer">Try again with safer settings/);
+  assert.match(html, /id="hl-go" >Continue with the settings above/);
+  assert.doesNotMatch(html, /Continue goes on where it stopped/);
+  assert.match(html, /makes the original answer again or starts the learning again/);
+  b.run(`wireReshape()`);
+  await b.els["hl-safer"].onclick();
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify([rs.hlSpec.checkpointing, rs.hlSpec.batch, rs.hlSpec.per_update, rs.hlSpec.kl_chunk])")), ["on", 1, 32, 128]);
+  // used up: the plain list of what is left
+  b.run(`rs.hl.opts.safer = null`);
+  assert.match(b.run("renderReshape()"), /The automatic steps are used up\. Next, in this order: a shorter sequence length, QLoRA, a lower LoRA size/);
+  // another failure keeps the old words and the old Continue
+  b.run(`rs.hl.opts.heal = { status: "failed", step: "train", error: "Healing stopped: the training became unstable." }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /Continue healing/);
+  assert.doesNotMatch(html, /hl-safer/);
 });

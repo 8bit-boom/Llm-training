@@ -166,6 +166,8 @@ The Rust side computes the same numbers (`reshape::plan::width_params`), tested 
 5. **Expert axes** (GatedDeltaNet value heads, attention heads) are implemented end to end (worker, Rust, page) but offered **in Expert mode only, labelled "experimental", and disabled** until the GPU
    checklist below is marked passed. The switch is the constant `EXPERIMENTAL_AXES_PASSED` at the top of the page's section in `ui/app.js`; flip it when the checklist is done.
 
+Healing settings (sequence length, batch, gradient checkpointing, rank, method, optimizer, loss chunk, top-k, ...), the size-based defaults (cautious from 15 B), the memory estimate and the automatic out-of-memory retries are described in `docs/HEAL_SETTINGS.md`; `heal_plan` is now `heal_plan_with` over `heal_memory` (activations, LoRA, loss chunk counted), so the numbers in decision 12 below are the older, weights-only ones.
+
 ### How healing works
 
 `models/<name>/heal.json` holds the state; three worker jobs run one after the other, each resumable, and `reshape::runs::heal` skips what is finished (so *Continue* after a stop, a failure
@@ -232,6 +234,10 @@ Each is the smallest change that made something work or kept something honest.
 13. **`ffn_divisor`** (default 256) is a job key only so that tests can use a tiny model (MLP 32, divisor 4).
 14. **Existing tests were extended, not weakened** where the new fields demanded it: the inspect and result key sets (`INSPECT_KEYS`, `RESULT_KEYS`) have the new keys, the Rust `inspect()` helper uses
     `..Default::default()`, `fake_worker` takes the inspect answer as a parameter, `stfile.BYTES` knows `I64`.
+
+## Try before cutting (version 3)
+
+A "Try first" card on the page finds out what a cut will cost before any model folder is written (job `reshape_try`: the loss of the original, of every block skipped on its own, of every run of blocks, of every width, of a chosen combination, on the project's calibration text, with the cut imitated by hooks; kept in `reshape_try.json` next to the measurements). Everything about it, including the colour bands, the deviations and its own "not verified yet" list, is in `docs/TRY_FIRST.md`. The predicted loss equals the calibration loss of the folder the `reshape` job writes, on a tiny model (`worker/tests/test_reshape_try_torch.py`); nothing is known yet about how it relates to the quality after healing.
 
 ## Not verified yet (needs a GPU run)
 

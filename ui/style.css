@@ -1,12 +1,12 @@
 :root {
   --bg: #f4f5f8; --panel: #ffffff; --text: #1d2130; --dim: #5d6478; --line: #d6d9e3; --accent: #1f6feb; --accent-text: #fff;
-  --ok: #1a7f4b; --err: #c0392b; --sel: #e4ecfd; color-scheme: light;
+  --ok: #1a7f4b; --err: #c0392b; --sel: #e4ecfd; --band-small: #1a7f4b; --band-noticeable: #c98a12; --band-large: #c0392b; color-scheme: light;
 }
 /* night mode: the system's dark setting while no choice was made, or the explicit choice */
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; color-scheme: dark; }
+  :root:not([data-theme="light"]) { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; --band-small: #4cc38a; --band-noticeable: #e0b44c; --band-large: #ff7b6e; color-scheme: dark; }
 }
-:root[data-theme="dark"] { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; color-scheme: dark; }
+:root[data-theme="dark"] { --bg: #14161d; --panel: #1c1f29; --text: #e6e8f0; --dim: #9aa1b5; --line: #323749; --accent: #4c8dff; --accent-text: #0b0d12; --ok: #4cc38a; --err: #ff7b6e; --sel: #26324f; --band-small: #4cc38a; --band-noticeable: #e0b44c; --band-large: #ff7b6e; color-scheme: dark; }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -115,3 +115,7 @@ textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace
 .chooser select { max-width: 100%; }
 .chooser pre { white-space: pre-wrap; word-break: break-word; max-height: 9em; overflow: auto; margin: 6px 0; }
 .chooser details { margin-top: 6px; }
+
+/* Try first: the colour bands of the relative rise of the error (a chip next to a number, never the only sign) */
+.tr-chip { display: inline-block; width: 10px; height: 10px; border-radius: 3px; vertical-align: baseline; margin: 0 2px 0 6px; }
+.tr-verdict { border-left: 3px solid var(--accent); padding-left: 12px; }
