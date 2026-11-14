@@ -137,6 +137,8 @@ The sidebar item **🧬 Slim or grow a model** makes a new base model from one y
 - Layers are moved as raw bytes between safetensors files (no model load), whole pattern periods only (Qwen3.5: 4 layers), so old and new Transformers / llama.cpp agree on the layer pattern. Gemma 4 and quantized models are refused with the reason.
 - Unsloth Studio can only prune MoE experts (REAP), not layers, and not dense or hybrid Qwen3.5: that is why this is built here (docs/RESHAPE.md, section "Could Unsloth Studio do it?").
 
+**Try first** (a card on the same page) finds out what a cut will cost before any model is written: the original is loaded once, a cut is imitated with hooks and the same text-prediction error as the made model's before / after numbers is measured for every block, every run of blocks, every width or your own choice (`docs/TRY_FIRST.md`; it has not been run on a real model yet).
+
 Code: worker `reshape.py`, `reshapejob.py`, `safetensors_io.py`; Rust `crates/ndforge-core/src/reshape/`; page `ui/app.js` (smoke test `ui/smoke/`). Method, file formats, deviations from the plan and the list of what **has not been verified without a GPU**: `docs/RESHAPE.md`.
 
 ### Thinner layers and healing (M14, version 2)

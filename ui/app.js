@@ -978,6 +978,8 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
   shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
+  // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
+  tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, rank: 64, lr: 0.0001, mode: "" } };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
@@ -1214,6 +1216,267 @@ function madeCard(m) {
     ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}</div>`;
 }
 
+// ------------------------------------------------------------------------------------------------------- try before cutting
+// A "Try first" card: what a cut will cost, found out in memory on the project's own text BEFORE a model is written (worker job reshape_try). The numbers are the
+// same text-prediction error as the loss_before / loss_after of a made model. Colour bands and the stability check come from the worker (one constant there).
+
+const TRY_BAND_WORD = { small: "small", noticeable: "noticeable", large: "large" };
+const TRY_WHAT = [["blocks", "Every block on its own"], ["runs", "Every run of the blocks on the slider"], ["widths", "Every width of the slider"], ["choice", "My choice (click blocks in the chart)"]];
+
+function tryDepthOn() { return rs.mode === "prune" && rs.shape !== "width"; }
+function tryWidthOnShape() { return rs.mode === "prune" && rs.shape !== "depth" && !!(rs.options && rs.options.width_options); }
+function trySamples() {
+  const b = rs.options && rs.options.inspect ? rs.options.inspect.total_params / 1e9 : 0;
+  const quick = rs.tr.quick == null ? b >= 15 : rs.tr.quick;
+  return quick ? 64 : 128;
+}
+function tryWidths() {
+  const g = rs.options && rs.options.width_options && rs.options.width_options.find((x) => x.blocks === 0), full = rs.options && rs.options.width && rs.options.width.dims ? rs.options.width.dims.intermediate : 0;
+  return g ? g.options.map((o) => o.intermediate).filter((w) => w < full) : [];
+}
+// what the person's current choice is: the clicked blocks and/or the chosen width
+function tryChoice() { return { blocks: rs.shape === "width" ? [] : [...rs.tr.sel].sort((a, b) => a - b), width: rs.shape === "depth" ? null : rs.wi }; }
+
+// the request for the worker, or null when the card cannot ask for anything now
+function trySpec() {
+  const op = rs.options, ins = op && op.inspect;
+  if (!ins || !ins.supported || rs.mode !== "prune" || !rs.state || !rs.state.dataset_version) return null;
+  const spec = { model_id: rs.model, samples: trySamples(), len: 512, load: rs.load, measure_samples: rs.wsamples, strategy: rs.strategy, protect_first: rs.pf, protect_last: rs.pl,
+    params_b: ins.total_params / 1e9, blocks: false, runs: [], widths: [], choices: [], force: false };
+  const w = rs.tr.what;
+  if (w === "blocks") { if (!tryDepthOn()) return null; spec.blocks = true; }
+  else if (w === "runs") { if (!tryDepthOn() || !rs.blocks) return null; spec.runs = [rs.blocks]; }
+  else if (w === "widths") { const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws; }
+  else {
+    const c = tryChoice();
+    if (!c.blocks.length && c.width == null) return null;
+    spec.choices = [c.width == null ? { blocks: c.blocks } : { blocks: c.blocks, width: c.width }];
+  }
+  return spec;
+}
+const tryNeedsMeasure = (spec) => !!spec && (spec.widths.length > 0 || spec.choices.some((c) => c.width != null)) && !(rs.meas && rs.meas.exists);
+
+function fmtDur(s) {
+  if (s == null) return "?";
+  if (s < 90) return `about ${Math.max(1, Math.round(s))} seconds`;
+  if (s < 5400) return `about ${Math.round(s / 60)} minutes`;
+  return `about ${(s / 3600).toFixed(1)} hours`;
+}
+const pct = (x) => x == null ? "–" : (x >= 0 ? "+" : "−") + Math.abs(x * 100).toFixed(1) + " %";
+
+// keeps the plan (how many cuts, how long) and the saved answers in step with the card; called after every render, asks the worker only when the request changed
+function tryRefresh() {
+  if (page !== "reshape" || !rs.state || !rs.options || rs.tr.running) return;
+  const spec = trySpec(), tr = rs.tr, sig = spec ? JSON.stringify(spec) : "";
+  if (sig !== tr.planFor) {
+    tr.planFor = sig; tr.plan = null; tr.planErr = null;
+    if (spec && !tryNeedsMeasure(spec)) {
+      const token = ++tr.planTok;
+      invoke("reshape_try_plan", { spec }).then((p) => { if (token === tr.planTok) { tr.plan = p; if (page === "reshape") render(); } })
+        .catch((e) => { if (token === tr.planTok) { tr.planErr = String(e); if (page === "reshape") render(); } });
+    }
+  }
+  const rsig = rs.model + "|" + trySamples() + "|" + rs.load;
+  if (rsig !== tr.resFor && rs.state.dataset_version) {
+    tr.resFor = rsig;
+    invoke("reshape_try_results", { model: rs.model, samples: trySamples(), len: 512, load: rs.load }).then((r) => { if (rsig === tr.resFor && !tr.running) { tr.analysis = r && r.exists ? r.analysis : null; tr.sps = r && r.exists ? r.seconds_per_pass : null; if (page === "reshape") render(); } })
+      .catch(() => {});
+  }
+}
+
+// finds the answer for the person's choice in the analysis (null while it was not tried)
+function tryLookup(a, ch) {
+  if (!a || !ch) return null;
+  const same = (x, y) => x.length === y.length && x.every((v, i) => v === y[i]);
+  let r = null;
+  if (!ch.blocks.length) r = ch.width != null ? (a.widths || []).find((w) => w.intermediate === ch.width) : null;
+  else if (ch.width == null) {
+    r = ch.blocks.length === 1 ? (a.blocks || []).find((b) => b.block === ch.blocks[0])
+      : (((a.runs || {})[String(ch.blocks.length)] || {}).windows || []).find((w) => same(w.blocks, ch.blocks)) || (a.choices || []).find((c) => c.intermediate == null && same(c.blocks, ch.blocks));
+  } else r = (a.choices || []).find((c) => c.intermediate === ch.width && same(c.blocks, ch.blocks));
+  return r && r.tried ? r : null;
+}
+
+function bandCss(b) { return b ? `var(--band-${b})` : "var(--line)"; }
+
+// one bar per block: the rise of the error when ONLY this block is skipped (colour = band); the program's influence score is the diamond; click a block to choose it
+function tryBlockChart(a, ins) {
+  const nb = ins.blocks, W = 560, H = 190, P = 34, rows = {};
+  (a ? a.blocks : []).forEach((r) => { rows[r.block] = r; });
+  const edges = a ? a.bands.edges : [0.03, 0.1];
+  const rels = Object.values(rows).map((r) => r.rel).filter((x) => x != null), top = Math.max(0.12, ...rels) * 1.05;
+  const infl = Object.values(rows).map((r) => r.influence).filter((x) => x != null), imax = Math.max(...infl, 1e-9);
+  const bw = (W - P - 8) / nb, base = H - 26, ph = H - 26 - 22, Y = (v) => base - (Math.max(0, v) / top) * ph;
+  const chosen = new Set(rs.tr.sel);
+  const bars = Array.from({ length: nb }, (_, i) => {
+    const x = P + i * bw + 1, w = Math.max(3, bw - 2), r = rows[i], prot = i < rs.pf || i >= nb - rs.pl;
+    if (prot) return `<rect x="${x.toFixed(1)}" y="${base - 6}" width="${w.toFixed(1)}" height="6" fill="var(--line)"><title>block ${i}: protected, never removed</title></rect>`;
+    const h = r && r.rel != null ? Math.max(2, base - Y(r.rel)) : 0, sel = chosen.has(i);
+    const body = r && r.tried ? `<rect x="${x.toFixed(1)}" y="${(base - h).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" fill="${bandCss(r.band)}"/>`
+      : `<rect x="${x.toFixed(1)}" y="${base - 10}" width="${w.toFixed(1)}" height="10" fill="none" stroke="var(--dim)" stroke-dasharray="2 2"/>`;
+    const mark = r && r.influence != null ? `<path d="M${(x + w / 2).toFixed(1)} ${(base - (r.influence / imax) * ph - 4).toFixed(1)} l4 4 l-4 4 l-4 -4 z" fill="var(--text)" opacity=".75"/>` : "";
+    const tip = `block ${i} (layers ${rs.options.inspect.period * i}–${rs.options.inspect.period * i + rs.options.inspect.period - 1})` + (r && r.tried ? `: error ${pct(r.rel)}, perplexity ${r.ppl}` : ": not tried yet") + (r && r.influence != null ? `, influence ${r.influence.toFixed(3)}` : "") + (sel ? " · chosen" : "");
+    return `<g data-trblock="${i}" style="cursor:pointer"><rect x="${x.toFixed(1)}" y="20" width="${w.toFixed(1)}" height="${base - 20}" fill="transparent"/>${body}${mark}${sel ? `<rect x="${(x - 1).toFixed(1)}" y="20" width="${(w + 2).toFixed(1)}" height="${base - 20}" fill="none" stroke="var(--text)" stroke-width="2.5"/>` : ""}<title>${esc(tip)}</title></g>`;
+  }).join("");
+  const lines = edges.map((e) => `<line x1="${P}" x2="${W - 8}" y1="${Y(e).toFixed(1)}" y2="${Y(e).toFixed(1)}" stroke="var(--dim)" stroke-dasharray="3 3" opacity=".6"/><text x="2" y="${(Y(e) + 3).toFixed(1)}" class="axis">+${Math.round(e * 100)} %</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="What skipping each block costs">${lines}${bars}
+    <line x1="${P}" y1="${base}" x2="${W - 8}" y2="${base}" stroke="var(--line)"/><text x="${P}" y="${H - 8}" class="axis">block 0</text><text x="${W - 70}" y="${H - 8}" class="axis">block ${nb - 1}</text>
+    <text x="${P + 4}" y="12" class="axis">bar = rise of the error with only this block skipped · ◆ = the program's influence score · outlined = chosen</text></svg>`;
+}
+
+function tryLegend(a) {
+  const e = a ? a.bands.edges : [0.03, 0.1];
+  return `<div class="dim small"><span class="tr-chip" style="background:var(--band-small)"></span> under +${Math.round(e[0] * 100)} % <span class="tr-chip" style="background:var(--band-noticeable)"></span> +${Math.round(e[0] * 100)} to +${Math.round(e[1] * 100)} % <span class="tr-chip" style="background:var(--band-large)"></span> over +${Math.round(e[1] * 100)} % — rules of thumb, not measurements.</div>`;
+}
+
+function tryRunsTable(a, k) {
+  const r = a && a.runs && a.runs[String(k)];
+  if (!r) return "";
+  const star = r.best, def = r.default, rows = r.windows.map((w) => {
+    const mark = (star && star.start === w.start ? "★ cheapest " : "") + (def && def.blocks && def.blocks[0] === w.start && def.blocks.length === k ? "◆ the program's choice" : "");
+    const on = rs.tr.sel.length === w.blocks.length && w.blocks.every((b) => rs.tr.sel.includes(b));
+    return `<tr data-trrun="${w.start}" style="cursor:pointer;${on ? "background:var(--sel)" : ""}"><td>${w.blocks.length === 1 ? w.blocks[0] : w.blocks[0] + "–" + w.blocks[w.blocks.length - 1]}</td><td>${esc(ranges(w.layers))}</td>
+      <td>${w.tried ? `<span class="tr-chip" style="background:${bandCss(w.band)}"></span> ${pct(w.rel)}` : "–"}</td><td>${w.tried ? w.ppl : "–"}</td><td>${w.distance != null ? w.distance.toFixed(3) : "–"}</td><td class="small">${mark}</td></tr>`;
+  }).join("");
+  let line = "";
+  if (def && def.tried && star) {
+    line = star.blocks.join() === (def.blocks || []).join() ? `<p>The program's choice (blocks ${esc(ranges(def.blocks))}) is also the cheapest run: it costs <strong>${pct(def.rel)}</strong>.</p>`
+      : `<p>The program's default choice (blocks ${esc(ranges(def.blocks))}) costs <strong>${pct(def.rel)}</strong>; the cheapest run (blocks ${esc(ranges(star.blocks))}) costs <strong>${pct(star.rel)}</strong>.</p>`;
+  } else if (star) line = `<p>The cheapest run is blocks ${esc(ranges(star.blocks))}: <strong>${pct(star.rel)}</strong>.${def && !def.tried ? " The program's own choice has not been tried yet." : ""}</p>`;
+  const unstable = r.stability && !r.stability.agree ? `<div class="warn">The two halves of your text disagree about which run is cheapest. Treat this ranking as uncertain; trying Full (more text) may help.</div>` : "";
+  return `<h4>Runs of ${k} block${k === 1 ? "" : "s"}${r.complete ? "" : " (not all tried yet)"}</h4>${line}${unstable}<table class="tbl"><tr><th>Blocks</th><th>Layers</th><th>Error</th><th>Perplexity</th><th>Influence</th><th></th></tr>${rows}</table>`;
+}
+
+function tryWidthChart(a, ins) {
+  const rows = (a ? a.widths : []).filter((w) => w.tried);
+  if (!rows.length) return "";
+  const full = rs.options.width.dims.intermediate, W = 560, H = 150, P = 34;
+  const top = Math.max(0.12, ...rows.map((r) => r.rel)) * 1.05, X = (w) => P + ((full - w) / (full - Math.min(...rows.map((r) => r.intermediate)) + 1e-9)) * (W - P - 16), Y = (v) => H - 24 - (Math.max(0, v) / top) * (H - 44);
+  const pts = rows.slice().sort((x, y) => y.intermediate - x.intermediate).map((r) => `${X(r.intermediate).toFixed(1)},${Y(r.rel).toFixed(1)}`).join(" ");
+  const dots = rows.map((r) => `<circle data-trwidth="${r.intermediate}" cx="${X(r.intermediate).toFixed(1)}" cy="${Y(r.rel).toFixed(1)}" r="${rs.wi === r.intermediate ? 6 : 4}" fill="${bandCss(r.band)}" stroke="var(--text)" stroke-width="${rs.wi === r.intermediate ? 2 : 0.5}" style="cursor:pointer"><title>MLP ${thou(r.intermediate)} (−${Math.round(100 * (1 - r.intermediate / full))} %): error ${pct(r.rel)}, perplexity ${r.ppl}</title></circle>`).join("");
+  const edges = a.bands.edges.map((e) => `<line x1="${P}" x2="${W - 8}" y1="${Y(e).toFixed(1)}" y2="${Y(e).toFixed(1)}" stroke="var(--dim)" stroke-dasharray="3 3" opacity=".6"/><text x="2" y="${(Y(e) + 3).toFixed(1)}" class="axis">+${Math.round(e * 100)} %</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Quality against size for thinner layers">${edges}<polyline fill="none" stroke="var(--dim)" points="${pts}"/>${dots}
+    <line x1="${P}" y1="${H - 24}" x2="${W - 8}" y2="${H - 24}" stroke="var(--line)"/><text x="${P}" y="${H - 8}" class="axis">MLP ${thou(full)} (the original)</text><text x="${W - 150}" y="${H - 8}" class="axis">thinner → (click to choose)</text>
+    <text x="${P + 4}" y="12" class="axis">rise of the error with only the neurons below the cut switched off</text></svg>`;
+}
+
+function tryWidthTable(a) {
+  const rows = (a ? a.widths : []).filter((w) => w.tried);
+  if (!rows.length) return "";
+  const full = rs.options.width.dims.intermediate;
+  const unstable = a.widths_stability && !a.widths_stability.agree ? `<div class="warn">The two halves of your text disagree about the order of the widths. Treat this curve as uncertain.</div>` : "";
+  return `${unstable}<details><summary>The numbers</summary><table class="tbl"><tr><th>MLP</th><th>Cut</th><th>Error</th><th>Perplexity</th></tr>${rows.slice().sort((x, y) => y.intermediate - x.intermediate).map((r) =>
+    `<tr data-trwidth="${r.intermediate}" style="cursor:pointer;${rs.wi === r.intermediate ? "background:var(--sel)" : ""}"><td>${thou(r.intermediate)}</td><td>−${Math.round(100 * (1 - r.intermediate / full))} %</td><td><span class="tr-chip" style="background:${bandCss(r.band)}"></span> ${pct(r.rel)}</td><td>${r.ppl}</td></tr>`).join("")}</table></details>`;
+}
+
+// the plain verdict for one answer, with the honest part that never changes
+function tryVerdict(a, r, what) {
+  const [e1, e2] = a.bands.edges, band = r.band, base = a.base;
+  const sentence = band === "small" ? "a small rise" : band === "noticeable" ? "a noticeable rise" : "a large rise";
+  return `<div class="tr-verdict"><p><strong>${esc(what)}</strong>: the text-prediction error on your own text goes from ${base.loss.toFixed(3)} to ${r.loss.toFixed(3)} (<strong>${pct(r.rel)}</strong>; perplexity ${base.ppl} → ${r.ppl}). That is
+    <span class="tr-chip" style="background:${bandCss(band)}"></span> <strong>${sentence}</strong>.</p></div>`;
+}
+
+const TRY_HONEST = (a) => `<p class="dim small">This is the error <strong>before</strong> healing: healing usually wins back part of it. A cheap cut now is not a guarantee that it heals well, and an expensive one can still heal into a usable model; nobody has measured how the two relate for your model yet. The colours are rules of thumb (under +${Math.round(a.bands.edges[0] * 100)} %, +${Math.round(a.bands.edges[0] * 100)} to +${Math.round(a.bands.edges[1] * 100)} %, over +${Math.round(a.bands.edges[1] * 100)} % of the original's error), not promises. Removing two blocks costs more than the two single costs added up; the "My choice" pass is the honest number. Small differences between two options are noise: the two halves of your text are compared below the chart.</p>`;
+
+function tryCard() {
+  const op = rs.options, ins = op && op.inspect, st = rs.state, tr = rs.tr;
+  if (!ins || !ins.supported || rs.mode !== "prune" || !(op.options.length > 0 || tryWidthOnShape())) return "";
+  if (!st.dataset_version) return `<div class="card wide"><h2>Try first</h2><p class="dim">Save a training-data version in Step 2 first: the cuts are tried on your own text.</p></div>`;
+  const a = tr.analysis, spec = trySpec(), needM = tryNeedsMeasure(spec), run = tr.running;
+  const what = TRY_WHAT.filter(([k]) => (k === "blocks" || k === "runs") ? tryDepthOn() : k === "widths" ? tryWidthOnShape() : true)
+    .map(([k, l]) => `<label class="opt"><input type="radio" name="tr-what" value="${k}" ${tr.what === k ? "checked" : ""} ${run ? "disabled" : ""}> ${esc(l)}${k === "runs" && rs.blocks ? ` <span class="dim">(${rs.blocks} block${rs.blocks === 1 ? "" : "s"})</span>` : ""}</label>`).join("");
+  const q = trySamples();
+  const plan = tr.plan;
+  const planLine = !spec ? `<span class="dim">${tr.what === "choice" ? "Click blocks in the chart (or pick a width) to choose what to try." : "Nothing to try with the settings above."}</span>`
+    : needM ? `<span class="dim">The width needs the neuron measurement of this model first. <button class="link" id="tr-measure" ${rs.running ? "disabled" : ""}>Measure first</button></span>`
+    : tr.planErr ? `<span class="err">${esc(tr.planErr)}</span>`
+    : !plan ? `<span class="dim">Counting…</span>`
+    : plan.passes_todo === 0 ? `<span class="dim">All ${plan.passes_total} answers are already kept; showing them costs nothing.</span>`
+    : `<strong>${plan.passes_todo}</strong> pass${plan.passes_todo === 1 ? "" : "es"} over your text${plan.passes_cached ? ` (${plan.passes_cached} already kept)` : ""} × ${fmtDur(plan.seconds_per_pass).replace("about ", "")} each = <strong>${fmtDur(plan.seconds)}</strong>${plan.guess ? ` <span class="dim">(a guess from the model's size; the real time is measured on the first pass and kept)</span>` : ` <span class="dim">(from a pass that was timed)</span>`}`;
+  const disabled = !spec || needM || run || rs.running || rs.testing || !!tr.planErr || (plan && plan.passes_todo === 0 && false);
+  const progress = run ? `<div class="stepline">${esc(tr.text)}${tr.total ? ` · ${tr.done} of ${tr.total} done` : ""}</div>${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}` : "";
+  let body = "";
+  if (a && a.base && a.base.loss != null) {
+    const parts = [];
+    if (tryDepthOn() && a.blocks.some((r) => r.tried)) parts.push(`<h4>Skipping one block at a time</h4>${tryBlockChart(a, ins)}${tryLegend(a)}${a.blocks_stability && !a.blocks_stability.agree ? `<div class="warn">The two halves of your text disagree about which blocks are cheapest to skip. Treat the order as uncertain.</div>` : ""}`);
+    else if (tryDepthOn() && (tr.what === "choice" || Object.keys(a.runs || {}).length)) parts.push(`<h4>Choose blocks</h4>${tryBlockChart(a, ins)}${tryLegend(a)}`);
+    if (tryDepthOn() && rs.blocks && a.runs && a.runs[String(rs.blocks)]) parts.push(tryRunsTable(a, rs.blocks));
+    if (tryWidthOnShape() && a.widths.some((w) => w.tried)) parts.push(`<h4>Thinner layers: quality against size</h4>${tryWidthChart(a, ins)}${tryLegend(a)}${tryWidthTable(a)}`);
+    const ch = tryChoice(), hit = tryLookup(a, ch);
+    const label = (ch.blocks.length ? `blocks ${ranges(ch.blocks)}` : "") + (ch.blocks.length && ch.width != null ? " and " : "") + (ch.width != null ? `MLP ${thou(ch.width)}` : "");
+    const verdict = hit ? tryVerdict(a, hit, "Your choice (" + label + ")") : (ch.blocks.length || ch.width != null) ? `<p class="dim">Your choice (${esc(label)}) has not been tried yet: choose “My choice” above and press Try.</p>` : "";
+    parts.push(`<h4>Verdict</h4>${verdict}<p>Original: error ${a.base.loss.toFixed(3)}, perplexity ${a.base.ppl}.</p>${TRY_HONEST(a)}
+      <div class="row"><button class="primary" id="tr-use" ${hit && !run && !rs.running ? "" : "disabled"}>Use this choice</button><span class="dim small">${hit ? "fills the Make form below so the model is cut exactly as it was tried" : "try the choice first, then it can be used"}</span></div>`);
+    body = parts.join("");
+  }
+  return `<div class="card wide"><h2>Try first <span class="tag">optional</span></h2>
+    <p>Before a new model is written (tens of GB), find out what a cut costs. The program imitates the cut inside the loaded model and measures the same text-prediction error as the “before / after” numbers of a made model. <strong>Nothing is saved except a small results file.</strong></p>
+    <div class="row">${what}</div>
+    <p>Text: <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="quick" ${q === 64 ? "checked" : ""} ${run ? "disabled" : ""}> Quick (64 samples)</label> <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="full" ${q === 128 ? "checked" : ""} ${run ? "disabled" : ""}> Full (128 samples)</label>
+      <span class="dim small">${ins.total_params / 1e9 >= 15 ? "Quick is the default for models of 15 B or more." : "Full is the default for smaller models."}</span></p>
+    <p id="tr-plan">${planLine}</p>
+    <div class="row"><button class="primary" id="tr-go" ${disabled ? "disabled" : ""}>${tr.what === "choice" ? "Preview my choice" : "Try"}</button><button class="secondary" id="tr-stop" ${run ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps the cuts already tried.</span></div>
+    ${progress}${body}</div>`;
+}
+
+function tryToggle(b) {
+  const i = rs.tr.sel.indexOf(b);
+  if (i >= 0) rs.tr.sel.splice(i, 1); else rs.tr.sel.push(b);
+  rs.tr.sel.sort((x, y) => x - y);
+  rs.tr.what = rs.tr.what === "runs" || rs.tr.what === "blocks" ? rs.tr.what : "choice";
+}
+
+// "Use this choice": fills the Make form with exactly what was tried
+function tryUse() {
+  const c = tryChoice(), ins = rs.options.inspect;
+  if (c.blocks.length) {
+    const layers = c.blocks.flatMap((b) => Array.from({ length: ins.period }, (_, i) => b * ins.period + i));
+    rs.dropText = ranges(layers);
+    if (rs.options.options.some((o) => o.blocks === c.blocks.length)) rs.blocks = c.blocks.length;
+    if (c.width != null && rs.shape === "depth") rs.shape = "both";
+  }
+  if (c.width != null) rs.wi = c.width;
+  rs.error = null;
+  rs.ok = "The Make form now cuts exactly what was tried" + (c.blocks.length ? `: layers ${ranges(rs.dropText ? parseLayers(rs.dropText) : [])}` : "") + (c.width != null ? `, MLP ${thou(c.width)}` : "") + ".";
+}
+
+function onTryEvent(p) {
+  const tr = rs.tr;
+  if (p.kind === "progress") { tr.text = p.text || tr.text; tr.progress = p.value; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "try_pass") { tr.analysis = p.analysis; tr.done = p.done; tr.total = p.total; tr.sps = p.seconds_per_pass; }
+  else if (p.kind === "error") { tr.running = false; tr.text = ""; tr.progress = null; rs.error = p.text; tr.planFor = null; tr.resFor = null; }
+  else if (p.kind === "done") {
+    tr.running = false; tr.text = ""; tr.progress = null; tr.planFor = null; tr.resFor = null;
+    if (p.data && p.data.analysis) tr.analysis = p.data.analysis;
+    rs.ok = p.data && p.data.stopped ? `Stopped. ${p.data.passes_done} of ${p.data.passes_total} cuts are kept; Try goes on from there.` : "Tried. The answers are kept; trying the same again costs nothing.";
+  }
+  if (page === "reshape") render();
+}
+
+function wireTry() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const tr = rs.tr;
+  document.querySelectorAll("input[name=tr-what]").forEach((r) => r.onchange = () => { tr.what = r.value; render(); });
+  document.querySelectorAll("input[name=tr-q]").forEach((r) => r.onchange = () => { tr.quick = r.value === "quick"; tr.analysis = null; render(); });
+  document.querySelectorAll("[data-trblock]").forEach((g) => g.onclick = () => { tryToggle(+g.dataset.trblock); render(); });
+  document.querySelectorAll("[data-trrun]").forEach((row) => row.onclick = () => {
+    const w = (((tr.analysis || {}).runs || {})[String(rs.blocks)] || {}).windows || [], hit = w.find((x) => x.start === +row.dataset.trrun);
+    if (hit) { tr.sel = [...hit.blocks]; render(); }
+  });
+  document.querySelectorAll("[data-trwidth]").forEach((e) => e.onclick = () => { if (rs.shape !== "depth") { rs.wi = +e.dataset.trwidth; render(); } });
+  on("tr-go", async () => {
+    const spec = trySpec(); if (!spec) return;
+    tr.running = true; tr.text = "Starting…"; tr.progress = null; tr.done = 0; tr.total = 0; rs.error = null; rs.ok = null; rs.log = []; render();
+    try { await invoke("reshape_try_start", { spec }); } catch (e) { tr.running = false; rs.error = String(e); render(); }
+  });
+  on("tr-stop", () => { tr.text = "Stopping…"; invoke("reshape_stop"); render(); });
+  on("tr-use", () => { tryUse(); render(); });
+  on("tr-measure", () => rsMeasure(false));
+  tryRefresh();
+}
+
 function renderReshape() {
   const head = `<h1>🧬 Slim or grow a model</h1><p class="lead">Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in. The help panel explains it.</p>`;
   if (!state.bundle) return head + `<p class="lead">Import your world data first (Step 1).</p>`;
@@ -1246,6 +1509,7 @@ function renderReshape() {
       <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${idx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
       <div id="rs-sizeinfo">${rsSizeInfo()}</div>${warn}</div>` : ""}
     ${ok ? "" : (ins && ins.supported && !rs.loadingOpts ? `<p class="dim">This model is too small to change in whole blocks.</p>` : "")}
+    ${ok && !grow && rs.dropText && !state.settings.expert_mode ? `<div class="dim small">Your choice from “Try first” is used: layers ${esc(ranges(parseLayers(rs.dropText) || []))}. <button class="link" id="rs-cleardrop">Use the program's choice instead</button></div>` : ""}
     ${ok && grow ? `<p style="margin-bottom:4px">How should the new layers start?</p>
       <label class="opt"><input type="radio" name="rs-init" value="identity" ${rs.init === "identity" ? "checked" : ""}> <strong>As an exact copy of the original</strong> (recommended): the new layers are switched off, so nothing is lost before training</label>
       <label class="opt"><input type="radio" name="rs-init" value="copy" ${rs.init === "copy" ? "checked" : ""}> <strong>Copy the layers</strong> (SOLAR style): the copied layers work at once, which disturbs the model until it is trained</label>` : ""}
@@ -1263,7 +1527,7 @@ function renderReshape() {
   const noData = !grow && !st.dataset_version && (rs.shape !== "depth" || !(dropList && dropList.length));
   const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : noData ? "Save a training-data version in Step 2 first." : diskBad ? `Not enough free disk space: ${needGb} GB needed, ${st.free_disk_gb} GB free.` : dropList === null ? "The layer list is not valid." : rsWidthOn() && !wo ? "Choose how thin the layers become." : "";
   const make = `<div class="card wide"><h2>3 · Make the model</h2>
-    <div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
+    <div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || rs.tr.running || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
     ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && (wo || (!rsWidthOn() && o)) ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
     ${rs.running ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
     ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
@@ -1273,7 +1537,7 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + pick + size + make + result + list;
+  return head + msg + intro + pick + size + tryCard() + make + result + list;
 }
 
 async function rsRefresh(stale) {
@@ -1354,6 +1618,7 @@ function onHealEvent(p) {
 
 function onReshapeEvent(p) {
   if (p.phase === "heal") return onHealEvent(p);
+  if (p.phase === "try") return onTryEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
     rs.running = false; rs.text = ""; rs.progress = null;
     if (p.kind === "error") rs.error = p.text; else rs.ok = "Measured. The result is kept for every size on this data.";
@@ -1393,10 +1658,15 @@ function rsHealSpec() {
   return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, rank: +sp.rank, lr: +sp.lr, mode: sp.mode || null };
 }
 
+async function rsMeasure(force) {
+  rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+  try { await invoke("reshape_measure", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load, force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+}
+
 function wireReshape() {
   if (page !== "reshape" || !rs.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
-  const m = $("rs-model"); if (m) m.onchange = () => { rs.model = m.value; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
+  const m = $("rs-model"); if (m) m.onchange = () => { rs.model = m.value; rs.tr.sel = []; rs.tr.analysis = null; rs.tr.planFor = null; rs.tr.resFor = null; rs.dropText = ""; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
   document.querySelectorAll("input[name=rs-mode]").forEach((r) => r.onchange = () => { rs.mode = r.value; rs.blocks = null; rs.options = null; rs.ok = null; rsOptions(); });
   document.querySelectorAll("input[name=rs-init]").forEach((r) => r.onchange = () => { rs.init = r.value; });
   document.querySelectorAll("input[name=rs-shape]").forEach((r) => r.onchange = () => { rs.shape = r.value; rs.wi = null; rs.ok = null; rs.options = null; rsOptions(); });
@@ -1416,10 +1686,7 @@ function wireReshape() {
   const lv = $("rs-lv"); if (lv) lv.onchange = () => { rs.lv = lv.checked; rs.options = null; rsOptions(); };
   const hh = $("rs-hh"); if (hh) hh.onchange = () => { rs.hh = hh.value ? +hh.value : null; rs.options = null; rsOptions(); };
   const wsm = $("rs-wsamples"); if (wsm) wsm.onchange = () => { rs.wsamples = +wsm.value; rsMeasInfo(); };
-  const measure = async (force) => {
-    rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
-    try { await invoke("reshape_measure", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load, force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
-  };
+  const measure = rsMeasure;
   on("rs-measure-now", () => measure(false));
   on("rs-measure-again", () => measure(true));
   const sm = $("rs-samples"); if (sm) sm.onchange = () => { rs.samples = +sm.value; };
@@ -1455,6 +1722,8 @@ function wireReshape() {
   if (rs.hl && rs.hl.opts && hs.general) gcWire("heal", render);
   on("hl-usedefault", () => { if (gc.state) { gcScope("heal").sel = gc.state.default; gcScope("heal").check = null; gcPersist("heal"); render(); } });
   on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
+  on("rs-cleardrop", () => { rs.dropText = ""; render(); });
+  wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
     if (!confirm("Delete this model and its files? A training run that used it must be deleted first.")) return;
