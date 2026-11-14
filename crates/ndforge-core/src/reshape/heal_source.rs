@@ -602,7 +602,12 @@ pub fn heal_prepare(p: &Project, student: &Source, teacher: Option<&Source>, che
         }
     }
     let name = format!("heal-{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&student.label()));
-    let name = name.trim_end_matches('-').to_string();
+    let base = name.trim_end_matches('-').to_string();
+    let (mut name, mut n) = (base.clone(), 1);
+    while mine.join(&name).exists() {
+        n += 1;
+        name = format!("{base}-{n}");
+    }
     write(&mine.join(&name), &HealSource { student: student.clone(), teacher: Some(teacher.clone()), created: now(), student_name: student.label(), teacher_name: teacher.label(), student_dir: None, check: keep })?;
     Ok(name)
 }
