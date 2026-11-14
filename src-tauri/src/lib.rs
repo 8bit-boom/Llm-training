@@ -367,11 +367,11 @@ fn export_state(s: State<App>) -> Out<Value> {
 
 /// Makes the GGUF + Modelfile of a run; progress goes to the window as "export-event" events.
 #[tauri::command]
-fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32, what: Option<String>, quants: Option<Vec<String>>) -> Out<()> {
+fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32, what: Option<String>, quants: Option<Vec<String>>, imatrix: Option<ndforge_core::export::runs::ImatrixOptions>) -> Out<()> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     spawn_task(app, &tasks, "export-event", move |cancel, emit| {
         let list = quants.filter(|q| !q.is_empty()).unwrap_or_else(|| vec![quant]);
-        let mut metas = ndforge_core::export::runs::execute_many(&project, &run, &list, num_ctx, what.as_deref().unwrap_or("gguf"), cancel, emit).map_err(|e| e.to_string())?;
+        let mut metas = ndforge_core::export::runs::execute_many_with(&project, &run, &list, num_ctx, what.as_deref().unwrap_or("gguf"), &imatrix.unwrap_or_default(), cancel, emit).map_err(|e| e.to_string())?;
         // one size: its export; several: a summary naming them all
         Ok(if metas.len() == 1 { metas.remove(0) } else { serde_json::json!({"name": metas.iter().filter_map(|m| m["name"].as_str()).collect::<Vec<_>>().join(", "), "run": run, "exports": metas}) })
     })

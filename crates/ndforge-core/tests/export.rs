@@ -349,3 +349,157 @@ fn the_studio_export_of_the_sample_project_matches_the_golden_files() {
         assert_eq!(got.lines().collect::<Vec<_>>(), want.lines().collect::<Vec<_>>(), "{f} differs from the fixture");
     }
 }
+
+// ------------------------------------------------------------------------------------------------------------------------ the importance matrix
+
+fn on() -> exports::ImatrixOptions {
+    exports::ImatrixOptions { enabled: true, ..Default::default() }
+}
+
+#[test]
+fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
+    let d = tempdir().unwrap();
+    let o = exports::ImatrixOptions::default();
+    assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
+    // the page sends only what it has: missing fields are the defaults
+    let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true });
+    assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
+    assert_eq!(exports::IMATRIX_CHUNKS, [64, 128, 256]);
+    assert!(exports::imatrix_helps("q4_k_m") && exports::imatrix_helps("q6_k") && !exports::imatrix_helps("q8_0") && !exports::imatrix_helps("f16") && !exports::imatrix_helps("bf16"));
+    assert!(exports::QUANTS.iter().filter(|(q, _)| exports::imatrix_helps(q)).count() == 3);
+    let p = project_with_world(d.path(), 1);
+    let cfg = json!({"dataset": {"version": 2, "train": "/data/v2/train.jsonl"}});
+    let out = d.path().join("out");
+    assert!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions::default(), &out).unwrap().is_none());
+    let b = exports::imatrix_block(&p, "run1", &cfg, &on(), &out).unwrap().unwrap();
+    assert_eq!((b["enabled"].clone(), b["model"].clone(), b["data_version"].clone(), b["chunks"].clone(), b["ctx"].clone(), b["general_share"].clone(), b["reuse"].clone()),
+               (json!(true), json!("run1"), json!(2), json!(128), json!(512), json!(0.2), json!(true)));
+    assert_eq!((b["train"].clone(), b["reuse_dirs"].clone()), (json!("/data/v2/train.jsonl"), json!([])));
+    assert_eq!(b["stop_file"], json!(out.join("STOP")));
+    // no train path in the run settings: the version's own file
+    let b = exports::imatrix_block(&p, "run1", &json!({"dataset": {"version": 3}}), &exports::ImatrixOptions { chunks: 64, reuse: false, ..on() }, &out).unwrap().unwrap();
+    assert!(b["train"].as_str().unwrap().replace('\\', "/").ends_with("datasets/v3/train.jsonl") && b["chunks"] == 64 && b["reuse"] == false);
+    assert!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { chunks: 100, ..on() }, &out).unwrap_err().0.contains("64, 128 or 256"));
+}
+
+#[test]
+fn saved_matrices_are_found_by_run_and_listed_with_time_guesses_for_the_page() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let save = |dir: &str, run: &str, created: &str| {
+        let f = exports::exports_dir(&p).join(dir);
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("imatrix.gguf"), "M").unwrap();
+        std::fs::write(f.join("imatrix.json"), json!({"model": run, "created": created, "chunks": 64, "ctx": 512, "general_used": true, "data_version": 1}).to_string()).unwrap();
+    };
+    save("run1-q4_k_m", "run1", "2026-01-01T00:00:00Z");
+    save("run1-q6_k", "run1", "2026-02-01T00:00:00Z");
+    save("run2-q4_k_m", "run2", "2026-03-01T00:00:00Z");
+    std::fs::create_dir_all(exports::exports_dir(&p).join("run1-q5_k_m")).unwrap();          // no matrix in it
+    let found = exports::saved_imatrices(&p, "run1");
+    assert_eq!(found.iter().map(|(d, _)| d.file_name().unwrap().to_str().unwrap().to_string()).collect::<Vec<_>>(), ["run1-q6_k", "run1-q4_k_m"], "newest first, only this run");
+    let st = exports::imatrix_state(&p);
+    assert_eq!((st["chunks"].clone(), st["default_chunks"].clone(), st["ctx"].clone()), (json!([64, 128, 256]), json!(128), json!(512)));
+    assert_eq!(st["saved"]["run1"]["chunks"], 64);
+    assert!(st["saved"]["run2"].is_null());
+    let est = &st["estimates"]["run1"];
+    assert!(est["64"]["gpu_minutes"].as_f64().unwrap() < est["256"]["gpu_minutes"].as_f64().unwrap() && est["128"]["tokens"] == 128 * 512);
+    assert!(est["128"]["cpu_minutes"].as_f64().unwrap() > est["128"]["gpu_minutes"].as_f64().unwrap());
+    let mut m = AppModel::load();
+    m.open_project(p.folder.to_str().unwrap()).unwrap();
+    assert_eq!(m.export_state().unwrap()["imatrix"]["saved"]["run1"]["chunks"], 64);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_export_with_the_matrix_sends_the_block_and_keeps_the_matrix_with_every_size() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // the fake worker makes one file per size; when the job has an "imatrix" block it also makes the matrix and reports it
+    fake_worker(d.path(), r#"cp "$5" "$out/job.json"
+qs=$(sed -n 's/.*"quants":\[\([^]]*\)\].*/\1/p' "$5" | tr -d '"' | tr ',' ' ')
+map=""
+for q in $qs; do printf "GGUF-$q" > "$out/model-$q.gguf"; map="$map\"$q\":\"$out/model-$q.gguf\","; done
+if grep -q '"imatrix":{' "$5"; then
+  printf IMATRIX > "$out/imatrix.gguf"; echo '{"model":"run1","chunks":64,"ctx":512,"general_used":false,"created":"2026-05-01T00:00:00Z"}' > "$out/imatrix.json"
+  im="{\"made\":true,\"reused\":false,\"file\":\"$out/imatrix.gguf\",\"applied\":[\"q4_k_m\"],\"not_applied\":{\"q8_0\":\"high precision\"},\"note\":\"The general text could not be read.\",\"info\":{\"general_used\":false,\"llama_cpp\":\"version: 1\"}}"
+else im=null; fi
+echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":null,\"imatrix\":$im}}""#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let q = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let kill = AtomicBool::new(false);
+
+    // not asked for: no block in the job, nothing in the meta, no matrix file
+    let off = exports::execute_many(&p, "run1", &q(&["q4_k_m", "q8_0"]), 8192, "gguf", &kill, &mut |_| {}).unwrap();
+    assert!(off.iter().all(|m| m["imatrix"].is_null()));
+    assert!(!p.folder.join("exports/run1-q4_k_m/imatrix.gguf").exists());
+
+    // asked for, two sizes: the block reaches the worker, the matrix and its json sit in both exports, the meta says which size used it
+    let metas = exports::execute_many_with(&p, "run1", &q(&["q4_k_m", "q8_0"]), 8192, "gguf", &exports::ImatrixOptions { chunks: 64, ..on() }, &kill, &mut |_| {}).unwrap();
+    for name in ["run1-q4_k_m", "run1-q8_0"] {
+        let dir = p.folder.join("exports").join(name);
+        assert_eq!(std::fs::read_to_string(dir.join("imatrix.gguf")).unwrap(), "IMATRIX", "{name}");
+        assert!(std::fs::read_to_string(dir.join("imatrix.json")).unwrap().contains("\"chunks\":64"));
+    }
+    assert!(!p.folder.join("exports/run1-gguf-work").exists());
+    let (a, b) = (&metas[0]["imatrix"], &metas[1]["imatrix"]);
+    assert_eq!((a["requested"].clone(), a["applied"].clone(), a["made"].clone(), a["file"].clone(), a["chunks"].clone()), (json!(true), json!(true), json!(true), json!("imatrix.gguf"), json!(64)));
+    assert_eq!((b["applied"].clone(), b["reason"].clone()), (json!(false), json!("high precision")));
+    assert_eq!((a["note"].clone(), a["general_used"].clone(), a["llama_cpp"].clone()), (json!("The general text could not be read."), json!(false), json!("version: 1")));
+    let saved = std::fs::read_to_string(p.folder.join("exports/run1-q8_0/meta.json")).unwrap();
+    assert!(saved.contains("\"imatrix\"") && saved.contains("high precision"));
+    assert!(exports::list_exports(&p).iter().all(|e| e["imatrix"]["requested"] == true));
+    // a later export finds the saved matrix and tells the worker where it is; one size goes straight into its export folder
+    let again = exports::imatrix_block(&p, "run1", &json!({"dataset": {"version": 1}}), &on(), &d.path().join("x")).unwrap().unwrap();
+    assert_eq!(again["reuse_dirs"].as_array().unwrap().len(), 2);
+    let one = exports::execute_many_with(&p, "run1", &q(&["q4_k_m"]), 8192, "gguf", &on(), &kill, &mut |_| {}).unwrap();
+    let job = std::fs::read_to_string(p.folder.join("exports/run1-q4_k_m/job.json")).unwrap();
+    let job: Value = serde_json::from_str(&job).unwrap();
+    assert_eq!((job["imatrix"]["chunks"].clone(), job["imatrix"]["ctx"].clone(), job["imatrix"]["reuse"].clone(), job["imatrix"]["model"].clone()), (json!(128), json!(512), json!(true), json!("run1")));
+    assert_eq!(job["imatrix"]["reuse_dirs"].as_array().unwrap().len(), 2);
+    assert_eq!(one[0]["imatrix"]["applied"], true);
+    // only the merged model (this fake worker makes none, so the call ends in that error): the matrix has nothing to do and is not even sent
+    let _ = exports::execute_many_with(&p, "run1", &q(&["q4_k_m"]), 8192, "merged", &on(), &kill, &mut |_| {});
+    assert!(!std::fs::read_to_string(p.folder.join("exports/run1-merged/job.json")).unwrap().contains("imatrix"));
+    // a wrong amount is refused before anything runs
+    assert!(exports::execute_many_with(&p, "run1", &q(&["q4_k_m"]), 8192, "gguf", &exports::ImatrixOptions { chunks: 7, ..on() }, &kill, &mut |_| {}).unwrap_err().0.contains("64, 128 or 256"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_during_an_export_with_the_matrix_lets_the_worker_end_by_itself() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // the fake worker waits for the STOP file that the program writes into the export folder, then says "Cancelled." like the real worker
+    fake_worker(d.path(), r#"touch "$out/waiting"
+while [ ! -f "$out/STOP" ]; do sleep 0.05; done
+echo '{"type":"error","code":"export_stopped","message":"Cancelled."}'
+exit 1"#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let kill = AtomicBool::new(false);
+    let waiting = p.folder.join("exports/run1-q4_k_m/waiting");
+    let t0 = std::time::Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !waiting.exists() && t0.elapsed().as_secs() < 20 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            kill.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        exports::execute_many_with(&p, "run1", &["q4_k_m".to_string()], 8192, "gguf", &on(), &kill, &mut |_| {})
+    });
+    assert_eq!(r.unwrap_err().0, "Cancelled.");
+    assert!(t0.elapsed().as_secs() < 15 && !p.folder.join("exports/run1-q4_k_m/STOP").exists());
+}

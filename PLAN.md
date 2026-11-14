@@ -466,6 +466,10 @@ test fixture on both sides.
 
 No blocking questions. Decided: the "Retrain with the new export" button is included (§5.4, milestone M7).
 
+## Addendum: importance matrix for the GGUF export
+
+An optional step of Step 5 (off by default) that measures the model on the project's own data plus some general text with llama.cpp's `llama-imatrix` and gives the matrix to `llama-quantize` for the sizes below Q8_0. Owner decisions, files, failure notes and what is not verified: `docs/IMATRIX.md`.
+
 ## Addendum: Unsloth Desktop (M15)
 Unsloth Desktop is a third place to train (after this PC and the TrueNAS server), never the default, added after the original milestones. Scope, owner decisions and what is not verified: `docs/UNSLOTH_DESKTOP.md`.
 

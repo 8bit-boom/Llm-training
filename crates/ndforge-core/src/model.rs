@@ -529,6 +529,7 @@ impl AppModel {
             "runs": exports::exportable_runs(p),
             "exports": exports::list_exports(p),
             "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+            "imatrix": exports::imatrix_state(p),
             "servers": self.settings.ollama_servers,
             "suggested_name": ollama_name(&p.model_label(), ""),
             "world": p.display_name(),

@@ -48,9 +48,12 @@ def main(argv: list) -> int:
             protocol.error("train_failed", _explain(exc))
             return 1
     if kind == "export":
-        from . import exportjob
+        from . import exportjob, imatrix
         try:
             return exportjob.run(job)
+        except imatrix.Stopped:   # the Stop button during the importance matrix: the same word as a killed worker
+            protocol.error("export_stopped", "Cancelled.")
+            return 1
         except Exception as exc:
             import traceback
             traceback.print_exc()

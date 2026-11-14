@@ -1,7 +1,8 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
 Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
-keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept)."""
+keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
+imatrix (optional: the importance matrix for the sizes below q8_0, see imatrix.py; it always goes through llama.cpp. Result: `imatrix` with made / reused / applied / not_applied / notes / file)."""
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backends, protocol, vision
+from . import backends, imatrix, protocol, vision
 from .families import default_non_thinking
 
 QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
@@ -98,8 +99,9 @@ def merge_hf(cfg, merged: Path):
     patch_template_dir(merged, cfg["base"]["family"])
 
 
-def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants) -> dict:
-    """Converts once to f16, then makes every wanted size from it. Returns {quant: file}."""
+def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = None) -> dict:
+    """Converts once to f16, then makes every wanted size from it. Returns {quant: file}. With cfg["imatrix"] and a `report` dict (see new_report) the
+    importance matrix is made (or reused) after the conversion and given to every size below q8_0; the report says what happened. Raises imatrix.Stopped on Stop."""
     quants = [quants] if isinstance(quants, str) else list(quants)
     conv, quantize = find_llama_cpp()
     if conv is None:
@@ -111,17 +113,63 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants) -> dict:
     _run([sys.executable, conv, merged, "--outfile", f16, "--outtype", "f16"], "The GGUF conversion")
     files = {}
     others = [q for q in quants if q != "f16"]
-    for i, quant in enumerate(others):
-        final = out / f"model-{quant}.gguf"
-        protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}")
-        _run([quantize, f16, final, quant.upper()], "The quantisation")
-        files[quant] = final
+    im = cfg.get("imatrix") if report is not None else None
+    try:
+        matrix = imatrix.prepare(cfg, merged, out, f16, quantize, quants, report) if im else None
+        for i, quant in enumerate(others):
+            if im and imatrix.stop_requested(im):
+                raise imatrix.Stopped()
+            final = out / f"model-{quant}.gguf"
+            protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}")
+            if matrix is not None and quant in imatrix.NO_IMATRIX:
+                report["not_applied"][quant] = "high precision: the matrix would change almost nothing"
+            if matrix is not None and quant not in imatrix.NO_IMATRIX:
+                rc, _ = imatrix.run_streaming(imatrix.launcher(quantize) + ["--imatrix", matrix, f16, final, quant.upper()], im, 1, None)
+                if rc == 0 and final.is_file():
+                    report["applied"].append(quant)
+                    files[quant] = final
+                    continue
+                msg = f"llama-quantize did not accept the importance matrix for {quant.upper()} (exit code {rc}); that size was made without it."
+                report["notes"].append(msg)
+                report["not_applied"][quant] = "llama-quantize refused the matrix"
+                protocol.log(msg)
+                final.unlink(missing_ok=True)
+            _run(imatrix.launcher(quantize) + [f16, final, quant.upper()], "The quantisation")
+            files[quant] = final
+    except imatrix.Stopped:
+        f16.unlink(missing_ok=True)
+        raise
     if "f16" in quants:
         final = out / "model-f16.gguf"
         files["f16"] = final            # the converter's own output, kept as it is
     else:
         f16.unlink(missing_ok=True)
     return {q: files[q] for q in quants}
+
+
+def new_report() -> dict:
+    return {"requested": True, "made": False, "reused": False, "file": None, "applied": [], "not_applied": {}, "notes": [], "info": None}
+
+
+def use_unsloth_for(backend: str, cfg: dict, quants: list, report) -> bool:
+    """Does Unsloth's save_pretrained_gguf make the GGUF? Only with the unsloth backend, and not when an importance matrix is wanted: the installed Unsloth is not
+    known to take one, so then llama.cpp (convert + llama-imatrix + llama-quantize) is used. Without llama-imatrix, or when no size below q8_0 is wanted,
+    the export goes through Unsloth as before and `report["notes"]` says why there is no matrix."""
+    if backend != "unsloth" or not cfg.get("gguf", True):
+        return False
+    if report is None:
+        return True
+    conv, quantize = find_llama_cpp()
+    if not [q for q in quants if q not in imatrix.NO_IMATRIX]:
+        report["notes"].append("The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made.")
+    elif conv is not None and imatrix.find_llama_imatrix(quantize) is not None:
+        protocol.log("An importance matrix was asked for: the GGUF is made with llama.cpp (it applies the matrix) instead of Unsloth.")
+        return False
+    else:
+        report["notes"].append("An importance matrix was asked for, but llama.cpp (with llama-imatrix) was not found, so the GGUF was made through Unsloth without it. "
+                               "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
+        protocol.log(report["notes"][-1])
+    return True
 
 
 def find_gguf(dirs, quant: str, strict: bool = False):
@@ -148,7 +196,11 @@ def run(cfg: dict) -> int:
     gguf_path = None
     ggufs = {}
     note = ""
-    if backend == "unsloth" and cfg.get("gguf", True):
+    report = new_report() if (cfg.get("imatrix") and cfg["imatrix"].get("enabled", True) and cfg.get("gguf", True)) else None
+    if report is None:
+        cfg = {k: v for k, v in cfg.items() if k != "imatrix"}
+    use_unsloth = use_unsloth_for(backend, cfg, quants, report)
+    if use_unsloth:
         from unsloth import FastLanguageModel, FastModel
         from .families import family
         loader = FastModel if family(cfg["base"]["family"])["loader"] == "FastModel" else FastLanguageModel
@@ -184,7 +236,7 @@ def run(cfg: dict) -> int:
         else:
             merge_hf(cfg, merged)
         if cfg.get("gguf", True):
-            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants)
+            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants, **({} if report is None else {"report": report}))
             gguf_path = ggufs[quant]
     mmproj, vnote, mods = None, "", []
     if gguf_path and cfg.get("vision", True):
@@ -211,7 +263,8 @@ def run(cfg: dict) -> int:
         note = "Merged 16-bit model only (no GGUF requested)."
     protocol.progress("done", 1.0, "Export ready")
     summary = {"gguf": str(gguf_path) if gguf_path else None, "ggufs": {q: str(f) for q, f in ggufs.items()}, "mmproj": str(mmproj) if mmproj else None, "modalities": mods, "vision_note": vnote, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
-               "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note}
+               "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note,
+               "imatrix": dict(report, note=" ".join(report["notes"])) if report is not None else None}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
     return 0
