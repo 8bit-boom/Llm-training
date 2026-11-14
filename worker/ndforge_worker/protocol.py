@@ -7,6 +7,8 @@
 
 Exit status: 0 after a result, 1 after an error."""
 import json
+import os
+import re
 import sys
 
 # the protocol goes to the REAL stdout; libraries that print (the Trainer's log dicts ...) are moved to stderr by `reserve_stdout`
@@ -18,7 +20,21 @@ def reserve_stdout() -> None:
     sys.stdout = sys.stderr
 
 
+_HF_TOKEN = re.compile(r"hf_[A-Za-z0-9]{20,}")
+
+
+def scrub(text):
+    """Takes Hugging Face tokens (hf_...) and the token in HF_TOKEN out of a text, so that they never reach a log, an error or a problem report."""
+    if not isinstance(text, str):
+        return text
+    text = _HF_TOKEN.sub("[token]", text)
+    tok = (os.environ.get("HF_TOKEN") or "").strip()
+    return text.replace(tok, "[token]") if len(tok) >= 8 else text
+
+
 def emit(kind: str, **fields) -> None:
+    if kind in ("log", "error"):
+        fields = {k: scrub(v) if k in ("text", "message") else v for k, v in fields.items()}
     _out.write(json.dumps({"type": kind, **fields}, ensure_ascii=False) + "\n")
     _out.flush()
 
