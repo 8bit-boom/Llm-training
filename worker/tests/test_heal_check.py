@@ -101,3 +101,21 @@ def test_the_job_answers_both_sides(tmp_path):
     assert set(data) == {"student", "teacher"} and data["student"]["tokenizer_hash"] == data["teacher"]["tokenizer_hash"]
     code, ev = run(tmp_path, {"job": "heal_check", "sources": {"student": str(s)}})
     assert code == 0 and set(ev[-1]["data"]) == {"student"}
+
+
+def test_the_facts_carry_the_ids_hash_the_template_hash_and_the_tokenizer_folder(tmp_path):
+    a = facts(model(tmp_path / "a"))
+    b = model(tmp_path / "b")
+    (b / "tokenizer_config.json").write_text(json.dumps({"chat_template": "T", "padding_side": "left"}), encoding="utf-8")
+    fb = facts(b)
+    assert a["tokenizer_hash"] != fb["tokenizer_hash"], "the strict hash still sees the settings"
+    assert a["ids_hash"] == fb["ids_hash"] is not None and a["template_hash"] is None and fb["template_hash"] is not None
+    assert a["tokenizer_dir"] == str(tmp_path / "a")
+    assert facts(model(tmp_path / "n", tokenizer=False))["ids_hash"] is None
+
+
+def test_the_pair_job_decides_two_tokenizer_folders(tmp_path):
+    a, b = model(tmp_path / "a"), model(tmp_path / "b", tokenizer=tok_json(("a", "b", "c", "d")))
+    code, ev = run(tmp_path, {"job": "heal_check", "pair": {"student": str(a), "teacher": str(b)}})
+    r = [e for e in ev if e["type"] == "result"][0]["data"]["pair"]
+    assert code == 0 and r["ok"] is False and "4 and 5 tokens" in r["text"]

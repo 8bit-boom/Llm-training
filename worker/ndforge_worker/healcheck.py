@@ -7,6 +7,7 @@ are not downloaded) and the model card are read. Standard library only (huggingf
     -> {"student": facts, "teacher": facts}
 
 `fetch: true` also downloads the weights of a hub id into the Hugging Face cache (the same call healing uses) and adds "folder" to the facts.
+{"job": "heal_check", "pair": {"student": "<tokenizer folder>", "teacher": "<tokenizer folder>"}} -> {"pair": tokpair.decide_pair(...)}
 Facts never raise: a model that cannot be read has "error" with a plain sentence. The comparison of the two is done by the program (Rust).
 """
 from __future__ import annotations
@@ -15,7 +16,7 @@ import json
 import re
 from pathlib import Path
 
-from . import protocol, reshape, safetensors_io
+from . import protocol, reshape, safetensors_io, tokpair
 from .distilljob import tokenizer_hash
 from .reshape import ReshapeError
 
@@ -27,31 +28,7 @@ def is_folder(source: str) -> bool:
     return Path(source).is_dir()
 
 
-def vocabulary_size(folder: Path):
-    """How many tokens the tokenizer has (its own vocabulary plus the added tokens), or None when the files do not say."""
-    f = folder / "tokenizer.json"
-    if f.is_file():
-        try:
-            tj = json.loads(f.read_text(encoding="utf-8"))
-            vocab = (tj.get("model") or {}).get("vocab")
-            n = len(vocab) if isinstance(vocab, (dict, list)) else None
-            if n is not None:
-                base = set(vocab) if isinstance(vocab, dict) else set()
-                extra = [t for t in tj.get("added_tokens") or [] if isinstance(t, dict) and t.get("content") not in base]
-                return n + len(extra)
-        except (OSError, ValueError):
-            pass
-    f = folder / "vocab.json"
-    if f.is_file():
-        try:
-            n = len(json.loads(f.read_text(encoding="utf-8")))
-            extra = folder / "added_tokens.json"
-            if extra.is_file():
-                n += len(json.loads(extra.read_text(encoding="utf-8")))
-            return n
-        except (OSError, ValueError):
-            pass
-    return None
+vocabulary_size = tokpair.vocabulary_size                    # kept here: tests and callers know it by this name
 
 
 def card_fields(text: str) -> dict:
@@ -116,7 +93,7 @@ def _facts_from_config(f: dict, cfg: dict) -> None:
 
 def facts_local(folder: Path, source: str) -> dict:
     f: dict = {"source": source, "kind": "folder", "on_disk": True, "folder": str(folder), "supported": True, "why": None, "error": None, "quantized": False, "gguf": False,
-               "params": None, "bytes": None, "tokenizer_hash": None, "vocab_tokens": None, "license": None, "base_guess": None, "download_bytes": 0}
+               "params": None, "bytes": None, "tokenizer_hash": None, "ids_hash": None, "template_hash": None, "tokenizer_dir": None, "vocab_tokens": None, "license": None, "base_guess": None, "download_bytes": 0}
     if not (folder / "config.json").is_file():
         f["error"] = f"There is no config.json in {source}. Choose the model's own folder (the one that holds config.json and the .safetensors files)."
         return f
@@ -137,6 +114,7 @@ def facts_local(folder: Path, source: str) -> dict:
         if not f["gguf"]:
             f["error"] = f"There are no readable .safetensors files in {source}."
     f["tokenizer_hash"] = tokenizer_hash(folder) if any((folder / n).is_file() for n in TOKENIZER_NAMES) else None
+    f["ids_hash"], f["template_hash"], f["tokenizer_dir"] = tokpair.ids_hash(folder), tokpair.template_hash(folder), str(folder)
     f["vocab_tokens"] = vocabulary_size(folder)
     readme = folder / "README.md"
     card = card_fields(readme.read_text(encoding="utf-8", errors="replace") if readme.is_file() else "")
@@ -147,7 +125,7 @@ def facts_local(folder: Path, source: str) -> dict:
 
 def facts_hub(repo: str) -> dict:
     f: dict = {"source": repo, "kind": "hub", "on_disk": False, "folder": None, "supported": True, "why": None, "error": None, "quantized": False, "gguf": False,
-               "params": None, "bytes": None, "tokenizer_hash": None, "vocab_tokens": None, "license": None, "base_guess": None, "download_bytes": 0}
+               "params": None, "bytes": None, "tokenizer_hash": None, "ids_hash": None, "template_hash": None, "tokenizer_dir": None, "vocab_tokens": None, "license": None, "base_guess": None, "download_bytes": 0}
     if not HUB_ID.match(repo):
         f["error"] = f"{repo} is not a folder on this computer and not a Hugging Face name (owner/model)."
         return f
@@ -173,6 +151,7 @@ def facts_hub(repo: str) -> dict:
         except Exception:                              # noqa: BLE001 - a missing optional file is not an error
             pass
     f["tokenizer_hash"] = tokenizer_hash(folder) if any((folder / n).is_file() for n in TOKENIZER_NAMES) else None
+    f["ids_hash"], f["template_hash"], f["tokenizer_dir"] = tokpair.ids_hash(folder), tokpair.template_hash(folder), str(folder)
     f["vocab_tokens"] = vocabulary_size(folder)
     readme = folder / "README.md"
     card = card_fields(readme.read_text(encoding="utf-8", errors="replace") if readme.is_file() else "")
@@ -221,6 +200,11 @@ def facts_of(source: str, fetch: bool = False) -> dict:
 def run_check(job: dict) -> int:
     protocol.reserve_stdout()
     out: dict = {}
+    pair = job.get("pair")
+    if pair:                                           # the probe of two tokenizer folders (the Check asks for it only when their ids hashes differ)
+        protocol.progress("check", 0.5, "Comparing the two tokenizers")
+        protocol.result({"pair": tokpair.decide_pair(pair["student"], pair["teacher"])})
+        return 0
     srcs = job.get("sources") or {}
     names = [k for k in ("student", "teacher") if srcs.get(k)]
     for i, k in enumerate(names):

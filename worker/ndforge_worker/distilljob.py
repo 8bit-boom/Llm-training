@@ -152,6 +152,17 @@ def tokenizer_hash(folder) -> str:
     return h.hexdigest()
 
 
+def _require_same_ids(teacher_dir, student_dir) -> None:
+    """The pair decision of the Heal Check (ids hash, then the probe texts): a pair the Check accepted is accepted here. The cache is still keyed by
+    `tokenizer_hash(student)`; only the question 'may this teacher teach this student' uses the ids."""
+    from . import tokpair
+    d = tokpair.decide_pair(student_dir, teacher_dir)
+    if not d["ok"]:
+        raise ReshapeError("The original model and the thinned model do not use the same tokenizer, so the original's answers cannot be used to teach it. " + d["text"])
+    if d["level"] == "warn":
+        protocol.log(d["text"])
+
+
 def data_hash(rows: list) -> str:
     """sha256 over the token ids (and lengths) of the rows, in order"""
     h = hashlib.sha256()
@@ -442,8 +453,7 @@ def run_cache(cfg: dict) -> int:
     k, max_seq = int(cfg.get("k", 32)), int(cfg.get("max_seq", 2048))
     student = Path(cfg["student"])
     teacher_dir = reshapejob._resolve_source(cfg["teacher"]["repo"])
-    if tokenizer_hash(teacher_dir) != tokenizer_hash(student):
-        raise ReshapeError("The original model and the thinned model do not use the same tokenizer, so the original's answers cannot be used to teach it.")
+    _require_same_ids(teacher_dir, student)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(student))
     rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
@@ -811,8 +821,7 @@ def run(cfg: dict) -> int:
         if stats["general_error"]:
             share = 0.0
         t_dir = reshapejob._resolve_source(d["teacher"]["repo"])
-        if tokenizer_hash(t_dir) != tokenizer_hash(student_dir):
-            raise ReshapeError("The original model and the thinned model do not use the same tokenizer, so the original's answers cannot be used to teach it.")
+        _require_same_ids(t_dir, student_dir)
         est = sum(r.nbytes for r in safetensors_io.list_tensors(t_dir).values())
         teacher = reshapejob._load(t_dir, reshapejob._choose_load(d["teacher"].get("load", "auto"), est))
         for p in teacher.parameters():
