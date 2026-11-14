@@ -169,3 +169,25 @@ test("the head option is not shown while the matrix is off or for a merged-only 
   b.run("us.im = true; us.what = 'merged'");
   assert.doesNotMatch(b.run("renderUse()"), /us-imnextn/);
 });
+
+test("the page explains the real flow: llama.cpp measures, Unsloth applies it when it can, else llama.cpp makes the files", () => {
+  const b = browser();
+  page(b, exportState());
+  const html = b.run("renderUse()");
+  assert.match(html, /llama\.cpp \(<code>llama-imatrix<\/code>\) measures the matrix/);
+  assert.match(html, /If the installed Unsloth can apply a matrix, Unsloth makes the files with it, otherwise llama\.cpp does/);
+  assert.doesNotMatch(html, /instead of Unsloth|llama\.cpp way/);
+});
+
+test("the files list says who made the GGUF and whether the head is in the matrix", () => {
+  const b = browser();
+  const m = (over) => ({ requested: true, applied: true, chunks: 128, reused: false, note: "", ...over });
+  const html = page(b, exportState({ exports: [
+    { name: "run1-q4_k_m", gguf_file: "m.gguf", size_mb: 5000, dir: "/p/e/1", via: "unsloth", imatrix: m({ nextn: true }) },
+    { name: "run1-q6_k", gguf_file: "m.gguf", size_mb: 7000, dir: "/p/e/2", via: "llama.cpp", imatrix: m() },
+    { name: "run1-q8_0", gguf_file: "m.gguf", size_mb: 9000, dir: "/p/e/3", via: "unsloth" },
+  ] }));
+  assert.match(html, /GGUF made by Unsloth<\/span> · <span title="">importance matrix used \(128 chunks, with the speculative-decoding head\)/);
+  assert.match(html, /GGUF made by llama\.cpp<\/span> · <span title="">importance matrix used \(128 chunks\)</);
+  assert.equal((html.match(/GGUF made by/g) || []).length, 2);                       // an export without a matrix shows nothing new
+});
