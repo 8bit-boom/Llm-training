@@ -108,6 +108,13 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain_heal(kind, exc))
             return 1
+    if kind == "heal_check":
+        from . import healcheck
+        try:
+            return healcheck.run_check(job)
+        except Exception as exc:
+            protocol.error("heal_check_failed", _explain(exc))
+            return 1
     if kind == "general_check":
         from . import generaltext
         return generaltext.run_check(job)

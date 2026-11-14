@@ -978,16 +978,29 @@ def merge(cfg: dict) -> int:
             shutil.copy2(base / "width_kept.npz", out / "width_kept.npz")
         try:
             meta = json.loads((base / "ndforge_reshape.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            meta = {"format": 2, "tool": "ND Lore Forge"}
+            external = False
+        except (OSError, ValueError):                  # a model that was not made on the Slim page (Heal a model): there is nothing to carry over
+            meta = {"format": 2, "tool": "ND Lore Forge", "mode": "heal"}
+            external = True
+        origin = cfg.get("origin")
+        if isinstance(origin, dict) and origin.get("repo") and (external or not (meta.get("origin") or {}).get("repo")):
+            meta["origin"] = origin                    # the teacher: Step 3 and Step 5 read the model it was healed from here
+        if external:
+            conf = _student_config(base)
+            meta["layers"] = conf.get("num_hidden_layers")
+            meta["params"] = sum(math.prod(t.shape) for t in tensors.values())
+            meta["healed_from"] = cfg.get("student_label") or str(base)
         s = cfg.get("summary") or {}
-        meta["healed"] = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "from": base.name if base.name != "model" else base.parent.name, "merged_weights": res["merged"],
+        meta["healed"] = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                          "from": cfg.get("student_label") or (base.name if base.name != "model" else base.parent.name), "merged_weights": res["merged"],
                           "lora_rank": res["rank"], "lora_scaling": res["scaling"], **{k: s.get(k) for k in (
                               "mode", "general", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
         (out / "ndforge_reshape.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        label = cfg.get("student_label") or base.parent.name
+        teacher = (meta.get("origin") or {}).get("repo")
         (out / "README.md").write_text(f"---\n{reshapejob._licence_front_matter(base / 'README.md')}---\n# {out.parent.name} (healed)\n\n"
-                                       f"{base.parent.name}, taught by its original model (distillation).\n\n"
-                                       "Made with ND Lore Forge (Slim or grow a model). See ndforge_reshape.json for the details.\n", encoding="utf-8")
+                                       f"{label}, taught by {'its original model' if not external else (teacher or 'another model')} (distillation).\n\n"
+                                       f"Made with ND Lore Forge ({'Heal a model' if external else 'Slim or grow a model'}). See ndforge_reshape.json for the details.\n", encoding="utf-8")
         out.rename(final)
     except safetensors_io.Cancelled:
         shutil.rmtree(out, ignore_errors=True)
