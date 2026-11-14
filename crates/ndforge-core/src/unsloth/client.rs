@@ -37,7 +37,7 @@ pub struct UnslothClient {
     agent: ureq::Agent,
 }
 
-/// Takes anything that looks like an Unsloth key out of a text.
+/// Takes anything that looks like an Unsloth key or a Hugging Face token (`hf_` and at least 20 letters or digits) out of a text.
 pub fn scrub(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -45,6 +45,25 @@ pub fn scrub(text: &str) -> String {
         out.push_str(&rest[..i]);
         out.push_str("[key]");
         rest = rest[i..].trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    }
+    out.push_str(rest);
+    scrub_hf_tokens(&out)
+}
+
+fn scrub_hf_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("hf_") {
+        let tail = &rest[i + 3..];
+        let n = tail.chars().take_while(|c| c.is_ascii_alphanumeric()).count();
+        out.push_str(&rest[..i]);
+        if n >= 20 {
+            out.push_str("[token]");
+            rest = &tail[n..];
+        } else {
+            out.push_str("hf_");
+            rest = tail;
+        }
     }
     out.push_str(rest);
     out

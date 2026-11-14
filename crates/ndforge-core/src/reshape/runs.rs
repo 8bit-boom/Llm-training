@@ -545,7 +545,10 @@ pub struct HealSpec {
     /// the share of the heal tokens that is general text (0 = the project's own text only, no download)
     #[serde(default = "half")]
     pub general_share: f64,
-    /// a Hugging Face dataset id; None = the program's default
+    /// where the general text comes from (a preset, a dataset the person added, a file); None = the program's default (`general::DEFAULT_ID`)
+    #[serde(default)]
+    pub general: Option<crate::general::GeneralSource>,
+    /// older windows sent only a dataset id and a column
     #[serde(default)]
     pub general_dataset: Option<String>,
     #[serde(default)]
@@ -579,8 +582,20 @@ impl HealSpec {
     }
 }
 
-/// The program's default general text for healing (NVIDIA's recommendation for distillation data); the page says it is downloaded.
-pub const DEFAULT_GENERAL_DATASET: &str = "nvidia/Nemotron-Pretraining-SFT-v1";
+/// The program's default general text for healing: open (Apache-2.0) chat data; the page says it is downloaded.
+pub const DEFAULT_GENERAL_DATASET: &str = crate::general::DEFAULT_ID;
+
+impl HealSpec {
+    /// The source of the general text with the gaps filled in, or None when healing uses the project's text only. Fails when a preset needs an acknowledgement
+    /// that was not given.
+    pub fn general_source(&self) -> Result<Option<crate::general::GeneralSource>> {
+        if self.general_share <= 0.0 {
+            return Ok(None);
+        }
+        let legacy = self.general_dataset.as_ref().filter(|d| !d.trim().is_empty()).map(|d| crate::general::GeneralSource { id: Some(d.clone()), column: self.general_column.clone(), ..Default::default() });
+        crate::general::resolve(self.general.as_ref().or(legacy.as_ref()), true).map(Some)
+    }
+}
 
 fn set_heal(dir: &Path, patch: Value) {
     let mut v = read_json(&dir.join("heal.json")).unwrap_or_else(|| json!({}));
@@ -610,8 +625,9 @@ fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBoo
     })
 }
 
-fn cache_complete(cache: &Path) -> bool {
-    read_json(&cache.join("index.json")).is_some_and(|i| i["complete"] == true)
+/// The teacher's answers are all there AND were made from this general text (an older cache has no key and counts as made from other data).
+fn cache_complete(cache: &Path, want: &Value) -> bool {
+    read_json(&cache.join("index.json")).is_some_and(|i| i["complete"] == true && i["general_key"] == *want)
 }
 
 fn training_done(run: &Path) -> bool {
@@ -651,8 +667,11 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let mode = spec.mode.clone().unwrap_or_else(|| hp.mode.to_string());
     let tokens = spec.tokens_m as u64 * 1_000_000;
+    let source = spec.general_source()?;
+    let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
+    let general_key = crate::general::key(&general, crate::general::SEED);
     let (cache_dir, run_dir) = (dir.join("distill").join("cache"), dir.join("distill").join("run"));
-    if mode == "cache" && !cache_complete(&cache_dir) {
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key) {
         let need = tokens as f64 * 196.0 / 1e9;
         if let Some(free) = crate::envmgr::health::free_disk_gb(&dir).filter(|f| *f < need * 1.05) {
             return Err(Error::new(format!("The teacher's answers need {need:.1} GB in {}; {free:.1} GB free.", cache_dir.display())));
@@ -660,16 +679,15 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let py = python()?;
     let _active = Active::begin(&dir)?;
-    let general = if spec.general_share > 0.0 {
-        json!({"share": spec.general_share, "id": spec.general_dataset.clone().unwrap_or_else(|| DEFAULT_GENERAL_DATASET.to_string()), "column": spec.general_column.clone().unwrap_or_else(|| "text".into())})
-    } else {
-        Value::Null
-    };
+    // a stopped heal that goes on with another general text cannot continue from the old one's checkpoints
+    if read_json(&dir.join("heal.json")).map(|h| h["general_key"].clone()).as_ref() != Some(&general_key) && run_dir.exists() {
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
     let cal = &meta["calibration"];
     let calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
-    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "created": started_at, "error": null, "mode": mode, "plan": hp}));
+    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "mode": mode, "plan": hp}));
     let stopped = |step: &str| {
         set_heal(&dir, json!({"status": "stopped", "step": step}));
         json!({"stopped": true, "name": name})
@@ -682,19 +700,20 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         set_heal(&dir, json!({"status": "failed", "error": e.0}));
         e
     };
-    if mode == "cache" && !cache_complete(&cache_dir) {
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key) {
         let job = json!({
             "job": "distill_cache", "teacher": {"repo": origin, "load": hp.teacher_load}, "student": model, "model": {"family": family},
-            "data": {"train": train, "tokens": tokens, "general": general}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "seed": 3407,
+            "data": {"train": train, "tokens": tokens, "general": general}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
             "out": cache_dir, "stop_file": stop_file,
         });
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));
         }
-        if let Some(note) = r["notes"].as_array().and_then(|n| n.first()).and_then(|n| n.as_str()) {
-            set_heal(&dir, json!({"note": note}));
-        }
+        let note = r["notes"].as_array().and_then(|n| n.first()).and_then(|n| n.as_str());
+        // the page shows which general text was used or skipped, and why
+        set_heal(&dir, json!({"note": note, "note_code": r["stats"]["general_error_code"], "general_used": {"source": r["stats"]["general_source"], "rows": r["stats"]["general_rows"],
+                              "tokens": r["stats"]["general_tokens"], "detected": r["stats"]["general_detected"], "skipped": note.is_some()}}));
     }
     let mut summary = read_json(&run_dir.join("summary.json")).filter(|_| training_done(&run_dir)).unwrap_or(Value::Null);
     if summary.is_null() {
@@ -713,6 +732,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         let r = heal_job(&py, &dir, &job, "train", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("train"));
+        }
+        if let Some(e) = r["general"]["general_error"].as_str() {
+            set_heal(&dir, json!({"note": e, "note_code": r["general"]["general_error_code"]}));
         }
         summary = r;
     }
@@ -797,7 +819,7 @@ pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Val
     let heal = read_json(&dir.join("heal.json"));
     Ok(json!({
         "name": name, "plan": hp, "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
-        "teacher": meta["origin"]["repo"], "general_dataset": DEFAULT_GENERAL_DATASET, "has_data": crate::train::runs::latest_version(p).is_some(),
+        "teacher": meta["origin"]["repo"], "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
         "healed": dir.join("healed").join("config.json").is_file(), "heal": heal, "metrics": heal_metrics(p, name), "vram_gb": vram_gb,
         "free_disk_gb": crate::envmgr::health::free_disk_gb(&dir).map(|g| (g * 10.0).round() / 10.0),
         "calibration": meta["calibration"], "loss": {"original": meta["loss_before"], "thinned": meta["loss_after"]},

@@ -9,6 +9,7 @@ pub mod envmgr;
 pub mod evaluate;
 pub mod error;
 pub mod export;
+pub mod general;
 pub mod help;
 pub mod model;
 pub mod paths;

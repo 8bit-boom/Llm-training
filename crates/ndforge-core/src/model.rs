@@ -580,6 +580,44 @@ impl AppModel {
         crate::train::catalog::remove_custom(id)
     }
 
+    // ------------------------------------------------------------------ the general text (healing, importance matrix)
+    pub fn general_state(&self) -> Value {
+        crate::general::state(self.project.as_ref())
+    }
+
+    /// Remembers the choice of this project for "heal" or "imatrix" (the dataset to use there).
+    pub fn general_choose(&self, scope: &str, src: &crate::general::GeneralSource) -> Result<Value> {
+        crate::general::set_choice(self.project_ref()?, scope, src)?;
+        Ok(self.general_state())
+    }
+
+    pub fn general_add(&self, src: &crate::general::GeneralSource) -> Result<Value> {
+        let key = crate::general::add_custom(src)?;
+        let mut s = self.general_state();
+        s["added"] = Value::String(key);
+        Ok(s)
+    }
+
+    pub fn general_remove(&self, key: &str) -> Result<Value> {
+        crate::general::remove_custom(key)?;
+        Ok(self.general_state())
+    }
+
+    pub fn general_ack(&self, key: &str) -> Result<Value> {
+        crate::general::acknowledge(key)?;
+        Ok(self.general_state())
+    }
+
+    pub fn hf_token_set(&self, token: &str) -> Result<Value> {
+        crate::general::token_set(token)?;
+        Ok(self.general_state())
+    }
+
+    pub fn hf_token_clear(&self) -> Result<Value> {
+        crate::general::token_clear()?;
+        Ok(self.general_state())
+    }
+
     pub fn project_clone(&self) -> Result<Project> {
         Ok(self.project_ref()?.clone())
     }

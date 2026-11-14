@@ -363,7 +363,7 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
     let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
-    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true });
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None });
     assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
     assert_eq!(exports::IMATRIX_CHUNKS, [64, 128, 256]);
     assert!(exports::imatrix_helps("q4_k_m") && exports::imatrix_helps("q6_k") && !exports::imatrix_helps("q8_0") && !exports::imatrix_helps("f16") && !exports::imatrix_helps("bf16"));
