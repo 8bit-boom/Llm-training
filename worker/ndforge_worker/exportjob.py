@@ -236,7 +236,7 @@ def run(cfg: dict) -> int:
         else:
             merge_hf(cfg, merged)
         if cfg.get("gguf", True):
-            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants, report)
+            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants, **({} if report is None else {"report": report}))
             gguf_path = ggufs[quant]
     mmproj, vnote, mods = None, "", []
     if gguf_path and cfg.get("vision", True):
