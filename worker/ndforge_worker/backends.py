@@ -117,6 +117,33 @@ def load_unsloth(cfg: dict):
     return model, tokenizer, loader
 
 
+def kbit_cast_savings(model) -> int:
+    """Bytes that PEFT's `prepare_model_for_kbit_training` would add and `prepare_kbit_keep_dtype` does not: every 16-bit parameter that is not 4-bit and has two or
+    more dimensions (the embedding table, the output layer, any weight bitsandbytes left alone) becomes 4 bytes per value there and stays at 2 here, so the saving
+    is 2 bytes per value. A shared (tied) table is counted once (`parameters()` lists it once)."""
+    import torch
+    return sum(p.numel() * 2 for p in model.parameters() if p.dtype in (torch.float16, torch.bfloat16) and p.__class__.__name__ != "Params4bit" and p.ndim >= 2)
+
+
+def prepare_kbit_keep_dtype(model):
+    """The light twin of PEFT's `prepare_model_for_kbit_training` (used when `kbit_upcast` is off, i.e. for healing): the same freezing, gradient checkpointing and
+    input gradients, but only the SMALL parameters (one dimension or none: norm weights, biases, per-head scalars) are made 32-bit, for stability. The large
+    parameters that are not 4-bit (the input embedding table and the output layer, ~2.5 GB each in 16-bit for a 248 k-word vocabulary and a hidden size of 5120)
+    stay in the 16-bit type they were loaded in, which saves as much memory again as they take. They are frozen while healing, so a 32-bit copy buys nothing for the
+    KL loss (computed in chunks, in 32-bit, from the hidden states and the output layer: distilljob._chunk_losses)."""
+    import torch
+    saved = kbit_cast_savings(model)
+    for p in model.parameters():
+        p.requires_grad = False
+        if p.dtype in (torch.float16, torch.bfloat16) and p.ndim <= 1 and p.__class__.__name__ != "Params4bit":
+            p.data = p.data.to(torch.float32)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.enable_input_require_grads()
+    gb = f"{saved / 1e9:.1f}" if saved >= 1e8 else f"{saved / 1e9:.4f}"
+    protocol.log(f"Keeping the embeddings and the output layer in 16-bit: saves about {gb} GB (compared with turning every 16-bit weight into 32-bit).")
+    return model
+
+
 def load_hf(cfg: dict):
     import torch
     from peft import LoraConfig, get_peft_model
@@ -159,8 +186,11 @@ def load_hf(cfg: dict):
         return model, tokenizer, None
     protocol.progress("load", 0.8, "Adding the LoRA layers")
     if cfg["method"] == "qlora":
-        from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(model)
+        if cfg.get("kbit_upcast", True):
+            from peft import prepare_model_for_kbit_training
+            model = prepare_model_for_kbit_training(model)      # turns every 16-bit weight that is not 4-bit into 32-bit, the embedding and the output layer included
+        else:
+            model = prepare_kbit_keep_dtype(model)
     elif torch.cuda.is_available():
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()

@@ -114,6 +114,51 @@
     "chunk": 64
    },
    "label": "gradient checkpointing"
+  },
+  {
+   "from": {
+    "checkpointing": false,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256,
+    "upcast": true
+   },
+   "to": {
+    "checkpointing": false,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256,
+    "upcast": false
+   },
+   "label": "the 32-bit embedding copy turned off"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 256,
+    "upcast": true
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 256,
+    "upcast": false
+   },
+   "label": "the 32-bit embedding copy turned off"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 64,
+    "upcast": false
+   },
+   "to": null,
+   "label": null
   }
  ],
  "activation": [
@@ -198,6 +243,113 @@
    "batch": 1,
    "grad_accum": 32,
    "chunk": 128
+  }
+ ],
+ "memory": [
+  {
+   "name": "16 B student, QLoRA, defaults, upcast on",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": true,
+   "gb": 21.96
+  },
+  {
+   "name": "16 B student, QLoRA, defaults, upcast off",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "gb": 17.48
+  },
+  {
+   "name": "16 B student, hidden 5120, QLoRA, upcast on",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 5120,
+   "vocab": 248320,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": true,
+   "gb": 24.61
+  },
+  {
+   "name": "16 B student, hidden 5120, QLoRA, upcast off",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 5120,
+   "vocab": 248320,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "gb": 19.02
+  },
+  {
+   "name": "4 B student, 16-bit LoRA, upcast on changes nothing",
+   "student_b": 4.0,
+   "layers": 32,
+   "hidden": 2560,
+   "vocab": 151936,
+   "seq": 2048,
+   "batch": 4,
+   "checkpointing": true,
+   "rank": 64,
+   "kl_chunk": 256,
+   "qlora": false,
+   "upcast": true,
+   "gb": 14.69
+  },
+  {
+   "name": "4 B student, 16-bit LoRA, upcast off",
+   "student_b": 4.0,
+   "layers": 32,
+   "hidden": 2560,
+   "vocab": 151936,
+   "seq": 2048,
+   "batch": 4,
+   "checkpointing": true,
+   "rank": 64,
+   "kl_chunk": 256,
+   "qlora": false,
+   "upcast": false,
+   "gb": 14.69
+  },
+  {
+   "name": "0.5 B student, tiny body (embeddings larger than the body)",
+   "student_b": 0.5,
+   "layers": 24,
+   "hidden": 1024,
+   "vocab": 248320,
+   "seq": 512,
+   "batch": 1,
+   "checkpointing": false,
+   "rank": 16,
+   "kl_chunk": 64,
+   "qlora": true,
+   "upcast": true,
+   "gb": 4.23
   }
  ]
 }

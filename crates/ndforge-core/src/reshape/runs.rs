@@ -593,6 +593,10 @@ pub struct HealSpec {
     pub teacher_load: Option<String>,
     #[serde(default)]
     pub warmup: Option<u32>,
+    /// QLoRA only: keep PEFT's 32-bit copy of the embedding and the output layer (the old behaviour, about 4 to 5 GB more graphics memory). None = off. It changes only
+    /// the numerics of the frozen tables: the training key and the teacher's cache key do not include it (docs/HEAL_SETTINGS.md).
+    #[serde(default)]
+    pub kbit_upcast: Option<bool>,
 }
 
 impl HealSpec {
@@ -666,8 +670,9 @@ pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &pl
     let per_update = spec.per_update.unwrap_or(def.batch * def.grad_accum).max(batch);
     let mut knobs = plan::HealKnobs {
         seq: spec.seq.unwrap_or(def.seq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(def.rank),
-        kl_chunk: spec.kl_chunk.unwrap_or(def.kl_chunk), qlora: match spec.method.as_deref() { Some("qlora") => true, Some("lora") => false, _ => def.qlora },
+        kl_chunk: spec.kl_chunk.unwrap_or(def.kl_chunk), qlora: match spec.method.as_deref() { Some("qlora") => true, Some("lora") => false, _ => def.qlora }, upcast: false,
     };
+    knobs.upcast = knobs.qlora && spec.kbit_upcast.unwrap_or(false);      // 16-bit LoRA has no such copy
     knobs.checkpointing = match spec.checkpointing.as_deref() {
         Some("on") => true,
         Some("off") => false,
@@ -677,7 +682,8 @@ pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &pl
 }
 
 /// The settings that change the maths of the training step: when one of them differs from the stopped run, its checkpoints cannot be continued.
-/// (Batch, accumulation, gradient checkpointing, the optimizer's 8 bits, the KL chunk and how the original is loaded are not in it: they only change the memory.)
+/// (Batch, accumulation, gradient checkpointing, the optimizer's 8 bits, the KL chunk, how the original is loaded and the 32-bit embedding copy (`upcast`) are not
+/// in it: they only change the memory, or the numerics of frozen weights, and the checkpoints of the LoRA resume.)
 fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
     json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr, "tokens": tokens,
            "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup})
@@ -686,7 +692,7 @@ fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
 /// The settings the worker reports ("heal_settings" / "heal_retry" events) as knobs again.
 fn knobs_from_worker(s: &Value) -> Option<plan::HealKnobs> {
     let n = |k: &str| s[k].as_u64().map(|v| v as u32);
-    Some(plan::HealKnobs { seq: n("max_seq")?, batch: n("batch")?, grad_accum: n("grad_accum")?, checkpointing: s["checkpointing"].as_bool()?, rank: n("rank")?, kl_chunk: n("chunk")?, qlora: s["method"] == "qlora" })
+    Some(plan::HealKnobs { seq: n("max_seq")?, batch: n("batch")?, grad_accum: n("grad_accum")?, checkpointing: s["checkpointing"].as_bool()?, rank: n("rank")?, kl_chunk: n("chunk")?, qlora: s["method"] == "qlora", upcast: s["upcast"].as_bool().unwrap_or(false) })
 }
 
 /// After an out-of-memory failure: the next safer setting from the settings of the last try, as what the page sets in the Heal card. `Null` when there is nothing
@@ -694,7 +700,7 @@ fn knobs_from_worker(s: &Value) -> Option<plan::HealKnobs> {
 fn heal_safer(h: &Value) -> Value {
     let last = knobs_from_worker(&h["knobs_now"]).or_else(|| serde_json::from_value::<plan::HealKnobs>(h["knobs"].clone()).ok());
     match last.and_then(|k| plan::heal_next_safer(&k)) {
-        Some((k, label)) => json!({"label": label, "checkpointing": if k.checkpointing { "on" } else { "off" }, "batch": k.batch, "per_update": k.batch * k.grad_accum, "kl_chunk": k.kl_chunk}),
+        Some((k, label)) => json!({"label": label, "kbit_upcast": k.upcast, "checkpointing": if k.checkpointing { "on" } else { "off" }, "batch": k.batch, "per_update": k.batch * k.grad_accum, "kl_chunk": k.kl_chunk}),
         None => Value::Null,
     }
 }
@@ -845,7 +851,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
                       "weight_decay": 0.0, "scheduler": "cosine", "seed": 3407, "save_steps": 50, "logging_steps": 1, "tokens": tokens,
                       "checkpointing": if ch.knobs.checkpointing { "on" } else { "off" }, "optimizer": ch.optimizer, "student_b": student_b},
             "distill": {"mode": mode, "cache": cache_dir, "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "alpha": spec.alpha, "k": ch.k,
-                        "chunk": ch.knobs.kl_chunk, "eval_every": 50},
+                        "chunk": ch.knobs.kl_chunk, "eval_every": 50, "kbit_upcast": ch.knobs.upcast},
             "eval": {"calibration": calibration, "teacher_loss": meta["loss_before"], "slim_loss": meta["loss_after"]},
             "out": run_dir, "resume": resume, "stop_file": stop_file,
         });
@@ -1107,7 +1113,7 @@ pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Val
     }).collect();
     let heal = read_json(&dir.join("heal.json"));
     Ok(json!({
-        "name": name, "plan": hp, "defaults": defaults, "dims": dims, "safer": heal.as_ref().filter(|h| h["status"] == "failed" && h["oom"] == true).map(heal_safer).unwrap_or(Value::Null), "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
+        "name": name, "plan": hp, "defaults": defaults, "dims": dims, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &defaults), "safer": heal.as_ref().filter(|h| h["status"] == "failed" && h["oom"] == true).map(heal_safer).unwrap_or(Value::Null), "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
         "teacher": meta["origin"]["repo"], "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
         "healed": dir.join("healed").join("config.json").is_file(), "heal": heal, "metrics": heal_metrics(p, name), "vram_gb": vram_gb,
         "free_disk_gb": crate::envmgr::health::free_disk_gb(&dir).map(|g| (g * 10.0).round() / 10.0),
@@ -1127,5 +1133,5 @@ pub fn heal_estimate(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f
     let dims = heal_dims(&dir.join("model"), student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
-    Ok(json!({"plan": hp, "knobs": ch.knobs, "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum}))
+    Ok(json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum}))
 }

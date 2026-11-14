@@ -46,7 +46,7 @@ def kd_topk_loss(student_logp, ids, logp, resid, mask):
 def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask):
     import torch
     import torch.nn.functional as F
-    logits = (h @ weight.t()).float()
+    logits = (h.to(weight.dtype) @ weight.t()).float()      # the output layer may be 16-bit (kbit_upcast off): the matrix product runs in its type, everything after it in 32-bit
     kd, _ = kd_topk_loss(torch.log_softmax(logits, dim=-1), ids, logp, resid, mask)
     if labels is None:
         return kd, kd.new_zeros(())
@@ -423,7 +423,7 @@ def _teacher_answers(model, batch_rows: list, k: int, chunk: int, pad_id: int):
             h = hidden[i, :len(r["input_ids"])]
             parts = []
             for a in range(0, h.shape[0], chunk):
-                parts.append([t.cpu() for t in topk_from_logits(h[a:a + chunk] @ weight.t(), k)])
+                parts.append([t.cpu() for t in topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k)])
             out.append(tuple(torch.cat([p[j] for p in parts]).numpy() for j in range(3)))
     return out
 
@@ -623,7 +623,7 @@ def _teacher_targets(teacher, ids, att, k: int, chunk: int):
         hidden, _ = forward_hidden(teacher, ids.to(next(teacher.parameters()).device), att.to(next(teacher.parameters()).device))
         h = hidden[att.bool().to(hidden.device)]
         weight = teacher.get_output_embeddings().weight
-        parts = [topk_from_logits(h[a:a + chunk] @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+        parts = [topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
     return tuple(torch.cat([p[j] for p in parts]).to(ids.device) for j in range(3))
 
 
@@ -693,7 +693,7 @@ def calib_loss(model, batches: list, chunk: int = 256):
                         continue
                     for a in range(0, n - 1, chunk):
                         c = min(chunk, n - 1 - a)
-                        logits = (hidden[i, a:a + c] @ weight.t()).float()
+                        logits = (hidden[i, a:a + c].to(weight.dtype) @ weight.t()).float()
                         total += float(F.cross_entropy(logits, ids[i, a + 1:a + 1 + c], reduction="sum"))
                     count += n - 1
     finally:
@@ -754,7 +754,8 @@ def run(cfg: dict) -> int:
     """job distill: {"model": {"repo": the thinned model's folder, "family"}, "method": "lora|qlora", "backend": "hf", "dataset": {"train", "general": {...}},
     "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?,
               checkpointing: "auto|on|off", optimizer: "auto|adamw_8bit|adamw", student_b?},
-    "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50},
+    "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50,
+                "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key)},
     "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path}.
     Settings the job leaves out are chosen by the student's size (resolve_hyper). When the graphics card runs out of memory the training is tried again, at
     most healmem.MAX_RETRIES times, from the last checkpoint with the next safer setting (healmem.next_safer); the final failure is a plain message.
@@ -801,7 +802,8 @@ def run(cfg: dict) -> int:
     else:
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
     method = cfg["method"]
-    lcfg = {"model": cfg["model"], "method": method, "hyper": h}
+    upcast = method == "qlora" and bool(d.get("kbit_upcast", False))     # the old 32-bit copy of the embeddings and the output layer (QLoRA only); off for healing
+    lcfg = {"model": cfg["model"], "method": method, "hyper": h, "kbit_upcast": upcast}
     model, tokenizer, _ = backends.load(lcfg, "hf")
     if mode == "online":
         dcfg = {"train": cfg["dataset"]["train"], "tokens": int(h["tokens"]), "general": (cfg["dataset"] or {}).get("general")}
@@ -853,12 +855,13 @@ def run(cfg: dict) -> int:
     if cuda:
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
     settings = {"checkpointing": _decide_checkpointing(h, student_dir, free_gb), "batch": int(h["batch"]), "grad_accum": int(h["grad_accum"]), "chunk": chunk,
-                "max_seq": int(h["max_seq"]), "rank": int(h["rank"]), "method": method}
+                "max_seq": int(h["max_seq"]), "rank": int(h["rank"]), "method": method, "upcast": upcast}
     protocol.log("Healing settings: " + healmem.describe(settings) + f", optimizer {optim}.")
     protocol.emit("heal_settings", settings=settings, optimizer=optim)
 
     def attempt(s: dict, n: int):
         if n > 0:                                            # a retry: a fresh model and trainer, from the last checkpoint
+            lcfg["kbit_upcast"] = bool(s.get("upcast"))      # the ladder's first step turns the 32-bit embedding copy off
             holder["model"] = backends.load(lcfg, "hf")[0]
         mdl = holder["model"]
         _apply_checkpointing(mdl, bool(s["checkpointing"]))

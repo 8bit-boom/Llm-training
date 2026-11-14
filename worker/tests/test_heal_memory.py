@@ -42,6 +42,33 @@ def test_an_odd_batch_goes_to_one_and_keeps_the_product():
     assert (s["batch"], s["grad_accum"]) == (1, 33)
 
 
+def test_the_32_bit_embedding_copy_is_the_first_step_when_it_is_on_and_only_then():
+    base = {"checkpointing": False, "batch": 4, "grad_accum": 8, "chunk": 256}
+    s, label = healmem.next_safer({**base, "upcast": True})
+    assert label == "the 32-bit embedding copy turned off" and s == {**base, "upcast": False}          # nothing else changes
+    assert healmem.next_safer(s)[1] == "gradient checkpointing"                                          # then the old ladder, from its first rung
+    assert healmem.next_safer(base)[1] == "gradient checkpointing"                                       # no key = off: the old ladder as it was
+    s = {**base, "upcast": True}
+    labels = []
+    while (step := healmem.next_safer(s)) is not None:
+        s, label = step
+        labels.append(label.split(" (")[0])
+        assert s["batch"] * s["grad_accum"] == 32 and len(labels) < 20
+    assert labels == ["the 32-bit embedding copy turned off", "gradient checkpointing", "a smaller batch", "a smaller batch", "a smaller KL chunk", "a smaller KL chunk"]
+    assert "embeddings and output layer in 32-bit" in healmem.describe({**base, "upcast": True}) and "32-bit" not in healmem.describe(base)
+
+
+def test_the_memory_estimate_matches_the_shared_cases_and_counts_the_32_bit_copy_only_when_it_is_on():
+    for c in CASES["memory"]:
+        got = healmem.heal_memory_gb(c["student_b"], c["layers"], c["hidden"], c["vocab"], c["seq"], c["batch"], c["checkpointing"], c["rank"], c["kl_chunk"], c["qlora"], c["upcast"])
+        assert got == pytest.approx(c["gb"], rel=1e-3), c
+    args = dict(student_b=16.0, layers=40, hidden=5120, vocab=248_320, seq=1024, batch=2, checkpointing=True, rank=32, kl_chunk=128)
+    on, off = healmem.heal_memory_gb(qlora=True, upcast=True, **args), healmem.heal_memory_gb(qlora=True, upcast=False, **args)
+    # both tables (2 x 248,320 x 5,120 values) are 2 bytes per value more when copied to 32-bit; the estimate adds 1 GB of overhead and then 10 %
+    assert on - off == pytest.approx(2 * 248_320 * 5120 * 2 / 1e9 * 1.10, abs=0.02) and 5.0 < on - off < 6.0
+    assert healmem.heal_memory_gb(qlora=False, upcast=True, **args) == healmem.heal_memory_gb(qlora=False, upcast=False, **args)    # 16-bit LoRA has no such copy
+
+
 def test_the_activation_estimate_matches_the_shared_cases_and_checkpointing_lowers_it():
     for c in CASES["activation"]:
         assert healmem.activation_gb(c["layers"], c["hidden"], c["seq"], c["batch"], c["checkpointing"]) == pytest.approx(c["gb"], rel=1e-3)
