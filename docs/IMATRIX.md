@@ -16,7 +16,7 @@ All in `worker/ndforge_worker/imatrix.py`, called from `exportjob.gguf_with_llam
 
 1. **Calibration text** (`build_calibration`), about `ctx x chunks` tokens (+10 % slack):
    - about **80 %** the project's saved data version (the one the run trained on: `train.jsonl`): a practice conversation rendered with the **model's own chat template** (Qwen3.5 and Gemma 4 with thinking off, the family's end marker; special tokens such as `<|im_start|>` stay in the text), a world-book text as it is. Rows are shuffled with a fixed seed; data smaller than its share is repeated.
-   - about **20 %** general text, through the healing code (`distilljob._general_texts`, default dataset `distilljob.DEFAULT_GENERAL`, streamed, never downloaded whole; a long text counts for at most two chunks).
+   - about **20 %** general text, through the healing code (`distilljob._general_texts`, default dataset `distilljob.DEFAULT_GENERAL` = `mlabonne/open-perfectblend`, or the dataset chosen in the box under the tick; chat rows go through the model's chat template; streamed, never downloaded whole; see docs/GENERAL_TEXT.md; a long text counts for at most two chunks).
    - both kinds are mixed evenly through the file, so `--chunks` never cuts one kind away. The same data and settings always give the same file.
    - The tokenizer is loaded from the merged model folder (so it carries the patched, non-thinking template), then from the base model.
 2. **llama-imatrix** (the tool is looked up next to `llama-quantize`, then on `PATH`):
@@ -43,7 +43,7 @@ Per export folder (`exports/<run>-<size>/`), next to the GGUFs, in **every** exp
 - `meta.json` gets `imatrix`: `null` when it was not asked for, else `requested`, `applied` (this size used it), `made`, `reused`, `file`, `chunks`, `ctx`, `general_used`, `llama_cpp`, `reason` (why this size did not use it), `note`.
 - `export.json` (the worker's summary) has the whole `imatrix` report.
 
-**Reuse.** A later export of the same run reuses a saved matrix instead of measuring again when `model`, `weights`, `data_hash`, `chunks`, `ctx` and `general_share` are all equal (the checkbox "Reuse the saved matrix" is on whenever one exists; untick it to measure again). A matrix that was made without general text (offline at the time) is **not** reused while general text is wanted. The page checks only that a matrix of the run exists; the worker does the exact comparison.
+**Reuse.** A later export of the same run reuses a saved matrix instead of measuring again when `model`, `weights`, `data_hash`, `chunks`, `ctx`, `general_share` and `general` (the dataset: id or file, config, split, column, share, seed; a matrix saved before this key existed counts as made from other data) are all equal (the checkbox "Reuse the saved matrix" is on whenever one exists; untick it to measure again). A matrix that was made without general text (offline at the time) is **not** reused while general text is wanted. The page checks only that a matrix of the run exists; the worker does the exact comparison.
 
 ## Defaults (owner decisions)
 
@@ -67,7 +67,7 @@ The export is never failed by the matrix step. Every problem is a plain-language
 | llama.cpp has no `llama-imatrix` | "This llama.cpp has no llama-imatrix (an older install), so the sizes were made without the importance matrix. Update llama.cpp ..." |
 | Unsloth back end and no llama.cpp | "An importance matrix was asked for, but llama.cpp (with llama-imatrix) was not found, so the GGUF was made through Unsloth without it. ..." |
 | no size below Q8_0 chosen | "The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made." |
-| general text cannot be read (offline, no `datasets`, gated, empty) | "The general text (...) could not be read (...). The matrix is made from your project's text only." (the matrix is still made) |
+| general text cannot be read (offline, gated, not found, no usable column, nothing read, no `datasets`) | "The general text (...) could not be read: <plain reason>. The matrix is made from your project's text only." (the matrix is still made; docs/GENERAL_TEXT.md lists the reasons) |
 | `llama-imatrix` fails | "llama-imatrix failed (exit code N; see the log), so the sizes were made without the importance matrix." |
 | `llama-quantize` refuses `--imatrix` | "llama-quantize did not accept the importance matrix for Q4_K_M (exit code N); that size was made without it." |
 | training file or tokenizer missing, any other error | "The importance matrix could not be made (...), so the sizes were made without it." |
@@ -89,7 +89,7 @@ Nothing below has run. Do not rely on any of it until checked on the owner's PC:
 - Whether `llama-quantize` accepts a GGUF-format matrix on that build (older builds read `.dat`), and the text of the errors that make the page fall back.
 - The time of the matrix for a **9B and a 27B** model (the time guess on the page is a rough formula, not a measurement), the memory it needs next to the 16-bit GGUF, and whether **`-ngl 99` helps** (and how a 27B f16 behaves on a 32 GB card).
 - That the calibration text, tokenized by llama.cpp with `--parse-special`, really gives the chat-template special tokens as special tokens, and that its token count matches the count made here (a 10 % slack is added).
-- The default general dataset (`nvidia/Nemotron-Pretraining-SFT-v1`) with its `text` column as streamed here (it is the healing code's default, itself unverified), and how long the failed download of an offline PC takes before the note appears.
+- The default general dataset (`mlabonne/open-perfectblend`, chat, rendered through the model's template; see docs/GENERAL_TEXT.md) as streamed here (it is the healing code's default, itself unverified), and how long the failed download of an offline PC takes before the note appears.
 - **Quality of Q4_K_M with and without the matrix** on the Test page (the point of the feature): make both, run the Step 4 test on each.
 - Whether killing `llama-imatrix` on Windows leaves anything running.
 

@@ -9,7 +9,7 @@ use super::catalog::{models, ModelEntry};
 use crate::error::{Error, Result};
 
 /// `NDFORGE_HF_URL` moves the address (tests use a stand-in server).
-fn base() -> String {
+pub(crate) fn base() -> String {
     std::env::var("NDFORGE_HF_URL").ok().filter(|u| !u.trim().is_empty()).map(|u| u.trim().trim_end_matches('/').to_string()).unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 

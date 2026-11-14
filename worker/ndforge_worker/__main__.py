@@ -92,6 +92,9 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain(exc))
             return 1
+    if kind == "general_check":
+        from . import generaltext
+        return generaltext.run_check(job)
     protocol.error("unknown_job", f"Unknown job type: {kind!r}")
     return 1
 

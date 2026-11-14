@@ -108,3 +108,10 @@ textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace
 
 /* a section inside a card (the Heal card under the result of a made model) */
 .card-in { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+
+/* the general-text chooser (Heal card and importance-matrix box) */
+.small { font-size: 13px; }
+.chooser { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0; }
+.chooser select { max-width: 100%; }
+.chooser pre { white-space: pre-wrap; word-break: break-word; max-height: 9em; overflow: auto; margin: 6px 0; }
+.chooser details { margin-top: 6px; }

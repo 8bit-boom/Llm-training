@@ -51,7 +51,7 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 
 **"The teacher's answers need … GB in … free".** Healing saves the original's answers to disk first (about 4 GB per 20 million tokens). Free the space, choose 10 million tokens, or move the project's folder to a bigger drive.
 
-**"The general text (…) could not be downloaded".** Healing goes on with your world's text only; nothing is lost, but general ability comes back less. Check the internet connection and press *Continue healing* later (the teacher's answers for your text are kept), or untick the general text on the Heal card if you work offline.
+**"The general text (…) could not be downloaded".** Healing goes on with your world's text only; nothing is lost, but general ability comes back less. The note says why. *Needs access approval*: ask for access on the dataset's Hugging Face page and save your Hugging Face token in the General text box, or choose another dataset (the note has a *Use mlabonne/open-perfectblend instead* button). *No dataset called…*: check the spelling, config and split with **Check it**. *No usable column*: name the column in *My own…*. *Could not be reached*: check the internet connection and press *Continue healing* later (the teacher's answers for your text are kept), or untick the general text on the Heal card if you work offline. Another dataset always makes the teacher answer again; an older answer set is never reused for it.
 
 **"Healing stopped: the training became unstable".** The error went to infinity. Open Expert mode on the Heal card, lower the learning rate (for example 0.00005) and press *Continue healing*; it goes on from the last checkpoint.
 

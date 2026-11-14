@@ -978,6 +978,7 @@ import json, os, sys
 root = {root:?}
 job = json.load(open(sys.argv[1], encoding="utf-8"))
 open(os.path.join(root, "jobs.jsonl"), "a", encoding="utf-8").write(json.dumps(job) + "\n")
+open(os.path.join(root, "env.jsonl"), "a", encoding="utf-8").write(json.dumps({{"job": job["job"], "hf": os.environ.get("HF_TOKEN")}}) + "\n")
 def out(**kw): print(json.dumps(kw), flush=True)
 def marker(n):
     return os.path.exists(os.path.join(root, n))
@@ -991,7 +992,9 @@ if kind == "distill_cache":
     if marker("stop-cache"):
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
     os.makedirs(job["out"], exist_ok=True)
-    json.dump({{"complete": True, "rows": 10, "done_rows": 10}}, open(os.path.join(job["out"], "index.json"), "w"))
+    g = job["data"].get("general")
+    key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"]}}
+    json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key}}, open(os.path.join(job["out"], "index.json"), "w"))
     out(type="progress", step="cache", value=0.5, text="The original model answers your texts")
     out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."]}})
 elif kind == "distill":
@@ -1089,7 +1092,8 @@ fn a_model_is_healed_in_three_jobs_and_the_healed_model_is_listed() {
     assert_eq!(jobs.iter().map(|j| j["job"].as_str().unwrap()).collect::<Vec<_>>(), ["distill_cache", "distill", "distill_merge"], "27B -> 21B on 32 GB: the teacher answers first");
     let (cache, train, merge) = (&jobs[0], &jobs[1], &jobs[2]);
     assert_eq!((cache["teacher"]["repo"].as_str(), cache["k"].clone(), cache["max_seq"].clone(), cache["data"]["tokens"].clone()), (Some("unsloth/Qwen3.5-4B"), json!(32), json!(2048), json!(20_000_000)));
-    assert_eq!((cache["data"]["general"]["share"].clone(), cache["data"]["general"]["id"].as_str(), cache["data"]["general"]["column"].as_str()), (json!(0.5), Some("nvidia/Nemotron-Pretraining-SFT-v1"), Some("text")));
+    assert_eq!((cache["data"]["general"]["share"].clone(), cache["data"]["general"]["id"].as_str(), cache["data"]["general"]["split"].as_str()), (json!(0.5), Some("mlabonne/open-perfectblend"), Some("train")));
+    assert!(cache["data"]["general"].get("column").is_none(), "the worker finds the column itself");
     assert_eq!(cache["student"].as_str().unwrap(), dir.join("model").to_string_lossy());
     assert_eq!(cache["stop_file"].as_str().unwrap(), dir.join("STOP").to_string_lossy());
     assert_eq!((train["method"].as_str(), train["backend"].as_str(), train["hyper"]["rank"].clone(), train["hyper"]["alpha"].clone(), train["hyper"]["lr"].clone(), train["hyper"]["tokens"].clone()),
@@ -1300,7 +1304,7 @@ fn the_heal_card_knows_the_way_the_budgets_and_the_state() {
     assert_eq!(t.iter().map(|x| x["tokens_m"].as_u64().unwrap()).collect::<Vec<_>>(), [10, 20, 40, 80]);
     assert_eq!(t[1]["cache_gb"], 3.9, "20 M tokens x 196 bytes");
     assert!(t[3]["hours"][0].as_f64().unwrap() > t[0]["hours"][0].as_f64().unwrap());
-    assert_eq!((o["loss"]["original"].clone(), o["loss"]["thinned"].clone(), o["general_dataset"].clone()), (json!(2.0), json!(3.1), json!("nvidia/Nemotron-Pretraining-SFT-v1")));
+    assert_eq!((o["loss"]["original"].clone(), o["loss"]["thinned"].clone(), o["general_dataset"].clone()), (json!(2.0), json!(3.1), json!("mlabonne/open-perfectblend")));
     assert!(o["metrics"].as_array().unwrap().is_empty() && o["heal"].is_null());
     rruns::heal(&p, "slim", &heal_spec(20), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
     let o = rruns::heal_options(&p, "slim", Some(32.0)).unwrap();
@@ -1340,4 +1344,102 @@ fn the_page_gets_width_options_for_every_way_of_slimming() {
     // grow has no width; unknown shapes are refused
     assert!(AppModel::reshape_options_with("qwen3.5-4b", "grow", "width", None, None).unwrap().get("width_options").is_none());
     assert!(AppModel::reshape_options_with("qwen3.5-4b", "prune", "tall", None, None).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------------------------- the general text of healing
+
+#[cfg(unix)]
+fn healer_env(root: &std::path::Path) -> Vec<(String, Option<String>)> {
+    std::fs::read_to_string(root.join("env.jsonl")).unwrap_or_default().lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| (v["job"].as_str().unwrap().to_string(), v["hf"].as_str().map(String::from))).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn healing_uses_the_chosen_dataset_and_the_token_only_through_the_environment() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let token = format!("hf_{}", "Qq7".repeat(12));
+    ndforge_core::general::token_set(&token).unwrap();
+    let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general": {"id": "HuggingFaceH4/ultrachat_200k", "column": "messages"}})).unwrap();
+    rruns::heal(&p, "slim", &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    let jobs = jobs_seen(d.path());
+    let g = &jobs[0]["data"]["general"];
+    assert_eq!((g["id"].as_str(), g["split"].as_str(), g["column"].as_str(), g["share"].clone()), (Some("HuggingFaceH4/ultrachat_200k"), Some("train_sft"), Some("messages"), json!(0.5)));
+    assert_eq!(jobs[1]["dataset"]["general"], *g);
+    assert!(jobs.iter().all(|j| !j.to_string().contains(&token) && !j.to_string().contains("hf_")), "the token is never in a job file");
+    let env = healer_env(d.path());
+    assert_eq!(env.iter().map(|(j, t)| (j.as_str(), t.is_some())).collect::<Vec<_>>(), [("distill_cache", true), ("distill", true), ("distill_merge", false)]);
+    assert!(env.iter().filter_map(|(_, t)| t.as_ref()).all(|t| *t == token));
+    // what the page reads back says which dataset was used or skipped, and the token is nowhere in it
+    let h = std::fs::read_to_string(p.folder.join("models/slim/heal.json")).unwrap();
+    assert!(h.contains("ultrachat_200k") && h.contains("general_used") && !h.contains(&token));
+    // without a saved token no variable is set
+    ndforge_core::general::token_clear().unwrap();
+    assert!(ndforge_core::envmgr::jobs::job_env(&jobs[0]).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn another_dataset_never_reuses_the_teachers_answers_or_the_old_checkpoints() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let go = |id: &str| {
+        let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general": {"id": id}})).unwrap();
+        rruns::heal(&p, "slim", &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {})
+    };
+    let kinds = || jobs_seen(d.path()).iter().map(|j| j["job"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    std::fs::write(d.path().join("stop-train"), "").unwrap();
+    assert_eq!(go("a/one").unwrap()["stopped"], true);
+    assert_eq!(go("a/one").unwrap()["stopped"], true);
+    assert_eq!(kinds(), ["distill_cache", "distill", "distill"], "the same dataset: the cache is kept");
+    assert_eq!(jobs_seen(d.path())[2]["resume"], true, "and the checkpoint is continued");
+    assert_eq!(go("a/two").unwrap()["stopped"], true);
+    assert_eq!(kinds(), ["distill_cache", "distill", "distill", "distill_cache", "distill"], "another dataset: the teacher answers again");
+    assert_eq!(jobs_seen(d.path())[4]["resume"], false, "and the other dataset's checkpoint is not continued");
+    // an older cache (no key) counts as other data
+    let idx = p.folder.join("models/slim/distill/cache/index.json");
+    std::fs::write(&idx, r#"{"complete": true, "rows": 10, "done_rows": 10}"#).unwrap();
+    std::fs::remove_file(d.path().join("stop-train")).unwrap();
+    go("a/two").unwrap();
+    assert_eq!(kinds().iter().filter(|k| *k == "distill_cache").count(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dataset_that_needs_an_acknowledgement_is_not_used_silently() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let id = "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation";
+    let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general": {"id": id}})).unwrap();
+    let go = || rruns::heal(&p, "slim", &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {});
+    let e = go().unwrap_err();
+    assert!(e.0.contains("needs your OK") && e.0.contains("Noncommercial research"), "{e}");
+    assert!(jobs_seen(d.path()).is_empty(), "nothing ran");
+    ndforge_core::general::acknowledge(&format!("{id}#sft_balanced")).unwrap();
+    go().unwrap();
+    assert_eq!(jobs_seen(d.path())[0]["data"]["general"]["config"], "sft_balanced");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_old_dataset_fields_still_work_and_zero_share_means_no_general_text() {
+    let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general_dataset": "a/b", "general_column": "body"})).unwrap();
+    let g = spec.general_source().unwrap().unwrap();
+    assert_eq!((g.id.as_deref(), g.column.as_deref()), (Some("a/b"), Some("body")));
+    let none: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general_share": 0.0})).unwrap();
+    assert!(none.general_source().unwrap().is_none());
+    assert_eq!(rruns::DEFAULT_GENERAL_DATASET, "mlabonne/open-perfectblend");
 }

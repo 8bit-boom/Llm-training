@@ -94,15 +94,20 @@ def render_rows(tokenizer, rows: list, fam_name: str):
     return docs, skipped
 
 
-def fetch_general(source: dict, tokenizer, budget: int, ctx: int, should_stop=lambda: False):
-    """(texts, note): general text of about `budget` tokens through the healing code's source reader (a local JSONL file, or a Hugging Face dataset streamed).
-    A text is cut at MAX_GENERAL_DOC chunks. Any problem (offline, no `datasets` library, nothing read) gives ([], plain-language note)."""
-    name = source.get("file") or source.get("id") or "the default general text"
+def fetch_general(source: dict, tokenizer, budget: int, ctx: int, should_stop=lambda: False, fam_name: str = None, seed: int = 3407, report: dict = None):
+    """(texts, note): general text of about `budget` tokens through the healing code's source reader (a local file, or a Hugging Face dataset streamed; text,
+    chat and prompt+completion rows; chat rows go through the model's chat template when fam_name is given). A text is cut at MAX_GENERAL_DOC chunks. Any
+    problem (offline, gated, not found, no usable column, nothing read) gives ([], plain-language note) and the matrix is made from the project's text only."""
+    from . import distilljob, generaltext
+    source = {**source}
+    if not (source.get("file") or source.get("id")):
+        source["id"] = distilljob.DEFAULT_GENERAL
+    name = source.get("file") or source.get("id")
+    rep = report if report is not None else {}
+    source.update(seed=seed, report=rep)
+    if fam_name:
+        source["render"] = lambda msgs: data.render_chat(tokenizer, msgs, fam_name)[1]
     try:
-        from . import distilljob
-        if not (source.get("file") or source.get("id")):
-            source = {**source, "id": distilljob.DEFAULT_GENERAL}
-            name = distilljob.DEFAULT_GENERAL
         texts, got, cap = [], 0, ctx * MAX_GENERAL_DOC
         for text in distilljob._general_texts(source):
             if should_stop():
@@ -122,7 +127,9 @@ def fetch_general(source: dict, tokenizer, budget: int, ctx: int, should_stop=la
     except Stopped:
         raise
     except Exception as exc:    # noqa: BLE001 - offline, gated, wrong id or column, library missing: all end the same plain way
-        return [], f"The general text ({name}) could not be read ({str(exc)[:160]}). The matrix is made from your project's text only."
+        note, code = generaltext.failure_note(exc, source, "read", "The matrix is made from your project's text only.", distilljob.DEFAULT_GENERAL)
+        rep["error_code"] = code
+        return [], note
 
 
 def build_calibration(tokenizer, rows: list, fam_name: str, ctx: int, chunks: int, general: list, share: float = DEFAULT_SHARE, seed: int = 3407):
@@ -189,8 +196,12 @@ def weights_fingerprint(cfg: dict) -> str:
 
 
 def settings_key(cfg: dict, im: dict, data_hash: str) -> dict:
+    """What a saved matrix was made from. "general" is the dataset (id or file, config, split, column, share, seed): another dataset never reuses this matrix
+    (a matrix saved before this key existed has no "general" and counts as made from other data)."""
+    from . import generaltext
+    share = float(im.get("general_share", DEFAULT_SHARE))
     return {"model": im.get("model") or "", "weights": weights_fingerprint(cfg), "data_hash": data_hash, "chunks": int(im.get("chunks", 128)),
-            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": float(im.get("general_share", DEFAULT_SHARE))}
+            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407)))}
 
 
 def find_saved(dirs, key: dict, general_wanted: bool):
@@ -317,9 +328,15 @@ def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: lis
         rows = data.read_jsonl(train)
         ctx, chunks = key["ctx"], key["chunks"]
         general, gnote = [], ""
+        from . import generaltext
         if share > 0:
             protocol.progress("imatrix", 0.0, "Getting the general text")
-            general, gnote = fetch_general(im.get("general") or {}, tokenizer, int(ctx * chunks * SLACK * share), ctx, lambda: stop_requested(im))
+            greport: dict = {}
+            general, gnote = fetch_general(im.get("general") or {}, tokenizer, int(ctx * chunks * SLACK * share), ctx, lambda: stop_requested(im), cfg["base"].get("family"),
+                                           int(im.get("seed", 3407)), greport)
+            if general:
+                protocol.log(f"General text for the matrix: {(im.get('general') or {}).get('file') or (im.get('general') or {}).get('id') or 'the default'} "
+                             f"(read as {generaltext.describe(greport['detected']) if greport.get('detected') else 'text'}).")
             if gnote:
                 note(gnote)
                 protocol.log(gnote)
@@ -344,7 +361,7 @@ def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: lis
             return give_up(f"llama-imatrix failed (exit code {rc}; see the log), so the sizes were made without the importance matrix.")
         os.replace(partial, target)
         info = {"format": FORMAT, **key, "data_version": im.get("data_version"), "base_repo": cfg["base"]["repo"], "general_used": bool(general), "general_source": (im.get("general") or {}).get("file")
-                or (im.get("general") or {}).get("id") or ("default" if general else None), "project_tokens": stats["project_tokens"], "general_tokens": stats["general_tokens"],
+                or (im.get("general") or {}).get("id") or ("default" if general else None), "general_error": gnote or None, "project_tokens": stats["project_tokens"], "general_tokens": stats["general_tokens"],
                 "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         (out / "imatrix.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
         report.update(made=True, reused=False, file=str(target), info=info)

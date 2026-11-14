@@ -31,11 +31,14 @@ pub struct ImatrixOptions {
     pub enabled: bool,
     pub chunks: u32,
     pub reuse: bool,
+    /// where the general text comes from; None = the program's default
+    #[serde(default)]
+    pub general: Option<crate::general::GeneralSource>,
 }
 
 impl Default for ImatrixOptions {
     fn default() -> Self {
-        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true }
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None }
     }
 }
 
@@ -88,7 +91,7 @@ pub fn imatrix_state(p: &Project) -> Value {
         estimates.insert(run.to_string(), Value::Object(per));
     }
     json!({"chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
-           "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates})
+           "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates, "general": crate::general::state(Some(p))})
 }
 
 /// The job's "imatrix" block (None when it is off or no GGUF is made). `out` is the folder the worker writes into.
@@ -101,7 +104,8 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
     }
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
     let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
-    Ok(Some(json!({"enabled": true, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+    let general = crate::general::job_block(&crate::general::resolve(opts.general.as_ref(), true)?, IMATRIX_GENERAL_SHARE);
+    Ok(Some(json!({"enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
                    "reuse": opts.reuse, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 

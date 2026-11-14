@@ -134,11 +134,11 @@ import shutil  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import protocol, safetensors_io  # noqa: E402
+from . import generaltext, protocol, safetensors_io  # noqa: E402
 from .reshape import ReshapeError  # noqa: E402
 
 CACHE_FORMAT = 1
-DEFAULT_GENERAL = "nvidia/Nemotron-Pretraining-SFT-v1"      # NVIDIA's recommendation for distillation data; [A] the subset and licence are checked on the owner's PC
+from .generaltext import DEFAULT_ID as DEFAULT_GENERAL      # mlabonne/open-perfectblend: open (Apache-2.0); the gated Nemotron set stays selectable in the app
 MIN_GENERAL_ROW = 16                                         # windows shorter than this many tokens are dropped
 
 
@@ -172,24 +172,16 @@ def _text_of(value) -> str:
 
 
 def _general_texts(source: dict):
-    """An iterator over the general texts: a local JSONL file (source["file"], used by the tests and by people who bring their own text) or a Hugging Face
-    dataset streamed from the Hub (source["id"], never downloaded as a whole)."""
-    column = source.get("column") or "text"
-    if source.get("file"):
-        with open(source["file"], encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    yield _text_of(json.loads(line).get(column))
-        return
-    from datasets import load_dataset
-    ds = load_dataset(source.get("id") or DEFAULT_GENERAL, name=source.get("config"), split=source.get("split") or "train", streaming=True)
-    for item in ds:
-        yield _text_of(item.get(column))
+    """An iterator over the general texts: a local file (source["file"]: .jsonl .json .txt .csv .parquet) or a Hugging Face dataset streamed from the Hub
+    (source["id"], never downloaded as a whole). Text, chat (messages / conversations) and prompt+completion rows are all read (generaltext.py);
+    source["render"] turns chat rows into text with the model's chat template."""
+    from . import generaltext
+    yield from generaltext.texts(source)
 
 
 def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407):
     """General text cut into rows of at most max_seq tokens (windows of long texts), about `budget` tokens in all. tok_fn(text) -> list of token ids.
-    The order is the dataset's own (deterministic); returns (rows, tokens). Raises whatever the source raises (the caller explains it)."""
+    The order is the dataset's own, or mixed by source["seed"] when it has one (the same seed gives the same sample); returns (rows, tokens). Raises whatever the source raises (the caller explains it)."""
     rows, tokens = [], 0
     for text in _general_texts(source):
         ids = tok_fn(text)
@@ -214,25 +206,34 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
     proj, pstats = data.load_training_rows(tokenizer, data_cfg["train"], fam_name, max_seq, seed)
     for r in proj:
         r["source"] = "project"
-    stats = {"project_rows": len(proj), "project_tokens": pstats["tokens"], "general_rows": 0, "general_tokens": 0, "general_error": None, "general_source": None}
+    stats = {"project_rows": len(proj), "project_tokens": pstats["tokens"], "general_rows": 0, "general_tokens": 0, "general_error": None, "general_error_code": None,
+             "general_source": None, "general_detected": None, "general_texts_skipped": 0}
     g = data_cfg.get("general")
     rows = list(proj)
     if g and float(g.get("share", 0)) > 0:
         total = int(data_cfg.get("tokens") or 0)
         budget = int(total * float(g["share"]))
-        name = g.get("file") or g.get("id") or DEFAULT_GENERAL
+        g = {**g}
+        if not g.get("file") and not g.get("id"):
+            g["id"] = DEFAULT_GENERAL
+        name = g.get("file") or g.get("id")
         stats["general_source"] = name
         inner = data._inner(tokenizer)
+        report: dict = {}
+        g.update(seed=seed, report=report, render=lambda msgs: data.render_chat(tokenizer, msgs, fam_name)[1])
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
         try:
             grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed)
         except Exception as exc:      # noqa: BLE001 - offline, gated, wrong id or column: all end the same plain way
             grows, gtok = [], 0
-            stats["general_error"] = (f"The general text ({name}) could not be downloaded: {str(exc)[:200]}. "
-                                      "Healing goes on with your world's text only; try again later for better results.")
+            stats["general_error"], stats["general_error_code"] = generaltext.failure_note(
+                exc, g, "downloaded", "Healing goes on with your world's text only; try again later or choose another dataset.", DEFAULT_GENERAL)
             protocol.log(stats["general_error"])
+        stats.update(general_detected=report.get("detected"), general_texts_skipped=report.get("skipped", 0))
         rows += grows
         stats.update(general_rows=len(grows), general_tokens=gtok)
+        if grows:
+            protocol.log(f"General text used: {name} ({len(grows)} rows, {gtok:,} tokens).")
         protocol.progress("data", 1.0, "")
     return rows, stats
 
@@ -367,7 +368,7 @@ def read_cache_index(folder):
 
 def cache_matches(index: dict, expect: dict) -> bool:
     """True when the saved teacher answers belong to this data, tokenizer, length, k and teacher"""
-    return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len"))
+    return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len", "general_key", "general_rows"))
 
 
 class CacheReader:
@@ -446,7 +447,9 @@ def run_cache(cfg: dict) -> int:
     tok = AutoTokenizer.from_pretrained(str(student))
     rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
     meta = {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
-            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"]}
+            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
+            "general_key": generaltext.general_key((cfg["data"] or {}).get("general"), ((cfg["data"] or {}).get("general") or {}).get("share", 0), int(cfg.get("seed", 3407))),
+            "general_source": stats["general_source"]}
     writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
     save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
@@ -708,6 +711,10 @@ def run(cfg: dict) -> int:
                 or data_hash(rows) != idx["data_hash"] or reader.done_rows < idx["rows"]):
             raise ReshapeError("The saved teacher answers belong to other data; they will be made again.")
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
+        g_cfg = (cfg.get("dataset") or {}).get("general")
+        # the rows come from the cache itself, so the training run's seed cannot change them (see generaltext.same_general)
+        if not generaltext.same_general(idx.get("general_key"), g_cfg, share):
+            raise ReshapeError("The saved teacher answers belong to other data (another general text); they will be made again.")
     else:
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
     lcfg = {"model": cfg["model"], "method": cfg["method"], "hyper": h}
@@ -795,7 +802,9 @@ def run(cfg: dict) -> int:
     target = out / "adapter"
     trainer.model.save_pretrained(str(target))
     hist = live.history
-    summary = {"backend": "hf", "method": cfg["method"], "mode": mode, "steps": trainer.state.global_step, "total_steps": steps, "tokens_seen": trainer.distill["tokens"],
+    gen_info = {k: stats.get(k) for k in ("general_source", "general_rows", "general_tokens", "general_error", "general_error_code", "general_detected")} if mode == "online" else \
+        {"general_source": idx.get("general_source"), "general_rows": idx.get("general_rows")}
+    summary = {"general": gen_info, "backend": "hf", "method": cfg["method"], "mode": mode, "steps": trainer.state.global_step, "total_steps": steps, "tokens_seen": trainer.distill["tokens"],
                "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": before,
                "calib_loss_after": after if after is not None else (live.calib[-1][1] if live.calib else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
                "train_seconds": round(time.time() - t0, 1), "peak_vram_mb": live._vram(), "adapter_dir": str(target), "stopped": live.stopped,
@@ -848,7 +857,7 @@ def merge(cfg: dict) -> int:
         s = cfg.get("summary") or {}
         meta["healed"] = {"created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "from": base.name if base.name != "model" else base.parent.name, "merged_weights": res["merged"],
                           "lora_rank": res["rank"], "lora_scaling": res["scaling"], **{k: s.get(k) for k in (
-                              "mode", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
+                              "mode", "general", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
         (out / "ndforge_reshape.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         (out / "README.md").write_text(f"---\n{reshapejob._licence_front_matter(base / 'README.md')}---\n# {out.parent.name} (healed)\n\n"
                                        f"{base.parent.name}, taught by its original model (distillation).\n\n"

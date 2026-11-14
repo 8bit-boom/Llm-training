@@ -80,7 +80,7 @@ test("Make the files sends the matrix options only when ticked", async () => {
   assert.equal(b.calls.at(-1)[0], "export_start");
   b.run("us.im = true; us.imChunks = 64; us.quants = ['q4_k_m', 'q8_0']"); b.run("renderUse(); wireUse()");
   b.els["us-make"].onclick();
-  assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].imatrix)), { enabled: true, chunks: 64, reuse: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].imatrix)), { enabled: true, chunks: 64, reuse: true, general: null });
   assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].quants)), ["q4_k_m", "q8_0"]);
   b.run("us.imReuse = false"); b.run("wireUse()");
   b.els["us-make"].onclick();

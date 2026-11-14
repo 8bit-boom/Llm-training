@@ -402,7 +402,7 @@ const thinModel = (over = {}) => doneModel({ name: "20261113-150000-qwen3.5-27b-
     width: { before: { intermediate_size: 17408 }, after: { intermediate_size: 10752 }, stable_overlap: 0.93, scores_key: "k", mtp: "sliced by weight size, not measured" } },
   width_scores: { layers: 64, mlp_mean: Array.from({ length: 64 }, (_, i) => 0.2 + (i % 7) * 0.05), kept_share: 0.81, stable_overlap: 0.93 }, ...over });
 
-const healOpts = (over = {}) => ({ name: "20261113-150000-qwen3.5-27b-slim-w10752", plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: true, why: null }, default_tokens_m: 20, general_dataset: "nvidia/Nemotron-Pretraining-SFT-v1", has_data: true, vram_gb: 32, healed: false, heal: null, metrics: [], loss: { original: 2.0, thinned: 3.1 },
+const healOpts = (over = {}) => ({ name: "20261113-150000-qwen3.5-27b-slim-w10752", plan: { mode: "cache", student_method: "qlora", est_gb: 18.7, fits: true, why: null }, default_tokens_m: 20, general_dataset: "mlabonne/open-perfectblend", has_data: true, vram_gb: 32, healed: false, heal: null, metrics: [], loss: { original: 2.0, thinned: 3.1 },
   tokens: [{ tokens_m: 10, cache_gb: 2, hours: [3.1, 5.9] }, { tokens_m: 20, cache_gb: 3.9, hours: [6.2, 11.8] }, { tokens_m: 40, cache_gb: 7.8, hours: [12.4, 23.6] }, { tokens_m: 80, cache_gb: 15.7, hours: [24.8, 47.2] }], ...over });
 
 test("the result card of a thinner model: the neurons chart, the stability and the honest numbers", () => {
@@ -431,7 +431,7 @@ test("the Heal card: explicit about the download, the budgets, the memory and th
   assert.match(html, /Heal it \(recommended\)/);
   assert.match(html, /The original model teaches the thinner one to answer like it did/);
   assert.match(html, /id="hl-general" checked/);                                             // owner decision: general text on by default
-  assert.match(html, /It is downloaded from Hugging Face<\/strong> \(nvidia\/Nemotron-Pretraining-SFT-v1\)/);
+  assert.match(html, /It is downloaded from Hugging Face<\/strong> \(or read from a file you choose\)/);
   assert.match(html, /Without it, or with this box unticked, healing uses your world's text only/);
   assert.match(html, /<option value="20" selected>20 million tokens<\/option>/);              // 20 M for a student of 15 B or more
   assert.match(html, /<option value="80" >80 million tokens<\/option>/);
@@ -443,7 +443,7 @@ test("the Heal card: explicit about the download, the budgets, the memory and th
   assert.doesNotMatch(html, /id="hl-dataset"/);                                              // Expert only
   b.run(`state.settings.expert_mode = true`);
   html = b.run("renderReshape()");
-  assert.match(html, /id="hl-dataset" value="" placeholder="nvidia\/Nemotron-Pretraining-SFT-v1"/);
+  assert.doesNotMatch(html, /id="hl-dataset"/);                                              // the dataset is chosen in the chooser for everybody, not in Expert
   assert.match(html, /id="hl-rank" value="64"/);
   assert.match(html, /id="hl-lr" value="0.0001"/);
   // a 9B-sized student: 40 M by default, and LoRA in 16-bit
@@ -510,7 +510,7 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; renderReshape(); wireReshape();`);
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
-  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general_dataset: null, alpha: 1, rank: 64, lr: 0.0001, mode: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general: null, alpha: 1, rank: 64, lr: 0.0001, mode: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
   assert.equal(b.run("rsHealSpec().general_share"), 0);

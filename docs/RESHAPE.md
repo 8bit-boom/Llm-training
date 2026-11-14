@@ -158,7 +158,7 @@ The Rust side computes the same numbers (`reshape::plan::width_params`), tested 
 1. **The slider's first (suggested) position for the 27B is the mild cut: 23.7 B (MLP 13,312).** 21.1 B stays reachable on the same slider with a "needs healing" warning; **Both** is offered as well
    (one block removed plus MLP 12,288 = 21.5 B). The page starts on 13/17 of the MLP, and on one block plus 12/17 for Both (`plan::suggested_widths`).
 2. **General text for healing is on by default** (about 50 % of the healing tokens), switched off in Expert mode (share 0). The page says plainly that it is **downloaded from Hugging Face**
-   (default dataset `nvidia/Nemotron-Pretraining-SFT-v1`, NVIDIA's recommendation for distillation data) and that this needs an internet connection. **Offline** (or any download error) is not an
+   (default dataset `mlabonne/open-perfectblend`, open, Apache-2.0; changed from the gated `nvidia/Nemotron-Pretraining-SFT-v1`, see docs/GENERAL_TEXT.md; the person can choose another preset or their own) and that this needs an internet connection. **Offline** (or any download error) is not an
    error: healing goes on with the project's own text only, with a plain-language note on the Heal card and in the result.
 3. **Heal budget:** 20 M tokens for students of 15 B or more, 40 M below; the page allows 10 / 20 / 40 / 80 M and shows an estimate of the time and of the disk space for the teacher's answers.
 4. **The healed adapter is merged into a NEW base model folder** (`models/<name>/healed/`, numpy, one tensor at a time, no torch). The distillation checkpoints are deleted afterwards; the
@@ -290,7 +290,7 @@ page in a stand-in browser.
 back without it, at the price of memory); PEFT's `all-linear` covers the linear-attention projections and the key names of the saved adapter match (the merge test checks this on CPU); QLoRA adapters merged into
 bf16 weights differ slightly from the 4-bit model they were trained on; a 4-bit teacher gives a slightly noisier target; llama.cpp quantises MLP rows of 13,312 or 10,752 values as k-quants (multiples of 256);
 Unsloth's bundled llama.cpp and Ollama accept a non-standard MLP width; the multi-token head cut by weight size loads in llama.cpp and is useless for speculative decoding; the general dataset
-(`nvidia/Nemotron-Pretraining-SFT-v1`: the right column is `text`, the licence suits the project) must be checked on the owner's PC; the time and memory estimates of the Heal card; and above all **the quality
+(`mlabonne/open-perfectblend`: that its column is `conversations` as described on its card; see docs/GENERAL_TEXT.md, "Not verified yet") must be checked on the owner's PC; the time and memory estimates of the Heal card; and above all **the quality
 after healing with 20 to 40 million tokens** (NVIDIA used 94 billion for its models: expect a usable model, not one as good as the original).
 
 **The GPU checklist of version 2** (RTX 5090; record the numbers here):

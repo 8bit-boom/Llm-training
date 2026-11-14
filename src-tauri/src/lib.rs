@@ -123,6 +123,50 @@ fn model_remove(id: String) -> Out<()> {
     AppModel::custom_model_remove(&id).map_err(|e| e.to_string())
 }
 
+/// The general-text chooser: presets, the person's own datasets, the last choice of this project, whether a Hugging Face token is saved.
+#[tauri::command]
+fn general_state(s: State<App>) -> Value {
+    lock(&s).general_state()
+}
+
+#[tauri::command]
+fn general_choose(s: State<App>, scope: String, source: ndforge_core::general::GeneralSource) -> Out<Value> {
+    lock(&s).general_choose(&scope, &source).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn general_add(s: State<App>, source: ndforge_core::general::GeneralSource) -> Out<Value> {
+    lock(&s).general_add(&source).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn general_remove(s: State<App>, key: String) -> Out<Value> {
+    lock(&s).general_remove(&key).map_err(|e| e.to_string())
+}
+
+/// The person ticked the licence acknowledgement of a dataset.
+#[tauri::command]
+fn general_ack(s: State<App>, key: String) -> Out<Value> {
+    lock(&s).general_ack(&key).map_err(|e| e.to_string())
+}
+
+/// "Check it": reads about 20 rows of the dataset with the worker (a network call, so off the window's thread).
+#[tauri::command]
+async fn general_check(source: ndforge_core::general::GeneralSource) -> Out<Value> {
+    tauri::async_runtime::spawn_blocking(move || ndforge_core::general::check(&source).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
+}
+
+/// The Hugging Face token for gated datasets: kept with the other secrets, handed to the worker as HF_TOKEN only.
+#[tauri::command]
+fn hf_token_set(s: State<App>, token: String) -> Out<Value> {
+    lock(&s).hf_token_set(&token).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn hf_token_clear(s: State<App>) -> Out<Value> {
+    lock(&s).hf_token_clear().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn test_state(s: State<App>) -> Out<Value> {
     lock(&s).test_state().map_err(|e| e.to_string())
@@ -805,7 +849,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
