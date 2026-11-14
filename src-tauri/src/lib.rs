@@ -687,6 +687,14 @@ fn heal_options(s: State<App>, name: String) -> Out<Value> {
     ndforge_core::reshape::runs::heal_options(&p, &name, card_vram_gb()).map_err(|e| e.to_string())
 }
 
+/// The live memory estimate of the Heal card for the settings chosen so far.
+#[tauri::command]
+fn heal_estimate(s: State<App>, name: String, spec: Value) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    ndforge_core::reshape::runs::heal_estimate(&p, &name, &spec, card_vram_gb()).map_err(|e| e.to_string())
+}
+
 /// Heals a made model (or continues where a stopped heal was). Events on "reshape-event" tagged {"phase": "heal"}; the end is {"kind": "done", "data": {...}}.
 #[tauri::command]
 fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: String, spec: Value) -> Out<()> {
@@ -849,7 +857,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

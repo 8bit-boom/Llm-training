@@ -307,16 +307,110 @@ fn width_warnings_are_honest() {
 fn healing_runs_the_way_that_fits_the_card() {
     let p = heal_plan(21.1, 27.8, Some(32.0));
     assert_eq!((p.mode, p.student_method, p.fits), ("cache", "qlora", true), "{p:?}");
-    assert!((p.est_gb - 18.7).abs() < 0.2 && p.why.is_none());
-    let q = heal_plan(8.0, 9.65, Some(32.0));
+    assert!(p.est_gb > 15.0 && p.est_gb < 27.2 && (p.est_gb - p.student_gb).abs() < 0.1 && p.why.is_none() && p.verdict == "fits", "the student's step is the heavier one: {p:?}");
+    // 8 B in 16-bit next to a 4-bit teacher no longer fits together on 32 GB by the new estimate (activations and the LoRA are counted): the teacher answers first
+    let q = heal_plan(4.0, 4.8, Some(32.0));
     assert_eq!((q.mode, q.student_method, q.teacher_load, q.fits), ("online", "lora", "4bit", true), "{q:?}");
+    let e = heal_plan(8.0, 9.65, Some(32.0));
+    assert_eq!((e.mode, e.student_method, e.fits), ("cache", "lora", true), "8 B in 16-bit: about 24 GB of the 32, below the 85 % that makes QLoRA the automatic choice: {e:?}");
     let small = heal_plan(21.1, 27.8, Some(16.0));
-    assert!(!small.fits && small.why.as_deref().unwrap().contains("this card has 16 GB") && small.why.as_deref().unwrap().contains("Choose a smaller model"), "{small:?}");
+    assert!(!small.fits && small.verdict == "over" && small.why.as_deref().unwrap().contains("this card has 16 GB") && small.why.as_deref().unwrap().contains("Choose a smaller model"), "{small:?}");
     assert_eq!(heal_plan(21.1, 27.8, None).mode, "cache");
     assert!(p.cache_gb_per_10m > 1.9 && p.cache_gb_per_10m < 2.0, "196 bytes per token, 10 M tokens");
     assert!(p.hours_per_10m.0 > 0.0 && p.hours_per_10m.1 > p.hours_per_10m.0);
     assert_eq!((default_heal_tokens_m(21.1), default_heal_tokens_m(8.0), default_heal_tokens_m(15.0)), (20, 40, 20));
     assert_eq!(HEAL_TOKENS_M, [10, 20, 40, 80]);
+}
+
+fn cases() -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker/tests/data/heal_cases.json")).unwrap()).unwrap()
+}
+
+fn knobs_of(v: &serde_json::Value) -> HealKnobs {
+    HealKnobs { seq: 1024, batch: v["batch"].as_u64().unwrap() as u32, grad_accum: v["grad_accum"].as_u64().unwrap() as u32, checkpointing: v["checkpointing"].as_bool().unwrap(), rank: 32,
+                kl_chunk: v["chunk"].as_u64().unwrap() as u32, qlora: true }
+}
+
+#[test]
+fn the_safer_settings_ladder_and_the_activation_estimate_equal_the_workers() {
+    let c = cases();
+    for case in c["ladder"].as_array().unwrap() {
+        let got = heal_next_safer(&knobs_of(&case["from"]));
+        match (&case["to"], got) {
+            (serde_json::Value::Null, g) => assert!(g.is_none(), "{case}"),
+            (to, Some((k, label))) => assert_eq!((k, label.as_str()), (knobs_of(to), case["label"].as_str().unwrap()), "{case}"),
+            (_, None) => panic!("{case}"),
+        }
+    }
+    for a in c["activation"].as_array().unwrap() {
+        let got = heal_activation_gb(a["layers"].as_u64().unwrap() as u32, a["hidden"].as_u64().unwrap() as u32, a["seq"].as_u64().unwrap() as u32, a["batch"].as_u64().unwrap() as u32, a["checkpointing"].as_bool().unwrap());
+        let want = a["gb"].as_f64().unwrap();
+        assert!((got - want).abs() <= want * 1e-3, "{a}: {got}");
+    }
+    // the ladder ends, keeps the sequences per update and never touches the maths
+    let mut k = HealKnobs { seq: 2048, batch: 4, grad_accum: 8, checkpointing: false, rank: 64, kl_chunk: 256, qlora: false };
+    let mut n = 0;
+    while let Some((next, _)) = heal_next_safer(&k) {
+        assert_eq!((next.batch * next.grad_accum, next.seq, next.rank, next.qlora), (32, 2048, 64, false));
+        k = next;
+        n += 1;
+        assert!(n < 20);
+    }
+    assert_eq!((n, k.checkpointing, k.batch, k.kl_chunk), (5, true, 1, 64));
+}
+
+#[test]
+fn the_automatic_settings_equal_the_workers_and_follow_the_size() {
+    for a in cases()["auto"].as_array().unwrap() {
+        let b = a["student_b"].as_f64().unwrap();
+        let k = heal_defaults(b, Some(32.0), &HealDims { layers: 40, hidden: 4096, vocab: 248_320 });
+        assert_eq!((k.seq as u64, k.rank as u64, k.batch as u64, k.grad_accum as u64, k.kl_chunk as u64), (a["max_seq"].as_u64().unwrap(), a["rank"].as_u64().unwrap(), a["batch"].as_u64().unwrap(), a["grad_accum"].as_u64().unwrap(), a["chunk"].as_u64().unwrap()), "{a}");
+        assert!(b < 15.0 || k.qlora, "{a}");
+        assert!(b < 8.0 || k.checkpointing, "always on from 8 B: {a}");
+    }
+    // a small student on a small card: checkpointing when the activations would take more than 60 % of what is left, not otherwise
+    let d = HealDims { layers: 28, hidden: 2048, vocab: 150_000 };
+    assert!(heal_defaults(2.0, Some(8.0), &d).checkpointing, "act without it: ~3.7 GB x 4 = 15 GB");
+    assert!(!heal_defaults(0.5, Some(80.0), &d).checkpointing);
+    assert!(heal_defaults(0.5, None, &d).checkpointing, "unknown card: on");
+    // 16-bit weights that do not fit the card: QLoRA whatever the size
+    assert!(heal_defaults(12.0, Some(24.0), &HealDims::guess(12.0)).qlora && !heal_defaults(12.0, Some(48.0), &HealDims::guess(12.0)).qlora);
+}
+
+fn mem(b: f64, k: &HealKnobs) -> f64 {
+    heal_memory_gb(b, &HealDims { layers: 40, hidden: 4096, vocab: 248_320 }, k)
+}
+
+#[test]
+fn the_memory_estimate_is_monotonic_and_checkpointing_and_qlora_lower_it() {
+    let base = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: false, rank: 32, kl_chunk: 128, qlora: true };
+    let m = |f: &dyn Fn(&mut HealKnobs)| { let mut k = base.clone(); f(&mut k); mem(16.0, &k) };
+    let b = mem(16.0, &base);
+    assert!(m(&|k| k.seq = 2048) > b && m(&|k| k.seq = 512) < b && m(&|k| k.batch = 4) > b && m(&|k| k.batch = 1) < b && m(&|k| k.rank = 64) > b && m(&|k| k.rank = 8) < b && m(&|k| k.kl_chunk = 512) > b);
+    assert!(m(&|k| k.checkpointing = true) < b);
+    assert!(m(&|k| k.qlora = false) > b, "16-bit weights are bigger than 4-bit ones");
+    assert!(mem(21.0, &base) > mem(16.0, &base));
+    let total = heal_memory(16.0, &HealDims { layers: 40, hidden: 4096, vocab: 248_320 }, &base);
+    assert!((total.total_gb - (total.weights_gb + total.lora_gb + total.activations_gb + total.kl_gb + total.overhead_gb) * 1.10).abs() < 0.1);
+}
+
+#[test]
+fn a_16b_student_fits_32_gb_at_the_defaults_and_not_at_batch_4_seq_2048_without_checkpointing() {
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    let def = heal_defaults(16.0, Some(32.0), &d);
+    let p = heal_plan_with(16.0, 21.0, Some(32.0), &d, &def);
+    assert!(p.fits && p.verdict == "fits" && p.student_gb < 27.2, "{p:?}");
+    let wild = HealKnobs { seq: 2048, batch: 4, grad_accum: 8, checkpointing: false, ..def.clone() };
+    let w = heal_plan_with(16.0, 21.0, Some(32.0), &d, &wild);
+    assert!(!w.fits && w.verdict == "over" && w.student_gb > 32.0, "the owner's failure: {w:?}");
+    assert!(w.verdict_text.starts_with("Will probably run out of memory") && p.verdict_text.starts_with("Fits"));
+    assert_eq!(heal_verdict(28.0, Some(32.0)), "tight");
+    assert!(heal_verdict_text(28.0, Some(32.0)).starts_with("Tight"));
+    assert_eq!(heal_verdict(10.0, None), "unknown");
+    // the sizes come from the model's config, the language part of a multimodal one included
+    let c = HealDims::from_config(&json!({"text_config": {"num_hidden_layers": 40, "hidden_size": 4096, "vocab_size": 248320}}), 16.0);
+    assert_eq!(c, d);
+    assert_eq!(HealDims::from_config(&json!({}), 16.0), HealDims::guess(16.0));
 }
 
 #[test]
@@ -994,11 +1088,15 @@ if kind == "distill_cache":
     os.makedirs(job["out"], exist_ok=True)
     g = job["data"].get("general")
     key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"]}}
-    json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key}}, open(os.path.join(job["out"], "index.json"), "w"))
+    json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key, "k": job["k"], "max_len": job["max_seq"]}}, open(os.path.join(job["out"], "index.json"), "w"))
     out(type="progress", step="cache", value=0.5, text="The original model answers your texts")
     out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."]}})
 elif kind == "distill":
     os.makedirs(os.path.join(job["out"], "checkpoints", "checkpoint-50"), exist_ok=True)
+    out(type="heal_settings", settings={{"checkpointing": job["hyper"]["checkpointing"] == "on", "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"]}})
+    if marker("oom-train"):
+        out(type="heal_retry", attempt=1, change="gradient checkpointing", settings={{"checkpointing": True, "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"]}})
+        out(type="error", code="distill_oom", message="The graphics card ran out of memory during step train. Settings used: x."); sys.exit(1)
     if marker("fail-train"):
         out(type="error", code="distill_unstable", message="Healing stopped: the training became unstable (the error went to infinity). Lower the learning rate (Expert) and continue."); sys.exit(1)
     out(type="distill_metric", step=1, kd=0.9, ce=0.0, tokens=100, total_steps=2)
@@ -1091,13 +1189,16 @@ fn a_model_is_healed_in_three_jobs_and_the_healed_model_is_listed() {
     let jobs = jobs_seen(d.path());
     assert_eq!(jobs.iter().map(|j| j["job"].as_str().unwrap()).collect::<Vec<_>>(), ["distill_cache", "distill", "distill_merge"], "27B -> 21B on 32 GB: the teacher answers first");
     let (cache, train, merge) = (&jobs[0], &jobs[1], &jobs[2]);
-    assert_eq!((cache["teacher"]["repo"].as_str(), cache["k"].clone(), cache["max_seq"].clone(), cache["data"]["tokens"].clone()), (Some("unsloth/Qwen3.5-4B"), json!(32), json!(2048), json!(20_000_000)));
+    assert_eq!((cache["teacher"]["repo"].as_str(), cache["k"].clone(), cache["max_seq"].clone(), cache["data"]["tokens"].clone()), (Some("unsloth/Qwen3.5-4B"), json!(32), json!(1024), json!(20_000_000)));
     assert_eq!((cache["data"]["general"]["share"].clone(), cache["data"]["general"]["id"].as_str(), cache["data"]["general"]["split"].as_str()), (json!(0.5), Some("mlabonne/open-perfectblend"), Some("train")));
     assert!(cache["data"]["general"].get("column").is_none(), "the worker finds the column itself");
     assert_eq!(cache["student"].as_str().unwrap(), dir.join("model").to_string_lossy());
     assert_eq!(cache["stop_file"].as_str().unwrap(), dir.join("STOP").to_string_lossy());
     assert_eq!((train["method"].as_str(), train["backend"].as_str(), train["hyper"]["rank"].clone(), train["hyper"]["alpha"].clone(), train["hyper"]["lr"].clone(), train["hyper"]["tokens"].clone()),
-               (Some("qlora"), Some("hf"), json!(64), json!(64), json!(1e-4), json!(20_000_000)));
+               (Some("qlora"), Some("hf"), json!(32), json!(32), json!(1e-4), json!(20_000_000)));
+    // a 21 B student: the cautious automatic settings (docs/HEAL_SETTINGS.md): 1024 tokens, batch 2 x 16, checkpointing on, 8-bit optimizer, KL chunk 128
+    assert_eq!((train["hyper"]["max_seq"].clone(), train["hyper"]["batch"].clone(), train["hyper"]["grad_accum"].clone(), train["hyper"]["checkpointing"].clone(), train["hyper"]["optimizer"].clone(), train["distill"]["chunk"].clone()),
+               (json!(1024), json!(2), json!(16), json!("on"), json!("adamw_8bit"), json!(128)));
     assert_eq!((train["distill"]["mode"].as_str(), train["distill"]["alpha"].clone(), train["resume"].clone()), (Some("cache"), json!(1.0), json!(false)));
     assert_eq!((train["eval"]["teacher_loss"].clone(), train["eval"]["slim_loss"].clone(), train["eval"]["calibration"]["samples"].clone()), (json!(2.0), json!(3.1), json!(256)));
     assert_eq!(merge["base"].as_str().unwrap(), dir.join("model").to_string_lossy());
@@ -1136,7 +1237,7 @@ fn a_small_student_is_healed_online_without_the_cache() {
     let d = tempdir().unwrap();
     fake_healer(d.path());
     let p = project_with_version(d.path());
-    made_model(&p, "slim-9b", 9_650_000_000, 8_000_000_000);
+    made_model(&p, "slim-9b", 4_800_000_000, 4_000_000_000);       // (an 8 B student no longer fits next to the teacher on 32 GB by the new estimate)
     let r = rruns::heal(&p, "slim-9b", &heal_spec(40), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
     assert_eq!(r["mode"], "online");
     let jobs = jobs_seen(d.path());
@@ -1144,12 +1245,109 @@ fn a_small_student_is_healed_online_without_the_cache() {
     assert_eq!((jobs[0]["method"].as_str(), jobs[0]["distill"]["teacher"]["load"].as_str(), jobs[0]["hyper"]["tokens"].clone()), (Some("lora"), Some("4bit"), json!(40_000_000)));
     // Expert: the project's own text only, and the cache even though the card could do it online
     let spec = serde_json::from_value(json!({"tokens_m": 10, "general_share": 0.0, "mode": "cache", "alpha": 0.8, "rank": 32, "lr": 2e-4})).unwrap();
-    made_model(&p, "slim-9b-2", 9_650_000_000, 8_000_000_000);
+    made_model(&p, "slim-9b-2", 4_800_000_000, 4_000_000_000);
     rruns::heal(&p, "slim-9b-2", &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
     let jobs = jobs_seen(d.path());
     let (cache, train) = (&jobs[2], &jobs[3]);
     assert_eq!((cache["job"].as_str(), cache["data"]["general"].clone()), (Some("distill_cache"), serde_json::Value::Null));
     assert_eq!((train["distill"]["alpha"].clone(), train["hyper"]["rank"].clone(), train["hyper"]["lr"].clone(), train["dataset"]["general"].clone()), (json!(0.8), json!(32), json!(2e-4), serde_json::Value::Null));
+}
+
+#[cfg(unix)]
+fn heal_with(p: &Project, name: &str, spec: serde_json::Value) -> Result<serde_json::Value, ndforge_core::error::Error> {
+    let spec: rruns::HealSpec = serde_json::from_value(spec).unwrap();
+    rruns::heal(p, name, &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {})
+}
+
+#[cfg(unix)]
+#[test]
+fn healing_settings_reach_the_jobs_and_the_teachers_answers_are_kept_unless_the_data_changes() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let dir = p.folder.join("models").join("slim");
+    let kinds = || jobs_seen(d.path()).iter().map(|j| j["job"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // the cache is made, then the training fails with an out-of-memory error: a plain flag, the retries and the settings used are kept
+    std::fs::write(d.path().join("oom-train"), "").unwrap();
+    let spec = json!({"tokens_m": 10, "general_share": 0.0, "seq": 512, "batch": 1, "per_update": 16, "checkpointing": "off", "kl_chunk": 128, "k": 16, "optimizer": "adamw", "warmup": 5, "method": "qlora", "teacher_load": "4bit", "rank": 16});
+    assert!(heal_with(&p, "slim", spec.clone()).unwrap_err().0.contains("ran out of memory"));
+    let jobs = jobs_seen(d.path());
+    let (cache, train) = (&jobs[0], &jobs[1]);
+    assert_eq!((cache["k"].clone(), cache["max_seq"].clone(), cache["teacher"]["load"].clone()), (json!(16), json!(512), json!("4bit")));
+    assert_eq!((train["hyper"]["batch"].clone(), train["hyper"]["grad_accum"].clone(), train["hyper"]["checkpointing"].clone(), train["hyper"]["optimizer"].clone(), train["hyper"]["warmup"].clone(), train["hyper"]["rank"].clone(), train["distill"]["chunk"].clone(), train["distill"]["k"].clone()),
+               (json!(1), json!(16), json!("off"), json!("adamw"), json!(5), json!(16), json!(128), json!(16)));
+    let h: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("heal.json")).unwrap()).unwrap();
+    assert_eq!((h["status"].clone(), h["oom"].clone(), h["retries"][0]["change"].clone()), (json!("failed"), json!(true), json!("gradient checkpointing")));
+    // the page's "Try again with safer settings": the next step of the ladder from the settings of the last try (checkpointing was already turned on by the retry)
+    let o = rruns::heal_options(&p, "slim", Some(32.0)).unwrap();
+    assert_eq!((o["safer"]["label"].as_str(), o["safer"]["checkpointing"].as_str(), o["safer"]["kl_chunk"].clone()), (Some("a smaller KL chunk (64)"), Some("on"), json!(64)), "{o}");
+    assert_eq!(o["safer"]["batch"], 1, "the batch is already 1; the next rung is the chunk");
+    // only student-side settings changed (and the memory ones): the teacher's answers stay, the training goes on from its checkpoint
+    std::fs::remove_file(d.path().join("oom-train")).unwrap();
+    let mut s2 = spec.clone();
+    s2["checkpointing"] = json!("on");
+    s2["kl_chunk"] = json!(64);
+    s2["optimizer"] = json!("adamw_8bit");
+    heal_with(&p, "slim", s2).unwrap();
+    let all = kinds();
+    assert_eq!(all, ["distill_cache", "distill", "distill", "distill_merge"], "the answers were not made again: {all:?}");
+    assert_eq!(jobs_seen(d.path())[2]["resume"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_changed_sequence_length_makes_the_original_answer_again_and_restarts_the_training() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    std::fs::write(d.path().join("oom-train"), "").unwrap();
+    let _ = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0, "seq": 1024})).unwrap_err();
+    std::fs::remove_file(d.path().join("oom-train")).unwrap();
+    heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0, "seq": 512})).unwrap();
+    let all = jobs_seen(d.path());
+    let kinds: Vec<_> = all.iter().map(|j| j["job"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["distill_cache", "distill", "distill_cache", "distill", "distill_merge"], "{kinds:?}");
+    assert_eq!((all[2]["max_seq"].clone(), all[3]["resume"].clone()), (json!(512), json!(false)), "the old checkpoints were for other rows");
+}
+
+#[test]
+fn healing_specs_old_and_new_load_and_are_checked() {
+    let old: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 20, "general_share": 0.5, "alpha": 1.0, "rank": 64, "lr": 1e-4, "mode": null})).unwrap();
+    assert_eq!((old.rank, old.seq, old.batch, old.checkpointing.clone(), old.k, old.warmup), (Some(64), None, None, None, None, None));
+    old.validate().unwrap();
+    let bare: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 20})).unwrap();
+    assert_eq!(bare.rank, None, "the rank follows the student's size now");
+    let new = json!({"tokens_m": 20, "general_share": 0.5, "alpha": 1.0, "rank": 32, "lr": 1e-4, "mode": "cache", "seq": 1024, "batch": 2, "per_update": 32, "checkpointing": "auto", "method": "qlora",
+                     "optimizer": "adamw_8bit", "kl_chunk": 128, "k": 32, "teacher_load": "auto", "warmup": 30});
+    let spec: rruns::HealSpec = serde_json::from_value(new.clone()).unwrap();
+    spec.validate().unwrap();
+    let back = serde_json::to_value(&spec).unwrap();
+    for (k, v) in new.as_object().unwrap() {
+        assert_eq!(&back[k], v, "{k}");
+    }
+    for bad in [json!({"seq": 777}), json!({"batch": 3}), json!({"checkpointing": "maybe"}), json!({"optimizer": "sgd"}), json!({"kl_chunk": 8}), json!({"k": 500}), json!({"teacher_load": "2bit"}), json!({"method": "full"}), json!({"per_update": 0})] {
+        let mut v = json!({"tokens_m": 20});
+        v.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let s: rruns::HealSpec = serde_json::from_value(v).unwrap();
+        assert!(s.validate().unwrap_err().0.contains("out of range"), "{bad}");
+    }
+}
+
+#[test]
+fn the_choice_fills_the_gaps_with_the_automatic_settings() {
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    let c = rruns::heal_choice(&serde_json::from_value(json!({"tokens_m": 20})).unwrap(), 16.0, Some(32.0), &d);
+    assert_eq!((c.knobs.seq, c.knobs.batch, c.knobs.grad_accum, c.knobs.rank, c.knobs.kl_chunk, c.knobs.qlora, c.knobs.checkpointing, c.optimizer.as_str(), c.k, c.warmup), (1024, 2, 16, 32, 128, true, true, "adamw_8bit", 32, 30));
+    let c = rruns::heal_choice(&serde_json::from_value(json!({"tokens_m": 20, "batch": 4, "per_update": 10, "checkpointing": "off", "method": "lora", "rank": 8})).unwrap(), 16.0, Some(32.0), &d);
+    assert_eq!((c.knobs.batch, c.knobs.grad_accum, c.knobs.checkpointing, c.knobs.qlora, c.knobs.rank), (4, 3, false, false, 8), "10 sequences per update at 4 per step: 3 steps added up (12)");
+    let c = rruns::heal_choice(&serde_json::from_value(json!({"tokens_m": 20, "batch": 1})).unwrap(), 3.0, Some(32.0), &HealDims::guess(3.0));
+    assert_eq!((c.knobs.batch, c.knobs.grad_accum, c.knobs.seq, c.knobs.rank), (1, 32, 2048, 64), "the 32 sequences per update stay");
 }
 
 #[cfg(unix)]

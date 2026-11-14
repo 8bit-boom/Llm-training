@@ -565,12 +565,167 @@ pub fn default_heal_tokens_m(student_b: f64) -> u32 {
     if student_b >= 15.0 { 20 } else { 40 }
 }
 
+// ---- the memory of healing (the student's training step)
+
+/// What the memory estimate needs to know about the student: the number of layers, the width and the vocabulary (the output layer is huge for Qwen3.5: 248,320 entries).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct HealDims {
+    pub layers: u32,
+    pub hidden: u32,
+    pub vocab: u32,
+}
+
+impl HealDims {
+    /// Without a config file: width from the size (hidden about 1024 x sqrt(billions)), 32 + b/2 layers, 150,000 tokens of vocabulary.
+    pub fn guess(student_b: f64) -> Self {
+        HealDims { layers: ((32.0 + student_b / 2.0).round() as u32).clamp(24, 64), hidden: ((1024.0 * student_b.max(0.1).sqrt() / 64.0).round() as u32 * 64).max(512), vocab: 150_000 }
+    }
+
+    /// From a model's config.json (the language part of a multimodal config is `text_config`); gaps are filled by `guess`.
+    pub fn from_config(cfg: &serde_json::Value, student_b: f64) -> Self {
+        let c = if cfg["text_config"].is_object() { &cfg["text_config"] } else { cfg };
+        let g = Self::guess(student_b);
+        let n = |k: &str, d: u32| c[k].as_u64().filter(|v| *v > 0).map(|v| v as u32).unwrap_or(d);
+        HealDims { layers: n("num_hidden_layers", g.layers), hidden: n("hidden_size", g.hidden), vocab: n("vocab_size", g.vocab) }
+    }
+}
+
+/// The settings of the student's training step that decide its memory. Shared with the job (`HealSpec` fills the gaps, see `heal_defaults`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealKnobs {
+    pub seq: u32,
+    pub batch: u32,
+    pub grad_accum: u32,
+    pub checkpointing: bool,
+    pub rank: u32,
+    pub kl_chunk: u32,
+    pub qlora: bool,
+}
+
+/// The activations kept for the backward pass in GB. Per token and layer about 34 x hidden bytes without checkpointing (bf16; Korthikanti et al. for attention
+/// that does not keep its score matrix, MLP of 3 x hidden); with checkpointing each layer's input (2 x hidden bytes) plus one layer being made again (34 x hidden).
+/// The same rule as `healmem.activation_gb` in the worker; both are tested against worker/tests/data/heal_cases.json.
+pub fn heal_activation_gb(layers: u32, hidden: u32, seq: u32, batch: u32, checkpointing: bool) -> f64 {
+    let tokens = seq.max(1) as f64 * batch.max(1) as f64;
+    let (l, h) = (layers as f64, hidden as f64);
+    let per_token = if checkpointing { 2.0 * l * h + 34.0 * h } else { 34.0 * l * h };
+    per_token * tokens / 1e9
+}
+
+/// Where the estimate comes from, GB each.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HealMemory {
+    pub weights_gb: f64,
+    pub lora_gb: f64,
+    pub activations_gb: f64,
+    pub kl_gb: f64,
+    pub overhead_gb: f64,
+    pub total_gb: f64,
+}
+
+/// Estimate of the graphics memory of the student's training step: weights + LoRA and optimizer + activations + the KL chunk + the card's own overhead, plus 10 %.
+/// An ESTIMATE, not a measurement (docs/HEAL_SETTINGS.md, "Not verified yet"). The arithmetic, with E = vocab x hidden (the embedding and the output layer; both
+/// are counted, a model with tied weights needs less):
+/// * weights, LoRA 16-bit: 2 bytes per parameter. QLoRA: the layers are 4-bit (0.55 bytes per parameter with the scales), but PEFT's kbit preparation turns
+///   the embedding and the output layer (2 E parameters) into 32-bit floats: 4 bytes each. That is why a 16 B student with a 248 k vocabulary needs ~16 GB, not ~9.
+/// * LoRA: rank x layers x 20 x hidden parameters (attention 8 x hidden + MLP 12 x hidden of input+output widths) at 16 bytes (32-bit weight, gradient, two Adam states;
+///   the 8-bit optimizer needs less, so this is on the safe side).
+/// * activations: `heal_activation_gb` for batch x seq tokens.
+/// * KL chunk: kl_chunk x vocab x 4 bytes x 4 (logits, log-softmax, their gradient, the recomputation).
+/// * overhead: 1 GB for the driver's context and the allocator; then x 1.10 for fragmentation and what is not counted.
+pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
+    let params = student_b * 1e9;
+    let ends = 2.0 * d.vocab as f64 * d.hidden as f64;
+    let body = (params - ends).max(0.0);
+    let weights = if k.qlora { body * 0.55 + ends * 4.0 } else { params * 2.0 } / 1e9;
+    let lora = k.rank as f64 * d.layers as f64 * 20.0 * d.hidden as f64 * 16.0 / 1e9;
+    let act = heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, k.checkpointing);
+    let kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
+    let overhead = 1.0;
+    let total = (weights + lora + act + kl + overhead) * 1.10;
+    let r = |x: f64| (x * 100.0).round() / 100.0;
+    HealMemory { weights_gb: r(weights), lora_gb: r(lora), activations_gb: r(act), kl_gb: r(kl), overhead_gb: overhead, total_gb: r(total) }
+}
+
+/// `heal_memory(..).total_gb`
+pub fn heal_memory_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
+    heal_memory(student_b, d, k).total_gb
+}
+
+/// "fits" (up to 85 % of the card), "tight" (up to 100 %), "over" (more than the card has); "unknown" without a known card.
+pub fn heal_verdict(est_gb: f64, vram_gb: Option<f64>) -> &'static str {
+    match vram_gb {
+        None => "unknown",
+        Some(v) if est_gb <= v * 0.85 => "fits",
+        Some(v) if est_gb <= v => "tight",
+        Some(_) => "over",
+    }
+}
+
+/// The verdict in plain words, for the page.
+pub fn heal_verdict_text(est_gb: f64, vram_gb: Option<f64>) -> String {
+    match (heal_verdict(est_gb, vram_gb), vram_gb) {
+        ("fits", Some(v)) => format!("Fits: about {est_gb:.0} GB of the {v:.0} GB of this card (an estimate)."),
+        ("tight", Some(v)) => format!("Tight: about {est_gb:.0} GB of the {v:.0} GB of this card (an estimate). It may run out of memory; the program then tries again with safer settings."),
+        ("over", Some(v)) => format!("Will probably run out of memory: about {est_gb:.0} GB needed, this card has {v:.0} GB (an estimate). Use a shorter sequence length, a smaller batch, gradient checkpointing or QLoRA."),
+        _ => format!("About {est_gb:.0} GB of graphics memory (an estimate; this card's memory is not known)."),
+    }
+}
+
+/// The automatic settings (owner decisions): students of 15 B or more train as QLoRA at sequence length 1024, rank 32, batch 2 (1 from 25 B), KL chunk 128; smaller
+/// ones at 2048 / 64 / 4 / 256. 32 sequences per update. Gradient checkpointing is always on from 8 B; below that it is on when the activations without it would
+/// take more than 60 % of the memory left after the weights. A student whose 16-bit weights would not fit the card is trained as QLoRA whatever its size.
+pub fn heal_defaults(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> HealKnobs {
+    let big = student_b >= 15.0;
+    let batch = if student_b >= 25.0 { 1 } else if big { 2 } else { 4 };
+    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big };
+    if !big && vram_gb.is_some_and(|v| heal_memory_gb(student_b, d, &HealKnobs { qlora: false, ..k.clone() }) > v * 0.85) {
+        k.qlora = true;
+    }
+    k.checkpointing = heal_checkpointing_auto(student_b, d, &k, vram_gb);
+    k
+}
+
+/// Gradient checkpointing "auto" for these settings (see `heal_defaults`). Unknown card: on.
+pub fn heal_checkpointing_auto(student_b: f64, d: &HealDims, k: &HealKnobs, vram_gb: Option<f64>) -> bool {
+    let Some(v) = vram_gb else { return true };
+    if student_b >= 8.0 {
+        return true;
+    }
+    let weights = heal_memory(student_b, d, &HealKnobs { checkpointing: true, ..k.clone() }).weights_gb;
+    heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, false) > 0.6 * (v - weights).max(0.0)
+}
+
+/// The next safer setting that keeps the maths (same rules as `healmem.next_safer` in the worker, tested against the same cases): 1. gradient checkpointing on;
+/// 2. half the batch per step with twice the accumulation (the sequences per update stay); 3. half the KL chunk, down to 64. Returns the new settings and a short
+/// label, or None when the ladder is used up. Changes that alter the maths (sequence length, rank) are never made here.
+pub fn heal_next_safer(k: &HealKnobs) -> Option<(HealKnobs, String)> {
+    let mut s = k.clone();
+    if !s.checkpointing {
+        s.checkpointing = true;
+        return Some((s, "gradient checkpointing".to_string()));
+    }
+    if s.batch > 1 {
+        let new = if s.batch % 2 == 0 { s.batch / 2 } else { 1 };
+        s.grad_accum = s.grad_accum * s.batch / new;
+        s.batch = new;
+        let label = format!("a smaller batch ({} per step, {} steps added up)", s.batch, s.grad_accum);
+        return Some((s, label));
+    }
+    if s.kl_chunk > 64 {
+        s.kl_chunk = (s.kl_chunk / 2).max(64);
+        let label = format!("a smaller KL chunk ({})", s.kl_chunk);
+        return Some((s, label));
+    }
+    None
+}
+
 /// How healing runs on this card.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HealPlan {
     /// "online": the teacher answers while the student learns; "cache": the teacher answers everything first, then the student learns
     pub mode: &'static str,
-    /// "qlora" (students of 15 B or more) or "lora"
+    /// "qlora" (students of 15 B or more, or when 16-bit does not fit) or "lora"
     pub student_method: &'static str,
     pub teacher_load: &'static str,
     /// the memory the heavier of the two steps needs
@@ -581,21 +736,38 @@ pub struct HealPlan {
     pub cache_gb_per_10m: f64,
     /// estimated hours per 10 M tokens, (low, high); an estimate until the benchmark has measured this card
     pub hours_per_10m: (f64, f64),
+    /// the student's training step alone, and where it comes from
+    pub student_gb: f64,
+    pub breakdown: HealMemory,
+    /// "fits" | "tight" | "over" | "unknown", and the sentence for the page
+    pub verdict: &'static str,
+    pub verdict_text: String,
+    /// the settings the estimate was made for
+    pub knobs: HealKnobs,
 }
 
-/// Memory for the teacher (4-bit) and the student (LoRA or QLoRA) and the way of healing that fits `vram_gb`: both at once when they fit together, else
-/// one after the other (the teacher's answers go to disk first). Without a known card: cache mode (it needs the least memory).
+/// `heal_plan_with` at the automatic settings and the sizes guessed from the parameter count.
 pub fn heal_plan(student_b: f64, teacher_b: f64, vram_gb: Option<f64>) -> HealPlan {
-    let (lora, qlora) = estimate_vram(student_b);
-    let (method, student_gb): (&'static str, f64) = if student_b >= 15.0 { ("qlora", qlora) } else { ("lora", lora) };
+    let d = HealDims::guess(student_b);
+    heal_plan_with(student_b, teacher_b, vram_gb, &d, &heal_defaults(student_b, vram_gb, &d))
+}
+
+/// Memory for the teacher (4-bit) and the student (`k`: its settings, LoRA or QLoRA) and the way of healing that fits `vram_gb`: both at once when they fit
+/// together, else one after the other (the teacher's answers go to disk first). Without a known card: cache mode (it needs the least memory).
+/// `fits` is false only when the estimate is more than the card has ("over"); "tight" still starts, and an out-of-memory error is then handled by the worker.
+pub fn heal_plan_with(student_b: f64, teacher_b: f64, vram_gb: Option<f64>, d: &HealDims, k: &HealKnobs) -> HealPlan {
+    let breakdown = heal_memory(student_b, d, k);
+    let student_gb = breakdown.total_gb;
+    let method: &'static str = if k.qlora { "qlora" } else { "lora" };
     let teacher_4bit = (teacher_b * 0.6 * 10.0).round() / 10.0;
     let online_gb = teacher_4bit + student_gb + 4.0;
-    let cache_gb = teacher_4bit.max(student_gb) + 2.0;
+    let cache_gb = (teacher_4bit + 2.0).max(student_gb);
     let online = vram_gb.is_some_and(|v| online_gb <= v);
     let est = if online { online_gb } else { cache_gb };
-    let fits = vram_gb.is_none_or(|v| est <= v);
+    let verdict = heal_verdict(est, vram_gb);
+    let fits = verdict != "over";
     let why = match (fits, vram_gb) {
-        (false, Some(v)) => Some(format!("Healing a model of {student_b:.0} B parameters needs about {est:.0} GB with the teacher's answers saved first; this card has {v:.0} GB. Choose a smaller model or heal on a bigger card.")),
+        (false, Some(v)) => Some(format!("Healing a model of {student_b:.0} B parameters needs about {est:.0} GB with the teacher's answers saved first and these settings (an estimate); this card has {v:.0} GB. Choose a smaller model or heal on a bigger card; in the healing settings (Expert) a shorter sequence length, a smaller batch or QLoRA may also make it fit.")),
         _ => None,
     };
     // tokens per second: the teacher reads 2,000 to 4,000 / s at 27 B, the student learns 800 to 1,500 / s at 21 B; both scale with the size
@@ -606,5 +778,6 @@ pub fn heal_plan(student_b: f64, teacher_b: f64, vram_gb: Option<f64>) -> HealPl
     HealPlan {
         mode: if online { "online" } else { "cache" }, student_method: method, teacher_load: if online { "4bit" } else { "auto" }, est_gb: (est * 10.0).round() / 10.0, fits, why,
         cache_gb_per_10m: 10e6 * 196.0 / 1e9, hours_per_10m: ((per.0 * 10.0).round() / 10.0, (per.1 * 10.0).round() / 10.0),
+        student_gb, breakdown, verdict, verdict_text: heal_verdict_text(est, vram_gb), knobs: k.clone(),
     }
 }
