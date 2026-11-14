@@ -233,6 +233,10 @@ Each is the smallest change that made something work or kept something honest.
 14. **Existing tests were extended, not weakened** where the new fields demanded it: the inspect and result key sets (`INSPECT_KEYS`, `RESULT_KEYS`) have the new keys, the Rust `inspect()` helper uses
     `..Default::default()`, `fake_worker` takes the inspect answer as a parameter, `stfile.BYTES` knows `I64`.
 
+## Try before cutting (version 3)
+
+A "Try first" card on the page finds out what a cut will cost before any model folder is written (job `reshape_try`: the loss of the original, of every block skipped on its own, of every run of blocks, of every width, of a chosen combination, on the project's calibration text, with the cut imitated by hooks; kept in `reshape_try.json` next to the measurements). Everything about it, including the colour bands, the deviations and its own "not verified yet" list, is in `docs/TRY_FIRST.md`. The predicted loss equals the calibration loss of the folder the `reshape` job writes, on a tiny model (`worker/tests/test_reshape_try_torch.py`); nothing is known yet about how it relates to the quality after healing.
+
 ## Not verified yet (needs a GPU run)
 
 Everything below is **implemented as the plan says and has not been seen working**. None of it should be described as working.
