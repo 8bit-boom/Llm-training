@@ -600,6 +600,10 @@ pub struct HealKnobs {
     pub rank: u32,
     pub kl_chunk: u32,
     pub qlora: bool,
+    /// QLoRA only: PEFT's 32-bit copy of the embedding and the output layer (the old behaviour). Off = they stay in 16-bit. Student-side numerics only: it is not in
+    /// the training key and not in the teacher's cache key, so changing it keeps both. Older saved settings have none: off.
+    #[serde(default)]
+    pub upcast: bool,
 }
 
 /// The activations kept for the backward pass in GB. Per token and layer about 34 x hidden bytes without checkpointing (bf16; Korthikanti et al. for attention
@@ -626,8 +630,9 @@ pub struct HealMemory {
 /// Estimate of the graphics memory of the student's training step: weights + LoRA and optimizer + activations + the KL chunk + the card's own overhead, plus 10 %.
 /// An ESTIMATE, not a measurement (docs/HEAL_SETTINGS.md, "Not verified yet"). The arithmetic, with E = vocab x hidden (the embedding and the output layer; both
 /// are counted, a model with tied weights needs less):
-/// * weights, LoRA 16-bit: 2 bytes per parameter. QLoRA: the layers are 4-bit (0.55 bytes per parameter with the scales), but PEFT's kbit preparation turns
-///   the embedding and the output layer (2 E parameters) into 32-bit floats: 4 bytes each. That is why a 16 B student with a 248 k vocabulary needs ~16 GB, not ~9.
+/// * weights, LoRA 16-bit: 2 bytes per parameter. QLoRA: the layers are 4-bit (0.55 bytes per parameter with the scales); the embedding and the output layer
+///   (2 E parameters) are not quantized: 2 bytes each (16-bit, the default for healing), or 4 bytes each with `upcast` (PEFT's kbit preparation turns them into
+///   32-bit floats: the old behaviour). `upcast` costs 2 E x 2 bytes more: ~4 GB at hidden size 4096, ~5 GB at 5120 (both tables counted, as if untied).
 /// * LoRA: rank x layers x 20 x hidden parameters (attention 8 x hidden + MLP 12 x hidden of input+output widths) at 16 bytes (32-bit weight, gradient, two Adam states;
 ///   the 8-bit optimizer needs less, so this is on the safe side).
 /// * activations: `heal_activation_gb` for batch x seq tokens.
@@ -637,7 +642,7 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
     let params = student_b * 1e9;
     let ends = 2.0 * d.vocab as f64 * d.hidden as f64;
     let body = (params - ends).max(0.0);
-    let weights = if k.qlora { body * 0.55 + ends * 4.0 } else { params * 2.0 } / 1e9;
+    let weights = if k.qlora { body * 0.55 + ends * if k.upcast { 4.0 } else { 2.0 } } else { params * 2.0 } / 1e9;
     let lora = k.rank as f64 * d.layers as f64 * 20.0 * d.hidden as f64 * 16.0 / 1e9;
     let act = heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, k.checkpointing);
     let kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
@@ -650,6 +655,13 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
 /// `heal_memory(..).total_gb`
 pub fn heal_memory_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
     heal_memory(student_b, d, k).total_gb
+}
+
+/// The graphics memory (GB, with the estimate's 10 % margin) that the 32-bit copy of the embedding and the output layer costs on top of the 16-bit tables in QLoRA,
+/// for these sizes: what the Heal card's checkbox says. The same difference as `heal_memory_gb` with `upcast` on and off.
+pub fn heal_upcast_extra_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
+    let q = |upcast: bool| heal_memory_gb(student_b, d, &HealKnobs { qlora: true, upcast, ..k.clone() });
+    ((q(true) - q(false)) * 10.0).round() / 10.0
 }
 
 /// "fits" (up to 85 % of the card), "tight" (up to 100 %), "over" (more than the card has); "unknown" without a known card.
@@ -678,7 +690,7 @@ pub fn heal_verdict_text(est_gb: f64, vram_gb: Option<f64>) -> String {
 pub fn heal_defaults(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> HealKnobs {
     let big = student_b >= 15.0;
     let batch = if student_b >= 25.0 { 1 } else if big { 2 } else { 4 };
-    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big };
+    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false };
     if !big && vram_gb.is_some_and(|v| heal_memory_gb(student_b, d, &HealKnobs { qlora: false, ..k.clone() }) > v * 0.85) {
         k.qlora = true;
     }
@@ -696,11 +708,16 @@ pub fn heal_checkpointing_auto(student_b: f64, d: &HealDims, k: &HealKnobs, vram
     heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, false) > 0.6 * (v - weights).max(0.0)
 }
 
-/// The next safer setting that keeps the maths (same rules as `healmem.next_safer` in the worker, tested against the same cases): 1. gradient checkpointing on;
+/// The next safer setting that keeps the maths (same rules as `healmem.next_safer` in the worker, tested against the same cases): 0. only when it is on: the 32-bit
+/// copy of the embedding and the output layer off (frozen weights, so the maths hardly changes; the checkpoint resumes); 1. gradient checkpointing on;
 /// 2. half the batch per step with twice the accumulation (the sequences per update stay); 3. half the KL chunk, down to 64. Returns the new settings and a short
 /// label, or None when the ladder is used up. Changes that alter the maths (sequence length, rank) are never made here.
 pub fn heal_next_safer(k: &HealKnobs) -> Option<(HealKnobs, String)> {
     let mut s = k.clone();
+    if s.upcast {
+        s.upcast = false;
+        return Some((s, "the 32-bit embedding copy turned off".to_string()));
+    }
     if !s.checkpointing {
         s.checkpointing = true;
         return Some((s, "gradient checkpointing".to_string()));
