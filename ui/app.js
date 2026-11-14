@@ -997,6 +997,7 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
+  hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
@@ -1140,7 +1141,7 @@ async function rsHealEstimate() {
   if (!name) return;
   const key = JSON.stringify(rsHealSpec());
   try {
-    const est = await invoke("heal_estimate", { name, spec: rsHealSpec() });
+    const est = rs.hl.pair ? await invoke("heal_pair_estimate", { student: rs.hl.pair.student, teacher: rs.hl.pair.teacher, spec: rsHealSpec() }) : await invoke("heal_estimate", { name, spec: rsHealSpec() });
     if (est && rs.hl && rs.hl.name === name) { rs.hlEst = { name, key, est }; render(); }
   } catch (e) { /* the page keeps the estimate it has */ }
 }
@@ -1179,12 +1180,17 @@ function healSettings(sp, kn, plan, busy, upcastGb) {
 }
 
 // "Heal it": the original teaches the thinner model to answer like it did
-function healCard(m) {
+// `pair`: a model from elsewhere (or another original for a made one), chosen in the Heal section: the same card, bound to the pair
+function healCard(m, pair) {
   const sm = m.summary;
   if (!sm || sm.mode !== "prune") return "";
+  if (!pair && rs.hl && rs.hl.pair) return `<div class="card-in"><h3>Heal it</h3><p class="dim">${rs.hl.name === m.name ? "Another original is chosen in the <strong>Heal a model</strong> section above: the settings are there." : "The Heal settings are in the <strong>Heal a model</strong> section above (another model is chosen there). Choose this model there to heal it."}</p></div>`;
   const h = rs.hl && rs.hl.name === m.name ? rs.hl.opts : null, run = rs.hlRun;
   const wide = sm.shape === "width" || sm.shape === "both";
-  const head = `<h3>Heal it ${wide ? "(recommended)" : "(optional)"}</h3>`;
+  const head = pair ? `<h3>Heal this model</h3>` : `<h3>Heal it ${wide ? "(recommended)" : "(optional)"}</h3>`;
+  const thin = pair ? "the model" : "the thinner model";
+  if (m.healed && pair) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3.The original's saved answers stay until you delete this heal.</p>
+    <div class="row">${m.healed_model_id ? `<button class="primary" data-rstrain="${esc(m.healed_model_id)}">Train the healed model on your world (Step 3)</button>` : ""}</div></div>`;
   if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
   if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
   const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, st = (h.heal && h.heal.status) || null;
@@ -1195,12 +1201,12 @@ function healCard(m) {
   const blocked = sp.general ? gcBlocked("heal") : "";
   const verdictP = plan.verdict_text ? `<p class="${plan.verdict === "over" ? "err" : plan.verdict === "tight" ? "warn" : "dim"} small" id="hl-verdict">${esc(plan.verdict_text)}${plan.breakdown ? ` <span class="dim">Weights ${plan.breakdown.weights_gb} GB, LoRA and optimizer ${plan.breakdown.lora_gb} GB, activations ${plan.breakdown.activations_gb} GB, loss ${plan.breakdown.kl_gb} GB, the rest ${(plan.breakdown.overhead_gb + (plan.breakdown.total_gb - plan.breakdown.weights_gb - plan.breakdown.lora_gb - plan.breakdown.activations_gb - plan.breakdown.kl_gb - plan.breakdown.overhead_gb)).toFixed(1)} GB.</span>` : ""}</p>` : "";
   const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>${verdictP}`
-    : `<p class="dim small">${plan.mode === "online" ? "The original and the thinner model run at the same time" : "The original answers first and saves its answers to disk, then the thinner model learns (they take turns)"}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. The thinner model is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>${verdictP}`;
+    : `<p class="dim small">${plan.mode === "online" ? `The original and ${thin} run at the same time` : `The original answers first and saves its answers to disk, then ${thin} learns (they take turns)`}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. ${pair ? "The model" : "The thinner model"} is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>${verdictP}`;
   const busy = rs.running || rs.testing || (run && run.running);
   const prog = run && run.running ? `<div class="stepline">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
   const series = healSeries();
-  const charts = lineChart(series.kd, "How far the thinner model's answers are from the original's (KL)", true) + lineChart(series.cal, "Text-prediction error on your data", true);
-  const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : "";
+  const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true);
+  const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : pair ? `<p class="dim small">Nothing is recorded about how well this model answered before. The error on your data is measured at the start of healing and shown in the chart.</p>` : "";
   const used = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
   const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
   const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
@@ -1211,7 +1217,8 @@ function healCard(m) {
     ? `<p>The next safer setting that keeps what the model learns: <strong>${esc(h.safer.label)}</strong>. <button class="primary" id="hl-safer">Try again with safer settings</button></p>`
     : `<p class="warn">The automatic steps are used up. Next, in this order: a shorter sequence length, QLoRA, a lower LoRA size (Expert: Healing settings), a smaller model.</p>`}</div>` : "";
   return `<div class="card-in">${head}
-    <p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>
+    ${pair ? `<p>The original model teaches the model you chose to answer like it does, on your world's text and on general text. This brings back what cutting the model down took away. Your world's facts are still taught afterwards, in Step 3. The healed copy is a new folder inside this project; the model you chose is only read, never changed.</p>${h.name == null && rs.hs.check && rs.hs.check.download_gb ? `<p class="warn small">Starting downloads about ${rs.hs.check.download_gb} GB from Hugging Face first (into the Hugging Face cache on this computer).</p>` : ""}`
+      : `<p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>`}
     <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
     ${sp.general ? gcHtml("heal") : ""}
     <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
@@ -1223,10 +1230,137 @@ function healCard(m) {
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
-    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
-    ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
     ${prog}${charts}</div>`;
+}
+
+
+// ------------------------------------------------------------------------------------------ Heal a model (any model, docs/HEAL_ANY_MODEL.md)
+// Two pickers (the model to heal and its original), a Check in plain words, then the same Heal card as above, bound to the pair. A made model with its recorded original
+// keeps the card of its result (same code, same state `rs.hl`); every other pair is healed from here.
+function hsMade() { return rs.state ? rs.state.made.filter((m) => m.status === "done" && m.summary && m.summary.mode === "prune") : []; }
+function hsPick() { const m = hsMade()[0]; return rs.hs.studentPick || (m ? "made:" + m.name : ""); }
+function hsEntry(pick) {
+  const c = rs.hs.cand; if (!c) return null;
+  const id = pick.slice(pick.indexOf(":") + 1), list = pick.startsWith("mine:") ? c.models.mine : c.models.builtin;
+  return (list || []).find((e) => e.id === id) || null;
+}
+function hsRun(pick) { const c = rs.hs.cand; return pick.startsWith("run:") && c ? (c.runs || []).find((r) => r.name === pick.slice(4)) || null : null; }
+function hsStudent() {
+  const h = rs.hs, pick = hsPick();
+  if (pick.startsWith("made:")) return { kind: "made", name: pick.slice(5) };
+  if (pick.startsWith("mine:") || pick.startsWith("built:")) { const e = hsEntry(pick); return e ? e.source : null; }
+  if (pick.startsWith("run:")) { const r = hsRun(pick); return r ? r.student : null; }
+  if (pick === "folder") return h.studentFolder.trim() ? { kind: "folder", path: h.studentFolder.trim() } : null;
+  if (pick === "hub") return h.studentHub.trim() ? { kind: "hub", id: h.studentHub.trim() } : null;
+  return null;
+}
+// null = the recorded original of a made model
+function hsTeacher() {
+  const h = rs.hs, pick = h.teacherPick, sp = hsPick();
+  if (sp.startsWith("run:")) { const r = hsRun(sp); return r ? r.teacher : null; }
+  if (pick === "guess") return h.guess ? { kind: "hub", id: h.guess.repo } : null;
+  if (pick.startsWith("mine:") || pick.startsWith("built:")) { const e = hsEntry(pick); return e ? e.source : null; }
+  if (pick === "folder") return h.teacherFolder.trim() ? { kind: "folder", path: h.teacherFolder.trim() } : null;
+  if (pick === "hub") return h.teacherHub.trim() ? { kind: "hub", id: h.teacherHub.trim() } : null;
+  return null;
+}
+const hsKey = () => JSON.stringify([hsStudent(), hsTeacher()]);
+// a made model with its own recorded original: healed from the result card, as before
+function hsCardMode() { const s = hsStudent(); return !!s && s.kind === "made" && !hsTeacher(); }
+function hsPassed() { const h = rs.hs; return !!(h.check && h.check.ok && h.checkKey === hsKey()); }
+
+async function hsLoadCand() {
+  try { rs.hs.cand = await invoke("heal_candidates"); } catch (_) { rs.hs.cand = null; }
+  if (page === "reshape") render();
+}
+// the choice changed: the Check no longer belongs to it, and the card that was bound to the old pair goes
+function hsChanged() {
+  const h = rs.hs;
+  h.check = null; h.checkKey = null; h.err = null;
+  if (rs.hl && rs.hl.pair) rs.hl = null;
+  const s = hsStudent(); if (s && s.kind === "made") rs.view = s.name;
+  rsAfterState(); render();
+}
+async function hsCheck(refresh) {
+  const h = rs.hs, st = hsStudent(), te = hsTeacher();
+  if (!st) { h.err = "Choose the model to heal first."; render(); return; }
+  const key = hsKey();
+  h.checking = true; h.err = null; render();
+  try {
+    if (hsCardMode()) { h.check = await invoke("heal_check", { student: st, teacher: null, refresh }); h.checkKey = key; }
+    else {
+      const r = await invoke("heal_pair", { student: st, teacher: te, refresh });
+      if (key !== hsKey()) { h.checking = false; return; }
+      h.check = r ? r.check : null; h.checkKey = key;
+      rs.hl = r && r.options ? { name: r.options.name || (st.kind === "made" ? st.name : "@pair"), opts: r.options, pair: { student: st, teacher: te } } : null;
+      if (rs.hl) rsHealEstimate();
+    }
+    if (h.check && h.check.teacher_guess) h.guess = h.check.teacher_guess;
+  } catch (e) { h.err = String(e); h.check = null; }
+  h.checking = false; render();
+}
+// after a heal: the folder, the healed model and the charts come from the core again
+async function hsReloadPair() {
+  const pr = rs.hl && rs.hl.pair; if (!pr) return;
+  try {
+    const r = await invoke("heal_pair", { student: pr.student, teacher: pr.teacher, refresh: false });
+    if (r && r.options && rs.hl && rs.hl.pair) { rs.hl = { name: r.options.name || "@pair", opts: r.options, pair: pr }; rsHealEstimate(); }
+  } catch (_) { if (rs.hl) rs.hl.stale = false; }
+  hsLoadCand();
+}
+
+function hsChecks(c) {
+  const icon = { ok: "✓", warn: "⚠", refuse: "✗", note: "•" }, cls = { ok: "hs-ok", warn: "hs-warn", refuse: "hs-no", note: "hs-note" };
+  return `<ul class="hs-check" id="hs-check-list">${c.items.map((i) => `<li class="${cls[i.level] || "hs-note"}"><span class="hs-ic">${icon[i.level] || "•"}</span> ${esc(i.text)}</li>`).join("")}</ul>
+    <p class="${c.ok ? "ok" : "err"}" id="hs-verdict">${c.ok ? "These two models can be used for healing." : "These two models cannot be used for healing as chosen."}</p>`;
+}
+
+function healSection() {
+  const h = rs.hs, st = rs.state, c = h.cand, made = hsMade();
+  const busy = !!(rs.running || rs.testing || (rs.hlRun && rs.hlRun.running));
+  const pick = hsPick(), opt = (v, t, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(t)}</option>`;
+  const grp = (label, items) => items.length ? `<optgroup label="${esc(label)}">${items.join("")}</optgroup>` : "";
+  const mine = (c && c.models.mine) || [], built = (c && c.models.builtin) || [], runs = (c && c.runs) || [];
+  const dis = busy || h.checking ? "disabled" : "";
+  const sOpts = (pick ? "" : opt("", "Choose a model…", "")) + grp("Made by this program", made.map((m) => opt("made:" + m.name, m.name + (m.healed ? " (healed)" : ""), pick)))
+    + grp("My models", mine.map((e) => opt("mine:" + e.id, e.name, pick))) + grp("Earlier heals of other models", runs.map((r) => opt("run:" + r.name, `${r.student_name} (taught by ${r.teacher_name})${r.healed ? " - healed" : ""}`, pick)))
+    + grp("Models that come with the program", built.map((e) => opt("built:" + e.id, e.name, pick)))
+    + `<optgroup label="Somewhere else">${opt("folder", "A folder on this computer…", pick)}${opt("hub", "A Hugging Face model…", pick)}</optgroup>`;
+  const st0 = hsStudent(), isRun = pick.startsWith("run:");
+  const sMore = pick === "folder" ? `<div class="row"><input type="text" id="hs-sfolder" value="${esc(h.studentFolder)}" placeholder="The model's own folder: it holds config.json and the .safetensors files" style="flex:1" ${dis}> <button class="secondary" id="hs-sbrowse" ${dis}>Browse…</button></div>`
+    : pick === "hub" ? `<div class="row"><input type="text" id="hs-shub" value="${esc(h.studentHub)}" placeholder="owner/model, for example Qwen/Qwen3-8B" style="flex:1" ${dis}></div>` : "";
+  const builtinWarn = pick.startsWith("built:") ? `<p class="hs-warn small">This model ships with the program and has not been changed. Healing it is pointless unless it was cut down or changed first.</p>` : "";
+  const madeStudent = st0 && st0.kind === "made";
+  const guess = h.guess && !isRun ? opt("guess", `${h.guess.repo} (a guess: ${h.guess.from})`, h.teacherPick) : "";
+  const tOpts = opt("", madeStudent ? "The model it was made from (recorded)" : "Choose the original…", h.teacherPick) + guess
+    + grp("My models", mine.map((e) => opt("mine:" + e.id, e.name, h.teacherPick))) + grp("Models that come with the program", built.map((e) => opt("built:" + e.id, e.name, h.teacherPick)))
+    + `<optgroup label="Somewhere else">${opt("folder", "A folder on this computer…", h.teacherPick)}${opt("hub", "A Hugging Face model…", h.teacherPick)}</optgroup>`;
+  const tMore = h.teacherPick === "folder" ? `<div class="row"><input type="text" id="hs-tfolder" value="${esc(h.teacherFolder)}" placeholder="The original's folder" style="flex:1" ${dis}> <button class="secondary" id="hs-tbrowse" ${dis}>Browse…</button></div>`
+    : h.teacherPick === "hub" ? `<div class="row"><input type="text" id="hs-thub" value="${esc(h.teacherHub)}" placeholder="owner/model" style="flex:1" ${dis}></div>` : "";
+  const guessNote = h.guess && !isRun && !h.teacherPick && !madeStudent ? `<p class="dim small">The model card of the model to heal names <strong>${esc(h.guess.repo)}</strong> as its base (${esc(h.guess.from)}). That is a guess: pick it in the list only if it is the model it was really made from.</p>` : "";
+  const tHtml = isRun ? `<p class="dim small">The original of this heal: <strong>${esc((hsRun(pick) || {}).teacher_name || "")}</strong>.</p>`
+    : `<label>Original model (the teacher) <select id="hs-teacher" ${dis}>${tOpts}</select></label>${tMore}${guessNote}`;
+  const checking = h.checking ? `<p class="dim" id="hs-checking">Checking the two models (their files are read; nothing is loaded or downloaded)…</p>` : "";
+  const list = h.check && h.checkKey === hsKey() ? hsChecks(h.check) : "";
+  const err = h.err ? `<div class="err">${esc(h.err)}</div>` : "";
+  let body = "";
+  if (hsCardMode() && st0 && made.some((m) => m.name === st0.name)) body = `<p class="dim small" id="hs-cardnote">The settings, the estimate and the Start button for this model are in its result card below (<strong>Heal it</strong>). Pick another original above to teach it from a different model.</p>`;
+  else if (rs.hl && rs.hl.pair && rs.hl.opts) {
+    const o = rs.hl.opts;
+    body = healCard({ name: rs.hl.name, healed: !!o.healed, healed_model_id: (o.heal && o.heal.result && o.heal.result.model_id) || null, healed_size_gb: null, cache_gb: null, summary: { mode: "prune", shape: "width" } }, true);
+  }
+  const del = isRun ? `<div class="row"><button class="link" id="hs-delrun" data-name="${esc(pick.slice(4))}" ${busy ? "disabled" : ""}>Delete this heal and its files</button></div>` : "";
+  const noEnv = !st.env_ready ? `<p class="warn small">The training software is not installed yet (Training setup): the check needs it.</p>` : "";
+  return `<div class="card wide" id="hs-section"><h2>Heal a model</h2>
+    <p>Teach a smaller or cut-down model to answer like the original it came from. It works for the models made on this page <strong>and for any other</strong>: a pruned model downloaded from Hugging Face, or one made with another tool. Nothing is written until you press Start.</p>
+    <label>Model to heal <select id="hs-student" ${dis}>${sOpts}</select></label>${sMore}${builtinWarn}${del}
+    ${tHtml}
+    <div class="row"><button class="primary" id="hs-check" ${!st0 || dis || !st.env_ready ? "disabled" : ""}>Check</button><span class="dim small">Reads the two models' files: size, layers, tokenizer, licence. A Hugging Face model that is not on this computer is not downloaded by this.</span></div>
+    ${noEnv}${checking}${err}${list}${body}
+    <p class="dim small">The healed copy is a derivative of both models. Check that their licences allow what you plan to do.</p></div>`;
 }
 
 // original · thinned · healed, side by side: what the tests found and the text-prediction error
@@ -1599,7 +1733,7 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + pick + size + tryCard() + make + result + list;
+  return head + msg + intro + pick + size + tryCard() + make + healSection() + result + list;
 }
 
 async function rsRefresh(stale) {
@@ -1610,6 +1744,7 @@ async function rsRefresh(stale) {
   if (page === "reshape") render();
   if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
   if (stale && rs.hl) rs.hl.stale = true;
+  hsLoadCand();
   rsAfterState();
 }
 
@@ -1652,6 +1787,7 @@ async function rsMeasInfo() {
 // the person's Heal card needs the options of the model that is shown
 function rsAfterState() {
   const st = rs.state; if (!st) return;
+  if (rs.hl && rs.hl.pair) { if (rs.hl.stale) hsReloadPair(); return; }          // a pair chosen in the Heal section: it is reloaded as a pair
   const made = st.made.filter((m) => m.status === "done" && m.summary);
   const shown = made.find((m) => m.name === rs.view) || made[0];
   if (shown && shown.summary.mode === "prune" && (!rs.hl || rs.hl.name !== shown.name || rs.hl.stale)) rsLoadHeal(shown.name);
@@ -1728,6 +1864,24 @@ async function rsMeasure(force) {
   try { await invoke("reshape_measure", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load, force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
 }
 
+
+function wireHealSection() {
+  const h = rs.hs, on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const text = (id, key) => { const e = $(id); if (e) e.onchange = () => { h[key] = e.value; hsChanged(); }; };
+  const sel = $("hs-student"); if (sel) sel.onchange = () => { h.studentPick = sel.value; h.guess = null; h.teacherPick = ""; hsChanged(); };
+  const tsel = $("hs-teacher"); if (tsel) tsel.onchange = () => { h.teacherPick = tsel.value; hsChanged(); };
+  text("hs-sfolder", "studentFolder"); text("hs-shub", "studentHub"); text("hs-tfolder", "teacherFolder"); text("hs-thub", "teacherHub");
+  const browse = (key, title) => async () => { try { const dir = await tauri.dialog.open({ directory: true, title }); if (dir) { h[key] = dir; hsChanged(); } } catch (_) { /* no folder window: the field is typed */ } };
+  on("hs-sbrowse", browse("studentFolder", "Choose the folder of the model to heal")); on("hs-tbrowse", browse("teacherFolder", "Choose the folder of the original model"));
+  on("hs-check", () => hsCheck(true));
+  on("hs-delrun", async () => {
+    const name = $("hs-delrun").dataset.name;
+    if (!confirm("Delete this heal and its files (the teacher's saved answers and the healed copy)? The model that was healed is not touched.")) return;
+    try { rs.state = await invoke("reshape_remove", { name }); h.studentPick = ""; rs.hl = null; rs.ok = "Deleted."; } catch (e) { rs.error = String(e); }
+    hsLoadCand(); render();
+  });
+}
+
 function wireReshape() {
   if (page !== "reshape" || !rs.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
@@ -1788,12 +1942,16 @@ function wireReshape() {
   hv("hl-mode", (e) => { hs.mode = e.value; });
   on("hl-go", async () => {
     rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }; rs.ok = null; rs.error = null; rs.log = []; render();
-    try { await invoke("heal_start", { name: rs.hl.name, spec: rsHealSpec() }); } catch (e) { rs.hlRun.running = false; rs.error = String(e); render(); }
+    try {
+      if (rs.hl.pair) await invoke("heal_source_start", { student: rs.hl.pair.student, teacher: rs.hl.pair.teacher, spec: rsHealSpec() });
+      else await invoke("heal_start", { name: rs.hl.name, spec: rsHealSpec() });
+    } catch (e) { rs.hlRun.running = false; rs.error = String(e); render(); }
   });
   if (rs.hl && rs.hl.opts && hs.general) gcWire("heal", render);
   on("hl-usedefault", () => { if (gc.state) { gcScope("heal").sel = gc.state.default; gcScope("heal").check = null; gcPersist("heal"); render(); } });
   on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
+  wireHealSection();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {

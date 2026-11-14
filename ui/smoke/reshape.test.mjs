@@ -668,3 +668,204 @@ test("After an out-of-memory failure the card offers safer settings instead of a
   assert.match(html, /Continue healing/);
   assert.doesNotMatch(html, /hl-safer/);
 });
+
+// ------------------------------------------------------------------------------------------------------------- Heal a model (any model)
+
+const hsCand = (over = {}) => ({ made: [], models: { mine: [{ id: "custom-f", name: "Pruned elsewhere", repo: "/m/pruned", source: { kind: "folder", path: "/m/pruned" }, custom: true }, { id: "custom-h", name: "Pruned on the Hub", repo: "acme/Pruned-7B", source: { kind: "hub", id: "acme/Pruned-7B" }, custom: true }],
+  builtin: [{ id: "qwen3.5-4b", name: "Qwen3.5 4B", repo: "unsloth/Qwen3.5-4B", source: { kind: "hub", id: "unsloth/Qwen3.5-4B" }, custom: false }] },
+  runs: [{ name: "heal-1-pruned", student: { kind: "folder", path: "/m/pruned" }, teacher: { kind: "hub", id: "acme/Big" }, student_name: "pruned", teacher_name: "acme/Big", healed: false }], ...over });
+const hsPass = (over = {}) => ({ ok: true, download_gb: 8, teacher_guess: null, items: [{ level: "ok", text: "Model to heal: 4.00 billion parameters, 24 layers, hidden size 2,048, family qwen3." }, { level: "ok", text: "The tokenizer is identical (151,665 tokens)." },
+  { level: "warn", text: "Original (teacher): not on this computer. Starting downloads 8.0 GB from Hugging Face." }, { level: "note", text: "Licences: the model to heal: apache-2.0; the original: apache-2.0. The healed copy is a derivative of both." }], ...over });
+const hsFail = () => ({ ok: false, download_gb: 0, teacher_guess: null, items: [{ level: "refuse", text: "The two models do not use the same tokenizer, so the teacher's answers cannot teach this model. The vocabularies have 151,665 and 152,000 tokens." }] });
+const pairOpts = (over = {}) => healOpts({ name: null, external: true, teacher_chosen: true, teacher: "acme/Big", student_label: "pruned", loss: { original: null, thinned: null }, healed: false, heal: null, metrics: [], ...over });
+
+test("the Heal a model section stands on its own, with the groups of both pickers", () => {
+  const b = browser();
+  open(b, pageState({ made: [] }));
+  let html = b.run("renderReshape()");
+  assert.match(html, /<h2>Heal a model<\/h2>/);
+  assert.match(html, /id="hs-student"/);
+  assert.match(html, /<option value=""[^>]*>Choose a model…<\/option>/);
+  assert.match(html, /<option value="folder"[^>]*>A folder on this computer…<\/option>/);
+  assert.match(html, /<option value="hub"[^>]*>A Hugging Face model…<\/option>/);
+  assert.match(html, /Original model \(the teacher\) <select id="hs-teacher"/);
+  assert.match(html, /<option value=""[^>]*>Choose the original…<\/option>/);                 // another model has no recorded original
+  assert.match(html, /id="hs-check" disabled/);                                             // nothing chosen yet
+  assert.doesNotMatch(html, /id="hl-go"/);
+  assert.match(html, /Nothing is written until you press Start/);
+  assert.match(html, /derivative of both models/);
+  // with the model list and an earlier heal
+  b.run(`rs.hs.cand = ${JSON.stringify(hsCand())}`);
+  html = b.run("renderReshape()");
+  assert.match(html, /<optgroup label="My models"><option value="mine:custom-f"[^>]*>Pruned elsewhere<\/option><option value="mine:custom-h"[^>]*>Pruned on the Hub<\/option><\/optgroup>/);
+  assert.match(html, /<optgroup label="Earlier heals of other models"><option value="run:heal-1-pruned"[^>]*>pruned \(taught by acme\/Big\)<\/option>/);
+  assert.match(html, /<optgroup label="Models that come with the program"><option value="built:qwen3.5-4b"/);
+  assert.doesNotMatch(html, /Made by this program/);                                       // no model was made here
+});
+
+test("the first made model is preselected, and its card keeps the settings", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; rs.hs.cand = ${JSON.stringify(hsCand())}`);
+  const html = b.run("renderReshape()");
+  assert.match(html, new RegExp(`<optgroup label="Made by this program"><option value="made:${m.name}" selected>`));
+  assert.match(html, /<option value="" selected>The model it was made from \(recorded\)<\/option>/);
+  assert.match(html, /id="hs-cardnote"/);
+  assert.equal((html.match(/id="hl-go"/g) || []).length, 1, "one set of controls only");
+  assert.match(html, /Heal it \(recommended\)/);
+  assert.equal(b.run("hsCardMode()"), true);
+});
+
+test("a folder or a Hugging Face id is typed, and the Check is asked with exactly that pair", async () => {
+  const asked = [];
+  const b = browser({ heal_pair: (a) => { asked.push(JSON.parse(JSON.stringify(a))); return { check: hsPass(), options: pairOpts(), name: null }; } });
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.cand = ${JSON.stringify(hsCand())}; rs.hs.studentPick = "folder"`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /id="hs-sfolder"/);
+  assert.match(html, /id="hs-check" disabled/);                                             // the folder is empty
+  b.run(`rs.hs.studentFolder = "/models/pruned-9b"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big-9B"`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hs-thub" value="acme\/Big-9B"/);
+  assert.match(html, /id="hs-check" >Check/);
+  await b.run("hsCheck(true)");
+  assert.deepEqual(asked, [{ student: { kind: "folder", path: "/models/pruned-9b" }, teacher: { kind: "hub", id: "acme/Big-9B" }, refresh: true }]);
+  b.run(`rs.hs.studentPick = "hub"; rs.hs.studentHub = " acme/Pruned "`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(hsStudent())")), { kind: "hub", id: "acme/Pruned" });
+  b.run(`rs.hs.studentPick = "mine:custom-f"; rs.hs.teacherPick = "built:qwen3.5-4b"`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify([hsStudent(), hsTeacher()])")), [{ kind: "folder", path: "/m/pruned" }, { kind: "hub", id: "unsloth/Qwen3.5-4B" }]);
+  b.run(`rs.hs.studentPick = "run:heal-1-pruned"`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify([hsStudent(), hsTeacher()])")), [{ kind: "folder", path: "/m/pruned" }, { kind: "hub", id: "acme/Big" }], "an earlier heal brings its own original");
+  assert.match(b.run("renderReshape()"), /The original of this heal: <strong>acme\/Big<\/strong>/);
+  assert.match(b.run("renderReshape()"), /id="hs-delrun"/);
+});
+
+test("the Check shows ticks, warnings and refusals, and Start waits for a pair that passed", async () => {
+  const answers = { heal_pair: { check: hsPass(), options: pairOpts(), name: null }, heal_pair_estimate: null };
+  const b = browser({ heal_pair: (a) => answers.heal_pair });
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.cand = ${JSON.stringify(hsCand())}; rs.hs.studentPick = "folder"; rs.hs.studentFolder = "/m/p"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big"`);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hs-check-list"/, "nothing shown before Check");
+  await b.run("hsCheck(true)");
+  let html = b.run("renderReshape()");
+  assert.match(html, /<li class="hs-ok"><span class="hs-ic">✓<\/span> The tokenizer is identical \(151,665 tokens\)\./);
+  assert.match(html, /<li class="hs-warn"><span class="hs-ic">⚠<\/span> Original \(teacher\): not on this computer\. Starting downloads 8\.0 GB/);
+  assert.match(html, /<li class="hs-note"><span class="hs-ic">•<\/span> Licences:/);
+  assert.match(html, /These two models can be used for healing\./);
+  // the same Heal card, bound to the pair
+  assert.match(html, /<h3>Heal this model<\/h3>/);
+  assert.match(html, /the model you chose is only read, never changed/);
+  assert.match(html, /Starting downloads about 8 GB from Hugging Face first/);
+  assert.match(html, /id="hl-go" >Start healing/);
+  assert.match(html, /Nothing is recorded about how well this model answered before/);
+  assert.equal((html.match(/id="hl-go"/g) || []).length, 1);
+  // changing the choice drops the Check and the card: Start is not there for a pair nobody checked
+  b.run(`rs.hs.teacherHub = "acme/Other"; hsChanged()`);
+  html = b.run("renderReshape()");
+  assert.doesNotMatch(html, /id="hl-go"|id="hs-check-list"/);
+  // a refused pair: the reason is red and there is nothing to start
+  answers.heal_pair = { check: hsFail(), options: null, name: null };
+  await b.run("hsCheck(true)");
+  html = b.run("renderReshape()");
+  assert.match(html, /<li class="hs-no"><span class="hs-ic">✗<\/span> The two models do not use the same tokenizer/);
+  assert.match(html, /These two models cannot be used for healing as chosen\./);
+  assert.doesNotMatch(html, /id="hl-go"/);
+  // a pair that passed but whose choice changed without hsChanged (the key no longer matches): Start is disabled with the reason
+  answers.heal_pair = { check: hsPass(), options: pairOpts(), name: null };
+  await b.run("hsCheck(true)");
+  b.run(`rs.hs.teacherHub = "acme/Third"`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-go" disabled/);
+  assert.match(html, /have not passed the check/);
+});
+
+test("Start sends the pair, and the usual conditions still hold", async () => {
+  const sent = [];
+  const b = browser({ heal_pair: { check: hsPass(), options: pairOpts(), name: null }, heal_source_start: (a) => { sent.push(JSON.parse(JSON.stringify(a))); return null; }, heal_start: (a) => { sent.push(["old", a]); return null; } });
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.cand = ${JSON.stringify(hsCand())}; rs.hs.studentPick = "hub"; rs.hs.studentHub = "acme/Pruned"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big"`);
+  await b.run("hsCheck(true)");
+  b.run("renderReshape(); wireReshape();");
+  await b.els["hl-go"].onclick();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].student, { kind: "hub", id: "acme/Pruned" });
+  assert.deepEqual(sent[0].teacher, { kind: "hub", id: "acme/Big" });
+  assert.equal(sent[0].spec.tokens_m, 20);
+  // no saved data version / no software / no fit: disabled as before
+  b.run(`rs.hl.opts.has_data = false`);
+  assert.match(b.run("renderReshape()"), /id="hl-go" disabled/);
+  b.run(`rs.hl.opts.has_data = true; rs.state.env_ready = false`);
+  assert.match(b.run("renderReshape()"), /id="hl-go" disabled/);
+  b.run(`rs.state.env_ready = true; rs.hl.opts.plan.fits = false; rs.hl.opts.plan.why = "Healing a model of 40 B parameters needs about 50 GB"`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /id="hl-go" disabled/);
+  assert.match(html, /needs about 50 GB/);
+  b.run(`rs.hl.opts.plan.fits = true; rs.hlRun = null`);
+  assert.match(b.run("renderReshape()"), /id="hl-go" >Start healing/);
+});
+
+test("the estimate of a pair asks for the pair, not for a folder name", async () => {
+  const asked = [];
+  const b = browser({ heal_pair: { check: hsPass(), options: pairOpts(), name: null }, heal_pair_estimate: (a) => { asked.push(JSON.parse(JSON.stringify(a))); return { plan: { mode: "online", fits: true, est_gb: 11.1, student_method: "lora" }, knobs: { seq: 2048, batch: 2, grad_accum: 16, rank: 64, kl_chunk: 256, checkpointing: false, qlora: false } }; }, heal_estimate: () => { asked.push("old"); return null; } });
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.studentPick = "hub"; rs.hs.studentHub = "acme/Pruned"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big"`);
+  await b.run("hsCheck(true)");
+  await b.run("rsHealEstimate()");
+  assert.ok(asked.length >= 1 && asked.every((a) => a !== "old" && a.student.id === "acme/Pruned" && a.teacher.id === "acme/Big" && a.spec.tokens_m === 20));
+  assert.match(b.run("renderReshape()"), /about 11\.1 GB of memory/);
+});
+
+test("switching between a made model and one from elsewhere never shows two sets of controls", async () => {
+  const b = browser({ heal_pair: { check: hsPass(), options: pairOpts(), name: null }, heal_options: healOpts(), heal_estimate: null });
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; rs.hs.cand = ${JSON.stringify(hsCand())}`);
+  const count = () => (b.run("renderReshape()").match(/id="hl-go"/g) || []).length;
+  assert.equal(count(), 1);
+  b.run(`rs.hs.studentPick = "hub"; rs.hs.studentHub = "acme/Pruned"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big"; rs.hl = null; hsChanged()`);
+  assert.equal(count(), 0, "a new pair has no card until it has been checked (the made model's own card waits)");
+  await b.run("hsCheck(true)");
+  assert.equal(count(), 1, "the pair's card, and not the made model's");
+  assert.match(b.run("renderReshape()"), /<h3>Heal this model<\/h3>/);
+  assert.match(b.run("renderReshape()"), /The Heal settings are in the <strong>Heal a model<\/strong> section above \(another model is chosen there\)/);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hs-cardnote"/);
+  // a made model with another original: the card says where the settings are
+  b.run(`rs.hs.studentPick = "made:${m.name}"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Better"; hsChanged()`);
+  await b.run("hsCheck(true)");
+  const html = b.run("renderReshape()");
+  assert.equal((html.match(/id="hl-go"/g) || []).length, 1);
+  assert.match(html, /Another original is chosen in the <strong>Heal a model<\/strong> section above/);
+  // back to the made model with its own original
+  b.run(`rs.hs.teacherPick = ""; hsChanged()`);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(b.run("hsCardMode()"), true);
+  assert.match(b.run("renderReshape()"), /id="hs-cardnote"/);
+  assert.equal(b.run("!!(rs.hl && rs.hl.pair)"), false);
+});
+
+test("a guess at the original is offered as a guess, and the Browse button fills the folder", async () => {
+  const picked = [];
+  const b = browser({ heal_pair: { check: { ...hsFail(), teacher_guess: { repo: "acme/Big", from: "base_model in the model card" } }, options: null, name: null } });
+  b.run(`window.__TAURI__.dialog.open = async (o) => { ${"globalThis.__asked = o.title"}; return "/picked/folder"; }`);
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.cand = ${JSON.stringify(hsCand())}; rs.hs.studentPick = "hub"; rs.hs.studentHub = "acme/Pruned"`);
+  await b.run("hsCheck(true)");
+  let html = b.run("renderReshape()");
+  assert.match(html, /<option value="guess"[^>]*>acme\/Big \(a guess: base_model in the model card\)<\/option>/);
+  assert.match(html, /That is a guess: pick it in the list only if it is the model it was really made from/);
+  b.run(`rs.hs.teacherPick = "guess"`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(hsTeacher())")), { kind: "hub", id: "acme/Big" });
+  b.run(`rs.hs.studentPick = "folder"; rs.hs.studentFolder = ""; renderReshape(); wireReshape();`);
+  await b.els["hs-sbrowse"].onclick();
+  assert.equal(b.run("rs.hs.studentFolder"), "/picked/folder");
+});
+
+test("a failing Check shows the error plainly", async () => {
+  const b = browser({ heal_pair: () => { throw "The training software is not installed yet. Open \"Training setup\" first."; } });
+  open(b, pageState({ made: [] }));
+  b.run(`rs.hs.studentPick = "hub"; rs.hs.studentHub = "acme/Pruned"; rs.hs.teacherPick = "hub"; rs.hs.teacherHub = "acme/Big"`);
+  await b.run("hsCheck(true)");
+  assert.match(b.run("renderReshape()"), /<div class="err">The training software is not installed yet/);
+  assert.match(b.run("renderReshape()"), /id="hs-check" >Check/);
+});
