@@ -25,6 +25,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
 | M13 Slim or grow a model: layer pruning and depth up-scaling as a new base model | built and tested without a GPU (worker on stand-ins, a fake worker in the Rust tests, the page in a stand-in browser); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
 | M14 Thinner layers (width pruning) + healing by distillation | built and tested without a GPU or torch (numpy stand-ins, fake workers, the page in a stand-in browser; the CPU torch tests are written and have never run); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
+| Importance matrix for the small GGUF sizes (optional, Step 5) | built and tested with stand-in llama.cpp tools; not run with a real llama.cpp or GPU (docs/IMATRIX.md, "Not verified yet") |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ## Install
@@ -76,7 +77,7 @@ Worker tests (CPU, tiny random models, no downloads): `pip install torch transfo
 
 **Step 5** makes `exports/<run>-<size>/` with `model-<size>.gguf`, a `Modelfile` and a model card. The worker merges the trained LoRA into the model (16-bit) and makes the
 GGUF with Unsloth's `save_pretrained_gguf`, or, without Unsloth, with a llama.cpp it finds (`LLAMA_CPP_DIR`, `~/llama.cpp`, a `llama.cpp` folder next to the program).
-Qwen3.5's chat template is edited to answer without thinking by default. **Install into Ollama** uploads the file as a blob and creates the model through Ollama's HTTP API
+Qwen3.5's chat template is edited to answer without thinking by default. An optional **importance matrix** ("Better small sizes", off by default) makes the Q6_K / Q5_K_M / Q4_K_M files lose less quality: llama.cpp's `llama-imatrix` reads your own data plus some general text first (`docs/IMATRIX.md`; built with stand-in tools, not yet run with a real llama.cpp). **Install into Ollama** uploads the file as a blob and creates the model through Ollama's HTTP API
 (`/api/blobs`, `/api/create`), so it works for this PC and for a server such as the TrueNAS box (`http://truenas:11434`; Ollama there needs `OLLAMA_HOST=0.0.0.0`).
 **Test it** asks the installed model one of the training questions. The page lists what to set in nd-world (`OLLAMA_MODEL`, or `UNSLOTH_MODEL` + `LLM_CONTEXT_TOKENS`) and warns
 that the model knows all GM secrets.
