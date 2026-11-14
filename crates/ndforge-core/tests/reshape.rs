@@ -1133,6 +1133,18 @@ if kind == "reshape_try":
                "analysis": {{"base": {{"loss": 2.0}}}}, "seconds_per_pass": 3.0, "tokens": 100, "load_used": "4bit"}}, open(os.path.join(job["out_dir"], "reshape_try.json"), "w"))
     out(type="try_pass", key="d=|w=", done=1, total=1, loss=2.0)
     out(type="result", data={{"passes_total": 1, "passes_done": 1, "stopped": False, "analysis": {{"base": {{"loss": 2.0}}}}}}); sys.exit(0)
+if kind == "heal_check":
+    facts = json.load(open(os.path.join(root, "facts.json"), encoding="utf-8"))
+    if "pair" in job:
+        out(type="result", data={{"pair": facts["__pair__"]}}); sys.exit(0)
+    res = {{}}
+    for side, src in job["sources"].items():
+        f = dict(facts.get(src) or facts["*"])
+        f["source"] = src
+        if job.get("fetch") and f.get("fetch_folder"):
+            f["folder"] = f["fetch_folder"]
+        res[side] = f
+    out(type="result", data=res); sys.exit(0)
 if kind == "distill_cache":
     if marker("stop-cache"):
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
@@ -1161,7 +1173,12 @@ elif kind == "distill":
     out(type="result", data=res)
 elif kind == "distill_merge":
     os.makedirs(job["out"], exist_ok=True)
-    meta = json.load(open(os.path.join(job["base"], "ndforge_reshape.json"), encoding="utf-8"))
+    try:
+        meta = json.load(open(os.path.join(job["base"], "ndforge_reshape.json"), encoding="utf-8"))
+    except OSError:
+        meta = {{"format": 2}}
+    if job.get("origin"):
+        meta["origin"] = job["origin"]
     meta["healed"] = {{"steps": 2}}
     json.dump(meta, open(os.path.join(job["out"], "ndforge_reshape.json"), "w"))
     open(os.path.join(job["out"], "config.json"), "w").write(json.dumps({{"model_type": "qwen3_5", "architectures": ["Qwen3_5ForCausalLM"], "num_hidden_layers": 24}}))
@@ -1820,4 +1837,471 @@ fn the_plan_and_the_run_of_a_try_go_through_the_worker_and_the_answers_are_found
 #[cfg(unix)]
 fn try_spec_with(model: &str) -> rruns::TrySpec {
     serde_json::from_value(json!({"model_id": model})).unwrap()
+}
+
+// ------------------------------------------------------------------------------------------------------- healing any model (docs/HEAL_ANY_MODEL.md)
+
+use ndforge_core::reshape::heal_source as hsrc;
+use ndforge_core::reshape::heal_source::{Ctx, Source};
+
+/// what the worker's `heal_check` says about a model that can be healed
+fn facts(params: f64, hash: &str, vocab_tokens: u64) -> serde_json::Value {
+    json!({"source": "x", "kind": "folder", "on_disk": true, "folder": "x", "supported": true, "why": null, "error": null, "quantized": false, "gguf": false, "params": params, "bytes": params * 2.0,
+           "model_type": "qwen3", "family": "qwen3", "layers": 24, "hidden": 2048, "intermediate": 6144, "vocab_size": 151_936, "has_vision": false, "tokenizer_hash": hash,
+           "vocab_tokens": vocab_tokens, "license": "apache-2.0", "base_guess": null, "download_bytes": 0})
+}
+
+fn levels(v: &serde_json::Value, level: &str) -> Vec<String> {
+    v["items"].as_array().unwrap().iter().filter(|i| i["level"] == level).map(|i| i["text"].as_str().unwrap().to_string()).collect()
+}
+
+fn ctx() -> Ctx {
+    Ctx { vram_gb: Some(32.0), free_disk_gb: Some(500.0) }
+}
+
+#[test]
+fn the_check_accepts_an_identical_tokenizer_and_says_so() {
+    let (s, t) = (facts(4.0e9, "abc", 151_665), facts(8.0e9, "abc", 151_665));
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(levels(&v, "ok").iter().any(|l| l.contains("The tokenizer is identical (151,665 tokens)")));
+    assert!(levels(&v, "ok").iter().any(|l| l.starts_with("Model to heal: 4.00 billion parameters, 24 layers, hidden size 2,048, MLP width 6,144, family qwen3")));
+    assert!(levels(&v, "ok").iter().any(|l| l.contains("The teacher needs about 4.8 GB in 4-bit; this card has 32 GB")));
+    assert!(levels(&v, "refuse").is_empty() && levels(&v, "warn").is_empty());
+    assert!(levels(&v, "note").iter().any(|l| l.contains("apache-2.0") && l.contains("derivative")), "the licence and the reminder are always there");
+}
+
+#[test]
+fn a_different_tokenizer_or_vocabulary_is_refused_with_the_reason() {
+    let s = facts(4.0e9, "abc", 151_665);
+    let v = hsrc::verdict(&s, Some(&facts(8.0e9, "other", 152_000)), &ctx());
+    assert_eq!(v["ok"], false);
+    assert!(levels(&v, "refuse")[0].contains("do not use the same tokenizer") && levels(&v, "refuse")[0].contains("151,665 and 152,000"), "{v}");
+    // the same number of tokens but other files is refused too, and says so
+    let w = hsrc::verdict(&s, Some(&facts(8.0e9, "other", 151_665)), &ctx());
+    assert_eq!(w["ok"], false);
+    assert!(levels(&w, "refuse")[0].contains("tokenizer files differ"));
+    // no tokenizer files at all
+    let mut none = facts(8.0e9, "abc", 1);
+    none["tokenizer_hash"] = json!(null);
+    let n = hsrc::verdict(&s, Some(&none), &ctx());
+    assert!(n["ok"] == false && levels(&n, "refuse")[0].contains("missing"));
+}
+
+#[test]
+fn the_check_compares_token_ids_not_settings_and_a_chat_template_is_only_a_warning() {
+    // the strict hash differs (a chat template, padding side...) but the ids hash is the same: accepted, and the template difference is a yellow warning
+    let (mut s, mut t) = (facts(4.0e9, "strict-a", 151_665), facts(8.0e9, "strict-b", 151_665));
+    s["ids_hash"] = json!("ids");
+    t["ids_hash"] = json!("ids");
+    s["template_hash"] = json!("t1");
+    t["template_hash"] = json!("t2");
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(levels(&v, "ok").iter().any(|l| l.contains("The tokenizer is identical (151,665 tokens)")));
+    assert!(levels(&v, "refuse").is_empty());
+    let w = levels(&v, "warn");
+    assert!(w.len() == 1 && w[0].contains("different chat templates") && w[0].contains("template of the model you heal"), "{w:?}");
+    // the same template (or none on both sides): no warning
+    t["template_hash"] = json!("t1");
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "warn").is_empty());
+    s["template_hash"] = json!(null);
+    t["template_hash"] = json!(null);
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "warn").is_empty());
+}
+
+#[test]
+fn the_probe_of_two_different_tokenizer_files_is_a_yellow_warning_or_a_refusal() {
+    let (mut s, mut t) = (facts(4.0e9, "x", 10), facts(8.0e9, "y", 10));
+    s["ids_hash"] = json!("ids-a");
+    t["ids_hash"] = json!("ids-b");
+    t["pair_probe"] = json!({"ok": true, "level": "warn", "text": "The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."});
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(levels(&v, "warn"), ["The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."]);
+    t["pair_probe"] = json!({"ok": false, "level": "refuse", "text": "The two models do not use the same tokenizer: the same text gives different token ids. First difference, on the text \"a\": [1], [2]."});
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert!(v["ok"] == false && levels(&v, "refuse")[0].contains("First difference"), "{v}");
+    // different sizes are refused whatever the probe says
+    t["vocab_tokens"] = json!(11);
+    t["pair_probe"] = json!({"ok": true, "level": "warn", "text": "fine"});
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "refuse")[0].contains("10 and 11"));
+    // no answer from the worker: refused as before
+    t["vocab_tokens"] = json!(10);
+    t["pair_probe"] = json!(null);
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "refuse")[0].contains("tokenizer files differ"));
+}
+
+#[test]
+fn what_cannot_be_healed_is_refused_in_plain_words() {
+    let t = facts(8.0e9, "abc", 10);
+    let mut q = facts(4.0e9, "abc", 10);
+    q["quantized"] = json!(true);
+    let v = hsrc::verdict(&q, Some(&t), &ctx());
+    assert!(v["ok"] == false && levels(&v, "refuse")[0].contains("quantized") && levels(&v, "refuse")[0].starts_with("Model to heal"), "{v}");
+    let mut g = facts(4.0e9, "abc", 10);
+    g["gguf"] = json!(true);
+    assert!(levels(&hsrc::verdict(&g, Some(&t), &ctx()), "refuse")[0].contains("GGUF"));
+    let mut u = facts(4.0e9, "abc", 10);
+    u["supported"] = json!(false);
+    u["why"] = json!("Only Qwen3.5 and plain Llama/Qwen/Mistral-style models can be slimmed or grown so far. (This one is of type \"gpt2\".)");
+    assert!(levels(&hsrc::verdict(&u, Some(&t), &ctx()), "refuse")[0].contains("gpt2"));
+    // the same for the teacher, and an unreadable model
+    let mut tq = facts(8.0e9, "abc", 10);
+    tq["quantized"] = json!(true);
+    let w = hsrc::verdict(&facts(4.0e9, "abc", 10), Some(&tq), &ctx());
+    assert!(w["ok"] == false && levels(&w, "refuse")[0].starts_with("Original (teacher)"));
+    let mut e = facts(4.0e9, "abc", 10);
+    e["error"] = json!("There are no readable .safetensors files in /x.");
+    assert!(levels(&hsrc::verdict(&e, Some(&t), &ctx()), "refuse")[0].contains("no readable .safetensors"));
+    // no teacher chosen yet
+    let n = hsrc::verdict(&facts(4.0e9, "abc", 10), None, &ctx());
+    assert!(n["ok"] == false && levels(&n, "refuse")[0].contains("Choose the original model"));
+}
+
+#[test]
+fn a_smaller_teacher_is_a_warning_not_a_refusal_and_other_hidden_sizes_are_fine() {
+    let s = facts(8.0e9, "abc", 10);
+    let mut t = facts(4.0e9, "abc", 10);
+    t["hidden"] = json!(1024);
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true);
+    assert!(levels(&v, "warn")[0].contains("teacher") && levels(&v, "warn")[0].contains("smaller"));
+    assert!(levels(&v, "note").iter().any(|l| l.contains("hidden sizes differ") && l.contains("fine")));
+    // a big teacher on a small card
+    let big = facts(40.0e9, "abc", 10);
+    let w = hsrc::verdict(&facts(8.0e9, "abc", 10), Some(&big), &Ctx { vram_gb: Some(16.0), free_disk_gb: Some(500.0) });
+    assert!(w["ok"] == true && levels(&w, "warn")[0].contains("24.0 GB") && levels(&w, "warn")[0].contains("16 GB"), "{w}");
+}
+
+#[test]
+fn a_hugging_face_model_is_told_whether_it_is_on_disk_and_the_download_needs_room() {
+    let mut s = facts(4.0e9, "abc", 10);
+    s["kind"] = json!("hub");
+    s["on_disk"] = json!(false);
+    s["download_bytes"] = json!(8.0e9);
+    let t = facts(8.0e9, "abc", 10);
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert!(levels(&v, "warn").iter().any(|l| l.contains("not on this computer") && l.contains("8.0 GB")), "{v}");
+    assert_eq!((v["ok"].clone(), v["download_gb"].clone()), (json!(true), json!(8.0)));
+    let tight = hsrc::verdict(&s, Some(&t), &Ctx { vram_gb: Some(32.0), free_disk_gb: Some(5.0) });
+    assert!(tight["ok"] == false && levels(&tight, "refuse")[0].contains("not enough free disk space"));
+    s["on_disk"] = json!(true);
+    s["download_bytes"] = json!(0);
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "ok").iter().any(|l| l.contains("already on this computer")));
+}
+
+#[test]
+fn the_hugging_face_names_that_are_accepted() {
+    for ok in ["Qwen/Qwen3-8B", "unsloth/Qwen3.5-4B", "a/b_c-d.e"] {
+        assert!(hsrc::is_hub_id(ok), "{ok}");
+    }
+    for bad in ["", "Qwen3-8B", "a/b/c", "/b", "a/", "../x", "a b/c", "a/.hidden"] {
+        assert!(!hsrc::is_hub_id(bad), "{bad}");
+    }
+    assert!(Source::Hub { id: "nope".into() }.validate().is_err() && Source::Folder { path: " ".into() }.validate().is_err() && Source::Made { name: "../x".into() }.validate().is_err());
+    // the sources travel as {"kind": ..} like the window sends them
+    let s: Source = serde_json::from_value(json!({"kind": "hub", "id": "a/b"})).unwrap();
+    assert_eq!(s, Source::Hub { id: "a/b".into() });
+    assert_eq!(serde_json::to_value(Source::Folder { path: "/m".into() }).unwrap(), json!({"kind": "folder", "path": "/m"}));
+}
+
+fn external(p: &Project, name: &str, student: Source, teacher: Source, dir_student: Option<&std::path::Path>) -> std::path::PathBuf {
+    let dir = p.folder.join("models").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let check = json!({"student": facts(4.0e9, "abc", 10), "teacher": facts(4.8e9, "abc", 10)});
+    hsrc::write(&dir, &hsrc::HealSource { student, teacher: Some(teacher), created: "2026-11-14T00:00:00Z".into(), student_name: "pruned".into(), teacher_name: "big".into(),
+                                          student_dir: dir_student.map(|d| d.to_string_lossy().to_string()), check }).unwrap();
+    dir
+}
+
+#[test]
+fn a_made_model_is_read_from_model_and_a_model_from_elsewhere_from_heal_source_json() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    // made: unchanged
+    let model = made_model(&p, "slim", 27_800_000_000, 21_100_000_000);
+    let dir = p.folder.join("models").join("slim");
+    assert_eq!(hsrc::resolve_student(&dir).unwrap(), model);
+    let o = hsrc::read_origin(&dir).unwrap();
+    assert_eq!((o.teacher.as_str(), o.family.as_str(), o.external, o.teacher_chosen), ("unsloth/Qwen3.5-4B", "qwen3_5", false, false));
+    assert!((o.student_b - 21.1).abs() < 1e-9 && (o.teacher_b - 27.8).abs() < 1e-9);
+    assert!(!hsrc::is_external(&dir) && hsrc::read(&dir).is_none(), "an old project has no heal_source.json");
+    // external: a folder on this computer
+    let folder = d.path().join("their-model");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert!(hsrc::resolve_student(&external(&p, "heal-a", Source::Folder { path: folder.to_string_lossy().to_string() }, Source::Hub { id: "acme/Big".into() }, None)).is_err(), "the folder has no config.json yet");
+    std::fs::write(folder.join("config.json"), "{}").unwrap();
+    let dir = p.folder.join("models").join("heal-a");
+    assert_eq!(hsrc::resolve_student(&dir).unwrap(), folder);
+    let o = hsrc::read_origin(&dir).unwrap();
+    assert_eq!((o.teacher.as_str(), o.family.as_str(), o.external, o.student_label.as_str()), ("acme/Big", "generic", true, "pruned"));
+    assert!((o.student_b - 4.0).abs() < 1e-9 && (o.teacher_b - 4.8).abs() < 1e-9);
+    assert_eq!((o.config["num_hidden_layers"].clone(), o.config["hidden_size"].clone()), (json!(24), json!(2048)));
+    assert!(o.calibration.is_null() && o.loss_before.is_null() && hsrc::is_external(&dir));
+    // external: a Hugging Face model is downloaded first, then read where the cache put it
+    let hub = external(&p, "heal-b", Source::Hub { id: "acme/Pruned".into() }, Source::Hub { id: "acme/Big".into() }, None);
+    assert!(hsrc::student_folder(&hub).unwrap().is_none() && hsrc::resolve_student(&hub).unwrap_err().0.contains("not been downloaded"));
+    let cached = d.path().join("hf-cache");
+    std::fs::create_dir_all(&cached).unwrap();
+    std::fs::write(cached.join("config.json"), "{}").unwrap();
+    let hub = external(&p, "heal-b", Source::Hub { id: "acme/Pruned".into() }, Source::Hub { id: "acme/Big".into() }, Some(&cached));
+    assert_eq!(hsrc::resolve_student(&hub).unwrap(), cached);
+    // the file round trip, and a heal_source.json that cannot be read counts as none
+    let h = hsrc::read(&hub).unwrap();
+    assert_eq!((h.student.clone(), h.teacher.clone(), h.student_dir.clone()), (Source::Hub { id: "acme/Pruned".into() }, Some(Source::Hub { id: "acme/Big".into() }), Some(cached.to_string_lossy().to_string())));
+    std::fs::write(hub.join("heal_source.json"), "{not json").unwrap();
+    assert!(hsrc::read(&hub).is_none() && !hsrc::is_external(&hub));
+    // a made model without ndforge_reshape.json still says what it always said
+    let bare = p.folder.join("models").join("bare");
+    std::fs::create_dir_all(bare.join("model")).unwrap();
+    std::fs::write(bare.join("model/config.json"), "{}").unwrap();
+    assert!(hsrc::read_origin(&bare).unwrap_err().0.contains("no ndforge_reshape.json"));
+}
+
+#[test]
+fn the_pickers_offer_made_models_the_model_list_and_earlier_heals() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project(d.path());
+    // nothing made, nothing added: only the models that ship with the program
+    let c = hsrc::heal_candidates(&p);
+    assert!(c["made"].as_array().unwrap().is_empty() && c["models"]["mine"].as_array().unwrap().is_empty() && c["runs"].as_array().unwrap().is_empty());
+    assert!(!c["models"]["builtin"].as_array().unwrap().is_empty() && c["models"]["builtin"][0]["source"]["kind"] == "hub");
+    // a made model, a custom folder and a custom Hugging Face model
+    made_model(&p, "slim-a", 4_800_000_000, 4_000_000_000);
+    let folder = d.path().join("pruned-elsewhere");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut e = catalog::builtin_models()[0].clone();
+    (e.id, e.name, e.repo, e.custom) = ("custom-folder".into(), "Pruned elsewhere".into(), folder.to_string_lossy().to_string(), true);
+    catalog::add_custom(e.clone()).unwrap();
+    (e.id, e.name, e.repo) = ("custom-hub".into(), "Pruned on the Hub".into(), "acme/Pruned-7B".into());
+    catalog::add_custom(e.clone()).unwrap();
+    (e.id, e.name, e.repo) = ("custom-weird".into(), "Neither".into(), "not a repo".into());
+    catalog::add_custom(e.clone()).unwrap();
+    // the made model's own list entry (its model/ folder) is not offered a second time
+    (e.id, e.name, e.repo) = ("custom-local-slim-a".into(), "Made".into(), p.folder.join("models/slim-a/model").canonicalize().unwrap().to_string_lossy().to_string());
+    catalog::add_custom(e).unwrap();
+    // an earlier heal of a model from elsewhere
+    external(&p, "heal-20261114-pruned", Source::Folder { path: folder.to_string_lossy().to_string() }, Source::Hub { id: "acme/Big".into() }, None);
+    let c = hsrc::heal_candidates(&p);
+    assert_eq!(c["made"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect::<Vec<_>>(), ["slim-a"]);
+    let mine: Vec<(&str, &str)> = c["models"]["mine"].as_array().unwrap().iter().map(|m| (m["name"].as_str().unwrap(), m["source"]["kind"].as_str().unwrap())).collect();
+    assert_eq!(mine, [("Pruned elsewhere", "folder"), ("Pruned on the Hub", "hub")]);
+    assert_eq!(c["runs"][0]["name"], "heal-20261114-pruned");
+    assert_eq!((c["runs"][0]["student_name"].clone(), c["runs"][0]["healed"].clone()), (json!("pruned"), json!(false)));
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
+
+#[cfg(unix)]
+fn write_facts(root: &std::path::Path, entries: &[(&str, serde_json::Value)]) {
+    let mut m = serde_json::Map::new();
+    for (k, v) in entries {
+        m.insert((*k).into(), v.clone());
+    }
+    std::fs::write(root.join("facts.json"), serde_json::Value::Object(m).to_string()).unwrap();
+}
+
+#[cfg(unix)]
+fn count_jobs(root: &std::path::Path, kind: &str) -> usize {
+    jobs_seen(root).iter().filter(|j| j["job"] == kind).count()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pair_whose_tokenizer_files_differ_but_whose_ids_agree_is_accepted_with_a_warning_and_can_start() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let folder = d.path().join("pruned-9b");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("config.json"), "{}").unwrap();
+    let (student, teacher) = (Source::Folder { path: folder.to_string_lossy().to_string() }, Source::Hub { id: "acme/Big-9B-probe".into() });
+    let (sk, tk) = (folder.to_string_lossy().to_string(), "acme/Big-9B-probe");
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["ids_hash"] = json!("ids-a");
+    sf["tokenizer_dir"] = json!("somewhere/s");
+    let mut tf = facts(4.8e9, "def", 10);
+    tf["kind"] = json!("hub");
+    tf["ids_hash"] = json!("ids-b");
+    tf["tokenizer_dir"] = json!("somewhere/t");
+    let mut m = serde_json::Map::new();
+    m.insert(sk.clone(), sf);
+    m.insert(tk.into(), tf);
+    m.insert("__pair__".into(), json!({"ok": true, "level": "warn", "text": "The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."}));
+    std::fs::write(d.path().join("facts.json"), serde_json::Value::Object(m).to_string()).unwrap();
+    let pair = hsrc::heal_pair(&p, &student, Some(&teacher), Some(32.0), true, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(pair["check"]["ok"], true, "{pair}");
+    assert!(levels(&pair["check"], "warn").iter().any(|l| l.contains("both produce the same token ids on 40 test texts")), "{pair}");
+    assert!(pair["options"].is_object(), "the Heal card's options are there for a pair accepted with a warning");
+    assert!(jobs_seen(d.path()).iter().any(|j| j["job"] == "heal_check" && j["pair"]["student"] == "somewhere/s" && j["pair"]["teacher"] == "somewhere/t"));
+    let spec = rruns::HealSpec { ..heal_spec(40) };
+    let r = hsrc::heal_from_source(&p, &student, Some(&teacher), &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    assert!(r["name"].as_str().is_some(), "{r}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_model_from_elsewhere_is_healed_with_a_chosen_teacher_and_the_healed_copy_is_listed() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let folder = d.path().join("pruned-9b");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("config.json"), "{}").unwrap();
+    let (student, teacher) = (Source::Folder { path: folder.to_string_lossy().to_string() }, Source::Hub { id: "acme/Big-9B".into() });
+    let (sk, tk) = (folder.to_string_lossy().to_string(), "acme/Big-9B");
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["layers"] = json!(20);
+    let mut tf = facts(4.8e9, "abc", 10);
+    tf["kind"] = json!("hub");
+    write_facts(d.path(), &[(&sk, sf), (tk, tf)]);
+    let ctx32 = Some(32.0);
+    // the Check writes nothing
+    let pair = hsrc::heal_pair(&p, &student, Some(&teacher), ctx32, false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((pair["check"]["ok"].clone(), pair["name"].clone()), (json!(true), json!(null)));
+    assert_eq!((pair["options"]["external"].clone(), pair["options"]["teacher"].clone(), pair["options"]["student_b"].clone(), pair["options"]["plan"]["mode"].clone()), (json!(true), json!("acme/Big-9B"), json!(4.0), json!("online")));
+    assert!(pair["options"]["loss"]["original"].is_null() && pair["options"]["healed"] == false && pair["options"]["name"].is_null());
+    assert!(!p.folder.join("models").exists() || std::fs::read_dir(p.folder.join("models")).unwrap().count() == 0, "nothing is written before Start");
+    assert_eq!(count_jobs(d.path(), "heal_check"), 1);
+    hsrc::heal_pair(&p, &student, Some(&teacher), ctx32, false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(count_jobs(d.path(), "heal_check"), 1, "the facts of a model are kept: the second Check does not ask the worker again (a Hugging Face model for ten minutes)");
+    hsrc::heal_pair(&p, &student, Some(&teacher), ctx32, true, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(count_jobs(d.path(), "heal_check"), 2, "Check again asks again");
+    let spec = rruns::HealSpec { ..heal_spec(40) };
+    let est = hsrc::heal_pair_estimate(&p, &student, Some(&teacher), &spec, ctx32).unwrap();
+    assert!(est["plan"]["est_gb"].as_f64().unwrap() > 0.0 && est["knobs"]["rank"].is_number());
+    // Start: the folder is made, the three jobs run on the folder where the model is
+    let r = hsrc::heal_from_source(&p, &student, Some(&teacher), &spec, ctx32, Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    let name = r["name"].as_str().unwrap().to_string();
+    assert!(name.starts_with("heal-") && name.ends_with("pruned-9b"), "{name}");
+    let dir = p.folder.join("models").join(&name);
+    let jobs: Vec<_> = jobs_seen(d.path()).into_iter().filter(|j| j["job"] != "heal_check").collect();
+    assert_eq!(jobs.iter().map(|j| j["job"].as_str().unwrap()).collect::<Vec<_>>(), ["distill", "distill_merge"], "4 B student, 4.8 B teacher: both at once");
+    let (train, merge) = (&jobs[0], &jobs[1]);
+    assert_eq!((train["model"]["repo"].as_str(), train["distill"]["teacher"]["repo"].as_str(), train["model"]["family"].as_str()), (Some(sk.as_str()), Some(tk), Some("generic")));
+    assert!(train["eval"]["teacher_loss"].is_null() && train["eval"]["slim_loss"].is_null(), "nothing recorded about before healing: the job computes it");
+    assert_eq!(train["eval"]["calibration"]["samples"], 128);
+    assert_eq!((merge["base"].as_str(), merge["origin"]["repo"].as_str(), merge["student_label"].as_str()), (Some(sk.as_str()), Some(tk), Some("pruned-9b")));
+    assert!(merge["final"].as_str().unwrap().ends_with("healed"));
+    // the folder keeps what is needed to continue, nothing is copied
+    assert!(dir.join("heal_source.json").is_file() && dir.join("heal.json").is_file() && !dir.join("model").exists());
+    // the healed copy is in the model list, derived from the student, with the teacher in its metadata
+    let id = format!("custom-local-{name}-healed");
+    let m = catalog::find(&id).expect("registered");
+    assert_eq!((m.name.as_str(), m.derived_from.as_deref()), ("pruned-9b · healed", Some(sk.as_str())));
+    assert!(m.reshape.as_deref().unwrap().contains("taught by acme/Big-9B") && m.note.contains("licences"));
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("healed/ndforge_reshape.json")).unwrap()).unwrap();
+    assert_eq!(meta["origin"]["repo"], tk);
+    assert_eq!(r["model_id"], id.as_str());
+    // it is found again as a finished heal, and once is enough
+    let again = hsrc::heal_pair(&p, &student, Some(&teacher), ctx32, false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((again["name"].clone(), again["options"]["healed"].clone()), (json!(name), json!(true)));
+    assert!(hsrc::heal_from_source(&p, &student, Some(&teacher), &spec, ctx32, Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).is_ok(), "a new folder is made for a pair that is already healed");
+    assert_eq!(hsrc::heal_candidates(&p)["runs"].as_array().unwrap().len(), 2);
+    // deleting removes the folder and the list entry
+    rruns::remove(&p, &name).unwrap();
+    assert!(catalog::find(&id).is_none() && !dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pair_that_fails_the_check_does_not_start_and_leaves_nothing() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    write_facts(d.path(), &[("*", facts(4.0e9, "abc", 10)), ("acme/Other", facts(8.0e9, "different", 20))]);
+    let (student, teacher) = (Source::Hub { id: "acme/Pruned".into() }, Source::Hub { id: "acme/Other".into() });
+    let err = hsrc::heal_from_source(&p, &student, Some(&teacher), &heal_spec(10), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap_err();
+    assert!(err.0.contains("did not pass the check"), "{err}");
+    // no teacher: the section asks for one and guesses from the card
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["base_guess"] = json!({"repo": "acme/Big", "from": "base_model in the model card"});
+    write_facts(d.path(), &[("*", sf)]);
+    let pair = hsrc::heal_pair(&p, &student, None, Some(32.0), true, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((pair["check"]["ok"].clone(), pair["check"]["teacher_guess"]["repo"].clone(), pair["options"].clone()), (json!(false), json!("acme/Big"), json!(null)));
+    assert!(pair["check"]["items"].as_array().unwrap().iter().any(|i| i["text"].as_str().unwrap().contains("Choose the original model")));
+    assert!(hsrc::heal_prepare(&p, &student, None, &pair["check"]).is_err());
+    assert!(!p.folder.join("models").exists() || std::fs::read_dir(p.folder.join("models")).unwrap().count() == 0);
+    // the same model twice, and an unmodified model of the program
+    let same = hsrc::heal_check(&p, &student, Some(&student), Ctx::default(), false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert!(same["ok"] == false && levels(&same, "refuse").iter().any(|l| l.contains("same model")));
+    let builtin = Source::Hub { id: catalog::builtin_models()[0].repo.clone() };
+    let b = hsrc::heal_check(&p, &builtin, Some(&Source::Hub { id: "acme/Other".into() }), Ctx::default(), false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert!(levels(&b, "warn").iter().any(|l| l.contains("unmodified model")));
+    // a made model cannot be the teacher
+    assert!(hsrc::heal_check(&p, &student, Some(&Source::Made { name: "x".into() }), Ctx::default(), false, &AtomicBool::new(false), &mut |_| {}).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hugging_face_student_is_downloaded_first_and_read_where_the_cache_put_it() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let cached = d.path().join("hf-cache-snapshot");
+    std::fs::create_dir_all(&cached).unwrap();
+    std::fs::write(cached.join("config.json"), "{}").unwrap();
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["kind"] = json!("hub");
+    sf["on_disk"] = json!(false);
+    sf["download_bytes"] = json!(8.0e9);
+    sf["fetch_folder"] = json!(cached.to_string_lossy());
+    write_facts(d.path(), &[("acme/Pruned", sf), ("acme/Big", facts(4.8e9, "abc", 10))]);
+    let (student, teacher) = (Source::Hub { id: "acme/Pruned".into() }, Source::Hub { id: "acme/Big".into() });
+    let mut events = Vec::new();
+    let r = hsrc::heal_from_source(&p, &student, Some(&teacher), &heal_spec(10), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |e| events.push(e)).unwrap();
+    let jobs = jobs_seen(d.path());
+    let kinds: Vec<_> = jobs.iter().map(|j| j["job"].as_str().unwrap()).collect();
+    assert_eq!(&kinds[..2], ["heal_check", "heal_check"], "the check, then the download, then the heal: {kinds:?}");
+    assert_eq!((jobs[1]["fetch"].clone(), jobs[1]["sources"]["student"].clone()), (json!(true), json!("acme/Pruned")));
+    for j in &jobs[2..] {
+        let folder = match j["job"].as_str().unwrap() { "distill_cache" => &j["student"], "distill" => &j["model"]["repo"], _ => &j["base"] };
+        assert_eq!(folder.as_str(), Some(cached.to_string_lossy().as_ref()), "{}", j["job"]);
+    }
+    let dir = p.folder.join("models").join(r["name"].as_str().unwrap());
+    assert_eq!(hsrc::read(&dir).unwrap().student_dir.as_deref(), Some(cached.to_string_lossy().as_ref()));
+    assert!(cached.join("config.json").is_file(), "the cache folder is read in place and never touched");
+}
+
+#[cfg(unix)]
+#[test]
+fn another_teacher_can_be_chosen_for_a_made_model_and_the_default_leaves_the_folder_as_it_was() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    made_model(&p, "slim-9b", 4_800_000_000, 4_000_000_000);
+    let model = p.folder.join("models/slim-9b/model");
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["family"] = json!("qwen3_5");
+    write_facts(d.path(), &[(model.to_str().unwrap(), sf), ("unsloth/Qwen3.5-4B", facts(4.8e9, "abc", 10)), ("acme/Better", facts(9.0e9, "abc", 10))]);
+    let made = Source::Made { name: "slim-9b".into() };
+    // the default teacher is the recorded original; the Check says which
+    let pair = hsrc::heal_pair(&p, &made, None, Some(32.0), false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((pair["check"]["ok"].clone(), pair["check"]["teacher_recorded"].clone(), pair["name"].clone(), pair["options"]["teacher"].clone()), (json!(true), json!("unsloth/Qwen3.5-4B"), json!("slim-9b"), json!("unsloth/Qwen3.5-4B")));
+    // another teacher: the options and the jobs use it, the recorded one stays in ndforge_reshape.json
+    let better = Source::Hub { id: "acme/Better".into() };
+    let pair = hsrc::heal_pair(&p, &made, Some(&better), Some(32.0), false, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((pair["options"]["teacher"].clone(), pair["options"]["teacher_chosen"].clone()), (json!("acme/Better"), json!(true)));
+    let r = hsrc::heal_from_source(&p, &made, Some(&better), &heal_spec(10), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    assert_eq!(r["name"], "slim-9b");
+    let jobs: Vec<_> = jobs_seen(d.path()).into_iter().filter(|j| j["job"] != "heal_check").collect();
+    assert_eq!((jobs[0]["distill"]["teacher"]["repo"].as_str(), jobs[1]["origin"]["repo"].as_str()), (Some("acme/Better"), Some("acme/Better")));
+    let dir = p.folder.join("models/slim-9b");
+    assert_eq!(hsrc::read(&dir).unwrap().teacher, Some(better));
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("ndforge_reshape.json")).unwrap()).unwrap();
+    assert_eq!(meta["origin"]["repo"], "unsloth/Qwen3.5-4B", "the made model's own record is not changed");
+    // it is still registered the way a made model is
+    assert_eq!(catalog::find("custom-local-slim-9b-healed").unwrap().derived_from.as_deref(), Some("acme/Better"));
 }

@@ -40,9 +40,19 @@ if a == ["--version"]:
     print("version: 9999 (stub1234)")
     sys.exit(0)
 log = os.environ["STUB_LOG"]
+if a == ["--help"]:
+    open(log, "a").write(json.dumps({"tool": "imatrix-help", "args": a}) + "\\n")
+    print("usage: llama-imatrix [options]\\n  --chunks N\\n" + ("" if os.environ.get("NEXTN_MODE") == "unsupported" else "  --nextn   collects data for MTP/NextN layers if present\\n"))
+    sys.exit(0)
 calib = a[a.index("-f") + 1]
 open(log, "a").write(json.dumps({"tool": "imatrix", "args": a, "calibration": open(calib, encoding="utf-8").read()}) + "\\n")
 mode = os.environ.get("IMATRIX_MODE", "")
+if "--nextn" in a and os.environ.get("NEXTN_MODE") == "refuse":
+    print("error: --nextn cannot be used on models where NextN layers share the trunk's KV cache")
+    sys.exit(1)
+if "--nextn" in a and os.environ.get("NEXTN_MODE") == "other":
+    print("CUDA out of memory")
+    sys.exit(2)
 if mode == "old" and "--output-format" in a:
     print("error: invalid argument: --output-format")
     sys.exit(1)
@@ -100,7 +110,7 @@ def world(tmp_path, monkeypatch):
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("STUB_LOG", str(log))
     monkeypatch.setenv("STUB_STARTED", str(tmp_path / "started"))
-    for var in ("IMATRIX_MODE", "QUANTIZE_REFUSES_IMATRIX"):
+    for var in ("IMATRIX_MODE", "QUANTIZE_REFUSES_IMATRIX", "NEXTN_MODE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(exportjob, "find_llama_cpp", lambda: (lcpp / "convert_hf_to_gguf.py", lcpp / "llama-quantize.py"))
     monkeypatch.setattr(imatrix, "find_llama_imatrix", lambda q: lcpp / "llama-imatrix.py")

@@ -19,6 +19,8 @@ Healing (distillation, `worker/ndforge_worker/distilljob.py`) ran out of graphic
 
 ## The settings (Heal card, Expert mode: "Healing settings"; the safe defaults apply without Expert mode)
 
+(The same card heals any model chosen in the *Heal a model* section, not only a made one: docs/HEAL_ANY_MODEL.md. The sizes it needs come from the made model's record or, for another model, from the Check.)
+
 | Setting | What it does | Default |
 |---|---|---|
 | Sequence length 512/1024/2048/4096 | tokens per training text. Memory grows with it. Changing it makes the original answer again (the cache is for one length) and restarts the learning. | 1024 from 15 B, else 2048 |

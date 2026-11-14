@@ -769,6 +769,91 @@ fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: S
     Ok(())
 }
 
+// ---- Heal a model: any model, not only the ones the Slim page made (docs/HEAL_ANY_MODEL.md). Job types and event names are the same as above.
+
+fn heal_source_of(v: Value) -> Result<ndforge_core::reshape::heal_source::Source, String> {
+    serde_json::from_value(v).map_err(|e| format!("The choice of model is not valid: {e}"))
+}
+
+fn heal_teacher_of(v: Value) -> Result<Option<ndforge_core::reshape::heal_source::Source>, String> {
+    if v.is_null() { Ok(None) } else { heal_source_of(v).map(Some) }
+}
+
+/// What the pickers of the Heal section offer: the made models, the model list's folders and Hugging Face ids, and the earlier heals of other models.
+#[tauri::command]
+fn heal_candidates(s: State<App>) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    Ok(ndforge_core::reshape::heal_source::heal_candidates(&p))
+}
+
+/// The Check of the Heal section: the pair compared in plain words. May ask the worker (and Hugging Face) the first time; `refresh` asks again.
+#[tauri::command]
+async fn heal_check(s: State<'_, App>, student: Value, teacher: Value, refresh: bool) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let (student, teacher) = (heal_source_of(student)?, heal_teacher_of(teacher)?);
+    let vram = card_vram_gb();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ctx = ndforge_core::reshape::heal_source::Ctx { vram_gb: vram, free_disk_gb: ndforge_core::envmgr::health::free_disk_gb(&ndforge_core::reshape::runs::models_dir(&p)) };
+        ndforge_core::reshape::heal_source::heal_check(&p, &student, teacher.as_ref(), ctx, refresh, &AtomicBool::new(false), &mut |_| {}).map_err(|e| e.to_string())
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// The Check and, when the pair passes it, the Heal card's options for it.
+#[tauri::command]
+async fn heal_pair(s: State<'_, App>, student: Value, teacher: Value, refresh: bool) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let (student, teacher) = (heal_source_of(student)?, heal_teacher_of(teacher)?);
+    let vram = card_vram_gb();
+    tauri::async_runtime::spawn_blocking(move || {
+        ndforge_core::reshape::heal_source::heal_pair(&p, &student, teacher.as_ref(), vram, refresh, &AtomicBool::new(false), &mut |_| {}).map_err(|e| e.to_string())
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// The live memory estimate for a pair (the Check's answer is kept, so this is quick).
+#[tauri::command]
+async fn heal_pair_estimate(s: State<'_, App>, student: Value, teacher: Value, spec: Value) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let (student, teacher) = (heal_source_of(student)?, heal_teacher_of(teacher)?);
+    let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let vram = card_vram_gb();
+    tauri::async_runtime::spawn_blocking(move || ndforge_core::reshape::heal_source::heal_pair_estimate(&p, &student, teacher.as_ref(), &spec, vram).map_err(|e| e.to_string()))
+        .await.map_err(|e| e.to_string())?
+}
+
+/// Heals the chosen pair (checks it again, makes the heal's folder, downloads a Hugging Face model first, then the three jobs of `heal_start`). Same events as
+/// `heal_start` on "reshape-event"; the end is {"kind": "done", "data": {...}} with the folder's "name" in it.
+#[tauri::command]
+fn heal_source_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, student: Value, teacher: Value, spec: Value) -> Out<()> {
+    let (student, teacher) = (heal_source_of(student)?, heal_teacher_of(teacher)?);
+    let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let m = lock(&s);
+    let p = m.project_clone().map_err(|e| e.to_string())?;
+    let keep_awake = m.settings.keep_awake;
+    drop(m);
+    if tasks.busy.swap(true, Ordering::SeqCst) {
+        return Err("Another job is still running. Wait for it or press Cancel.".into());
+    }
+    tasks.cancel.store(false, Ordering::SeqCst);
+    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    std::thread::spawn(move || {
+        let emitter = app.clone();
+        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
+        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
+        if !awake.note.is_empty() {
+            emit(serde_json::json!({"kind": "log", "text": awake.note}));
+        }
+        let r = ndforge_core::reshape::heal_source::heal_from_source(&p, &student, teacher.as_ref(), &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
+        drop(awake);
+        busy.store(false, Ordering::SeqCst);
+        let end = match r {
+            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
+            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
+        };
+        let _ = app.emit("reshape-event", end);
+    });
+    Ok(())
+}
+
 /// The Stop button of healing: the worker saves a checkpoint and stops; healing continues from it later.
 #[tauri::command]
 fn heal_stop(tasks: State<Tasks>) {
@@ -898,7 +983,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

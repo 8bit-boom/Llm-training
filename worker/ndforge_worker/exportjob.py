@@ -2,7 +2,10 @@
 
 Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
 keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
-imatrix (optional: the importance matrix for the sizes below q8_0, see imatrix.py; it always goes through llama.cpp. Result: `imatrix` with made / reused / applied / not_applied / notes / file)."""
+imatrix (optional: the importance matrix for the sizes below q8_0, see imatrix.py. It is measured with llama.cpp's llama-imatrix; the GGUF is then made by Unsloth (its
+save_pretrained_gguf(imatrix_file=...)) when the installed build can apply a matrix, else the llama.cpp way. Result: `imatrix` with made / reused / applied / not_applied / notes / file / nextn / via;
+and `via` ("unsloth" | "llama.cpp") for the GGUF step of every export)."""
+import inspect
 import json
 import os
 import shutil
@@ -148,28 +151,129 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
 
 
 def new_report() -> dict:
-    return {"requested": True, "made": False, "reused": False, "file": None, "applied": [], "not_applied": {}, "notes": [], "info": None}
+    return {"requested": True, "made": False, "reused": False, "file": None, "applied": [], "not_applied": {}, "notes": [], "info": None, "nextn": False, "via": None}
 
 
-def use_unsloth_for(backend: str, cfg: dict, quants: list, report) -> bool:
-    """Does Unsloth's save_pretrained_gguf make the GGUF? Only with the unsloth backend, and not when an importance matrix is wanted: the installed Unsloth is not
-    known to take one, so then llama.cpp (convert + llama-imatrix + llama-quantize) is used. Without llama-imatrix, or when no size below q8_0 is wanted,
-    the export goes through Unsloth as before and `report["notes"]` says why there is no matrix."""
-    if backend != "unsloth" or not cfg.get("gguf", True):
+def unsloth_can_apply_imatrix(save_fn, has_resolver=None) -> bool:
+    """Can this Unsloth build APPLY an importance matrix, not merely swallow the keyword? The same test as Unsloth Studio's export code: `save_pretrained_gguf`
+    has a parameter `imatrix_file` (positional-only does not count: it is passed by keyword), or takes **kwargs and unsloth_zoo has `llama_cpp.resolve_imatrix_file`
+    (a `**kwargs` alone may be a function that filters them away; unsloth_zoo's CPU loader is such a function and is refused here, which is stricter than Studio). `has_resolver` (a function returning bool) replaces the import check, for the tests."""
+    try:
+        params = inspect.signature(save_fn).parameters
+    except (TypeError, ValueError):
         return False
-    if report is None:
+    p = params.get("imatrix_file")
+    if p is not None and p.kind is not inspect.Parameter.POSITIONAL_ONLY:
         return True
+    if not any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values()):
+        return False
+    if str(getattr(save_fn, "__module__", "")).startswith("unsloth_zoo.cpu"):
+        return False        # unsloth_zoo's CPU loader takes **kwargs and drops imatrix_file without a word (version 2026.11.4); Studio's test would call it capable
+    if has_resolver is not None:
+        return bool(has_resolver())
+    try:
+        from unsloth_zoo.llama_cpp import resolve_imatrix_file  # noqa: F401
+    except Exception:       # noqa: BLE001 - any trouble importing means "cannot"
+        return False
+    return True
+
+
+def installed_save_fn():
+    """The function Unsloth puts on a model as `save_pretrained_gguf` (None when Unsloth cannot be imported). Looked at before the model is loaded, so that the matrix
+    can be measured while no model sits in memory."""
+    try:
+        import unsloth.save as unsloth_save
+        return unsloth_save.unsloth_save_pretrained_gguf
+    except Exception:       # noqa: BLE001 - no GPU, not installed, a different build: then it cannot be asked
+        return None
+
+
+def plan_gguf(backend: str, cfg: dict, quants: list, report, can_apply=None):
+    """(use_unsloth, matrix_via_unsloth): who makes the GGUF, and does Unsloth get a matrix measured here?
+    Without a matrix asked for (report None): Unsloth with the unsloth back end, as before. With one, and sizes below Q8_0:
+      - llama.cpp (convert script + llama-quantize + llama-imatrix) found and `can_apply()` (this Unsloth build applies a matrix): Unsloth makes the GGUF and is given the matrix;
+      - llama.cpp found, the build cannot apply one: llama.cpp makes the GGUF (convert + llama-imatrix + llama-quantize), as before;
+      - llama.cpp or llama-imatrix not found: Unsloth without a matrix, and a note says so.
+    `report["via"]` and the notes say which; the log too. `can_apply` is called only when it matters (the unsloth package is imported late)."""
+    if backend != "unsloth" or not cfg.get("gguf", True):
+        return False, False
+    if report is None:
+        return True, False
+    report["via"] = "unsloth"
     conv, quantize = find_llama_cpp()
     if not [q for q in quants if q not in imatrix.NO_IMATRIX]:
         report["notes"].append("The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made.")
-    elif conv is not None and imatrix.find_llama_imatrix(quantize) is not None:
-        protocol.log("An importance matrix was asked for: the GGUF is made with llama.cpp (it applies the matrix) instead of Unsloth.")
-        return False
-    else:
+    elif conv is None or imatrix.find_llama_imatrix(quantize) is None:
         report["notes"].append("An importance matrix was asked for, but llama.cpp (with llama-imatrix) was not found, so the GGUF was made through Unsloth without it. "
                                "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
         protocol.log(report["notes"][-1])
-    return True
+    elif can_apply is not None and can_apply():
+        protocol.log("An importance matrix was asked for: llama.cpp measures it, Unsloth applies it (save_pretrained_gguf with imatrix_file).")
+        return True, True
+    else:
+        report["via"] = "llama.cpp"
+        protocol.log("An importance matrix was asked for, but this Unsloth build cannot apply one: the GGUF is made with llama.cpp (it applies the matrix) instead of Unsloth.")
+        return False, False
+    return True, False
+
+
+def use_unsloth_for(backend: str, cfg: dict, quants: list, report, can_apply=None) -> bool:
+    """Does Unsloth's save_pretrained_gguf make the GGUF? See plan_gguf."""
+    return plan_gguf(backend, cfg, quants, report, can_apply)[0]
+
+
+def _newer_than_weights(path: Path, cfg: dict) -> bool:
+    folder = cfg.get("full_model") or cfg.get("adapter")
+    files = list(Path(folder).glob("*.safetensors")) if folder and Path(folder).is_dir() else []
+    return Path(path).is_file() and all(Path(path).stat().st_mtime >= f.stat().st_mtime for f in files)
+
+
+def matrix_for_unsloth(cfg: dict, merged: Path, out: Path, quants: list, report: dict):
+    """The importance matrix (made or reused, saved as out/imatrix.gguf) for an export that Unsloth finishes. It is measured with llama.cpp on a 16-bit GGUF: one
+    already in the export folder (model-f16.gguf, newer than the weights), else made now (merge with Transformers + PEFT, then llama.cpp's converter; both are removed
+    afterwards, Unsloth merges again by itself). Returns the matrix file or None; every problem is a note, never an error. Raises imatrix.Stopped on Stop."""
+    conv, quantize = find_llama_cpp()
+    f16 = out / "model-f16.gguf"
+    scratch = out / "imatrix-f16.gguf"
+    made_merged = []
+
+    def make_f16():
+        if _newer_than_weights(f16, cfg):
+            protocol.log("The 16-bit GGUF already in the export folder is used to measure the matrix.")
+            return f16
+        if not cfg.get("full_model") and not merged.exists():
+            merge_hf(cfg, merged)
+            made_merged.append(merged)
+            _release_memory()
+        protocol.progress("gguf", 0.15, "Converting to a 16-bit GGUF to measure the matrix")
+        _run([sys.executable, conv, merged, "--outfile", scratch, "--outtype", "f16"], "The GGUF conversion")
+        return scratch
+
+    try:
+        return imatrix.prepare(cfg, merged, out, make_f16, quantize, quants, report)
+    except imatrix.Stopped:
+        raise
+    except Exception as exc:    # noqa: BLE001 - merging or converting failed: Unsloth still makes the files, without the matrix
+        msg = f"The importance matrix could not be made ({type(exc).__name__}: {str(exc)[:200]}), so the sizes were made without it."
+        report["notes"].append(msg)
+        protocol.log(msg)
+        return None
+    finally:
+        scratch.unlink(missing_ok=True)
+        (out / "imatrix.partial.gguf").unlink(missing_ok=True)
+        for m in made_merged:           # Unsloth merges by itself (and saves the merged model again when it is kept)
+            shutil.rmtree(m, ignore_errors=True)
+
+
+def _release_memory():
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:       # noqa: BLE001 - only a courtesy to the next loader
+        pass
 
 
 def find_gguf(dirs, quant: str, strict: bool = False):
@@ -177,7 +281,7 @@ def find_gguf(dirs, quant: str, strict: bool = False):
     files = [f for d in dirs if Path(d).exists() for f in Path(d).rglob("*.gguf")]
     want = [f for f in files if quant.lower() in f.name.lower()]
     pool = want if strict else (want or [f for f in files if "mmproj" not in f.name.lower()])
-    pool = [f for f in pool if "mmproj" not in f.name.lower()]
+    pool = [f for f in pool if "mmproj" not in f.name.lower() and "imatrix" not in f.name.lower()]
     return max(pool, key=lambda f: f.stat().st_mtime) if pool else None
 
 
@@ -199,7 +303,10 @@ def run(cfg: dict) -> int:
     report = new_report() if (cfg.get("imatrix") and cfg["imatrix"].get("enabled", True) and cfg.get("gguf", True)) else None
     if report is None:
         cfg = {k: v for k, v in cfg.items() if k != "imatrix"}
-    use_unsloth = use_unsloth_for(backend, cfg, quants, report)
+    use_unsloth, unsloth_matrix = plan_gguf(backend, cfg, quants, report, lambda: unsloth_can_apply_imatrix(installed_save_fn()))
+    matrix_file = None
+    if use_unsloth and unsloth_matrix:
+        matrix_file = matrix_for_unsloth(cfg, merged, out, quants, report)
     if use_unsloth:
         from unsloth import FastLanguageModel, FastModel
         from .families import family
@@ -213,7 +320,34 @@ def run(cfg: dict) -> int:
             protocol.log("The base model's image processor was added so the vision file can be made.")
         tokenizer = wrapped
         protocol.progress("gguf", 0.3, "Merging and converting to GGUF (Unsloth)")
-        model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=quants if len(quants) > 1 else quant)
+        method = quants if len(quants) > 1 else quant
+        if matrix_file is not None and not unsloth_can_apply_imatrix(model.save_pretrained_gguf):
+            report["notes"].append("The loaded Unsloth could not take the importance matrix after all, so the GGUF was made through Unsloth without it.")
+            protocol.log(report["notes"][-1])
+            report.update(applied=[], nextn=False)
+            matrix_file = None
+        try:
+            if matrix_file is None:
+                model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=method)
+            else:
+                # one call for the whole batch: another call would merge the model again. The matrix does (almost) nothing for Q8_0 and the 16-bit files; llama-quantize ignores it there
+                model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=method, imatrix_file=str(matrix_file))
+        except Exception as exc:    # noqa: BLE001 - Unsloth refused the matrix: once more without it
+            if matrix_file is None or "imatrix" not in str(exc).lower():
+                raise
+            msg = f"Unsloth did not accept the importance matrix ({type(exc).__name__}: {str(exc)[:200]}), so the GGUF was made through Unsloth without it."
+            report["notes"].append(msg)
+            protocol.log(msg)
+            report.update(applied=[], nextn=False)
+            matrix_file = None
+            shutil.rmtree(tmp, ignore_errors=True)
+            model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=method)
+        if matrix_file is not None:
+            for q in quants:
+                if q in imatrix.NO_IMATRIX:
+                    report["not_applied"][q] = "high precision: the matrix would change almost nothing"
+                else:
+                    report["applied"].append(q)
         for q in quants:
             found = find_gguf([tmp, str(tmp) + "_gguf", out], q, strict=len(quants) > 1)
             if found is None:
@@ -262,7 +396,10 @@ def run(cfg: dict) -> int:
     elif not gguf_path:
         note = "Merged 16-bit model only (no GGUF requested)."
     protocol.progress("done", 1.0, "Export ready")
-    summary = {"gguf": str(gguf_path) if gguf_path else None, "ggufs": {q: str(f) for q, f in ggufs.items()}, "mmproj": str(mmproj) if mmproj else None, "modalities": mods, "vision_note": vnote, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
+    via = (report["via"] if report is not None and report.get("via") else "unsloth" if use_unsloth else "llama.cpp") if gguf_path else None
+    if report is not None:
+        report["via"] = via
+    summary = {"gguf": str(gguf_path) if gguf_path else None, "via": via, "ggufs": {q: str(f) for q, f in ggufs.items()}, "mmproj": str(mmproj) if mmproj else None, "modalities": mods, "vision_note": vnote, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
                "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note,
                "imatrix": dict(report, note=" ".join(report["notes"])) if report is not None else None}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

@@ -9,13 +9,15 @@ uses it. It helps the sizes at about 4 bits and below; Q8_0 and F16/BF16 are lef
     never fatal        every problem becomes a note and the sizes are made without the matrix; only the Stop button ends the export (Stopped)
 
 Config (job["imatrix"]): {"enabled": true, "model": run name, "data_version": n, "train": train.jsonl path, "chunks": 128, "ctx": 512, "general_share": 0.2,
-"reuse": true, "reuse_dirs": [export folders that may hold a saved matrix], "general": {"id" | "file", "column", ...} | None, "stop_file": path}."""
+"reuse": true, "reuse_dirs": [export folders that may hold a saved matrix], "general": {"id" | "file", "column", ...} | None, "stop_file": path,
+"nextn": true (also measure the model's speculative-decoding / MTP head; only when the model has one and this llama-imatrix has --nextn)}."""
 import hashlib
 import os
 import queue
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -65,6 +67,169 @@ def tool_version(tool) -> str:
                 return line.strip()[:200]
     except Exception:       # noqa: BLE001 - the version string is a nicety
         pass
+    return ""
+
+
+# ------------------------------------------------------------------------------------------------------------------ the speculative-decoding (MTP / NextN) head
+
+MTP_CONFIG_KEYS = ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+NEXTN_REFUSAL = ("nextn", "kv cache", "mtp")      # words of the text llama-imatrix prints when it cannot measure the head
+
+
+def mtp_in_config(cfg) -> bool:
+    """Does a model's config.json (a dict; the keys may sit in `text_config`) announce MTP / NextN layers?"""
+    if not isinstance(cfg, dict):
+        return False
+    for d in (cfg, cfg.get("text_config")):
+        if isinstance(d, dict):
+            for k in MTP_CONFIG_KEYS:
+                v = d.get(k)
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                    return True
+    return False
+
+
+def mtp_in_tensor_names(names) -> bool:
+    """Is any tensor of the MTP head among these names (`mtp.layers.0...`, `model.mtp...`)?"""
+    return any(n.startswith("mtp.") or n.startswith("model.mtp.") for n in names)
+
+
+def folder_has_mtp(folder):
+    """True / False / None (cannot tell) for a model folder: the config keys, else the tensor names of its safetensors files (the index when there is one)."""
+    import json
+    from . import safetensors_io
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+    try:
+        cfg = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = None
+    if mtp_in_config(cfg):
+        return True
+    try:
+        index = folder / safetensors_io.INDEX_NAME
+        if index.is_file():
+            names = list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
+        else:
+            files = sorted(folder.glob("*.safetensors"))
+            if not files:
+                return False if cfg is not None else None
+            names = [n for f in files for n in safetensors_io.read_header(f)[0] if n != "__metadata__"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None if cfg is None else False
+    return mtp_in_tensor_names(names)
+
+
+_GGUF_FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def gguf_has_mtp(path):
+    """True / False / None for a GGUF file: a key ending `nextn_predict_layers` with a value above 0, or a tensor named `...nextn...` / `mtp...`. None when the file is not
+    a readable GGUF (the tests' stand-in files, a truncated file). Only the header is read."""
+    try:
+        with open(path, "rb") as fh:
+            def take(fmt):
+                size = struct.calcsize(fmt)
+                raw = fh.read(size)
+                if len(raw) != size:
+                    raise ValueError("short")
+                return struct.unpack("<" + fmt, raw)[0]
+
+            def string(keep=False):
+                n = take("Q")
+                if n > 1 << 24:
+                    raise ValueError("long string")
+                if keep:
+                    return fh.read(n).decode("utf-8", "replace")
+                fh.seek(n, 1)
+
+            def value(kind):
+                if kind in _GGUF_FIXED:
+                    return take({0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}[kind])
+                if kind == 8:
+                    return string()
+                if kind == 9:
+                    inner, n = take("I"), take("Q")
+                    if inner in _GGUF_FIXED:
+                        fh.seek(_GGUF_FIXED[inner] * n, 1)
+                    else:
+                        for _ in range(n):
+                            value(inner)
+                    return None
+                raise ValueError("unknown value type")
+
+            if fh.read(4) != b"GGUF":
+                return None
+            if take("I") < 2:
+                return None
+            tensors, kvs = take("Q"), take("Q")
+            if tensors > 1 << 22 or kvs > 1 << 22:
+                return None
+            found = False
+            for _ in range(kvs):
+                key = string(keep=True)
+                v = value(take("I"))
+                if key.endswith("nextn_predict_layers") and isinstance(v, int) and v > 0:
+                    found = True
+            for _ in range(tensors):
+                name = string(keep=True)
+                for _ in range(take("I")):
+                    take("Q")
+                take("I")
+                take("Q")
+                if "nextn" in name or name.startswith("mtp.") or ".mtp." in name:
+                    found = True
+            return found
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def hf_cache_dirs(repo: str) -> list:
+    """Snapshot folders of a Hugging Face model id in the local cache (newest first); [] when it is not cached or `repo` is not an id."""
+    if not repo or "/" not in repo or Path(repo).exists():
+        return []
+    roots = [os.environ.get("HF_HUB_CACHE"), os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else None,
+             str(Path.home() / ".cache" / "huggingface" / "hub")]
+    found = []
+    for root in filter(None, roots):
+        snaps = Path(root) / ("models--" + repo.replace("/", "--")) / "snapshots"
+        if snaps.is_dir():
+            found += sorted((d for d in snaps.iterdir() if (d / "config.json").is_file()), key=lambda d: d.stat().st_mtime, reverse=True)
+    return found
+
+
+def model_has_mtp(cfg: dict, merged, f16=None):
+    """Does the model being exported have an MTP head? True / False / None (cannot tell). The converted 16-bit GGUF is the best witness (it is what llama-imatrix
+    reads); else the merged folder, the full model, the base model (a folder or the Hugging Face cache)."""
+    if f16 is not None and Path(f16).is_file():
+        seen = gguf_has_mtp(f16)
+        if seen is not None:
+            return seen
+    folders = [merged, cfg.get("full_model"), cfg["base"].get("repo")]
+    folders += hf_cache_dirs(cfg["base"].get("repo") or "")
+    for f in folders:
+        if f and Path(f).is_dir():
+            seen = folder_has_mtp(f)
+            if seen is not None:
+                return seen
+    return None
+
+
+def nextn_supported(tool) -> bool:
+    """Does this llama-imatrix know --nextn? Asked once with `--help`."""
+    try:
+        p = subprocess.run(launcher(tool) + ["--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=60)
+        return "--nextn" in p.stdout
+    except Exception:       # noqa: BLE001 - cannot ask: leave the head out
+        return False
+
+
+def nextn_refused(tail) -> str:
+    """The line of llama-imatrix's output that tells why it cannot measure the MTP head (mentions nextn or the KV cache), or "" when the failure is something else."""
+    for line in tail:
+        if any(w in line.lower() for w in NEXTN_REFUSAL):
+            return line.strip()[:200]
     return ""
 
 
@@ -195,13 +360,22 @@ def weights_fingerprint(cfg: dict) -> str:
     return h.hexdigest()
 
 
-def settings_key(cfg: dict, im: dict, data_hash: str) -> dict:
+def settings_key(cfg: dict, im: dict, data_hash: str, nextn: bool = False) -> dict:
     """What a saved matrix was made from. "general" is the dataset (id or file, config, split, column, share, seed): another dataset never reuses this matrix
-    (a matrix saved before this key existed has no "general" and counts as made from other data)."""
+    (a matrix saved before this key existed has no "general" and counts as made from other data). "nextn" is whether the MTP head is part of the measuring:
+    exact match, so a matrix made without the head is not used when the head is wanted, nor the reverse (one saved before this key existed counts as without)."""
     from . import generaltext
     share = float(im.get("general_share", DEFAULT_SHARE))
     return {"model": im.get("model") or "", "weights": weights_fingerprint(cfg), "data_hash": data_hash, "chunks": int(im.get("chunks", 128)),
-            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407)))}
+            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407))), "nextn": bool(nextn)}
+
+
+def _saved_value(info: dict, k: str):
+    """What a saved imatrix.json says for key `k`. "nextn" is compared with what was asked and possible then ("nextn_asked"; a matrix whose head was refused still
+    answers the same question next time), and a file saved before the key existed counts as made without the head."""
+    if k == "nextn":
+        return bool(info.get("nextn_asked", info.get("nextn", False)))
+    return info.get(k)
 
 
 def find_saved(dirs, key: dict, general_wanted: bool):
@@ -214,7 +388,7 @@ def find_saved(dirs, key: dict, general_wanted: bool):
         try:
             info = json.loads((d / "imatrix.json").read_text(encoding="utf-8"))
             f = d / "imatrix.gguf"
-            if not f.is_file() or info.get("format") != FORMAT or any(info.get(k) != v for k, v in key.items()):
+            if not f.is_file() or info.get("format") != FORMAT or any(_saved_value(info, k) != v for k, v in key.items()):
                 continue
             if general_wanted and not info.get("general_used"):
                 continue
@@ -289,9 +463,11 @@ def load_tokenizer(sources):
     raise last or ValueError("no tokenizer")
 
 
-def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: list, report: dict):
+def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, report: dict):
     """Makes (or reuses) out/imatrix.gguf for the quantisations below Q8_0. Returns the matrix file, or None when there is none: then report["notes"] says why
-    in plain words and the sizes are made without it. Only the STOP file raises (Stopped)."""
+    in plain words and the sizes are made without it. Only the STOP file raises (Stopped).
+    `f16` is the 16-bit GGUF to measure on: a path, or a function that makes it (called only when the matrix is really measured, not when a saved one is reused;
+    the file need not exist yet then). With im["nextn"] the speculative-decoding head is measured too when the model has one and this llama-imatrix knows --nextn."""
     import json
     im = cfg["imatrix"]
     note = report["notes"].append
@@ -312,7 +488,22 @@ def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: lis
         train = im.get("train")
         if not train or not Path(train).is_file():
             return give_up("The training data of this run is missing, so the importance matrix could not be made. The sizes were made without it.")
-        key = settings_key(cfg, im, file_sha256(train))
+        want_nextn, head, nnote = False, None, ""
+        if im.get("nextn"):
+            head = model_has_mtp(cfg, merged, None if callable(f16) else f16)
+            if head is None and callable(f16):          # nothing on disk tells yet (the model is merged only when the 16-bit file is made): make it now
+                f16 = f16()
+                head = model_has_mtp(cfg, merged, f16)
+            if head is True:
+                if nextn_supported(tool):
+                    want_nextn = True
+                else:
+                    nnote = "this llama-imatrix has no --nextn option (an older build)"
+            elif head is False:
+                nnote = "the model has no speculative-decoding head"
+            else:
+                nnote = "it could not be told whether the model has one"
+        key = settings_key(cfg, im, file_sha256(train), want_nextn)
         share = key["general_share"]
         target = out / "imatrix.gguf"
         if im.get("reuse", True):
@@ -321,7 +512,11 @@ def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: lis
                 if (folder / "imatrix.gguf").resolve() != target.resolve():
                     shutil.copy2(folder / "imatrix.gguf", target)
                     shutil.copy2(folder / "imatrix.json", out / "imatrix.json")
-                report.update(made=False, reused=True, file=str(target), info=info)
+                report.update(made=False, reused=True, file=str(target), info=info, nextn=bool(info.get("nextn")))
+                if nnote:
+                    note(f"The MTP head was left out: {nnote}.")
+                elif want_nextn and not info.get("nextn"):
+                    note(f"The MTP head was left out: {info.get('nextn_note') or 'llama-imatrix could not measure it'}.")
                 protocol.log(f"The saved importance matrix of this model and data is used again ({key['chunks']} chunks).")
                 return target
         tokenizer = load_tokenizer([merged, cfg["base"]["repo"]])
@@ -347,24 +542,42 @@ def prepare(cfg: dict, merged: Path, out: Path, f16: Path, quantize, quants: lis
                      + (f", your data repeated to fill it" if stats["repeated"] else "") + f") and {stats['general_rows']} general texts ({stats['general_tokens']:,} tokens).")
         partial = out / "imatrix.partial.gguf"
         partial.unlink(missing_ok=True)
+        if callable(f16):
+            f16 = f16()
         base = launcher(tool) + ["-m", f16, "-f", calib, "-o", partial]
         flags = ["--no-ppl", "--chunks", chunks, "--parse-special", "-ngl", 99, "-c", ctx]
-        try:
-            rc, tail = run_streaming(base + ["--output-format", "gguf"] + flags, im, chunks)
+
+        def measure(with_head):
+            extra = ["-b", ctx, "--nextn"] if with_head else []         # --nextn needs one sequence per batch: the batch size must not exceed the context
+            rc, tail = run_streaming(base + ["--output-format", "gguf"] + flags + extra, im, chunks)
             if rc != 0 and any("output-format" in line for line in tail):      # an older llama-imatrix that does not know the flag (its file format is the default there)
                 protocol.log("This llama-imatrix has no --output-format; trying without it.")
-                rc, tail = run_streaming(base + flags, im, chunks)
+                rc, tail = run_streaming(base + flags + extra, im, chunks)
+            return rc, tail
+
+        used_nextn, left_out = want_nextn, nnote
+        try:
+            rc, tail = measure(want_nextn)
+            if rc != 0 and want_nextn:
+                why = nextn_refused(tail)
+                if why:                                                  # the head cannot be measured here: once more without it
+                    left_out, used_nextn = why, False
+                    protocol.log(f"llama-imatrix would not measure the MTP head ({why}); trying once without it.")
+                    partial.unlink(missing_ok=True)
+                    rc, tail = measure(False)
         finally:
             calib.unlink(missing_ok=True)
+        if left_out:
+            note(f"The MTP head was left out: {left_out}.")
         if rc != 0 or not partial.is_file():
             partial.unlink(missing_ok=True)
             return give_up(f"llama-imatrix failed (exit code {rc}; see the log), so the sizes were made without the importance matrix.")
         os.replace(partial, target)
-        info = {"format": FORMAT, **key, "data_version": im.get("data_version"), "base_repo": cfg["base"]["repo"], "general_used": bool(general), "general_source": (im.get("general") or {}).get("file")
+        info = {"format": FORMAT, **key, "nextn": used_nextn, "nextn_asked": want_nextn, "data_version": im.get("data_version"), "base_repo": cfg["base"]["repo"], "general_used": bool(general), "general_source": (im.get("general") or {}).get("file")
                 or (im.get("general") or {}).get("id") or ("default" if general else None), "general_error": gnote or None, "project_tokens": stats["project_tokens"], "general_tokens": stats["general_tokens"],
-                "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                "nextn_note": left_out or None, "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         (out / "imatrix.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
-        report.update(made=True, reused=False, file=str(target), info=info)
+        report.update(made=True, reused=False, file=str(target), info=info, nextn=used_nextn)
         protocol.progress("imatrix", 1.0, "Importance matrix ready")
         return target
     except Stopped:

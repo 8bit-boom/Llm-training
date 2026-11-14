@@ -80,7 +80,7 @@ test("Make the files sends the matrix options only when ticked", async () => {
   assert.equal(b.calls.at(-1)[0], "export_start");
   b.run("us.im = true; us.imChunks = 64; us.quants = ['q4_k_m', 'q8_0']"); b.run("renderUse(); wireUse()");
   b.els["us-make"].onclick();
-  assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].imatrix)), { enabled: true, chunks: 64, reuse: true, general: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].imatrix)), { enabled: true, chunks: 64, reuse: true, nextn: false, general: null });
   assert.deepEqual(JSON.parse(JSON.stringify(b.calls.at(-1)[1].quants)), ["q4_k_m", "q8_0"]);
   b.run("us.imReuse = false"); b.run("wireUse()");
   b.els["us-make"].onclick();
@@ -126,4 +126,68 @@ test("the result of an export names the matrix note", () => {
   assert.match(b.run("us.ok"), /Importance matrix: This llama\.cpp has no llama-imatrix\./);
   b.run(`onExportEvent({kind: "error", text: "Cancelled."})`);
   assert.match(b.run("us.error"), /^Cancelled\. The export was stopped/);
+});
+
+test("the speculative-decoding head option is shown only for a model that has one, on by default, and is sent as chosen", () => {
+  const b = browser();
+  page(b, exportState({}, { mtp: { run1: false } }));
+  b.run("us.im = true");
+  assert.doesNotMatch(b.run("renderUse()"), /us-imnextn|speculative-decoding/);
+  page(b, exportState({}, { mtp: { run1: null } }));
+  b.run("us.im = true");
+  assert.doesNotMatch(b.run("renderUse()"), /us-imnextn/);                         // unknown: not offered
+  page(b, exportState({}, { mtp: { run1: true } }));
+  b.run("us.im = true; us.quants = ['q4_k_m']");
+  let html = b.run("renderUse()");
+  assert.match(html, /id="us-imnextn" checked\s*> Include the speculative-decoding head \(MTP\) in the matrix/);
+  b.run("renderUse(); wireUse()"); b.els["us-make"].onclick();
+  assert.equal(b.calls.at(-1)[1].imatrix.nextn, true);
+  b.run("wireUse()"); b.els["us-imnextn"].checked = false; b.els["us-imnextn"].onchange();
+  assert.match(b.run("renderUse()"), /id="us-imnextn"\s+>/);
+  b.run("wireUse()"); b.els["us-make"].onclick();
+  assert.equal(b.calls.at(-1)[1].imatrix.nextn, false);
+});
+
+test("the head option is greyed with the reason when llama-imatrix is known not to support it, and the matrix is then asked without it", () => {
+  const b = browser();
+  page(b, exportState({}, { mtp: { run1: true }, nextn_supported: false }));
+  b.run("us.im = true");
+  const html = b.run("renderUse()");
+  assert.match(html, /id="us-imnextn"\s+disabled>/);
+  assert.match(html, /Not available: this llama\.cpp has no --nextn option \(an older build\)\. The matrix is made without the head\./);
+  b.run("renderUse(); wireUse()"); b.els["us-make"].onclick();
+  assert.equal(b.calls.at(-1)[1].imatrix.nextn, false);
+  page(b, exportState({}, { mtp: { run1: true }, nextn_supported: false, nextn_reason: "the installed llama-imatrix is too old" }));
+  b.run("us.im = true");
+  assert.match(b.run("renderUse()"), /Not available: the installed llama-imatrix is too old/);
+});
+
+test("the head option is not shown while the matrix is off or for a merged-only export", () => {
+  const b = browser();
+  page(b, exportState({}, { mtp: { run1: true } }));
+  assert.doesNotMatch(b.run("renderUse()"), /us-imnextn/);
+  b.run("us.im = true; us.what = 'merged'");
+  assert.doesNotMatch(b.run("renderUse()"), /us-imnextn/);
+});
+
+test("the page explains the real flow: llama.cpp measures, Unsloth applies it when it can, else llama.cpp makes the files", () => {
+  const b = browser();
+  page(b, exportState());
+  const html = b.run("renderUse()");
+  assert.match(html, /llama\.cpp \(<code>llama-imatrix<\/code>\) measures the matrix/);
+  assert.match(html, /If the installed Unsloth can apply a matrix, Unsloth makes the files with it, otherwise llama\.cpp does/);
+  assert.doesNotMatch(html, /instead of Unsloth|llama\.cpp way/);
+});
+
+test("the files list says who made the GGUF and whether the head is in the matrix", () => {
+  const b = browser();
+  const m = (over) => ({ requested: true, applied: true, chunks: 128, reused: false, note: "", ...over });
+  const html = page(b, exportState({ exports: [
+    { name: "run1-q4_k_m", gguf_file: "m.gguf", size_mb: 5000, dir: "/p/e/1", via: "unsloth", imatrix: m({ nextn: true }) },
+    { name: "run1-q6_k", gguf_file: "m.gguf", size_mb: 7000, dir: "/p/e/2", via: "llama.cpp", imatrix: m() },
+    { name: "run1-q8_0", gguf_file: "m.gguf", size_mb: 9000, dir: "/p/e/3", via: "unsloth" },
+  ] }));
+  assert.match(html, /GGUF made by Unsloth<\/span> · <span title="">importance matrix used \(128 chunks, with the speculative-decoding head\)/);
+  assert.match(html, /GGUF made by llama\.cpp<\/span> · <span title="">importance matrix used \(128 chunks\)</);
+  assert.equal((html.match(/GGUF made by/g) || []).length, 2);                       // an export without a matrix shows nothing new
 });

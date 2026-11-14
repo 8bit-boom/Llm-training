@@ -61,6 +61,16 @@ The thinner model is **healed** by distillation: the **original model is the tea
 - **The result** is a new, self-contained model (`models/<name>/healed`, as large as the thinner one) in the model list of Step 3, marked *healed*. The chart shows how far the thinner model's answers are from the original's and the text-prediction error on your data. The distillation checkpoints are deleted afterwards.
 - **Test it.** *Test the healed model* asks the same questions as Step 4; the table shows **original · thinner · healed** side by side. Train the healed model in Step 3 as usual.
 
+## Heal a model (any model)
+The **Heal a model** section on this page heals a model whether or not this page made it. Choose two things:
+
+- **Model to heal** (the student): *Made by this program* (the first one is chosen for you), *My models* (the folders and Hugging Face names in your model list), *Earlier heals of other models*, *Models that come with the program* (healing a whole, unchanged one is pointless: the page warns you), *A folder on this computer…* (its own folder, with `config.json` and the `.safetensors` files) or *A Hugging Face model…* (`owner/model`).
+- **Original model** (the teacher): for a model made here it is the model it was made from. For any other model you must choose it. If the model's card names a base model the page offers it as **a guess**: use it only if it really is the model yours was made from.
+
+**Check** reads the files of both models (sizes, layers, tokenizer, licence; nothing is loaded, nothing is downloaded) and says in plain words what works (green tick), what to watch (yellow) and what is refused (red). Healing needs: full-precision `.safetensors` models (no GGUF, no quantized ones), a family this page supports (Qwen3.5, Qwen3, Qwen2, Llama, Mistral), and **exactly the same tokenizer** in both models (the teacher's answers are word-by-word probabilities). A smaller teacher gets a warning, different hidden sizes are fine. A Hugging Face model that is not on this computer is **downloaded when you press Start**; the Check tells you the size. Nothing is written until Start.
+
+The model you heal is only read, never changed or copied; the healed copy is a new folder inside the project (`models/<name>/healed`) and appears in the model list of Step 3. The healed copy is a derivative of both models: check their licences (the Check shows them when it can read them). Settings, estimate, Start, Stop and Continue are the same as for a model made here; nothing is recorded about how well the model answered before healing, so the error before healing is measured when healing starts.
+
 ## Files and disk space
 The new model is a full copy: about 2 bytes per parameter (a 21 B model is about 43 GB); healing adds another copy of that size (the healed model) and the teacher's saved answers. The page shows the space needed and checks the free space first. A model that is not on this computer is downloaded first (that needs its full size in the Hugging Face cache as well). **Delete** removes a made model; it is refused while a training run used it as its base.
 
