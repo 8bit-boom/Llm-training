@@ -491,6 +491,9 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
         want_nextn, head, nnote = False, None, ""
         if im.get("nextn"):
             head = model_has_mtp(cfg, merged, None if callable(f16) else f16)
+            if head is None and callable(f16):          # nothing on disk tells yet (the model is merged only when the 16-bit file is made): make it now
+                f16 = f16()
+                head = model_has_mtp(cfg, merged, f16)
             if head is True:
                 if nextn_supported(tool):
                     want_nextn = True
