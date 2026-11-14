@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use serde::{Deserialize, Serialize};
 
+use super::heal_source;
 use super::plan::{self, Inspect, Mode, ReshapeSpec, Width};
 use crate::envmgr::jobs::{run_job, WorkerEvent};
 use crate::envmgr::{env_dir, python_path, worker_dir};
@@ -26,7 +27,7 @@ pub fn models_dir(p: &Project) -> PathBuf {
     p.folder.join("models")
 }
 
-fn write_json(path: &Path, v: &Value) -> Result<()> {
+pub(super) fn write_json(path: &Path, v: &Value) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
@@ -36,16 +37,16 @@ fn write_json(path: &Path, v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_json(path: &Path) -> Option<Value> {
+pub(super) fn read_json(path: &Path) -> Option<Value> {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-fn now() -> String {
+pub(super) fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Folder names come from the window: no path tricks.
-fn valid_name(name: &str) -> Result<()> {
+pub(super) fn valid_name(name: &str) -> Result<()> {
     if name.is_empty() || name.starts_with('_') || name.contains(['/', '\\']) || name.contains("..") {
         return Err(Error::new("That is not the name of a made model."));
     }
@@ -64,7 +65,7 @@ fn set_state(dir: &Path, patch: Value) {
 }
 
 /// "qwen3.5-27b" from "Qwen3.5 27B" (letters, digits and dots; the rest becomes a dash)
-fn slug(text: &str) -> String {
+pub(super) fn slug(text: &str) -> String {
     let s: String = text.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect();
     let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
     s.chars().take(40).collect::<String>().trim_matches('-').to_string()
@@ -123,7 +124,7 @@ pub fn event_json(e: WorkerEvent) -> Value {
     }
 }
 
-fn python() -> Result<PathBuf> {
+pub(super) fn python() -> Result<PathBuf> {
     let py = python_path(&env_dir());
     if !py.is_file() {
         return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
@@ -312,7 +313,7 @@ pub fn register_healed(p: &Project, name: &str) -> Result<String> {
     register_folder(p, name, "healed")
 }
 
-fn thousands(n: u64) -> String {
+pub(super) fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -336,6 +337,9 @@ fn register_folder(p: &Project, name: &str, sub: &str) -> Result<String> {
         return Ok(m.id);
     }
     let mut entry = crate::train::hub::lookup(&repo)?.entry;
+    if healed && heal_source::is_external(&dir) {
+        return register_external_healed(&dir, entry, &model, name);
+    }
     let meta = read_json(&model.join("ndforge_reshape.json")).unwrap_or(Value::Null);
     let state = read_json(&dir.join("state.json")).unwrap_or(Value::Null);
     let source = state["source_model_id"].as_str().and_then(catalog::find);
@@ -383,6 +387,34 @@ fn register_folder(p: &Project, name: &str, sub: &str) -> Result<String> {
     let id = entry.id.clone();
     catalog::add_custom(entry)?;
     set_state(&dir, json!({id_key: id}));
+    Ok(id)
+}
+
+/// The healed copy of a model the Slim page did not make: "<student> · healed", derived from the student (its folder or Hugging Face id).
+fn register_external_healed(dir: &Path, mut entry: ModelEntry, model: &Path, name: &str) -> Result<String> {
+    let h = heal_source::read(dir).ok_or_else(|| Error::new("This heal has no heal_source.json."))?;
+    let meta = read_json(&model.join("ndforge_reshape.json")).unwrap_or(Value::Null);
+    let student = match &h.student {
+        heal_source::Source::Folder { path } => path.trim().to_string(),
+        heal_source::Source::Hub { id } => id.trim().to_string(),
+        heal_source::Source::Made { name } => name.clone(),
+    };
+    let teacher = meta["origin"]["repo"].as_str().map(String::from).or_else(|| h.teacher.as_ref().map(|t| t.label())).unwrap_or_else(|| "another model".into());
+    entry.id = format!("custom-local-{name}-healed");
+    entry.name = format!("{} · healed", h.student_name);
+    if let Some(total) = meta["params"].as_u64().filter(|t| *t > 0) {
+        entry.params_b = total as f64 / 1e9;
+        let (lora, qlora) = estimate_vram(entry.params_b);
+        entry.vram_lora_gb = lora;
+        entry.vram_qlora_gb = qlora;
+    }
+    entry.derived_from = Some(student.clone());
+    entry.reshape = Some(format!("healed: {} taught by {}", h.student_name, h.teacher_name));
+    entry.good_for = format!("Healed on the Heal page: {} taught by {teacher}.", h.student_name);
+    entry.note = "Healed: another model taught this one to answer like it did (distillation). The copy is a derivative of both models: check their licences. It is the better base for Step 3. Memory figures are estimates.".to_string();
+    let id = entry.id.clone();
+    catalog::add_custom(entry)?;
+    set_state(dir, json!({"healed_model_id": id}));
     Ok(id)
 }
 
@@ -462,7 +494,11 @@ pub fn mark_interrupted(p: &Project) -> usize {
     let Ok(rd) = std::fs::read_dir(models_dir(p)) else { return 0 };
     for e in rd.flatten() {
         let dir = e.path();
-        let Some(st) = read_json(&dir.join("state.json")) else { continue };
+        // a heal of a model the Slim page did not make has no state.json: only its heal.json can be cut off
+        let st = read_json(&dir.join("state.json")).unwrap_or(Value::Null);
+        if st.is_null() && !heal_source::is_external(&dir) {
+            continue;
+        }
         let live = active().lock().map(|a| a.contains(&dir)).unwrap_or(false);
         // healing that was cut off can be continued: its checkpoints and the teacher's answers are kept
         if !live && read_json(&dir.join("heal.json")).is_some_and(|h| h["status"] == "running") {
@@ -648,11 +684,6 @@ impl HealSpec {
     }
 }
 
-/// The student's sizes for the memory estimate, from the made model's config.json (guessed from its size when the file has no numbers).
-fn heal_dims(model: &Path, student_b: f64) -> plan::HealDims {
-    plan::HealDims::from_config(&read_json(&model.join("config.json")).unwrap_or(Value::Null), student_b)
-}
-
 /// What a healing run will use: the automatic settings for this student and card (`plan::heal_defaults`) with the person's choices on top.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HealChoice {
@@ -764,24 +795,19 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     valid_name(name)?;
     spec.validate()?;
     let dir = models_dir(p).join(name);
-    let model = dir.join("model");
-    if !model.join("config.json").is_file() {
-        return Err(Error::new("That model is not ready (it was stopped or failed)."));
-    }
+    let mut model = heal_source::student_folder(&dir)?;     // None: a Hugging Face model that is downloaded first (below)
     if dir.join("healed").join("config.json").is_file() {
         return Err(Error::new("This model has already been healed."));
     }
-    let meta = read_json(&model.join("ndforge_reshape.json")).ok_or_else(|| Error::new("This model has no ndforge_reshape.json, so its original is unknown."))?;
-    let origin = meta["origin"]["repo"].as_str().ok_or_else(|| Error::new("This model's original is unknown."))?.to_string();
-    let family = meta["origin"]["family"].as_str().unwrap_or("generic").to_string();
+    let o = heal_source::read_origin(&dir)?;
+    let (origin, family) = (o.teacher.clone(), o.family.clone());
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: healing uses your world's text."))?;
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
     if !train.is_file() {
         return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
     }
-    let student_b = meta["params"].as_f64().unwrap_or(0.0) / 1e9;
-    let teacher_b = meta["origin"]["params"].as_f64().map(|x| x / 1e9).unwrap_or(student_b * 1.3);
-    let dims = heal_dims(&model, student_b);
+    let (student_b, teacher_b) = (o.student_b, o.teacher_b);
+    let dims = plan::HealDims::from_config(&o.config, student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
     if !hp.fits {
@@ -809,7 +835,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     if (old.as_ref().map(|h| h["general_key"].clone()).as_ref() != Some(&general_key) || old.as_ref().map(|h| h["train_key"].clone()).as_ref() != Some(&train_key)) && run_dir.exists() {
         let _ = std::fs::remove_dir_all(&run_dir);
     }
-    let cal = &meta["calibration"];
+    let cal = &o.calibration;
     let calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
@@ -825,6 +851,14 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         }
         set_heal(&dir, json!({"status": "failed", "error": e.0, "oom": e.0.to_lowercase().contains("out of memory")}));
         e
+    };
+    // a Hugging Face student is downloaded into the Hugging Face cache first (the weights are read there, never copied)
+    let model = match model.take() {
+        Some(m) => m,
+        None => {
+            set_heal(&dir, json!({"step": "download"}));
+            heal_source::fetch_student(&dir, &stop, on_event).map_err(failed)?
+        }
     };
     if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq) {
         let job = json!({
@@ -852,7 +886,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
                       "checkpointing": if ch.knobs.checkpointing { "on" } else { "off" }, "optimizer": ch.optimizer, "student_b": student_b},
             "distill": {"mode": mode, "cache": cache_dir, "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "alpha": spec.alpha, "k": ch.k,
                         "chunk": ch.knobs.kl_chunk, "eval_every": 50, "kbit_upcast": ch.knobs.upcast},
-            "eval": {"calibration": calibration, "teacher_loss": meta["loss_before"], "slim_loss": meta["loss_after"]},
+            "eval": {"calibration": calibration, "teacher_loss": o.loss_before, "slim_loss": o.loss_after},
             "out": run_dir, "resume": resume, "stop_file": stop_file,
         });
         std::fs::create_dir_all(&run_dir)?;
@@ -866,7 +900,12 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         }
         summary = r;
     }
-    let job = json!({"job": "distill_merge", "base": model, "adapter": run_dir.join("adapter"), "out": dir.join("healed.partial"), "final": dir.join("healed"), "summary": summary, "stop_file": stop_file});
+    let mut job = json!({"job": "distill_merge", "base": model, "adapter": run_dir.join("adapter"), "out": dir.join("healed.partial"), "final": dir.join("healed"), "summary": summary, "stop_file": stop_file});
+    if o.external || o.teacher_chosen {
+        // a model the Slim page did not make has no recorded original: the merged folder records the teacher (and the student's name) for Step 3 and Step 5
+        job["origin"] = json!({"repo": origin, "family": family, "params": (teacher_b * 1e9).round()});
+        job["student_label"] = json!(o.student_label);
+    }
     let outcome = heal_job(&py, &dir, &job, "merge", &stop, grace, on_event);
     let _ = std::fs::remove_dir_all(dir.join("healed.partial"));
     let r = outcome.map_err(failed)?;
@@ -1101,24 +1140,29 @@ pub fn try_run(p: &Project, spec: &TrySpec, stop: Arc<AtomicBool>, on_event: &mu
 pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Value> {
     valid_name(name)?;
     let dir = models_dir(p).join(name);
-    let meta = read_json(&dir.join("model").join("ndforge_reshape.json")).ok_or_else(|| Error::new("This model has no ndforge_reshape.json, so its original is unknown."))?;
-    let student_b = meta["params"].as_f64().unwrap_or(0.0) / 1e9;
-    let teacher_b = meta["origin"]["params"].as_f64().map(|x| x / 1e9).unwrap_or(student_b * 1.3);
-    let dims = heal_dims(&dir.join("model"), student_b);
+    let o = heal_source::read_origin(&dir)?;
+    Ok(heal_options_with(p, Some((name, &dir)), &o, vram_gb))
+}
+
+/// The same for a pair that may have no folder yet (`dir` None: nothing was written, so there is no state, no chart and nothing healed).
+pub fn heal_options_with(p: &Project, dir: Option<(&str, &Path)>, o: &heal_source::Origin, vram_gb: Option<f64>) -> Value {
+    let (student_b, teacher_b) = (o.student_b, o.teacher_b);
+    let dims = plan::HealDims::from_config(&o.config, student_b);
     let defaults = plan::heal_defaults(student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &defaults);
     let tokens: Vec<Value> = plan::HEAL_TOKENS_M.iter().map(|&t| {
         let m = t as f64 / 10.0;
         json!({"tokens_m": t, "cache_gb": (hp.cache_gb_per_10m * m * 10.0).round() / 10.0, "hours": [((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0]})
     }).collect();
-    let heal = read_json(&dir.join("heal.json"));
-    Ok(json!({
-        "name": name, "plan": hp, "defaults": defaults, "dims": dims, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &defaults), "safer": heal.as_ref().filter(|h| h["status"] == "failed" && h["oom"] == true).map(heal_safer).unwrap_or(Value::Null), "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
-        "teacher": meta["origin"]["repo"], "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
-        "healed": dir.join("healed").join("config.json").is_file(), "heal": heal, "metrics": heal_metrics(p, name), "vram_gb": vram_gb,
-        "free_disk_gb": crate::envmgr::health::free_disk_gb(&dir).map(|g| (g * 10.0).round() / 10.0),
-        "calibration": meta["calibration"], "loss": {"original": meta["loss_before"], "thinned": meta["loss_after"]},
-    }))
+    let heal = dir.and_then(|(_, d)| read_json(&d.join("heal.json")));
+    let free_in = dir.map(|(_, d)| d.to_path_buf()).unwrap_or_else(|| models_dir(p));
+    json!({
+        "name": dir.map(|(n, _)| n), "plan": hp, "defaults": defaults, "dims": dims, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &defaults), "safer": heal.as_ref().filter(|h| h["status"] == "failed" && h["oom"] == true).map(heal_safer).unwrap_or(Value::Null), "tokens": tokens, "default_tokens_m": plan::default_heal_tokens_m(student_b), "student_b": (student_b * 100.0).round() / 100.0,
+        "teacher": o.teacher, "external": o.external, "teacher_chosen": o.teacher_chosen, "student_label": o.student_label, "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
+        "healed": dir.is_some_and(|(_, d)| d.join("healed").join("config.json").is_file()), "heal": heal, "metrics": dir.map(|(n, _)| heal_metrics(p, n)).unwrap_or_default(), "vram_gb": vram_gb,
+        "free_disk_gb": crate::envmgr::health::free_disk_gb(&free_in).map(|g| (g * 10.0).round() / 10.0),
+        "calibration": o.calibration, "loss": {"original": o.loss_before, "thinned": o.loss_after},
+    })
 }
 
 /// The Heal card's live estimate: the plan (memory in plain words, the breakdown, the way that fits) for the settings the person has chosen so far, and the
@@ -1126,12 +1170,15 @@ pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Val
 pub fn heal_estimate(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>) -> Result<Value> {
     valid_name(name)?;
     spec.validate()?;
-    let dir = models_dir(p).join(name);
-    let meta = read_json(&dir.join("model").join("ndforge_reshape.json")).ok_or_else(|| Error::new("This model has no ndforge_reshape.json, so its original is unknown."))?;
-    let student_b = meta["params"].as_f64().unwrap_or(0.0) / 1e9;
-    let teacher_b = meta["origin"]["params"].as_f64().map(|x| x / 1e9).unwrap_or(student_b * 1.3);
-    let dims = heal_dims(&dir.join("model"), student_b);
+    let o = heal_source::read_origin(&models_dir(p).join(name))?;
+    Ok(heal_estimate_with(&o, spec, vram_gb))
+}
+
+/// The estimate for a pair (`heal_source::origin_from_check`) that may have no folder yet.
+pub fn heal_estimate_with(o: &heal_source::Origin, spec: &HealSpec, vram_gb: Option<f64>) -> Value {
+    let (student_b, teacher_b) = (o.student_b, o.teacher_b);
+    let dims = plan::HealDims::from_config(&o.config, student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
-    Ok(json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum}))
+    json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum})
 }
