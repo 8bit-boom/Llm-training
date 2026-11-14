@@ -1,0 +1,203 @@
+{
+ "ladder": [
+  {
+   "from": {
+    "checkpointing": false,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256
+   },
+   "label": "gradient checkpointing"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 256
+   },
+   "label": "a smaller batch (2 per step, 16 steps added up)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 256
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 256
+   },
+   "label": "a smaller batch (1 per step, 32 steps added up)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 256
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128
+   },
+   "label": "a smaller KL chunk (128)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 64
+   },
+   "label": "a smaller KL chunk (64)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 64
+   },
+   "to": null,
+   "label": null
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 3,
+    "grad_accum": 11,
+    "chunk": 256
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 33,
+    "chunk": 256
+   },
+   "label": "a smaller batch (1 per step, 33 steps added up)"
+  },
+  {
+   "from": {
+    "checkpointing": false,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 64
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 64
+   },
+   "label": "gradient checkpointing"
+  }
+ ],
+ "activation": [
+  {
+   "layers": 40,
+   "hidden": 4096,
+   "seq": 2048,
+   "batch": 4,
+   "checkpointing": false,
+   "gb": 45.634028
+  },
+  {
+   "layers": 40,
+   "hidden": 4096,
+   "seq": 2048,
+   "batch": 4,
+   "checkpointing": true,
+   "gb": 3.825205
+  },
+  {
+   "layers": 24,
+   "hidden": 5120,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "gb": 0.859832
+  },
+  {
+   "layers": 4,
+   "hidden": 64,
+   "seq": 128,
+   "batch": 2,
+   "checkpointing": false,
+   "gb": 0.002228
+  }
+ ],
+ "auto": [
+  {
+   "student_b": 1.0,
+   "max_seq": 2048,
+   "rank": 64,
+   "batch": 4,
+   "grad_accum": 8,
+   "chunk": 256
+  },
+  {
+   "student_b": 8.0,
+   "max_seq": 2048,
+   "rank": 64,
+   "batch": 4,
+   "grad_accum": 8,
+   "chunk": 256
+  },
+  {
+   "student_b": 14.9,
+   "max_seq": 2048,
+   "rank": 64,
+   "batch": 4,
+   "grad_accum": 8,
+   "chunk": 256
+  },
+  {
+   "student_b": 15.0,
+   "max_seq": 1024,
+   "rank": 32,
+   "batch": 2,
+   "grad_accum": 16,
+   "chunk": 128
+  },
+  {
+   "student_b": 21.1,
+   "max_seq": 1024,
+   "rank": 32,
+   "batch": 2,
+   "grad_accum": 16,
+   "chunk": 128
+  },
+  {
+   "student_b": 27.0,
+   "max_seq": 1024,
+   "rank": 32,
+   "batch": 1,
+   "grad_accum": 32,
+   "chunk": 128
+  }
+ ]
+}

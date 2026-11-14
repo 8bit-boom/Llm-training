@@ -21,6 +21,19 @@ def _explain(exc: Exception) -> str:
     return text[:600]
 
 
+def _explain_heal(kind: str, exc: Exception) -> str:
+    """Healing jobs: an out-of-memory error that was not handled by the retries (the cache step, or while loading a model) names the step and the next actions."""
+    from . import healmem
+    text = f"{type(exc).__name__}: {exc}"
+    if kind == "distill_cache" and healmem.is_oom(exc):
+        return ("The graphics card ran out of memory during step cache (the original model answering your texts). What to change next, in this order: 1. load the original "
+                "as 4-bit (Healing settings, Expert: original loaded as 4-bit); 2. a shorter sequence length; 3. a smaller model. Continue goes on where it stopped. (" + text[:200] + ")")
+    if kind == "distill" and healmem.is_oom(exc):
+        return ("The graphics card ran out of memory during step train, while the models were being loaded, before any training step. What to change next, in this order: "
+                "1. QLoRA (4-bit) instead of LoRA 16-bit; 2. load the original as 4-bit; 3. a smaller model. (" + text[:200] + ")")
+    return _explain(exc)
+
+
 def main(argv: list) -> int:
     if len(argv) != 2:
         protocol.error("usage", "Usage: python -m ndforge_worker <job.json>")
@@ -85,12 +98,13 @@ def main(argv: list) -> int:
         try:
             return {"distill_cache": distilljob.run_cache, "distill": distilljob.run, "distill_merge": distilljob.merge}[kind](job)
         except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
-            protocol.error("distill_unstable" if str(exc) == distilljob.UNSTABLE else "reshape_refused", str(exc))
+            from . import healmem
+            protocol.error("distill_unstable" if str(exc) == distilljob.UNSTABLE else "distill_oom" if isinstance(exc, healmem.HealOutOfMemory) else "reshape_refused", str(exc))
             return 1
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain(exc))
+            protocol.error({"distill_cache": "distill_failed", "distill": "distill_failed", "distill_merge": "merge_failed"}[kind], _explain_heal(kind, exc))
             return 1
     if kind == "general_check":
         from . import generaltext

@@ -134,7 +134,7 @@ import shutil  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import generaltext, protocol, safetensors_io  # noqa: E402
+from . import generaltext, healmem, protocol, safetensors_io  # noqa: E402
 from .reshape import ReshapeError  # noqa: E402
 
 CACHE_FORMAT = 1
@@ -433,6 +433,7 @@ def run_cache(cfg: dict) -> int:
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
     "out": cache folder, "stop_file": path}. Saves the teacher's top-k answers for every row (resumable). Result: rows, tokens, bytes, reused, stopped, notes."""
     protocol.reserve_stdout()
+    healmem.set_alloc_conf()
     started = time.monotonic()
     from . import reshapejob, slice_io
     slice_io.np()
@@ -511,6 +512,79 @@ def _dir_bytes(folder) -> int:
 
 DEFAULT_HYPER = {"rank": 64, "alpha": 64, "lr": 1e-4, "max_seq": 2048, "batch": 4, "grad_accum": 8, "warmup": 30, "weight_decay": 0.0, "scheduler": "cosine",
                  "seed": 3407, "save_steps": 50, "logging_steps": 1, "tokens": 20_000_000}
+
+
+def _student_config(student_dir) -> dict:
+    try:
+        conf = json.loads((Path(student_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return conf.get("text_config") or conf
+
+
+def _student_b(student_dir) -> float:
+    """Billions of parameters of the student, from its weight files (2 bytes each); 0 when unknown."""
+    try:
+        return sum(r.nbytes for r in safetensors_io.list_tensors(student_dir).values()) / 2e9
+    except Exception:                       # noqa: BLE001 - an unreadable folder is reported by the loader later
+        return 0.0
+
+
+def resolve_hyper(cfg: dict, student_dir) -> dict:
+    """The training settings: the built-in ones, then the automatic ones for the student's size (healmem.auto_defaults: a longer sequence, a bigger LoRA and a
+    bigger batch only for small students), then what the job names. `batch` named without `grad_accum` keeps 32 sequences per update. Also sets
+    "student_b" and "checkpointing" (the person's "auto" is decided after the model is loaded, see _decide_checkpointing)."""
+    user = dict(cfg.get("hyper") or {})
+    sb = float(user.get("student_b") or 0) or _student_b(student_dir)
+    auto = healmem.auto_defaults(sb)
+    h = {**DEFAULT_HYPER, "max_seq": auto["max_seq"], "rank": auto["rank"], "alpha": auto["rank"], "batch": auto["batch"], "grad_accum": auto["grad_accum"],
+         "chunk": auto["chunk"]}
+    if "rank" in user and "alpha" not in user:
+        user["alpha"] = user["rank"]
+    if "batch" in user and "grad_accum" not in user:
+        user["grad_accum"] = max(1, -(-healmem.EFFECTIVE_BATCH // max(1, int(user["batch"]))))
+    h.update({k: v for k, v in user.items() if v is not None})
+    h["student_b"] = sb
+    return h
+
+
+def _decide_checkpointing(h: dict, student_dir, free_gb) -> bool:
+    """checkpointing "on" / "off" / True / False as the job says; "auto" (or missing): healmem.checkpointing_auto from the activation estimate."""
+    v = h.get("checkpointing", "auto")
+    if v in (True, "on", "true", "yes"):
+        return True
+    if v in (False, "off", "false", "no"):
+        return False
+    c = _student_config(student_dir)
+    layers, hidden = int(c.get("num_hidden_layers") or 0), int(c.get("hidden_size") or 0)
+    act = healmem.activation_gb(layers, hidden, int(h["max_seq"]), int(h["batch"]), False) if layers and hidden else 0.0
+    return healmem.checkpointing_auto(float(h.get("student_b") or 0), act, free_gb)
+
+
+def _apply_checkpointing(model, on: bool) -> None:
+    """Switches gradient checkpointing on (the Hugging Face way: not reentrant, the inputs require grads so that the LoRA layers get gradients) or off. The model
+    may already be switched on by the loader (LoRA and QLoRA on a graphics card), so "off" has to be done explicitly."""
+    if on:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        try:
+            model.enable_input_require_grads()
+        except Exception:                   # noqa: BLE001 - models without an input embedding hook; the non-reentrant mode does not need it
+            pass
+    else:
+        model.gradient_checkpointing_disable()
+    conf = getattr(model, "config", None)
+    if conf is not None:
+        conf.use_cache = False
+
+
+def _trim() -> None:
+    """Gives cached, unused graphics memory back (after saving a checkpoint or a measurement), so that the next step starts from a clean pool."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:                       # noqa: BLE001
+        pass
 
 
 def _distill_collator(pad_id: int, reader):
@@ -661,9 +735,13 @@ def _callback_class():
             except Exception as exc:         # noqa: BLE001 - the measurement must never stop the healing
                 protocol.log(f"The check on your text was skipped: {type(exc).__name__}: {exc}")
                 return
+            _trim()
             if v is not None:
                 self.calib.append((step, v))
                 protocol.emit("distill_eval", step=step, calib_loss=v)
+
+        def on_save(self, args, state, control, **kw):
+            _trim()                                     # a checkpoint was just written: give the unused cached memory back
 
         def on_step_end(self, args, state, control, **kw):
             super().on_step_end(args, state, control, **kw)
@@ -674,11 +752,15 @@ def _callback_class():
 
 def run(cfg: dict) -> int:
     """job distill: {"model": {"repo": the thinned model's folder, "family"}, "method": "lora|qlora", "backend": "hf", "dataset": {"train", "general": {...}},
-    "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?},
+    "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?,
+              checkpointing: "auto|on|off", optimizer: "auto|adamw_8bit|adamw", student_b?},
     "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50},
     "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path}.
-    Writes the LoRA to out/adapter. Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss, adapter_dir, stopped."""
+    Settings the job leaves out are chosen by the student's size (resolve_hyper). When the graphics card runs out of memory the training is tried again, at
+    most healmem.MAX_RETRIES times, from the last checkpoint with the next safer setting (healmem.next_safer); the final failure is a plain message.
+    Writes the LoRA to out/adapter. Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss, adapter_dir, stopped, settings, oom_retries."""
     protocol.reserve_stdout()
+    healmem.set_alloc_conf()
     from . import backends
     out = Path(cfg["out"])
     out.mkdir(parents=True, exist_ok=True)
@@ -697,11 +779,12 @@ def run(cfg: dict) -> int:
     from trl import SFTConfig, SFTTrainer
     from . import data, reshapejob
 
-    h = {**DEFAULT_HYPER, **(cfg.get("hyper") or {})}
-    k, chunk, alpha = int(d.get("k", 32)), int(d.get("chunk", 256)), float(d.get("alpha", 1.0))
+    student_dir = cfg["model"]["repo"]
+    h = resolve_hyper(cfg, student_dir)
+    k, alpha = int(d.get("k", 32)), float(d.get("alpha", 1.0))
+    chunk = int(d.get("chunk") or h["chunk"])
     set_seed(h["seed"])
     protocol.log(f"Healing: {mode} mode, precision {backends.precision_name()}, LoRA rank {h['rank']}, learning rate {h['lr']}, KL loss weight {alpha}.")
-    student_dir = cfg["model"]["repo"]
     reader = teacher = None
     if mode == "cache":
         reader = CacheReader(d["cache"])
@@ -717,7 +800,8 @@ def run(cfg: dict) -> int:
             raise ReshapeError("The saved teacher answers belong to other data (another general text); they will be made again.")
     else:
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
-    lcfg = {"model": cfg["model"], "method": cfg["method"], "hyper": h}
+    method = cfg["method"]
+    lcfg = {"model": cfg["model"], "method": method, "hyper": h}
     model, tokenizer, _ = backends.load(lcfg, "hf")
     if mode == "online":
         dcfg = {"train": cfg["dataset"]["train"], "tokens": int(h["tokens"]), "general": (cfg["dataset"] or {}).get("general")}
@@ -737,7 +821,7 @@ def run(cfg: dict) -> int:
     if not order:
         raise ReshapeError("There is nothing to learn from: the training data is empty.")
     ds = Dataset.from_list([{"input_ids": rows[i]["input_ids"], "completion_mask": rows[i]["completion_mask"], "row": i} for i in order])
-    per_step = max(1, int(h["batch"]) * int(h["grad_accum"]))
+    per_step = max(1, int(h["batch"]) * int(h["grad_accum"]))               # the sequences per update: it stays the same when a retry halves the batch
     steps = int(h["max_steps"]) if h.get("max_steps") else max(1, -(-len(order) // per_step))
     tokens_planned = sum(len(rows[i]["input_ids"]) for i in order)
     protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text).")
@@ -746,69 +830,108 @@ def run(cfg: dict) -> int:
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
     cuda = torch.cuda.is_available()
     bf16 = cuda and torch.cuda.get_device_capability(0)[0] >= 8
-    optim = "adamw_8bit" if cuda else "adamw_torch"
+    want = str(h.get("optimizer") or "auto").lower()
+    optim = "adamw_torch" if want in ("adamw", "adamw_torch") or not cuda else "adamw_8bit"
     if optim == "adamw_8bit":
         try:
             import bitsandbytes  # noqa: F401
         except Exception:
             optim = "adamw_torch"
+            if want in ("adamw_8bit", "8bit"):
+                protocol.log("The 8-bit optimizer (bitsandbytes) is not available here; using the standard AdamW (it needs more memory).")
     fields = getattr(SFTConfig, "__dataclass_fields__", {})
     ckdir = out / "checkpoints"
-    kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(h["batch"]), gradient_accumulation_steps=int(h["grad_accum"]), learning_rate=float(h["lr"]),
-                  warmup_steps=int(h["warmup"]), weight_decay=float(h["weight_decay"]), lr_scheduler_type=h["scheduler"], logging_steps=int(h["logging_steps"]),
-                  save_strategy="steps", save_steps=int(h["save_steps"]), save_total_limit=2, optim=optim, seed=int(h["seed"]), report_to="none", disable_tqdm=True,
-                  bf16=bf16, fp16=cuda and not bf16, remove_unused_columns=False, gradient_checkpointing=False, dataloader_num_workers=0, use_cpu=not cuda,
-                  max_steps=steps)
-    kwargs["max_length" if "max_length" in fields else "max_seq_length"] = int(h["max_seq"])
-    if "dataset_kwargs" in fields:
-        kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
-    if "packing" in fields:
-        kwargs["packing"] = False
-    args = SFTConfig(**kwargs)
-
     ev = cfg.get("eval") or None
-    eval_fn = None
-    if ev and ev.get("calibration"):
-        batches = reshapejob._calibration(tokenizer, ev["calibration"], cfg["model"].get("family", "generic"))
-        eval_fn = lambda: calib_loss(model, batches, chunk)  # noqa: E731
-    state = {"kd": [], "ce": [], "tokens": 0}
+    batches = reshapejob._calibration(tokenizer, ev["calibration"], cfg["model"].get("family", "generic")) if ev and ev.get("calibration") else None
+    holder = {"model": model}
+    del model                                                # only the holder keeps the model, so that a retry can really free it
     Heal = _callback_class()
-    live = Heal(str(stop_file), None, [], 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state)
-    trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
-    trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
-    trainer = _trainer_class(SFTTrainer)(**trainer_kw)
-    trainer.model_accepts_loss_kwargs = False           # the trainer then divides the loss by the gradient accumulation itself
-    targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, chunk))
-    trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": chunk}
-    live.distill = trainer.distill
-    before = ev.get("slim_loss") if ev else None
-    if before is None and eval_fn is not None:
-        before = eval_fn()
-        if before is not None:
-            protocol.emit("distill_eval", step=0, calib_loss=before)
-    ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
-    resume = bool(cfg.get("resume")) and bool(ckpts)
-    if cfg.get("resume") and not ckpts:
-        protocol.log("No checkpoint to continue from; starting from the beginning.")
-    t0 = time.time()
+    hist_all: list = []
+    calib_all: list = []
+    done = {"before": ev.get("slim_loss") if ev else None, "t0": time.time(), "tokens": 0}
+    free_gb = None
     if cuda:
-        torch.cuda.reset_peak_memory_stats()
-    trainer.train(resume_from_checkpoint=True if resume else None)
-    after = None
-    if eval_fn is not None and not live.stopped:
-        after = eval_fn()
-        if after is not None:
-            protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
-    target = out / "adapter"
-    trainer.model.save_pretrained(str(target))
-    hist = live.history
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+    settings = {"checkpointing": _decide_checkpointing(h, student_dir, free_gb), "batch": int(h["batch"]), "grad_accum": int(h["grad_accum"]), "chunk": chunk,
+                "max_seq": int(h["max_seq"]), "rank": int(h["rank"]), "method": method}
+    protocol.log("Healing settings: " + healmem.describe(settings) + f", optimizer {optim}.")
+    protocol.emit("heal_settings", settings=settings, optimizer=optim)
+
+    def attempt(s: dict, n: int):
+        if n > 0:                                            # a retry: a fresh model and trainer, from the last checkpoint
+            holder["model"] = backends.load(lcfg, "hf")[0]
+        mdl = holder["model"]
+        _apply_checkpointing(mdl, bool(s["checkpointing"]))
+        kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(s["batch"]), gradient_accumulation_steps=int(s["grad_accum"]), learning_rate=float(h["lr"]),
+                      warmup_steps=int(h["warmup"]), weight_decay=float(h["weight_decay"]), lr_scheduler_type=h["scheduler"], logging_steps=int(h["logging_steps"]),
+                      save_strategy="steps", save_steps=int(h["save_steps"]), save_total_limit=2, optim=optim, seed=int(h["seed"]), report_to="none", disable_tqdm=True,
+                      bf16=bf16, fp16=cuda and not bf16, remove_unused_columns=False, gradient_checkpointing=bool(s["checkpointing"]), dataloader_num_workers=0,
+                      use_cpu=not cuda, max_steps=steps)
+        if s["checkpointing"]:
+            kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+        kwargs["max_length" if "max_length" in fields else "max_seq_length"] = int(h["max_seq"])
+        if "dataset_kwargs" in fields:
+            kwargs["dataset_kwargs"] = {"skip_prepare_dataset": True}
+        if "packing" in fields:
+            kwargs["packing"] = False
+        args = SFTConfig(**kwargs)
+        eval_fn = (lambda: calib_loss(holder["model"], batches, int(s["chunk"]))) if batches else None        # noqa: E731
+        state = {"kd": [], "ce": [], "tokens": 0}
+        live = Heal(str(stop_file), None, [], 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state)
+        trainer_kw = {"model": mdl, "args": args, "train_dataset": ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
+        trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
+        trainer = _trainer_class(SFTTrainer)(**trainer_kw)
+        trainer.model_accepts_loss_kwargs = False           # the trainer then divides the loss by the gradient accumulation itself
+        targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, int(s["chunk"])))
+        trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"])}
+        live.distill = trainer.distill
+        if done["before"] is None and eval_fn is not None:
+            done["before"] = eval_fn()
+            if done["before"] is not None:
+                protocol.emit("distill_eval", step=0, calib_loss=done["before"])
+        ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
+        resume = (bool(cfg.get("resume")) or n > 0) and bool(ckpts)
+        if cfg.get("resume") and not ckpts and n == 0:
+            protocol.log("No checkpoint to continue from; starting from the beginning.")
+        if n > 0:
+            at = int(ckpts[-1].name.split("-")[1]) if ckpts else 0
+            hist_all[:] = [r for r in hist_all if r[0] <= at]
+            calib_all[:] = [r for r in calib_all if r[0] <= at]
+            protocol.log(f"Going on from {'step ' + str(at) if ckpts else 'the beginning (no checkpoint was saved yet)'}.")
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
+        try:
+            trainer.train(resume_from_checkpoint=True if resume else None)
+            after = None
+            if eval_fn is not None and not live.stopped:
+                after = eval_fn()
+                if after is not None:
+                    protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
+            target = out / "adapter"
+            trainer.model.save_pretrained(str(target))
+            return {"after": after, "steps": trainer.state.global_step, "tokens": trainer.distill["tokens"], "stopped": live.stopped, "vram": live._vram(), "target": target}
+        finally:
+            hist_all.extend(live.history)               # also of a failed attempt: the steps up to its last checkpoint count
+            calib_all.extend(live.calib)
+            del trainer, live
+
+    def free_memory():
+        holder["model"] = None
+        reshapejob._free()
+
+    def on_retry(n, label, s):
+        protocol.log(f"Out of memory: trying again with {label}. The sequences per update stay {int(s['batch']) * int(s['grad_accum'])}; training goes on from the last saved checkpoint.")
+        protocol.emit("heal_retry", attempt=n, change=label, settings=s)
+
+    r, used, tried = healmem.run_with_oom_retry(attempt, settings, on_retry=on_retry, free=free_memory)
+    hist = hist_all
     gen_info = {k: stats.get(k) for k in ("general_source", "general_rows", "general_tokens", "general_error", "general_error_code", "general_detected")} if mode == "online" else \
         {"general_source": idx.get("general_source"), "general_rows": idx.get("general_rows")}
-    summary = {"general": gen_info, "backend": "hf", "method": cfg["method"], "mode": mode, "steps": trainer.state.global_step, "total_steps": steps, "tokens_seen": trainer.distill["tokens"],
-               "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": before,
-               "calib_loss_after": after if after is not None else (live.calib[-1][1] if live.calib else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
-               "train_seconds": round(time.time() - t0, 1), "peak_vram_mb": live._vram(), "adapter_dir": str(target), "stopped": live.stopped,
-               "rows": len(order), "tokens_planned": tokens_planned}
+    summary = {"general": gen_info, "backend": "hf", "method": method, "mode": mode, "steps": r["steps"], "total_steps": steps, "tokens_seen": r["tokens"],
+               "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": done["before"],
+               "calib_loss_after": r["after"] if r["after"] is not None else (calib_all[-1][1] if calib_all else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
+               "train_seconds": round(time.time() - done["t0"], 1), "peak_vram_mb": r["vram"], "adapter_dir": str(r["target"]), "stopped": r["stopped"],
+               "rows": len(order), "tokens_planned": tokens_planned, "settings": used, "optimizer": optim, "oom_retries": tried}
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
     return 0

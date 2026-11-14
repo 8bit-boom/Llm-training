@@ -244,3 +244,144 @@ def test_the_numpy_merge_equals_pefts_own_merge(tmp_path):
     for name, p in ours.state_dict().items():
         assert torch.allclose(p, ref_state[name], atol=1e-5), name
     assert torch.allclose(ours(input_ids=IDS, use_cache=False).logits, reference(input_ids=IDS, use_cache=False).logits, atol=1e-4)
+
+
+# ------------------------------------------------------------------------------------------------- memory settings and out-of-memory retries
+
+OOM = getattr(torch, "OutOfMemoryError", None) or getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+
+
+def fail_at(monkeypatch, calls_to_fail, text="CUDA out of memory. Tried to allocate 2.00 GiB"):
+    """student_loss raises an out-of-memory error at the given (1-based) call numbers: the same place where a real card runs out of memory."""
+    real = dj.student_loss
+    count = {"n": 0}
+
+    def flaky(*a, **kw):
+        count["n"] += 1
+        if count["n"] in calls_to_fail:
+            raise OOM(text)
+        return real(*a, **kw)
+    monkeypatch.setattr(dj, "student_loss", flaky)
+    return count
+
+
+def logs(ev):
+    return [e["text"] for e in ev if e["type"] == "log"]
+
+
+def test_an_out_of_memory_error_is_retried_with_checkpointing_and_finishes_with_the_same_steps(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    count = fail_at(monkeypatch, {8})                                    # step 8 of 20; a checkpoint was saved after step 5
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"save_steps": 5, "checkpointing": "off"})
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    assert r["steps"] == 20 and r["stopped"] is False and r["oom_retries"] == ["gradient checkpointing"] and r["settings"]["checkpointing"] is True
+    assert r["settings"]["batch"] == 2 and r["settings"]["max_seq"] == 128 and r["settings"]["rank"] == 8       # nothing that changes the maths
+    assert any("Out of memory: trying again with gradient checkpointing" in t for t in logs(ev)) and any("Going on from step 5" in t for t in logs(ev))
+    assert [e["change"] for e in ev if e["type"] == "heal_retry"] == ["gradient checkpointing"]
+    first = [e for e in ev if e["type"] == "heal_settings"][0]["settings"]
+    assert first["checkpointing"] is False
+    assert count["n"] == 7 + 1 + 15                                      # 7 good calls, the failing one, then steps 6..20 again
+    kd = [e["kd"] for e in metrics(ev)]
+    assert all(np.isfinite(kd)) and r["kd_last"] == kd[-1] and Path(r["adapter_dir"], "adapter_config.json").is_file()
+
+
+def test_a_second_out_of_memory_error_halves_the_batch_and_the_run_still_has_the_same_updates(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    fail_at(monkeypatch, {8, 12})                                         # the second failure comes during the retry (calls 8 .. 14 are steps 6 .. 12)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"save_steps": 5, "checkpointing": "off"})
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    r = ev[-1]["data"]
+    assert code == 0 and r["steps"] == 20 and r["total_steps"] == 20, r
+    assert r["oom_retries"][0] == "gradient checkpointing" and r["oom_retries"][1].startswith("a smaller batch")
+    assert (r["settings"]["batch"], r["settings"]["grad_accum"]) == (1, 2)           # 2 x 1 -> 1 x 2: the same 2 sequences per update
+    assert len([e for e in ev if e["type"] == "heal_retry"]) == 2
+
+
+def test_when_every_retry_fails_the_message_names_the_numbers_and_the_next_steps(tmp_path, teacher, monkeypatch):
+    from ndforge_worker import healmem
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    fail_at(monkeypatch, set(range(1, 400)))
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"checkpointing": "off"})
+    with pytest.raises(healmem.HealOutOfMemory) as e:
+        run_in_process(monkeypatch, dj.run, cfg)
+    text = str(e.value)
+    assert "step train" in text and "sequence length 128" in text and "LoRA rank 8" in text and "shorter sequence length" in text and "gradient checkpointing" in text
+
+
+def test_a_failure_that_is_not_out_of_memory_is_not_retried(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    count = fail_at(monkeypatch, set())
+    monkeypatch.setattr(dj, "student_loss", lambda *a, **kw: (_ for _ in ()).throw(ValueError("not memory")))
+    with pytest.raises(ValueError, match="not memory"):
+        run_in_process(monkeypatch, dj.run, distill_cfg(tmp_path, student, teacher, "cache"))
+    assert count["n"] == 0
+
+
+def captured_trainer(monkeypatch):
+    got = []
+    real = dj._trainer_class
+
+    def wrap(base):
+        cls = real(base)
+
+        class Spy(cls):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                got.append(self)
+        return Spy
+    monkeypatch.setattr(dj, "_trainer_class", wrap)
+    return got
+
+
+def test_the_settings_reach_the_trainer(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    got = captured_trainer(monkeypatch)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"batch": 1, "grad_accum": 4, "max_steps": 1, "checkpointing": "on", "optimizer": "adamw"})
+    cfg["distill"]["chunk"] = 32
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    assert code == 0, ev[-1]
+    t = got[0]
+    a = t.args
+    assert (a.per_device_train_batch_size, a.gradient_accumulation_steps, a.max_length, a.gradient_checkpointing) == (1, 4, 128, True)
+    assert a.gradient_checkpointing_kwargs == {"use_reentrant": False} and getattr(a.optim, "value", a.optim) == "adamw_torch" and t.distill["chunk"] == 32
+    assert t.model.is_gradient_checkpointing is True
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 1, "checkpointing": "off"}, out=str(tmp_path / "run2"))
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    assert code == 0 and got[1].args.gradient_checkpointing is False and got[1].args.gradient_checkpointing_kwargs in (None, {})
+    assert [e for e in ev if e["type"] == "heal_settings"][0]["settings"]["checkpointing"] is False
+
+
+def test_the_first_step_loss_is_the_same_with_and_without_gradient_checkpointing(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    first = {}
+    for ck in ("off", "on"):
+        cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 1, "checkpointing": ck}, out=str(tmp_path / f"ck-{ck}"))
+        cfg["distill"]["eval_every"] = 0
+        cfg["eval"] = None
+        code, ev = run_in_process(monkeypatch, dj.run, cfg)
+        assert code == 0, ev[-1]
+        first[ck] = metrics(ev)[0]["kd"]
+    assert first["off"] > 0 and first["on"] == pytest.approx(first["off"], rel=1e-4)
+
+
+def test_the_settings_follow_the_students_size_unless_the_job_names_them(tmp_path, base):
+    cfg = {"hyper": {"student_b": 21.0}}
+    h = dj.resolve_hyper(cfg, base)
+    assert (h["max_seq"], h["rank"], h["alpha"], h["batch"], h["grad_accum"], h["chunk"]) == (1024, 32, 32, 2, 16, 128)
+    h = dj.resolve_hyper({"hyper": {"student_b": 3.0}}, base)
+    assert (h["max_seq"], h["rank"], h["batch"], h["grad_accum"], h["chunk"]) == (2048, 64, 4, 8, 256)
+    h = dj.resolve_hyper({"hyper": {"student_b": 21.0, "batch": 1, "rank": 16, "max_seq": 512}}, base)
+    assert (h["max_seq"], h["rank"], h["alpha"], h["batch"], h["grad_accum"]) == (512, 16, 16, 1, 32)            # batch named: 32 sequences per update stay
+    h = dj.resolve_hyper({}, base)                                                                           # the tiny model: its size comes from its files
+    assert h["student_b"] < 0.01 and h["max_seq"] == 2048
+    assert dj._decide_checkpointing({"student_b": 21.0, "max_seq": 1024, "batch": 2}, base, 100.0) is True
+    assert dj._decide_checkpointing({"student_b": 0.1, "max_seq": 128, "batch": 2}, base, 100.0) is False
+    assert dj._decide_checkpointing({"student_b": 0.1, "max_seq": 128, "batch": 2, "checkpointing": "on"}, base, 100.0) is True
