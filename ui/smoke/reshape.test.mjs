@@ -511,7 +511,7 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
-    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null });
+    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
   assert.equal(b.run("rsHealSpec().general_share"), 0);
@@ -591,6 +591,54 @@ test("Healing settings: only in Expert mode, with the automatic values shown, th
   assert.equal(asked.at(-1).seq, null);
   b.run(`state.settings.expert_mode = true`);
   assert.match(b.run("renderReshape()"), /id="hl-verdict">Fits: about 23 GB/);
+});
+
+test("Healing settings: the 32-bit embedding copy is off by default, its memory comes from the estimate, ticking it is sent, Reset and the safer step clear it", async () => {
+  const asked = [];
+  const m = thinModel();
+  const b = browser({ heal_estimate: (a) => { asked.push(JSON.parse(JSON.stringify(a.spec))); const on = a.spec.kbit_upcast === true;
+    return estOf({ upcast_gb: 5.6, knobs: { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: on } },
+      on ? { est_gb: 28.7, verdict: "tight", verdict_text: "Tight: about 29 GB of the 32 GB of this card (an estimate)." } : {}); } });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ upcast_gb: 5.6 }))} }`);
+  b.run(`state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /<input type="checkbox" id="hl-upcast" +>/);                                                   // unchecked: the new default
+  assert.match(html, /Keep the embeddings and output layer in 32-bit \(the old behaviour: about <span id="hl-upcast-gb">5\.6<\/span> GB more memory\)/);
+  assert.equal(b.run("rsHealSpec().kbit_upcast"), null);                                                             // nothing sent: the program's default (off)
+  b.run(`renderReshape(); wireReshape();`);
+  b.els["hl-upcast"].checked = true;
+  await b.els["hl-upcast"].onchange();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(asked.at(-1).kbit_upcast, true);
+  b.run(`state.settings.expert_mode = true`);
+  html = b.run("renderReshape()");
+  assert.match(html, /<input type="checkbox" id="hl-upcast" checked +>/);
+  assert.match(html, /id="hl-verdict">Tight: about 29 GB/);                                                          // the live estimate followed
+  assert.equal(b.run("rsHealSpec().kbit_upcast"), true);
+  b.run(`wireReshape()`);
+  await b.els["hl-reset"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.kbit_upcast"), null);
+  assert.equal(asked.at(-1).kbit_upcast, null);
+  // LoRA 16-bit has no such copy: the box is greyed out and says so
+  b.run(`state.settings.expert_mode = true; rs.hlEst = { name: ${JSON.stringify(m.name)}, key: "", est: ${JSON.stringify(estOf({ knobs: { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: false } }))} }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-upcast" +disabled>.*only for QLoRA/);
+});
+
+test("After an out-of-memory failure the first safer step can be the 32-bit embedding copy turned off", async () => {
+  const m = thinModel();
+  const b = browser({ heal_estimate: () => estOf() });
+  open(b, pageState({ made: [m] }));
+  const heal = { status: "failed", step: "train", oom: true, error: "The graphics card ran out of memory during step train.", retries: [] };
+  const safer = { label: "the 32-bit embedding copy turned off", kbit_upcast: false, checkpointing: "on", batch: 2, per_update: 32, kl_chunk: 128 };
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ heal, safer }))} }`);
+  b.run(`rs.hlSpec.kbit_upcast = true`);
+  assert.match(b.run("renderReshape()"), /<strong>the 32-bit embedding copy turned off<\/strong>/);
+  b.run(`wireReshape()`);
+  await b.els["hl-safer"].onclick();
+  assert.equal(b.run("rs.hlSpec.kbit_upcast"), null);
 });
 
 test("After an out-of-memory failure the card offers safer settings instead of a blind Continue", async () => {
