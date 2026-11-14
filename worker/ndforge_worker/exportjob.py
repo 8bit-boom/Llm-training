@@ -157,7 +157,7 @@ def new_report() -> dict:
 def unsloth_can_apply_imatrix(save_fn, has_resolver=None) -> bool:
     """Can this Unsloth build APPLY an importance matrix, not merely swallow the keyword? The same test as Unsloth Studio's export code: `save_pretrained_gguf`
     has a parameter `imatrix_file` (positional-only does not count: it is passed by keyword), or takes **kwargs and unsloth_zoo has `llama_cpp.resolve_imatrix_file`
-    (a `**kwargs` alone may be a function that filters them away). `has_resolver` (a function returning bool) replaces the import check, for the tests."""
+    (a `**kwargs` alone may be a function that filters them away; unsloth_zoo's CPU loader is such a function and is refused here, which is stricter than Studio). `has_resolver` (a function returning bool) replaces the import check, for the tests."""
     try:
         params = inspect.signature(save_fn).parameters
     except (TypeError, ValueError):
@@ -167,6 +167,8 @@ def unsloth_can_apply_imatrix(save_fn, has_resolver=None) -> bool:
         return True
     if not any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values()):
         return False
+    if str(getattr(save_fn, "__module__", "")).startswith("unsloth_zoo.cpu"):
+        return False        # unsloth_zoo's CPU loader takes **kwargs and drops imatrix_file without a word (version 2026.11.4); Studio's test would call it capable
     if has_resolver is not None:
         return bool(has_resolver())
     try:

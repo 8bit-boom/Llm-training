@@ -51,6 +51,14 @@ def test_a_positional_only_parameter_does_not_count_but_kwargs_still_may():
     assert exportjob.unsloth_can_apply_imatrix(positional_only, has_resolver=lambda: True) is True
 
 
+def test_the_cpu_loader_of_the_zoo_swallows_the_keyword_so_it_cannot_apply():
+    def cpu_save(self, save_directory, tokenizer=None, quantization_method="q8_0", **kwargs):
+        pass
+    cpu_save.__module__ = "unsloth_zoo.cpu.loader"
+    assert exportjob.unsloth_can_apply_imatrix(cpu_save, has_resolver=lambda: True) is False
+    assert exportjob.unsloth_can_apply_imatrix(kwargs_only, has_resolver=lambda: True) is True
+
+
 def test_what_cannot_be_inspected_cannot_apply():
     assert exportjob.unsloth_can_apply_imatrix(None) is False
     assert exportjob.unsloth_can_apply_imatrix(len, has_resolver=lambda: True) in (True, False)      # a builtin without a signature must not raise
