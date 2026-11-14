@@ -1135,6 +1135,8 @@ if kind == "reshape_try":
     out(type="result", data={{"passes_total": 1, "passes_done": 1, "stopped": False, "analysis": {{"base": {{"loss": 2.0}}}}}}); sys.exit(0)
 if kind == "heal_check":
     facts = json.load(open(os.path.join(root, "facts.json"), encoding="utf-8"))
+    if "pair" in job:
+        out(type="result", data={{"pair": facts["__pair__"]}}); sys.exit(0)
     res = {{}}
     for side, src in job["sources"].items():
         f = dict(facts.get(src) or facts["*"])
@@ -1887,6 +1889,50 @@ fn a_different_tokenizer_or_vocabulary_is_refused_with_the_reason() {
 }
 
 #[test]
+fn the_check_compares_token_ids_not_settings_and_a_chat_template_is_only_a_warning() {
+    // the strict hash differs (a chat template, padding side...) but the ids hash is the same: accepted, and the template difference is a yellow warning
+    let (mut s, mut t) = (facts(4.0e9, "strict-a", 151_665), facts(8.0e9, "strict-b", 151_665));
+    s["ids_hash"] = json!("ids");
+    t["ids_hash"] = json!("ids");
+    s["template_hash"] = json!("t1");
+    t["template_hash"] = json!("t2");
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(levels(&v, "ok").iter().any(|l| l.contains("The tokenizer is identical (151,665 tokens)")));
+    assert!(levels(&v, "refuse").is_empty());
+    let w = levels(&v, "warn");
+    assert!(w.len() == 1 && w[0].contains("different chat templates") && w[0].contains("template of the model you heal"), "{w:?}");
+    // the same template (or none on both sides): no warning
+    t["template_hash"] = json!("t1");
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "warn").is_empty());
+    s["template_hash"] = json!(null);
+    t["template_hash"] = json!(null);
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "warn").is_empty());
+}
+
+#[test]
+fn the_probe_of_two_different_tokenizer_files_is_a_yellow_warning_or_a_refusal() {
+    let (mut s, mut t) = (facts(4.0e9, "x", 10), facts(8.0e9, "y", 10));
+    s["ids_hash"] = json!("ids-a");
+    t["ids_hash"] = json!("ids-b");
+    t["pair_probe"] = json!({"ok": true, "level": "warn", "text": "The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."});
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(levels(&v, "warn"), ["The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."]);
+    t["pair_probe"] = json!({"ok": false, "level": "refuse", "text": "The two models do not use the same tokenizer: the same text gives different token ids. First difference, on the text \"a\": [1], [2]."});
+    let v = hsrc::verdict(&s, Some(&t), &ctx());
+    assert!(v["ok"] == false && levels(&v, "refuse")[0].contains("First difference"), "{v}");
+    // different sizes are refused whatever the probe says
+    t["vocab_tokens"] = json!(11);
+    t["pair_probe"] = json!({"ok": true, "level": "warn", "text": "fine"});
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "refuse")[0].contains("10 and 11"));
+    // no answer from the worker: refused as before
+    t["vocab_tokens"] = json!(10);
+    t["pair_probe"] = json!(null);
+    assert!(levels(&hsrc::verdict(&s, Some(&t), &ctx()), "refuse")[0].contains("tokenizer files differ"));
+}
+
+#[test]
 fn what_cannot_be_healed_is_refused_in_plain_words() {
     let t = facts(8.0e9, "abc", 10);
     let mut q = facts(4.0e9, "abc", 10);
@@ -2060,6 +2106,41 @@ fn write_facts(root: &std::path::Path, entries: &[(&str, serde_json::Value)]) {
 #[cfg(unix)]
 fn count_jobs(root: &std::path::Path, kind: &str) -> usize {
     jobs_seen(root).iter().filter(|j| j["job"] == kind).count()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pair_whose_tokenizer_files_differ_but_whose_ids_agree_is_accepted_with_a_warning_and_can_start() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let folder = d.path().join("pruned-9b");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("config.json"), "{}").unwrap();
+    let (student, teacher) = (Source::Folder { path: folder.to_string_lossy().to_string() }, Source::Hub { id: "acme/Big-9B-probe".into() });
+    let (sk, tk) = (folder.to_string_lossy().to_string(), "acme/Big-9B-probe");
+    let mut sf = facts(4.0e9, "abc", 10);
+    sf["ids_hash"] = json!("ids-a");
+    sf["tokenizer_dir"] = json!("somewhere/s");
+    let mut tf = facts(4.8e9, "def", 10);
+    tf["kind"] = json!("hub");
+    tf["ids_hash"] = json!("ids-b");
+    tf["tokenizer_dir"] = json!("somewhere/t");
+    let mut m = serde_json::Map::new();
+    m.insert(sk.clone(), sf);
+    m.insert(tk.into(), tf);
+    m.insert("__pair__".into(), json!({"ok": true, "level": "warn", "text": "The tokenizer files differ but both produce the same token ids on 40 test texts; healing can go on."}));
+    std::fs::write(d.path().join("facts.json"), serde_json::Value::Object(m).to_string()).unwrap();
+    let pair = hsrc::heal_pair(&p, &student, Some(&teacher), Some(32.0), true, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(pair["check"]["ok"], true, "{pair}");
+    assert!(levels(&pair["check"], "warn").iter().any(|l| l.contains("both produce the same token ids on 40 test texts")), "{pair}");
+    assert!(pair["options"].is_object(), "the Heal card's options are there for a pair accepted with a warning");
+    assert!(jobs_seen(d.path()).iter().any(|j| j["job"] == "heal_check" && j["pair"]["student"] == "somewhere/s" && j["pair"]["teacher"] == "somewhere/t"));
+    let spec = rruns::HealSpec { ..heal_spec(40) };
+    let r = hsrc::heal_from_source(&p, &student, Some(&teacher), &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    assert!(r["name"].as_str().is_some(), "{r}");
 }
 
 #[cfg(unix)]

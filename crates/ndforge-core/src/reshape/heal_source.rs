@@ -226,9 +226,9 @@ fn facts_key(repr: &str) -> (String, Option<u64>) {
     let dir = Path::new(repr);
     if dir.is_dir() {
         let mtime = std::fs::metadata(dir.join("config.json")).and_then(|x| x.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-        (format!("{repr}@{mtime}"), None)
+        (format!("v2|{repr}@{mtime}"), None)
     } else {
-        (repr.to_string(), Some(600))
+        (format!("v2|{repr}"), Some(600))
     }
 }
 
@@ -266,7 +266,40 @@ pub fn facts(student: &str, teacher: Option<&str>, refresh: bool, kill: &AtomicB
         }
         let _ = write_json(&facts_cache_file(), &cache);
     }
-    Ok((s.ok_or_else(|| Error::new("The worker did not describe the model."))?, t))
+    let s = s.ok_or_else(|| Error::new("The worker did not describe the model."))?;
+    if let Some(t) = t.as_mut() {
+        attach_pair_probe(&s, t, &mut cache, kill, on_event);
+    }
+    Ok((s, t))
+}
+
+/// When the two tokenizers' ids hashes differ (and the vocabularies are not known to differ in size), the worker compares what they do with a fixed set of texts
+/// (`tokpair.decide_pair`); its answer is put on the teacher's facts as `pair_probe` and kept per pair. Without an answer the verdict refuses, as before.
+fn attach_pair_probe(s: &Value, t: &mut Value, cache: &mut Value, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) {
+    if !s["error"].is_null() || !t["error"].is_null() {
+        return;
+    }
+    let (Some(sh), Some(th)) = (s["ids_hash"].as_str(), t["ids_hash"].as_str()) else { return };
+    let (Some(sd), Some(td)) = (s["tokenizer_dir"].as_str(), t["tokenizer_dir"].as_str()) else { return };
+    if sh == th || matches!((s["vocab_tokens"].as_u64(), t["vocab_tokens"].as_u64()), (Some(a), Some(b)) if a != b) {
+        return;
+    }
+    let key = format!("pair|{sh}|{th}");
+    let kept = cache.get(&key).filter(|e| e["probe"]["level"].is_string()).map(|e| e["probe"].clone());
+    let probe = kept.or_else(|| {
+        let py = python().ok()?;
+        let r = run_job(&py, &worker_dir(), &json!({"job": "heal_check", "pair": {"student": sd, "teacher": td}}), kill, &mut |e| on_event(event_json(e))).ok()?;
+        let probe = r.get("pair").filter(|p| p["level"].is_string())?.clone();
+        // an answer that only says "could not run" is not kept: the next Check tries again
+        if matches!(probe["probe"]["status"].as_str(), Some("passed") | Some("different")) {
+            cache[&key] = json!({"at": epoch(), "probe": probe});
+            let _ = write_json(&facts_cache_file(), cache);
+        }
+        Some(probe)
+    });
+    if let Some(p) = probe {
+        t["pair_probe"] = p;
+    }
 }
 
 fn gb(bytes: f64) -> f64 {
@@ -384,18 +417,27 @@ pub fn verdict(student: &Value, teacher: Option<&Value>, ctx: &Ctx) -> Value {
 }
 
 fn tokenizer_items(student: &Value, t: &Value, out: &mut Vec<Value>) {
-    let (sh, th) = (student["tokenizer_hash"].as_str(), t["tokenizer_hash"].as_str());
+    // `ids_hash` (what decides token ids) is what the pair is compared by; facts of an older worker only have the strict `tokenizer_hash`
+    let hash = |f: &Value| f["ids_hash"].as_str().or_else(|| f["tokenizer_hash"].as_str()).map(String::from);
+    let (sh, th) = (hash(student), hash(t));
     let (sv, tv) = (student["vocab_tokens"].as_u64(), t["vocab_tokens"].as_u64());
     match (sh, th) {
         (Some(a), Some(b)) if a == b && sv == tv => out.push(item("ok", format!("The tokenizer is identical{}.", sv.map(|v| format!(" ({} tokens)", crate::reshape::runs::thousands(v))).unwrap_or_default()))),
         (Some(_), Some(_)) => {
-            let sizes = match (sv, tv) {
-                (Some(a), Some(b)) if a != b => format!(" The vocabularies have {} and {} tokens.", crate::reshape::runs::thousands(a), crate::reshape::runs::thousands(b)),
-                _ => " The vocabularies have the same size, but the tokenizer files differ.".into(),
-            };
-            out.push(item("refuse", format!("The two models do not use the same tokenizer, so the teacher's answers cannot teach this model.{sizes} Choose the model this one was made from.")));
+            if let Some((a, b)) = sv.zip(tv).filter(|(a, b)| a != b) {
+                out.push(item("refuse", format!("The two models do not use the same tokenizer, so the teacher's answers cannot teach this model. The vocabularies have {} and {} tokens. Choose the model this one was made from.", crate::reshape::runs::thousands(a), crate::reshape::runs::thousands(b))));
+            } else if let Some(p) = t["pair_probe"].as_object().filter(|p| p.get("level").is_some_and(|l| l == "warn" || l == "refuse")) {
+                let level = p["level"].as_str().unwrap_or("refuse");
+                out.push(item(level, p.get("text").and_then(|x| x.as_str()).unwrap_or("The tokenizers could not be compared.")));
+            } else {
+                out.push(item("refuse", "The two models do not use the same tokenizer, so the teacher's answers cannot teach this model. The vocabularies have the same size, but the tokenizer files differ. Choose the model this one was made from."));
+            }
         }
         _ => out.push(item("refuse", "A tokenizer's files are missing in one of the models, so the program cannot tell whether they use the same tokenizer. Healing needs them (tokenizer.json or vocab.json).")),
+    }
+    // a chat template that differs never refuses: the healing texts are written with the student's own template and the teacher reads the same ids
+    if student["template_hash"] != t["template_hash"] && (student["template_hash"].is_string() || t["template_hash"].is_string()) {
+        out.push(item("warn", "The two models use different chat templates. That is fine for healing: the texts are written with the template of the model you heal, and the original then reads exactly the same token ids, so the original's own template is not used. The healed copy keeps the template of the model you heal."));
     }
     if let (Some(a), Some(b)) = (student["vocab_size"].as_u64(), t["vocab_size"].as_u64()) {
         if a != b {
