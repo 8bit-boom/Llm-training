@@ -781,3 +781,14 @@ pub fn heal_plan_with(student_b: f64, teacher_b: f64, vram_gb: Option<f64>, d: &
         student_gb, breakdown, verdict, verdict_text: heal_verdict_text(est, vram_gb), knobs: k.clone(),
     }
 }
+
+// ------------------------------------------------------------------------------------------------------------- try before cutting
+
+/// "Quick" and "Full" of the Try-first card: the number of calibration samples of a pass.
+pub const TRY_QUICK_SAMPLES: u32 = 64;
+pub const TRY_FULL_SAMPLES: u32 = 128;
+
+/// Owner decision: Quick for models of 15 B or more (a pass over a 27B is slow), Full below.
+pub fn default_try_samples(total_b: f64) -> u32 {
+    if total_b >= 15.0 { TRY_QUICK_SAMPLES } else { TRY_FULL_SAMPLES }
+}

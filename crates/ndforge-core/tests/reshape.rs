@@ -1082,6 +1082,14 @@ if kind == "reshape_measure":
     json.dump({{"format": 1, "tokens": 4321, "load": "4bit", "created": "2026-11-13T00:00:00Z"}}, open(os.path.join(job["out_dir"], "scores.json"), "w"))
     out(type="progress", step="score", value=0.5, text="Measuring")
     out(type="result", data={{"tokens": 4321, "load": "4bit", "loss": 2.0, "stable_depth": True}}); sys.exit(0)
+if kind == "reshape_try":
+    os.makedirs(job["out_dir"], exist_ok=True)
+    if job.get("plan_only"):
+        out(type="result", data={{"passes_total": 3, "passes_cached": 1, "passes_todo": 2, "needs_measurement": False, "seconds_per_pass": 12.0, "seconds": 24.0, "guess": True}}); sys.exit(0)
+    json.dump({{"format": 1, "key": {{"source": job["source"]["repo"], "data_version": job["calibration"]["version"]}}, "passes": {{"d=|w=": {{"loss": 2.0}}}},
+               "analysis": {{"base": {{"loss": 2.0}}}}, "seconds_per_pass": 3.0, "tokens": 100, "load_used": "4bit"}}, open(os.path.join(job["out_dir"], "reshape_try.json"), "w"))
+    out(type="try_pass", key="d=|w=", done=1, total=1, loss=2.0)
+    out(type="result", data={{"passes_total": 1, "passes_done": 1, "stopped": False, "analysis": {{"base": {{"loss": 2.0}}}}}}); sys.exit(0)
 if kind == "distill_cache":
     if marker("stop-cache"):
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
@@ -1640,4 +1648,88 @@ fn the_old_dataset_fields_still_work_and_zero_share_means_no_general_text() {
     let none: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10, "general_share": 0.0})).unwrap();
     assert!(none.general_source().unwrap().is_none());
     assert_eq!(rruns::DEFAULT_GENERAL_DATASET, "mlabonne/open-perfectblend");
+}
+
+
+// ---------------------------------------------------------------------------------------------------- try before cutting
+
+fn try_spec() -> rruns::TrySpec {
+    serde_json::from_value(json!({"model_id": "qwen3.5-4b"})).unwrap()
+}
+
+#[test]
+fn a_try_spec_has_the_owner_defaults_and_refuses_nonsense() {
+    let s = try_spec();
+    assert_eq!((s.samples, s.len, s.measure_samples, s.load.as_str(), s.strategy.as_str(), s.protect_first, s.protect_last, s.blocks, s.force), (64, 512, 256, "auto", "contiguous", 1, 1, false, false));
+    assert!(s.validate().is_ok() && s.runs.is_empty() && s.widths.is_empty() && s.choices.is_empty());
+    assert_eq!(s.want(), json!({"blocks": false, "runs": [], "widths": [], "choices": []}));
+    for bad in [json!({"load": "8bit"}), json!({"strategy": "x"}), json!({"samples": 2}), json!({"len": 8}), json!({"runs": [0]}), json!({"runs": [65]}), json!({"widths": [0]}),
+                json!({"choices": [{}]}), json!({"choices": [{"blocks": []}]}), json!({"protect_first": 9})] {
+        let mut v = json!({"model_id": "qwen3.5-4b"});
+        v.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let s: rruns::TrySpec = serde_json::from_value(v.clone()).unwrap();
+        assert!(s.validate().is_err(), "{v}");
+    }
+    let ok: rruns::TrySpec = serde_json::from_value(json!({"model_id": "m", "blocks": true, "runs": [4], "widths": [13312], "choices": [{"blocks": [9, 10], "width": 12288}, {"width": 13312}]})).unwrap();
+    assert!(ok.validate().is_ok());
+    assert_eq!(ok.want(), json!({"blocks": true, "runs": [4], "widths": [13312], "choices": [{"blocks": [9, 10], "width": 12288}, {"blocks": [], "width": 13312}]}));
+}
+
+#[test]
+fn quick_for_big_models_and_full_for_small_ones() {
+    assert_eq!((default_try_samples(27.8), default_try_samples(15.0), default_try_samples(9.0), default_try_samples(4.0)), (64, 64, 128, 128));
+    assert_eq!((TRY_QUICK_SAMPLES, TRY_FULL_SAMPLES), (64, 128));
+}
+
+#[test]
+fn the_try_job_names_the_measurement_and_its_own_folder() {
+    let d = tempdir().unwrap();
+    let p = project_with_version(d.path());
+    let m = catalog::find("qwen3.5-4b").unwrap();
+    let mut s = try_spec();
+    s.samples = 128;
+    s.params_b = Some(4.0);
+    s.runs = vec![4];
+    let job = rruns::try_job(&p, &m, &s, true).unwrap();
+    assert_eq!((job["job"].as_str(), job["plan_only"].clone(), job["force"].clone(), job["load"].as_str(), job["strategy"].as_str()), (Some("reshape_try"), json!(true), json!(false), Some("auto"), Some("contiguous")));
+    assert_eq!(job["out_dir"].as_str().unwrap(), rruns::scores_dir(&p, "unsloth-qwen3.5-4b-v1-128x512-auto").to_string_lossy());
+    assert_eq!(job["measure_dir"].as_str().unwrap(), rruns::scores_dir(&p, "unsloth-qwen3.5-4b-v1-256x512-auto").to_string_lossy(), "the neuron scores come from the measurement the Make button would use");
+    assert_eq!((job["calibration"]["samples"].clone(), job["calibration"]["version"].clone(), job["measure_samples"].clone(), job["protect"].clone(), job["want"]["runs"].clone(), job["params_b"].clone()),
+               (json!(128), json!(1), json!(256), json!({"first": 1, "last": 1}), json!([4]), json!(4.0)));
+    assert!(job["calibration"]["train"].as_str().unwrap().ends_with("train.jsonl"));
+    let q = project(&d.path().join("empty"));
+    assert!(rruns::try_job(&q, &m, &s, false).unwrap_err().0.contains("training-data version"));
+    s.load = "8bit".into();
+    assert!(rruns::try_job(&p, &m, &s, false).is_err());
+    assert!(rruns::try_results(&q, "qwen3.5-4b", 64, 512, "auto").unwrap()["exists"] == false);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_plan_and_the_run_of_a_try_go_through_the_worker_and_the_answers_are_found_again() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    assert_eq!(rruns::try_results(&p, "qwen3.5-4b", 64, 512, "auto").unwrap()["exists"], false);
+    let mut s = try_spec();
+    s.runs = vec![4];
+    let plan = rruns::try_plan(&p, &s, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!((plan["passes_total"].clone(), plan["passes_todo"].clone(), plan["seconds"].clone(), plan["guess"].clone()), (json!(3), json!(2), json!(24.0), json!(true)));
+    assert_eq!(plan["dir"].as_str().unwrap(), rruns::scores_dir(&p, "unsloth-qwen3.5-4b-v1-64x512-auto").to_string_lossy());
+    let mut events = Vec::new();
+    let r = rruns::try_run(&p, &s, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
+    assert_eq!((r["passes_done"].clone(), r["stopped"].clone(), r["samples"].clone()), (json!(1), json!(false), json!(64)));
+    assert!(events.iter().any(|e| e["kind"] == "try_pass" && e["done"] == 1));
+    let jobs = jobs_seen(d.path());
+    assert_eq!((jobs[0]["plan_only"].clone(), jobs[1]["plan_only"].clone()), (json!(true), json!(false)));
+    let found = rruns::try_results(&p, "qwen3.5-4b", 64, 512, "auto").unwrap();
+    assert_eq!((found["exists"].clone(), found["analysis"]["base"]["loss"].clone(), found["seconds_per_pass"].clone(), found["load"].clone(), found["passes"].clone()), (json!(true), json!(2.0), json!(3.0), json!("4bit"), json!(1)));
+    assert_eq!(rruns::try_results(&p, "qwen3.5-4b", 128, 512, "auto").unwrap()["exists"], false, "another number of samples is another set of answers");
+    assert!(rruns::try_run(&p, &try_spec_with("nope"), Arc::new(AtomicBool::new(false)), &mut |_| {}).is_err());
+}
+
+#[cfg(unix)]
+fn try_spec_with(model: &str) -> rruns::TrySpec {
+    serde_json::from_value(json!({"model_id": model})).unwrap()
 }

@@ -81,17 +81,19 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("evaluate_failed", _explain(exc))
             return 1
-    if kind in ("reshape_inspect", "reshape", "reshape_measure"):
-        from . import reshape, reshapejob
+    if kind in ("reshape_inspect", "reshape", "reshape_measure", "reshape_try"):
+        from . import reshape, reshapejob, reshapetry
         try:
-            return {"reshape_inspect": reshapejob.run_inspect, "reshape": reshapejob.run, "reshape_measure": reshapejob.run_measure}[kind](job)
+            return {"reshape_inspect": reshapejob.run_inspect, "reshape": reshapejob.run, "reshape_measure": reshapejob.run_measure,
+                    "reshape_try": reshapetry.run_try}[kind](job)
         except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
             protocol.error("reshape_refused", str(exc))
             return 1
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            protocol.error({"reshape_inspect": "inspect_failed", "reshape": "reshape_failed", "reshape_measure": "measure_failed"}[kind], _explain(exc))
+            protocol.error({"reshape_inspect": "inspect_failed", "reshape": "reshape_failed", "reshape_measure": "measure_failed",
+                                                   "reshape_try": "try_failed"}[kind], _explain(exc))
             return 1
     if kind in ("distill_cache", "distill", "distill_merge"):
         from . import distilljob, reshape

@@ -24,6 +24,16 @@ The program runs a sample of **your own world's text** (the saved data version o
 - **As an exact copy of the original** (default, recommended): the layers that are copied in have their output weights set to zero, so they do nothing yet. The program checks this on a sample of your text (the error must be the same before and after) and refuses to keep a model that fails the check. Training then switches them on. Because they are zero, the program also trains their output weights (Step 3 does this by itself); Expert mode has *Train only the new layers*.
 - **Copy the layers** (SOLAR style): the copies work at once. The model is disturbed until it has been trained.
 
+## Try first (before anything is written)
+The **Try first** card tells you what a cut will cost **before** a new model (tens of GB) is written. It loads the original once, imitates the cut inside it (the removed layers pass their input on; the removed neurons are switched off) and measures the same text-prediction error on **your own text** as the *before / after* numbers of a made model, so the two can be compared. Only a small results file is saved.
+
+- **What to try:** every block on its own (a bar chart: the rise of the error with only that block skipped, the program's own score as a ◆), every run of the blocks on the slider (a table with the cheapest run next to the program's default choice), every width of the slider (quality against size), or **My choice**: click blocks in the chart (and pick a width) and *Preview my choice* gives the honest number for exactly that cut. Two blocks together cost more than the two single costs added up.
+- **Cost:** the card says how many passes over your text a request needs and how long that takes. The first time the time is a guess from the model's size; the real time of a pass is measured and kept. **Quick** (64 samples) is the default for models of 15 B or more, **Full** (128) below.
+- **Stop** keeps the cuts already tried. Trying the same again costs nothing; a request that adds more only runs the new ones. Other data, other settings or other weights of the model mean new answers (the log says why).
+- **How to read the colours:** green under +3 %, amber +3 to +10 %, red over +10 % rise of the error. These are **rules of thumb**, not measurements. The numbers are the error **before healing**: healing usually wins back part of it, a cheap cut now is not a guarantee that it heals well, and an expensive one can still heal into a usable model.
+- **Two halves:** the text is also split in two halves. If they disagree about which cut is cheapest, the card says so; treat that ranking as uncertain (Full uses more text).
+- **Use this choice** fills the Make form below with exactly the layers (and width) that were tried. Widths need the neuron measurement (*Measure first*). Models other than Qwen3.5 / 3.8 are not offered this.
+
 ## After it is made
 1. **Test against the original.** The same questions as Step 4, asked to the original and to the new model. Big models are loaded in 4-bit so both fit the card; the result says so.
 2. **Train it on your world** (Step 3). Big slimmed models usually need QLoRA on a 32 GB card. 4-bit training is fine for dense Qwen3.5 models (Unsloth's caution is about the MoE ones), but it loses a little more quality than 16-bit, so check the result with the test.

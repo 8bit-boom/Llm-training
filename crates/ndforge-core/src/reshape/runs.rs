@@ -926,6 +926,171 @@ pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, 
     Ok(result)
 }
 
+// ------------------------------------------------------------------------------------------------------------ try before cutting
+
+fn try_one() -> u32 {
+    1
+}
+fn try_samples() -> u32 {
+    plan::TRY_QUICK_SAMPLES
+}
+fn try_len() -> u32 {
+    512
+}
+fn try_measure_samples() -> u32 {
+    256
+}
+fn try_auto() -> String {
+    "auto".into()
+}
+fn try_contiguous() -> String {
+    "contiguous".into()
+}
+
+/// One cut the person wants an exact answer for: blocks (clicked or typed) and/or an MLP width.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TryChoice {
+    #[serde(default)]
+    pub blocks: Vec<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+}
+
+/// What "Try first" is asked to find out: which cuts, on how much text. Nothing is written but `reshape_try.json` in the measurement's folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrySpec {
+    pub model_id: String,
+    /// Quick (64) or Full (128) samples of the project's text; the answers are kept per number of samples
+    #[serde(default = "try_samples")]
+    pub samples: u32,
+    #[serde(default = "try_len")]
+    pub len: u32,
+    #[serde(default = "try_auto")]
+    pub load: String,
+    /// the samples of the measurement whose neuron scores (and influence) are used
+    #[serde(default = "try_measure_samples")]
+    pub measure_samples: u32,
+    #[serde(default = "try_contiguous")]
+    pub strategy: String,
+    #[serde(default = "try_one")]
+    pub protect_first: u32,
+    #[serde(default = "try_one")]
+    pub protect_last: u32,
+    /// every block on its own
+    #[serde(default)]
+    pub blocks: bool,
+    /// run lengths: every run of that many neighbouring blocks
+    #[serde(default)]
+    pub runs: Vec<u32>,
+    /// MLP widths (the stops of the size slider)
+    #[serde(default)]
+    pub widths: Vec<u32>,
+    /// exact choices (blocks and/or width)
+    #[serde(default)]
+    pub choices: Vec<TryChoice>,
+    /// throw the saved answers away first
+    #[serde(default)]
+    pub force: bool,
+    /// the model's size in billions of parameters (for the first time estimate)
+    #[serde(default)]
+    pub params_b: Option<f64>,
+}
+
+/// The most cuts one request may ask for (a safety net; the page asks for far fewer).
+pub const TRY_MAX_PASSES: usize = 400;
+
+impl TrySpec {
+    pub fn validate(&self) -> Result<()> {
+        if !["auto", "16bit", "4bit", "offload"].contains(&self.load.as_str()) {
+            return Err(Error::new(format!("Unknown way of loading the model: {}.", self.load)));
+        }
+        if !["contiguous", "separate"].contains(&self.strategy.as_str()) {
+            return Err(Error::new(format!("Unknown way of choosing layers: {}.", self.strategy)));
+        }
+        if !(8..=4096).contains(&self.samples) || !(8..=4096).contains(&self.measure_samples) || !(32..=8192).contains(&self.len) {
+            return Err(Error::new("Try on 8 to 4096 samples of 32 to 8192 tokens."));
+        }
+        if self.protect_first > 8 || self.protect_last > 8 {
+            return Err(Error::new("Protect at most 8 blocks at each end."));
+        }
+        if self.runs.iter().any(|k| !(1..=64).contains(k)) || self.widths.iter().any(|w| *w == 0) {
+            return Err(Error::new("The run lengths and widths to try are not valid."));
+        }
+        if self.choices.iter().any(|c| c.blocks.is_empty() && c.width.is_none()) {
+            return Err(Error::new("A choice to try needs at least one block or a width."));
+        }
+        if self.choices.len() + self.widths.len() + self.runs.len() * 64 > TRY_MAX_PASSES {
+            return Err(Error::new("That asks for too many cuts at once."));
+        }
+        Ok(())
+    }
+
+    /// The `want` of the worker job.
+    pub fn want(&self) -> Value {
+        json!({"blocks": self.blocks, "runs": self.runs, "widths": self.widths, "choices": self.choices})
+    }
+}
+
+/// The folder where the answers for this model, data and settings are kept (the measurement's own folder when the samples are the same).
+pub fn try_dir(p: &Project, m: &ModelEntry, version: u32, spec: &TrySpec) -> PathBuf {
+    scores_dir(p, &scores_key(&m.repo, Some(version), spec.samples, spec.len, &spec.load))
+}
+
+/// The worker's job for a spec. `plan_only`: count the passes and estimate the time, run nothing.
+pub fn try_job(p: &Project, m: &ModelEntry, spec: &TrySpec, plan_only: bool) -> Result<Value> {
+    spec.validate()?;
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the cuts are tried on your own text."))?;
+    let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
+    if !train.is_file() {
+        return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
+    }
+    Ok(json!({
+        "job": "reshape_try", "source": {"repo": m.repo, "family": m.family}, "load": spec.load, "out_dir": try_dir(p, m, version, spec), "plan_only": plan_only, "force": spec.force,
+        "calibration": {"train": train, "samples": spec.samples, "max_len": spec.len, "seed": 3407, "version": version},
+        "measure_dir": scores_dir(p, &scores_key(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load)), "measure_samples": spec.measure_samples,
+        "protect": {"first": spec.protect_first, "last": spec.protect_last}, "strategy": spec.strategy, "want": spec.want(), "params_b": spec.params_b,
+    }))
+}
+
+fn try_model(spec: &TrySpec) -> Result<ModelEntry> {
+    catalog::find(&spec.model_id).ok_or_else(|| Error::new("That model is not in the list any more."))
+}
+
+/// How many cuts the request needs, how many are saved already and the time the rest will take (a guess the first time, then measured). Loads nothing.
+pub fn try_plan(p: &Project, spec: &TrySpec, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let m = try_model(spec)?;
+    let job = try_job(p, &m, spec, true)?;
+    let py = python()?;
+    let mut r = run_job(&py, &worker_dir(), &job, kill, &mut |e| on_event(event_json(e)))?;
+    r["dir"] = job["out_dir"].clone();
+    Ok(r)
+}
+
+/// The answers kept for this model, data and settings (`{"exists": false}` when there are none). Whether they still belong to the weights is checked by the worker.
+pub fn try_results(p: &Project, model_id: &str, samples: u32, len: u32, load: &str) -> Result<Value> {
+    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+    let Some((version, _)) = crate::train::runs::latest_version(p) else { return Ok(json!({"exists": false})) };
+    let file = scores_dir(p, &scores_key(&m.repo, Some(version), samples, len, load)).join("reshape_try.json");
+    let Some(v) = read_json(&file) else { return Ok(json!({"exists": false})) };
+    if v["key"]["source"] != json!(m.repo) || v["key"]["data_version"] != json!(version) {
+        return Ok(json!({"exists": false}));
+    }
+    Ok(json!({"exists": true, "analysis": v["analysis"], "seconds_per_pass": v["seconds_per_pass"], "tokens": v["tokens"], "load": v["load_used"], "passes": v["passes"].as_object().map(|o| o.len()).unwrap_or(0)}))
+}
+
+/// Runs the cuts that are not saved yet (a stop keeps the finished ones). Events: `try_pass` after every cut, `progress`, `log`. Returns the worker's result.
+pub fn try_run(p: &Project, spec: &TrySpec, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let m = try_model(spec)?;
+    let job = try_job(p, &m, spec, false)?;
+    let py = python()?;
+    let folder = PathBuf::from(job["out_dir"].as_str().unwrap_or_default());
+    let _active = Active::begin(&folder)?;
+    let stop_dir = models_dir(p).join("_scores");
+    let mut result = crate::train::runs::drive(&py, &stop_dir, &job, stop, Duration::from_secs(60), &mut |e| on_event(event_json(e)))?;
+    result["samples"] = json!(spec.samples);
+    Ok(result)
+}
+
 /// What the Heal card shows for a made model: how it would run on this card, the budgets with the disk and time they need, and where it stands.
 pub fn heal_options(p: &Project, name: &str, vram_gb: Option<f64>) -> Result<Value> {
     valid_name(name)?;
