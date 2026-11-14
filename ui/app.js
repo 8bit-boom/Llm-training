@@ -974,11 +974,13 @@ function wireTest() {
 }
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
+// the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
+const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
   shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
-  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, rank: 64, lr: 0.0001, mode: "" } };
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
 // labelled experimental, and stays switched off until the measurements on a real graphics card (docs/RESHAPE.md, "Not verified yet") are done:
@@ -1114,12 +1116,47 @@ function lineChart(points, label, lower) {
 
 const HEAL_STEPS = { cache: "1 of 3 · The original model answers your texts", train: "2 of 3 · The thinner model learns from the original", merge: "3 of 3 · Saving the healed model" };
 
+
+// the live memory estimate for the settings chosen so far (the numbers come from the core, one source for the page and the job)
+async function rsHealEstimate() {
+  const name = rs.hl && rs.hl.name;
+  if (!name) return;
+  const key = JSON.stringify(rsHealSpec());
+  try {
+    const est = await invoke("heal_estimate", { name, spec: rsHealSpec() });
+    if (est && rs.hl && rs.hl.name === name) { rs.hlEst = { name, key, est }; render(); }
+  } catch (e) { /* the page keeps the estimate it has */ }
+}
+
 // the measured numbers of a healing run (saved ones, then the live ones of this session), as chart points
 function healSeries() {
   const ev = ((rs.hl && rs.hl.opts && rs.hl.opts.metrics) || []).concat((rs.hlRun && rs.hlRun.live) || []);
   const seen = new Set(), kd = [], cal = [];
   ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") cal.push([e.step, e.calib_loss]); });
   return { kd, cal };
+}
+
+// the Expert "Healing settings" section of the Heal card; null in a field of the spec = the automatic value, shown here from `kn`
+function healSettings(sp, kn, plan, busy) {
+  const d = busy ? "disabled" : "", v = (x, auto) => (x ?? auto);
+  const sel = (id, cur, opts) => `<select id="${id}" ${d}>${opts.map(([val, label]) => `<option value="${val}" ${String(cur) === String(val) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+  const pu = v(sp.per_update, (kn.batch || 1) * (kn.grad_accum || 1)), bt = v(sp.batch, kn.batch || 1);
+  return `<details id="hl-settings" open><summary>Healing settings</summary>
+    <p class="dim small">The safe settings for this model and card are already chosen. If healing runs out of memory, the program tries again by itself with safer ones.</p>
+    <div class="grid">
+    <label>Sequence length<br>${sel("hl-seq", v(sp.seq, kn.seq), [[512, "512"], [1024, "1024"], [2048, "2048"], [4096, "4096"]])}</label>
+    <label>Batch per step<br>${sel("hl-batch", bt, [[1, "1"], [2, "2"], [4, "4"]])}</label>
+    <label>Sequences per update<br><input type="text" id="hl-perupdate" value="${pu}" ${d}> <span class="dim small" id="hl-accum">= ${bt} × ${Math.ceil(pu / bt)} steps added up</span></label>
+    <label>Gradient checkpointing<br>${sel("hl-ckpt", sp.checkpointing || "auto", [["auto", "Auto" + (kn.checkpointing != null ? " (" + (kn.checkpointing ? "on" : "off") + ")" : "")], ["on", "On (less memory, about a third slower)"], ["off", "Off"]])}</label>
+    <label>LoRA size (rank, 8 to 128)<br><input type="text" id="hl-rank" value="${v(sp.rank, kn.rank ?? "")}" ${d}></label>
+    <label>Method<br>${sel("hl-method", sp.method || "", [["", "Automatic (" + (plan.student_method === "qlora" ? "QLoRA 4-bit" : "LoRA 16-bit") + ")"], ["qlora", "QLoRA 4-bit"], ["lora", "LoRA 16-bit"]])}</label>
+    <label>Optimizer<br>${sel("hl-optim", sp.optimizer || "adamw_8bit", [["adamw_8bit", "8-bit AdamW (less memory)"], ["adamw", "AdamW"]])}</label>
+    <label>Loss chunk (64 to 512 tokens)<br><input type="text" id="hl-klchunk" value="${v(sp.kl_chunk, kn.kl_chunk ?? "")}" ${d}></label>
+    <label>Answers kept per token (top-k, 8 to 128)<br><input type="text" id="hl-k" value="${v(sp.k, 32)}" ${d}></label>
+    <label>The original is loaded as<br>${sel("hl-tload", sp.teacher_load || "auto", [["auto", "Automatic"], ["4bit", "4-bit"], ["16bit", "16-bit"]])}</label>
+    <label>Warm-up steps<br><input type="text" id="hl-warmup" value="${v(sp.warmup, 30)}" ${d}></label></div>
+    <p class="dim small">A different sequence length, LoRA size or top-k means the original answers again or the learning starts again; the other settings keep what was saved.</p>
+    <div class="row"><button class="secondary" id="hl-reset" ${d}>Reset to safe defaults</button></div></details>`;
 }
 
 // "Heal it": the original teaches the thinner model to answer like it did
@@ -1131,13 +1168,15 @@ function healCard(m) {
   const head = `<h3>Heal it ${wide ? "(recommended)" : "(optional)"}</h3>`;
   if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
   if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
-  const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, plan = h.plan || {}, st = (h.heal && h.heal.status) || null;
+  const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, st = (h.heal && h.heal.status) || null;
+  const est = rs.hlEst && rs.hlEst.name === m.name ? rs.hlEst.est : null, plan = (est && est.plan) || h.plan || {}, kn = (est && est.knobs) || h.defaults || plan.knobs || {};
   const t = (h.tokens || []).find((x) => x.tokens_m === tk) || {};
   const expert = state.settings.expert_mode;
   gcUse(h.general);
   const blocked = sp.general ? gcBlocked("heal") : "";
-  const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>`
-    : `<p class="dim small">${plan.mode === "online" ? "The original and the thinner model run at the same time" : "The original answers first and saves its answers to disk, then the thinner model learns (they take turns)"}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. The thinner model is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>`;
+  const verdictP = plan.verdict_text ? `<p class="${plan.verdict === "over" ? "err" : plan.verdict === "tight" ? "warn" : "dim"} small" id="hl-verdict">${esc(plan.verdict_text)}${plan.breakdown ? ` <span class="dim">Weights ${plan.breakdown.weights_gb} GB, LoRA and optimizer ${plan.breakdown.lora_gb} GB, activations ${plan.breakdown.activations_gb} GB, loss ${plan.breakdown.kl_gb} GB, the rest ${(plan.breakdown.overhead_gb + (plan.breakdown.total_gb - plan.breakdown.weights_gb - plan.breakdown.lora_gb - plan.breakdown.activations_gb - plan.breakdown.kl_gb - plan.breakdown.overhead_gb)).toFixed(1)} GB.</span>` : ""}</p>` : "";
+  const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>${verdictP}`
+    : `<p class="dim small">${plan.mode === "online" ? "The original and the thinner model run at the same time" : "The original answers first and saves its answers to disk, then the thinner model learns (they take turns)"}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. The thinner model is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>${verdictP}`;
   const busy = rs.running || rs.testing || (run && run.running);
   const prog = run && run.running ? `<div class="stepline">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
   const series = healSeries();
@@ -1147,6 +1186,11 @@ function healCard(m) {
   const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
   const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
   const resume = st === "stopped" || st === "failed";
+  const oomFailed = st === "failed" && h.heal && h.heal.oom === true;
+  const tried = oomFailed && (h.heal.retries || []).length ? `<p class="dim small">Tried automatically: ${esc(h.heal.retries.map((r) => r.change).join(", then "))}.</p>` : "";
+  const oomBlock = oomFailed ? `<div class="card-in" id="hl-oom">${tried}${h.safer
+    ? `<p>The next safer setting that keeps what the model learns: <strong>${esc(h.safer.label)}</strong>. <button class="primary" id="hl-safer">Try again with safer settings</button></p>`
+    : `<p class="warn">The automatic steps are used up. Next, in this order: a shorter sequence length, QLoRA, a lower LoRA size (Expert: Healing settings), a smaller model.</p>`}</div>` : "";
   return `<div class="card-in">${head}
     <p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>
     <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
@@ -1157,11 +1201,12 @@ function healCard(m) {
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
       <label>Weight of copying the original (1 = only copy it)<input type="text" id="hl-alpha" value="${sp.alpha}"></label>
-      <label>LoRA size (rank)<input type="text" id="hl-rank" value="${sp.rank}"></label><label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
+      <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
-    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked ? "disabled" : ""}>${resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    ${expert ? healSettings(sp, kn, plan, busy) : ""}${oomBlock}
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}
-    ${resume && h.heal ? `<p class="dim small">${st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${h.heal.step ? " during step " + esc(h.heal.step) : ""}. Continue goes on where it stopped.</p>` : ""}
+    ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
     ${prog}${charts}</div>`;
 }
 
@@ -1335,6 +1380,7 @@ async function rsLoadHeal(name) {
   rs.hl = { name, opts: null };
   try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
   if (page === "reshape") render();
+  if (rs.hl && rs.hl.opts) rsHealEstimate();
 }
 
 function onHealEvent(p) {
@@ -1390,7 +1436,9 @@ function rsSpec() {
 // what the Heal card sends
 function rsHealSpec() {
   const sp = rs.hlSpec, o = rs.hl && rs.hl.opts;
-  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, rank: +sp.rank, lr: +sp.lr, mode: sp.mode || null };
+  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
+    rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
+    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup };
 }
 
 function wireReshape() {
@@ -1441,11 +1489,16 @@ function wireReshape() {
   document.querySelectorAll("[data-rstest]").forEach((b) => b.onclick = runTest(b.dataset.rstest, "slim"));
   document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
   // healing
-  const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); }; };
+  const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); rsHealEstimate(); }; };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); 
   hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; });
   hv("hl-alpha", (e) => { const v = parseFloat(e.value); hs.alpha = Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; });
-  hv("hl-rank", (e) => { const v = parseInt(e.value, 10); hs.rank = Number.isFinite(v) && v >= 4 && v <= 256 ? v : 64; });
+  const hnum = (id, key, lo, hi) => hv(id, (e) => { const v = parseInt(e.value, 10); hs[key] = Number.isFinite(v) && v >= lo && v <= hi ? v : null; });
+  hnum("hl-rank", "rank", 8, 128); hnum("hl-klchunk", "kl_chunk", 64, 512); hnum("hl-k", "k", 8, 128); hnum("hl-warmup", "warmup", 0, 1000); hnum("hl-perupdate", "per_update", 1, 256);
+  hv("hl-seq", (e) => { hs.seq = +e.value; }); hv("hl-batch", (e) => { hs.batch = +e.value; }); hv("hl-ckpt", (e) => { hs.checkpointing = e.value; }); hv("hl-method", (e) => { hs.method = e.value || null; });
+  hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
+  on("hl-reset", () => { Object.assign(hs, HEAL_AUTO); render(); rsHealEstimate(); });
+  on("hl-safer", () => { const s = rs.hl.opts.safer; if (!s) return; hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
   hv("hl-mode", (e) => { hs.mode = e.value; });
   on("hl-go", async () => {
