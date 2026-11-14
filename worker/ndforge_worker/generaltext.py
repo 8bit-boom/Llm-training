@@ -68,6 +68,14 @@ def general_key(source, share, seed) -> dict:
             "column": source.get("column") or None, "share": float(share), "seed": int(seed)}
 
 
+def same_general(index_key, source, share) -> bool:
+    """True when a cache made with `index_key` (the `general_key` stored in its index) is for this general text: the same dataset, config, split, column and share.
+    The seed is NOT compared with the caller's: the cache's rows come from the cache itself, so the training run's seed (changed in Expert mode) cannot make them
+    other rows; the cache is judged against the seed it was made with."""
+    made_with = (index_key or {}).get("seed", 0)
+    return (index_key or {}) == general_key(source, share, int(made_with))
+
+
 # ------------------------------------------------------------------------------------------------------------------ reading rows
 
 def buffer_shuffle(items, seed: int, size: int = SHUFFLE_BUFFER):

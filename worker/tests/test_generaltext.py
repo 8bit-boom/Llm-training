@@ -341,3 +341,18 @@ def test_failure_notes_never_contain_the_token(monkeypatch):
     assert tok not in note and code == "other"
     gated = gt.explain(RuntimeError(GATED), {"id": "o/s"})
     assert "token was sent" in gated.plain and tok not in gated.plain
+
+
+def test_a_cache_is_judged_by_its_dataset_not_by_the_training_runs_seed():
+    """The teacher cache holds its own rows: changing the training seed (Expert mode) must not make a good cache 'other data'; changing the dataset or the share must."""
+    from ndforge_worker import generaltext as gt
+    src = {"id": "acme/blend", "config": "default", "split": "train"}
+    made = gt.general_key(src, 0.5, 3407)
+    assert gt.same_general(made, src, 0.5)                                    # the same dataset: fine, whatever seed the run uses
+    assert not gt.same_general(made, {**src, "id": "acme/other"}, 0.5)        # another dataset
+    assert not gt.same_general(made, {**src, "split": "validation"}, 0.5)     # another split
+    assert not gt.same_general(made, {**src, "column": "text"}, 0.5)          # another column
+    assert not gt.same_general(made, src, 0.25)                               # another share
+    assert not gt.same_general(made, None, 0.5)                               # general text switched off
+    assert gt.same_general(gt.general_key(None, 0.0, 3407), None, 0.0)        # off then and off now
+    assert not gt.same_general({}, src, 0.5)                                  # an old cache without a key

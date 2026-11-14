@@ -712,8 +712,8 @@ def run(cfg: dict) -> int:
             raise ReshapeError("The saved teacher answers belong to other data; they will be made again.")
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
         g_cfg = (cfg.get("dataset") or {}).get("general")
-        want = generaltext.general_key(g_cfg, share, int(h["seed"]))
-        if idx.get("general_key") != want:
+        # the rows come from the cache itself, so the training run's seed cannot change them (see generaltext.same_general)
+        if not generaltext.same_general(idx.get("general_key"), g_cfg, share):
             raise ReshapeError("The saved teacher answers belong to other data (another general text); they will be made again.")
     else:
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
