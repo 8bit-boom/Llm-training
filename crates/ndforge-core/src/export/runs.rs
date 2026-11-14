@@ -1,8 +1,10 @@
 //! Export runs: `exports/<run>-<quant>/` holds model-<quant>.gguf, Modelfile, MODEL_CARD.md, meta.json (what it was made from and where it was
 //! installed) and export.json (the worker's summary).
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::modelfile::{model_card, modelfile_text, ollama_name, spec_for, CardInfo};
@@ -19,6 +21,117 @@ pub const QUANTS: [(&str, &str); 5] = [
     ("q8_0", "Q8_0: large, very close to the original"),
     ("f16", "F16: the original precision (very large)"),
 ];
+
+/// The optional importance matrix of a GGUF export (docs/IMATRIX.md): off by default. llama.cpp measures on calibration text which weights matter most and
+/// rounds the sizes below Q8_0 with more care. `chunks` is the amount of calibration text (chunks of IMATRIX_CTX tokens); `reuse` takes a saved matrix of the
+/// same model and data instead of measuring again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImatrixOptions {
+    pub enabled: bool,
+    pub chunks: u32,
+    pub reuse: bool,
+}
+
+impl Default for ImatrixOptions {
+    fn default() -> Self {
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true }
+    }
+}
+
+pub const IMATRIX_CHUNKS: [u32; 3] = [64, 128, 256];
+pub const IMATRIX_DEFAULT_CHUNKS: u32 = 128;
+/// The context of one calibration chunk (tokens).
+pub const IMATRIX_CTX: u32 = 512;
+/// About this share of the calibration text is general text, the rest is the project's own data.
+pub const IMATRIX_GENERAL_SHARE: f64 = 0.2;
+/// After Stop the worker has this long to end the matrix step by itself (it kills llama-imatrix at once); then the worker is killed.
+const IMATRIX_STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// Does the importance matrix do anything for this size? Not for Q8_0 and the 16-bit files.
+pub fn imatrix_helps(quant: &str) -> bool {
+    !matches!(quant, "q8_0" | "f16" | "bf16")
+}
+
+/// A rough guess of how long the matrix takes, for the export page: the text is `chunks` x `ctx` tokens read once through the 16-bit model.
+/// **A guess, not a measurement** (docs/IMATRIX.md "Not verified yet"): about 0.15 s per chunk per billion parameters on a graphics card, 30 times that on the processor.
+pub fn imatrix_estimate(chunks: u32, params_b: Option<f64>) -> Value {
+    let b = params_b.filter(|b| *b > 0.0).unwrap_or(9.0);
+    let gpu = chunks as f64 * 0.15 * b / 60.0 + 1.0;
+    json!({"chunks": chunks, "ctx": IMATRIX_CTX, "tokens": chunks * IMATRIX_CTX, "gpu_minutes": gpu.ceil(), "cpu_minutes": (gpu * 30.0).ceil()})
+}
+
+/// Folders of earlier exports of `run` that hold a saved matrix (imatrix.gguf + imatrix.json made for this run), newest first.
+pub fn saved_imatrices(p: &Project, run: &str) -> Vec<(PathBuf, Value)> {
+    let mut found: Vec<(PathBuf, Value)> = std::fs::read_dir(exports_dir(p)).map(|d| d.flatten().filter_map(|e| {
+        let info = read_json(&e.path().join("imatrix.json"))?;
+        (info["model"] == run && e.path().join("imatrix.gguf").is_file()).then(|| (e.path(), info))
+    }).collect()).unwrap_or_default();
+    found.sort_by(|a, b| b.1["created"].as_str().cmp(&a.1["created"].as_str()));
+    found
+}
+
+/// What the export page needs for the importance matrix: the choices, and per run the saved matrix (if any) and the time guesses for each amount of text.
+pub fn imatrix_state(p: &Project) -> Value {
+    let mut saved = serde_json::Map::new();
+    let mut estimates = serde_json::Map::new();
+    for r in exportable_runs(p) {
+        let Some(run) = r["name"].as_str() else { continue };
+        if let Some((dir, info)) = saved_imatrices(p, run).into_iter().next() {
+            saved.insert(run.to_string(), json!({"dir": dir, "chunks": info["chunks"], "ctx": info["ctx"], "created": info["created"], "general_used": info["general_used"], "data_version": info["data_version"]}));
+        }
+        let params = r["model_id"].as_str().and_then(crate::train::catalog::find).map(|m| m.params_b);
+        let mut per = serde_json::Map::new();
+        for c in IMATRIX_CHUNKS {
+            per.insert(c.to_string(), imatrix_estimate(c, params));
+        }
+        estimates.insert(run.to_string(), Value::Object(per));
+    }
+    json!({"chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+           "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates})
+}
+
+/// The job's "imatrix" block (None when it is off or no GGUF is made). `out` is the folder the worker writes into.
+pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions, out: &std::path::Path) -> Result<Option<Value>> {
+    if !opts.enabled {
+        return Ok(None);
+    }
+    if !IMATRIX_CHUNKS.contains(&opts.chunks) {
+        return Err(Error::new(format!("Unknown amount of calibration text: {} chunks. Choose 64, 128 or 256.", opts.chunks)));
+    }
+    let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
+    let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
+    Ok(Some(json!({"enabled": true, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+                   "reuse": opts.reuse, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
+}
+
+/// Runs the export job. With the importance matrix the Stop button first writes a STOP file (the worker kills llama-imatrix and ends cleanly) and kills the
+/// worker only after IMATRIX_STOP_GRACE; without it the worker is killed at once, as before.
+fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
+    let Some(grace) = graceful else { return run_job(py, &worker_dir(), job, kill, on_event) };
+    let (inner, done, stop_file) = (AtomicBool::new(false), AtomicBool::new(false), out.join("STOP"));
+    let _ = std::fs::remove_file(&stop_file);
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut asked: Option<Instant> = None;
+            while !done.load(Ordering::SeqCst) {
+                if kill.load(Ordering::SeqCst) && asked.is_none() {
+                    let _ = std::fs::write(&stop_file, b"");
+                    asked = Some(Instant::now());
+                }
+                if asked.is_some_and(|t| t.elapsed() > grace) {
+                    inner.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let r = run_job(py, &worker_dir(), job, &inner, on_event);
+        done.store(true, Ordering::SeqCst);
+        r
+    });
+    let _ = std::fs::remove_file(&stop_file);
+    result
+}
 
 pub fn exports_dir(p: &Project) -> PathBuf {
     p.folder.join("exports")
@@ -70,6 +183,12 @@ pub fn execute_what(p: &Project, run: &str, quant: &str, num_ctx: u32, what: &st
 /// Several GGUF sizes of one run in one go: the model is merged and converted once, then shrunk to each size. Every size becomes its own export
 /// (`exports/<run>-<size>/`, with its own Modelfile and meta). With "gguf_merged" the merged model is kept in the first one. Returns the metas.
 pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, what: &str, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    execute_many_with(p, run, quants, num_ctx, what, &ImatrixOptions::default(), kill, on_event)
+}
+
+/// `execute_many` with the options of the importance matrix (only used for a GGUF).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32, what: &str, imatrix: &ImatrixOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
     if !WHAT.contains(&what) {
         return Err(Error::new(format!("Unknown export kind: {what}")));
     }
@@ -114,13 +233,17 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
+    let matrix = if want_gguf { imatrix_block(p, run, &cfg, imatrix, &out)? } else { None };
+    if let Some(m) = &matrix {
+        job["imatrix"] = m.clone();
+    }
     // a full fine-tune saved the whole model (nothing to merge); a LoRA run saved an adapter
     if is_full {
         job["full_model"] = json!(full);
     } else {
         job["adapter"] = json!(adapter);
     }
-    let result = run_job(&py, &worker_dir(), &job, kill, &mut |e| on_event(match e {
+    let result = run_export_job(&py, &job, &out, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
@@ -175,6 +298,20 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
             }
             None => None,
         };
+        // the importance matrix (and what it was made from) sits next to every GGUF of the batch, so a later export finds it whichever size is kept
+        let matrix_file = match result["imatrix"]["file"].as_str().map(PathBuf::from).filter(|m| m.is_file()) {
+            Some(m) => {
+                let info = m.with_file_name("imatrix.json");
+                if dir != out {
+                    for f in [&m, &info].into_iter().filter(|f| f.is_file()) {
+                        let to = dir.join(f.file_name().unwrap_or_default());
+                        if i == list.len() - 1 { std::fs::rename(f, to)?; } else { std::fs::copy(f, to)?; }
+                    }
+                }
+                Some("imatrix.gguf")
+            }
+            None => None,
+        };
         std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
         std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
             world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
@@ -182,6 +319,8 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
         }))?;
         let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
                           "created": created, "world": p.display_name(), "installed": []});
+        let mut meta = meta;
+        meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, matrix_file);
         write_json(&dir.join("meta.json"), &meta)?;
         metas.push(meta);
     }
@@ -189,6 +328,15 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
         let _ = std::fs::remove_dir_all(&out);
     }
     Ok(metas)
+}
+
+/// What meta.json says about the importance matrix of one size: null when it was not asked for. `applied` is whether THIS size was made with it.
+fn imatrix_meta(asked: Option<&Value>, report: &Value, quant: &str, file: Option<&str>) -> Value {
+    let Some(asked) = asked else { return Value::Null };
+    let applied = report["applied"].as_array().is_some_and(|a| a.iter().any(|q| q == quant));
+    let reason = report["not_applied"][quant].as_str();
+    json!({"requested": true, "applied": applied, "made": report["made"] == true, "reused": report["reused"] == true, "file": file, "chunks": asked["chunks"], "ctx": asked["ctx"],
+           "general_used": report["info"]["general_used"], "llama_cpp": report["info"]["llama_cpp"], "reason": reason, "note": report["note"]})
 }
 
 /// Remember that an export was installed into a server under a name.
@@ -265,4 +413,43 @@ fn vision_readme(gguf: &str, mmproj: &str) -> String {
 ## Unsloth Studio / llama.cpp (images work)\n- **Unsloth Studio**: load this folder (or the GGUF; Studio finds the `mmproj` file next to it) and attach pictures in the chat.\n- **llama.cpp**: `llama-server -m {gguf} --mmproj {mmproj}`, or `llama-mtmd-cli -m {gguf} --mmproj {mmproj} --image picture.png -p \"What is in this picture?\"`.\n\n\
 ## Ollama (text only)\nOllama's GGUF import takes one file, so the program installs only `{gguf}` and the model answers text. Keep using Unsloth Studio or llama.cpp for pictures, or run a normal vision model next to it in Ollama for the photo tools.\n\n\
 Pictures are not part of the training: the model will not know your world's maps or art, only what it could read from a picture before.\n")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn fake_python(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let py = dir.join("python");
+        std::fs::write(&py, format!("#!/bin/sh\nout=$(sed -n 's/.*\"stop_file\":\"\\([^\"]*\\)\".*/\\1/p' \"$5\")\n{body}\n")).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        py
+    }
+
+    /// Stop with the importance matrix: a STOP file first (a worker that obeys ends by itself), the kill only after the grace time (a worker that does not).
+    #[test]
+    fn stop_writes_the_stop_file_first_and_kills_only_after_the_grace_time() {
+        let d = tempfile::tempdir().unwrap();
+        let stop = d.path().join("STOP");
+        let job = json!({"job": "export", "stop_file": stop});
+        // obeys: waits for the file, answers "Cancelled."
+        let py = fake_python(d.path(), "while [ ! -f \"$out\" ]; do sleep 0.05; done\necho '{\"type\":\"error\",\"code\":\"export_stopped\",\"message\":\"Cancelled.\"}'\nexit 1");
+        let kill = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let r = std::thread::scope(|s| {
+            s.spawn(|| { std::thread::sleep(Duration::from_millis(300)); kill.store(true, Ordering::SeqCst); });
+            run_export_job(&py, &job, d.path(), Some(Duration::from_secs(60)), &kill, &mut |_| {})
+        });
+        assert_eq!(r.unwrap_err().0, "Cancelled.");
+        assert!(t0.elapsed() < Duration::from_secs(20), "the worker ended by itself, long before the grace time");
+        assert!(!stop.exists(), "the STOP file is removed afterwards");
+        // ignores the file: killed when the grace time is over
+        let py = fake_python(d.path(), "sleep 30");
+        let kill = AtomicBool::new(true);
+        let t0 = Instant::now();
+        let r = run_export_job(&py, &job, d.path(), Some(Duration::from_millis(400)), &kill, &mut |_| {});
+        assert_eq!(r.unwrap_err().0, "Cancelled.");
+        assert!(t0.elapsed() < Duration::from_secs(20) && !stop.exists());
+    }
 }
