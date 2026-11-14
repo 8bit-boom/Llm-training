@@ -352,3 +352,234 @@ def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, s
             "bands": {"edges": list(BAND_EDGES), "names": list(BAND_NAMES), "agree_pairs": AGREE_PAIRS},
             "blocks": blocks_rows, "blocks_stability": stability(blocks_rows), "runs": runs, "widths": widths, "widths_stability": stability(widths), "choices": choices,
             "passes": len(passes)}
+
+
+# ------------------------------------------------------------------------------------------------ running the model (needs torch)
+
+class _Stopped(Exception):
+    """The stop file appeared: the pass in progress is dropped, the finished ones are kept."""
+
+
+def describe_key(key: str) -> str:
+    """"block 5 skipped", "blocks 9-12 skipped, MLP 13,312": what a pass does, for the progress line."""
+    blocks, width = parse_key(key)
+    parts = []
+    if blocks:
+        parts.append((f"block {blocks[0]}" if len(blocks) == 1 else "blocks " + (f"{blocks[0]}-{blocks[-1]}" if blocks == tuple(range(blocks[0], blocks[0] + len(blocks)))
+                                                                                  else ", ".join(map(str, blocks)))) + " skipped")
+    if width:
+        parts.append(f"MLP {width:,}")
+    return ", ".join(parts) or "the original"
+
+
+def _passthrough(*args, **kwargs):
+    """What a skipped layer does: its input is its output."""
+    h = args[0] if args else kwargs["hidden_states"]
+    return h
+
+
+class _Cut:
+    """Imitates a cut inside the loaded model while the `with` block runs: the layers of the skipped blocks pass their input on, and the MLP neurons that a width cut
+    removes are zeroed in front of `down_proj` (a zero column of down_proj is a removed neuron: the torch tests prove that this equals the written model)."""
+
+    def __init__(self, layers, skip_layers, masks):
+        self.layers, self.skip, self.masks, self.handles = layers, list(skip_layers), masks or {}, []
+
+    def __enter__(self):
+        for i in self.skip:
+            self.layers[i].forward = _passthrough
+        for s, m in self.masks.items():
+            def hook(module, args, m=m):
+                x = args[0]
+                return (x * m.to(device=x.device, dtype=x.dtype),) + tuple(args[1:])
+            self.handles.append(self.layers[s].mlp.down_proj.register_forward_pre_hook(hook))
+        return self
+
+    def __exit__(self, *exc):
+        for h in self.handles:
+            h.remove()
+        for i in self.skip:
+            self.layers[i].__dict__.pop("forward", None)
+        return False
+
+
+def _masks_for(mlp_scores, layer_ids, width: int, size: int) -> dict:
+    """{layer: float mask of `size` neurons, 1 for the `width` kept ones}: the neurons the written model keeps (reshape_width.keep_top on the same scores)."""
+    import torch
+    out = {}
+    for s in layer_ids:
+        m = torch.zeros(size, dtype=torch.float32)
+        m[torch.as_tensor(reshape_width.keep_top([float(x) for x in mlp_scores[s]], width), dtype=torch.long)] = 1.0
+        out[s] = m
+    return out
+
+
+def _one_pass(model, layers, batches, period, key: str, mlp_scores, size: int, stop) -> dict:
+    """One pass over the batches with the cut of `key` imitated. The two halves are the batches of even and odd position (as in the measurement)."""
+    import torch
+    from . import reshapejob
+    blocks, width = parse_key(key)
+    skip = reshape.blocks_to_layers(list(blocks), period)
+    masks = _masks_for(mlp_scores, [i for i in range(len(layers)) if i not in set(skip)], width, size) if width else {}
+    dev = next(model.parameters()).device
+    sums, counts = [0.0, 0.0], [0, 0]
+    started = time.monotonic()
+    with torch.no_grad(), _Cut(layers, skip, masks):
+        for bi, b in enumerate(batches):
+            if stop():
+                raise _Stopped()
+            ids, mask = b["input_ids"].to(dev), b["attention_mask"].to(dev)
+            ls, ln = reshapejob._token_losses(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, ids, mask)
+            sums[bi % 2] += ls
+            counts[bi % 2] += ln
+    n = counts[0] + counts[1]
+    h1 = sums[0] / counts[0] if counts[0] else None
+    return {"loss": (sums[0] + sums[1]) / n if n else None, "loss_h1": h1, "loss_h2": sums[1] / counts[1] if counts[1] else h1, "tokens": n,
+            "seconds": round(time.monotonic() - started, 3)}
+
+
+def _config_and_dir(repo: str, download: bool):
+    """(config.json, folder) of the model. Without `download` a Hub model that is not on this computer gives (config, None) and nothing is downloaded."""
+    from . import reshapejob
+    if Path(repo).is_dir():
+        d = Path(repo)
+    elif download:
+        d = reshapejob._resolve_source(repo)
+    else:
+        d = None
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            f = try_to_load_from_cache(repo, "config.json")
+            d = Path(f).parent if isinstance(f, (str, os.PathLike)) else None
+        except Exception:
+            d = None
+    if d is None:
+        return reshapejob._hub_config(repo), None
+    return json.loads((d / "config.json").read_text(encoding="utf-8")), d
+
+
+def run_try(cfg: dict) -> int:
+    """job reshape_try (see the top of this file). The result: {"analysis", "passes_total", "passes_done", "stopped", "seconds_per_pass", "load", "tokens", "dir"}; with
+    cfg["plan_only"] only the number of passes and the time they will take (no model is loaded, no torch is needed)."""
+    from . import reshapejob
+    protocol.reserve_stdout()
+    repo = cfg["source"]["repo"]
+    plan_only = bool(cfg.get("plan_only"))
+    config, src_dir = _config_and_dir(repo, not plan_only)
+    reshape.check_supported(config)
+    tc = reshape.text_config(config)
+    types = reshape.layer_types_of(tc)
+    period = reshapejob.check_period(config, types)
+    n_layers = int(tc["num_hidden_layers"])
+    nb = reshape.block_count(n_layers, period)
+    protect = cfg.get("protect") or {}
+    pf, pl = int(protect.get("first", 1)), int(protect.get("last", 1))
+    strategy = cfg.get("strategy", "contiguous")
+    why = reshape_width.width_supported(config)
+    dims = None if why else reshape_width.width_dims(config)
+    divisor = int(cfg.get("ffn_divisor", reshape_width.FFN_DIVISOR))
+    want = cfg.get("want") or {}
+    wants_width = bool(want.get("widths")) or any(c.get("width") for c in want.get("choices") or ())
+    if wants_width and why:
+        raise ReshapeError(why)
+    calib = cfg.get("calibration") or {}
+    if not (calib.get("train") and Path(calib["train"]).is_file()):
+        raise ReshapeError("Trying a cut is measured on your own text. Save a training-data version in Step 2 first.")
+    meas = None
+    if dims and cfg.get("measure_dir"):
+        meas = reshapejob._read_scores(cfg["measure_dir"], {"source": cfg["source"], "calibration": {"version": calib.get("version"), "samples": cfg.get("measure_samples"),
+                                                                                                    "max_len": calib.get("max_len")}}, n_layers, dims, types)
+    needs_measurement = wants_width and meas is None
+    if needs_measurement and not plan_only:
+        raise ReshapeError("Trying a width needs the measurement of the neurons. Measure the model first.")
+    matrix = (meas["meta"].get("matrix") or None) if meas else None
+    keys = expand_want(want, nb, pf, pl, strategy, matrix, dims, divisor)
+    folder = Path(cfg["out_dir"])
+    if cfg.get("force") and (folder / TRY_FILE).is_file():
+        (folder / TRY_FILE).unlink()
+    key = build_key(repo, weights_fingerprint(src_dir) if src_dir else None, calib, data_hash(calib["train"]), cfg.get("load", "auto"))
+    data = read_results(folder, key if src_dir else None, protocol.log) if src_dir else None
+    if data is None:
+        data = empty_results(key)
+    todo = [k for k in keys if k not in data["passes"]]
+    mm = meas["meta"] if meas else {}
+    known, known_tokens = data["seconds_per_pass"], data["tokens"]
+    if known is None and mm.get("seconds_per_pass"):
+        known, known_tokens = mm["seconds_per_pass"], mm.get("tokens")
+    tokens = data["tokens"] or (mm["tokens"] * calib["samples"] / cfg["measure_samples"] if mm.get("tokens") and cfg.get("measure_samples") and calib.get("samples") else None)
+    est = estimate(len(todo), known, tokens, known_tokens, float(cfg.get("params_b") or 10.0), cfg.get("load", "auto"),
+                   int(calib.get("samples", 64)) * min(int(calib.get("max_len", 512)), GUESS_TOKENS_PER_SAMPLE))
+    plan = {"passes_total": len(keys), "passes_cached": len(keys) - len(todo), "passes_todo": len(todo), "needs_measurement": needs_measurement, **est}
+    if plan_only:
+        protocol.result(plan)
+        return 0
+
+    def finish(stopped: bool) -> int:
+        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+        write_results(folder, data)
+        protocol.progress("try", 1.0, "")
+        protocol.result({"analysis": data["analysis"], "passes_total": len(keys), "passes_done": len(keys) - len([k for k in keys if k not in data["passes"]]),
+                         "stopped": stopped, "seconds_per_pass": data["seconds_per_pass"], "load": data["load_used"], "tokens": data["tokens"], "dir": str(folder)})
+        return 0
+
+    if not todo:
+        protocol.log("Every answer is already saved; nothing is run.")
+        return finish(False)
+    reshapejob._require_torch()
+    import transformers
+    if int(transformers.__version__.split(".")[0]) < 5:          # before 5 a decoder layer returns a tuple: a skipped layer would need to as well (not tested)
+        raise ReshapeError("Trying a cut needs a newer version of the training software (Training setup, update).")
+    est_bytes = sum(r.nbytes for r in reshapejob.safetensors_io.list_tensors(src_dir).values())
+    mode = reshapejob._choose_load(cfg.get("load", "auto"), est_bytes)
+    if data["load_used"] not in (None, mode):
+        protocol.log(f"The earlier answers were made with the model loaded as {data['load_used']}; they are computed again as {mode}.")
+        data = empty_results(key)
+        todo = list(keys)
+    stop_file = folder.parent / "STOP"
+    stop = stop_file.exists
+    from transformers import AutoTokenizer
+    protocol.progress("calibrate", 0.0, "Preparing the text")
+    batches = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), calib, cfg["source"].get("family", "generic"))
+    data["tokens"] = sum(int(b["attention_mask"].sum()) for b in batches)
+    data["load_used"] = mode
+    protocol.log(f"Trying {len(todo)} cuts on {len(batches)} batches ({data['tokens']:,} tokens), model loaded as {mode}.")
+    protocol.progress("calibrate", 1.0, "")
+    protocol.progress("try", 0.0, f"Loading the model ({mode})")
+    model = reshapejob._load(src_dir, mode)
+    layers = reshapejob._find_layers(model, n_layers)
+    mlp = meas["mlp"] if meas else None
+    size = dims["intermediate"] if dims else 0
+    stopped = False
+    try:
+        for i, k in enumerate(todo):
+            if stop():
+                stopped = True
+                break
+            protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}")
+            try:
+                try:
+                    res = _one_pass(model, layers, batches, period, k, mlp, size, stop)
+                except RuntimeError as exc:
+                    if not reshapejob._is_oom(exc):
+                        raise
+                    protocol.log("Out of memory; trying again with one text at a time.")
+                    reshapejob._free()
+                    batches = reshapejob._split_single(batches)
+                    res = _one_pass(model, layers, batches, period, k, mlp, size, stop)
+            except _Stopped:
+                stopped = True
+                break
+            except RuntimeError as exc:
+                if reshapejob._is_oom(exc):
+                    raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
+                raise
+            merge_pass(data, k, res)
+            data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+            write_results(folder, data)
+            protocol.emit("try_pass", key=k, loss=res["loss"], seconds=res["seconds"], done=i + 1, total=len(todo), seconds_per_pass=data["seconds_per_pass"],
+                          analysis=data["analysis"])
+    finally:
+        del layers
+        del model
+        reshapejob._free()
+    return finish(stopped)

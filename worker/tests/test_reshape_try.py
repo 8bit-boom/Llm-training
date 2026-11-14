@@ -220,3 +220,49 @@ def test_time_estimate_uses_a_timed_pass_when_there_is_one():
     assert rt.estimate(3, 30.0, None, None, 27.8, "4bit", 0)["seconds_per_pass"] == 30.0
     assert rt.estimate(0, None, 100, None, 0.001, "16bit", 100)["seconds"] == 0.0 and rt.guess_seconds_per_pass(0.001, 10, "16bit") == 1.0
     assert rt.mean_seconds({}) is None and rt.mean_seconds({"a": {"seconds": 2.0}, "b": {"seconds": None}, "c": {"seconds": 4.0}}) == 3.0
+
+
+# ------------------------------------------------------------------------------------ the plan (no torch, no model loaded)
+
+def plan_job(tmp_path, src, want, **over):
+    train = tmp_path / "train.jsonl"
+    train.write_text('{"type": "text", "text": "x"}\n', encoding="utf-8")
+    return {"job": "reshape_try", "source": {"repo": str(src), "family": "qwen3_5"}, "load": "16bit", "plan_only": True, "out_dir": str(tmp_path / "models" / "_scores" / "t1"),
+            "calibration": {"train": str(train), "samples": 16, "max_len": 32, "version": 3, "seed": 3407}, "measure_dir": str(tmp_path / "models" / "_scores" / "k1"),
+            "measure_samples": 16, "protect": {"first": 1, "last": 1}, "strategy": "contiguous", "want": want, "ffn_divisor": 4, "params_b": 0.0001, **over}
+
+
+def test_the_plan_counts_the_passes_and_the_time_without_loading_anything(tmp_path):
+    from test_reshape import run_job
+    from test_reshape_width import fake_qwen_width, write_scores
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src), seconds_per_pass=10.0)
+    code, ev = run_job(tmp_path, plan_job(tmp_path, src, {"widths": [20, 24]}))
+    r = ev[-1]["data"]
+    assert code == 0 and ev[-1]["type"] == "result"
+    assert (r["passes_total"], r["passes_cached"], r["passes_todo"], r["needs_measurement"], r["guess"]) == (3, 0, 3, False, False)
+    assert r["seconds_per_pass"] == pytest.approx(10.0) and r["seconds"] == pytest.approx(30.0)          # the measurement's own timing, scaled to the same text
+    assert not (tmp_path / "models" / "_scores" / "t1").exists()                                      # nothing is written by a plan
+
+
+def test_the_plan_knows_what_is_saved_already_and_what_needs_a_measurement(tmp_path):
+    from test_reshape import run_job
+    from test_reshape_width import fake_qwen_width
+    src = fake_qwen_width(tmp_path)
+    job = plan_job(tmp_path, src, {"widths": [20, 24]})
+    code, ev = run_job(tmp_path, job)
+    r = ev[-1]["data"]
+    assert code == 0 and r["needs_measurement"] is True and r["guess"] is True and r["seconds_per_pass"] >= 1.0          # no measurement: a width cannot be tried yet
+    code, ev = run_job(tmp_path, {**job, "plan_only": False})
+    assert code == 1 and "Measure the model first" in ev[-1]["message"] and ev[-1]["code"] == "reshape_refused"
+    # saved answers of the same question are counted, the time of the passes done is used
+    key = rt.build_key(str(src), rt.weights_fingerprint(src), job["calibration"], rt.data_hash(job["calibration"]["train"]), "16bit")
+    data = rt.empty_results(key)
+    rt.merge_pass(data, rt.BASE_KEY, {"loss": 2.0, "seconds": 8.0, "tokens": 100})
+    data["tokens"] = 100
+    rt.write_results(tmp_path / "models" / "_scores" / "t1", data)
+    code, ev = run_job(tmp_path, {**job, "want": {"choices": [{"blocks": [], "width": 20}]}, "measure_dir": str(tmp_path / "nothing")})
+    r = ev[-1]["data"]
+    assert (r["passes_total"], r["passes_cached"], r["passes_todo"], r["guess"], r["seconds"]) == (2, 1, 1, False, 8.0)
+    code, ev = run_job(tmp_path, {**job, "want": {"choices": [{"blocks": [], "width": 20}]}, "calibration": {**job["calibration"], "samples": 8}})
+    assert ev[-1]["data"]["passes_cached"] == 0 and any("another number of samples" in e.get("text", "") for e in ev if e["type"] == "log")          # and says why
