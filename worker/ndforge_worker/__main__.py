@@ -87,6 +87,21 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("imatrix_failed", imatrixjob.plain(exc))
             return 1
+    if kind in ("quantcheck", "quantcheck_plan"):
+        from . import imatrix, quantcheck
+        try:
+            return {"quantcheck": quantcheck.run, "quantcheck_plan": quantcheck.run_plan}[kind](job)
+        except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
+            protocol.error("quantcheck_stopped", "Cancelled.")
+            return 1
+        except quantcheck.QuantCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error("quantcheck_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("quantcheck_failed", _explain(exc))
+            return 1
     if kind == "evaluate":
         from . import evaluatejob
         try:
