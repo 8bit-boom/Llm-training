@@ -6,6 +6,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
+  imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
 
@@ -34,6 +35,7 @@ function setState(s) { if (s) { state = s; } }
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
+  items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
@@ -597,7 +599,7 @@ function gcWire(scope, rerender) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 5: use in nd-world
-let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", imCheck: null, imAdd: false, imAddLabel: "", server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
 
 function nextnHtml(im) {
@@ -615,6 +617,31 @@ function nextnState(im) {
   return { head, unsupported, on: head && !unsupported && us.imNextn };
 }
 
+// "Use a saved matrix" (the matrix library, page "Importance matrices"): the export measures nothing and gives that file to llama-quantize / Unsloth as a fresh one
+function savedPick(im) {
+  const lib = im.library || [];
+  const opts = lib.map((e) => `<option value="${esc(e.id)}" ${us.imSaved === e.id ? "selected" : ""}>${esc(e.label || e.id)} · ${esc(e.model || "other model")} · ${e.chunks != null ? e.chunks + " chunks" : "unknown amount"} · ${esc(String(e.created || "").slice(0, 10))}</option>`).join("");
+  const add = us.imAdd ? `<div class="row"><label>Label <input type="text" id="us-imaddlabel" value="${esc(us.imAddLabel)}" maxlength="80" placeholder="for example: from my friend, Q4 test"></label><button class="secondary" id="us-imaddfile">Choose the matrix file…</button><button class="link" id="us-imaddcancel">Cancel</button></div>
+    <p class="dim small">A .gguf matrix (the current format) or a legacy .dat file, for example one made on another computer. It is copied into the library of this project.</p>` : "";
+  return `<div class="row"><label>Use a saved matrix <select id="us-imsaved"><option value="">Measure a new one now</option>${opts}</select></label>
+      <button class="secondary" id="us-imadd">Add a matrix file from my computer…</button><button class="link" id="us-imlib">Open the matrix library</button></div>${add}
+    ${lib.length ? "" : `<p class="dim small">The library is empty. Make a matrix on its own on the "Importance matrices" page, or add a file.</p>`}`;
+}
+function savedNote() {
+  const c = us.imCheck && us.imCheck.id === us.imSaved && us.imCheck.run === us.run ? us.imCheck : null;
+  const warn = c && c.warnings && c.warnings.length ? `<div class="warn small" id="us-imwarn"><strong>Check before you export.</strong> ${c.warnings.map(esc).join("<br>")}</div>` : c && c.error ? `<div class="warn small" id="us-imwarn">${esc(c.error)}</div>` : "";
+  return `<p class="dim small">Nothing is measured: this matrix is copied into the export and given to <code>llama-quantize</code> (or Unsloth) as it is, for the sizes below Q8_0. It should have been made from the same model.</p>${warn}`;
+}
+function usCheckSaved() {
+  if (!us.imSaved || !us.run) return;
+  const key = us.imSaved + "|" + us.run;
+  if (us.imCheckKey === key) return;
+  us.imCheckKey = key;
+  invoke("imatrix_check", { id: us.imSaved, run: us.run })
+    .then((r) => { us.imCheck = { id: us.imSaved, run: us.run, ...(r || {}) }; if (page === "use") render(); })
+    .catch((e) => { us.imCheck = { id: us.imSaved, run: us.run, error: String(e), warnings: [] }; if (page === "use") render(); });
+}
+
 function imatrixBox(st) {
   const im = st.imatrix;
   if (!im || us.what === "merged") return "";
@@ -624,11 +651,12 @@ function imatrixBox(st) {
   const helps = us.quants.some((q) => !(im.no_matrix_for || []).includes(q));
   const est = ((im.estimates || {})[us.run] || {})[String(us.imChunks)];
   const names = { 64: "64 chunks (quick)", 128: "128 chunks (recommended)", 256: "256 chunks (thorough)" };
-  const detail = us.im ? `<div class="row"><label>Calibration text <select id="us-imchunks">${im.chunks.map((n) => `<option value="${n}" ${us.imChunks === n ? "selected" : ""}>${names[n] || n + " chunks"}</option>`).join("")}</select></label>
+  const measure = `<div class="row"><label>Calibration text <select id="us-imchunks">${im.chunks.map((n) => `<option value="${n}" ${us.imChunks === n ? "selected" : ""}>${names[n] || n + " chunks"}</option>`).join("")}</select></label>
       <span class="dim">${est ? `${est.tokens.toLocaleString("en")} tokens, about ${est.gpu_minutes} min on a graphics card (up to ${est.cpu_minutes} min on the processor): a rough guess, the log shows the real progress` : ""}</span></div>
     ${nextnHtml(im)}${gcHtml("imatrix")}<p class="dim small">About ${Math.round((im.general_share || 0.2) * 100)} % of the calibration text is general text from the dataset above; the rest is your own data. A matrix is only reused for the same dataset.</p>
     ${saved ? `<label class="opt" title="${esc(saved.dir)}"><input type="checkbox" id="us-imreuse" ${reuse ? "checked" : ""}> Reuse the saved matrix (${saved.chunks} chunks, made ${esc(String(saved.created || "").slice(0, 10))}, if it still fits this model and data)</label>` : `<p class="dim">No saved matrix of this run yet: it will be made now and kept next to the files.</p>`}
-    ${helps ? "" : `<p class="dim">None of the chosen sizes is below Q8_0, so there is nothing to improve: the matrix would not be made.</p>`}` : "";
+    ${helps ? "" : `<p class="dim">None of the chosen sizes is below Q8_0, so there is nothing to improve: the matrix would not be made.</p>`}`;
+  const detail = us.im ? savedPick(im) + (us.imSaved ? savedNote() : measure) : "";
   return `<div class="row imatrix"><label class="opt" title="llama.cpp reads about ${im.ctx * im.default_chunks} tokens of your data and some general text and learns which weights matter most; the small sizes then keep those more exactly"><input type="checkbox" id="us-im" ${us.im ? "checked" : ""}> Better small sizes (importance matrix)</label></div>
     <p class="dim">Makes Q6_K, Q5_K_M and Q4_K_M lose less quality (Q8_0 and F16 stay as they are). llama.cpp (<code>llama-imatrix</code>) measures the matrix; adds a few minutes. If the installed Unsloth can apply a matrix, Unsloth makes the files with it, otherwise llama.cpp does (convert, then <code>llama-quantize</code>); the list below says which. Without llama.cpp, or if anything about it fails, the files are made without the matrix and the page says so.</p>${detail}`;
 }
@@ -649,7 +677,7 @@ function renderUse() {
     <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
     ${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && gcBlocked("imatrix")) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
@@ -684,6 +712,7 @@ function renderUse() {
 
 async function usRefresh() {
   try { us.state = await invoke("export_state"); } catch (e) { us.error = String(e); }
+  if (us.imSaved && us.state && !((us.state.imatrix && us.state.imatrix.library) || []).some((e) => e.id === us.imSaved)) { us.imSaved = ""; us.imCheck = null; us.imCheckKey = null; }
   if (page === "use") render();
 }
 
@@ -723,18 +752,34 @@ function wireUse() {
   if (page !== "use" || !us.state) return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
   const bind = (id, key, num) => { const e = $(id); if (e) e.onchange = () => { us[key] = num ? Number(e.value) : e.value; }; };
-  bind("us-run", "run");
+  const usr = $("us-run"); if (usr) usr.onchange = () => { us.run = usr.value; us.imCheck = null; us.imCheckKey = null; render(); };
   document.querySelectorAll(".us-q").forEach((c) => c.onchange = () => { us.quants = [...document.querySelectorAll(".us-q")].filter((x) => x.checked).map((x) => x.value); render(); }); const wh = $("us-what"); if (wh) wh.onchange = () => { us.what = wh.value; render(); }; bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
   const imx = $("us-im"); if (imx) imx.onchange = () => { us.im = imx.checked; render(); };
   const imc = $("us-imchunks"); if (imc) imc.onchange = () => { us.imChunks = Number(imc.value); render(); };
   const imn = $("us-imnextn"); if (imn) imn.onchange = () => { us.imNextn = imn.checked; render(); };
   const imr = $("us-imreuse"); if (imr) imr.onchange = () => { us.imReuse = imr.checked; render(); };
+  const ims = $("us-imsaved"); if (ims) ims.onchange = () => { us.imSaved = ims.value; us.imCheck = null; us.imCheckKey = null; render(); };
+  on("us-imlib", () => go("imatrix"));
+  on("us-imadd", () => { us.imAdd = true; render(); });
+  on("us-imaddcancel", () => { us.imAdd = false; render(); });
+  const ial = $("us-imaddlabel"); if (ial) ial.onchange = () => { us.imAddLabel = ial.value; };
+  on("us-imaddfile", async () => {
+    const f = await tauri.dialog.open({ multiple: false, title: "Choose an importance matrix file", filters: [{ name: "Importance matrix", extensions: ["gguf", "dat"] }, { name: "All files", extensions: ["*"] }] });
+    if (!f) return;
+    try {
+      const r = await invoke("imatrix_import", { file: f, label: us.imAddLabel });
+      us.imAdd = false; us.imAddLabel = ""; us.error = null; us.ok = `Added to the library${r.added && r.added.warning ? ": " + r.added.warning : "."}`;
+      await usRefresh(); us.imSaved = r.added.id; us.imCheck = null; us.imCheckKey = null;
+    } catch (e) { us.error = String(e); }
+    render();
+  });
+  usCheckSaved();
   if (us.im && us.what !== "merged") gcWire("imatrix", render);
   on("us-cancel", () => invoke("env_cancel"));
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
   on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
-    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix") } : null }));
+    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null }));
   on("us-lora", async () => {
     const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
     if (!dest) return;
@@ -750,6 +795,193 @@ function wireUse() {
   on("srv-save", async () => {
     try { us.state = await invoke("ollama_server_add", { name: $("srv-name").value, url: $("srv-url").value }); us.server = us.state.servers.at(-1).url; us.adding = false; us.error = null; }
     catch (e) { us.error = String(e); }
+    render();
+  });
+}
+
+// ------------------------------------------------------------------------------------------- importance matrices (the matrix library)
+// A matrix made on its own (no GGUF export), kept in the project (imatrix/<id>/), reused by exports ("Use a saved matrix" on Step 5) and copied out. docs/IMATRIX.md.
+let im = { state: null, src: "run", run: "", model: "", modelPath: "", gguf: "", tokenizer: "", cal: "data", textFile: "", share: 20, chunks: 128, nextn: true, dat: false, label: "",
+  addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
+
+const IM_INTRO = `<p>An <strong>importance matrix</strong> is a short measurement: the model reads some typical text, and llama.cpp notes how strongly each part of it is used. When the model is later shrunk to about 4 or 5 bits (Q4_K_M, Q5_K_M, Q6_K), the rounding then takes more care of the parts that matter, so the small file loses less quality. For Q8_0 and F16 it does nothing.</p>
+  <p class="dim">You can make one here without making any GGUF file, keep it, use it in later exports (Step 5, "Use a saved matrix"), or save a copy to use with <code>llama-quantize</code> on another computer or to share. It needs llama.cpp (<code>llama-imatrix</code>); set <code>LLAMA_CPP_DIR</code> to its folder if the program does not find it.</p>`;
+
+function imEstimate(st) {
+  const e = st.estimates || {};
+  const key = im.src === "run" ? "run:" + im.run : im.src === "model" && im.model ? "model:" + im.model : "default";
+  return (e[key] || e.default || {})[String(im.chunks)] || null;
+}
+
+function imEntryHtml(e) {
+  const g = e.general_used === true ? "with general text" + (e.general_source && e.general_source !== "default" ? " (" + e.general_source + ")" : "") : e.general_used === false ? "your own text only" : "general text unknown";
+  const head = e.nextn === true ? "MTP head included" : e.nextn_asked ? "MTP head left out" : "no MTP head";
+  const copying = im.copyFor === e.id ? `<div class="row"><label>Save into the folder <input type="text" id="im-copydir" value="${esc(im.copyDir)}" placeholder="C:\\matrices" style="min-width:260px"></label><button class="secondary" id="im-copybrowse">Browse…</button><button class="primary" id="im-copygo">Save</button><button class="link" id="im-copycancel">Cancel</button></div>
+    <p class="dim small">A new folder named <code>${esc(e.id)}</code> is made inside it (a number is added if that name is taken: nothing is overwritten). It holds imatrix.gguf${e.has_dat ? ", imatrix.dat" : ""} and imatrix-info.json.</p>` : "";
+  const stats = e.statistics && e.statistics.lines && e.statistics.lines.length ? `<details><summary>What the matrix looks like</summary><ul class="small">${e.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></details>` : "";
+  const notes = (e.notes || []).length ? `<p class="dim small">${e.notes.map(esc).join(" ")}</p>` : "";
+  const off = im.running || e.in_use;
+  return `<li class="imentry"><strong>${esc(e.label || e.id)}</strong> <span class="dim">${esc(e.id)}</span><br>
+    <span class="dim small">Model: ${esc(e.model || "not stated")} · ${e.size_mb} MB · ${e.chunks != null ? e.chunks + " chunks" : "unknown amount of text"} · ${esc(g)} · ${esc(head)} · ${esc(String(e.created || "").slice(0, 10))} · made by ${esc(e.via || "unknown")}${e.has_dat ? " · legacy .dat too" : ""}${e.has_gguf ? "" : " · legacy .dat only"}</span><br>
+    <span class="dim small">Made from: ${esc(e.source || "unknown")}${e.calibration ? " · text: " + esc(e.calibration) : ""}</span>${e.in_use ? ` <span class="warn small">in use right now</span>` : ""}
+    <div class="row"><button class="secondary im-copy" data-id="${esc(e.id)}" ${im.running ? "disabled" : ""}>Save a copy…</button><button class="secondary im-open" data-id="${esc(e.id)}">Open folder</button>
+      ${e.has_gguf && !e.has_dat ? `<button class="secondary im-dat" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="llama-imatrix converts the matrix to the old format some tools still read">Make a .dat (legacy)</button>` : ""}
+      <button class="secondary im-del" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="${e.in_use ? "A job uses this matrix right now" : "Deletes the matrix from the project"}">Delete</button></div>${copying}${stats}${notes}</li>`;
+}
+
+function imFormHtml(st) {
+  const runs = st.runs || [], models = st.models || [];
+  if (!im.run && runs.length) im.run = runs[0].name;
+  if (!im.model && models.length) im.model = models[0].id;
+  const srcOpts = [["run", "A trained run (its add-on merged into its model)"], ["model", "A model (the model list, a folder or a Hugging Face id)"], ["gguf", "A GGUF file I already have"]]
+    .map(([k, t]) => `<option value="${k}" ${im.src === k ? "selected" : ""}>${t}</option>`).join("");
+  let src = "";
+  if (im.src === "run") {
+    src = runs.length ? `<div class="row"><label>Run <select id="im-run">${runs.map((r) => `<option value="${esc(r.name)}" ${im.run === r.name ? "selected" : ""}>${esc(r.name)} · ${esc(r.model)} · ${esc(r.status)}</option>`).join("")}</select></label></div>
+      <p class="dim small">The run's add-on is merged into its base model, then the model is converted to a 16-bit GGUF file with llama.cpp (as the export does). If an earlier export of this run left such a file, it is used instead. Needs the training software.</p>`
+      : `<p class="dim">There is no trained run yet (Step 3). Choose another source.</p>`;
+  } else if (im.src === "model") {
+    src = `<div class="row"><label>Model <select id="im-model">${models.map((m) => `<option value="${esc(m.id)}" ${im.model === m.id && !im.modelPath ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("")}<option value="__typed" ${im.model === "__typed" ? "selected" : ""}>A folder or a Hugging Face id…</option></select></label></div>
+      ${im.model === "__typed" ? `<div class="row"><label>Folder or id <input type="text" id="im-modelpath" value="${esc(im.modelPath)}" placeholder="C:\\models\\mymodel   or   owner/name" style="min-width:300px"></label><button class="secondary" id="im-modelbrowse">Browse…</button></div>` : ""}
+      <p class="dim small">A full-precision model (the folder with config.json and the .safetensors files, or its Hugging Face id: it is downloaded if needed). It is converted to a 16-bit GGUF file with llama.cpp. Made, slimmed and healed models are in the list.</p>`;
+  } else {
+    src = `<div class="row"><label>GGUF file <input type="text" id="im-gguf" value="${esc(im.gguf)}" placeholder="C:\\models\\model-f16.gguf" style="min-width:300px"></label><button class="secondary" id="im-ggufbrowse">Browse…</button></div>
+      ${im.cal === "data" ? `<div class="row"><label>Made from (folder or Hugging Face id) <input type="text" id="im-tok" value="${esc(im.tokenizer)}" placeholder="owner/name" style="min-width:300px"></label><button class="secondary" id="im-tokbrowse">Browse…</button></div>
+      <p class="dim small">Needed only for your saved data: the chat template of that model writes the practice conversations the way the model sees them.</p>` : ""}
+      <p class="dim small">A 16-bit (F16 or BF16) or Q8_0 file is best; any GGUF that <code>llama-imatrix</code> accepts works. <strong>A more precise file gives a better matrix.</strong></p>`;
+  }
+  const blocked = im.cal === "data" && im.share > 0 ? gcBlocked("imatrix") : "";
+  const cal = `<div class="row"><label>Calibration text <select id="im-cal"><option value="data" ${im.cal === "data" ? "selected" : ""}>My saved training data${st.data_version != null ? " (version " + st.data_version + ")" : ""} and general text</option><option value="text" ${im.cal === "text" ? "selected" : ""}>A text file of my own</option></select></label></div>`
+    + (im.cal === "data" ? (st.data_version == null ? `<p class="warn small">There is no saved version of the training data yet (Step 2). Save one, or choose a text file of your own.</p>` : "")
+      + `<div class="row"><label>General text <select id="im-share">${[0, 10, 20, 30, 40].map((n) => `<option value="${n}" ${im.share === n ? "selected" : ""}>${n === 0 ? "none (only my data)" : "about " + n + " %"}${n === 20 ? " (recommended)" : ""}</option>`).join("")}</select></label></div>${im.share > 0 ? gcHtml("imatrix") : ""}
+      <p class="dim small">Your data is written through the model's chat template (practice conversations, world-book texts as they are), about ${100 - im.share} % of the text; the rest is general text, so the matrix does not only know your world.</p>`
+      : `<div class="row"><label>Text file <input type="text" id="im-text" value="${esc(im.textFile)}" placeholder="C:\\texts\\calibration.txt" style="min-width:300px"></label><button class="secondary" id="im-textbrowse">Browse…</button></div>
+      <p class="dim small">Plain text, used as it is (a few hundred KB or more; text that looks like what the model will be asked). Nothing is added to it.</p>`);
+  const est = imEstimate(st);
+  const chunks = `<div class="row"><label>Amount of text <select id="im-chunks">${st.chunks.map((n) => `<option value="${n}" ${im.chunks === n ? "selected" : ""}>${{ 64: "64 chunks (quick)", 128: "128 chunks (recommended)", 256: "256 chunks (thorough)" }[n] || n + " chunks"}</option>`).join("")}</select></label>
+      <span class="dim" id="im-est">${est ? `${est.tokens.toLocaleString("en")} tokens, about ${est.gpu_minutes} min on a graphics card (up to ${est.cpu_minutes} min on the processor)${im.src !== "gguf" ? ", plus the time to convert the model" : ""}: a rough guess, the log shows the real progress` : ""}</span></div>
+    <div class="row"><label class="opt" title="If the model has a speculative-decoding head (MTP) and your llama-imatrix has --nextn, the head is measured too; otherwise it is left out and the result says so"><input type="checkbox" id="im-nextn" ${im.nextn ? "checked" : ""}> Include the speculative-decoding head (MTP) if the model has one</label>
+      <label class="opt"><input type="checkbox" id="im-dat" ${im.dat ? "checked" : ""}> Also make a legacy .dat file</label></div>
+    <div class="row"><label>Label <input type="text" id="im-label" value="${esc(im.label)}" maxlength="80" placeholder="for example: Q4 test with my own text"></label></div>`;
+  const incomplete = im.src === "run" ? !runs.length : im.src === "model" ? (im.model === "__typed" ? !im.modelPath.trim() : !im.model) : !im.gguf.trim();
+  const calMissing = im.cal === "text" ? !im.textFile.trim() : st.data_version == null;
+  const why = !st.env_ready && im.src !== "gguf" ? "The training software is not installed yet (Training setup)." : incomplete ? "Choose the model first." : calMissing ? (im.cal === "text" ? "Choose the text file." : "Save a version of the training data first.") : blocked;
+  const prog = im.running ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="llama.cpp is stopped at once; nothing is kept">Stop</button>` : "";
+  return `<div class="card wide"><h2>Create a matrix</h2>
+    <div class="row"><label>The model comes from <select id="im-src" ${im.running ? "disabled" : ""}>${srcOpts}</select></label></div>${src}${cal}${chunks}
+    ${why ? `<p class="dim small" id="im-why">${esc(why)}</p>` : ""}
+    <div class="row"><button class="primary" id="im-create" ${im.running || why ? "disabled" : ""}>Create the matrix</button></div>${prog}</div>`;
+}
+
+function renderImatrix() {
+  if (!state.bundle) return `<h1>Importance matrices</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = im.state;
+  if (!st) return `<h1>Importance matrices</h1><p class="lead">Loading…</p>`;
+  gcUse(st.general);
+  const entries = st.entries || [];
+  const list = entries.length ? `<ul class="exlist">${entries.map(imEntryHtml).join("")}</ul>` : `<p class="dim">No matrix saved in this project yet. Create one below, or add a file.</p>`;
+  const exp = (st.exports || []).filter((x) => !x.added);
+  const add = `<div class="row"><button class="secondary" id="im-addopen" ${im.running ? "disabled" : ""}>Add a matrix file from my computer…</button>${exp.length ? `<label>or from an earlier export <select id="im-addexp"><option value="">choose…</option>${exp.map((x) => `<option value="${esc(x.name)}" ${im.addExport === x.name ? "selected" : ""}>${esc(x.name)}${x.chunks != null ? " · " + x.chunks + " chunks" : ""}</option>`).join("")}</select></label><button class="secondary" id="im-addexpgo" ${im.addExport ? "" : "disabled"}>Add to library</button>` : ""}</div>
+    ${im.addOpen ? `<div class="row"><label>Label <input type="text" id="im-addlabel" value="${esc(im.addLabel)}" maxlength="80" placeholder="for example: from my friend"></label><button class="secondary" id="im-addfile">Choose the matrix file…</button><button class="link" id="im-addcancel">Cancel</button></div>
+      <p class="dim small">A .gguf matrix (the current format) or a legacy .dat file. It is copied into the library of this project. Matrices that exports saved next to their GGUF files are not moved: "Add to library" copies one in.</p>` : ""}`;
+  const r = im.result;
+  const result = r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
+      ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>` : "";
+  const msg = `${im.error ? `<div class="err">${esc(im.error)}</div>` : ""}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
+  const log = im.log.length ? `<details><summary>Log</summary><pre class="log">${im.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
+  const prog = im.running && im.pending === "dat" ? `<div class="stepline">${esc(im.step)}</div> <button class="secondary" id="im-stop">Stop</button>` : "";
+  return `<h1>Importance matrices</h1><p class="lead">Measure which parts of a model matter most, keep the result, and use it for better small GGUF files.</p>
+    <div class="card wide"><h2>What it is</h2>${IM_INTRO}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
+    <div class="card wide"><h2>Your matrices</h2>${list}${add}${prog}</div>
+    ${imFormHtml(st)}${msg}${result}${log}`;
+}
+
+async function imRefresh() {
+  try { im.state = await invoke("imatrix_list"); } catch (e) { im.error = String(e); }
+  if (page === "imatrix") render();
+}
+
+function imSpec() {
+  const model = im.model === "__typed" ? { path: im.modelPath.trim() } : { model: im.model };
+  const source = im.src === "run" ? { kind: "run", run: im.run } : im.src === "model" ? { kind: "model", ...model } : { kind: "gguf", file: im.gguf.trim(), tokenizer: im.tokenizer.trim() || null };
+  return { source, calibration: im.cal, text_file: im.cal === "text" ? im.textFile.trim() : null, general: im.cal === "data" && im.share > 0 ? gcSource("imatrix") : null,
+    general_share: im.cal === "data" ? im.share / 100 : null, chunks: im.chunks, nextn: im.nextn, dat: im.dat, label: im.label.trim() };
+}
+
+function onImatrixEvent(p) {
+  if (p.kind === "log") im.log.push(p.text);
+  else if (p.kind === "progress") { if (p.text) im.step = p.text; if (p.value != null) im.progress = p.value; }
+  else if (p.kind === "done") {
+    im.running = false; im.progress = null; im.step = "";
+    const d = p.data || {};
+    if (im.pending === "dat") im.ok = "The legacy .dat file was made.";
+    else { im.result = d; im.ok = null; im.label = ""; }
+    imRefresh();
+  } else if (p.kind === "error") {
+    im.running = false; im.progress = null; im.step = "";
+    im.error = p.text === "Cancelled." ? "Cancelled. Nothing was kept." : p.text;
+    imRefresh();
+  }
+  if (page === "imatrix") render();
+}
+
+async function imRun(kind, cmd, args) {
+  im.running = true; im.pending = kind; im.error = null; im.ok = null; im.result = null; im.log = []; im.step = "Starting…"; im.progress = null;
+  render();
+  try { await invoke(cmd, args); } catch (e) { im.running = false; im.error = String(e); im.step = ""; render(); }
+}
+
+function wireImatrix() {
+  if (page !== "imatrix" || !im.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, key, num, redraw) => { const e = $(id); if (e) e.onchange = () => { im[key] = num ? Number(e.value) : e.value; if (redraw) render(); }; };
+  const pick = (id, key, dir, title, filters) => on(id, async () => {
+    const f = await tauri.dialog.open({ multiple: false, directory: dir, title, filters });
+    if (f) { im[key] = f; render(); }
+  });
+  bind("im-src", "src", false, true); bind("im-run", "run", false, true); bind("im-model", "model", false, true); bind("im-modelpath", "modelPath"); bind("im-gguf", "gguf"); bind("im-tok", "tokenizer");
+  bind("im-cal", "cal", false, true); bind("im-share", "share", true, true); bind("im-text", "textFile"); bind("im-chunks", "chunks", true, true); bind("im-label", "label");
+  const nx = $("im-nextn"); if (nx) nx.onchange = () => { im.nextn = nx.checked; };
+  const dt = $("im-dat"); if (dt) dt.onchange = () => { im.dat = dt.checked; };
+  pick("im-modelbrowse", "modelPath", true, "Choose the model's folder");
+  pick("im-ggufbrowse", "gguf", false, "Choose a GGUF file", [{ name: "GGUF", extensions: ["gguf"] }, { name: "All files", extensions: ["*"] }]);
+  pick("im-tokbrowse", "tokenizer", true, "Choose the folder of the model this file was made from");
+  pick("im-textbrowse", "textFile", false, "Choose a text file", [{ name: "Text", extensions: ["txt", "text", "md"] }, { name: "All files", extensions: ["*"] }]);
+  if (im.cal === "data" && im.share > 0) gcWire("imatrix", render);
+  on("im-create", () => imRun("create", "imatrix_create", { spec: imSpec() }));
+  on("im-stop", () => invoke("imatrix_stop"));
+  on("im-tostep5", () => go("use"));
+  // the list
+  document.querySelectorAll(".im-copy").forEach((b) => b.onclick = () => { im.copyFor = b.dataset.id; render(); });
+  document.querySelectorAll(".im-open").forEach((b) => b.onclick = async () => { try { await invoke("imatrix_open_folder", { id: b.dataset.id }); } catch (e) { im.error = String(e); render(); } });
+  document.querySelectorAll(".im-dat").forEach((b) => b.onclick = () => imRun("dat", "imatrix_make_dat", { id: b.dataset.id }));
+  document.querySelectorAll(".im-del").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete this matrix from the project? Copies you saved elsewhere stay.")) return;
+    try { im.state = await invoke("imatrix_delete", { id: b.dataset.id }); im.ok = "Deleted."; im.error = null; } catch (e) { im.error = String(e); im.ok = null; }
+    render();
+  });
+  const cd = $("im-copydir"); if (cd) cd.onchange = () => { im.copyDir = cd.value; };
+  on("im-copybrowse", async () => { const d = await tauri.dialog.open({ directory: true, title: "Choose the folder to save the copy in" }); if (d) { im.copyDir = d; render(); } });
+  on("im-copycancel", () => { im.copyFor = ""; render(); });
+  on("im-copygo", async () => {
+    const dest = ($("im-copydir") ? $("im-copydir").value : im.copyDir).trim();
+    im.copyDir = dest;
+    try { const to = await invoke("imatrix_save_copy", { id: im.copyFor, dest }); im.saved = to; im.ok = `Saved a copy in ${to}`; im.error = null; im.copyFor = ""; } catch (e) { im.error = String(e); im.ok = null; }
+    render();
+  });
+  // adding
+  on("im-addopen", () => { im.addOpen = true; render(); });
+  on("im-addcancel", () => { im.addOpen = false; render(); });
+  const al = $("im-addlabel"); if (al) al.onchange = () => { im.addLabel = al.value; };
+  on("im-addfile", async () => {
+    const f = await tauri.dialog.open({ multiple: false, title: "Choose an importance matrix file", filters: [{ name: "Importance matrix", extensions: ["gguf", "dat"] }, { name: "All files", extensions: ["*"] }] });
+    if (!f) return;
+    try { const r = await invoke("imatrix_import", { file: f, label: im.addLabel }); im.state = r.state; im.addOpen = false; im.addLabel = ""; im.ok = "Added to the library." + (r.added && r.added.warning ? " " + r.added.warning : ""); im.error = null; } catch (e) { im.error = String(e); im.ok = null; }
+    render();
+  });
+  const ae = $("im-addexp"); if (ae) ae.onchange = () => { im.addExport = ae.value; render(); };
+  on("im-addexpgo", async () => {
+    try { const r = await invoke("imatrix_import", { export: im.addExport, label: im.addLabel }); im.state = r.state; im.addExport = ""; im.ok = "Added to the library."; im.error = null; } catch (e) { im.error = String(e); im.ok = null; }
     render();
   });
 }
@@ -1987,7 +2219,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -2012,6 +2244,7 @@ function wire() {
   wireDataset();
   wireTrain();
   wireUse();
+  wireImatrix();
   wireTest();
   wireReshape();
   wireGuide();
@@ -2125,6 +2358,7 @@ async function go(key) {
   if (key === "train" && state.bundle) trRefresh();
   if (key === "reshape" && state.bundle) { rs.ok = null; rs.error = null; rsRefresh(); }
   if (key === "use" && state.bundle) usRefresh();
+  if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
   if (key === "test" && state.bundle) { te.ok = null; teRefresh(); }
   if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
   $("help").innerHTML = await invoke("help", { key: key === "guide" ? "troubleshooting" : key });
@@ -2152,6 +2386,7 @@ async function init() {
   try { await tauri.event.listen("unsloth-event", (e) => onUnslothEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("imatrix-event", (e) => onImatrixEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
