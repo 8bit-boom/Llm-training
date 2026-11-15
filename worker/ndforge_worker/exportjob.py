@@ -201,15 +201,20 @@ def plan_gguf(backend: str, cfg: dict, quants: list, report, can_apply=None):
         return True, False
     report["via"] = "unsloth"
     conv, quantize = find_llama_cpp()
+    use_file = bool((cfg.get("imatrix") or {}).get("use_file"))      # a matrix from the library: nothing is measured, so llama-imatrix is not needed to apply it
     if not [q for q in quants if q not in imatrix.NO_IMATRIX]:
         report["notes"].append("The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made.")
-    elif conv is None or imatrix.find_llama_imatrix(quantize) is None:
+    elif not use_file and (conv is None or imatrix.find_llama_imatrix(quantize) is None):
         report["notes"].append("An importance matrix was asked for, but llama.cpp (with llama-imatrix) was not found, so the GGUF was made through Unsloth without it. "
                                "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
         protocol.log(report["notes"][-1])
     elif can_apply is not None and can_apply():
         protocol.log("An importance matrix was asked for: llama.cpp measures it, Unsloth applies it (save_pretrained_gguf with imatrix_file).")
         return True, True
+    elif use_file and conv is None:
+        report["notes"].append("A saved importance matrix was chosen, but this Unsloth build cannot apply one and llama.cpp was not found, so the GGUF was made through Unsloth without it. "
+                               "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
+        protocol.log(report["notes"][-1])
     else:
         report["via"] = "llama.cpp"
         protocol.log("An importance matrix was asked for, but this Unsloth build cannot apply one: the GGUF is made with llama.cpp (it applies the matrix) instead of Unsloth.")
