@@ -45,7 +45,7 @@ In Step 5, tick *Better small sizes (importance matrix)*, then choose **Use a sa
 
 ## When something goes wrong
 
-- *"llama.cpp was not found"*: install llama.cpp (https://github.com/ggml-org/llama.cpp) and set the environment variable `LLAMA_CPP_DIR` to its folder. The program looks in `LLAMA_CPP_DIR`, then a `llama.cpp` folder in your home folder, then next to the program, then on the PATH. A GGUF file as the source needs only `llama-imatrix`; a model also needs `convert_hf_to_gguf.py`.
+- *"llama.cpp was not found"*: press **Install llama.cpp now** under the message (or in **⚙ Training setup**): the program downloads the build that fits your computer from GitHub into its own folder, after you have seen the size, and checks that it starts. To use a copy of your own instead, set the environment variable `LLAMA_CPP_DIR` to its folder (<https://github.com/ggml-org/llama.cpp>); that always wins. The program looks in `LLAMA_CPP_DIR`, then in the folder it installed llama.cpp into, then in a `llama.cpp` folder in your home folder, then next to the program; `llama-imatrix` is also looked for on the PATH (the converter script is not). A GGUF file as the source needs only `llama-imatrix`; a model also needs `convert_hf_to_gguf.py`.
 - *"could not turn this model into a GGUF file"*: the model is not a full-precision Hugging Face model this llama.cpp knows. Update llama.cpp, or use a GGUF file.
 - *"llama-imatrix failed"*: see the log. Often the file is not a model it can read, there is not enough memory, or llama.cpp is old.
 - *"not enough free disk space"* or *"The disk is full"*: the 16-bit file of a big model needs as much space as the model itself. Free some space.

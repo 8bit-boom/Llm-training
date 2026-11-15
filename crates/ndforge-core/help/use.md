@@ -35,7 +35,7 @@ It was trained on **all** of the world's text, including GM secrets, and it will
 
 ## If something goes wrong
 - *"Ollama did not answer"*: start Ollama, or check the address. For another computer, Ollama must listen on the network.
-- *"llama.cpp is needed"*: the file could not be made without Unsloth. Install Unsloth in **⚙ Training setup**, or install llama.cpp (<https://github.com/ggml-org/llama.cpp>) and set `LLAMA_CPP_DIR` to its folder. The merged model stays in the export folder.
+- *"llama.cpp is needed"*: the file could not be made without Unsloth. Install Unsloth in **⚙ Training setup**, or press **Install llama.cpp now** (under the message, or in **⚙ Training setup**: the program downloads it into its own folder after you have seen the size). A copy of your own works too: set `LLAMA_CPP_DIR` to its folder (<https://github.com/ggml-org/llama.cpp>); that always wins. The merged model stays in the export folder.
 - *"This llama.cpp has no llama-imatrix"*: the importance matrix was skipped and the files were made normally. Update llama.cpp (llama-imatrix sits next to llama-quantize) if you want it.
 - *"The MTP head was left out: …"*: the matrix was made without the speculative-decoding head (an older llama-imatrix without `--nextn`, or it refused). The sizes still got the matrix.
 - *"The general text (…) could not be read"*: the note says why: the dataset needs access approval (ask for access and save your Hugging Face token, or choose another), it was not found, it has no usable column, or you are offline. The matrix was made from your world's text only; try again later for a slightly better one.
