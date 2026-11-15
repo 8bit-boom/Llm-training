@@ -421,6 +421,78 @@ fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: 
     })
 }
 
+// ------------------------------------------------------------------------------------------------ the matrix library (docs/IMATRIX.md)
+
+/// What the "Importance matrices" card shows: the library, the choices for a new matrix, time guesses, the general-text chooser.
+#[tauri::command]
+fn imatrix_list(s: State<App>) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    Ok(ndforge_core::export::imatrix_lib::state(&project))
+}
+
+/// Makes a matrix on its own (no GGUF export). Events on "imatrix-event"; the end is {"kind": "done", "data": {..., "entry": ...}} or an error. Stop: `imatrix_stop`.
+#[tauri::command]
+fn imatrix_create(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
+    let spec: ndforge_core::export::imatrix_lib::MakeSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::create(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn imatrix_stop(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
+/// Adds a matrix file from this computer (`file`: .gguf or .dat) or the matrix saved next to an earlier export (`export`) to the library. Returns {"added": entry, "state": ...}.
+#[tauri::command]
+fn imatrix_import(s: State<App>, file: Option<String>, export: Option<String>, label: Option<String>) -> Out<Value> {
+    use ndforge_core::export::imatrix_lib as lib;
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let label = label.unwrap_or_default();
+    let added = match (file, export) {
+        (Some(f), _) if !f.trim().is_empty() => lib::import_file(&project, std::path::Path::new(f.trim()), &label, &lib::free_bytes),
+        (_, Some(e)) if !e.is_empty() => lib::import_export(&project, &e, &label, &lib::free_bytes),
+        _ => return Err("Choose a matrix file (.gguf or .dat) or an earlier export.".into()),
+    }.map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"added": added, "state": lib::state(&project)}))
+}
+
+/// "Save a copy...": the files of an entry in a new numbered folder inside `dest`. Returns the new folder.
+#[tauri::command]
+fn imatrix_save_copy(s: State<App>, id: String, dest: String) -> Out<String> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::imatrix_lib::save_copy(&project, &id, std::path::Path::new(dest.trim()), &ndforge_core::export::imatrix_lib::free_bytes).map(|p| p.display().to_string()).map_err(|e| e.to_string())
+}
+
+/// Opens the folder of an entry (`id`) or a folder a copy was saved in (`path`) with the system's file manager.
+#[tauri::command]
+fn imatrix_open_folder(s: State<App>, id: Option<String>, path: Option<String>) -> Out<()> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::imatrix_lib::open_folder(&project, id.as_deref(), path.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Makes the legacy .dat of an entry. Events on "imatrix-event" like `imatrix_create`.
+#[tauri::command]
+fn imatrix_make_dat(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, id: String) -> Out<()> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::make_dat(&project, &id, cancel, emit).map_err(|e| e.to_string()))
+}
+
+/// Deletes an entry (refused while a job uses it). Returns the new state of the card.
+#[tauri::command]
+fn imatrix_delete(s: State<App>, id: String) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::imatrix_lib::delete(&project, &id).map_err(|e| e.to_string())?;
+    Ok(ndforge_core::export::imatrix_lib::state(&project))
+}
+
+/// The light check before an export: does this matrix seem to fit the model of `run`? {"warnings": [...], ...}; never a refusal.
+#[tauri::command]
+fn imatrix_check(s: State<App>, id: String, run: Option<String>) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::imatrix_lib::check(&project, &id, run.as_deref()).map_err(|e| e.to_string())
+}
+
 /// Copies a run's LoRA add-on (with a README on how to load and merge it) into a folder the user chose. Returns the new folder.
 #[tauri::command]
 fn copy_adapter(s: State<App>, run: String, dest: String) -> Out<String> {
@@ -983,7 +1055,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

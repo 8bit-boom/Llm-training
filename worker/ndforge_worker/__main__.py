@@ -72,6 +72,21 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("export_failed", _explain(exc))
             return 1
+    if kind in ("imatrix_make", "imatrix_dat"):
+        from . import imatrix, imatrixjob
+        try:
+            return {"imatrix_make": imatrixjob.run, "imatrix_dat": imatrixjob.run_dat}[kind](job)
+        except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
+            protocol.error("imatrix_stopped", "Cancelled.")
+            return 1
+        except imatrixjob.MatrixError as exc:   # a plain-language failure: no traceback text
+            protocol.error("imatrix_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("imatrix_failed", imatrixjob.plain(exc))
+            return 1
     if kind == "evaluate":
         from . import evaluatejob
         try:

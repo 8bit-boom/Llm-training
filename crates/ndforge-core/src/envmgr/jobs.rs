@@ -26,6 +26,7 @@ pub fn job_env(job: &Value) -> Vec<(String, String)> {
         Some("distill_cache") => job["data"]["general"].is_object(),
         Some("distill") => job["dataset"]["general"].is_object(),
         Some("export") => job["imatrix"]["enabled"] == true,
+        Some("imatrix_make") => true,           // the general text, and a model that is a Hugging Face id (a gated one needs the token)
         _ => false,
     };
     if !reads_general {

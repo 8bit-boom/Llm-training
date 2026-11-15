@@ -206,7 +206,7 @@ fn settings_roundtrip_and_recent() {
 
 #[test]
 fn help_pages_render() {
-    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape"] {
+    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape", "imatrix"] {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));

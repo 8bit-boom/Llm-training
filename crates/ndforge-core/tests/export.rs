@@ -365,7 +365,7 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
     let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
-    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true });
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true, use_saved: None });
     assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
     // the speculative-decoding head: on by default (the worker uses it only when there is one and llama-imatrix knows --nextn); an old spec without the field loads as on
     assert!(o.nextn && sent.nextn);

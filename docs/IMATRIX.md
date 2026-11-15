@@ -1,6 +1,6 @@
 # Importance matrix (imatrix) for the GGUF export
 
-An optional step of Step 5 ("Better small sizes (importance matrix)"). Built and tested with stand-in tools; **never run with a real llama.cpp or a GPU** (see "Not verified yet").
+An optional step of Step 5 ("Better small sizes (importance matrix)"), and, since the matrix library, a function of its own (page "Importance matrices", see "The matrix library"). Built and tested with stand-in tools; **never run with a real llama.cpp or a GPU** (see "Not verified yet").
 
 ## What it is, and when it helps
 
@@ -127,6 +127,64 @@ Only the Stop button ends the export early.
 - Rust: `crates/ndforge-core/tests/export.rs` (options default off and are checked, the job block, saved matrices and time guesses, the matrix and its json kept in every export of a batch, meta, graceful Stop with a fake worker) and `export/runs.rs` (STOP file first, kill after the grace time).
 - Window: `ui/smoke/export.test.mjs` (off by default, 64/128/256, reuse box, only for GGUF, options sent, the files list, Cancel, the head option shown only with a head and greyed with a reason when unsupported, the explanation of who makes the files, "GGUF made by").
 
+## The matrix library
+
+A matrix can also be made **on its own**, without exporting any GGUF: page **Importance matrices** (main navigation, next to "Slim or grow a model", and a link from Step 5). The matrices are kept in the project, used again by exports and copied out. Built and tested with stand-in tools only (see "Not verified yet").
+
+### Owner decisions (defaults) as built
+
+| | |
+|---|---|
+| Where | `<project>/imatrix/<id>/`, id = `yyyymmdd-hhmm-<short model name>` (local time, a number is added if the name is taken). Old projects have no such folder: it is made with the first matrix |
+| Files | `imatrix.gguf` (what llama.cpp reads), optional `imatrix.dat` (legacy), `imatrix.json` |
+| `imatrix.json` | the export's fields (`format`, `model`, `weights`, `data_hash`, `chunks`, `ctx`, `general_share`, `general`, `nextn`, `nextn_asked`, `data_version`, `base_repo`, `general_used`, `general_source`, `general_error`, `project_tokens`, `general_tokens`, `nextn_note`, `llama_cpp`, `created`) plus `id`, `label` (at most 80 characters), `source` (what it was made from, in words) and `source_kind` (`run` / `model` / `gguf` / `imported` / `export`), `calibration` / `calibration_kind` (`data` / `text`), `run`, `size` (bytes), `arch`, `layers`, `entries` (read from the matrix header when it can be), `via` (`llama.cpp` / `imported`; for a matrix added from an export, what that export says), `has_dat`, `notes`, `statistics` |
+| Matrices saved next to past exports | **not moved, not changed, not migrated.** "Add to library" (page, list "or from an earlier export") copies one in (`copied_from` names the export) |
+| Model sources | (a) **a trained run**: its adapter merged into its base with the export's own `merge_hf` (a full fine-tune is used as it is), then converted with `convert_hf_to_gguf.py --outtype f16`; **an f16 GGUF of an export of that run is used instead** when it is newer than the weights (`model-f16.gguf` in an export folder whose `meta.json` names the run); (b) **a model**: an entry of the model list (also made, slimmed or healed models: they are list entries), a typed folder, or a Hugging Face id (the local cache first, else `snapshot_download`; the token only through `HF_TOKEN`), converted exactly as in (a); (c) **a GGUF file** (F16 / BF16 / Q8_0 recommended, any GGUF `llama-imatrix` accepts; the page says a more precise file gives a better matrix) |
+| Calibration | the project's latest saved data version through the model's chat template (about 80 %) plus general text (the shared chooser, scope `imatrix`; default `mlabonne/open-perfectblend`, share default 20 %, 0 to 50 % allowed), or **a text file of the person's own**, used as it is (no general text, no template; `--parse-special` only when it contains template tokens such as `<|im_start|>`) |
+| Options | chunks 64 / **128** / 256, context 512, `-ngl 99`, `--parse-special` (data), the `--nextn` option as in the export (probe with `--help` once, `-b` = ctx, one retry without when llama-imatrix refuses, a note), output format `gguf`, **also make a legacy .dat** (off), a label |
+| Statistics | `llama-imatrix -m <model> --in-file imatrix.gguf --show-statistics` after the measuring, parsed leniently (a header line with tabs and `Min` / `Max` / `μ` columns and a `(N tensors)` line) into a few lines (tensors measured, largest value, mean of the means, share of active weights); skipped without a word when the build has no such option or nothing sensible is found |
+| Legacy `.dat` | the README of llama.cpp's `tools/imatrix` documents `llama-imatrix --in-file x.gguf --output-format dat -o y.dat`; that is tried first, then the same with only the file extension (`-o y.dat`), then a note ("The legacy .dat file could not be made ...") and the matrix is still kept. "Make a .dat (legacy)" on an entry runs the same conversion as its own job (`imatrix_dat`) |
+| Stop | the STOP file, as in the export: the tool is killed at once (also during the model conversion, which runs through the same streaming runner), the half-made folder is removed, the job ends with "Cancelled." (`imatrix_stopped`); the program kills the worker 20 s later if it has not ended. Merging a run (Transformers + PEFT) cannot be interrupted: the STOP file is looked at after it |
+| Progress | step `imatrix`, one bar that never goes back: preparing / merging, converting (0.02 to 0.2), general text, measuring (0.2 to 0.95, the chunk markers), statistics, .dat; the last 40 lines of every tool's output go to the log |
+| Failures | always a `MatrixError` with plain words (`imatrix_failed`): llama.cpp not found (says where to get it and that `LLAMA_CPP_DIR` is read, then `~/llama.cpp`, then a `llama.cpp` folder next to the program, then the PATH), no `convert_hf_to_gguf.py`, model not convertible, not enough free space (checked before converting: the size of the model's safetensors), disk full while writing, a Hugging Face model that is gated / not found / unreachable, calibration unreadable (text file missing or empty, `train.jsonl` missing or unreadable, no text in the data, tokenizer unreadable), llama-imatrix failed (with the usual causes), a GGUF with saved data but no model to take the chat template from. Any other exception is turned into "The matrix could not be made (...)" |
+| Result | `id`, `dir`, `file`, `dat`, `size_mb`, `info` (the json), `notes`, `statistics` |
+
+### Using a matrix in an export
+
+The export box (Step 5, after ticking *Better small sizes*) has **Use a saved matrix**: a list of the library, **Add a matrix file from my computer...** (a `.gguf` or `.dat`, with a label; copied into the library and selected) and **Open the matrix library**. Choosing one hides the measuring options. The job gets `imatrix.use_file` (the library file) and `imatrix.use_id`; the worker's `imatrix.use_saved_file` copies it into the export folder as `imatrix.gguf` (or `imatrix.dat`) with its `imatrix.json` (`from_library` added) and returns it from `prepare` exactly like a freshly measured matrix, so llama-quantize and Unsloth receive it through the same code. Nothing is measured, so llama.cpp (llama-imatrix) is not needed to apply it through Unsloth. The report says `reused`, `from_library`; `meta.json` has `imatrix.library`.
+
+**Light compatibility check** (never a refusal; yellow warning on the page, `Warning:` note in the worker): the header of the matrix is read (`imatrix.read_gguf_header`; the minimal GGUF header reader that `gguf_has_mtp` now uses too; the Rust twin is `export/gguf_meta.rs`) for `general.architecture` (when present), the layers (highest `blk.N.` plus one) and the entries, and compared with the model: from the 16-bit GGUF (`<arch>.block_count`) when the worker has one, else from a model folder's `config.json` (`model_type`, `num_hidden_layers`, also inside `text_config`; the MTP layers count as allowed extra layers). A different architecture or layer count is a warning; a file that cannot be read (a legacy `.dat`, an unusual file) is a warning; a model whose layers cannot be read is a warning on the page; `llama-quantize` decides.
+
+While an export uses a library matrix (and while a `.dat` is being made) the matrix is **in use** and cannot be deleted (a counter in the program, `imatrix_lib::mark_in_use`).
+
+### Actions on an entry
+
+- **Save a copy...**: `imatrix.gguf`, `imatrix.dat` if present, and `imatrix.json` as `imatrix-info.json`, into a **new folder `<chosen folder>/<id>`** (`<id>-2`, `-3` ... when it exists; nothing is overwritten). The free space is checked first (the function is injected in the tests); a failed copy removes what it made.
+- **Open folder**: the system's own file manager (`explorer` / `open` / `xdg-open`); the program had no such command, so `imatrix_open_folder` was added.
+- **Make a .dat (legacy)** when missing; **Delete** with a question, refused while in use. Importing refuses names that are not `.gguf` / `.dat`, empty files and too little free space; a file that is not readable as a GGUF is still added with a warning.
+
+### Tauri commands
+
+`imatrix_list` (state of the card), `imatrix_create` (events on `imatrix-event`), `imatrix_stop`, `imatrix_import` (`file` or `export`, `label`), `imatrix_save_copy`, `imatrix_open_folder`, `imatrix_make_dat`, `imatrix_delete`, `imatrix_check`. The export command `export_start` takes `imatrix.use_saved` (a library id; old specs without it load). Job types `imatrix_make` and `imatrix_dat` are new; existing job types and events are unchanged. The Hugging Face token reaches the worker only as `HF_TOKEN` (`job_env`), never in a job file or a log.
+
+### Tests of the library
+
+- Worker `worker/tests/test_imatrix_library.py`: both the export and the new job call `imatrix.make_matrix`; every model source (run: merge, f16 of an earlier export reused or too old, full fine-tune; folder; Hub id stand-in and the Hub error texts; GGUF), the command lines (`-m`, `-f`, `-o`, `--chunks`, `-c`, `--parse-special`, `-ngl`, `--nextn` and its retry, `--output-format dat`, `--in-file`), the folder contents and json fields, own text (as it is, `--parse-special` only with template tokens), progress never going back, Stop (a hanging tool is killed, no folder left), every failure text, statistics present and absent and odd, `.dat` fallbacks and "make a .dat later", the GGUF header reader and the check with hand-built headers, and a saved matrix in an export (llama-quantize gets the file, a `.dat`, warnings, a vanished file, only Q8_0, through Unsloth without llama.cpp). The existing export tests are unchanged and green.
+- Rust `crates/ndforge-core/tests/imatrix_library.rs` and `export/gguf_meta.rs`: list (old project, odd folders), import (file, `.dat`, unreadable, nonsense, free space), from an export, save a copy (numbered names, free space injected, a file instead of a folder), delete and refuse while in use, the check, spec serde (old export specs), the job for each source (and the data, text, share and chunk refusals), the token only in the environment, the export block, and fake-worker runs (unix only: a whole job, Stop, a failure, a `.dat`, an export with a saved matrix).
+- Window `ui/smoke/imatrix.test.mjs`: the card in the navigation, the explanation, the list and its actions, copy / delete / open / `.dat`, the three sources, the chooser, create / progress / Stop / result with statistics, add from a file and from an export, and in the export box: the list, the check and its yellow warning, `use_saved` sent only when chosen.
+
+### Deviations
+
+- **Legacy `.dat` command**: the brief named `--in-file x.gguf -o y.dat`; the README of llama.cpp (read for this change) documents `--in-file x.gguf --output-format dat -o y.dat`. That is tried first, the brief's form is the fallback.
+- **Open folder**: the program had no opener, so a small command `imatrix_open_folder` starts the system's file manager (not in the brief's list of names).
+- **Save a copy** writes into a new numbered folder named after the matrix, not straight into the chosen folder (all matrices are called `imatrix.gguf`; this is the only way never to overwrite).
+- **A GGUF source with the saved data** needs the model it was made from (folder or Hugging Face id) for the chat template; without it the job says so and offers the own-text calibration. A typed folder or Hub id that is not in the model list uses the chat family `generic`.
+- **The compatibility check lives twice**: in the worker (used at export time, notes) and in Rust (the page, before the export; a small second GGUF header reader, `export/gguf_meta.rs`), with the same texts.
+- `ImatrixOptions` got `use_saved`; one existing struct literal in `crates/ndforge-core/tests/export.rs` needed `use_saved: None` to compile (no assertion changed).
+- **In use** is a counter inside the running program, not a lock on disk: a second program on the same project would not see it.
+- **No label editing** after a matrix is made (the label is asked when it is created or added).
+- The time guess is the export's formula; the page adds "plus the time to convert the model" for a model source.
+
 ## Not verified yet (needs llama.cpp and a GPU)
 
 Nothing below has run. Do not rely on any of it until checked on the owner's PC:
@@ -143,6 +201,19 @@ Nothing below has run. Do not rely on any of it until checked on the owner's PC:
 - The default general dataset (`mlabonne/open-perfectblend`, chat, rendered through the model's template; see docs/GENERAL_TEXT.md) as streamed here (it is the healing code's default, itself unverified), and how long the failed download of an offline PC takes before the note appears.
 - **Quality of Q4_K_M with and without the matrix** on the Test page (the point of the feature): make both, run the Step 4 test on each.
 - Whether killing `llama-imatrix` on Windows leaves anything running.
+
+Matrix library (everything above, and in addition):
+
+- **`--show-statistics` output**: its real text (the README only describes the columns); the parser looks for a `(N tensors)` line and a tab-separated header with `Min` / `Max` / `μ` / `% Active`, and whether `-m <model>` is needed next to `--in-file` (the README example has both).
+- **`--in-file x.gguf --output-format dat -o y.dat`** (and the extension-only fallback) on the user's build, that the `.dat` it writes is read by `llama-quantize` and by Unsloth's quantiser, and that a `.dat` imported from elsewhere is accepted by them.
+- **Compatibility between matrices and files**: that a matrix made on a merged model fits quantising a different source file of the same model (for example the one an export converts, or another GGUF of the same weights), and that a matrix made on a Q8_0 GGUF is as good as one made on F16.
+- **The header of a real matrix**: the reader assumes keys like `general.architecture` (maybe absent), `imatrix.chunk_count`, and tensor names `blk.N.<name>.in_sum2` / `.counts`; the layer comparison for hybrid or MTP models (the MTP layers are allowed as extra) is a guess from the configs.
+- **Hugging Face download** of a model folder with `snapshot_download` (ignored patterns: gguf, onnx, msgpack, h5, pth, `original/*`, md), gated models and the token path, the disk use of a big model, and that `convert_hf_to_gguf.py` accepts the downloaded folder.
+- Merging a trained run for the library (memory, time, that STOP during the merge ends within the 20 s grace), the 16-bit file of an export being really newer than the weights check, and the time of the conversion (the page only says "plus the time to convert the model").
+- The chat template of a typed folder or Hub id with the family `generic`, and of a GGUF whose "made from" model is a different quantisation of the same family.
+- `explorer` / `open` / `xdg-open` for "Open folder" on Windows, macOS and Linux (the program only reports a failure to start the tool).
+- That `llama-imatrix --in-file ... --show-statistics` and `--output-format dat` do not take long enough on a large matrix to need their own progress (no progress is shown for them).
+- Windows paths with spaces or non-ASCII characters through the stand-in tools only (the tests do not use real llama.cpp).
 
 ## Deviations from the brief
 

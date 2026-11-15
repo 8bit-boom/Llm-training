@@ -124,9 +124,9 @@ def folder_has_mtp(folder):
 _GGUF_FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
-def gguf_has_mtp(path):
-    """True / False / None for a GGUF file: a key ending `nextn_predict_layers` with a value above 0, or a tensor named `...nextn...` / `mtp...`. None when the file is not
-    a readable GGUF (the tests' stand-in files, a truncated file). Only the header is read."""
+def read_gguf_header(path):
+    """(metadata, tensor names) of a GGUF file: `metadata` maps each key to its value (numbers, booleans and strings; None for an array), the names are the tensors'.
+    Only the header is read. Raises ValueError when the file is not a readable GGUF (not one, version below 2, truncated, absurd sizes), OSError when it cannot be opened."""
     try:
         with open(path, "rb") as fh:
             def take(fmt):
@@ -144,11 +144,11 @@ def gguf_has_mtp(path):
                     return fh.read(n).decode("utf-8", "replace")
                 fh.seek(n, 1)
 
-            def value(kind):
+            def value(kind, keep=False):
                 if kind in _GGUF_FIXED:
                     return take({0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}[kind])
                 if kind == 8:
-                    return string()
+                    return string(keep)
                 if kind == 9:
                     inner, n = take("I"), take("Q")
                     if inner in _GGUF_FIXED:
@@ -160,29 +160,101 @@ def gguf_has_mtp(path):
                 raise ValueError("unknown value type")
 
             if fh.read(4) != b"GGUF":
-                return None
+                raise ValueError("not a GGUF file")
             if take("I") < 2:
-                return None
+                raise ValueError("an old GGUF version")
             tensors, kvs = take("Q"), take("Q")
             if tensors > 1 << 22 or kvs > 1 << 22:
-                return None
-            found = False
+                raise ValueError("absurd counts")
+            meta = {}
             for _ in range(kvs):
                 key = string(keep=True)
-                v = value(take("I"))
-                if key.endswith("nextn_predict_layers") and isinstance(v, int) and v > 0:
-                    found = True
+                meta[key] = value(take("I"), keep=True)
+            names = []
             for _ in range(tensors):
-                name = string(keep=True)
+                names.append(string(keep=True))
                 for _ in range(take("I")):
                     take("Q")
                 take("I")
                 take("Q")
-                if "nextn" in name or name.startswith("mtp.") or ".mtp." in name:
-                    found = True
-            return found
-    except (OSError, ValueError, struct.error):
+            return meta, names
+    except struct.error as exc:
+        raise ValueError(str(exc))
+
+
+def gguf_has_mtp(path):
+    """True / False / None for a GGUF file: a key ending `nextn_predict_layers` with a value above 0, or a tensor named `...nextn...` / `mtp...`. None when the file is not
+    a readable GGUF (the tests' stand-in files, a truncated file). Only the header is read."""
+    try:
+        meta, names = read_gguf_header(path)
+    except (OSError, ValueError):
         return None
+    if any(k.endswith("nextn_predict_layers") and isinstance(v, int) and not isinstance(v, bool) and v > 0 for k, v in meta.items()):
+        return True
+    return any("nextn" in n or n.startswith("mtp.") or ".mtp." in n for n in names)
+
+
+# ------------------------------------------------------------------------------------------------------------------ does a matrix fit a model? (a light check, never a refusal)
+
+def matrix_summary(path):
+    """What a GGUF-format matrix says about itself, from its header: {"arch": str | None, "layers": int | None (the highest `blk.N.` plus one), "entries": number of
+    tensors measured, "chunks": int | None}. None when the file cannot be read as a GGUF (a legacy .dat, a stand-in, a truncated file)."""
+    try:
+        meta, names = read_gguf_header(path)
+    except (OSError, ValueError):
+        return None
+    blocks = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
+    sums = [n for n in names if n.endswith(".in_sum2")]
+    arch = meta.get("general.architecture")
+    chunks = meta.get("imatrix.chunk_count")
+    return {"arch": arch if isinstance(arch, str) else None, "layers": max(blocks) + 1 if blocks else None, "entries": len(sums) or len(names) // 2,
+            "chunks": chunks if isinstance(chunks, int) else None}
+
+
+def gguf_model_facts(path):
+    """(architecture, block count) of a model GGUF, each None when not readable."""
+    try:
+        meta, _ = read_gguf_header(path)
+    except (OSError, ValueError):
+        return None, None
+    arch = meta.get("general.architecture")
+    arch = arch if isinstance(arch, str) else None
+    n = meta.get(f"{arch}.block_count") if arch else None
+    return arch, n if isinstance(n, int) and not isinstance(n, bool) else None
+
+
+def folder_model_facts(folder):
+    """(model type, layer count, MTP layer count) from a model folder's config.json (also inside `text_config`); None where it is not readable (the MTP count is 0 then)."""
+    import json
+    try:
+        cfg = json.loads((Path(folder) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None, 0
+    typ, layers, mtp = None, None, 0
+    for d in (cfg, cfg.get("text_config") if isinstance(cfg, dict) else None):
+        if isinstance(d, dict):
+            typ = typ or (d.get("model_type") if isinstance(d.get("model_type"), str) else None)
+            n = d.get("num_hidden_layers")
+            layers = layers if layers is not None else (n if isinstance(n, int) and not isinstance(n, bool) else None)
+            for k in MTP_CONFIG_KEYS:
+                v = d.get(k)
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                    mtp = max(mtp, v)
+    return typ, layers, mtp
+
+
+def compat_warnings(matrix, model_arch=None, model_layers=None, mtp_layers: int = 0) -> list:
+    """Plain-language warnings about using `matrix` (a file) for a model with this architecture and layer count (None = not known). [] when it looks fine or nothing
+    can be compared. Never a refusal: llama-quantize itself decides."""
+    info = matrix_summary(matrix)
+    if info is None:
+        return [f"The matrix file {Path(matrix).name} could not be read here (a legacy .dat file or an unusual file), so it could not be checked against this model. llama-quantize will tell if it does not fit."]
+    out = []
+    if info["arch"] and model_arch and info["arch"] != model_arch:
+        out.append(f"This matrix says it was made for the architecture \"{info['arch']}\", but the model is \"{model_arch}\". It will most likely not fit.")
+    if info["layers"] is not None and model_layers is not None and info["layers"] not in (model_layers, model_layers + max(mtp_layers, 0)):
+        out.append(f"This matrix has data for {info['layers']} layers, but the model has {model_layers}. It was probably made from a different model; llama-quantize decides whether it can use it.")
+    return out
 
 
 def hf_cache_dirs(repo: str) -> list:
@@ -399,15 +471,84 @@ def find_saved(dirs, key: dict, general_wanted: bool):
     return (best[1], best[2]) if best else (None, None)
 
 
+def nextn_plan(tool, head):
+    """(use --nextn, why not): `head` is whether the model has an MTP head (True / False / None = cannot tell). Asks `tool` only when there is a head."""
+    if head is True:
+        if nextn_supported(tool):
+            return True, ""
+        return False, "this llama-imatrix has no --nextn option (an older build)"
+    if head is False:
+        return False, "the model has no speculative-decoding head"
+    return False, "it could not be told whether the model has one"
+
+
+def calibration_text(tokenizer, rows: list, fam_name: str, im: dict, ctx: int, chunks: int, share: float, note, at: float = 0.0):
+    """(text, stats, general texts, general note): the calibration file's text, with the general text fetched first when `share` > 0 (im["general"], im["seed"], the STOP
+    file of `im`). Notes about the general text go through `note` and the log. Used by the export and by the matrix library's own job."""
+    from . import generaltext
+    general, gnote = [], ""
+    seed = int(im.get("seed", 3407))
+    if share > 0:
+        protocol.progress("imatrix", at, "Getting the general text")
+        greport: dict = {}
+        general, gnote = fetch_general(im.get("general") or {}, tokenizer, int(ctx * chunks * SLACK * share), ctx, lambda: stop_requested(im), fam_name, seed, greport)
+        if general:
+            protocol.log(f"General text for the matrix: {(im.get('general') or {}).get('file') or (im.get('general') or {}).get('id') or 'the default'} "
+                         f"(read as {generaltext.describe(greport['detected']) if greport.get('detected') else 'text'}).")
+        if gnote:
+            note(gnote)
+            protocol.log(gnote)
+    text, stats = build_calibration(tokenizer, rows, fam_name, ctx, chunks, general, share)
+    protocol.log(f"Calibration text: {stats['project_rows_used']} project texts ({stats['project_tokens']:,} tokens"
+                 + (f", your data repeated to fill it" if stats["repeated"] else "") + f") and {stats['general_rows']} general texts ({stats['general_tokens']:,} tokens).")
+    return text, stats, general, gnote
+
+
+def matrix_info(key: dict, im: dict, base_repo, stats: dict, general: list, gnote: str, used_nextn: bool, want_nextn: bool, left_out: str, tool) -> dict:
+    """The contents of imatrix.json (what the matrix was made from)."""
+    g = im.get("general") or {}
+    return {"format": FORMAT, **key, "nextn": used_nextn, "nextn_asked": want_nextn, "data_version": im.get("data_version"), "base_repo": base_repo, "general_used": bool(general),
+            "general_source": g.get("file") or g.get("id") or ("default" if general else None), "general_error": gnote or None, "project_tokens": stats["project_tokens"],
+            "general_tokens": stats["general_tokens"], "nextn_note": left_out or None, "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def make_matrix(tool, f16, calib, partial, im: dict, chunks: int, ctx: int, want_nextn: bool = False, left_out: str = "", ngl: int = 99, parse_special: bool = True, span=(0.0, 1.0)):
+    """Measures the matrix: llama-imatrix reads the calibration file `calib` through the 16-bit (or any) GGUF `f16` and writes `partial` (GGUF format). Returns
+    (exit code, whether the MTP head is in it, why the head was left out or ""). Two retries, as the export always had: without --output-format when this llama-imatrix does
+    not know the flag, and without --nextn when llama-imatrix says it cannot measure the head. Raises Stopped on the STOP file (im["stop_file"]); the caller removes the files."""
+    base = launcher(tool) + ["-m", f16, "-f", calib, "-o", partial]
+    flags = ["--no-ppl", "--chunks", chunks] + (["--parse-special"] if parse_special else []) + ["-ngl", ngl, "-c", ctx]
+
+    def measure(with_head):
+        extra = ["-b", ctx, "--nextn"] if with_head else []         # --nextn needs one sequence per batch: the batch size must not exceed the context
+        rc, tail = run_streaming(base + ["--output-format", "gguf"] + flags + extra, im, chunks, span=span)
+        if rc != 0 and any("output-format" in line for line in tail):      # an older llama-imatrix that does not know the flag (its file format is the default there)
+            protocol.log("This llama-imatrix has no --output-format; trying without it.")
+            rc, tail = run_streaming(base + flags + extra, im, chunks, span=span)
+        return rc, tail
+
+    used_nextn = want_nextn
+    rc, tail = measure(want_nextn)
+    if rc != 0 and want_nextn:
+        why = nextn_refused(tail)
+        if why:                                                  # the head cannot be measured here: once more without it
+            left_out, used_nextn = why, False
+            protocol.log(f"llama-imatrix would not measure the MTP head ({why}); trying once without it.")
+            Path(partial).unlink(missing_ok=True)
+            rc, tail = measure(False)
+    return rc, used_nextn, left_out
+
+
 # ------------------------------------------------------------------------------------------------------------------ running llama-imatrix
 
 def stop_requested(im: dict) -> bool:
     return bool(im.get("stop_file")) and os.path.exists(im["stop_file"])
 
 
-def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix"):
+def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix", span=(0.0, 1.0), tail_len: int = 40, log_tail: bool = True):
     """Runs a tool and returns (exit code, last output lines). Output is read on a thread so that the STOP file is seen at once: it kills the tool (Stopped).
-    Progress (unless label is None): the chunk markers "[12]" llama-imatrix prints, else a heartbeat with the elapsed time. The tail of the output goes to the log."""
+    Progress (unless label is None): the chunk markers "[12]" llama-imatrix prints, else a heartbeat with the elapsed time; `span` is the part of the bar this call fills
+    (the matrix library's job shares the bar with the model conversion). The last `tail_len` lines of the output are returned and, with `log_tail`, go to the log."""
     protocol.log("$ " + " ".join(str(c) for c in cmd))
     proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     lines: queue.Queue = queue.Queue()
@@ -418,10 +559,10 @@ def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix"):
         lines.put(None)
 
     threading.Thread(target=pump, daemon=True).start()
-    tail: deque = deque(maxlen=40)
+    tail: deque = deque(maxlen=tail_len)
     t0, beat, seen = time.time(), 0.0, 0
     if label:
-        protocol.progress(label, 0.0, "Measuring which weights matter most")
+        protocol.progress(label, span[0], "Measuring which weights matter most")
     try:
         while True:
             if stop_requested(im):
@@ -431,7 +572,7 @@ def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix"):
             except queue.Empty:
                 if label and time.time() - beat >= HEARTBEAT and not seen:
                     beat = time.time()
-                    protocol.progress(label, 0.0, f"Measuring which weights matter most ({int(beat - t0)} s)")
+                    protocol.progress(label, span[0], f"Measuring which weights matter most ({int(beat - t0)} s)")
                 continue
             if line is None:
                 break
@@ -439,14 +580,15 @@ def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix"):
             marks = [int(m) for m in re.findall(r"\[(\d+)\]", line)]
             if label and marks and max(marks) > seen:
                 seen = max(marks)
-                protocol.progress(label, min(seen / max(chunks, 1), 0.99), f"Chunk {seen} of {chunks}")
+                protocol.progress(label, span[0] + (span[1] - span[0]) * min(seen / max(chunks, 1), 0.99), f"Chunk {seen} of {chunks}")
         return proc.wait(), list(tail)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-        for line in tail:
-            protocol.log(line)
+        if log_tail:
+            for line in tail:
+                protocol.log(line)
 
 
 # ------------------------------------------------------------------------------------------------------------------ the step
@@ -461,6 +603,54 @@ def load_tokenizer(sources):
         except Exception as exc:    # noqa: BLE001
             last = exc
     raise last or ValueError("no tokenizer")
+
+
+def model_facts(cfg: dict, merged, f16=None):
+    """(architecture or model type, layer count, MTP layers) of the model being exported, from its 16-bit GGUF when there is one, else from a model folder's config.json
+    (the merged one, the full model, the base model as a folder or in the Hugging Face cache). None for what cannot be read."""
+    if f16 is not None and not callable(f16) and Path(f16).is_file():
+        arch, layers = gguf_model_facts(f16)
+        if layers is not None:
+            return arch, layers, 0
+    for f in [merged, cfg.get("full_model"), cfg["base"].get("repo")] + hf_cache_dirs(cfg["base"].get("repo") or ""):
+        if f and Path(f).is_dir():
+            typ, layers, mtp = folder_model_facts(f)
+            if layers is not None:
+                return typ, layers, mtp
+    return None, None, 0
+
+
+def use_saved_file(cfg: dict, merged, out: Path, f16, im: dict, report: dict):
+    """The export uses a matrix from the library (im["use_file"], a .gguf or a legacy .dat; im["use_id"] is its library id): it is copied into the export folder as
+    imatrix.gguf / imatrix.dat (with its imatrix.json when it has one) and given to llama-quantize / Unsloth exactly like a freshly measured one. A light check against
+    the model puts warnings among the notes; a matrix that does not seem to fit is still used (llama-quantize decides). A missing file is a note and no matrix."""
+    import json
+    src = Path(im["use_file"])
+    note = report["notes"].append
+    if not src.is_file():
+        msg = f"The saved matrix file is missing ({src}), so the sizes were made without the importance matrix."
+        note(msg)
+        protocol.log(msg)
+        return None
+    target = out / ("imatrix.dat" if src.suffix.lower() == ".dat" else "imatrix.gguf")
+    if src.resolve() != target.resolve():
+        shutil.copy2(src, target)
+    info = None
+    try:
+        info = json.loads(src.with_name("imatrix.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    info = dict(info) if isinstance(info, dict) else {"format": FORMAT, "source": "a matrix file"}
+    info["from_library"] = im.get("use_id")
+    (out / "imatrix.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    arch, layers, mtp = model_facts(cfg, merged, f16)
+    for w in compat_warnings(target, arch, layers, mtp):
+        note("Warning: " + w)
+        protocol.log("Warning: " + w)
+    report.update(made=False, reused=True, file=str(target), info=info, nextn=bool(info.get("nextn")), from_library=im.get("use_id"))
+    protocol.log(f"The saved matrix {im.get('use_id') or src.name} from the library is used.")
+    protocol.progress("imatrix", 1.0, "Using the saved matrix")
+    return target
 
 
 def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, report: dict):
@@ -480,6 +670,8 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
     targets = [q for q in quants if q not in NO_IMATRIX]
     if not targets:
         return give_up("The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made.")
+    if im.get("use_file"):
+        return use_saved_file(cfg, merged, out, f16, im, report)
     tool = find_llama_imatrix(quantize)
     if tool is None:
         return give_up("This llama.cpp has no llama-imatrix (an older install), so the sizes were made without the importance matrix. "
@@ -494,15 +686,7 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
             if head is None and callable(f16):          # nothing on disk tells yet (the model is merged only when the 16-bit file is made): make it now
                 f16 = f16()
                 head = model_has_mtp(cfg, merged, f16)
-            if head is True:
-                if nextn_supported(tool):
-                    want_nextn = True
-                else:
-                    nnote = "this llama-imatrix has no --nextn option (an older build)"
-            elif head is False:
-                nnote = "the model has no speculative-decoding head"
-            else:
-                nnote = "it could not be told whether the model has one"
+            want_nextn, nnote = nextn_plan(tool, head)
         key = settings_key(cfg, im, file_sha256(train), want_nextn)
         share = key["general_share"]
         target = out / "imatrix.gguf"
@@ -522,49 +706,15 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
         tokenizer = load_tokenizer([merged, cfg["base"]["repo"]])
         rows = data.read_jsonl(train)
         ctx, chunks = key["ctx"], key["chunks"]
-        general, gnote = [], ""
-        from . import generaltext
-        if share > 0:
-            protocol.progress("imatrix", 0.0, "Getting the general text")
-            greport: dict = {}
-            general, gnote = fetch_general(im.get("general") or {}, tokenizer, int(ctx * chunks * SLACK * share), ctx, lambda: stop_requested(im), cfg["base"].get("family"),
-                                           int(im.get("seed", 3407)), greport)
-            if general:
-                protocol.log(f"General text for the matrix: {(im.get('general') or {}).get('file') or (im.get('general') or {}).get('id') or 'the default'} "
-                             f"(read as {generaltext.describe(greport['detected']) if greport.get('detected') else 'text'}).")
-            if gnote:
-                note(gnote)
-                protocol.log(gnote)
-        text, stats = build_calibration(tokenizer, rows, cfg["base"]["family"], ctx, chunks, general, share)
+        text, stats, general, gnote = calibration_text(tokenizer, rows, cfg["base"]["family"], im, ctx, chunks, share, note)
         calib = out / "imatrix-calibration.txt"
         calib.write_text(text, encoding="utf-8")
-        protocol.log(f"Calibration text: {stats['project_rows_used']} project texts ({stats['project_tokens']:,} tokens"
-                     + (f", your data repeated to fill it" if stats["repeated"] else "") + f") and {stats['general_rows']} general texts ({stats['general_tokens']:,} tokens).")
         partial = out / "imatrix.partial.gguf"
         partial.unlink(missing_ok=True)
         if callable(f16):
             f16 = f16()
-        base = launcher(tool) + ["-m", f16, "-f", calib, "-o", partial]
-        flags = ["--no-ppl", "--chunks", chunks, "--parse-special", "-ngl", 99, "-c", ctx]
-
-        def measure(with_head):
-            extra = ["-b", ctx, "--nextn"] if with_head else []         # --nextn needs one sequence per batch: the batch size must not exceed the context
-            rc, tail = run_streaming(base + ["--output-format", "gguf"] + flags + extra, im, chunks)
-            if rc != 0 and any("output-format" in line for line in tail):      # an older llama-imatrix that does not know the flag (its file format is the default there)
-                protocol.log("This llama-imatrix has no --output-format; trying without it.")
-                rc, tail = run_streaming(base + flags + extra, im, chunks)
-            return rc, tail
-
-        used_nextn, left_out = want_nextn, nnote
         try:
-            rc, tail = measure(want_nextn)
-            if rc != 0 and want_nextn:
-                why = nextn_refused(tail)
-                if why:                                                  # the head cannot be measured here: once more without it
-                    left_out, used_nextn = why, False
-                    protocol.log(f"llama-imatrix would not measure the MTP head ({why}); trying once without it.")
-                    partial.unlink(missing_ok=True)
-                    rc, tail = measure(False)
+            rc, used_nextn, left_out = make_matrix(tool, f16, calib, partial, im, chunks, ctx, want_nextn, nnote)
         finally:
             calib.unlink(missing_ok=True)
         if left_out:
@@ -573,9 +723,7 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
             partial.unlink(missing_ok=True)
             return give_up(f"llama-imatrix failed (exit code {rc}; see the log), so the sizes were made without the importance matrix.")
         os.replace(partial, target)
-        info = {"format": FORMAT, **key, "nextn": used_nextn, "nextn_asked": want_nextn, "data_version": im.get("data_version"), "base_repo": cfg["base"]["repo"], "general_used": bool(general), "general_source": (im.get("general") or {}).get("file")
-                or (im.get("general") or {}).get("id") or ("default" if general else None), "general_error": gnote or None, "project_tokens": stats["project_tokens"], "general_tokens": stats["general_tokens"],
-                "nextn_note": left_out or None, "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        info = matrix_info(key, im, cfg["base"]["repo"], stats, general, gnote, used_nextn, want_nextn, left_out, tool)
         (out / "imatrix.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
         report.update(made=True, reused=False, file=str(target), info=info, nextn=used_nextn)
         protocol.progress("imatrix", 1.0, "Importance matrix ready")
