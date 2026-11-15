@@ -414,13 +414,10 @@ impl Default for MakeSpec {
     }
 }
 
-/// The job for the worker, and the short name the id is made from. Everything the person could get wrong is a plain message here, before anything runs.
-pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Result<Value> {
-    if !IMATRIX_CHUNKS.contains(&spec.chunks) {
-        return Err(Error::new(format!("Unknown amount of calibration text: {} chunks. Choose 64, 128 or 256.", spec.chunks)));
-    }
-    let s = &spec.source;
-    let (source, name) = match s.kind.as_str() {
+/// The worker's description of where a model comes from (a trained run, a model of the list, a folder or Hugging Face id, a GGUF file) and the short name an id is made
+/// from. Shared by the matrix library and the quant comparison (which can make its 16-bit reference from such a source). Every mistake is a plain message.
+pub fn build_source(p: &Project, s: &SourceSpec) -> Result<(Value, String)> {
+    Ok(match s.kind.as_str() {
         "run" => {
             let run = s.run.as_deref().filter(|r| !r.is_empty()).ok_or_else(|| Error::new("Choose a trained run."))?;
             if run.contains(['/', '\\']) || run.contains("..") {
@@ -462,7 +459,15 @@ pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Re
             (json!({"kind": "gguf", "file": file, "tokenizer": tok, "family": family}), stem)
         }
         _ => return Err(Error::new("Choose where the model comes from: a trained run, a model, or a GGUF file.")),
-    };
+    })
+}
+
+/// The job for the worker. Everything the person could get wrong is a plain message here, before anything runs.
+pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Result<Value> {
+    if !IMATRIX_CHUNKS.contains(&spec.chunks) {
+        return Err(Error::new(format!("Unknown amount of calibration text: {} chunks. Choose 64, 128 or 256.", spec.chunks)));
+    }
+    let (source, name) = build_source(p, &spec.source)?;
     let calibration = match spec.calibration.as_str() {
         "text" => {
             let f = spec.text_file.as_deref().map(str::trim).filter(|f| !f.is_empty()).ok_or_else(|| Error::new("Choose the text file."))?;

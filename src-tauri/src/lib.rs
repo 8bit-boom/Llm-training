@@ -493,6 +493,58 @@ fn imatrix_check(s: State<App>, id: String, run: Option<String>) -> Out<Value> {
     ndforge_core::export::imatrix_lib::check(&project, &id, run.as_deref()).map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------------------------------------ compare quants (docs/QUANT_COMPARE.md)
+
+/// What the "Compare quants" card shows: the saved comparisons, the files of the exports, the runs and models, the disk.
+#[tauri::command]
+fn quantcheck_state(s: State<App>) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    Ok(ndforge_core::export::quantcheck::state(&project))
+}
+
+/// The disk need of the 16-bit model's answers for every amount of text, before anything runs (the worker reads the vocabulary from the reference).
+#[tauri::command]
+fn quantcheck_plan(s: State<App>, reference: Option<String>) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::quantcheck::plan(&project, reference.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Runs a comparison. Events on "quantcheck-event"; the end is {"kind": "done", "data": {..., "entry": ...}} or an error. Stop: `quantcheck_stop`.
+#[tauri::command]
+fn quantcheck_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
+    let spec: ndforge_core::export::quantcheck::CompareSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "quantcheck-event", move |cancel, emit| ndforge_core::export::quantcheck::compare(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn quantcheck_stop(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
+/// One saved comparison (the table, the line, the words).
+#[tauri::command]
+fn quantcheck_get(s: State<App>, id: String) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::quantcheck::get(&project, &id).map(|(_, r)| r).map_err(|e| e.to_string())
+}
+
+/// Deletes a comparison (refused while it runs). Returns the new state of the card.
+#[tauri::command]
+fn quantcheck_delete(s: State<App>, id: String) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::quantcheck::delete(&project, &id).map_err(|e| e.to_string())?;
+    Ok(ndforge_core::export::quantcheck::state(&project))
+}
+
+/// Deletes only the big file of the 16-bit model's answers of a comparison. Returns the new state of the card.
+#[tauri::command]
+fn quantcheck_delete_logits(s: State<App>, id: String) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::quantcheck::delete_logits(&project, &id).map_err(|e| e.to_string())?;
+    Ok(ndforge_core::export::quantcheck::state(&project))
+}
+
 /// Copies a run's LoRA add-on (with a README on how to load and merge it) into a folder the user chose. Returns the new folder.
 #[tauri::command]
 fn copy_adapter(s: State<App>, run: String, dest: String) -> Out<String> {
@@ -1055,7 +1107,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
