@@ -1109,6 +1109,54 @@ fn env_cancel(tasks: State<Tasks>) {
     tasks.cancel.store(true, Ordering::SeqCst);
 }
 
+// ------------------------------------------------------------------------------------------------------------------ llama.cpp (docs/LLAMA_CPP_INSTALL.md)
+
+#[tauri::command]
+fn llamacpp_status() -> Value {
+    ndforge_core::envmgr::llamacpp::status(&ndforge_core::envmgr::llamacpp::Config::from_env())
+}
+
+/// What an install would download (backend, files, size), for the confirmation: nothing is downloaded or changed.
+#[tauri::command]
+fn llamacpp_plan(backend: Option<String>, tag: Option<String>) -> Out<Value> {
+    use ndforge_core::envmgr::llamacpp as lc;
+    let opts = lc::Options { want: lc::choose::Want::parse(backend.as_deref().unwrap_or("auto")), tag: tag.filter(|t| !t.trim().is_empty()) };
+    lc::plan(&lc::Config::from_env(), &lc::choose::detect_machine(), &opts).map_err(|f| f.message)
+}
+
+#[tauri::command]
+fn llamacpp_install(app: tauri::AppHandle, tasks: State<Tasks>, backend: Option<String>, tag: Option<String>) -> Out<()> {
+    use ndforge_core::envmgr::llamacpp as lc;
+    let opts = lc::Options { want: lc::choose::Want::parse(backend.as_deref().unwrap_or("auto")), tag: tag.filter(|t| !t.trim().is_empty()) };
+    spawn_task(app, &tasks, "env-event", move |cancel, emit| {
+        let mut out = lc::install_task(&lc::Config::from_env(), &opts, cancel, emit).map_err(|e| e.to_string())?;
+        out["task"] = Value::from("llamacpp");
+        Ok(out)
+    })
+}
+
+#[tauri::command]
+fn llamacpp_cancel(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn llamacpp_remove(tasks: State<Tasks>) -> Out<Value> {
+    use ndforge_core::envmgr::llamacpp as lc;
+    if tasks.busy.load(Ordering::SeqCst) {
+        return Err("Something is still running. Wait for it or press Cancel, then remove llama.cpp.".into());
+    }
+    let cfg = lc::Config::from_env();
+    lc::remove(&cfg).map_err(|f| f.message)?;
+    Ok(lc::status(&cfg))
+}
+
+/// A hint only: is there a newer llama.cpp release than the installed one? Installs nothing.
+#[tauri::command]
+fn llamacpp_check_update() -> Out<Value> {
+    ndforge_core::envmgr::llamacpp::check_update(&ndforge_core::envmgr::llamacpp::Config::from_env()).map_err(|f| f.message)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1131,7 +1179,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

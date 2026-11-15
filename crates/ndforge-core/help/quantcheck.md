@@ -25,4 +25,4 @@ Press **Stop** at any time: the files that are measured stay measured, and **Con
 
 ## When something is wrong
 
-Nothing here stops the program. If `llama-perplexity` is missing, the page says how to install llama.cpp and that `LLAMA_CPP_DIR` tells the program where it is. A file that cannot be read, or that is not made from the same model (another vocabulary), fails only its own row.
+Nothing here stops the program. If `llama-perplexity` is missing, the page has an **Install llama.cpp now** button (the program downloads it into its own folder after you have seen the size); `LLAMA_CPP_DIR` tells the program where a copy of your own is, and always wins. A file that cannot be read, or that is not made from the same model (another vocabulary), fails only its own row.

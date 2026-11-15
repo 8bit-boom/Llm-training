@@ -25,17 +25,20 @@ import sys
 import time
 from pathlib import Path
 
-from . import data, exportjob, imatrix, protocol
+from . import data, exportjob, imatrix, llamacpp, protocol
 
 SOURCES = ("run", "model", "gguf")
 DAT_NAME = "imatrix.dat"
 NO_LLAMA = ("llama.cpp was not found, so no importance matrix can be made. Install it from https://github.com/ggml-org/llama.cpp (a build that has llama-imatrix"
-            "{conv}), then tell this program where it is: set the environment variable LLAMA_CPP_DIR to its folder. This program looks in LLAMA_CPP_DIR, then in a folder "
-            "called llama.cpp in your home folder, then next to the program, then on the PATH.")
+            "{conv}), then tell this program where it is: set the environment variable LLAMA_CPP_DIR to its folder. " + llamacpp.SEARCH_ORDER + " " + llamacpp.CAN_INSTALL)
 
 
 class MatrixError(Exception):
     """A failure with a plain-language text for the person."""
+
+
+class MatrixLlamaMissing(MatrixError, llamacpp.LlamaCppMissing):
+    """llama.cpp (or its converter) is not there: error code llama_cpp_missing, the page offers the installer."""
 
 
 def plain(exc: BaseException) -> str:
@@ -72,23 +75,14 @@ def check_space(where, need: int, what: str):
 # ------------------------------------------------------------------------------------------------------------------ llama.cpp
 
 def find_tools(need_convert: bool):
-    """(convert script or None, llama-imatrix). A source that is already a GGUF needs only llama-imatrix."""
+    """(convert script or None, llama-imatrix). A source that is already a GGUF needs only llama-imatrix. One finder for everything: llamacpp.py."""
     conv, quantize = exportjob.find_llama_cpp()
-    tool = imatrix.find_llama_imatrix(quantize)
+    tool = imatrix.find_llama_imatrix(quantize) or llamacpp.find_tool("llama-imatrix")      # llama-imatrix alone is enough for a GGUF source
     if tool is None:
-        for d in filter(None, [os.environ.get("LLAMA_CPP_DIR"), str(Path.home() / "llama.cpp")]):
-            exe = "llama-imatrix.exe" if os.name == "nt" else "llama-imatrix"
-            for c in (Path(d) / exe, Path(d) / "build" / "bin" / exe, Path(d) / "build" / "bin" / "Release" / exe):
-                if c.is_file():
-                    tool = c
-                    break
-            if tool:
-                break
-    if tool is None:
-        raise MatrixError(NO_LLAMA.format(conv=" and convert_hf_to_gguf.py" if need_convert else ""))
+        raise MatrixLlamaMissing(NO_LLAMA.format(conv=" and convert_hf_to_gguf.py" if need_convert else ""))
     if need_convert and conv is None:
-        raise MatrixError("llama.cpp was found, but not its convert_hf_to_gguf.py (needed to turn a model into a GGUF file). Use a full llama.cpp folder (a download of the source or a git "
-                          "clone, with a build that has llama-quantize) and set LLAMA_CPP_DIR to it; or choose a GGUF file as the model.")
+        raise MatrixLlamaMissing("llama.cpp was found, but not its convert_hf_to_gguf.py (needed to turn a model into a GGUF file). Use a full llama.cpp folder (a download of the source or a git "
+                                 "clone, with a build that has llama-quantize) and set LLAMA_CPP_DIR to it; or choose a GGUF file as the model. " + llamacpp.CAN_INSTALL)
     return conv, tool
 
 

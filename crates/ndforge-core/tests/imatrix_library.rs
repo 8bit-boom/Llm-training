@@ -501,6 +501,32 @@ exit 1"#);
 
 #[cfg(unix)]
 #[test]
+fn a_missing_llama_cpp_carries_its_code_and_the_worker_is_told_where_the_installed_one_is() {
+    use ndforge_core::envmgr::jobs::{LLAMA_CPP_MISSING_MARK};
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    let p = project_with_data(d.path());
+    let gguf = d.path().join("m.gguf");
+    std::fs::write(&gguf, "x").unwrap();
+    let spec = lib::MakeSpec { source: lib::SourceSpec { kind: "gguf".into(), file: Some(gguf.display().to_string()), ..Default::default() }, calibration: "text".into(), text_file: Some(gguf.display().to_string()), ..Default::default() };
+    fake_worker(d.path(), r#"echo '{"type":"error","code":"llama_cpp_missing","message":"llama.cpp was not found, so no importance matrix can be made. LLAMA_CPP_DIR"}'; exit 1"#);
+    let e = lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(e.starts_with("llama.cpp was not found") && e.ends_with(LLAMA_CPP_MISSING_MARK), "{e}");
+    // another code gets no mark
+    fake_worker(d.path(), r#"echo '{"type":"error","code":"imatrix_failed","message":"something else"}'; exit 1"#);
+    assert!(!lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("llama_cpp_missing"));
+    // the install folder, when it exists, is handed to the worker; the error shows what the worker saw
+    std::fs::create_dir_all(d.path().join("cfg/llama.cpp")).unwrap();
+    fake_worker(d.path(), r#"echo "{\"type\":\"error\",\"code\":\"imatrix_failed\",\"message\":\"saw $NDFORGE_LLAMA_CPP_DIR\"}"; exit 1"#);
+    let e = lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(e.ends_with("cfg/llama.cpp"), "{e}");
+    std::fs::remove_dir_all(d.path().join("cfg/llama.cpp")).unwrap();
+    let e = lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert_eq!(e, "saw ", "no folder, no variable");
+}
+
+#[cfg(unix)]
+#[test]
 fn making_a_dat_marks_the_entry_in_use_while_the_worker_runs() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let d = tempdir().unwrap();

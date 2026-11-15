@@ -9,6 +9,10 @@ use serde_json::Value;
 use super::process::{run_lines, Stream};
 use crate::error::{Error, Result};
 
+/// The worker's error code when llama.cpp (or a part of it) is not there, and the mark the error text then ends with.
+pub const LLAMA_CPP_MISSING: &str = "llama_cpp_missing";
+pub const LLAMA_CPP_MISSING_MARK: &str = "[llama_cpp_missing]";
+
 /// What the worker reports while it runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerEvent {
@@ -47,9 +51,14 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
     for (k, v) in job_env(job) {
         cmd.env(k, v);
     }
+    // the llama.cpp this program installed (docs/LLAMA_CPP_INSTALL.md): the worker's finder looks there after an explicit LLAMA_CPP_DIR
+    for (k, v) in super::llamacpp::worker_env(&super::llamacpp::Config::from_env()) {
+        cmd.env(k, v);
+    }
     let scrub = crate::unsloth::client::scrub;
     let mut result: Option<Value> = None;
     let mut failure: Option<String> = None;
+    let mut failure_code = String::new();
     let status = run_lines(cmd, cancel, &mut |stream: Stream, line: &str| {
         if stream == Stream::Err {
             on_event(WorkerEvent::Log(scrub(line)));
@@ -62,7 +71,10 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
                     step: v["step"].as_str().unwrap_or("").to_string(), value: v["value"].as_f64().unwrap_or(0.0), text: v["text"].as_str().unwrap_or("").to_string(),
                 }),
                 Some("result") => result = Some(v["data"].clone()),
-                Some("error") => failure = Some(scrub(v["message"].as_str().unwrap_or("The worker reported an error."))),
+                Some("error") => {
+                    failure = Some(scrub(v["message"].as_str().unwrap_or("The worker reported an error.")));
+                    failure_code = v["code"].as_str().unwrap_or("").to_string();
+                }
                 Some(_) => on_event(WorkerEvent::Other(v.clone())),
                 None => on_event(WorkerEvent::Log(scrub(line))),
             },
@@ -72,7 +84,8 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
     let _ = std::fs::remove_dir_all(&dir);
     let status = status?;
     if let Some(msg) = failure {
-        return Err(Error::new(msg));
+        // the page offers "Install llama.cpp now" when it finds this mark (the text above it stays as the worker wrote it, for logs)
+        return Err(Error::new(if failure_code == LLAMA_CPP_MISSING { format!("{msg} {LLAMA_CPP_MISSING_MARK}") } else { msg }));
     }
     match (status.success(), result) {
         (true, Some(r)) => Ok(r),

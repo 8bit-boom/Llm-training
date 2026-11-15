@@ -641,7 +641,7 @@ function mixedBox(st) {
   const fitOn = us.quants.includes("mixed_fit");
   const lib = (st.imatrix && st.imatrix.library) || [];
   const fileOpts = files.map((f) => `<option value="${esc(f.path)}" ${usMixedFile(st) === f.path ? "selected" : ""}>${esc(f.label)}</option>`).join("") + `<option value="__typed" ${us.mx.file === "__typed" ? "selected" : ""}>A GGUF file I choose…</option>`;
-  const detail = any ? `<p class="dim small" id="us-mxwhy">Made with llama.cpp: <code>llama-quantize</code> gives single tensors their own types. If Unsloth is the back end that would make the files, llama.cpp makes the <em>whole batch</em> instead (Unsloth cannot do per-tensor types) and the result says so. More bits go to the embedding and output tensors, the attention k / v / output, the linear-attention projections, ffn_down and the first and last layers; fewer to the ffn_up / gate of the middle layers. The importance matrix, when you use one, is applied to these sizes too. <strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}</strong>: they are our own recipes, not copies of anyone else's, and nobody has measured yet whether they beat the plain sizes: that is what <strong>Compare quants</strong> is for.</p>
+  const detail = any ? `${us.im ? "" : llamaNotice("all")}<p class="dim small" id="us-mxwhy">Made with llama.cpp: <code>llama-quantize</code> gives single tensors their own types. If Unsloth is the back end that would make the files, llama.cpp makes the <em>whole batch</em> instead (Unsloth cannot do per-tensor types) and the result says so. More bits go to the embedding and output tensors, the attention k / v / output, the linear-attention projections, ffn_down and the first and last layers; fewer to the ffn_up / gate of the middle layers. The importance matrix, when you use one, is applied to these sizes too. <strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}</strong>: they are our own recipes, not copies of anyone else's, and nobody has measured yet whether they beat the plain sizes: that is what <strong>Compare quants</strong> is for.</p>
     <div class="row"><label>Estimate the size from <select id="us-mxfile">${fileOpts}</select></label>${us.mx.file === "__typed" ? `<input type="text" id="us-mxtyped" value="${esc(us.mx.typed)}" placeholder="C:\\models\\model-Q4_K_M.gguf" style="min-width:260px">` : ""}<button class="secondary" id="us-mxplanbtn" ${us.mx.busy || !usMixedFile(st) ? "disabled" : ""}>Show the estimated sizes</button></div>
     ${files.length || us.mx.file === "__typed" ? "" : `<p class="dim small">No GGUF of this model exists yet. Choose any GGUF file of it (any size, only its tensor shapes are read) to see the estimated sizes, or make the files and read the real ones afterwards.</p>`}
     ${fitOn ? `<div class="row" id="us-mxfitbox"><strong>Fit to a size (experimental)</strong> <label>Target size <input type="text" id="us-mxtarget" value="${esc(us.mx.target)}" placeholder="12.5" style="min-width:80px;flex:0"> GB</label>
@@ -718,7 +718,7 @@ function imatrixBox(st) {
     ${helps ? "" : `<p class="dim">None of the chosen sizes is below Q8_0, so there is nothing to improve: the matrix would not be made.</p>`}`;
   const detail = us.im ? savedPick(im) + (us.imSaved ? savedNote() : measure) : "";
   return `<div class="row imatrix"><label class="opt" title="llama.cpp reads about ${im.ctx * im.default_chunks} tokens of your data and some general text and learns which weights matter most; the small sizes then keep those more exactly"><input type="checkbox" id="us-im" ${us.im ? "checked" : ""}> Better small sizes (importance matrix)</label></div>
-    <p class="dim">Makes Q6_K, Q5_K_M and Q4_K_M lose less quality (Q8_0 and F16 stay as they are). llama.cpp (<code>llama-imatrix</code>) measures the matrix; adds a few minutes. If the installed Unsloth can apply a matrix, Unsloth makes the files with it, otherwise llama.cpp does (convert, then <code>llama-quantize</code>); the list below says which. Without llama.cpp, or if anything about it fails, the files are made without the matrix and the page says so.</p>${detail}`;
+    <p class="dim">Makes Q6_K, Q5_K_M and Q4_K_M lose less quality (Q8_0 and F16 stay as they are). llama.cpp (<code>llama-imatrix</code>) measures the matrix; adds a few minutes. If the installed Unsloth can apply a matrix, Unsloth makes the files with it, otherwise llama.cpp does (convert, then <code>llama-quantize</code>); the list below says which. Without llama.cpp, or if anything about it fails, the files are made without the matrix and the page says so.</p>${us.im ? llamaNotice("all") : ""}${detail}`;
 }
 
 function renderUse() {
@@ -765,7 +765,7 @@ function renderUse() {
     <p><strong>nd-world with Unsloth Studio</strong>: the GGUF file in the folder above can be loaded in Studio's Model Hub (local model); then set <code>UNSLOTH_MODEL</code> to it and <code>LLM_CONTEXT_TOKENS</code> to the context length it was loaded with (${us.numCtx}). The chat template inside the file answers without thinking, as the model was trained.</p>
     <div class="warn"><strong>For the game master only.</strong> This model was trained on <em>all</em> of your world's text, including GM secrets, and it will repeat them. If players can use AI in this world ("players can use Ask AI"), turn that off, or keep players on another model.</div></div>` : "";
   const prog = (us.running || us.step) ? `<div class="stepline">${esc(us.step)}</div>${us.progress != null ? `<progress max="1" value="${us.progress}"></progress>` : ""}${us.running && us.pending === "make" ? ` <button class="secondary" id="us-cancel" title="Stops the export; while the importance matrix is made, llama.cpp is stopped at once">Cancel</button>` : ""}` : "";
-  const msg = `${us.error ? `<div class="err">${esc(us.error)}</div>` : ""}${us.ok ? `<div class="ok">${esc(us.ok)}</div>` : ""}`;
+  const msg = `${errBox(us.error, "all")}${us.ok ? `<div class="ok">${esc(us.ok)}</div>` : ""}`;
   const log = us.log.length ? `<details><summary>Log</summary><pre class="log">${us.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
   return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Turns the trained model into a file nd-world can use, installs it into Ollama and shows what to set. The help panel explains each part.</p>
     ${files}${prog}${msg}${log}${list}${install}${how}`;
@@ -875,7 +875,7 @@ let im = { state: null, src: "run", run: "", model: "", modelPath: "", gguf: "",
   addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", mergePicked: [], mergeFiles: [], mergeFileInput: "", mergePub: false, mergePubBase: "", mergePubInfo: null, mergePubBusy: false, mergePubError: "", mergeLabel: "", mergePub2: false, running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
 
 const IM_INTRO = `<p>An <strong>importance matrix</strong> is a short measurement: the model reads some typical text, and llama.cpp notes how strongly each part of it is used. When the model is later shrunk to about 4 or 5 bits (Q4_K_M, Q5_K_M, Q6_K), the rounding then takes more care of the parts that matter, so the small file loses less quality. For Q8_0 and F16 it does nothing.</p>
-  <p class="dim">You can make one here without making any GGUF file, keep it, use it in later exports (Step 5, "Use a saved matrix"), or save a copy to use with <code>llama-quantize</code> on another computer or to share. It needs llama.cpp (<code>llama-imatrix</code>); set <code>LLAMA_CPP_DIR</code> to its folder if the program does not find it.</p>`;
+  <p class="dim">You can make one here without making any GGUF file, keep it, use it in later exports (Step 5, "Use a saved matrix"), or save a copy to use with <code>llama-quantize</code> on another computer or to share. It needs llama.cpp (<code>llama-imatrix</code>): the program can install it for you (the button appears below when it is missing; <strong>Training setup</strong> has the same). A copy of your own in <code>LLAMA_CPP_DIR</code> always wins.</p>`;
 
 function imEstimate(st) {
   const e = st.estimates || {};
@@ -966,7 +966,7 @@ function imMergeHtml(st) {
   const n = im.mergePicked.length + im.mergeFiles.length + (im.mergePub ? 1 : 0);
   const why = !st.env_ready ? "The merge runs in the training software's worker, which is not set up yet (open Training setup)." : n < 2 ? "Tick two or more matrices above, or add a file, or use Unsloth's published matrix: a merge needs at least two things." : im.mergePub && !im.mergePubBase ? "Choose the base model." : "";
   const prog = im.running && im.pending === "merge" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
-  return `<div class="card wide" id="im-merge"><h2>Merge matrices</h2>
+  return `<div class="card wide" id="im-merge"><h2>Merge matrices</h2>${llamaNotice("merge")}
     <p>Combine two or more matrices into a new one: matrices of your own (tick them in the list above), matrix files, and/or <strong>Unsloth's published matrix</strong> for the base model. llama.cpp (<code>llama-imatrix --in-file a --in-file b</code>) does it; the matrices you merge are not changed.</p>
     <div class="warn small"><strong>What merging does, honestly.</strong> Merging <em>adds</em> the statistics of the matrices. A matrix measured on more text therefore outweighs a smaller one: a large published matrix can drown a small one of your own (make yours with more chunks if you want it to count). And Unsloth's published matrix describes the <em>unmodified base model</em>, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model. Matrices are checked against each other from their headers; a mismatch is a warning, and if llama-imatrix refuses, its own message is shown.</div>
     <p class="dim small" id="im-merge-count">${im.mergePicked.length} ticked in the list${im.mergeFiles.length ? ` · ${im.mergeFiles.length} file(s)` : ""}${im.mergePub ? " · the published matrix" : ""}.</p>
@@ -1005,11 +1005,11 @@ function renderImatrix() {
       ${(r.weights || []).length ? `<ul class="small">${r.weights.map((w) => `<li>${esc(w.label)}: ${w.chunks != null ? w.chunks + " chunks" : "amount of text unknown"}${w.share != null ? ` · about ${Math.round(w.share * 100)} % of the merged statistics` : ""}</li>`).join("")}</ul>` : ""}` : "";
   const result = mergeResult || (r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
       ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>${mergedPart}` : "");
-  const msg = `${im.error ? `<div class="err">${esc(im.error)}</div>` : ""}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
+  const msg = `${errBox(im.error, "imatrix")}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
   const log = im.log.length ? `<details><summary>Log</summary><pre class="log">${im.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
   const prog = im.running && im.pending === "dat" ? `<div class="stepline">${esc(im.step)}</div> <button class="secondary" id="im-stop">Stop</button>` : "";
   return `<h1>Importance matrices</h1><p class="lead">Measure which parts of a model matter most, keep the result, and use it for better small GGUF files.</p>
-    <div class="card wide"><h2>What it is</h2>${IM_INTRO}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
+    <div class="card wide"><h2>What it is</h2>${IM_INTRO}${llamaNotice("imatrix")}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
     <div class="card wide"><h2>Your matrices</h2>${list}${add}${prog}</div>
     ${imMergeHtml(st)}${imFormHtml(st)}${msg}${result}${log}`;
 }
@@ -1127,7 +1127,7 @@ let qk = { state: null, refSel: "", refFile: "", makeSrc: "run", makeRun: "", ma
   keep: false, plan: null, planRef: undefined, planBusy: false, running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, shown: null, resume: "" };
 
 const QK_INTRO = `<p>A smaller GGUF file (Q4_K_M, a mixed-precision size ...) rounds the model's numbers, so its answers drift a little from the 16-bit original's. This page measures that drift: the 16-bit model reads a test text once and saves how likely it finds every next word; each smaller file then reads the same text and is compared with it. The figure is the <strong>KL divergence</strong> (KLD): 0 means the same answers, the larger, the further away. It also shows how often both files pick the same top word.</p>
-  <p class="dim">KLD is a <strong>proxy</strong>: Unsloth reports it for its own quants too, but it does not replace trying the model on your own questions (Step 4 · Test). The test text is, by default, <strong>text the matrix was not measured on</strong> (the held-out part of your saved data), so a matrix does not get a head start. It needs llama.cpp with <code>llama-perplexity</code> (set <code>LLAMA_CPP_DIR</code> to its folder if the program does not find it). The 16-bit model's answers are saved in one big temporary file: the page shows its size before anything runs.</p>`;
+  <p class="dim">KLD is a <strong>proxy</strong>: Unsloth reports it for its own quants too, but it does not replace trying the model on your own questions (Step 4 · Test). The test text is, by default, <strong>text the matrix was not measured on</strong> (the held-out part of your saved data), so a matrix does not get a head start. It needs llama.cpp with <code>llama-perplexity</code>: the program can install it for you (the button appears below when it is missing); a copy of your own in <code>LLAMA_CPP_DIR</code> always wins. The 16-bit model's answers are saved in one big temporary file: the page shows its size before anything runs.</p>`;
 
 const qkGb = (b) => (b / 1e9).toFixed(2);
 const qkNum = (v, d = 4) => (v == null || Number.isNaN(+v) ? "–" : (+v).toFixed(d));
@@ -1256,10 +1256,10 @@ function renderQuantcheck() {
   if (!st) return `<h1>Compare quants</h1><p class="lead">Loading…</p>`;
   const entries = st.entries || [];
   const list = entries.length ? `<ul class="exlist">${entries.map(qkEntryHtml).join("")}</ul>` : `<p class="dim">No comparison saved in this project yet. Make one below.</p>`;
-  const msg = `${qk.error ? `<div class="err">${esc(qk.error)}</div>` : ""}${qk.ok ? `<div class="ok">${esc(qk.ok)}</div>` : ""}`;
+  const msg = `${errBox(qk.error, "perplexity")}${qk.ok ? `<div class="ok">${esc(qk.ok)}</div>` : ""}`;
   const log = qk.log.length ? `<details><summary>Log</summary><pre class="log">${qk.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
   return `<h1>Compare quants</h1><p class="lead">See how much of the 16-bit model each smaller file keeps, and which size is worth it.</p>
-    <div class="card wide"><h2>What it measures</h2>${QK_INTRO}<div class="row"><button class="secondary" id="qk-tostep5">Go to Step 5 (make the files)</button></div></div>
+    <div class="card wide"><h2>What it measures</h2>${QK_INTRO}${llamaNotice("perplexity")}<div class="row"><button class="secondary" id="qk-tostep5">Go to Step 5 (make the files)</button></div></div>
     <div class="card wide"><h2>Your comparisons</h2>${list}</div>${qkFormHtml(st)}${msg}${log}${qkResultHtml(qk.shown)}`;
 }
 
@@ -1464,6 +1464,184 @@ function onUnslothEvent(p) {
   if (page === "setup") render();
 }
 
+// ------------------------------------------------------------------------------------------------------------ llama.cpp: the installer (docs/LLAMA_CPP_INSTALL.md)
+// One state for every place that needs llama.cpp (Training setup, Step 5, Importance matrices, Compare quants): the status the workers will find, the plan to confirm, the progress.
+let lc = { status: null, planning: false, confirm: null, running: false, step: "", progress: null, bytes: null, log: [], error: null, result: null, update: null, updating: false, backend: "auto", pendingAuto: false };
+const LLAMA_MARK = "[llama_cpp_missing]";                // the program ends the text of a worker error with this when llama.cpp (or a part of it) was not found
+const llamaMarked = (t) => typeof t === "string" && t.includes(LLAMA_MARK);
+const stripLlamaMark = (t) => (typeof t === "string" ? t.split(LLAMA_MARK).join("").trim() : t);
+const LC_WHY = { all: "It is needed to make GGUF files with llama.cpp (the importance matrix, the mixed sizes).", imatrix: "It is needed to measure an importance matrix.", perplexity: "Compare quants needs its llama-perplexity program.", merge: "Merging matrices needs its llama-imatrix program." };
+
+// is a part that the page needs missing? (null status = not known yet: say nothing)
+function lcGap(need) {
+  const s = lc.status;
+  if (!s) return false;
+  const t = s.tools || {};
+  if (need === "perplexity") return !t.perplexity;
+  if (need === "imatrix") return !t.imatrix || (!s.converter_found && typeof im !== "undefined" && im.src !== "gguf");
+  if (need === "merge") return !t.imatrix;
+  return !s.found;
+}
+
+async function lcRefresh() {
+  try { lc.status = await invoke("llamacpp_status"); } catch (_) { lc.status = null; }
+  if (["setup", "use", "imatrix", "quantcheck"].includes(page)) render();
+}
+
+const lcMb = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.round(n / 1e6) + " MB");
+
+// the plan is shown first (what, from where, how big); nothing is downloaded until the person agrees (one click). `auto`: the person already agreed (the CPU build offer).
+async function lcPlan(backend, auto) {
+  lc.planning = true; lc.error = null; lc.result = null; lc.confirm = null; lc.pendingAuto = !!auto;
+  render();
+  try {
+    const plan = await invoke("llamacpp_plan", { backend: backend || lc.backend || "auto", tag: null });
+    lc.planning = false;
+    if (auto) { lc.confirm = plan; await lcInstall(); return; }
+    lc.confirm = plan;
+  } catch (e) { lc.planning = false; lc.error = String(e); }
+  render();
+}
+
+async function lcInstall() {
+  const plan = lc.confirm;
+  if (!plan) return;
+  lc.confirm = null; lc.running = true; lc.log = []; lc.step = "Starting…"; lc.progress = 0; lc.bytes = null; lc.error = null; lc.result = null;
+  render();
+  try { await invoke("llamacpp_install", { backend: plan.backend, tag: plan.tag }); } catch (e) { lc.running = false; lc.error = String(e); lc.step = ""; render(); }
+}
+
+// the events of the install arrive on the environment channel; the page that started it knows it by `lc.running`
+function onLlamaEvent(p) {
+  if (p.kind === "log") lc.log.push(p.text);
+  else if (p.kind === "step") { lc.step = `Step ${p.index} of ${p.total}: ${p.text}`; }
+  else if (p.kind === "progress") { if (p.text) lc.step = p.text; if (p.value != null) lc.progress = p.value; if (p.bytes != null) lc.bytes = [p.bytes, p.total]; }
+  else if (p.kind === "done") { lc.running = false; lc.progress = null; lc.step = ""; lc.result = p.data || {}; lc.error = null; lcAfter(); return; }
+  else if (p.kind === "error") {
+    lc.running = false; lc.progress = null; lc.step = "";
+    lc.error = p.text === "Cancelled." ? "Cancelled. Nothing was changed." : p.text;
+    lcAfter(); return;
+  }
+  if (["setup", "use", "imatrix", "quantcheck"].includes(page)) { render(); const l = $("lc-log"); if (l) l.scrollTop = l.scrollHeight; }
+}
+
+// after an install (or a failure): the status, then every page that waited for llama.cpp is read again so the person can simply retry
+async function lcAfter() {
+  await lcRefresh();
+  if (lc.result) {
+    if (llamaMarked(im.error)) im.error = null;
+    if (llamaMarked(qk.error)) qk.error = null;
+    if (llamaMarked(us.error)) us.error = null;
+    if (page === "use" && state.bundle) usRefresh();
+    if (page === "imatrix" && state.bundle) imRefresh();
+    if (page === "quantcheck" && state.bundle) qkRefresh();
+  }
+}
+
+function lcBackendName(plan) {
+  return ({ cuda: `NVIDIA (CUDA ${plan.cuda_version || ""})`.replace(" )", ")"), vulkan: "Vulkan (AMD, Intel, NVIDIA)", cpu: "processor only", metal: "Apple (Metal)", build: "built here with CUDA" })[plan.backend] || plan.backend;
+}
+
+function lcConfirmHtml(plan) {
+  const files = (plan.assets || []).map((a) => `<code>${esc(a.name)}</code> (${lcMb(a.size)})`).join(", ");
+  const notes = (plan.notes || []).map((n) => `<li>${esc(n)}</li>`).join("");
+  const build = plan.backend === "build";
+  return `<div class="warn lc-confirm"><strong>Install llama.cpp ${esc(plan.tag)}: ${esc(lcBackendName(plan))}?</strong>
+    <p class="small">${esc(plan.reason || "")}${plan.gpu ? ` (Your card: ${esc(plan.gpu.name)}.)` : ""}</p>
+    ${notes ? `<ul class="small">${notes}</ul>` : ""}
+    <p class="small">${build ? "The source of llama.cpp is downloaded (about " + lcMb(plan.total_bytes) + ") and built on this computer, which takes 20 minutes or more. You can cancel at any time." : `This downloads about <strong>${lcMb(plan.total_bytes)}</strong> from github.com: ${files || "the program files"}, and the source files of the same release for the converter (about 30 MB).`}
+    It is installed into this program's own data folder; nothing needs administrator rights. The programs are not signed: Windows SmartScreen or an antivirus may warn about them. A folder you name in <code>LLAMA_CPP_DIR</code> still wins.</p>
+    <div class="row"><button class="primary lc-go">Download and install (${lcMb(plan.total_bytes)})</button><button class="secondary lc-notnow">Not now</button></div></div>`;
+}
+
+function lcProgressHtml() {
+  return `<div class="lc-progress"><div class="stepline">${esc(lc.step)}</div>${lc.progress != null ? `<progress max="1" value="${lc.progress}"></progress>` : ""}${lc.bytes ? `<span class="dim small"> ${lcMb(lc.bytes[0])} of about ${lcMb(lc.bytes[1])}</span>` : ""}
+    <div class="row"><button class="secondary lc-cancel">Cancel</button></div>${lc.log.length ? `<pre class="log" id="lc-log">${lc.log.slice(-60).map(esc).join("\n")}</pre>` : ""}</div>`;
+}
+
+function lcResultHtml() {
+  const r = lc.result;
+  if (!r) return "";
+  const v = Object.entries(r.versions || {}).map(([k, x]) => `${esc(k)}: ${esc(x)}`).join(" · ");
+  return `<div class="ok lc-result"><strong>llama.cpp ${esc(r.tag || "")} is installed</strong> (${esc(r.backend || "")}${r.cuda_version ? " " + esc(r.cuda_version) : ""}). ${v ? esc(v) + ". " : ""}${r.converter_check ? esc(r.converter_check) + " " : ""}You can go on now; press the button you pressed before once more.</div>`;
+}
+
+function lcErrorHtml() {
+  if (!lc.error) return "";
+  const f = lc.status && lc.status.last_failure;
+  const offer = f && f.offer_cpu && lc.error !== "Cancelled. Nothing was changed." ? `<div class="row"><button class="primary lc-cpu">Install the CPU build instead</button><span class="dim small">It needs no graphics card or driver and is slower for the measurements, but it works.</span></div>` : "";
+  return `<div class="err lc-error">${esc(lc.error)}</div>${offer}`;
+}
+
+// the line shown wherever llama.cpp is needed: a note and "Install llama.cpp now" while it is missing, the plan / the progress / the result while the install goes
+function llamaNotice(need, force) {
+  if (lc.running) return `<div class="warn llama-notice"><strong>Installing llama.cpp…</strong>${lcProgressHtml()}</div>`;
+  if (lc.planning) return `<div class="warn llama-notice"><strong>Looking up the llama.cpp release…</strong></div>`;
+  if (lc.confirm) return lcConfirmHtml(lc.confirm);
+  if (lc.result && (lcGap(need) === false)) return lcResultHtml();
+  if (!force && !lcGap(need)) return "";
+  return `<div class="warn llama-notice" data-need="${esc(need)}"><strong>llama.cpp is not installed (or not found).</strong> ${esc(LC_WHY[need] || LC_WHY.all)}
+    <div class="row"><button class="primary lc-start">Install llama.cpp now</button></div>
+    <p class="dim small">The program downloads it from GitHub into its own folder (you see the size first). To use your own copy instead, set the environment variable <code>LLAMA_CPP_DIR</code> to its folder: that always wins. The program looks in LLAMA_CPP_DIR, then in the folder it installed llama.cpp into, then in a folder called llama.cpp in your home folder, then next to the program; <code>llama-imatrix</code> and <code>llama-perplexity</code> are also looked for on the PATH (the converter script is not).</p>${lcErrorHtml()}</div>`;
+}
+
+// an error box; a worker error that ends with the mark gets the install button under it
+function errBox(text, need) {
+  if (!text) return "";
+  const body = `<div class="err">${esc(stripLlamaMark(text))}</div>`;
+  return llamaMarked(text) ? body + llamaNotice(need || "all", true) : body;
+}
+
+// the section of the Training setup page
+function renderLlamaSection() {
+  const s = lc.status;
+  const expert = state.settings && state.settings.expert_mode;
+  const busy = lc.running || lc.planning || env.running;
+  let line = "<p class=\"dim\">Looking…</p>";
+  if (s) {
+    const inst = s.installed;
+    const f = s.found;
+    const how = f ? f.how_label : "";
+    line = f
+      ? `<p><span class="lamp">🟢</span> <strong>Found</strong> in <code>${esc(f.folder)}</code> (${esc(how)}).${inst && f.how === "program_install" ? ` Release <strong>${esc(inst.tag)}</strong>, ${esc(inst.backend)}${inst.cuda_version ? " " + esc(inst.cuda_version) : ""}, installed ${esc(String(inst.installed_at || "").slice(0, 10))}.` : ""}</p>
+        <ul class="small dim"><li>llama-imatrix: ${s.tools && s.tools.imatrix ? esc(s.tools.imatrix.how_label) : "not found"}</li><li>llama-perplexity: ${s.tools && s.tools.perplexity ? esc(s.tools.perplexity.how_label) : "not found"}</li>${inst && f.how === "program_install" && inst.converter_check ? `<li>Converter: ${esc(inst.converter_check)}</li>` : ""}${inst && inst.versions ? Object.entries(inst.versions).map(([k, v]) => `<li>${esc(k)}: ${esc(v)}</li>`).join("") : ""}</ul>`
+      : `<p><span class="lamp">🟡</span> <strong>Not installed.</strong> The program can install it for you.${s.folder_without_record ? ` (The folder <code>${esc(s.install_dir)}</code> exists but was not made by this program or is incomplete.)` : ""}</p>`;
+    if (s.install_error) line += `<div class="warn small">The record of the installed copy is damaged (${esc(s.install_error)}). Press Install to make a new copy.</div>`;
+  }
+  const upd = lc.update && lc.update.newer ? `<div class="warn small lc-update">A newer release is available: <strong>${esc(lc.update.latest)}</strong> (installed: ${esc(lc.update.installed)}). <button class="secondary lc-start" data-backend="${esc((s && s.installed && s.installed.backend) || "auto")}">Update</button></div>` : lc.update ? `<p class="dim small">${lc.update.installed ? "This is the newest release (" + esc(lc.update.latest) + ")." : "The newest release is " + esc(lc.update.latest) + "."}</p>` : "";
+  const ours = s && s.installed;
+  const picker = expert ? `<label>Build <select id="lc-backend" ${busy ? "disabled" : ""}>${[["auto", "Automatic (the best for this computer)"], ["cuda", "NVIDIA (CUDA)"], ["vulkan", "Vulkan (AMD, Intel, NVIDIA)"], ["cpu", "Processor only"], ["build", "Build with CUDA from the source (Linux, long)"]].map(([v, t]) => `<option value="${v}" ${lc.backend === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>` : "";
+  return `<div class="card wide" id="lc-section"><h2>llama.cpp</h2>
+    <p class="lead small">Makes GGUF files, importance matrices, quant comparisons and the mixed sizes. The program can install it for you; you do not have to build anything.</p>
+    ${line}${upd}
+    <div class="row">${picker}<button class="primary lc-start" ${busy ? "disabled" : ""}>${ours ? "Install again" : "Install llama.cpp"}</button>
+      ${expert || (lc.status && lc.status.last_failure && lc.status.last_failure.offer_cpu) ? `<button class="secondary lc-cpu" ${busy ? "disabled" : ""}>Install the CPU build</button>` : ""}
+      <button class="secondary lc-check" ${busy ? "disabled" : ""}>Check for a newer release</button>
+      ${ours ? `<button class="secondary lc-remove" ${busy ? "disabled" : ""}>Remove</button>` : ""}</div>
+    ${lc.planning ? `<p class="dim">Looking up the release…</p>` : ""}${lc.confirm ? lcConfirmHtml(lc.confirm) : ""}${lc.running ? lcProgressHtml() : ""}${lcErrorHtml()}${lcResultHtml()}
+    <p class="dim small">Honestly: this downloads from GitHub (about 30 MB for a processor-only build, several hundred MB for a CUDA build; you see the size before anything starts). The programs are not signed, so Windows SmartScreen or an antivirus may warn about them. Nothing needs administrator rights. Your own copy named in <code>LLAMA_CPP_DIR</code> always wins. "Remove" deletes only the folder the program made.</p></div>`;
+}
+
+function wireLlama() {
+  const all = (sel) => document.querySelectorAll(sel);
+  all(".lc-start").forEach((b) => b.onclick = () => { const bk = b.dataset.backend; if (bk) lc.backend = bk; return lcPlan(lc.backend, false); });
+  all(".lc-go").forEach((b) => b.onclick = () => lcInstall());
+  all(".lc-notnow").forEach((b) => b.onclick = () => { lc.confirm = null; render(); });
+  all(".lc-cancel").forEach((b) => b.onclick = () => invoke("llamacpp_cancel"));
+  all(".lc-cpu").forEach((b) => b.onclick = () => lcPlan("cpu", true));
+  all(".lc-check").forEach((b) => b.onclick = async () => {
+    lc.updating = true; lc.error = null; render();
+    try { lc.update = await invoke("llamacpp_check_update"); } catch (e) { lc.error = String(e); }
+    lc.updating = false; render();
+  });
+  all(".lc-remove").forEach((b) => b.onclick = async () => {
+    if (!confirm("Remove the llama.cpp this program installed? Only its own folder is deleted; a folder of yours (LLAMA_CPP_DIR) is never touched.")) return;
+    try { lc.status = await invoke("llamacpp_remove"); lc.result = null; lc.update = null; lc.error = null; } catch (e) { lc.error = String(e); }
+    render();
+  });
+  const sel = $("lc-backend"); if (sel) sel.onchange = () => { lc.backend = sel.value; };
+}
+
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
 function renderSetup() {
@@ -1486,6 +1664,7 @@ function renderSetup() {
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderLlamaSection()}
     ${renderUnsloth()}`;
 }
 
@@ -1501,6 +1680,7 @@ async function startEnv(cmd, args) {
 }
 
 function onEnvEvent(p) {
+  if (p.task === "llamacpp" || (p.data && p.data.task === "llamacpp") || (lc.running && (p.kind === "done" || p.kind === "error" || p.kind === "log" || p.kind === "step" || p.kind === "progress"))) { onLlamaEvent(p); return; }
   if (p.kind === "log") env.log.push(p.text);
   else if (p.kind === "step") { env.step = `Step ${p.index} of ${p.total}: ${p.text}`; env.progress = (p.index - 1) / p.total; }
   else if (p.kind === "progress") { env.step = p.text || p.step; env.progress = p.value; }
@@ -2629,6 +2809,7 @@ function wire() {
   wireGuide();
   wireRetrain();
   wireUnsloth();
+  wireLlama();
   on("recheck", refreshEnv);
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
@@ -2732,6 +2913,7 @@ async function go(key) {
   message = message && message.kind === "err" && key !== "welcome" && key !== "data" ? null : message;
   render();
   if (key === "setup") refreshEnv();
+  if (["setup", "use", "imatrix", "quantcheck"].includes(key)) lcRefresh();
   if (key === "guide") gdLoad();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();

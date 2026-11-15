@@ -3,6 +3,7 @@
 pub mod gpu;
 pub mod health;
 pub mod jobs;
+pub mod llamacpp;
 pub mod process;
 pub mod setup;
 pub mod tasks;

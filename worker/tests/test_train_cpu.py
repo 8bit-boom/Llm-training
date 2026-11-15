@@ -218,7 +218,8 @@ def test_gguf_is_made_with_llama_cpp_and_the_big_files_are_cleaned_up(tmp_path):
 def test_without_llama_cpp_the_error_says_what_to_do(tmp_path):
     p, ev, run_out = run_job(tmp_path, "qwen3_5")
     p2, ev2 = run_export(tmp_path, "qwen3_5", run_out, env={"LLAMA_CPP_DIR": str(tmp_path / "nothing"), "HOME": str(tmp_path / "home")}, gguf=True)
-    assert p2.returncode == 1 and ev2[-1]["code"] == "export_failed" and "llama.cpp is needed" in ev2[-1]["message"]
+    # the code is `llama_cpp_missing` (the page then offers to install llama.cpp); the text still says what to do
+    assert p2.returncode == 1 and ev2[-1]["code"] == "llama_cpp_missing" and "llama.cpp is needed" in ev2[-1]["message"] and "LLAMA_CPP_DIR" in ev2[-1]["message"]
     p3, ev3 = run_export(tmp_path, "qwen3_5", run_out, quant="q2")
     assert p3.returncode == 1 and "Unknown quantisation" in ev3[-1]["message"]
 
