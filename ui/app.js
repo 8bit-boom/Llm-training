@@ -601,7 +601,65 @@ function gcWire(scope, rerender) {
 }
 
 // ------------------------------------------------------------------------------------------------ step 5: use in nd-world
-let us = { state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", imCheck: null, imAdd: false, imAddLabel: "", server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+// ------------------------------------------------------------------------------------------- mixed precision (our own recipe): docs/MIXED_QUANTS.md
+function usQuantBox(q) {
+  return `<label class="opt" title="${esc(q.name)}"><input type="checkbox" class="us-q" value="${q.id}" ${us.quants.includes(q.id) ? "checked" : ""} ${us.what === "merged" ? "disabled" : ""}> ${esc(q.label || q.name.split(":")[0])}</label>`;
+}
+
+// the file whose tensor shapes the size estimate reads (any GGUF of the model: only its header is read): a file of this run's exports, else any, else a typed path
+function usMixedFile(st) {
+  const files = (st.mixed && st.mixed.files) || [];
+  if (us.mx.file === "__typed") return us.mx.typed.trim();
+  if (us.mx.file) return us.mx.file;
+  const mine = files.find((f) => f.run === us.run) || files[0];
+  return mine ? mine.path : "";
+}
+
+function mixedPlanHtml() {
+  const pl = us.mx.plan;
+  if (us.mx.busy) return `<p class="dim small">Reading the model's tensor shapes…</p>`;
+  if (us.mx.error) return `<div class="warn small" id="us-mxerror">${esc(us.mx.error)}</div>`;
+  if (!pl) return "";
+  const rows = pl.presets.map((p) => `<tr><td>${esc(p.label)}</td><td>${p.estimate.gb} GB</td><td>${p.estimate.bpw != null ? p.estimate.bpw : "–"}</td><td>${esc(p.base)}</td></tr>`).join("");
+  const plain = pl.plain_bpw || {};
+  const rules = pl.presets.map((p) => `<details><summary>${esc(p.label)}: the rules llama-quantize gets</summary><pre class="log">${[`--output-tensor-type ${p.output}`, `--token-embedding-type ${p.embd}`].concat(p.rules.map((r) => `--tensor-type ${r}`)).map(esc).join("\n")}\n(base type ${esc(p.base)})</pre>${p.notes.map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}</details>`).join("");
+  const fit = pl.fit ? (pl.fit.ok ? `<div class="small" id="us-mxfit"><strong>${esc(pl.fit.label)}:</strong> about ${pl.fit.estimate.gb} GB (${pl.fit.estimate.bpw} bits per weight) for the ${pl.fit.target_bytes ? (pl.fit.target_bytes / 1e9).toFixed(2) : ""} GB asked${pl.fit.fits ? "" : ", <strong>which the lowest types cannot reach</strong>"}.
+      ${(pl.fit.notes || []).map((n) => `<br>${esc(n)}`).join("")}<details><summary>The ${pl.fit.rules.length} rules this gives</summary><pre class="log">${pl.fit.rules.map((r) => esc("--tensor-type " + r)).join("\n")}</pre></details></div>`
+    : `<div class="warn small" id="us-mxfiterror">${esc(pl.fit.error)}</div>`) : "";
+  return `<div id="us-mxplan"><table class="qk-table"><thead><tr><th>${esc(pl.recipe)}</th><th>Estimated size</th><th>Bits per weight</th><th>Base type</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="dim small">Estimated from the ${pl.params ? (pl.params / 1e9).toFixed(1) + " billion" : ""} weights and shapes in the file's header (architecture ${esc(pl.arch || "unknown")}, ${pl.n_layer != null ? pl.n_layer : "?"} layers). For comparison, llama.cpp's own table gives the plain sizes about ${plain.Q4_K_M} (Q4_K_M), ${plain.Q3_K_M} (Q3_K_M) and ${plain.Q2_K} (Q2_K) bits per weight on a typical model; a plain size's real figure depends on the model. The real size is shown after the export; <strong>Compare quants</strong> says how good each one is.</p>
+    ${rules}${fit}</div>`;
+}
+
+function mixedBox(st) {
+  if (us.what === "merged") return "";
+  const mixed = st.mixed_quants || [];
+  if (!mixed.length) return "";
+  const any = mixed.some((q) => us.quants.includes(q.id));
+  const files = (st.mixed && st.mixed.files) || [];
+  const boxes = mixed.map(usQuantBox).join(" ");
+  const fitOn = us.quants.includes("mixed_fit");
+  const lib = (st.imatrix && st.imatrix.library) || [];
+  const fileOpts = files.map((f) => `<option value="${esc(f.path)}" ${usMixedFile(st) === f.path ? "selected" : ""}>${esc(f.label)}</option>`).join("") + `<option value="__typed" ${us.mx.file === "__typed" ? "selected" : ""}>A GGUF file I choose…</option>`;
+  const detail = any ? `<p class="dim small" id="us-mxwhy">Made with llama.cpp: <code>llama-quantize</code> gives single tensors their own types. If Unsloth is the back end that would make the files, llama.cpp makes the <em>whole batch</em> instead (Unsloth cannot do per-tensor types) and the result says so. More bits go to the embedding and output tensors, the attention k / v / output, the linear-attention projections, ffn_down and the first and last layers; fewer to the ffn_up / gate of the middle layers. The importance matrix, when you use one, is applied to these sizes too. <strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}</strong>: they are our own recipes, not copies of anyone else's, and nobody has measured yet whether they beat the plain sizes: that is what <strong>Compare quants</strong> is for.</p>
+    <div class="row"><label>Estimate the size from <select id="us-mxfile">${fileOpts}</select></label>${us.mx.file === "__typed" ? `<input type="text" id="us-mxtyped" value="${esc(us.mx.typed)}" placeholder="C:\\models\\model-Q4_K_M.gguf" style="min-width:260px">` : ""}<button class="secondary" id="us-mxplanbtn" ${us.mx.busy || !usMixedFile(st) ? "disabled" : ""}>Show the estimated sizes</button></div>
+    ${files.length || us.mx.file === "__typed" ? "" : `<p class="dim small">No GGUF of this model exists yet. Choose any GGUF file of it (any size, only its tensor shapes are read) to see the estimated sizes, or make the files and read the real ones afterwards.</p>`}
+    ${fitOn ? `<div class="row" id="us-mxfitbox"><strong>Fit to a size (experimental)</strong> <label>Target size <input type="text" id="us-mxtarget" value="${esc(us.mx.target)}" placeholder="12.5" style="min-width:80px;flex:0"> GB</label>
+      <label>Statistics from <select id="us-mxmatrix"><option value="">the matrix of this export</option>${lib.map((e) => `<option value="${esc(e.id)}" ${us.mx.matrix === e.id ? "selected" : ""}>${esc(e.label || e.id)}</option>`).join("")}</select></label><button class="secondary" id="us-mxfitbtn" ${us.mx.busy || !usMixedFile(st) || !(+us.mx.target > 0) ? "disabled" : ""}>Work out the rules</button></div>
+      <p class="dim small">Experimental, and said so: every large tensor starts at the lowest type and the ones the matrix says matter most per extra byte get more bits until the size is used. It is a <strong>guess</strong> from the matrix's per-tensor statistics, not a measurement. It needs a saved matrix (without one, the closest recipe is used instead and the result says so). Press the button to see the rules before you export.</p>${!(+us.mx.target > 0) ? `<p class="warn small" id="us-mxtargetwhy">Give the size in GB that the fit should aim for.</p>` : ""}` : ""}
+    ${mixedPlanHtml()}` : "";
+  return `<div class="row mixedbox"><span class="quants"><strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}:</strong> ${boxes}</span></div>${detail}`;
+}
+
+async function usMixedPlan(withFit) {
+  const st = us.state, file = usMixedFile(st);
+  us.mx.busy = true; us.mx.error = ""; us.mx.plan = null; render();
+  try { us.mx.plan = await invoke("mixed_plan", { gguf: file, targetGb: withFit ? Number(us.mx.target) : null, matrix: withFit && us.mx.matrix ? us.mx.matrix : null }); } catch (e) { us.mx.error = String(e); }
+  us.mx.busy = false; render();
+}
+
+
+let us = { mx: { file: "", typed: "", target: "", matrix: "", plan: null, busy: false, error: "", key: "" }, state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", imCheck: null, imAdd: false, imAddLabel: "", server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
 
 function nextnHtml(im) {
@@ -674,13 +732,13 @@ function renderUse() {
   const runOpts = st.runs.map((r) => `<option value="${esc(r.name)}" ${us.run === r.name ? "selected" : ""}>${esc(r.name)} · ${esc(r.model)} · ${esc(r.status)}${r.loss != null ? " · loss " + (+r.loss).toFixed(2) : ""}</option>`).join("");
   const busy = us.running;
   const files = `<div class="card wide"><h2>1 · Make the files</h2>
-    <div class="row"><label>Run <select id="us-run">${runOpts}</select></label><span class="quants">File sizes: ${st.quants.map((q) => `<label class="opt" title="${esc(q.name)}"><input type="checkbox" class="us-q" value="${q.id}" ${us.quants.includes(q.id) ? "checked" : ""} ${us.what === "merged" ? "disabled" : ""}> ${esc(q.name.split(":")[0])}</label>`).join(" ")}</span>
+    <div class="row"><label>Run <select id="us-run">${runOpts}</select></label><span class="quants">File sizes: ${st.quants.map(usQuantBox).join(" ")}</span>
       <label>Context <select id="us-ctx">${[4096, 8192, 16384, 32768].map((n) => `<option ${us.numCtx === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
     <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
-    ${imatrixBox(st)}
+    ${mixedBox(st)}${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
-  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
+  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul>${gg.length > 1 ? `<div class="row"><button class="secondary" id="us-compare" title="Measures how far each of these files is from the 16-bit model (KL divergence)">Compare these sizes</button></div>` : ""}</div>` : "";
@@ -731,7 +789,8 @@ function onExportEvent(p) {
     else if (d.installed) us.ok = `Installed as "${d.installed}" at ${d.url}.`;
     else if (d.name && d.run) {
       const notes = [...new Set((d.exports || [d]).map((m) => m.imatrix && m.imatrix.note).filter(Boolean))];
-      us.ok = `Files made: ${d.name}.${d.merged_dir ? " Merged model: " + d.merged_dir : ""}${notes.length ? " Importance matrix: " + notes.join(" ") : ""}`;
+      const mnotes = [...new Set((d.exports || [d]).map((m) => m.mixed && m.mixed.note).filter(Boolean))];
+      us.ok = `Files made: ${d.name}.${d.merged_dir ? " Merged model: " + d.merged_dir : ""}${notes.length ? " Importance matrix: " + notes.join(" ") : ""}${mnotes.length ? " " + mnotes.join(" ") : ""}`;
     }
     usRefresh(); setState_(); 
   } else if (p.kind === "error") {
@@ -757,6 +816,12 @@ function wireUse() {
   const bind = (id, key, num) => { const e = $(id); if (e) e.onchange = () => { us[key] = num ? Number(e.value) : e.value; }; };
   const usr = $("us-run"); if (usr) usr.onchange = () => { us.run = usr.value; us.imCheck = null; us.imCheckKey = null; render(); };
   document.querySelectorAll(".us-q").forEach((c) => c.onchange = () => { us.quants = [...document.querySelectorAll(".us-q")].filter((x) => x.checked).map((x) => x.value); render(); }); const wh = $("us-what"); if (wh) wh.onchange = () => { us.what = wh.value; render(); }; bind("us-ctx", "numCtx", true); bind("us-exp", "exp"); bind("us-server", "server");
+  const mxf = $("us-mxfile"); if (mxf) mxf.onchange = () => { us.mx.file = mxf.value; us.mx.plan = null; us.mx.error = ""; render(); };
+  const mxt = $("us-mxtyped"); if (mxt) mxt.onchange = () => { us.mx.typed = mxt.value; us.mx.plan = null; };
+  const mxg = $("us-mxtarget"); if (mxg) mxg.onchange = () => { us.mx.target = mxg.value.trim(); render(); };
+  const mxm = $("us-mxmatrix"); if (mxm) mxm.onchange = () => { us.mx.matrix = mxm.value; };
+  on("us-mxplanbtn", () => usMixedPlan(false));
+  on("us-mxfitbtn", () => usMixedPlan(true));
   const imx = $("us-im"); if (imx) imx.onchange = () => { us.im = imx.checked; render(); };
   const imc = $("us-imchunks"); if (imc) imc.onchange = () => { us.imChunks = Number(imc.value); render(); };
   const imn = $("us-imnextn"); if (imn) imn.onchange = () => { us.imNextn = imn.checked; render(); };
@@ -783,7 +848,8 @@ function wireUse() {
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
   on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
-    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null }));
+    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null,
+    ...(us.what !== "merged" && us.quants.includes("mixed_fit") ? { mixed: { fit: { target_gb: Number(us.mx.target), matrix: us.mx.matrix || null } } } : {}) }));
   on("us-lora", async () => {
     const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
     if (!dest) return;
