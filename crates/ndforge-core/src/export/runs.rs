@@ -38,6 +38,9 @@ pub struct ImatrixOptions {
     /// (else it says so in a note); the page shows the tick only for a model with a head.
     #[serde(default = "default_nextn")]
     pub nextn: bool,
+    /// the id of a matrix of the library (`export::imatrix_lib`) to use as it is: nothing is measured. Old specs have none.
+    #[serde(default)]
+    pub use_saved: Option<String>,
 }
 
 fn default_nextn() -> bool {
@@ -46,7 +49,7 @@ fn default_nextn() -> bool {
 
 impl Default for ImatrixOptions {
     fn default() -> Self {
-        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true }
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true, use_saved: None }
     }
 }
 
@@ -57,7 +60,7 @@ pub const IMATRIX_CTX: u32 = 512;
 /// About this share of the calibration text is general text, the rest is the project's own data.
 pub const IMATRIX_GENERAL_SHARE: f64 = 0.2;
 /// After Stop the worker has this long to end the matrix step by itself (it kills llama-imatrix at once); then the worker is killed.
-const IMATRIX_STOP_GRACE: Duration = Duration::from_secs(20);
+pub(crate) const IMATRIX_STOP_GRACE: Duration = Duration::from_secs(20);
 
 /// Does the importance matrix do anything for this size? Not for Q8_0 and the 16-bit files.
 pub fn imatrix_helps(quant: &str) -> bool {
@@ -125,7 +128,7 @@ pub fn mtp_head_in(dir: &std::path::Path) -> Option<bool> {
 }
 
 /// Snapshot folders of a Hugging Face model id in the local cache (HF_HUB_CACHE, HF_HOME/hub, ~/.cache/huggingface/hub), newest first.
-fn hf_cache_snapshots(repo: &str) -> Vec<PathBuf> {
+pub(crate) fn hf_cache_snapshots(repo: &str) -> Vec<PathBuf> {
     if !repo.contains('/') || std::path::Path::new(repo).exists() {
         return vec![];
     }
@@ -176,7 +179,7 @@ pub fn imatrix_state(p: &Project) -> Value {
     }
     json!({"chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
            "no_matrix_for": ["q8_0", "f16"], "saved": saved, "estimates": estimates,
-           "mtp": mtp, "nextn_supported": Value::Null, "general": crate::general::state(Some(p))})
+           "mtp": mtp, "nextn_supported": Value::Null, "general": crate::general::state(Some(p)), "library": super::imatrix_lib::brief(p)})
 }
 
 /// The job's "imatrix" block (None when it is off or no GGUF is made). `out` is the folder the worker writes into.
@@ -190,13 +193,18 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
     let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
     let general = crate::general::job_block(&crate::general::resolve(opts.general.as_ref(), true)?, IMATRIX_GENERAL_SHARE);
-    Ok(Some(json!({"enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+    // a saved matrix of the library: nothing is measured, the worker copies the file into the export folder and gives it to llama-quantize / Unsloth as a fresh one
+    let (use_file, use_id) = match opts.use_saved.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => { let (id, f) = super::imatrix_lib::for_export(p, id)?; (json!(f), json!(id)) }
+        None => (Value::Null, Value::Null),
+    };
+    Ok(Some(json!({"use_file": use_file, "use_id": use_id, "enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
                    "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
 /// Runs the export job. With the importance matrix the Stop button first writes a STOP file (the worker kills llama-imatrix and ends cleanly) and kills the
 /// worker only after IMATRIX_STOP_GRACE; without it the worker is killed at once, as before.
-fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
+pub(crate) fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
     let Some(grace) = graceful else { return run_job(py, &worker_dir(), job, kill, on_event) };
     let (inner, done, stop_file) = (AtomicBool::new(false), AtomicBool::new(false), out.join("STOP"));
     let _ = std::fs::remove_file(&stop_file);
@@ -226,11 +234,11 @@ pub fn exports_dir(p: &Project) -> PathBuf {
     p.folder.join("exports")
 }
 
-fn read_json(path: &std::path::Path) -> Option<Value> {
+pub(crate) fn read_json(path: &std::path::Path) -> Option<Value> {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-fn write_json(path: &std::path::Path, v: &Value) -> Result<()> {
+pub(crate) fn write_json(path: &std::path::Path, v: &Value) -> Result<()> {
     std::fs::write(path, serde_json::to_vec_pretty(v)?)?;
     Ok(())
 }
@@ -282,6 +290,8 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
         return Err(Error::new(format!("Unknown export kind: {what}")));
     }
     let (want_gguf, keep_merged) = (what != "merged", what != "gguf");
+    // a saved matrix of the library cannot be deleted while this export uses it
+    let _in_use = imatrix.use_saved.as_deref().filter(|s| !s.is_empty() && imatrix.enabled && want_gguf).map(super::imatrix_lib::mark_in_use);
     let mut list: Vec<String> = Vec::new();
     for q in quants {
         if !QUANTS.iter().any(|(id, _)| id == q) {
@@ -397,7 +407,7 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
                         if i == list.len() - 1 { std::fs::rename(f, to)?; } else { std::fs::copy(f, to)?; }
                     }
                 }
-                Some("imatrix.gguf")
+                m.file_name().and_then(|n| n.to_str()).map(String::from)
             }
             None => None,
         };
@@ -409,7 +419,7 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
         let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
                           "created": created, "world": p.display_name(), "installed": [], "via": result["via"]});
         let mut meta = meta;
-        meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, matrix_file);
+        meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, matrix_file.as_deref());
         write_json(&dir.join("meta.json"), &meta)?;
         metas.push(meta);
     }
@@ -426,7 +436,7 @@ fn imatrix_meta(asked: Option<&Value>, report: &Value, quant: &str, file: Option
     let reason = report["not_applied"][quant].as_str();
     json!({"requested": true, "applied": applied, "made": report["made"] == true, "reused": report["reused"] == true, "file": file, "chunks": asked["chunks"], "ctx": asked["ctx"],
            "general_used": report["info"]["general_used"], "llama_cpp": report["info"]["llama_cpp"], "reason": reason, "note": report["note"],
-           "nextn": report["nextn"] == true, "nextn_asked": asked["nextn"] == true, "via": report["via"]})
+           "nextn": report["nextn"] == true, "nextn_asked": asked["nextn"] == true, "via": report["via"], "library": report["from_library"]})
 }
 
 /// Remember that an export was installed into a server under a name.

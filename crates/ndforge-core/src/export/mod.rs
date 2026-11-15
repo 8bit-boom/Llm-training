@@ -2,5 +2,7 @@
 pub mod modelfile;
 pub mod install;
 pub mod ollama;
+pub mod gguf_meta;
+pub mod imatrix_lib;
 pub mod runs;
 pub mod studio;
