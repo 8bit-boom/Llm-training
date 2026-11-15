@@ -96,3 +96,6 @@ Given a target size in GB and a saved matrix: every large tensor starts at the l
 - Dropping the speculative-decoding (MTP) head from the small sizes (not in this version, by decision).
 - IQ types for the 1-3 bit recipes (they need a matrix and a real test first).
 - Tuning the recipes after the first real comparison, and a "learn from the comparison" step.
+
+## Where llama.cpp comes from
+The mixed sizes need llama.cpp (`convert_hf_to_gguf.py` and `llama-quantize`). The program can install it for the person (**Install llama.cpp now** under the message, or Training setup): docs/LLAMA_CPP_INSTALL.md. A missing llama.cpp ends the export with the error code `llama_cpp_missing`; a copy named in `LLAMA_CPP_DIR` always wins.

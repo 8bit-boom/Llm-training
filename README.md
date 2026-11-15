@@ -30,6 +30,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | Compare quants (KL divergence of each quantised GGUF from the 16-bit model, a table, a chart with the Pareto line and a plain verdict) | built and tested with stand-in llama.cpp tools and a stand-in browser; not run with a real llama.cpp or GPU (docs/QUANT_COMPARE.md, "Not verified yet") |
 | Merge importance matrices (also with Unsloth's published matrix for the base model, downloaded from the Hub) | built and tested with stand-in tools, a stand-in Hub and a stand-in browser; not run with a real llama.cpp or the real Hub (docs/IMATRIX.md, "Merging matrices" and "Not verified yet") |
 | Mixed-precision sizes ("Mixed precision (our own recipe)": three presets and an experimental fit to a size, made through llama.cpp's per-tensor types) | built and tested with stand-in tools and hand-built GGUF headers; not run with a real llama.cpp or model; not compared with plain sizes yet (docs/MIXED_QUANTS.md, "Not verified yet") |
+| llama.cpp installed by the program (the build that fits the graphics card and driver, the converter's source files, a check that it starts; one button wherever llama.cpp is needed) | built and tested with a stand-in GitHub, stand-in programs and the page in a stand-in browser; **not run against the real GitHub releases, a real GPU or a real converter** (docs/LLAMA_CPP_INSTALL.md, "Not verified yet") |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ### About Unsloth Dynamic quants
@@ -84,7 +85,7 @@ Worker tests (CPU, tiny random models, no downloads): `pip install torch transfo
 ## Export and retrain (M7)
 
 **Step 5** makes `exports/<run>-<size>/` with `model-<size>.gguf`, a `Modelfile` and a model card. The worker merges the trained LoRA into the model (16-bit) and makes the
-GGUF with Unsloth's `save_pretrained_gguf`, or, without Unsloth, with a llama.cpp it finds (`LLAMA_CPP_DIR`, `~/llama.cpp`, a `llama.cpp` folder next to the program).
+GGUF with Unsloth's `save_pretrained_gguf`, or, without Unsloth, with a llama.cpp it finds (`LLAMA_CPP_DIR`, the copy the program installed itself, `~/llama.cpp`, a `llama.cpp` folder next to the program); if there is none, the page has an **Install llama.cpp now** button (docs/LLAMA_CPP_INSTALL.md).
 Qwen3.5's chat template is edited to answer without thinking by default. An optional **importance matrix** ("Better small sizes", off by default) makes the Q6_K / Q5_K_M / Q4_K_M files lose less quality: llama.cpp's `llama-imatrix` reads your own data plus some general text first and Unsloth's own GGUF export applies it when the installed build can; the speculative-decoding (MTP) head can be measured too (`docs/IMATRIX.md`; built with stand-in tools, not yet run with a real llama.cpp or Unsloth). **Install into Ollama** uploads the file as a blob and creates the model through Ollama's HTTP API
 (`/api/blobs`, `/api/create`), so it works for this PC and for a server such as the TrueNAS box (`http://truenas:11434`; Ollama there needs `OLLAMA_HOST=0.0.0.0`).
 **Test it** asks the installed model one of the training questions. The page lists what to set in nd-world (`OLLAMA_MODEL`, or `UNSLOTH_MODEL` + `LLM_CONTEXT_TOKENS`) and warns

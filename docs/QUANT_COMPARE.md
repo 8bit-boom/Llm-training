@@ -47,7 +47,7 @@ Sorted by size. The chart plots mean KLD (y, log scale when the values differ by
 
 | Situation | What the page says (shortened) |
 |---|---|
-| `llama-perplexity` not found | "llama-perplexity was not found ... Install a current llama.cpp ..., set LLAMA_CPP_DIR ... looks in LLAMA_CPP_DIR, then a llama.cpp folder in your home folder, then next to the program, then on the PATH" (also its `build/bin` folders) |
+| `llama-perplexity` not found | "llama-perplexity was not found ... Install a current llama.cpp ..., set LLAMA_CPP_DIR ... looks in LLAMA_CPP_DIR, then the folder the program installed llama.cpp into, then a llama.cpp folder in your home folder, then next to the program; also on the PATH" (also its `build/bin` folders), error code `llama_cpp_missing`: the page then shows **Install llama.cpp now** (docs/LLAMA_CPP_INSTALL.md) |
 | the training software is not installed | "Open Training setup first" (the worker runs the job; no torch is needed for the comparison itself) |
 | the reference is missing / not a GGUF | "was not found" / "could not be read as a GGUF file ... Choose a 16-bit GGUF" |
 | not enough disk | the numbers, "a tenth is kept in reserve", and the largest amount that would fit |
