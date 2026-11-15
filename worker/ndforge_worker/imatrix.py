@@ -47,15 +47,10 @@ def launcher(path) -> list:
 
 
 def find_llama_imatrix(quantize):
-    """llama-imatrix of the llama.cpp that `quantize` (llama-quantize) belongs to, or on PATH. None when this llama.cpp has none (an older install)."""
-    exe = "llama-imatrix.exe" if os.name == "nt" else "llama-imatrix"
-    if quantize:
-        q = Path(quantize)
-        for d in (q.parent, q.parent.parent):
-            if (d / exe).is_file():
-                return d / exe
-    found = shutil.which("llama-imatrix")
-    return Path(found) if found else None
+    """llama-imatrix of the llama.cpp that `quantize` (llama-quantize) belongs to, in the other places llama.cpp is looked for, or on PATH (llamacpp.find_tool).
+    None when this llama.cpp has none (an older install)."""
+    from . import llamacpp
+    return llamacpp.find_tool("llama-imatrix", quantize)
 
 
 def tool_version(tool) -> str:

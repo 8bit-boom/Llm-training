@@ -5,6 +5,11 @@ import sys
 from . import __version__, protocol
 
 
+def _code(exc: Exception, default: str) -> str:
+    """The error code of exceptions that carry one (llama_cpp_missing: the page then offers to install llama.cpp), else `default`."""
+    return getattr(exc, "code", None) or default
+
+
 def _explain(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
@@ -70,7 +75,7 @@ def main(argv: list) -> int:
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            protocol.error("export_failed", _explain(exc))
+            protocol.error(_code(exc, "export_failed"), str(exc) if _code(exc, "") else _explain(exc))
             return 1
     if kind in ("imatrix_make", "imatrix_dat", "imatrix_merge", "imatrix_published"):
         from . import imatrix, imatrixjob, imatrixmerge
@@ -80,7 +85,7 @@ def main(argv: list) -> int:
             protocol.error("imatrix_stopped", "Cancelled.")
             return 1
         except imatrixjob.MatrixError as exc:   # a plain-language failure: no traceback text
-            protocol.error("imatrix_failed", str(exc))
+            protocol.error(_code(exc, "imatrix_failed"), str(exc))
             return 1
         except Exception as exc:
             import traceback
@@ -95,7 +100,7 @@ def main(argv: list) -> int:
             protocol.error("quantcheck_stopped", "Cancelled.")
             return 1
         except quantcheck.QuantCheckError as exc:   # a plain-language failure: no traceback text
-            protocol.error("quantcheck_failed", str(exc))
+            protocol.error(_code(exc, "quantcheck_failed"), str(exc))
             return 1
         except Exception as exc:
             import traceback

@@ -22,7 +22,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import data, ggufinfo, imatrix, protocol
+from . import data, ggufinfo, imatrix, llamacpp, protocol
 
 FORMAT = 1
 CTX = 512
@@ -35,12 +35,15 @@ SEED = 1234                     # not the calibration's seed (3407): another sam
 SLACK = 1.1
 STOP_MARKER = r"^\s*(\d+)\s+[-+]?\d+\.\d+\s*±"          # a row of the per-chunk table of the comparison pass
 INSTALL_HELP = ("llama-perplexity is part of llama.cpp. Install a current llama.cpp (https://github.com/ggml-org/llama.cpp; a release or a build that has llama-quantize also has "
-                "llama-perplexity), then tell this program where it is: set the environment variable LLAMA_CPP_DIR to its folder. This program looks in LLAMA_CPP_DIR, then in a "
-                "folder called llama.cpp in your home folder, then next to the program, then on the PATH.")
+                "llama-perplexity), then tell this program where it is: set the environment variable LLAMA_CPP_DIR to its folder. " + llamacpp.SEARCH_ORDER + " " + llamacpp.CAN_INSTALL)
 
 
 class QuantCheckError(Exception):
     """A failure with a plain-language text for the person."""
+
+
+class QuantLlamaMissing(QuantCheckError, llamacpp.LlamaCppMissing):
+    """llama-perplexity (llama.cpp) is not there: error code llama_cpp_missing."""
 
 
 def plain_gb(n) -> str:
@@ -50,20 +53,10 @@ def plain_gb(n) -> str:
 # ------------------------------------------------------------------------------------------------------------------ the tool, the disk
 
 def find_perplexity():
-    """llama-perplexity: next to llama-quantize, in LLAMA_CPP_DIR (also its build folders), a llama.cpp folder in the home folder, on the PATH. None when not found."""
+    """llama-perplexity: next to llama-quantize and in the other places llama.cpp is looked for, then on the PATH (llamacpp.find_tool). None when not found."""
     from . import exportjob
-    exe = "llama-perplexity.exe" if os.name == "nt" else "llama-perplexity"
     _, quantize = exportjob.find_llama_cpp()
-    dirs = []
-    if quantize:
-        dirs += [Path(quantize).parent, Path(quantize).parent.parent]
-    for d in filter(None, [os.environ.get("LLAMA_CPP_DIR"), str(Path.home() / "llama.cpp"), str(Path(__file__).resolve().parents[2] / "llama.cpp")]):
-        dirs += [Path(d), Path(d) / "build" / "bin", Path(d) / "build" / "bin" / "Release"]
-    for d in dirs:
-        if (d / exe).is_file():
-            return d / exe
-    found = shutil.which("llama-perplexity")
-    return Path(found) if found else None
+    return llamacpp.find_tool("llama-perplexity", quantize)
 
 
 def free_bytes(path) -> int:
@@ -412,7 +405,7 @@ def make(job: dict) -> dict:
         raise QuantCheckError("Choose at least one quantised GGUF file to compare.")
     tool = find_perplexity()
     if tool is None:
-        raise QuantCheckError("llama-perplexity was not found, so the quants cannot be compared. " + INSTALL_HELP)
+        raise QuantLlamaMissing("llama-perplexity was not found, so the quants cannot be compared. " + INSTALL_HELP)
     im = {"stop_file": job.get("stop_file")}
     out = root / cid
     resume = bool(job.get("resume")) and (out / "results.json").is_file()
@@ -501,7 +494,7 @@ def resolve_reference(job: dict, spec: dict, out: Path, im: dict, notes: list, o
         conv, _ = imatrixjob.find_tools(need_convert=True)
         f16, _, _, described, _ = imatrixjob.source_f16(job, spec.get("source") or {}, out, conv, im, notes)
     except imatrixjob.MatrixError as exc:
-        raise QuantCheckError(str(exc))
+        raise (QuantLlamaMissing if isinstance(exc, llamacpp.LlamaCppMissing) else QuantCheckError)(str(exc))
     finally:
         shutil.rmtree(out / "merged", ignore_errors=True)
     f16 = Path(f16)

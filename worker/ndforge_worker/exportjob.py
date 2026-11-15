@@ -13,23 +13,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backends, imatrix, mixedquant, protocol, vision
+from . import backends, imatrix, llamacpp, mixedquant, protocol, vision
 from .families import default_non_thinking
 
 QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16") + mixedquant.MIXED_IDS      # the last ones are "Mixed precision (our own recipe)": llama.cpp only, see mixedquant.py
 
 
 def find_llama_cpp():
-    """(convert script, quantize program) of a llama.cpp the user has: LLAMA_CPP_DIR, a `llama.cpp` folder next to the program, or on PATH."""
-    cands = [os.environ.get("LLAMA_CPP_DIR"), str(Path.home() / "llama.cpp"), str(Path(__file__).resolve().parents[2] / "llama.cpp")]
-    exe = "llama-quantize.exe" if os.name == "nt" else "llama-quantize"
-    for d in filter(None, cands):
-        d = Path(d)
-        conv = d / "convert_hf_to_gguf.py"
-        quant = next((q for q in (d / exe, d / "build" / "bin" / exe, d / "build" / "bin" / "Release" / exe, d / exe) if q.is_file()), None)
-        if conv.is_file() and quant:
-            return conv, quant
-    return None, None
+    """(convert script, quantize program) of a llama.cpp the user has or the program installed: see llamacpp.py for the places and their order."""
+    return llamacpp.find_llama_cpp()
+
+
+class ExportLlamaMissing(RuntimeError, llamacpp.LlamaCppMissing):
+    """The export needs llama.cpp and it is not there (error code llama_cpp_missing)."""
 
 
 def _vision_source(cfg: dict) -> str:
@@ -139,9 +135,9 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
     quants = [quants] if isinstance(quants, str) else list(quants)
     conv, quantize = find_llama_cpp()
     if conv is None:
-        raise RuntimeError("To make a GGUF file without Unsloth, llama.cpp is needed (convert_hf_to_gguf.py and llama-quantize). Install it from "
-                           "https://github.com/ggml-org/llama.cpp and set LLAMA_CPP_DIR, or install Unsloth in the training setup. "
-                           f"The merged model is saved in {merged}.")
+        raise ExportLlamaMissing("To make a GGUF file without Unsloth, llama.cpp is needed (convert_hf_to_gguf.py and llama-quantize). Install it from "
+                                 "https://github.com/ggml-org/llama.cpp and set LLAMA_CPP_DIR, or install Unsloth in the training setup. "
+                                 f"{llamacpp.SEARCH_ORDER} {llamacpp.CAN_INSTALL} The merged model is saved in {merged}.")
     f16 = out / "model-f16.gguf"
     protocol.progress("gguf", 0.2, "Converting to GGUF")
     _run([sys.executable, conv, merged, "--outfile", f16, "--outtype", "f16"], "The GGUF conversion")
@@ -241,14 +237,14 @@ def plan_gguf(backend: str, cfg: dict, quants: list, report, can_apply=None):
         report["notes"].append("The importance matrix helps the sizes below Q8_0; none of them was chosen, so it was not made.")
     elif not use_file and (conv is None or imatrix.find_llama_imatrix(quantize) is None):
         report["notes"].append("An importance matrix was asked for, but llama.cpp (with llama-imatrix) was not found, so the GGUF was made through Unsloth without it. "
-                               "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
+                               "Install a current llama.cpp (the program can do it: Training setup, \"Install llama.cpp now\") or set LLAMA_CPP_DIR to use the matrix.")
         protocol.log(report["notes"][-1])
     elif can_apply is not None and can_apply():
         protocol.log("An importance matrix was asked for: llama.cpp measures it, Unsloth applies it (save_pretrained_gguf with imatrix_file).")
         return True, True
     elif use_file and conv is None:
         report["notes"].append("A saved importance matrix was chosen, but this Unsloth build cannot apply one and llama.cpp was not found, so the GGUF was made through Unsloth without it. "
-                               "Install a current llama.cpp and set LLAMA_CPP_DIR to use the matrix.")
+                               "Install a current llama.cpp (the program can do it: Training setup, \"Install llama.cpp now\") or set LLAMA_CPP_DIR to use the matrix.")
         protocol.log(report["notes"][-1])
     else:
         report["via"] = "llama.cpp"
@@ -348,8 +344,8 @@ def run(cfg: dict) -> int:
         # Unsloth's save_pretrained_gguf cannot give single tensors their own types, which a mixed-precision size is made of: the whole batch goes the llama.cpp way (a second pass
         # through Unsloth for the plain sizes would merge the model again)
         if find_llama_cpp()[0] is None:
-            raise RuntimeError("The mixed-precision sizes need llama.cpp (convert_hf_to_gguf.py and llama-quantize): Unsloth cannot give single tensors their own types. Install it from "
-                               "https://github.com/ggml-org/llama.cpp and set LLAMA_CPP_DIR, or choose only the plain sizes.")
+            raise ExportLlamaMissing("The mixed-precision sizes need llama.cpp (convert_hf_to_gguf.py and llama-quantize): Unsloth cannot give single tensors their own types. Install it from "
+                                     f"https://github.com/ggml-org/llama.cpp and set LLAMA_CPP_DIR, or choose only the plain sizes. {llamacpp.SEARCH_ORDER} {llamacpp.CAN_INSTALL}")
         mixed_notes.append("The mixed-precision sizes need llama-quantize's per-tensor types, which Unsloth's export cannot do, so this export was made with llama.cpp (convert, then llama-quantize)"
                            + (" for every size." if len(quants) > len([q for q in quants if q in mixedquant.MIXED_IDS]) else "."))
         protocol.log(mixed_notes[-1])
