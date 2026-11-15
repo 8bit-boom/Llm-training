@@ -37,10 +37,10 @@ Names are read by lower-case tokens (os, architecture, backend, the CUDA version
 
 | Machine | Choice (automatic) |
 |---|---|
-| Windows x64, NVIDIA card, driver readable | the highest `win-cuda-<v>-x64` with `<v>` not above the driver's CUDA version (from the `CUDA Version: 12.9` header of `nvidia-smi`, or derived from the driver number), **at least 12.8 for an RTX 50 card** (compute capability 10 or 12), together with the matching `cudart-llama-bin-win-cuda-<v>-x64` runtime package (a version without one is skipped) |
+| NVIDIA card, driver readable (Windows x64 and Linux x64) | the highest `...-cuda-<v>-x64` build whose **major** version is not above the major version the driver reports (`CUDA Version: 13.0` in the `nvidia-smi` header, or derived from the driver number): CUDA's minor-version compatibility lets the 13.5 build run on a driver that reports any 13.x, so the minor is informational. Real Windows builds are 12.4 and 13.5, Linux 12.8 and 13.5. An **RTX 50 card** (compute capability 10 or 12) needs a build and a driver of at least 12.8: with a 13.x driver it gets 13.5, with a 12.x driver it gets Vulkan and the plain note "a newer NVIDIA driver is needed for the CUDA build of this card". The runtime package is taken with it (Windows `cudart-llama-bin-win-cuda-<v>-x64.zip`, **no tag in its name**; Linux `cudart-llama-<tag>-bin-ubuntu-cuda-<v>-x64.tar.gz`); on Windows a version without one is skipped. Its DLLs / `.so` files are put next to the programs |
 | the above without a usable CUDA file | Vulkan build (works on NVIDIA too), else the CPU build; the reason is shown in the confirmation |
 | Windows, no NVIDIA card | Vulkan when an AMD or Intel card is present, else the CPU build (the new `win-cpu-x64`, or the best of the old `avx2` / `avx` / `avx512` / `noavx` / `openblas` ones) |
-| Linux x64 | the Vulkan build when an AMD or Intel card is present, else the plain `ubuntu-x64` build. With an NVIDIA card there is no ready-made CUDA build: **Build with CUDA** is offered in Expert mode when `nvcc`, `cmake` and a C++ compiler are on the PATH (never the default) |
+| Linux x64, no usable CUDA build | the Vulkan build when an AMD or Intel card is present, else the plain `ubuntu-x64` build. With an NVIDIA card the prebuilt `ubuntu-cuda-<v>` tar.gz is chosen by the rule above; **Build with CUDA** from the source stays an Expert-mode extra when `nvcc`, `cmake` and a C++ compiler are on the PATH |
 | macOS arm64 / x64 | `macos-arm64` (Metal is part of it) / `macos-x64`; the `kleidiai` variant is not chosen |
 | anything else (other architecture, FreeBSD ...) | a plain message with the manual steps |
 
@@ -49,7 +49,7 @@ Expert mode shows a list (automatic, CUDA, Vulkan, processor only, build from th
 
 ## The install, step by step
 
-1. `GET https://api.github.com/repos/ggml-org/llama.cpp/releases/latest` (or `/releases/tags/<tag>` when `NDFORGE_LLAMA_CPP_TAG` pins one), with a User-Agent and no token.
+1. **Release discovery:** `GET https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30` (newest first, prereleases included, drafts skipped; or `/releases/tags/<tag>` alone when `NDFORGE_LLAMA_CPP_TAG` pins one), with a User-Agent and no token. The FIRST release for which the asset choice succeeds is used; a release without a matching file is skipped. A `nightly-tag.txt` in a release that fits nothing is read (at most 512 bytes, allowed hosts, at most 3 of them) as a possible pointer to a tag; if its text looks like a tag the tag is looked up, otherwise it is ignored. If nothing matches, the error says how many releases were checked, the newest tag and its file names, and points to the manual steps. One page of 30 is enough.
 2. The plan (tag, backend, reason, files, size) is shown first; **nothing is downloaded until the person presses "Download and install (NNN MB)"** (one click, no typing). The size is the
    files' sizes plus about 30 MB for the source zip (its size is not listed).
 3. Downloads (only `github.com`, `codeload.github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`; https; redirects followed by hand and only inside this list;
@@ -111,6 +111,8 @@ variable `LLAMA_CPP_DIR` to it. It wins over the installed copy. To get rid of t
 
 ## Deviations
 
+- **Changed after the owner's first run (release discovery, asset names, CUDA rule).** The first version asked `GET /releases/latest`. llama.cpp's publish workflow creates every build release as a *prerelease*, and `/releases/latest` never returns prereleases, so it answered an unrelated release whose only file is `nightly-tag.txt` ("This llama.cpp release has no file for this computer"). Now the list of the newest 30 releases is read and the first one with a fitting file is used (above). The asset names and the CUDA rule were also changed to match the real ones from `release-publish.yml`: Windows CUDA builds are 12.4 and 13.5 with tag-less `cudart-llama-bin-win-cuda-<v>-x64.zip`; Linux has `ubuntu-cuda-12.8` / `13.5` tar.gz with `cudart-llama-<tag>-...` tars; the rule "highest version not above the driver's" became "highest major not above the driver's major" (an RTX 5090 with a 13.x driver now gets the 13.5 build, with a 12.x driver Vulkan plus a note to update the driver). Linux NVIDIA machines get the prebuilt CUDA tar instead of only the source-build option.
+
 - The brief asked for PATH to be used "for imatrix only". The existing code also used the PATH for `llama-perplexity` (Compare quants); that behaviour is kept (the brief said to keep the
   other behaviour unchanged) and the messages now say "llama-imatrix and llama-perplexity are also looked for on the PATH (the converter script is not)".
 - `.tar.gz` assets are read as well as `.zip` (the project's newer Linux and macOS releases are, as far as I remember, `.tar.gz`; the zip crate cannot read them, so a small reader on the
@@ -127,10 +129,11 @@ variable `LLAMA_CPP_DIR` to it. It wins over the installed copy. To get rid of t
 
 Nothing in this list has been run; none of it is claimed to work.
 
-- **The real asset names.** The names in the tests are from memory (`llama-<tag>-bin-win-cuda-12.4-x64.zip`, `cudart-llama-bin-win-cuda-12.4-x64.zip`, `...-win-vulkan-x64.zip`, `...-win-cpu-x64.zip`,
+- **The real API answers.** api.github.com is blocked where this was written, so the shape of `GET /releases?per_page=30` (the fields `tag_name`, `draft`, `assets[].name/size/browser_download_url/digest`) is from GitHub's documentation, not seen; the asset names now follow llama.cpp's `release-publish.yml` (read from raw.githubusercontent.com) but no real release list was fetched. Whether `nightly-tag.txt` always holds a bare tag is unknown (it is only used as an optional pointer).
+- **The earlier asset-name note.** The names in the older tests are from memory (`llama-<tag>-bin-win-cuda-12.4-x64.zip`, `cudart-llama-bin-win-cuda-12.4-x64.zip`, `...-win-vulkan-x64.zip`, `...-win-cpu-x64.zip`,
   `...-ubuntu-x64`, `...-macos-arm64`, and whether Linux / macOS are `.zip` or `.tar.gz`). GitHub's API was blocked where this was written; the real list of a release is the first thing to check
   (`NDFORGE_LLAMA_CPP_TAG` plus the plan button prints the choice without downloading).
-- **CUDA variants for Blackwell.** Whether a release ships a `cuda-12.8` (or newer) build, and whether it runs on an RTX 5090 with the driver's CUDA version; whether the `cudart` package's DLLs are
+- **CUDA variants for Blackwell.** Whether the `cuda-13.5` build (and the Linux `cuda-12.8` / `13.5` ones) runs on an RTX 5090 with a driver reporting 13.x, and that the minor-version compatibility claim holds for these builds; whether the `cudart` package's DLLs are
   all that the build needs.
 - **The driver's CUDA detection** (`CUDA Version:` in the `nvidia-smi` header; the driver-number table is from NVIDIA's release notes) on a real Windows machine.
 - **Whether the source subset is enough** for the converter in every release (a script that imports something new would fail the converter check; the fallback would be to unpack the whole source
