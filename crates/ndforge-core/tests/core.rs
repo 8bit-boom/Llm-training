@@ -206,10 +206,12 @@ fn settings_roundtrip_and_recent() {
 
 #[test]
 fn help_pages_render() {
-    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape", "imatrix"] {
+    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape", "imatrix", "quantcheck"] {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));
+    let q = help_markdown("quantcheck");
+    assert!(!q.contains("No help text") && q.contains("proxy") && q.contains("llama-perplexity") && q.contains("LLAMA_CPP_DIR") && q.contains("Lower left is better") && q.contains("Compare these sizes") && !q.contains("UD-"));
     assert!(help_html("nope").contains("No help text"));
     // the Slim or grow page has its own text, not the fallback, and it carries the honest expectations
     let r = help_markdown("reshape");

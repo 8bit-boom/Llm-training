@@ -7,6 +7,7 @@ const TITLES = {
   welcome: ["Welcome to ND Lore Forge", "Teach a small AI model your nd-world world. Start by creating a project (one project = one world)."],
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
+  quantcheck: ["Compare quants", "Measure how far each smaller GGUF file is from the 16-bit model, as KL divergence, and see which size keeps the most."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
 
@@ -36,6 +37,7 @@ function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
+  items.push({ key: "quantcheck", label: "📏 Compare quants", unlocked: !!state.bundle, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
@@ -680,7 +682,8 @@ function renderUse() {
     <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
-  const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul></div>` : "";
+  const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
+  const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul>${gg.length > 1 ? `<div class="row"><button class="secondary" id="us-compare" title="Measures how far each of these files is from the 16-bit model (KL divergence)">Compare these sizes</button></div>` : ""}</div>` : "";
   const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
   const exOpts = st.exports.filter((e) => e.gguf_file !== null).map((e) => `<option value="${esc(e.name)}" ${us.exp === e.name ? "selected" : ""}>${esc(e.name)}</option>`).join("");
   const ggufExports = st.exports.filter((e) => e.gguf_file !== null);
@@ -760,6 +763,7 @@ function wireUse() {
   const imr = $("us-imreuse"); if (imr) imr.onchange = () => { us.imReuse = imr.checked; render(); };
   const ims = $("us-imsaved"); if (ims) ims.onchange = () => { us.imSaved = ims.value; us.imCheck = null; us.imCheckKey = null; render(); };
   on("us-imlib", () => go("imatrix"));
+  on("us-compare", () => qkFromRun(us.run));
   on("us-imadd", () => { us.imAdd = true; render(); });
   on("us-imaddcancel", () => { us.imAdd = false; render(); });
   const ial = $("us-imaddlabel"); if (ial) ial.onchange = () => { us.imAddLabel = ial.value; };
@@ -984,6 +988,250 @@ function wireImatrix() {
     try { const r = await invoke("imatrix_import", { export: im.addExport, label: im.addLabel }); im.state = r.state; im.addExport = ""; im.ok = "Added to the library."; im.error = null; } catch (e) { im.error = String(e); im.ok = null; }
     render();
   });
+}
+
+// ------------------------------------------------------------------------------------------- compare quants
+// How far is each smaller GGUF from the 16-bit model? llama.cpp's llama-perplexity measures the KL divergence on a test text; the table, the chart and the words are drawn
+// from results.json (written by the worker). docs/QUANT_COMPARE.md.
+let qk = { state: null, refSel: "", refFile: "", makeSrc: "run", makeRun: "", makeModel: "", picked: null, typed: [], typedInput: "", text: "data", textFile: "", tokRun: "", tokTyped: "", tokMode: "run", chunks: 16,
+  keep: false, plan: null, planRef: undefined, planBusy: false, running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, shown: null, resume: "" };
+
+const QK_INTRO = `<p>A smaller GGUF file (Q4_K_M, a mixed-precision size ...) rounds the model's numbers, so its answers drift a little from the 16-bit original's. This page measures that drift: the 16-bit model reads a test text once and saves how likely it finds every next word; each smaller file then reads the same text and is compared with it. The figure is the <strong>KL divergence</strong> (KLD): 0 means the same answers, the larger, the further away. It also shows how often both files pick the same top word.</p>
+  <p class="dim">KLD is a <strong>proxy</strong>: Unsloth reports it for its own quants too, but it does not replace trying the model on your own questions (Step 4 · Test). The test text is, by default, <strong>text the matrix was not measured on</strong> (the held-out part of your saved data), so a matrix does not get a head start. It needs llama.cpp with <code>llama-perplexity</code> (set <code>LLAMA_CPP_DIR</code> to its folder if the program does not find it). The 16-bit model's answers are saved in one big temporary file: the page shows its size before anything runs.</p>`;
+
+const qkGb = (b) => (b / 1e9).toFixed(2);
+const qkNum = (v, d = 4) => (v == null || Number.isNaN(+v) ? "–" : (+v).toFixed(d));
+
+function qkChartHtml(r) {
+  const rows = (r.rows || []).filter((x) => x.status === "done" && x.mean_kld != null && x.size);
+  if (rows.length < 1) return "";
+  const W = 600, H = 340, L = 64, R = 20, T = 34, B = 48;
+  const xs = rows.map((x) => x.size / 1e9), ys = rows.map((x) => Math.max(x.mean_kld, 1e-6));
+  const x0 = Math.min(...xs) * 0.95, x1 = Math.max(...xs) * 1.05 || 1;
+  const logY = Math.max(...ys) / Math.min(...ys) > 30;
+  const f = logY ? (v) => Math.log10(v) : (v) => v;
+  const y0 = logY ? f(Math.min(...ys)) - 0.2 : 0, y1 = logY ? f(Math.max(...ys)) + 0.2 : Math.max(...ys) * 1.1;
+  const px = (v) => L + ((v - x0) / (x1 - x0 || 1)) * (W - L - R), py = (v) => H - B - ((f(Math.max(v, 1e-6)) - y0) / (y1 - y0 || 1)) * (H - T - B);
+  const front = new Set(r.pareto || []);
+  const line = rows.filter((x) => front.has(x.id)).sort((a, b) => a.size - b.size);
+  const xt = [0, 1, 2, 3, 4].map((i) => x0 + ((x1 - x0) * i) / 4);
+  const yt = [0, 1, 2, 3, 4].map((i) => (logY ? Math.pow(10, y0 + ((y1 - y0) * i) / 4) : y0 + ((y1 - y0) * i) / 4));
+  const grid = `<style>.qk-g{stroke:var(--line);stroke-width:1}.qk-t{fill:var(--dim);font-size:11px}.qk-l{fill:var(--text);font-size:11px}</style>`
+    + xt.map((v) => `<line class="qk-g" x1="${px(v)}" x2="${px(v)}" y1="${T}" y2="${H - B}"/><text class="qk-t" x="${px(v)}" y="${H - B + 16}" text-anchor="middle">${v.toFixed(1)}</text>`).join("")
+    + yt.map((v) => `<line class="qk-g" x1="${L}" x2="${W - R}" y1="${py(v)}" y2="${py(v)}"/><text class="qk-t" x="${L - 6}" y="${py(v) + 4}" text-anchor="end">${v < 0.01 ? v.toExponential(0) : v.toFixed(3)}</text>`).join("");
+  const poly = line.length > 1 ? `<polyline points="${line.map((x) => `${px(x.size / 1e9)},${py(x.mean_kld)}`).join(" ")}" style="fill:none;stroke:var(--accent);stroke-width:2"/>` : "";
+  const dots = rows.map((x) => { const on = front.has(x.id); const cx = px(x.size / 1e9), cy = py(x.mean_kld);
+    return `<g><title>${esc(x.label)}: ${qkGb(x.size)} GB, mean KLD ${qkNum(x.mean_kld)}</title><circle cx="${cx}" cy="${cy}" r="5" style="fill:${on ? "var(--accent)" : "var(--panel)"};stroke:var(--accent);stroke-width:2"/><text class="qk-l" x="${cx + 8}" y="${cy - 7}">${esc(String(x.label).slice(0, 26))}</text></g>`; }).join("");
+  return `<svg id="qk-chart" role="img" aria-label="Mean KL divergence against file size; lower left is better" viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;background:var(--panel);border:1px solid var(--line);border-radius:10px">
+    <text class="qk-l" x="${L}" y="20" style="font-weight:600">KLD against size${logY ? " (log scale)" : ""}: lower left is better. The line joins the files nothing smaller beats.</text>${grid}${poly}${dots}
+    <text class="qk-t" x="${(L + W - R) / 2}" y="${H - 8}" text-anchor="middle">file size (GB)</text><text class="qk-t" transform="translate(14 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">mean KL divergence</text></svg>`;
+}
+
+function qkResultHtml(r) {
+  if (!r) return "";
+  const rows = [...(r.rows || [])].sort((a, b) => (a.size || 1e18) - (b.size || 1e18));
+  const front = new Set(r.pareto || []);
+  const body = rows.map((x) => `<tr class="${x.status === "done" ? "" : "dim"}"><td>${front.has(x.id) ? "● " : ""}${esc(x.label)}${x.partial ? ` <span class="dim" title="Only the running figures were printed, not the final statistics">(running figure)</span>` : ""}</td><td>${x.size ? qkGb(x.size) : "–"}</td><td>${x.bpw != null ? (+x.bpw).toFixed(2) : "–"}</td>
+    <td>${x.status === "done" ? qkNum(x.mean_kld) : `<span class="err" title="${esc(x.error || "")}">${x.status === "pending" ? "not measured yet" : "failed"}</span>`}</td><td>${qkNum(x.median_kld)}</td><td>${qkNum(x.p99)}</td><td>${qkNum(x.max_kld, 3)}</td>
+    <td>${x.same_top != null ? (+x.same_top).toFixed(1) + " %" : "–"}</td><td>${x.ppl != null ? (+x.ppl).toFixed(3) : "–"}</td></tr>${x.status === "failed" && x.error ? `<tr class="dim small"><td colspan="9">${esc(x.error)}</td></tr>` : ""}`).join("");
+  const ref = r.reference || {};
+  return `<div class="card wide" id="qk-result"><h2>Result: ${esc(r.id || "")}</h2>
+    <p class="dim small">Reference: ${esc(ref.name || "")}${ref.params ? ` · ${(ref.params / 1e9).toFixed(1)} billion weights` : ""} · test text: ${esc((r.text || {}).source || "")} · ${(r.settings || {}).chunks} chunks of ${(r.settings || {}).ctx} tokens · ${esc((r.key || {}).llama_cpp || "llama.cpp version unknown")}${r.state && r.state !== "done" ? ` · <strong>${esc(r.state)}</strong>` : ""}</p>
+    <div style="overflow-x:auto"><table class="qk-table"><thead><tr><th>File (● on the line)</th><th>Size (GB)</th><th>Bits per weight</th><th>Mean KLD</th><th>Median</th><th>99 %</th><th>Max</th><th>Same top word</th><th>PPL</th></tr></thead><tbody>${body}</tbody></table></div>
+    <p class="dim small">Size in GB (10⁹ bytes); bits per weight = file size × 8 ÷ the weights in the file. Mean KLD is the figure to compare; the 99 % and maximum show the rare big misses. Lower is closer to the 16-bit model.</p>
+    ${qkChartHtml(r)}
+    <h3>In words</h3><ul>${(r.verdict || []).map((v) => `<li>${esc(v)}</li>`).join("")}</ul>
+    ${(r.notes || []).length ? `<p class="dim small">${r.notes.map(esc).join("<br>")}</p>` : ""}</div>`;
+}
+
+function qkEntryHtml(e) {
+  const states = { done: "finished", stopped: "stopped (the finished files are kept)", failed: "ended with an error", running: "was running" };
+  const off = qk.running || e.running;
+  return `<li class="imentry"><strong>${esc(e.id)}</strong> <span class="dim small">${esc(states[e.state] || e.state || "")}</span><br>
+    <span class="dim small">Reference ${esc(e.reference || "?")} · ${e.rows_done} of ${e.rows} files measured · ${e.chunks} chunks · ${esc(String(e.created || "").slice(0, 10))}${e.base_kept ? ` · the 16-bit model's answers are kept (${e.base_mb} MB)` : ""}</span>
+    <div class="row"><button class="secondary qk-show" data-id="${esc(e.id)}">Show</button>
+      ${e.rows_done < e.rows || e.state === "stopped" ? `<button class="secondary qk-continue" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="Goes on with the files that are not measured yet, without reading the text again when the saved answers are still there">Continue</button>` : ""}
+      ${e.base_kept ? `<button class="secondary qk-dellog" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="Frees ${e.base_mb} MB; the table stays">Delete the saved answers (${e.base_mb} MB)</button>` : ""}
+      <button class="secondary qk-del" data-id="${esc(e.id)}" ${off ? "disabled" : ""}>Delete</button></div></li>`;
+}
+
+function qkRefPath(st) {
+  if (qk.refSel === "__file") return qk.refFile.trim();
+  if (qk.refSel === "__make") return "";
+  return qk.refSel;
+}
+
+function qkPlanHtml() {
+  const pl = qk.plan;
+  if (!pl) return qk.planBusy ? `<p class="dim small">Checking the disk…</p>` : "";
+  const rows = pl.options.map((o) => `<tr class="${o.fits ? "" : "dim"}"><td>${o.chunks}</td><td>${o.scored.toLocaleString("en")}</td><td>${o.gb} GB</td><td>${o.fits ? "fits" : "does not fit"}</td></tr>`).join("");
+  return `<div id="qk-plan"><table class="qk-table"><thead><tr><th>Chunks</th><th>Words compared</th><th>Temporary file</th><th>Disk</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="dim small">${pl.vocab_assumed ? "The reference's vocabulary is not known yet, so " + pl.vocab.toLocaleString("en") + " words are assumed. " : `The vocabulary has ${pl.vocab.toLocaleString("en")} words. `}The temporary file holds the 16-bit model's answers for every compared word (about 2 bytes per vocabulary word) and is deleted when the comparison ends${qk.keep ? " (you chose to keep it)" : ""}. Free on this disk: ${pl.free != null ? qkGb(pl.free) + " GB" : "unknown"}; a tenth is kept in reserve.</p>
+    ${pl.refusal ? `<div class="err" id="qk-refusal">${esc(pl.refusal)}</div>` : ""}</div>`;
+}
+
+function qkFormHtml(st) {
+  const c = st.candidates || { references: [], quants: [] };
+  if (!qk.refSel) qk.refSel = c.references.length ? c.references[0].path : (st.runs || []).length ? "__make" : "__file";
+  if (qk.picked === null) qk.picked = [];
+  if (!qk.makeRun && (st.runs || []).length) qk.makeRun = st.runs[0].name;
+  if (!qk.makeModel && (st.models || []).length) qk.makeModel = st.models[0].id;
+  if (!qk.tokRun && (st.runs || []).length) qk.tokRun = st.runs[0].name;
+  const refOpts = c.references.map((r) => `<option value="${esc(r.path)}" ${qk.refSel === r.path ? "selected" : ""}>${esc(r.label)} · ${r.size_mb} MB</option>`).join("")
+    + `<option value="__file" ${qk.refSel === "__file" ? "selected" : ""}>A 16-bit GGUF file I choose…</option><option value="__make" ${qk.refSel === "__make" ? "selected" : ""}>Make a 16-bit file with llama.cpp…</option>`;
+  let refExtra = "";
+  if (qk.refSel === "__file") refExtra = `<div class="row"><label>File <input type="text" id="qk-reffile" value="${esc(qk.refFile)}" placeholder="C:\\models\\model-f16.gguf" style="min-width:300px"></label><button class="secondary" id="qk-refbrowse">Browse…</button></div>
+    <p class="dim small">An F16 or BF16 file of the same model as the files below. A file that is already quantised can be chosen, but then the figures say how far the others are from <em>it</em>.</p>`;
+  if (qk.refSel === "__make") refExtra = `<div class="row"><label>Made from <select id="qk-makesrc"><option value="run" ${qk.makeSrc === "run" ? "selected" : ""}>A trained run</option><option value="model" ${qk.makeSrc === "model" ? "selected" : ""}>A model of the list</option></select></label>
+    ${qk.makeSrc === "run" ? `<label>Run <select id="qk-makerun">${(st.runs || []).map((r) => `<option value="${esc(r.name)}" ${qk.makeRun === r.name ? "selected" : ""}>${esc(r.name)} · ${esc(r.model)}</option>`).join("")}</select></label>`
+      : `<label>Model <select id="qk-makemodel">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${qk.makeModel === m.id ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select></label>`}</div>
+    <p class="dim small">The model is merged (a trained run) and converted to a 16-bit GGUF file with llama.cpp's converter; it needs the training software, about two bytes per weight of free disk (a 27 B model: 54 GB) and some minutes. The file is kept in the comparison's folder and deleted with it.</p>`;
+  const quants = c.quants.length ? c.quants.map((q) => `<li><label class="opt"><input type="checkbox" class="qk-pick" value="${esc(q.path)}" ${qk.picked.includes(q.path) ? "checked" : ""}> ${esc(q.label)} <span class="dim small">· ${q.size_mb} MB · ${esc(q.export)}</span></label></li>`).join("")
+    : `<li class="dim">No exported GGUF files in this project yet. Make some on Step 5, or add files by their path.</li>`;
+  const typed = qk.typed.map((t, i) => `<li><span>${esc(t)}</span> <button class="link qk-untype" data-i="${i}">Remove</button></li>`).join("");
+  const run = (st.runs || []).map((r) => `<option value="${esc(r.name)}" ${qk.tokRun === r.name && qk.tokMode === "run" ? "selected" : ""}>${esc(r.name)} · ${esc(r.model)}</option>`).join("");
+  const dataInfo = st.data_version == null ? `<p class="warn small">There is no saved version of the training data yet (Step 2). Save one, or choose a text file of your own.</p>`
+    : `<p class="dim small">${st.has_test_rows ? `The held-out questions of data version ${st.data_version}: conversations the training never saw, and (by design) not the text any matrix was measured on.` : `Version ${st.data_version} holds out no test questions, so a sample of its training rows is used (another sample than the matrix calibration's); files measured on text they were trained on look a little better than on new text, the ranking is still fair.`} They are written through the model's chat template with its special markers taken out (llama-perplexity cannot read them as markers).</p>`;
+  const textBlock = `<div class="row"><label>Test text <select id="qk-text"><option value="data" ${qk.text === "data" ? "selected" : ""}>The held-out part of my saved data</option><option value="file" ${qk.text === "file" ? "selected" : ""}>A text file of my own</option></select></label></div>`
+    + (qk.text === "data" ? dataInfo + `<div class="row"><label>The files were made from <select id="qk-tokrun">${run}<option value="__typed" ${qk.tokMode === "typed" || !(st.runs || []).length ? "selected" : ""}>A model folder or Hugging Face id…</option></select></label>${qk.tokMode === "typed" || !(st.runs || []).length ? `<label>Folder or id <input type="text" id="qk-toktyped" value="${esc(qk.tokTyped)}" placeholder="owner/name" style="min-width:260px"></label>` : ""}</div>`
+      : `<div class="row"><label>Text file <input type="text" id="qk-textfile" value="${esc(qk.textFile)}" placeholder="C:\\texts\\test.txt" style="min-width:300px"></label><button class="secondary" id="qk-textbrowse">Browse…</button></div><p class="dim small">Plain text, used as it is (a few thousand words or more).</p>`);
+  const pl = qk.plan;
+  const names = (n) => { const o = pl && pl.options.find((x) => x.chunks === n); return `${n} chunks${o ? ` (${o.gb} GB temporary file${o.fits ? "" : ", too big for the disk"})` : ""}${n === 16 ? " · recommended" : ""}`; };
+  const refPath = qkRefPath(st);
+  const total = qk.picked.length + qk.typed.length;
+  const typedModel = qk.tokMode === "typed" || !(st.runs || []).length;
+  const noData = qk.text === "data" && (st.data_version == null || (typedModel && !qk.tokTyped.trim()));
+  const chosen = pl && pl.options.find((o) => o.chunks === qk.chunks);
+  const why = !st.env_ready ? "The training software is not installed yet (Training setup): it runs the comparison." : qk.refSel === "__file" && !qk.refFile.trim() ? "Choose the 16-bit file."
+    : !total ? "Choose at least one file to compare." : qk.text === "file" && !qk.textFile.trim() ? "Choose the text file." : noData ? "Choose the test text (save a data version, or use a text file)."
+    : pl && pl.refusal ? pl.refusal : chosen && !chosen.fits ? "That amount of text needs more free disk than there is. Choose fewer chunks." : "";
+  const prog = qk.running ? `<div class="stepline">${esc(qk.step)}</div>${qk.progress != null ? `<progress max="1" value="${qk.progress}"></progress>` : ""} <button class="secondary" id="qk-stop" title="llama.cpp is stopped at once; the files that are finished stay measured">Stop</button>` : "";
+  return `<div class="card wide"><h2>New comparison</h2>
+    <h3>1 · The 16-bit reference</h3><div class="row"><label>Reference <select id="qk-ref" ${qk.running ? "disabled" : ""}>${refOpts}</select></label></div>${refExtra}
+    ${c.references.length ? "" : `<p class="dim small">No 16-bit file was found in your exports (a size "F16" in Step 5 makes one). Choose a file, or let llama.cpp make one.</p>`}
+    <h3>2 · The files to compare</h3><ul class="exlist" id="qk-quants">${quants}${typed}</ul>
+    <div class="row"><label>Add a file by its path <input type="text" id="qk-typed" value="${esc(qk.typedInput)}" placeholder="C:\\models\\model-Q4_K_M.gguf" style="min-width:300px"></label><button class="secondary" id="qk-typeadd">Add</button><button class="secondary" id="qk-typebrowse">Browse…</button></div>
+    <p class="dim small">Files made with and without an importance matrix, and the mixed-precision sizes, go in the same table: tick them all.</p>
+    <h3>3 · The test text</h3>${textBlock}
+    <h3>4 · How much text</h3><div class="row"><label>Amount <select id="qk-chunks">${[4, 8, 16, 32, 64, 128].map((n) => `<option value="${n}" ${qk.chunks === n ? "selected" : ""}>${names(n)}</option>`).join("")}</select></label>
+      <label class="opt"><input type="checkbox" id="qk-keep" ${qk.keep ? "checked" : ""}> Keep the 16-bit model's answers afterwards</label></div>${qkPlanHtml()}
+    <p class="dim small">More text gives steadier figures but a bigger temporary file and a longer run: the 16-bit model reads the text once, then every file reads it again.</p>
+    ${why ? `<p class="dim small" id="qk-why">${esc(why)}</p>` : ""}
+    <div class="row"><button class="primary" id="qk-start" ${qk.running || why ? "disabled" : ""}>Compare</button></div>${prog}</div>`;
+}
+
+function renderQuantcheck() {
+  if (!state.bundle) return `<h1>Compare quants</h1><p class="lead">Import your world data first (Step 1).</p>`;
+  const st = qk.state;
+  if (!st) return `<h1>Compare quants</h1><p class="lead">Loading…</p>`;
+  const entries = st.entries || [];
+  const list = entries.length ? `<ul class="exlist">${entries.map(qkEntryHtml).join("")}</ul>` : `<p class="dim">No comparison saved in this project yet. Make one below.</p>`;
+  const msg = `${qk.error ? `<div class="err">${esc(qk.error)}</div>` : ""}${qk.ok ? `<div class="ok">${esc(qk.ok)}</div>` : ""}`;
+  const log = qk.log.length ? `<details><summary>Log</summary><pre class="log">${qk.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
+  return `<h1>Compare quants</h1><p class="lead">See how much of the 16-bit model each smaller file keeps, and which size is worth it.</p>
+    <div class="card wide"><h2>What it measures</h2>${QK_INTRO}<div class="row"><button class="secondary" id="qk-tostep5">Go to Step 5 (make the files)</button></div></div>
+    <div class="card wide"><h2>Your comparisons</h2>${list}</div>${qkFormHtml(st)}${msg}${log}${qkResultHtml(qk.shown)}`;
+}
+
+async function qkRefresh() {
+  try { qk.state = await invoke("quantcheck_state"); } catch (e) { qk.error = String(e); }
+  if (page === "quantcheck") { render(); qkCheckPlan(); }
+}
+
+// the disk need of the 16-bit model's answers, for the chosen reference: asked once per reference
+function qkCheckPlan() {
+  if (!qk.state || page !== "quantcheck") return;
+  const ref = qkRefPath(qk.state);
+  if (qk.planRef === ref || qk.planBusy) return;
+  qk.planRef = ref; qk.planBusy = true;
+  invoke("quantcheck_plan", { reference: ref || null })
+    .then((r) => { qk.plan = r; if (r && r.default_chunks && !r.options.find((o) => o.chunks === qk.chunks && o.fits)) qk.chunks = r.default_chunks; })
+    .catch((e) => { qk.plan = null; qk.error = String(e); })
+    .finally(() => { qk.planBusy = false; if (page === "quantcheck") render(); });
+}
+
+function qkSpec() {
+  const st = qk.state, c = st.candidates;
+  const picks = c.quants.filter((q) => qk.picked.includes(q.path)).map((q) => ({ path: q.path, label: q.label, group: q.group, matrix: q.matrix, mixed: q.mixed }))
+    .concat(qk.typed.map((t) => ({ path: t, label: t.split(/[\\/]/).pop(), group: null, matrix: null, mixed: null })));
+  const reference = qk.refSel === "__make" ? { kind: "make", source: qk.makeSrc === "run" ? { kind: "run", run: qk.makeRun } : { kind: "model", model: qk.makeModel } } : { kind: "file", file: qkRefPath(st) };
+  const typedModel = qk.tokMode === "typed" || !(st.runs || []).length;
+  const text = qk.text === "file" ? { kind: "file", file: qk.textFile.trim() } : { kind: "data", run: typedModel ? null : qk.tokRun, tokenizer: typedModel ? qk.tokTyped.trim() || null : null };
+  return { reference, quants: picks, text, chunks: qk.chunks, keep_logits: qk.keep, resume: qk.resume || null };
+}
+
+function onQuantcheckEvent(p) {
+  if (p.kind === "log") qk.log.push(p.text);
+  else if (p.kind === "progress") { if (p.text) qk.step = p.text; if (p.value != null) qk.progress = p.value; }
+  else if (p.kind === "done") {
+    qk.running = false; qk.progress = null; qk.step = ""; qk.resume = "";
+    qk.shown = p.data || null; qk.ok = "The comparison is ready."; qk.error = null;
+    qkRefresh();
+  } else if (p.kind === "error") {
+    qk.running = false; qk.progress = null; qk.step = ""; qk.resume = "";
+    qk.error = p.text === "Cancelled." ? "Stopped. The files that were already measured are kept (see Your comparisons: Continue)." : p.text;
+    qkRefresh();
+  }
+  if (page === "quantcheck") render();
+}
+
+async function qkRun(spec) {
+  qk.running = true; qk.error = null; qk.ok = null; qk.shown = null; qk.log = []; qk.step = "Starting…"; qk.progress = null;
+  render();
+  try { await invoke("quantcheck_start", { spec }); } catch (e) { qk.running = false; qk.error = String(e); qk.step = ""; render(); }
+}
+
+function wireQuantcheck() {
+  if (page !== "quantcheck" || !qk.state) return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, key, num, redraw) => { const e = $(id); if (e) e.onchange = () => { qk[key] = num ? Number(e.value) : e.value; if (redraw) render(); }; };
+  bind("qk-ref", "refSel", false, true); bind("qk-reffile", "refFile", false, false); bind("qk-makesrc", "makeSrc", false, true); bind("qk-makerun", "makeRun"); bind("qk-makemodel", "makeModel");
+  bind("qk-text", "text", false, true); bind("qk-textfile", "textFile"); bind("qk-chunks", "chunks", true, true); bind("qk-toktyped", "tokTyped");
+  const tr = $("qk-tokrun"); if (tr) tr.onchange = () => { if (tr.value === "__typed") { qk.tokMode = "typed"; } else { qk.tokRun = tr.value; qk.tokMode = "run"; } render(); };
+  const kp = $("qk-keep"); if (kp) kp.onchange = () => { qk.keep = kp.checked; render(); };
+  const ty = $("qk-typed"); if (ty) ty.onchange = () => { qk.typedInput = ty.value; };
+  document.querySelectorAll(".qk-pick").forEach((c) => c.onchange = () => { qk.picked = [...document.querySelectorAll(".qk-pick")].filter((x) => x.checked).map((x) => x.value); render(); });
+  document.querySelectorAll(".qk-untype").forEach((b) => b.onclick = () => { qk.typed.splice(Number(b.dataset.i), 1); render(); });
+  on("qk-typeadd", () => { const v = ($("qk-typed") ? $("qk-typed").value : qk.typedInput).trim(); if (v && !qk.typed.includes(v)) qk.typed.push(v); qk.typedInput = ""; render(); });
+  const pick = (id, apply, dir, title, filters) => on(id, async () => { const f = await tauri.dialog.open({ multiple: false, directory: dir, title, filters }); if (f) { apply(f); render(); } });
+  const gg = [{ name: "GGUF", extensions: ["gguf"] }, { name: "All files", extensions: ["*"] }];
+  pick("qk-refbrowse", (f) => { qk.refFile = f; }, false, "Choose the 16-bit GGUF file", gg);
+  pick("qk-typebrowse", (f) => { if (!qk.typed.includes(f)) qk.typed.push(f); }, false, "Choose a GGUF file to compare", gg);
+  pick("qk-textbrowse", (f) => { qk.textFile = f; }, false, "Choose a text file", [{ name: "Text", extensions: ["txt", "text", "md"] }, { name: "All files", extensions: ["*"] }]);
+  on("qk-tostep5", () => go("use"));
+  on("qk-start", () => qkRun(qkSpec()));
+  on("qk-stop", () => invoke("quantcheck_stop"));
+  document.querySelectorAll(".qk-show").forEach((b) => b.onclick = async () => { try { qk.shown = await invoke("quantcheck_get", { id: b.dataset.id }); qk.error = null; } catch (e) { qk.error = String(e); } render(); });
+  document.querySelectorAll(".qk-continue").forEach((b) => b.onclick = async () => {
+    // goes on with the files the comparison had, plus the ones ticked now; the saved answers and the saved test text are used when they are still there
+    try {
+      const r = await invoke("quantcheck_get", { id: b.dataset.id });
+      const spec = qkSpec(); spec.resume = b.dataset.id; spec.chunks = (r.settings || {}).chunks || spec.chunks; spec.reference = { kind: "file", file: (r.reference || {}).path };
+      const have = new Set(spec.quants.map((q) => q.path));
+      (r.rows || []).forEach((x) => { if (!have.has(x.path)) spec.quants.push({ path: x.path, label: x.label, group: x.group, matrix: x.matrix, mixed: x.mixed }); });
+      qk.resume = b.dataset.id; qkRun(spec);
+    } catch (e) { qk.error = String(e); render(); }
+  });
+  document.querySelectorAll(".qk-dellog").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete the saved answers of the 16-bit model? The table stays; continuing later has to read the text again.")) return;
+    try { qk.state = await invoke("quantcheck_delete_logits", { id: b.dataset.id }); qk.ok = "The saved answers were deleted."; qk.error = null; } catch (e) { qk.error = String(e); qk.ok = null; }
+    render();
+  });
+  document.querySelectorAll(".qk-del").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete this comparison with its results? A 16-bit reference that the program made for it is deleted too.")) return;
+    try { qk.state = await invoke("quantcheck_delete", { id: b.dataset.id }); if (qk.shown && qk.shown.id === b.dataset.id) qk.shown = null; qk.ok = "Deleted."; qk.error = null; } catch (e) { qk.error = String(e); qk.ok = null; }
+    render();
+  });
+  qkCheckPlan();
+}
+
+// the "Compare these sizes" button of the export results: the files of one run, ticked
+async function qkFromRun(run) {
+  await qkRefresh();
+  const c = (qk.state && qk.state.candidates) || { quants: [] };
+  qk.picked = c.quants.filter((q) => q.run === run).map((q) => q.path);
+  qk.tokRun = run; qk.tokMode = "run"; qk.shown = null;
+  go("quantcheck");
 }
 
 // ------------------------------------------------------------------------------------------- retrain with the new export (step 1)
@@ -2219,7 +2467,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -2245,6 +2493,7 @@ function wire() {
   wireTrain();
   wireUse();
   wireImatrix();
+  wireQuantcheck();
   wireTest();
   wireReshape();
   wireGuide();
@@ -2359,6 +2608,7 @@ async function go(key) {
   if (key === "reshape" && state.bundle) { rs.ok = null; rs.error = null; rsRefresh(); }
   if (key === "use" && state.bundle) usRefresh();
   if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
+  if (key === "quantcheck" && state.bundle) { qk.ok = null; qk.error = null; qkRefresh(); }
   if (key === "test" && state.bundle) { te.ok = null; teRefresh(); }
   if (key === "data" && state.project) { if (!us.state) usRefresh(); rtRefresh(); }
   $("help").innerHTML = await invoke("help", { key: key === "guide" ? "troubleshooting" : key });
@@ -2387,6 +2637,7 @@ async function init() {
   try { await tauri.event.listen("server-event", (e) => onServerEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("imatrix-event", (e) => onImatrixEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("quantcheck-event", (e) => onQuantcheckEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }

@@ -131,3 +131,7 @@ textarea[readonly] { width: 100%; font-family: ui-monospace, Consolas, monospace
 .hs-note { color: var(--dim); }
 p.hs-warn { color: #8a5a00; }
 #hs-section select, #hs-section input[type=text] { max-width: 100%; }
+.qk-table { border-collapse: collapse; font-size: 13px; width: 100%; margin: 6px 0; }
+.qk-table th, .qk-table td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: right; white-space: nowrap; }
+.qk-table th:first-child, .qk-table td:first-child { text-align: left; white-space: normal; }
+.qk-table th { color: var(--dim); font-weight: 600; }
