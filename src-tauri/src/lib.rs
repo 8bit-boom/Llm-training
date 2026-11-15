@@ -486,6 +486,22 @@ fn imatrix_delete(s: State<App>, id: String) -> Out<Value> {
     Ok(ndforge_core::export::imatrix_lib::state(&project))
 }
 
+/// Merges matrices (library entries, files, Unsloth's published matrix). `spec` is {"inputs": [{"kind": "library"|"file"|"published", "id"|"file"|"base"}], "label"}.
+/// Events on "imatrix-event" like `imatrix_create`; the end has {"entry": ...}.
+#[tauri::command]
+fn imatrix_merge(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
+    let spec: ndforge_core::export::imatrix_lib::MergeSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::merge(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+}
+
+/// Looks up Unsloth's published matrix for a base model on the Hub (its repo, file and size; nothing is downloaded).
+#[tauri::command]
+fn imatrix_published(s: State<App>, base: String) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::imatrix_lib::published_info(&project, &base).map_err(|e| e.to_string())
+}
+
 /// The light check before an export: does this matrix seem to fit the model of `run`? {"warnings": [...], ...}; never a refusal.
 #[tauri::command]
 fn imatrix_check(s: State<App>, id: String, run: Option<String>) -> Out<Value> {
@@ -1107,7 +1123,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
