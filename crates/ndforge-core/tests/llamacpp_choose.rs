@@ -298,7 +298,7 @@ fn unpacking_a_tar_gz_refuses_unsafe_names_hard_links_and_reads_long_names() {
     std::fs::write(&z, tar_gz(vec![tar_entry("l", b'1', b"", "ok.txt", 0o644)])).unwrap();
     assert!(unpack(&z, Archive::TarGz, &d.path().join("o2"), &everything, &AtomicBool::new(false)).unwrap_err().0.contains("hard link"));
     // a GNU long name
-    let long = format!("llama-b7000/{}/file.txt", "d".repeat(120));
+    let long = format!("llama-b7000/{}/file.txt", "d".repeat(90));
     let mut long_data = long.clone().into_bytes();
     long_data.push(0);
     std::fs::write(&z, tar_gz(vec![tar_entry("././@LongLink", b'L', &long_data, "", 0o644), tar_entry("short", b'0', b"hello", "", 0o644), tar_entry("llama-b7000/", b'5', b"", "", 0o755), tar_entry("llama-b7000/run", b'0', b"#!/bin/sh\n", "", 0o755)])).unwrap();
