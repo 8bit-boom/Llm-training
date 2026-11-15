@@ -411,14 +411,22 @@ fn export_state(s: State<App>) -> Out<Value> {
 
 /// Makes the GGUF + Modelfile of a run; progress goes to the window as "export-event" events.
 #[tauri::command]
-fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32, what: Option<String>, quants: Option<Vec<String>>, imatrix: Option<ndforge_core::export::runs::ImatrixOptions>) -> Out<()> {
+fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32, what: Option<String>, quants: Option<Vec<String>>, imatrix: Option<ndforge_core::export::runs::ImatrixOptions>, mixed: Option<ndforge_core::export::runs::MixedOptions>) -> Out<()> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     spawn_task(app, &tasks, "export-event", move |cancel, emit| {
         let list = quants.filter(|q| !q.is_empty()).unwrap_or_else(|| vec![quant]);
-        let mut metas = ndforge_core::export::runs::execute_many_with(&project, &run, &list, num_ctx, what.as_deref().unwrap_or("gguf"), &imatrix.unwrap_or_default(), cancel, emit).map_err(|e| e.to_string())?;
+        let mut metas = ndforge_core::export::runs::execute_many_full(&project, &run, &list, num_ctx, what.as_deref().unwrap_or("gguf"), &imatrix.unwrap_or_default(), &mixed.unwrap_or_default(), cancel, emit).map_err(|e| e.to_string())?;
         // one size: its export; several: a summary naming them all
         Ok(if metas.len() == 1 { metas.remove(0) } else { serde_json::json!({"name": metas.iter().filter_map(|m| m["name"].as_str()).collect::<Vec<_>>().join(", "), "run": run, "exports": metas}) })
     })
+}
+
+/// The mixed-precision plan (docs/MIXED_QUANTS.md): every recipe's rules and estimated size from the tensor shapes of `gguf` (any GGUF of the model), and the "Fit to a size"
+/// proposal when `target_gb` and a saved matrix (`matrix`, a library id) are given.
+#[tauri::command]
+fn mixed_plan(s: State<App>, gguf: String, target_gb: Option<f64>, matrix: Option<String>) -> Out<Value> {
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    ndforge_core::export::mixed::plan(&project, &gguf, target_gb, matrix.as_deref()).map_err(|e| e.to_string())
 }
 
 // ------------------------------------------------------------------------------------------------ the matrix library (docs/IMATRIX.md)
@@ -1123,7 +1131,7 @@ pub fn run() {
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
+        .invoke_handler(tauri::generate_handler![get_state, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

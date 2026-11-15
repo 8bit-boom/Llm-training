@@ -528,7 +528,9 @@ impl AppModel {
         Ok(json!({
             "runs": exports::exportable_runs(p),
             "exports": exports::list_exports(p),
-            "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+            "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name, "label": exports::quant_label(id, name)})).collect::<Vec<_>>(),
+            "mixed_quants": exports::MIXED_QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name, "label": exports::quant_label(id, name), "mixed": true})).collect::<Vec<_>>(),
+            "mixed": crate::export::mixed::state(p),
             "imatrix": exports::imatrix_state(p),
             "servers": self.settings.ollama_servers,
             "suggested_name": ollama_name(&p.model_label(), ""),
