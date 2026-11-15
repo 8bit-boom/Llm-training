@@ -102,6 +102,15 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("quantcheck_failed", _explain(exc))
             return 1
+    if kind == "mixed_plan":
+        from . import mixedquant
+        try:
+            return mixedquant.run_plan(job)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("mixed_failed", str(exc) if isinstance(exc, ValueError) else _explain(exc))
+            return 1
     if kind == "evaluate":
         from . import evaluatejob
         try:
