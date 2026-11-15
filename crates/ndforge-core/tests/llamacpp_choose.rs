@@ -18,21 +18,22 @@ fn assets(names: &[&str]) -> Vec<Asset> {
     names.iter().map(|n| Asset::new(n, 1_000_000)).collect()
 }
 
-/// A recent release's files (from memory of the project's naming; the real list is in docs/LLAMA_CPP_INSTALL.md under "Not verified yet").
+/// A recent release's files, as llama.cpp's own release-publish workflow names them (the CUDA runtime zips of Windows have no tag in their names, the Linux ones have).
 fn new_style() -> Vec<Asset> {
     assets(&[
-        "llama-b7000-bin-win-cpu-x64.zip", "llama-b7000-bin-win-cpu-arm64.zip", "llama-b7000-bin-win-cuda-12.4-x64.zip", "llama-b7000-bin-win-cuda-13.1-x64.zip", "llama-b7000-bin-win-vulkan-x64.zip",
-        "llama-b7000-bin-win-hip-radeon-x64.zip", "llama-b7000-bin-win-sycl-x64.zip", "llama-b7000-bin-win-opencl-adreno-arm64.zip",
-        "cudart-llama-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-13.1-x64.zip",
-        "llama-b7000-bin-ubuntu-x64.tar.gz", "llama-b7000-bin-ubuntu-vulkan-x64.tar.gz", "llama-b7000-bin-ubuntu-arm64.tar.gz", "llama-b7000-bin-ubuntu-rocm-7.0-x64.tar.gz", "llama-b7000-bin-ubuntu-openvino-x64.tar.gz",
-        "llama-b7000-bin-macos-arm64.tar.gz", "llama-b7000-bin-macos-x64.tar.gz", "llama-b7000-bin-macos-arm64-kleidiai.tar.gz", "llama-b7000-xcframework.zip", "llama-b7000-bin-win-cuda-12.4-x64-ci.zip",
+        "llama-b9000-bin-win-cpu-x64.zip", "llama-b9000-bin-win-cpu-arm64.zip", "llama-b9000-bin-win-cuda-12.4-x64.zip", "llama-b9000-bin-win-cuda-13.5-x64.zip", "llama-b9000-bin-win-cuda-13.5-arm64.zip", "llama-b9000-bin-win-vulkan-x64.zip",
+        "llama-b9000-bin-win-vulkan-arm64.zip", "llama-b9000-bin-win-opencl-adreno-arm64.zip", "llama-b9000-bin-win-openvino-2026.4.1-x64.zip", "llama-b9000-bin-win-sycl-x64.zip", "llama-b9000-bin-win-rocm-10.0-x64.zip",
+        "cudart-llama-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-13.5-x64.zip", "cudart-llama-bin-win-cuda-13.5-arm64.zip",
+        "llama-b9000-bin-ubuntu-x64.tar.gz", "llama-b9000-bin-ubuntu-arm64.tar.gz", "llama-b9000-bin-ubuntu-vulkan-x64.tar.gz", "llama-b9000-bin-ubuntu-vulkan-arm64.tar.gz",
+        "llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz", "cudart-llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz", "llama-b9000-bin-ubuntu-cuda-13.5-x64.tar.gz", "cudart-llama-b9000-bin-ubuntu-cuda-13.5-x64.tar.gz",
+        "llama-b9000-bin-ubuntu-cuda-13.5-arm64.tar.gz", "llama-b9000-bin-ubuntu-rocm-10.0-x64.tar.gz", "llama-b9000-bin-ubuntu-openvino-2026.4.1-x64.tar.gz", "llama-b9000-bin-ubuntu-sycl-fp32-x64.tar.gz", "llama-b9000-bin-ubuntu-sycl-fp16-x64.tar.gz",
+        "llama-b9000-bin-ubuntu-s390x.tar.gz", "llama-b9000-bin-ubuntu-26.04-s390x.tar.gz", "llama-b9000-bin-ubuntu-zdnn-s390x.tar.gz", "llama-b9000-bin-linux-arm64-snapdragon.tar.gz", "llama-b9000-bin-android-arm64.tar.gz", "llama-b9000-bin-android-arm64-snapdragon.tar.gz",
+        "llama-b9000-bin-macos-arm64.tar.gz", "llama-b9000-bin-macos-x64.tar.gz", "llama-b9000-xcframework.zip", "llama-b9000-ui.tar.gz", "llama-b9000-bin-win-cuda-12.4-x64-ci.zip", "nightly-tag.txt",
     ])
 }
 
 fn with_128() -> Vec<Asset> {
-    let mut v = new_style();
-    v.extend(assets(&["llama-b7000-bin-win-cuda-12.8-x64.zip", "cudart-llama-bin-win-cuda-12.8-x64.zip"]));
-    v
+    new_style()
 }
 
 fn old_style() -> Vec<Asset> {
@@ -60,35 +61,40 @@ fn names(c: &Choice) -> Vec<&str> {
 }
 
 #[test]
-fn blackwell_on_windows_needs_cuda_12_8_or_newer_and_gets_its_runtime_files() {
-    let m = win(Some(nv("NVIDIA GeForce RTX 5090", Some((12, 9)), Some((12, 0)))), false);
-    let c = choose(&with_128(), &m, Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), c.cuda_version.as_deref()), ("cuda", Some("12.8")));
-    assert_eq!(names(&c), ["llama-b7000-bin-win-cuda-12.8-x64.zip", "cudart-llama-bin-win-cuda-12.8-x64.zip"]);
-    // a driver that supports CUDA 13 takes the 13.1 build when there is one
-    let m13 = win(Some(nv("NVIDIA GeForce RTX 5090", Some((13, 1)), Some((12, 0)))), false);
-    assert_eq!(choose(&with_128(), &m13, Want::Auto).unwrap().cuda_version.as_deref(), Some("13.1"));
-    // the driver's 12.9 is below the 13.1 build: the highest that fits is 12.8
-    assert_eq!(choose(&with_128(), &win(Some(nv("RTX 5080", Some((12, 9)), Some((12, 0)))), false), Want::Auto).unwrap().cuda_version.as_deref(), Some("12.8"));
+fn blackwell_on_windows_gets_the_13_5_build_when_the_driver_reports_13_and_its_runtime_files() {
+    let m = win(Some(nv("NVIDIA GeForce RTX 5090", Some((13, 0)), Some((12, 0)))), false);
+    let c = choose(&new_style(), &m, Want::Auto).unwrap();
+    assert_eq!((c.backend.as_str(), c.cuda_version.as_deref()), ("cuda", Some("13.5")), "a driver reporting 13.0 runs the 13.5 build (minor-version compatibility)");
+    assert_eq!(names(&c), ["llama-b9000-bin-win-cuda-13.5-x64.zip", "cudart-llama-bin-win-cuda-13.5-x64.zip"]);
+    assert_eq!(choose(&new_style(), &win(Some(nv("RTX 5080", Some((13, 2)), Some((12, 0)))), false), Want::Auto).unwrap().cuda_version.as_deref(), Some("13.5"));
 }
 
 #[test]
-fn blackwell_never_gets_a_cuda_build_older_than_12_8() {
-    let m = win(Some(nv("NVIDIA GeForce RTX 5090", Some((12, 9)), Some((12, 0)))), false);
-    let c = choose(&new_style(), &m, Want::Auto).unwrap(); // only 12.4 and 13.1 exist: 13.1 is above the driver, 12.4 is too old
+fn blackwell_with_a_12_x_driver_gets_vulkan_and_is_told_to_update_the_driver() {
+    for driver in [(12, 9), (12, 8)] {
+        let m = win(Some(nv("NVIDIA GeForce RTX 5090", Some(driver), Some((12, 0)))), false);
+        let c = choose(&new_style(), &m, Want::Auto).unwrap(); // 12.4 is too old for the card, 13.5 needs a newer driver
+        assert_eq!(c.backend, "vulkan", "{driver:?}");
+        assert!(c.notes.iter().any(|n| n.contains("newer NVIDIA driver is needed for the CUDA 13.5 build") && n.contains("12.")), "{:?}", c.notes);
+        assert!(c.notes.iter().any(|n| n.contains("CUDA 12.4 is too old for an RTX 50")), "{:?}", c.notes);
+        let e = choose(&new_style(), &m, Want::Cuda).unwrap_err().0;
+        assert!(e.contains("No CUDA build fits") && e.contains("newer NVIDIA driver"), "{e}");
+    }
+    // a driver too old for any RTX 50 card
+    let old = win(Some(nv("NVIDIA GeForce RTX 5090", Some((12, 4)), Some((12, 0)))), false);
+    let c = choose(&new_style(), &old, Want::Auto).unwrap();
     assert_eq!(c.backend, "vulkan");
-    assert!(c.notes.iter().any(|n| n.contains("too old for an RTX 50") && n.contains("13.1")), "{:?}", c.notes);
-    let e = choose(&new_style(), &m, Want::Cuda).unwrap_err().0;
-    assert!(e.contains("No CUDA build fits") && e.contains("12.8"), "{e}");
+    assert!(c.notes.iter().any(|n| n.contains("newer NVIDIA driver is needed for the CUDA build of this card")), "{:?}", c.notes);
 }
 
 #[test]
-fn an_older_card_gets_the_highest_cuda_not_above_the_driver() {
-    let m = win(Some(nv("NVIDIA GeForce RTX 3080", Some((12, 6)), Some((8, 6)))), false);
-    let c = choose(&with_128(), &m, Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), c.cuda_version.as_deref()), ("cuda", Some("12.4")));
-    let m = win(Some(nv("NVIDIA GeForce RTX 3080", Some((12, 9)), Some((8, 6)))), false);
-    assert_eq!(choose(&with_128(), &m, Want::Auto).unwrap().cuda_version.as_deref(), Some("12.8"));
+fn an_older_card_gets_the_highest_cuda_whose_major_version_the_driver_reports() {
+    let c = |d| choose(&new_style(), &win(Some(nv("NVIDIA GeForce RTX 3080", Some(d), Some((8, 6)))), false), Want::Auto).unwrap();
+    assert_eq!(c((12, 6)).cuda_version.as_deref(), Some("12.4"));
+    assert_eq!(c((12, 2)).cuda_version.as_deref(), Some("12.4"), "the minor version of the driver is not compared");
+    assert_eq!(c((12, 9)).cuda_version.as_deref(), Some("12.4"));
+    let x = c((13, 0));
+    assert_eq!(names(&x), ["llama-b9000-bin-win-cuda-13.5-x64.zip", "cudart-llama-bin-win-cuda-13.5-x64.zip"]);
 }
 
 #[test]
@@ -96,8 +102,8 @@ fn a_driver_older_than_every_cuda_build_falls_back_to_vulkan_then_cpu() {
     let m = win(Some(nv("GeForce GTX 1060", Some((11, 4)), Some((6, 1)))), false);
     let c = choose(&new_style(), &m, Want::Auto).unwrap();
     assert_eq!(c.backend, "vulkan");
-    assert!(c.notes.iter().any(|n| n.contains("newer driver")));
-    let no_vulkan = assets(&["llama-b7000-bin-win-cpu-x64.zip", "llama-b7000-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]);
+    assert!(c.notes.iter().any(|n| n.contains("newer NVIDIA driver")));
+    let no_vulkan = assets(&["llama-b9000-bin-win-cpu-x64.zip", "llama-b9000-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]);
     assert_eq!(choose(&no_vulkan, &m, Want::Auto).unwrap().backend, "cpu");
     // an unreadable driver version: no CUDA guess
     let unknown = win(Some(nv("RTX 4090", None, Some((8, 9)))), false);
@@ -107,8 +113,24 @@ fn a_driver_older_than_every_cuda_build_falls_back_to_vulkan_then_cpu() {
 }
 
 #[test]
+fn linux_with_an_nvidia_card_gets_the_prebuilt_cuda_tar_with_its_runtime_libraries() {
+    let lin = |cuda, cc: (u32, u32)| linux(Some(nv("NVIDIA GeForce RTX", Some(cuda), Some(cc))), true);
+    let c = choose(&new_style(), &lin((12, 8), (8, 9)), Want::Auto).unwrap();
+    assert_eq!((c.backend.as_str(), c.cuda_version.as_deref()), ("cuda", Some("12.8")));
+    assert_eq!(names(&c), ["llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz", "cudart-llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz"]);
+    assert_eq!(choose(&new_style(), &lin((13, 0), (8, 9)), Want::Auto).unwrap().cuda_version.as_deref(), Some("13.5"));
+    assert_eq!(choose(&new_style(), &lin((12, 9), (12, 0)), Want::Auto).unwrap().cuda_version.as_deref(), Some("12.8"), "Blackwell: 12.8 is enough");
+    let old = choose(&new_style(), &lin((11, 8), (7, 5)), Want::Auto).unwrap();
+    assert_eq!(old.backend, "cpu");
+    assert!(old.notes.iter().any(|n| n.contains("newer NVIDIA driver")));
+    // a release whose Linux CUDA build has no runtime tar: the build alone
+    let a = assets(&["llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz", "llama-b9000-bin-ubuntu-x64.tar.gz"]);
+    assert_eq!(names(&choose(&a, &lin((12, 8), (8, 9)), Want::Auto).unwrap()), ["llama-b9000-bin-ubuntu-cuda-12.8-x64.tar.gz"]);
+}
+
+#[test]
 fn a_cuda_build_without_runtime_files_is_skipped_for_the_next_lower_one() {
-    let a = assets(&["llama-b7000-bin-win-cuda-12.4-x64.zip", "llama-b7000-bin-win-cuda-12.8-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip", "llama-b7000-bin-win-cpu-x64.zip"]);
+    let a = assets(&["llama-b9000-bin-win-cuda-12.4-x64.zip", "llama-b9000-bin-win-cuda-12.8-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip", "llama-b9000-bin-win-cpu-x64.zip"]);
     let c = choose(&a, &win(Some(nv("RTX 4090", Some((12, 9)), Some((8, 9)))), false), Want::Auto).unwrap();
     assert_eq!(c.cuda_version.as_deref(), Some("12.4"));
     let blackwell = choose(&a, &win(Some(nv("RTX 5090", Some((12, 9)), Some((12, 0)))), false), Want::Auto).unwrap();
@@ -118,19 +140,19 @@ fn a_cuda_build_without_runtime_files_is_skipped_for_the_next_lower_one() {
 #[test]
 fn no_nvidia_card_gets_vulkan_for_amd_or_intel_and_the_cpu_build_otherwise() {
     let c = choose(&new_style(), &win(None, true), Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), names(&c)), ("vulkan", vec!["llama-b7000-bin-win-vulkan-x64.zip"]));
+    assert_eq!((c.backend.as_str(), names(&c)), ("vulkan", vec!["llama-b9000-bin-win-vulkan-x64.zip"]));
     let c = choose(&new_style(), &win(None, false), Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), names(&c)), ("cpu", vec!["llama-b7000-bin-win-cpu-x64.zip"]));
+    assert_eq!((c.backend.as_str(), names(&c)), ("cpu", vec!["llama-b9000-bin-win-cpu-x64.zip"]));
     // AMD but this release has no Vulkan file
-    let c = choose(&assets(&["llama-b7000-bin-win-cpu-x64.zip"]), &win(None, true), Want::Auto).unwrap();
+    let c = choose(&assets(&["llama-b9000-bin-win-cpu-x64.zip"]), &win(None, true), Want::Auto).unwrap();
     assert_eq!(c.backend, "cpu");
 }
 
 #[test]
 fn extra_files_are_never_chosen() {
-    let a = assets(&["llama-b7000-bin-win-cuda-12.4-x64-ci.zip", "llama-b7000-bin-win-hip-radeon-x64.zip", "llama-b7000-bin-win-sycl-x64.zip", "llama-b7000-bin-win-openvino-x64.zip", "llama-b7000-bin-win-opencl-adreno-arm64.zip", "llama-b7000-xcframework.zip", "llama-b7000-bin-win-cuda-13.1-x64.zip"]);
+    let a = assets(&["llama-b9000-bin-win-cuda-12.4-x64-ci.zip", "llama-b9000-bin-win-hip-radeon-x64.zip", "llama-b9000-bin-win-sycl-x64.zip", "llama-b9000-bin-win-openvino-x64.zip", "llama-b9000-bin-win-opencl-adreno-arm64.zip", "llama-b9000-xcframework.zip", "llama-b9000-bin-win-cuda-13.1-x64.zip"]);
     let e = choose(&a, &win(None, false), Want::Auto).unwrap_err().0;
-    assert!(e.contains("no file for this computer") && e.contains("llama-b7000-xcframework.zip") && e.contains("LLAMA_CPP_DIR"), "{e}");
+    assert!(e.contains("no file for this computer") && e.contains("llama-b9000-xcframework.zip") && e.contains("LLAMA_CPP_DIR"), "{e}");
 }
 
 #[test]
@@ -146,10 +168,11 @@ fn older_names_work_too() {
 }
 
 #[test]
-fn linux_gets_the_cpu_or_vulkan_build_and_cuda_is_a_build_option() {
+fn linux_gets_the_cpu_or_vulkan_build_and_the_source_build_is_an_extra_option() {
     let gpu = nv("RTX 4090", Some((12, 8)), Some((8, 9)));
-    let c = choose(&new_style(), &linux(Some(gpu.clone()), true), Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), names(&c)), ("cpu", vec!["llama-b7000-bin-ubuntu-x64.tar.gz"]));
+    let no_cuda: Vec<Asset> = new_style().into_iter().filter(|a| !a.name.contains("cuda")).collect();
+    let c = choose(&no_cuda, &linux(Some(gpu.clone()), true), Want::Auto).unwrap();
+    assert_eq!((c.backend.as_str(), names(&c)), ("cpu", vec!["llama-b9000-bin-ubuntu-x64.tar.gz"]));
     assert!(c.reason.contains("build one with CUDA"));
     let mut amd = linux(None, false);
     amd.vulkan_likely = true;
@@ -170,7 +193,7 @@ fn linux_gets_the_cpu_or_vulkan_build_and_cuda_is_a_build_option() {
 fn macos_gets_metal_on_apple_silicon_and_the_cpu_build_on_intel() {
     let mac = |arch| Machine::cpu_only(Os::Macos, arch);
     let c = choose(&new_style(), &mac(Arch::Arm64), Want::Auto).unwrap();
-    assert_eq!((c.backend.as_str(), names(&c)), ("metal", vec!["llama-b7000-bin-macos-arm64.tar.gz"])); // not the kleidiai one
+    assert_eq!((c.backend.as_str(), names(&c)), ("metal", vec!["llama-b9000-bin-macos-arm64.tar.gz"])); // not the kleidiai one
     assert_eq!(choose(&new_style(), &mac(Arch::X64), Want::Auto).unwrap().backend, "cpu");
     assert_eq!(choose(&old_style(), &mac(Arch::Arm64), Want::Auto).unwrap().assets[0].name, "llama-b4000-bin-macos-arm64.zip");
     assert!(choose(&new_style(), &mac(Arch::Arm64), Want::Cuda).unwrap().notes[0].contains("no CUDA or Vulkan"));
@@ -178,13 +201,13 @@ fn macos_gets_metal_on_apple_silicon_and_the_cpu_build_on_intel() {
 
 #[test]
 fn a_zip_is_preferred_over_a_tar_gz_of_the_same_build() {
-    let a = assets(&["llama-b7000-bin-ubuntu-x64.tar.gz", "llama-b7000-bin-ubuntu-x64.zip"]);
-    assert_eq!(choose(&a, &linux(None, false), Want::Auto).unwrap().assets[0].name, "llama-b7000-bin-ubuntu-x64.zip");
+    let a = assets(&["llama-b9000-bin-ubuntu-x64.tar.gz", "llama-b9000-bin-ubuntu-x64.zip"]);
+    assert_eq!(choose(&a, &linux(None, false), Want::Auto).unwrap().assets[0].name, "llama-b9000-bin-ubuntu-x64.zip");
 }
 
 #[test]
 fn an_unknown_list_is_a_plain_error_never_a_panic() {
-    for list in [vec![], vec!["README.md", "source.tar.gz", "llama-.zip", "---.zip", "b123.zip"], vec!["llama-b7000-bin-freebsd-x64.zip"], vec!["llama-b7000-bin-win-cuda-x64.zip"]] {
+    for list in [vec![], vec!["README.md", "source.tar.gz", "llama-.zip", "---.zip", "b123.zip"], vec!["llama-b9000-bin-freebsd-x64.zip"], vec!["llama-b9000-bin-win-cuda-x64.zip"]] {
         for m in [win(None, false), linux(None, false), Machine::cpu_only(Os::Macos, Arch::Arm64), Machine::cpu_only(Os::Other, Arch::Other), win(Some(nv("RTX 5090", Some((12, 9)), Some((12, 0)))), true)] {
             for w in [Want::Auto, Want::Cuda, Want::Vulkan, Want::Cpu, Want::Build] {
                 let _ = choose(&assets(&list), &m, w); // must not panic
@@ -298,17 +321,17 @@ fn unpacking_a_tar_gz_refuses_unsafe_names_hard_links_and_reads_long_names() {
     std::fs::write(&z, tar_gz(vec![tar_entry("l", b'1', b"", "ok.txt", 0o644)])).unwrap();
     assert!(unpack(&z, Archive::TarGz, &d.path().join("o2"), &everything, &AtomicBool::new(false)).unwrap_err().0.contains("hard link"));
     // a GNU long name
-    let long = format!("llama-b7000/{}/file.txt", "d".repeat(90));
+    let long = format!("llama-b9000/{}/file.txt", "d".repeat(90));
     let mut long_data = long.clone().into_bytes();
     long_data.push(0);
-    std::fs::write(&z, tar_gz(vec![tar_entry("././@LongLink", b'L', &long_data, "", 0o644), tar_entry("short", b'0', b"hello", "", 0o644), tar_entry("llama-b7000/", b'5', b"", "", 0o755), tar_entry("llama-b7000/run", b'0', b"#!/bin/sh\n", "", 0o755)])).unwrap();
+    std::fs::write(&z, tar_gz(vec![tar_entry("././@LongLink", b'L', &long_data, "", 0o644), tar_entry("short", b'0', b"hello", "", 0o644), tar_entry("llama-b9000/", b'5', b"", "", 0o755), tar_entry("llama-b9000/run", b'0', b"#!/bin/sh\n", "", 0o755)])).unwrap();
     let n = unpack(&z, Archive::TarGz, &d.path().join("o3"), &everything, &AtomicBool::new(false)).unwrap();
     assert_eq!(n.files, 2);
     assert_eq!(std::fs::read(d.path().join("o3").join(&long)).unwrap(), b"hello");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(d.path().join("o3/llama-b7000/run")).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(std::fs::metadata(d.path().join("o3/llama-b9000/run")).unwrap().permissions().mode() & 0o111, 0o111);
     }
     // an incomplete archive is an error, not a half result
     let bytes = std::fs::read(&z).unwrap();

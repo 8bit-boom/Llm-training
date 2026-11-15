@@ -333,20 +333,20 @@ fn not_found_rate_limit_and_offline_have_plain_messages() {
     assert_eq!(failure_code(&c).as_deref(), Some("not_found"));
     old_survived(&c);
     // the API's rate limit: a 403 with a message and the header
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(403, r#"{"message":"API rate limit exceeded for 203.0.113.9."}"#.into(), vec![("x-ratelimit-remaining", "0")]));
+    fake.set(Fake::LIST, Reply::Json(403, r#"{"message":"API rate limit exceeded for 203.0.113.9."}"#.into(), vec![("x-ratelimit-remaining", "0")]));
     let e = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
     assert!(e.contains("limiting how often") && e.contains("hour"), "{e}");
     assert_eq!(failure_code(&c).as_deref(), Some("rate_limit"));
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(429, "{}".into(), vec![]));
+    fake.set(Fake::LIST, Reply::Json(429, "{}".into(), vec![]));
     assert_eq!(run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0.contains("limiting"), true);
     // a 403 that is not the limit
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(403, r#"{"message":"Forbidden by policy"}"#.into(), vec![]));
+    fake.set(Fake::LIST, Reply::Json(403, r#"{"message":"Forbidden by policy"}"#.into(), vec![]));
     let e = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
     assert!(e.contains("refused") && e.contains("Forbidden by policy"), "{e}");
     // a server error, and an answer that is not a release
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(503, "{}".into(), vec![]));
+    fake.set(Fake::LIST, Reply::Json(503, "{}".into(), vec![]));
     assert!(run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0.contains("(503)"));
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, "<html>captive portal</html>".into(), vec![]));
+    fake.set(Fake::LIST, Reply::Json(200, "<html>captive portal</html>".into(), vec![]));
     assert!(run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0.contains("not a release list"));
     // offline: nothing listens there
     let mut off = c.clone();
@@ -377,8 +377,8 @@ fn a_cut_off_download_is_refused() {
     serve_host(&fake, "b6000");
     // the listing promises more bytes than the server sends (what a connection that dropped half way looks like to the size check)
     let bytes = bin_zip("");
-    let body = json!({"tag_name": "b6000", "assets": [{"name": host_asset(), "size": bytes.len() * 2, "browser_download_url": format!("{}/dl/{}", fake.base, host_asset())}]}).to_string();
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, body, vec![]));
+    let body = json!({"tag_name": "b6000", "assets": [{"name": host_asset(), "size": bytes.len() * 2, "browser_download_url": format!("{}/dl/b6000/{}", fake.base, host_asset())}]}).to_string();
+    fake.set(Fake::LIST, Reply::Json(200, format!("[{body}]"), vec![]));
     let c = cfg(d.path(), &fake);
     old_install(&c);
     let e = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
@@ -399,9 +399,9 @@ fn a_wrong_checksum_deletes_the_file_and_refuses_it() {
     assert_eq!(failure_code(&c).as_deref(), Some("checksum"));
     old_survived(&c);
     // no digest in the listing (an older API answer): the download is accepted, its own sha256 is recorded
-    let body = json!({"tag_name": "b6000", "assets": [{"name": host_asset(), "size": bin_zip("").len(), "browser_download_url": format!("{}/dl/{}", fake.base, host_asset())}]}).to_string();
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, body, vec![]));
-    fake.set(&format!("/dl/{}", host_asset()), Reply::Bytes(bin_zip("")));
+    let body = json!({"tag_name": "b6000", "assets": [{"name": host_asset(), "size": bin_zip("").len(), "browser_download_url": format!("{}/dl/b6000/{}", fake.base, host_asset())}]}).to_string();
+    fake.set(Fake::LIST, Reply::Json(200, format!("[{body}]"), vec![]));
+    fake.set(&format!("/dl/b6000/{}", host_asset()), Reply::Bytes(bin_zip("")));
     let info = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap();
     assert_eq!(info["sha256"][host_asset()].as_str().unwrap().len(), 64);
 }
@@ -412,13 +412,13 @@ fn only_github_hosts_are_downloaded_from_even_when_the_release_list_says_otherwi
     let fake = Fake::start();
     let c = cfg(d.path(), &fake);
     let body = json!({"tag_name": "b6000", "assets": [{"name": host_asset(), "size": 10, "browser_download_url": format!("https://evil.example.com/{}", host_asset())}]}).to_string();
-    fake.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, body, vec![]));
+    fake.set(Fake::LIST, Reply::Json(200, format!("[{body}]"), vec![]));
     let e = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
     assert!(e.contains("not one this program downloads from"), "{e}");
     assert_eq!(failure_code(&c).as_deref(), Some("host_not_allowed"));
     // a redirect out of the list is refused too
     serve_host(&fake, "b6000");
-    fake.set(&format!("/dl/{}", host_asset()), Reply::Redirect("https://evil.example.com/x.zip".into()));
+    fake.set(&format!("/dl/b6000/{}", host_asset()), Reply::Redirect("https://evil.example.com/x.zip".into()));
     let e = run(&c, &host(), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
     assert!(e.contains("not one this program downloads from"), "{e}");
 }
@@ -533,4 +533,163 @@ fn the_update_check_is_a_hint_and_installs_nothing() {
     let mut off = c.clone();
     off.api_base = "http://127.0.0.1:1".into();
     assert_eq!(check_update(&off).unwrap_err().code, "offline");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------- release discovery (the owner's first run)
+// llama.cpp publishes every build as a PRERELEASE; GET /releases/latest skips prereleases and answered an unrelated release whose only file is nightly-tag.txt. The installer
+// reads the list of the newest 30 releases instead (the stand-in answers /releases/latest with exactly that unrelated release, so any use of it fails the test).
+
+fn win_files(tag: &str) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = ["bin-win-cpu-x64", "bin-win-cpu-arm64", "bin-win-vulkan-x64", "bin-win-cuda-12.4-x64", "bin-win-cuda-13.5-x64", "bin-win-cuda-13.5-arm64", "bin-win-sycl-x64", "bin-win-opencl-adreno-arm64", "bin-win-openvino-2026.4.1-x64", "bin-win-rocm-10.0-x64"]
+        .iter().map(|s| (format!("llama-{tag}-{s}.zip"), bin_zip(""))).collect();
+    v.push(("cudart-llama-bin-win-cuda-12.4-x64.zip".into(), cudart_zip()));
+    v.push(("cudart-llama-bin-win-cuda-13.5-x64.zip".into(), cudart_zip()));
+    v.push((format!("llama-{tag}-xcframework.zip"), vec![1]));
+    v.push((format!("llama-{tag}-ui.tar.gz"), vec![1]));
+    v
+}
+
+fn refs(v: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
+    v.iter().map(|(n, b)| (n.as_str(), b.clone())).collect()
+}
+
+fn blackwell_windows() -> Machine {
+    Machine { os: Os::Windows, arch: Arch::X64, nvidia: Some(Nvidia { name: "NVIDIA GeForce RTX 5090".into(), driver_cuda: Some((13, 0)), compute_cap: Some((12, 0)), blackwell: true }), vulkan_likely: false, tools: BuildTools { nvcc: false, cmake: false, cxx: false } }
+}
+
+fn count(fake: &Fake, prefix: &str) -> usize {
+    fake.hits.lock().unwrap().iter().filter(|h| h.starts_with(prefix)).count()
+}
+
+#[test]
+fn the_owners_case_installs_from_the_listed_prerelease_not_from_the_unrelated_latest() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let (w1, w0) = (win_files("b9001"), win_files("b9000"));
+    let (r1, r0) = (fake.release_json("b9001", &refs(&w1), &[]), fake.release_json("b9000", &refs(&w0), &[]));
+    fake.serve_tag("b9001", &r1, source());
+    fake.serve_tag("b9000", &r0, source());
+    fake.serve_list(vec![r1, r0]); // /releases/latest answers a release with nightly-tag.txt only
+    let c = cfg(d.path(), &fake);
+    let (res, events) = run(&c, &blackwell_windows(), &opts(Want::Auto), &FakeRunner::default());
+    let info = res.unwrap();
+    assert_eq!((info["tag"].as_str(), info["backend"].as_str(), info["cuda_version"].as_str()), (Some("b9001"), Some("cuda"), Some("13.5")));
+    assert_eq!(info["assets"], json!(["llama-b9001-bin-win-cuda-13.5-x64.zip", "cudart-llama-bin-win-cuda-13.5-x64.zip"]));
+    assert!(info["source_url"].as_str().unwrap().ends_with("/archive/refs/tags/b9001.zip"));
+    let hits = fake.hits.lock().unwrap().clone();
+    assert!(hits.contains(&"/codeload/b9001.zip".to_string()) && hits.contains(&"/dl/b9001/llama-b9001-bin-win-cuda-13.5-x64.zip".to_string()) && hits.contains(&"/dl/b9001/cudart-llama-bin-win-cuda-13.5-x64.zip".to_string()), "{hits:?}");
+    assert!(!hits.iter().any(|h| h.ends_with("/releases/latest")), "latest is never asked");
+    assert!(c.install_dir().join("build/bin/cudart64_12.dll").is_file() && layout_of(&c.install_dir()).is_some());
+    assert!(events.iter().any(|e| e["kind"] == "log" && e["text"].as_str().is_some_and(|t| t.starts_with("Release b9001"))));
+    // the plan says the same before anything is downloaded
+    let p = plan(&c, &blackwell_windows(), &opts(Want::Auto)).unwrap();
+    assert_eq!((p["tag"].as_str(), p["cuda_version"].as_str()), (Some("b9001"), Some("13.5")));
+}
+
+#[test]
+fn a_newest_release_without_a_file_for_this_computer_is_skipped_for_the_next_one() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let only_arm = vec![("llama-b9002-bin-win-cpu-arm64.zip".to_string(), bin_zip("")), ("nightly-tag.txt".to_string(), b"zzz".to_vec())];
+    let w1 = win_files("b9001");
+    let (r2, r1) = (fake.release_json("b9002", &refs(&only_arm), &[]), fake.release_json("b9001", &refs(&w1), &[]));
+    fake.serve_tag("b9002", &r2, source());
+    fake.serve_tag("b9001", &r1, source());
+    // a draft with matching files is never used
+    let mut draft = fake.release_json("b9003", &refs(&win_files("b9003")), &[]);
+    draft["draft"] = json!(true);
+    fake.serve_list(vec![draft, r2, r1]);
+    let c = cfg(d.path(), &fake);
+    let info = run(&c, &Machine::cpu_only(Os::Windows, Arch::X64), &opts(Want::Auto), &FakeRunner::default()).0.unwrap();
+    assert_eq!((info["tag"].as_str(), info["backend"].as_str()), (Some("b9001"), Some("cpu")));
+    assert_eq!(count(&fake, "/dl/b9003"), 0);
+    assert_eq!(count(&fake, "/dl/b9002"), 0);
+}
+
+#[test]
+fn when_no_release_matches_the_error_says_how_many_were_checked_the_newest_and_its_files() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let junk = |t: &str| vec![(format!("llama-{t}-xcframework.zip"), vec![1u8]), (format!("llama-{t}-bin-win-cpu-arm64.zip"), vec![1u8])];
+    let (a, b) = (junk("b9002"), junk("b9001"));
+    let (ra, rb) = (fake.release_json("b9002", &refs(&a), &[]), fake.release_json("b9001", &refs(&b), &[]));
+    fake.serve_list(vec![ra, rb]);
+    let c = cfg(d.path(), &fake);
+    old_install(&c);
+    let e = run(&c, &Machine::cpu_only(Os::Windows, Arch::X64), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
+    assert!(e.contains("None of the 2 newest llama.cpp releases") && e.contains("The newest is b9002") && e.contains("llama-b9002-bin-win-cpu-arm64.zip") && e.contains("llama-b9002-xcframework.zip"), "{e}");
+    assert!(e.contains("docs/LLAMA_CPP_INSTALL.md") && e.contains("LLAMA_CPP_DIR"), "{e}");
+    assert_eq!(failure_code(&c).as_deref(), Some("no_asset"));
+    old_survived(&c);
+    // an empty list
+    fake.set(Fake::LIST, Reply::Json(200, "[]".into(), vec![]));
+    assert!(run(&c, &Machine::cpu_only(Os::Windows, Arch::X64), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0.contains("list of llama.cpp releases is empty"));
+    // the only release is the owner's nightly-tag.txt one
+    let nt = vec![("nightly-tag.txt".to_string(), b"not-a-tag!!".to_vec())];
+    let r = fake.release_json("nightly", &refs(&nt), &[]);
+    fake.set(Fake::LIST, Reply::Json(200, json!([r]).to_string(), vec![]));
+    let e = run(&c, &Machine::cpu_only(Os::Windows, Arch::X64), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
+    assert!(e.contains("None of the 1 newest") && e.contains("nightly-tag.txt"), "{e}");
+}
+
+#[test]
+fn nightly_tag_txt_is_only_a_pointer_that_is_followed_when_it_names_a_real_release() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let w = win_files("b9000");
+    let target = fake.release_json("b9000", &refs(&w), &[]);
+    fake.serve_tag("b9000", &target, source()); // NOT in the list
+    let pointer = |txt: &str| { let f = vec![("nightly-tag.txt".to_string(), txt.as_bytes().to_vec())]; fake.release_json("nightly", &refs(&f), &[]) };
+    let m = Machine::cpu_only(Os::Windows, Arch::X64);
+    let c = cfg(d.path(), &fake);
+    // a pointer to an existing tag
+    fake.set(Fake::LIST, Reply::Json(200, json!([pointer("b9000\n")]).to_string(), vec![]));
+    assert_eq!(run(&c, &m, &opts(Want::Auto), &FakeRunner::default()).0.unwrap()["tag"], "b9000");
+    // a pointer to nothing (the tag address answers 404), junk, an HTML page, something very long: all plain errors, never a crash
+    for txt in ["b8999", "<html>captive portal</html>", "../../etc/passwd", &"b".repeat(400), ""] {
+        fake.set(Fake::LIST, Reply::Json(200, json!([pointer(txt)]).to_string(), vec![]));
+        let e = run(&c, &m, &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
+        assert!(e.contains("None of the 1 newest llama.cpp releases"), "{txt:?}: {e}");
+    }
+    assert!(!fake.hits.lock().unwrap().iter().any(|h| h.contains("..") || h.contains("passwd")), "junk is never turned into a request");
+}
+
+#[test]
+fn a_pinned_tag_is_used_alone_and_a_pin_without_a_file_for_this_computer_says_so() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let w = win_files("b8000");
+    let r = fake.release_json("b8000", &refs(&w), &[]);
+    fake.serve_tag("b8000", &r, source());
+    let newer = win_files("b9000");
+    let rn = fake.release_json("b9000", &refs(&newer), &[]);
+    fake.serve_list(vec![rn]);
+    let mut c = cfg(d.path(), &fake);
+    c.tag_pin = Some("b8000".into());
+    let m = Machine::cpu_only(Os::Windows, Arch::X64);
+    assert_eq!(run(&c, &m, &opts(Want::Auto), &FakeRunner::default()).0.unwrap()["tag"], "b8000");
+    assert!(!fake.hits.lock().unwrap().iter().any(|h| h == Fake::LIST), "the list is not asked when a tag is pinned");
+    let e = run(&c, &Machine::cpu_only(Os::Linux, Arch::X64), &opts(Want::Auto), &FakeRunner::default()).0.unwrap_err().0;
+    assert!(e.contains("The release b8000 has no file for this computer") && e.contains("llama-b8000-bin-win-cpu-x64.zip"), "{e}");
+}
+
+#[test]
+fn linux_with_nvidia_installs_the_prebuilt_cuda_tar_and_its_runtime_libraries_next_to_the_programs() {
+    let d = tempdir().unwrap();
+    let fake = Fake::start();
+    let prog = tar_gz(vec![
+        tar_entry("llama-b9000/", b'5', b"", "", 0o755), tar_entry(&format!("llama-b9000/{}", exe("llama-quantize")), b'0', b"stub", "", 0o755), tar_entry(&format!("llama-b9000/{}", exe("llama-imatrix")), b'0', b"stub", "", 0o755),
+        tar_entry(&format!("llama-b9000/{}", exe("llama-perplexity")), b'0', b"stub", "", 0o755),
+    ]);
+    let rt = tar_gz(vec![tar_entry("cudart-b9000/", b'5', b"", "", 0o755), tar_entry("cudart-b9000/libcudart.so.13", b'0', b"lib", "", 0o644), tar_entry("cudart-b9000/libcudart.so", b'2', b"", "libcudart.so.13", 0o777), tar_entry("cudart-b9000/NOTICE.txt", b'0', b"x", "", 0o644)]);
+    let files = vec![("llama-b9000-bin-ubuntu-x64.tar.gz".to_string(), prog.clone()), ("llama-b9000-bin-ubuntu-cuda-13.5-x64.tar.gz".to_string(), prog), ("cudart-llama-b9000-bin-ubuntu-cuda-13.5-x64.tar.gz".to_string(), rt)];
+    fake.release("b9000", &refs(&files), source(), &[], true);
+    let m = Machine { os: Os::Linux, arch: Arch::X64, nvidia: Some(Nvidia { name: "RTX 5090".into(), driver_cuda: Some((13, 0)), compute_cap: Some((12, 0)), blackwell: true }), vulkan_likely: false, tools: BuildTools { nvcc: false, cmake: false, cxx: false } };
+    let c = cfg(d.path(), &fake);
+    let info = run(&c, &m, &opts(Want::Auto), &FakeRunner::default()).0.unwrap();
+    assert_eq!((info["backend"].as_str(), info["cuda_version"].as_str()), (Some("cuda"), Some("13.5")));
+    let bin = c.install_dir().join("build/bin");
+    assert!(bin.join("libcudart.so.13").is_file() && !bin.join("NOTICE.txt").exists());
+    #[cfg(unix)]
+    assert!(std::fs::symlink_metadata(bin.join("libcudart.so")).unwrap().file_type().is_symlink());
 }

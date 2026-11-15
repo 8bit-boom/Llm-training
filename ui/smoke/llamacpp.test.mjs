@@ -40,9 +40,9 @@ const exportState = (over = {}) => ({ runs: [{ name: "run1", model: "Qwen3.5 9B"
 
 const FOUND = { folder: "C:/Users/me/AppData/Roaming/NDLoreForge/llama.cpp", how: "program_install", how_label: "installed by this program", convert: "x", quantize: "y" };
 const absent = (over = {}) => ({ install_dir: "C:/d/llama.cpp", platform: { os: "windows", arch: "x64" }, installed: null, install_error: null, layout_ok: false, folder_without_record: false, found: null, tools: { imatrix: null, perplexity: null }, converter_found: false, last_failure: null, pinned_tag: null, search_order: [], ...over });
-const installed = (over = {}) => absent({ installed: { tag: "b6000", backend: "cuda", cuda_version: "12.8", installed_at: "2026-11-15T10:00:00+00:00", versions: { "llama-imatrix": "version: 6000 (abc1234)" }, converter_check: "ok" }, layout_ok: true, found: FOUND, converter_found: true,
+const installed = (over = {}) => absent({ installed: { tag: "b6000", backend: "cuda", cuda_version: "13.5", installed_at: "2026-11-15T10:00:00+00:00", versions: { "llama-imatrix": "version: 6000 (abc1234)" }, converter_check: "ok" }, layout_ok: true, found: FOUND, converter_found: true,
   tools: { imatrix: { path: "i", how: "program_install", how_label: "installed by this program" }, perplexity: { path: "p", how: "program_install", how_label: "installed by this program" } }, ...over });
-const PLAN = { tag: "b6000", backend: "cuda", cuda_version: "12.8", reason: "The CUDA 12.8 build: NVIDIA GeForce RTX 5090 and its driver can use it.", notes: [], assets: [{ name: "llama-b6000-bin-win-cuda-12.8-x64.zip", size: 270e6 }, { name: "cudart-llama-bin-win-cuda-12.8-x64.zip", size: 380e6 }], total_bytes: 680e6, total_mb: 680, options: [], gpu: { name: "NVIDIA GeForce RTX 5090", driver_cuda: "12.9", blackwell: true } };
+const PLAN = { tag: "b6000", backend: "cuda", cuda_version: "13.5", reason: "The CUDA 13.5 build: NVIDIA GeForce RTX 5090 and its driver can use it.", notes: [], assets: [{ name: "llama-b6000-bin-win-cuda-13.5-x64.zip", size: 270e6 }, { name: "cudart-llama-bin-win-cuda-13.5-x64.zip", size: 380e6 }], total_bytes: 680e6, total_mb: 680, options: [], gpu: { name: "NVIDIA GeForce RTX 5090", driver_cuda: "12.9", blackwell: true } };
 
 const base = (b, extra = "") => b.run(`state = {project: {name: "P", folder: "/p"}, steps: [], bundle: {world: "W"}, settings: {theme: "light", expert_mode: false}, worlds: [], recent: []}; ${extra}`);
 const setup = (b, status, extra = "") => { base(b, `page = "setup"; env.status = {checks: [], can_install: true, env_installed: true}; lc.status = ${JSON.stringify(status)}; ${extra}`); const h = b.run("renderSetup()"); wired(b); return h; };
@@ -69,8 +69,8 @@ test("the first download is confirmed with its size first: one click, no typing,
   await click(b, ".lc-start");
   assert.deepEqual(b.calls.filter((c) => c[0].startsWith("llamacpp")), [["llamacpp_plan", { backend: "auto", tag: null }]]);
   let html = b.run("renderSetup()"); wired(b);
-  assert.match(html, /Install llama.cpp b6000: NVIDIA \(CUDA 12.8\)\?/); assert.match(html, /downloads about <strong>680 MB<\/strong> from github.com/);
-  assert.match(html, /llama-b6000-bin-win-cuda-12.8-x64.zip<\/code> \(270 MB\)/); assert.match(html, /RTX 5090/);
+  assert.match(html, /Install llama.cpp b6000: NVIDIA \(CUDA 13.5\)\?/); assert.match(html, /downloads about <strong>680 MB<\/strong> from github.com/);
+  assert.match(html, /llama-b6000-bin-win-cuda-13.5-x64.zip<\/code> \(270 MB\)/); assert.match(html, /RTX 5090/);
   assert.match(html, /class="primary lc-go">Download and install \(680 MB\)<\/button>/);
   assert.match(html, /nothing needs administrator rights/);
   assert.equal(b.calls.filter((c) => c[0] === "llamacpp_install").length, 0, "no download before the click");
@@ -113,7 +113,7 @@ test("installed: where it is, how it was found, the release and the versions, an
   const b = browser({ llamacpp_status: installed() });
   let html = section(setup(b, installed()));
   assert.match(html, /Found<\/strong> in <code>C:\/Users\/me\/AppData\/Roaming\/NDLoreForge\/llama.cpp<\/code> \(installed by this program\)/);
-  assert.match(html, /Release <strong>b6000<\/strong>, cuda 12.8, installed 2026-11-15/);
+  assert.match(html, /Release <strong>b6000<\/strong>, cuda 13.5, installed 2026-11-15/);
   assert.match(html, /llama-imatrix: version: 6000 \(abc1234\)/); assert.match(html, /Converter: ok/);
   assert.match(html, /class="secondary lc-remove"/); assert.match(html, /Install again/);
   // a folder of the person's own: found, but not ours: no Remove
@@ -121,10 +121,10 @@ test("installed: where it is, how it was found, the release and the versions, an
   html = section(setup(browser(), own));
   assert.match(html, /\(your LLAMA_CPP_DIR folder\)/); assert.doesNotMatch(html, /lc-remove/);
   // after an install
-  b.run(`onEnvEvent({kind: "done", data: {task: "llamacpp", tag: "b6000", backend: "cuda", cuda_version: "12.8", versions: {"llama-imatrix": "version: 6000 (abc)"}, converter_check: "ok"}})`);
+  b.run(`onEnvEvent({kind: "done", data: {task: "llamacpp", tag: "b6000", backend: "cuda", cuda_version: "13.5", versions: {"llama-imatrix": "version: 6000 (abc)"}, converter_check: "ok"}})`);
   await new Promise((r) => setTimeout(r, 5));
   assert.ok(b.calls.some((c) => c[0] === "llamacpp_status"), "the status is read again");
-  assert.match(section(b.run("renderSetup()")), /llama.cpp b6000 is installed<\/strong> \(cuda 12.8\)/);
+  assert.match(section(b.run("renderSetup()")), /llama.cpp b6000 is installed<\/strong> \(cuda 13.5\)/);
   // remove asks first
   wired(b); b.confirm(false); await click(b, ".lc-remove");
   assert.equal(b.calls.filter((c) => c[0] === "llamacpp_remove").length, 0);

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use self::archive::{find_dir_with, unpack, EntryKind};
 use self::choose::{choose, detect_machine, options, parse_asset, Archive, Asset, Choice, Machine, Os, Want};
-use self::net::{download, fail, fetch_release, source_url, valid_tag};
+use self::net::{download, fail, fetch_release, fetch_releases, fetch_text, source_url, valid_tag, Release};
 use crate::envmgr::process::{run_lines, Stream};
 use crate::error::Error;
 use crate::paths::config_dir;
@@ -502,11 +502,62 @@ pub struct Options {
 /// About how big the source zip is (it is not listed with the release): shown in the size the person confirms.
 pub const SOURCE_ESTIMATE_BYTES: u64 = 30_000_000;
 
+/// How many releases are looked through for a file that fits this computer, and the pointer files (`nightly-tag.txt`) that are followed at most.
+const MAX_POINTERS: usize = 3;
+
+/// The release to install from, and the choice in it. Pinned: that tag only. Otherwise the newest 30 releases (prereleases included: every llama.cpp build is one; `/releases/latest`
+/// would skip them all) are looked through newest first and the first one with a file that fits is taken; a release without one (only `nightly-tag.txt`, or an unfinished upload) is
+/// skipped, not an error. A `nightly-tag.txt` in a release that fits nothing is read as a possible pointer to a tag.
+pub fn select_release(cfg: &Config, machine: &Machine, want: Want, pin: Option<&str>) -> Res<(Release, Choice)> {
+    if let Some(t) = pin {
+        let rel = fetch_release(cfg, t)?;
+        let choice = choose(&rel.assets, machine, want).map_err(|e| fail("no_asset", format!("The release {t} {}", e.0.trim_start_matches("This llama.cpp release "))))?;
+        return Ok((rel, choice));
+    }
+    let list = fetch_releases(cfg)?;
+    if list.is_empty() {
+        return Err(fail("no_asset", "GitHub's list of llama.cpp releases is empty. Try again later, or install llama.cpp by hand (see docs/LLAMA_CPP_INSTALL.md)."));
+    }
+    let mut last_err = String::new();
+    let mut pointers: Vec<String> = Vec::new();
+    for rel in &list {
+        match choose(&rel.assets, machine, want) {
+            Ok(c) => return Ok((rel.clone(), c)),
+            Err(e) => {
+                if last_err.is_empty() { last_err = e.0; }
+                if let Some(a) = rel.assets.iter().find(|a| a.name == "nightly-tag.txt") {
+                    if pointers.len() < MAX_POINTERS {
+                        pointers.push(a.url.clone());
+                    }
+                }
+            }
+        }
+    }
+    for url in pointers {
+        let Ok(text) = fetch_text(cfg, &url) else { continue };
+        let tag = text.trim();
+        if tag.len() > 40 || !valid_tag(tag) || list.iter().any(|r| r.tag == tag) {
+            continue;
+        }
+        if let Ok(rel) = fetch_release(cfg, tag) {
+            if let Ok(c) = choose(&rel.assets, machine, want) {
+                return Ok((rel, c));
+            }
+        }
+    }
+    let newest = &list[0];
+    let mut names: Vec<&str> = newest.assets.iter().map(|a| a.name.as_str()).collect();
+    names.sort();
+    Err(fail("no_asset", format!(
+        "None of the {} newest llama.cpp releases has a file for this computer ({} {}). The newest is {} with these files: {}. {} Install llama.cpp by hand instead (see docs/LLAMA_CPP_INSTALL.md): download a build from https://github.com/ggml-org/llama.cpp/releases and the source, then set the environment variable LLAMA_CPP_DIR to its folder.",
+        list.len(), machine.os.label(), machine.arch.label(), newest.tag, if names.is_empty() { "(none)".to_string() } else { names.join(", ") },
+        if last_err.contains("Building needs") || last_err.contains("Linux only") || last_err.contains("No CUDA build") { last_err.clone() } else { String::new() })))
+}
+
 /// What an install would download, for the confirmation: no file is touched.
 pub fn plan(cfg: &Config, machine: &Machine, opts: &Options) -> Res<Value> {
     let tag = opts.tag.clone().or_else(|| cfg.tag_pin.clone());
-    let rel = fetch_release(cfg, tag.as_deref())?;
-    let choice = choose(&rel.assets, machine, opts.want).map_err(|e| fail("no_asset", e.0))?;
+    let (rel, choice) = select_release(cfg, machine, opts.want, tag.as_deref())?;
     let total: u64 = choice.assets.iter().map(|a| a.size).sum::<u64>() + SOURCE_ESTIMATE_BYTES;
     let opt = options(&rel.assets, machine);
     Ok(json!({
@@ -578,9 +629,8 @@ pub fn install(cfg: &Config, machine: &Machine, opts: &Options, runner: &dyn Run
     let tag_req = opts.tag.clone().or_else(|| cfg.tag_pin.clone());
     em.step("lookup", "Looking up the llama.cpp release on GitHub");
     em.progress("lookup", 0.01, "Looking up the release", None);
-    let rel = fetch_release(cfg, tag_req.as_deref())?;
+    let (rel, choice): (Release, Choice) = select_release(cfg, machine, opts.want, tag_req.as_deref())?;
     check_cancel(cancel)?;
-    let choice: Choice = choose(&rel.assets, machine, opts.want).map_err(|e| fail("no_asset", e.0))?;
     em.log(&format!("Release {}: {} ({})", rel.tag, choice.backend, choice.reason));
     for n in &choice.notes {
         em.log(n);
@@ -631,9 +681,14 @@ pub fn install(cfg: &Config, machine: &Machine, opts: &Options, runner: &dyn Run
     }
     for (a, p) in fetched.iter().filter(|(a, _)| parse_asset(&a.name).cudart) {
         std::fs::create_dir_all(&bin_dir)?;
-        let n = unpack(p, archive_of(a), &bin_dir, &|parts, kind| (*kind == EntryKind::File && parts.last().is_some_and(|l| l.to_lowercase().ends_with(".dll"))).then(|| vec![parts.last().cloned().unwrap_or_default()]), cancel)?;
+        let n = unpack(p, archive_of(a), &bin_dir, &|parts, kind| {
+            let last = parts.last()?.to_lowercase();
+            let lib = last.ends_with(".dll") || last.contains(".so") || last.ends_with(".dylib");
+            let ok = match kind { EntryKind::File => true, EntryKind::Symlink(t) => !t.contains('/') && !t.contains('\\'), EntryKind::Dir => false };
+            (lib && ok).then(|| vec![parts.last().cloned().unwrap_or_default()])
+        }, cancel)?;
         if n.files == 0 {
-            return Err(fail("layout", format!("{} has no DLL files in it. This release may have changed its files.", a.name)));
+            return Err(fail("layout", format!("{} has no runtime library files (.dll / .so) in it. This release may have changed its files.", a.name)));
         }
     }
     em.progress("unpack", 0.8, "Unpacking the converter", None);
@@ -761,7 +816,7 @@ pub fn run_install(cfg: &Config, machine: &Machine, opts: &Options, runner: &dyn
 /// Is there a newer release than the installed one? A hint only (never installs anything).
 pub fn check_update(cfg: &Config) -> Res<Value> {
     let installed = read_info(&cfg.install_dir()).ok().flatten().map(|i| i.tag);
-    let rel = fetch_release(cfg, None)?;
+    let rel = fetch_releases(cfg)?.into_iter().find(|r| r.assets.iter().any(|a| a.name.starts_with("llama-") && parse_asset(&a.name).os.is_some())).ok_or_else(|| fail("no_asset", "GitHub lists no llama.cpp release with program files."))?;
     let newer = installed.as_deref().is_some_and(|i| update_available(i, &rel.tag));
     Ok(json!({"installed": installed, "latest": rel.tag, "newer": newer}))
 }

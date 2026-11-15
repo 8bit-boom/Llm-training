@@ -62,25 +62,44 @@ impl Fake {
         self.routes.lock().unwrap().insert(path.to_string(), r);
     }
 
-    /// Serves a release: `assets` (name, bytes), a source zip, under the real URL shapes of GitHub. `bad_digest` lists the assets whose listed checksum is wrong.
-    pub fn release(&self, tag: &str, assets: &[(&str, Vec<u8>)], source: Vec<u8>, bad_digest: &[&str], latest: bool) {
+    pub const LIST: &'static str = "/repos/ggml-org/llama.cpp/releases";
+
+    /// A release as the API lists it (every llama.cpp build is a prerelease). The asset files are served at /dl/<name>. `bad_digest` lists the assets whose listed checksum is wrong.
+    pub fn release_json(&self, tag: &str, assets: &[(&str, Vec<u8>)], bad_digest: &[&str]) -> Value {
         let list: Vec<Value> = assets.iter().map(|(n, b)| {
-            self.set(&format!("/dl/{n}"), Reply::Bytes(b.clone()));
+            self.set(&format!("/dl/{tag}/{n}"), Reply::Bytes(b.clone()));
             let mut h = Sha256::new();
             h.update(b);
             let mut sum = hex(&h.finalize());
             if bad_digest.contains(n) {
                 sum = "0".repeat(64);
             }
-            json!({"name": n, "size": b.len(), "browser_download_url": format!("{}/dl/{n}", self.base), "digest": format!("sha256:{sum}")})
+            json!({"name": n, "size": b.len(), "browser_download_url": format!("{}/dl/{tag}/{n}", self.base), "digest": format!("sha256:{sum}")})
         }).collect();
-        let body = json!({"tag_name": tag, "assets": list}).to_string();
-        if latest {
-            self.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, body.clone(), vec![]));
-        }
-        self.set(&format!("/repos/ggml-org/llama.cpp/releases/tags/{tag}"), Reply::Json(200, body, vec![]));
+        json!({"tag_name": tag, "prerelease": true, "draft": false, "assets": list})
+    }
+
+    /// The by-tag address and the source zip of a tag.
+    pub fn serve_tag(&self, tag: &str, release: &Value, source: Vec<u8>) {
+        self.set(&format!("/repos/ggml-org/llama.cpp/releases/tags/{tag}"), Reply::Json(200, release.to_string(), vec![]));
         self.set(&format!("/ggml-org/llama.cpp/archive/refs/tags/{tag}.zip"), Reply::Redirect(format!("{}/codeload/{tag}.zip", self.base)));
         self.set(&format!("/codeload/{tag}.zip"), Reply::Bytes(source));
+    }
+
+    /// The list address (`/releases?per_page=30`), and the owner's case on `/releases/latest`: an unrelated release whose only file is nightly-tag.txt.
+    pub fn serve_list(&self, releases: Vec<Value>) {
+        self.set(Self::LIST, Reply::Json(200, Value::Array(releases).to_string(), vec![]));
+        let pointer = json!({"tag_name": "nightly", "prerelease": false, "assets": [{"name": "nightly-tag.txt", "size": 5, "browser_download_url": format!("{}/dl/nightly/nightly-tag.txt", self.base)}]});
+        self.set("/repos/ggml-org/llama.cpp/releases/latest", Reply::Json(200, pointer.to_string(), vec![]));
+    }
+
+    /// One release, listed (and by tag), with its source zip.
+    pub fn release(&self, tag: &str, assets: &[(&str, Vec<u8>)], source: Vec<u8>, bad_digest: &[&str], listed: bool) {
+        let r = self.release_json(tag, assets, bad_digest);
+        if listed {
+            self.serve_list(vec![r.clone()]);
+        }
+        self.serve_tag(tag, &r, source);
     }
 }
 
