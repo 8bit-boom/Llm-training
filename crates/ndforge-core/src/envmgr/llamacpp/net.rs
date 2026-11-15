@@ -132,21 +132,33 @@ pub fn valid_tag(t: &str) -> bool {
     !t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The latest release, or the one named by `tag` (NDFORGE_LLAMA_CPP_TAG).
-pub fn fetch_release(cfg: &Config, tag: Option<&str>) -> std::result::Result<Release, Failure> {
-    let url = match tag {
-        Some(t) => {
-            if !valid_tag(t) {
-                return Err(fail("bad_tag", format!("\"{t}\" is not a release tag (it looks like b6000).")));
-            }
-            format!("{}/repos/ggml-org/llama.cpp/releases/tags/{t}", cfg.api_base)
-        }
-        None => format!("{}/repos/ggml-org/llama.cpp/releases/latest", cfg.api_base),
-    };
-    let resp = get(cfg, &url, true, "application/vnd.github+json")?;
+/// The release named by `tag` (NDFORGE_LLAMA_CPP_TAG, or a pointer from `nightly-tag.txt`).
+pub fn fetch_release(cfg: &Config, tag: &str) -> std::result::Result<Release, Failure> {
+    if !valid_tag(tag) {
+        return Err(fail("bad_tag", format!("\"{tag}\" is not a release tag (it looks like b6000).")));
+    }
+    let resp = get(cfg, &format!("{}/repos/ggml-org/llama.cpp/releases/tags/{tag}", cfg.api_base), true, "application/vnd.github+json")?;
+    let text = resp.into_string().map_err(|e| transport_failure(&e.to_string()))?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| fail("bad_answer", "GitHub's answer was not a release (a proxy page, perhaps). Try again later."))?;
+    parse_release(&v).ok_or_else(|| fail("bad_answer", "GitHub's answer has no release in it. Try again later."))
+}
+
+/// The newest 30 releases, newest first, prereleases included, drafts left out. (`/releases/latest` is NOT used: llama.cpp publishes every build as a prerelease, which
+/// that address never returns; it answered an unrelated release with a single file called nightly-tag.txt.)
+pub fn fetch_releases(cfg: &Config) -> std::result::Result<Vec<Release>, Failure> {
+    let resp = get(cfg, &format!("{}/repos/ggml-org/llama.cpp/releases?per_page=30", cfg.api_base), true, "application/vnd.github+json")?;
     let text = resp.into_string().map_err(|e| transport_failure(&e.to_string()))?;
     let v: Value = serde_json::from_str(&text).map_err(|_| fail("bad_answer", "GitHub's answer was not a release list (a proxy page, perhaps). Try again later."))?;
-    parse_release(&v).ok_or_else(|| fail("bad_answer", "GitHub's answer has no release in it. Try again later."))
+    let arr = v.as_array().ok_or_else(|| fail("bad_answer", "GitHub's answer was not a release list. Try again later."))?;
+    Ok(arr.iter().filter(|r| r["draft"].as_bool() != Some(true)).filter_map(parse_release).collect())
+}
+
+/// A tiny text file (at most 512 bytes) from the allowed hosts.
+pub fn fetch_text(cfg: &Config, url: &str) -> std::result::Result<String, Failure> {
+    let resp = get(cfg, url, false, "text/plain")?;
+    let mut buf = Vec::new();
+    std::io::Read::take(resp.into_reader(), 512).read_to_end(&mut buf).map_err(|e| transport_failure(&e.to_string()))?;
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 pub fn source_url(cfg: &Config, tag: &str) -> String {

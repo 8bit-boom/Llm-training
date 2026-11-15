@@ -260,8 +260,10 @@ fn no_match(assets: &[Asset], what: &str, m: &Machine) -> ChooseError {
          and the source, then set the environment variable LLAMA_CPP_DIR to its folder.", m.os.label(), m.arch.label(), names(assets)))
 }
 
-/// The highest CUDA build this card and driver can use: version <= the driver's, >= 12.8 for Blackwell, with its runtime DLLs on Windows. Err(why not).
-fn pick_cuda<'a>(assets: &'a [Asset], m: &Machine) -> std::result::Result<(Asset, Option<Asset>, (u32, u32)), String> {
+/// The highest CUDA build this card and driver can use. CUDA's minor-version compatibility lets a build run on a driver that reports the same MAJOR version (a driver
+/// reporting 13.0 runs the 13.5 build), so only the major versions are compared; the minor is informational. An RTX 50 card (Blackwell) needs a build and a driver of
+/// CUDA 12.8 or newer. On Windows the matching runtime-files package is required (a version without one is skipped); on Linux it is taken when the release has it.
+fn pick_cuda<'a>(assets: &'a [Asset], m: &Machine) -> std::result::Result<(Asset, Vec<Asset>, (u32, u32)), String> {
     let Some(n) = &m.nvidia else { return Err("no NVIDIA graphics card was found".into()) };
     let Some(driver) = n.driver_cuda else { return Err("the NVIDIA driver's CUDA version could not be read".into()) };
     let mut found: Vec<((u32, u32), &Asset)> = binaries(assets, m.os, m.arch).into_iter().filter_map(|(p, a)| match p.kind { Kind::Cuda(Some(v)) => Some((v, a)), _ => None }).collect();
@@ -270,22 +272,25 @@ fn pick_cuda<'a>(assets: &'a [Asset], m: &Machine) -> std::result::Result<(Asset
     }
     found.sort_by(|a, b| b.0.cmp(&a.0));
     let mut why = Vec::new();
+    if n.blackwell && driver < (12, 8) {
+        why.push(format!("a newer NVIDIA driver is needed for the CUDA build of this card (an RTX 50 card needs a driver for CUDA 12.8 or newer; yours supports CUDA {})", version_text(driver)));
+        return Err(why.join("; "));
+    }
     for (v, a) in &found {
-        if *v > driver {
-            why.push(format!("CUDA {} needs a newer driver than yours (it supports up to CUDA {})", version_text(*v), version_text(driver)));
+        if v.0 > driver.0 {
+            why.push(format!("a newer NVIDIA driver is needed for the CUDA {} build (yours supports CUDA {})", version_text(*v), version_text(driver)));
             continue;
         }
         if n.blackwell && *v < (12, 8) {
             why.push(format!("CUDA {} is too old for an RTX 50 card (CUDA 12.8 or newer is needed)", version_text(*v)));
             continue;
         }
-        if m.os == Os::Windows {
-            match cudart_for(assets, m.os, m.arch, *v) {
-                Some(rt) => return Ok(((*a).clone(), Some(rt.clone()), *v)),
-                None => { why.push(format!("CUDA {} has no runtime-files package in this release", version_text(*v))); continue }
-            }
+        let rt = cudart_for(assets, m.os, m.arch, *v);
+        if m.os == Os::Windows && rt.is_none() {
+            why.push(format!("CUDA {} has no runtime-files package in this release", version_text(*v)));
+            continue;
         }
-        return Ok(((*a).clone(), None, *v));
+        return Ok(((*a).clone(), rt.into_iter().cloned().collect(), *v));
     }
     Err(why.join("; "))
 }
@@ -317,7 +322,7 @@ pub fn choose(assets: &[Asset], m: &Machine, want: Want) -> std::result::Result<
         }
         return Ok(Choice { backend: "build".into(), cuda_version: None, assets: Vec::new(), reason: "Built here from the source with CUDA (takes a long time, 20 minutes or more).".into(), notes });
     }
-    let mk = |backend: &str, a: Asset, extra: Option<Asset>, cuda: Option<(u32, u32)>, reason: String, notes: Vec<String>| {
+    let mk = |backend: &str, a: Asset, extra: Vec<Asset>, cuda: Option<(u32, u32)>, reason: String, notes: Vec<String>| {
         let mut assets = vec![a];
         assets.extend(extra);
         Choice { backend: backend.into(), cuda_version: cuda.map(version_text), assets, reason, notes }
@@ -329,16 +334,16 @@ pub fn choose(assets: &[Asset], m: &Machine, want: Want) -> std::result::Result<
         if matches!(want, Want::Cuda | Want::Vulkan) {
             notes.push("There is no CUDA or Vulkan build for a Mac; the normal one was chosen.".into());
         }
-        return Ok(mk(b, a, None, None, r.into(), notes));
+        return Ok(mk(b, a, Vec::new(), None, r.into(), notes));
     }
     match want {
         Want::Cpu => {
             let a = best_cpu(assets, m).ok_or_else(|| no_match(assets, "a processor-only build", m))?;
-            return Ok(mk("cpu", a, None, None, "The processor-only build, as you chose.".into(), notes));
+            return Ok(mk("cpu", a, Vec::new(), None, "The processor-only build, as you chose.".into(), notes));
         }
         Want::Vulkan => {
             let a = vulkan(assets, m).ok_or_else(|| no_match(assets, "the Vulkan build", m))?;
-            return Ok(mk("vulkan", a, None, None, "The Vulkan build (works with NVIDIA, AMD and Intel cards), as you chose.".into(), notes));
+            return Ok(mk("vulkan", a, Vec::new(), None, "The Vulkan build (works with NVIDIA, AMD and Intel cards), as you chose.".into(), notes));
         }
         Want::Cuda => {
             return match pick_cuda(assets, m) {
@@ -361,12 +366,12 @@ pub fn choose(assets: &[Asset], m: &Machine, want: Want) -> std::result::Result<
     if m.vulkan_likely || (m.nvidia.is_some() && m.os == Os::Windows) {
         if let Some(a) = vulkan(assets, m) {
             let r = if m.nvidia.is_some() { "The Vulkan build (it works with your NVIDIA card; no CUDA build fits)." } else { "The Vulkan build, for your AMD or Intel graphics card." };
-            return Ok(mk("vulkan", a, None, None, r.into(), notes));
+            return Ok(mk("vulkan", a, Vec::new(), None, r.into(), notes));
         }
     }
     let a = best_cpu(assets, m).ok_or_else(|| no_match(assets, "this computer", m))?;
-    let r = if m.os == Os::Linux && m.nvidia.is_some() { "The ready-made Linux build (processor only: there is no ready-made CUDA build for Linux; you can build one with CUDA below)." } else { "The processor-only build (no graphics card that a ready-made build can use was found)." };
-    Ok(mk("cpu", a, None, None, r.into(), notes))
+    let r = if m.os == Os::Linux && m.nvidia.is_some() { "The ready-made Linux build (processor only: no ready-made CUDA build fits, see the notes; you can build one with CUDA from the source in Expert mode)." } else { "The processor-only build (no graphics card that a ready-made build can use was found)." };
+    Ok(mk("cpu", a, Vec::new(), None, r.into(), notes))
 }
 
 fn names_hint(assets: &[Asset]) -> String {
