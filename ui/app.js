@@ -806,7 +806,7 @@ function wireUse() {
 // ------------------------------------------------------------------------------------------- importance matrices (the matrix library)
 // A matrix made on its own (no GGUF export), kept in the project (imatrix/<id>/), reused by exports ("Use a saved matrix" on Step 5) and copied out. docs/IMATRIX.md.
 let im = { state: null, src: "run", run: "", model: "", modelPath: "", gguf: "", tokenizer: "", cal: "data", textFile: "", share: 20, chunks: 128, nextn: true, dat: false, label: "",
-  addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
+  addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", mergePicked: [], mergeFiles: [], mergeFileInput: "", mergePub: false, mergePubBase: "", mergePubInfo: null, mergePubBusy: false, mergePubError: "", mergeLabel: "", mergePub2: false, running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
 
 const IM_INTRO = `<p>An <strong>importance matrix</strong> is a short measurement: the model reads some typical text, and llama.cpp notes how strongly each part of it is used. When the model is later shrunk to about 4 or 5 bits (Q4_K_M, Q5_K_M, Q6_K), the rounding then takes more care of the parts that matter, so the small file loses less quality. For Q8_0 and F16 it does nothing.</p>
   <p class="dim">You can make one here without making any GGUF file, keep it, use it in later exports (Step 5, "Use a saved matrix"), or save a copy to use with <code>llama-quantize</code> on another computer or to share. It needs llama.cpp (<code>llama-imatrix</code>); set <code>LLAMA_CPP_DIR</code> to its folder if the program does not find it.</p>`;
@@ -825,12 +825,20 @@ function imEntryHtml(e) {
   const stats = e.statistics && e.statistics.lines && e.statistics.lines.length ? `<details><summary>What the matrix looks like</summary><ul class="small">${e.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></details>` : "";
   const notes = (e.notes || []).length ? `<p class="dim small">${e.notes.map(esc).join(" ")}</p>` : "";
   const off = im.running || e.in_use;
-  return `<li class="imentry"><strong>${esc(e.label || e.id)}</strong> <span class="dim">${esc(e.id)}</span><br>
+  const parents = e.source_kind === "merged" && (e.parents || []).length ? `<br><span class="dim small">Parents: ${e.parents.map((x) => esc(x.label || x.path) + (x.chunks != null ? ` (${x.chunks} chunks)` : "") + (x.kind === "published" ? ` · from ${esc(x.repo || "the Hub")}` : "")).join(" + ")}</span>` : "";
+  return `<li class="imentry"><label class="opt" title="Tick two or more matrices to merge them (see Merge matrices below)"><input type="checkbox" class="im-pick" value="${esc(e.id)}" ${im.mergePicked.includes(e.id) ? "checked" : ""} ${im.running ? "disabled" : ""}></label> <strong>${esc(e.label || e.id)}</strong> <span class="dim">${esc(e.id)}</span>${e.source_kind === "merged" ? ` <span class="tag">merged</span>` : ""}<br>
     <span class="dim small">Model: ${esc(e.model || "not stated")} · ${e.size_mb} MB · ${e.chunks != null ? e.chunks + " chunks" : "unknown amount of text"} · ${esc(g)} · ${esc(head)} · ${esc(String(e.created || "").slice(0, 10))} · made by ${esc(e.via || "unknown")}${e.has_dat ? " · legacy .dat too" : ""}${e.has_gguf ? "" : " · legacy .dat only"}</span><br>
-    <span class="dim small">Made from: ${esc(e.source || "unknown")}${e.calibration ? " · text: " + esc(e.calibration) : ""}</span>${e.in_use ? ` <span class="warn small">in use right now</span>` : ""}
+    <span class="dim small">Made from: ${esc(e.source || "unknown")}${e.calibration ? " · text: " + esc(e.calibration) : ""}</span>${parents}${e.in_use ? ` <span class="warn small">in use right now</span>` : ""}
     <div class="row"><button class="secondary im-copy" data-id="${esc(e.id)}" ${im.running ? "disabled" : ""}>Save a copy…</button><button class="secondary im-open" data-id="${esc(e.id)}">Open folder</button>
       ${e.has_gguf && !e.has_dat ? `<button class="secondary im-dat" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="llama-imatrix converts the matrix to the old format some tools still read">Make a .dat (legacy)</button>` : ""}
       <button class="secondary im-del" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="${e.in_use ? "A job uses this matrix right now" : "Deletes the matrix from the project"}">Delete</button></div>${copying}${stats}${notes}</li>`;
+}
+
+// the Hugging Face id of the model a new matrix is made from, when the Hub has one ("also merge Unsloth's published matrix" is offered only then)
+function imBase(st) {
+  if (im.src === "run") { const r = (st.runs || []).find((x) => x.name === im.run); return r && r.base ? r.base : ""; }
+  if (im.src === "model") { if (im.model === "__typed") return /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(im.modelPath.trim()) ? im.modelPath.trim() : ""; const m = (st.models || []).find((x) => x.id === im.model); return m && /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(m.repo) ? m.repo : ""; }
+  return /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(im.tokenizer.trim()) ? im.tokenizer.trim() : "";
 }
 
 function imFormHtml(st) {
@@ -866,15 +874,51 @@ function imFormHtml(st) {
       <span class="dim" id="im-est">${est ? `${est.tokens.toLocaleString("en")} tokens, about ${est.gpu_minutes} min on a graphics card (up to ${est.cpu_minutes} min on the processor)${im.src !== "gguf" ? ", plus the time to convert the model" : ""}: a rough guess, the log shows the real progress` : ""}</span></div>
     <div class="row"><label class="opt" title="If the model has a speculative-decoding head (MTP) and your llama-imatrix has --nextn, the head is measured too; otherwise it is left out and the result says so"><input type="checkbox" id="im-nextn" ${im.nextn ? "checked" : ""}> Include the speculative-decoding head (MTP) if the model has one</label>
       <label class="opt"><input type="checkbox" id="im-dat" ${im.dat ? "checked" : ""}> Also make a legacy .dat file</label></div>
-    <div class="row"><label>Label <input type="text" id="im-label" value="${esc(im.label)}" maxlength="80" placeholder="for example: Q4 test with my own text"></label></div>`;
+    <div class="row"><label>Label <input type="text" id="im-label" value="${esc(im.label)}" maxlength="80" placeholder="for example: Q4 test with my own text"></label></div>
+    ${imBase(st) ? `<div class="row"><label class="opt" title="After the matrix is made, a second entry is made by merging it with the matrix Unsloth published for ${esc(imBase(st))}"><input type="checkbox" id="im-mergepub2" ${im.mergePub2 ? "checked" : ""}> Also merge Unsloth's published matrix for the base model (${esc(imBase(st))})</label></div>
+      ${im.mergePub2 ? `<p class="dim small">A second entry is made after yours (yours is kept). It downloads the published matrix from the Hub, adds its statistics to yours (a large published matrix can outweigh a small one of your own), and describes the unmodified base model. If the download or the merge fails, your matrix is kept and the reason is shown.</p>` : ""}` : ""}`;
   const incomplete = im.src === "run" ? !runs.length : im.src === "model" ? (im.model === "__typed" ? !im.modelPath.trim() : !im.model) : !im.gguf.trim();
   const calMissing = im.cal === "text" ? !im.textFile.trim() : st.data_version == null;
   const why = !st.env_ready && im.src !== "gguf" ? "The training software is not installed yet (Training setup)." : incomplete ? "Choose the model first." : calMissing ? (im.cal === "text" ? "Choose the text file." : "Save a version of the training data first.") : blocked;
-  const prog = im.running ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="llama.cpp is stopped at once; nothing is kept">Stop</button>` : "";
+  const prog = im.running && im.pending === "create" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="llama.cpp is stopped at once; nothing is kept">Stop</button>` : "";
   return `<div class="card wide"><h2>Create a matrix</h2>
     <div class="row"><label>The model comes from <select id="im-src" ${im.running ? "disabled" : ""}>${srcOpts}</select></label></div>${src}${cal}${chunks}
     ${why ? `<p class="dim small" id="im-why">${esc(why)}</p>` : ""}
     <div class="row"><button class="primary" id="im-create" ${im.running || why ? "disabled" : ""}>Create the matrix</button></div>${prog}</div>`;
+}
+
+// "Merge matrices": the ticked matrices of the library, files, and/or Unsloth's published matrix for a base model, combined by llama-imatrix into a new entry. docs/IMATRIX.md.
+function imMergeHtml(st) {
+  const bases = st.published_bases || [];
+  if (!im.mergePubBase && bases.length) im.mergePubBase = bases[0].repo;
+  const info = im.mergePubInfo;
+  const pubInfo = im.mergePubBusy ? `<p class="dim small">Looking it up on the Hub…</p>` : im.mergePubError ? `<div class="warn small" id="im-pub-error">${esc(im.mergePubError)}</div>`
+    : info ? `<div class="small" id="im-pub-info"><strong>${esc(info.repo)}</strong> · file <code>${esc(info.file)}</code> · ${info.size != null ? (info.size / 1048576).toFixed(1) + " MB" : "size not stated"}${info.gated ? " · <strong>gated</strong>" : " · not gated"}<br>
+      ${info.cached ? `Already downloaded: <code>${esc(info.cache_file)}</code> (nothing will be downloaded).` : `<strong>This merge downloads ${info.size != null ? (info.size / 1048576).toFixed(1) + " MB" : "the file"} from huggingface.co</strong> into this project's <code>imatrix_downloads</code> folder, once; nothing else is downloaded.`}
+      Source: <code>${esc(info.page)}</code></div>` : "";
+  const files = im.mergeFiles.map((f, i) => `<li><span>${esc(f)}</span> <button class="link im-unmergefile" data-i="${i}">Remove</button></li>`).join("");
+  const n = im.mergePicked.length + im.mergeFiles.length + (im.mergePub ? 1 : 0);
+  const why = !st.env_ready ? "The merge runs in the training software's worker, which is not set up yet (open Training setup)." : n < 2 ? "Tick two or more matrices above, or add a file, or use Unsloth's published matrix: a merge needs at least two things." : im.mergePub && !im.mergePubBase ? "Choose the base model." : "";
+  const prog = im.running && im.pending === "merge" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
+  return `<div class="card wide" id="im-merge"><h2>Merge matrices</h2>
+    <p>Combine two or more matrices into a new one: matrices of your own (tick them in the list above), matrix files, and/or <strong>Unsloth's published matrix</strong> for the base model. llama.cpp (<code>llama-imatrix --in-file a --in-file b</code>) does it; the matrices you merge are not changed.</p>
+    <div class="warn small"><strong>What merging does, honestly.</strong> Merging <em>adds</em> the statistics of the matrices. A matrix measured on more text therefore outweighs a smaller one: a large published matrix can drown a small one of your own (make yours with more chunks if you want it to count). And Unsloth's published matrix describes the <em>unmodified base model</em>, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model. Matrices are checked against each other from their headers; a mismatch is a warning, and if llama-imatrix refuses, its own message is shown.</div>
+    <p class="dim small" id="im-merge-count">${im.mergePicked.length} ticked in the list${im.mergeFiles.length ? ` · ${im.mergeFiles.length} file(s)` : ""}${im.mergePub ? " · the published matrix" : ""}.</p>
+    <ul class="exlist">${files}</ul>
+    <div class="row"><label>Add a matrix file <input type="text" id="im-mergefile" value="${esc(im.mergeFileInput)}" placeholder="C:\\matrices\\imatrix.gguf" style="min-width:300px"></label><button class="secondary" id="im-mergefileadd">Add</button><button class="secondary" id="im-mergefilebrowse">Browse…</button></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="im-mergepub" ${im.mergePub ? "checked" : ""} ${bases.length ? "" : "disabled"}> Also use Unsloth's published matrix for the base model</label>
+      ${im.mergePub && bases.length ? `<label>Base model <select id="im-mergepubbase">${bases.map((b) => `<option value="${esc(b.repo)}" ${im.mergePubBase === b.repo ? "selected" : ""}>${esc(b.label)}</option>`).join("")}</select></label><button class="secondary" id="im-pub-lookup" ${im.mergePubBusy ? "disabled" : ""}>Look it up</button>` : ""}</div>
+    ${bases.length ? "" : `<p class="dim small">No base model on the Hugging Face Hub is known in this project yet (train a run on a model of the list first).</p>`}
+    ${im.mergePub ? `<p class="dim small">The repository is named the way Unsloth's own code does it: <code>unsloth/&lt;model name&gt;-GGUF</code>, file <code>imatrix_unsloth.gguf</code> (or <code>.dat</code>). It is downloaded from the Hub, so this one step needs the internet; offline, not found and gated are explained in plain words.</p>${pubInfo}` : ""}
+    <div class="row"><label>Label <input type="text" id="im-mergelabel" value="${esc(im.mergeLabel)}" maxlength="80" placeholder="for example: mine + Unsloth's"></label></div>
+    ${why ? `<p class="dim small" id="im-merge-why">${esc(why)}</p>` : ""}
+    <div class="row"><button class="primary" id="im-merge-go" ${im.running || why ? "disabled" : ""}>Merge</button></div>${prog}</div>`;
+}
+
+function imMergeSpec() {
+  const inputs = im.mergePicked.map((id) => ({ kind: "library", id })).concat(im.mergeFiles.map((file) => ({ kind: "file", file })));
+  if (im.mergePub) inputs.push({ kind: "published", base: im.mergePubBase });
+  return { inputs, label: im.mergeLabel.trim() };
 }
 
 function renderImatrix() {
@@ -889,15 +933,19 @@ function renderImatrix() {
     ${im.addOpen ? `<div class="row"><label>Label <input type="text" id="im-addlabel" value="${esc(im.addLabel)}" maxlength="80" placeholder="for example: from my friend"></label><button class="secondary" id="im-addfile">Choose the matrix file…</button><button class="link" id="im-addcancel">Cancel</button></div>
       <p class="dim small">A .gguf matrix (the current format) or a legacy .dat file. It is copied into the library of this project. Matrices that exports saved next to their GGUF files are not moved: "Add to library" copies one in.</p>` : ""}`;
   const r = im.result;
-  const result = r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
-      ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>` : "";
+  const mergedPart = r && r.merged && r.merged.entry ? `<div class="ok" id="im-merged-result"><strong>Also merged with Unsloth's published matrix:</strong> ${esc(r.merged.entry.label || r.merged.entry.id)} (${r.merged.entry.size_mb} MB). Your own matrix is kept as well.${(r.merged.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}</div>` : r && r.merge_error ? `<div class="warn" id="im-merge-error">${esc(r.merge_error)}</div>` : "";
+  const mergeResult = r && r.kind === "merge" && r.entry ? `<div class="ok" id="im-merge-result"><strong>Merged matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB). It is in the list above and can be used in exports and in Compare quants like any other.</div>
+      ${(r.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
+      ${(r.weights || []).length ? `<ul class="small">${r.weights.map((w) => `<li>${esc(w.label)}: ${w.chunks != null ? w.chunks + " chunks" : "amount of text unknown"}${w.share != null ? ` · about ${Math.round(w.share * 100)} % of the merged statistics` : ""}</li>`).join("")}</ul>` : ""}` : "";
+  const result = mergeResult || (r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
+      ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>${mergedPart}` : "");
   const msg = `${im.error ? `<div class="err">${esc(im.error)}</div>` : ""}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
   const log = im.log.length ? `<details><summary>Log</summary><pre class="log">${im.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
   const prog = im.running && im.pending === "dat" ? `<div class="stepline">${esc(im.step)}</div> <button class="secondary" id="im-stop">Stop</button>` : "";
   return `<h1>Importance matrices</h1><p class="lead">Measure which parts of a model matter most, keep the result, and use it for better small GGUF files.</p>
     <div class="card wide"><h2>What it is</h2>${IM_INTRO}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
     <div class="card wide"><h2>Your matrices</h2>${list}${add}${prog}</div>
-    ${imFormHtml(st)}${msg}${result}${log}`;
+    ${imMergeHtml(st)}${imFormHtml(st)}${msg}${result}${log}`;
 }
 
 async function imRefresh() {
@@ -909,7 +957,7 @@ function imSpec() {
   const model = im.model === "__typed" ? { path: im.modelPath.trim() } : { model: im.model };
   const source = im.src === "run" ? { kind: "run", run: im.run } : im.src === "model" ? { kind: "model", ...model } : { kind: "gguf", file: im.gguf.trim(), tokenizer: im.tokenizer.trim() || null };
   return { source, calibration: im.cal, text_file: im.cal === "text" ? im.textFile.trim() : null, general: im.cal === "data" && im.share > 0 ? gcSource("imatrix") : null,
-    general_share: im.cal === "data" ? im.share / 100 : null, chunks: im.chunks, nextn: im.nextn, dat: im.dat, label: im.label.trim() };
+    general_share: im.cal === "data" ? im.share / 100 : null, chunks: im.chunks, nextn: im.nextn, dat: im.dat, label: im.label.trim(), ...(im.mergePub2 && im.state && imBase(im.state) ? { merge_published: true } : {}) };
 }
 
 function onImatrixEvent(p) {
@@ -919,11 +967,12 @@ function onImatrixEvent(p) {
     im.running = false; im.progress = null; im.step = "";
     const d = p.data || {};
     if (im.pending === "dat") im.ok = "The legacy .dat file was made.";
+    else if (im.pending === "merge") { im.result = { ...d, kind: "merge" }; im.ok = null; im.mergePicked = []; im.mergeFiles = []; im.mergeLabel = ""; }
     else { im.result = d; im.ok = null; im.label = ""; }
     imRefresh();
   } else if (p.kind === "error") {
     im.running = false; im.progress = null; im.step = "";
-    im.error = p.text === "Cancelled." ? "Cancelled. Nothing was kept." : p.text;
+    im.error = p.text === "Cancelled." ? (im.pending === "create" ? "Cancelled. Nothing was kept." : "Cancelled. Nothing was kept; the matrices you merge are unchanged.") : p.text;
     imRefresh();
   }
   if (page === "imatrix") render();
@@ -953,6 +1002,21 @@ function wireImatrix() {
   pick("im-textbrowse", "textFile", false, "Choose a text file", [{ name: "Text", extensions: ["txt", "text", "md"] }, { name: "All files", extensions: ["*"] }]);
   if (im.cal === "data" && im.share > 0) gcWire("imatrix", render);
   on("im-create", () => imRun("create", "imatrix_create", { spec: imSpec() }));
+  const m2 = $("im-mergepub2"); if (m2) m2.onchange = () => { im.mergePub2 = m2.checked; render(); };
+  document.querySelectorAll(".im-pick").forEach((c) => c.onchange = () => { im.mergePicked = [...document.querySelectorAll(".im-pick")].filter((x) => x.checked).map((x) => x.value); render(); });
+  document.querySelectorAll(".im-unmergefile").forEach((b) => b.onclick = () => { im.mergeFiles.splice(Number(b.dataset.i), 1); render(); });
+  const mf = $("im-mergefile"); if (mf) mf.onchange = () => { im.mergeFileInput = mf.value; };
+  on("im-mergefileadd", () => { const v = ($("im-mergefile") ? $("im-mergefile").value : im.mergeFileInput).trim(); if (v && !im.mergeFiles.includes(v)) im.mergeFiles.push(v); im.mergeFileInput = ""; render(); });
+  on("im-mergefilebrowse", async () => { const f = await tauri.dialog.open({ multiple: false, title: "Choose an importance matrix file", filters: [{ name: "Importance matrix", extensions: ["gguf", "dat"] }, { name: "All files", extensions: ["*"] }] }); if (f && !im.mergeFiles.includes(f)) { im.mergeFiles.push(f); render(); } });
+  const mp = $("im-mergepub"); if (mp) mp.onchange = () => { im.mergePub = mp.checked; im.mergePubInfo = null; im.mergePubError = ""; render(); };
+  const mb = $("im-mergepubbase"); if (mb) mb.onchange = () => { im.mergePubBase = mb.value; im.mergePubInfo = null; im.mergePubError = ""; render(); };
+  const ml = $("im-mergelabel"); if (ml) ml.onchange = () => { im.mergeLabel = ml.value; };
+  on("im-pub-lookup", async () => {
+    im.mergePubBusy = true; im.mergePubError = ""; im.mergePubInfo = null; render();
+    try { im.mergePubInfo = await invoke("imatrix_published", { base: im.mergePubBase }); } catch (e) { im.mergePubError = String(e); }
+    im.mergePubBusy = false; render();
+  });
+  on("im-merge-go", () => imRun("merge", "imatrix_merge", { spec: imMergeSpec() }));
   on("im-stop", () => invoke("imatrix_stop"));
   on("im-tostep5", () => go("use"));
   // the list

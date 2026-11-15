@@ -210,6 +210,8 @@ fn help_pages_render() {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));
+    let m = help_markdown("imatrix");
+    assert!(m.contains("Merge matrices") && m.contains("adds the statistics") && m.contains("unmodified base model") && m.contains("imatrix_downloads") && m.contains("**size**") && !m.contains("UD-") && !m.contains("Dynamic"));
     let q = help_markdown("quantcheck");
     assert!(!q.contains("No help text") && q.contains("proxy") && q.contains("llama-perplexity") && q.contains("LLAMA_CPP_DIR") && q.contains("Lower left is better") && q.contains("Compare these sizes") && !q.contains("UD-"));
     assert!(help_html("nope").contains("No help text"));
