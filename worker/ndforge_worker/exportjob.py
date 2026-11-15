@@ -1,7 +1,7 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
 Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
-keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
+mixed_fit (optional {"target_gb", "matrix": a matrix file}: the target of the size "mixed_fit", see mixedquant.py), keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
 imatrix (optional: the importance matrix for the sizes below q8_0, see imatrix.py. It is measured with llama.cpp's llama-imatrix; the GGUF is then made by Unsloth (its
 save_pretrained_gguf(imatrix_file=...)) when the installed build can apply a matrix, else the llama.cpp way. Result: `imatrix` with made / reused / applied / not_applied / notes / file / nextn / via;
 and `via` ("unsloth" | "llama.cpp") for the GGUF step of every export)."""
@@ -13,10 +13,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backends, imatrix, protocol, vision
+from . import backends, imatrix, mixedquant, protocol, vision
 from .families import default_non_thinking
 
-QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
+QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16") + mixedquant.MIXED_IDS      # the last ones are "Mixed precision (our own recipe)": llama.cpp only, see mixedquant.py
 
 
 def find_llama_cpp():
@@ -102,7 +102,38 @@ def merge_hf(cfg, merged: Path):
     patch_template_dir(merged, cfg["base"]["family"])
 
 
-def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = None) -> dict:
+def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, report, im, mixed_report: dict):
+    """One mixed-precision size ("Mixed precision (our own recipe)", mixedquant.py): llama-quantize with the preset's base type, `--output-tensor-type`, `--token-embedding-type`
+    and its ordered `--tensor-type REGEX=TYPE` rules, with the importance matrix when there is one (and once more without it when llama-quantize refuses it, as for the other sizes)."""
+    fit_cfg = cfg.get("mixed_fit") or {}
+    try:
+        info = mixedquant.for_export(quant, f16, fit_cfg, fit_cfg.get("matrix") or (str(matrix) if matrix is not None else None))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"The 16-bit GGUF could not be read to plan the mixed-precision size ({exc}).")
+    for n in info["notes"]:
+        protocol.log(n)
+    tail = info["flags"] + [f16, final, info["base"]]
+    base = imatrix.launcher(quantize)
+    used = False
+    if matrix is not None:
+        rc, _ = imatrix.run_streaming(base + ["--imatrix", matrix] + tail, im, 1, None)
+        if rc == 0 and final.is_file():
+            report["applied"].append(quant)
+            used = True
+        else:
+            msg = f"llama-quantize did not accept the importance matrix for {info['label']} (exit code {rc}); that size was made without it."
+            report["notes"].append(msg)
+            report["not_applied"][quant] = "llama-quantize refused the matrix"
+            protocol.log(msg)
+            final.unlink(missing_ok=True)
+    if not used:
+        _run(base + tail, f"The quantisation ({info['label']})")
+    mixed_report[quant] = {"id": info["id"], "requested": quant, "label": info["label"], "recipe": mixedquant.LABEL, "base": info["base"], "embd": info["embd"], "output": info["output"], "rules": info["rules"],
+                           "estimate": {k: info["estimate"][k] for k in ("bytes", "gb", "bpw", "unmatched", "dead_rules")}, "notes": info["notes"], "fit": info.get("fit"), "matrix_used": used,
+                           "actual_bytes": final.stat().st_size if final.is_file() else None}
+
+
+def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = None, mixed_report: dict = None) -> dict:
     """Converts once to f16, then makes every wanted size from it. Returns {quant: file}. With cfg["imatrix"] and a `report` dict (see new_report) the
     importance matrix is made (or reused) after the conversion and given to every size below q8_0; the report says what happened. Raises imatrix.Stopped on Stop."""
     quants = [quants] if isinstance(quants, str) else list(quants)
@@ -124,6 +155,10 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
                 raise imatrix.Stopped()
             final = out / f"model-{quant}.gguf"
             protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}")
+            if quant in mixedquant.MIXED_IDS:
+                _make_mixed(cfg, quantize, f16, final, quant, matrix, report, im, mixed_report if mixed_report is not None else {})
+                files[quant] = final
+                continue
             if matrix is not None and quant in imatrix.NO_IMATRIX:
                 report["not_applied"][quant] = "high precision: the matrix would change almost nothing"
             if matrix is not None and quant not in imatrix.NO_IMATRIX:
@@ -308,7 +343,21 @@ def run(cfg: dict) -> int:
     report = new_report() if (cfg.get("imatrix") and cfg["imatrix"].get("enabled", True) and cfg.get("gguf", True)) else None
     if report is None:
         cfg = {k: v for k, v in cfg.items() if k != "imatrix"}
-    use_unsloth, unsloth_matrix = plan_gguf(backend, cfg, quants, report, lambda: unsloth_can_apply_imatrix(installed_save_fn()))
+    mixed_info, mixed_notes = {}, []
+    if backend == "unsloth" and cfg.get("gguf", True) and any(q in mixedquant.MIXED_IDS for q in quants):
+        # Unsloth's save_pretrained_gguf cannot give single tensors their own types, which a mixed-precision size is made of: the whole batch goes the llama.cpp way (a second pass
+        # through Unsloth for the plain sizes would merge the model again)
+        if find_llama_cpp()[0] is None:
+            raise RuntimeError("The mixed-precision sizes need llama.cpp (convert_hf_to_gguf.py and llama-quantize): Unsloth cannot give single tensors their own types. Install it from "
+                               "https://github.com/ggml-org/llama.cpp and set LLAMA_CPP_DIR, or choose only the plain sizes.")
+        mixed_notes.append("The mixed-precision sizes need llama-quantize's per-tensor types, which Unsloth's export cannot do, so this export was made with llama.cpp (convert, then llama-quantize)"
+                           + (" for every size." if len(quants) > len([q for q in quants if q in mixedquant.MIXED_IDS]) else "."))
+        protocol.log(mixed_notes[-1])
+        use_unsloth, unsloth_matrix = False, False
+        if report is not None:
+            report["via"] = "llama.cpp"
+    else:
+        use_unsloth, unsloth_matrix = plan_gguf(backend, cfg, quants, report, lambda: unsloth_can_apply_imatrix(installed_save_fn()))
     matrix_file = None
     if use_unsloth and unsloth_matrix:
         matrix_file = matrix_for_unsloth(cfg, merged, out, quants, report)
@@ -375,7 +424,7 @@ def run(cfg: dict) -> int:
         else:
             merge_hf(cfg, merged)
         if cfg.get("gguf", True):
-            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants, **({} if report is None else {"report": report}))
+            ggufs = gguf_with_llama_cpp(cfg, merged, out, quants, **({} if report is None else {"report": report}), **({"mixed_report": mixed_info} if any(q in mixedquant.MIXED_IDS for q in quants) else {}))
             gguf_path = ggufs[quant]
     mmproj, vnote, mods = None, "", []
     if gguf_path and cfg.get("vision", True):
@@ -406,7 +455,7 @@ def run(cfg: dict) -> int:
         report["via"] = via
     summary = {"gguf": str(gguf_path) if gguf_path else None, "via": via, "ggufs": {q: str(f) for q, f in ggufs.items()}, "mmproj": str(mmproj) if mmproj else None, "modalities": mods, "vision_note": vnote, "merged_dir": str(merged) if merged.exists() else None, "full_model": bool(full_model), "quant": quant, "backend": backend,
                "size_mb": round(gguf_path.stat().st_size / 1048576, 1) if gguf_path else None, "note": note,
-               "imatrix": dict(report, note=" ".join(report["notes"])) if report is not None else None}
+               "imatrix": dict(report, note=" ".join(report["notes"])) if report is not None else None, "mixed": mixed_info or None, "mixed_notes": mixed_notes}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
     return 0

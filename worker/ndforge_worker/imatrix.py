@@ -545,10 +545,12 @@ def stop_requested(im: dict) -> bool:
     return bool(im.get("stop_file")) and os.path.exists(im["stop_file"])
 
 
-def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix", span=(0.0, 1.0), tail_len: int = 40, log_tail: bool = True):
+def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix", span=(0.0, 1.0), tail_len: int = 40, log_tail: bool = True, what: str = "Measuring which weights matter most",
+                  marker: str = r"\[(\d+)\]"):
     """Runs a tool and returns (exit code, last output lines). Output is read on a thread so that the STOP file is seen at once: it kills the tool (Stopped).
     Progress (unless label is None): the chunk markers "[12]" llama-imatrix prints, else a heartbeat with the elapsed time; `span` is the part of the bar this call fills
-    (the matrix library's job shares the bar with the model conversion). The last `tail_len` lines of the output are returned and, with `log_tail`, go to the log."""
+    (the matrix library's job shares the bar with the model conversion). The last `tail_len` lines of the output are returned and, with `log_tail`, go to the log.
+    `what` is the progress text and `marker` the regular expression whose first group is the number of the chunk a line reports (other tools, such as the quant comparison, use their own)."""
     protocol.log("$ " + " ".join(str(c) for c in cmd))
     proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     lines: queue.Queue = queue.Queue()
@@ -562,7 +564,7 @@ def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix", span=(0.0, 
     tail: deque = deque(maxlen=tail_len)
     t0, beat, seen = time.time(), 0.0, 0
     if label:
-        protocol.progress(label, span[0], "Measuring which weights matter most")
+        protocol.progress(label, span[0], what)
     try:
         while True:
             if stop_requested(im):
@@ -572,12 +574,12 @@ def run_streaming(cmd: list, im: dict, chunks: int, label="imatrix", span=(0.0, 
             except queue.Empty:
                 if label and time.time() - beat >= HEARTBEAT and not seen:
                     beat = time.time()
-                    protocol.progress(label, span[0], f"Measuring which weights matter most ({int(beat - t0)} s)")
+                    protocol.progress(label, span[0], f"{what} ({int(beat - t0)} s)")
                 continue
             if line is None:
                 break
             tail.append(line)
-            marks = [int(m) for m in re.findall(r"\[(\d+)\]", line)]
+            marks = [int(m) for m in re.findall(marker, line)]
             if label and marks and max(marks) > seen:
                 seen = max(marks)
                 protocol.progress(label, span[0] + (span[1] - span[0]) * min(seen / max(chunks, 1), 0.99), f"Chunk {seen} of {chunks}")

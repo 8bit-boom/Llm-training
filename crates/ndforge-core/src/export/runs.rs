@@ -22,6 +22,41 @@ pub const QUANTS: [(&str, &str); 5] = [
     ("f16", "F16: the original precision (very large)"),
 ];
 
+/// The mixed-precision sizes ("Mixed precision (our own recipe)", docs/MIXED_QUANTS.md): the recipes are in ONE table in the worker (`worker/ndforge_worker/mixedquant.py`); the ids and
+/// the labels here must say the same (a worker test reads this file and checks). Made through llama.cpp only (per-tensor types); never called anything else.
+pub const MIXED_QUANTS: [(&str, &str); 4] = [
+    ("mixed_4", "Mixed 4-bit (balanced) · Mixed precision (our own recipe): about 5 bits per weight"),
+    ("mixed_3", "Mixed 3-bit (small) · Mixed precision (our own recipe): about 4 bits per weight"),
+    ("mixed_2", "Mixed 2-bit (smallest: short answers only) · Mixed precision (our own recipe): about 3 bits per weight"),
+    ("mixed_fit", "Mixed: fit to a size (experimental) · Mixed precision (our own recipe): made to fit the size you give, from a saved matrix"),
+];
+/// What the recipes are called wherever they are shown.
+pub const MIXED_RECIPE: &str = "Mixed precision (our own recipe)";
+
+pub fn is_mixed(quant: &str) -> bool {
+    MIXED_QUANTS.iter().any(|(id, _)| *id == quant)
+}
+
+/// The short name of a size for a checkbox or a table: "Q4_K_M" for "Q4_K_M: smallest, good quality (recommended)", "Mixed 4-bit (balanced)" for a mixed one.
+pub fn quant_label(id: &str, name: &str) -> String {
+    if is_mixed(id) { name.split(" · ").next().unwrap_or(name).to_string() } else { name.split(':').next().unwrap_or(name).to_string() }
+}
+
+/// "Fit to a size" (experimental): the size asked for and, optionally, the saved matrix (a library id) whose per-tensor statistics decide; without one the export's own matrix is used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MixedFit {
+    pub target_gb: f64,
+    pub matrix: Option<String>,
+}
+
+/// Options of the mixed-precision sizes. Old specs have none.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MixedOptions {
+    pub fit: Option<MixedFit>,
+}
+
 /// The optional importance matrix of a GGUF export (docs/IMATRIX.md): off by default. llama.cpp measures on calibration text which weights matter most and
 /// rounds the sizes below Q8_0 with more care. `chunks` is the amount of calibration text (chunks of IMATRIX_CTX tokens); `reuse` takes a saved matrix of the
 /// same model and data instead of measuring again.
@@ -286,6 +321,12 @@ pub fn execute_many(p: &Project, run: &str, quants: &[String], num_ctx: u32, wha
 /// `execute_many` with the options of the importance matrix (only used for a GGUF).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32, what: &str, imatrix: &ImatrixOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    execute_many_full(p, run, quants, num_ctx, what, imatrix, &MixedOptions::default(), kill, on_event)
+}
+
+/// `execute_many_with` with the options of the mixed-precision sizes.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32, what: &str, imatrix: &ImatrixOptions, mixed: &MixedOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
     if !WHAT.contains(&what) {
         return Err(Error::new(format!("Unknown export kind: {what}")));
     }
@@ -294,7 +335,7 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
     let _in_use = imatrix.use_saved.as_deref().filter(|s| !s.is_empty() && imatrix.enabled && want_gguf).map(super::imatrix_lib::mark_in_use);
     let mut list: Vec<String> = Vec::new();
     for q in quants {
-        if !QUANTS.iter().any(|(id, _)| id == q) {
+        if !QUANTS.iter().chain(MIXED_QUANTS.iter()).any(|(id, _)| id == q) {
             return Err(Error::new(format!("Unknown file size: {q}")));
         }
         if !list.contains(q) {
@@ -333,6 +374,14 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
         job["base"]["vision_repo"] = json!(o);
     }
     let matrix = if want_gguf { imatrix_block(p, run, &cfg, imatrix, &out)? } else { None };
+    if want_gguf && list.iter().any(|q| q == "mixed_fit") {
+        let fit = mixed.fit.as_ref().filter(|f| f.target_gb.is_finite() && f.target_gb > 0.0).ok_or_else(|| Error::new("Give the size in GB that \"Mixed: fit to a size\" should aim for (a number above 0)."))?;
+        let file = match fit.matrix.as_deref().filter(|m| !m.is_empty()) {
+            Some(id) => Some(super::imatrix_lib::for_export(p, id)?.1),
+            None => None,
+        };
+        job["mixed_fit"] = json!({"target_gb": fit.target_gb, "matrix": file});
+    }
     if let Some(m) = &matrix {
         job["imatrix"] = m.clone();
     }
@@ -412,14 +461,24 @@ pub fn execute_many_with(p: &Project, run: &str, quants: &[String], num_ctx: u32
             None => None,
         };
         std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
+        let quant_shown = if is_mixed(quant) { format!("{} ({MIXED_RECIPE})", MIXED_QUANTS.iter().find(|(id, _)| id == quant).map(|(id, n)| quant_label(id, n)).unwrap_or_default()) } else { quant.clone() };
         std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
-            world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant,
+            world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant: &quant_shown,
             dataset_version: version, steps: summary["steps"].as_u64(), final_loss: summary["final_loss"].as_f64(), ollama_name: &oname, derived_from: origin.as_deref(),
         }))?;
         let meta = json!({"name": name_of(quant), "run": run, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file, "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": keep_here, "ollama_name": oname, "num_ctx": num_ctx,
                           "created": created, "world": p.display_name(), "installed": [], "via": result["via"]});
         let mut meta = meta;
         meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, matrix_file.as_deref());
+        if is_mixed(quant) {
+            // what the recipe was (the rules llama-quantize got, the size estimate, whether the matrix was used), always labelled as our own
+            let mut m = result["mixed"][quant.as_str()].clone();
+            if !m.is_object() {
+                m = json!({"id": quant, "label": MIXED_QUANTS.iter().find(|(id, _)| id == quant).map(|(id, n)| quant_label(id, n)), "recipe": MIXED_RECIPE});
+            }
+            m["note"] = json!(result["mixed_notes"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default());
+            meta["mixed"] = m;
+        }
         write_json(&dir.join("meta.json"), &meta)?;
         metas.push(meta);
     }

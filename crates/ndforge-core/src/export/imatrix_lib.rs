@@ -406,21 +406,20 @@ pub struct MakeSpec {
     /// also make the legacy .dat
     pub dat: bool,
     pub label: String,
+    /// after the matrix is made, also merge it with Unsloth's published matrix for the base model (a second entry; the first is kept). Old specs have none.
+    pub merge_published: bool,
 }
 
 impl Default for MakeSpec {
     fn default() -> Self {
-        MakeSpec { source: SourceSpec::default(), calibration: "data".into(), text_file: None, general: None, general_share: None, chunks: IMATRIX_DEFAULT_CHUNKS, nextn: true, dat: false, label: String::new() }
+        MakeSpec { source: SourceSpec::default(), calibration: "data".into(), text_file: None, general: None, general_share: None, chunks: IMATRIX_DEFAULT_CHUNKS, nextn: true, dat: false, label: String::new(), merge_published: false }
     }
 }
 
-/// The job for the worker, and the short name the id is made from. Everything the person could get wrong is a plain message here, before anything runs.
-pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Result<Value> {
-    if !IMATRIX_CHUNKS.contains(&spec.chunks) {
-        return Err(Error::new(format!("Unknown amount of calibration text: {} chunks. Choose 64, 128 or 256.", spec.chunks)));
-    }
-    let s = &spec.source;
-    let (source, name) = match s.kind.as_str() {
+/// The worker's description of where a model comes from (a trained run, a model of the list, a folder or Hugging Face id, a GGUF file) and the short name an id is made
+/// from. Shared by the matrix library and the quant comparison (which can make its 16-bit reference from such a source). Every mistake is a plain message.
+pub fn build_source(p: &Project, s: &SourceSpec) -> Result<(Value, String)> {
+    Ok(match s.kind.as_str() {
         "run" => {
             let run = s.run.as_deref().filter(|r| !r.is_empty()).ok_or_else(|| Error::new("Choose a trained run."))?;
             if run.contains(['/', '\\']) || run.contains("..") {
@@ -462,7 +461,15 @@ pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Re
             (json!({"kind": "gguf", "file": file, "tokenizer": tok, "family": family}), stem)
         }
         _ => return Err(Error::new("Choose where the model comes from: a trained run, a model, or a GGUF file.")),
-    };
+    })
+}
+
+/// The job for the worker. Everything the person could get wrong is a plain message here, before anything runs.
+pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Result<Value> {
+    if !IMATRIX_CHUNKS.contains(&spec.chunks) {
+        return Err(Error::new(format!("Unknown amount of calibration text: {} chunks. Choose 64, 128 or 256.", spec.chunks)));
+    }
+    let (source, name) = build_source(p, &spec.source)?;
     let calibration = match spec.calibration.as_str() {
         "text" => {
             let f = spec.text_file.as_deref().map(str::trim).filter(|f| !f.is_empty()).ok_or_else(|| Error::new("Choose the text file."))?;
@@ -514,7 +521,37 @@ pub fn create(p: &Project, spec: &MakeSpec, kill: &AtomicBool, on_event: &mut dy
     let job = build_job(p, spec, &id, &lib_dir(p).join("STOP"))?;
     let mut result = run_export_job(&py, &job, &lib_dir(p), Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(event(e)))?;
     result["entry"] = entry(&lib_dir(p).join(&id)).unwrap_or(Value::Null);
+    if spec.merge_published {
+        // a merge after the creation: the matrix just made stays whatever happens (offline, no published matrix, Stop); the reason is told next to it
+        let outcome = match base_repo_of(&job["source"]) {
+            None => Err(Error::new("The model has no base model on the Hugging Face Hub, so there is no published matrix to merge with. The matrix you made is kept.")),
+            Some(base) => merge(p, &MergeSpec { inputs: vec![MergeInput { kind: "library".into(), id: Some(id.clone()), ..Default::default() }, MergeInput { kind: "published".into(), base: Some(base), ..Default::default() }],
+                                                label: format!("{} + Unsloth's published matrix", if spec.label.trim().is_empty() { id.as_str() } else { spec.label.trim() }) }, kill, on_event),
+        };
+        match outcome {
+            Ok(m) => { result["merged"] = m; }
+            Err(e) => { result["merge_error"] = json!(format!("{} The matrix you made is kept.", e.0.trim_end())); }
+        }
+    }
     Ok(result)
+}
+
+/// The Hugging Face id of the base model a worker source is made from (a trained run's base, a model of the list, a typed Hub id, the model a GGUF file was made from);
+/// None for a local folder.
+pub fn base_repo_of(source: &Value) -> Option<String> {
+    let cand = match source["kind"].as_str()? {
+        "run" => source["base"]["repo"].as_str(),
+        "model" => source["model"].as_str(),
+        "gguf" => source["tokenizer"].as_str(),
+        _ => None,
+    }?;
+    is_hub_id(cand).then(|| cand.to_string())
+}
+
+/// `owner/name` of a model on the Hub (not a folder on this computer).
+pub fn is_hub_id(s: &str) -> bool {
+    let s = s.trim();
+    s.matches('/').count() == 1 && !s.starts_with(['/', '.']) && !s.contains(['\\', ':']) && !s.ends_with('/') && !Path::new(s).exists()
 }
 
 /// Makes the legacy .dat of an entry that has none.
@@ -529,6 +566,114 @@ pub fn make_dat(p: &Project, id: &str, kill: &AtomicBool, on_event: &mut dyn FnM
     let mut result = run_export_job(&py, &job, &lib_dir(p), Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(event(e)))?;
     result["entry"] = entry(&dir).unwrap_or(Value::Null);
     Ok(result)
+}
+
+// ------------------------------------------------------------------------------------------------------------------ merging matrices
+
+/// One thing to merge: a matrix of the library (`id`), a matrix file (`file`, .gguf or .dat) or Unsloth's published matrix for a base model (`base`, a Hugging Face id).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeInput {
+    /// "library" | "file" | "published"
+    pub kind: String,
+    pub id: Option<String>,
+    pub file: Option<String>,
+    pub base: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeSpec {
+    pub inputs: Vec<MergeInput>,
+    pub label: String,
+}
+
+/// Where the published matrices are downloaded to (kept for the next merge).
+pub fn downloads_dir(p: &Project) -> PathBuf {
+    p.folder.join("imatrix_downloads")
+}
+
+/// The job for the worker. Everything the person could get wrong is a plain message here.
+pub fn build_merge_job(p: &Project, spec: &MergeSpec, id: &str, stop_file: &Path) -> Result<Value> {
+    if spec.inputs.len() < 2 {
+        return Err(Error::new("Choose at least two matrices to merge (matrices of the library, a file, or Unsloth's published matrix)."));
+    }
+    let (mut inputs, mut seen) = (vec![], std::collections::HashSet::new());
+    for i in &spec.inputs {
+        let key = match i.kind.as_str() {
+            "library" => {
+                let lid = i.id.as_deref().filter(|x| !x.is_empty()).ok_or_else(|| Error::new("Choose a saved matrix."))?;
+                let (dir, e) = get(p, lid)?;
+                let f = matrix_file(&dir).ok_or_else(|| Error::new("That saved matrix has no file any more."))?;
+                inputs.push(json!({"kind": "library", "id": lid, "file": f, "label": if e["label"].as_str().is_some_and(|l| !l.is_empty()) { e["label"].clone() } else { json!(lid) }, "model": e["model"], "chunks": e["chunks"]}));
+                format!("library:{lid}")
+            }
+            "file" => {
+                let f = i.file.as_deref().map(str::trim).filter(|f| !f.is_empty()).ok_or_else(|| Error::new("Choose the matrix file."))?;
+                file_kind(Path::new(f))?;
+                if !Path::new(f).is_file() {
+                    return Err(Error::new(format!("The file {f} was not found.")));
+                }
+                inputs.push(json!({"kind": "file", "file": f}));
+                format!("file:{f}")
+            }
+            "published" => {
+                let b = i.base.as_deref().map(str::trim).filter(|b| !b.is_empty()).ok_or_else(|| Error::new("Choose the base model whose published matrix to use."))?;
+                inputs.push(json!({"kind": "published", "base": b}));
+                format!("published:{b}")
+            }
+            _ => return Err(Error::new("One of the things to merge is neither a saved matrix, a file nor the published matrix.")),
+        };
+        if !seen.insert(key) {
+            return Err(Error::new("The same matrix is in the merge twice: it would count double. Take one out."));
+        }
+    }
+    let base_repo = spec.inputs.iter().find(|i| i.kind == "published").and_then(|i| i.base.as_deref()).map(|b| b.trim().to_string());
+    Ok(json!({"job": "imatrix_merge", "root": lib_dir(p), "id": id, "label": tidy_label(&spec.label), "stop_file": stop_file, "cache": downloads_dir(p), "notes": [],
+              "base_repo": base_repo, "inputs": inputs}))
+}
+
+/// Merges matrices in the worker (a new library entry; the parents are untouched and cannot be deleted meanwhile). Stop as for `create`. Returns the worker's answer with `entry`.
+pub fn merge(p: &Project, spec: &MergeSpec, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let py = python()?;
+    std::fs::create_dir_all(lib_dir(p))?;
+    let id = new_id(p, "merged");
+    let job = build_merge_job(p, spec, &id, &lib_dir(p).join("STOP"))?;
+    let _guards: Vec<InUse> = spec.inputs.iter().filter(|i| i.kind == "library").filter_map(|i| i.id.as_deref()).map(mark_in_use).collect();
+    let mut result = run_export_job(&py, &job, &lib_dir(p), Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(event(e)))?;
+    result["entry"] = entry(&lib_dir(p).join(&id)).unwrap_or(Value::Null);
+    Ok(result)
+}
+
+/// Unsloth's published matrix for a base model: the repo, the file, its size, whether it is already downloaded (a quick look at the Hub; nothing is downloaded).
+/// Offline, not found, gated and "a folder on this computer" come back as plain messages.
+pub fn published_info(p: &Project, base: &str) -> Result<Value> {
+    let py = python()?;
+    std::fs::create_dir_all(lib_dir(p))?;
+    let job = json!({"job": "imatrix_published", "base": base.trim(), "cache": downloads_dir(p)});
+    run_export_job(&py, &job, &lib_dir(p), None, &AtomicBool::new(false), &mut |_| {})
+}
+
+/// The base models the page offers for "Unsloth's published matrix": the base of every trained run and the models of the list that are on the Hub (a model made, slimmed or
+/// healed here is a folder and has none).
+pub fn published_bases(p: &Project) -> Vec<Value> {
+    let mut out: Vec<Value> = vec![];
+    let mut add = |repo: &str, label: String| {
+        if is_hub_id(repo) && !out.iter().any(|o| o["repo"] == repo) {
+            out.push(json!({"repo": repo, "label": label}));
+        }
+    };
+    for r in exportable_runs(p) {
+        if let Some(n) = r["name"].as_str() {
+            if let Some(repo) = read_json(&runs_dir(p).join(n).join("config.json")).and_then(|c| c["model"]["repo"].as_str().map(String::from)) {
+                add(&repo, format!("{repo} (the base of the run {n})"));
+            }
+        }
+    }
+    for m in crate::train::catalog::models() {
+        add(&m.repo, m.repo.clone());
+    }
+    out
 }
 
 // ------------------------------------------------------------------------------------------------------------------ what the page shows
@@ -548,8 +693,9 @@ pub fn state(p: &Project) -> Value {
         json!({"id": m.id, "name": m.name, "repo": m.repo, "family": m.family, "params_b": m.params_b, "reshape": m.reshape})
     }).collect();
     estimates.insert("default".into(), est(None));
-    json!({"entries": list(p), "exports": exports_with_matrix(p), "runs": runs.iter().map(|r| json!({"name": r["name"], "model": r["model"], "status": r["status"], "loss": r["loss"]})).collect::<Vec<_>>(),
-           "models": models, "data_version": crate::train::runs::latest_version(p).map(|(n, _)| n), "chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX,
+    json!({"entries": list(p), "exports": exports_with_matrix(p), "runs": runs.iter().map(|r| json!({"name": r["name"], "model": r["model"], "status": r["status"], "loss": r["loss"],
+                                               "base": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from)).filter(|r| is_hub_id(r))})).collect::<Vec<_>>(),
+           "models": models, "published_bases": published_bases(p), "data_version": crate::train::runs::latest_version(p).map(|(n, _)| n), "chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX,
            "general_share": IMATRIX_GENERAL_SHARE, "estimates": estimates, "general": crate::general::state(Some(p)),
            "env_ready": crate::envmgr::health::env_installed(&env_dir())})
 }

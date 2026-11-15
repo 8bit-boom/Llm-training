@@ -72,10 +72,10 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error("export_failed", _explain(exc))
             return 1
-    if kind in ("imatrix_make", "imatrix_dat"):
-        from . import imatrix, imatrixjob
+    if kind in ("imatrix_make", "imatrix_dat", "imatrix_merge", "imatrix_published"):
+        from . import imatrix, imatrixjob, imatrixmerge
         try:
-            return {"imatrix_make": imatrixjob.run, "imatrix_dat": imatrixjob.run_dat}[kind](job)
+            return {"imatrix_make": imatrixjob.run, "imatrix_dat": imatrixjob.run_dat, "imatrix_merge": imatrixmerge.run, "imatrix_published": imatrixmerge.run_published}[kind](job)
         except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
             protocol.error("imatrix_stopped", "Cancelled.")
             return 1
@@ -86,6 +86,30 @@ def main(argv: list) -> int:
             import traceback
             traceback.print_exc()
             protocol.error("imatrix_failed", imatrixjob.plain(exc))
+            return 1
+    if kind in ("quantcheck", "quantcheck_plan"):
+        from . import imatrix, quantcheck
+        try:
+            return {"quantcheck": quantcheck.run, "quantcheck_plan": quantcheck.run_plan}[kind](job)
+        except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
+            protocol.error("quantcheck_stopped", "Cancelled.")
+            return 1
+        except quantcheck.QuantCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error("quantcheck_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("quantcheck_failed", _explain(exc))
+            return 1
+    if kind == "mixed_plan":
+        from . import mixedquant
+        try:
+            return mixedquant.run_plan(job)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("mixed_failed", str(exc) if isinstance(exc, ValueError) else _explain(exc))
             return 1
     if kind == "evaluate":
         from . import evaluatejob

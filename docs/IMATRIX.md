@@ -185,6 +185,48 @@ While an export uses a library matrix (and while a `.dat` is being made) the mat
 - **No label editing** after a matrix is made (the label is asked when it is created or added).
 - The time guess is the export's formula; the page adds "plus the time to convert the model" for a model source.
 
+## Merging matrices
+
+In the card **Importance matrices**: tick two or more entries (and/or add matrix files, and/or use **Unsloth's published matrix for a base model**), press **Merge**. A new worker job (`imatrix_merge`, new; the existing jobs are untouched) runs llama.cpp and registers a new library entry. Built and tested with stand-in tools and a stand-in Hub; **never run with a real llama.cpp or the real Hub** (see "Not verified yet").
+
+### The command, from llama.cpp's README and source
+
+```
+llama-imatrix --in-file a.gguf --in-file b.gguf -o imatrix.partial.gguf --output-format gguf
+```
+
+`tools/imatrix/README.md` documents exactly this ("combine existing imatrices": `--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf -o imatrix-combined.gguf`). **`-m` and `-f` are not needed with `--in-file`**: `imatrix.cpp` loads every `--in-file` and, with no prompt, prints "No prompt provided; combining precomputed matrices only." and saves (the README's usage line calls `-m`/`-f` mandatory, its own combine example has neither). A legacy `.dat` is read too (`--in-file` accepts both formats). `--output-format gguf` is passed first and dropped when this build does not know it (as for the measuring). **What it does:** `load_imatrix` **adds** the sums (`<tensor>.in_sum2`) and the counts (`<tensor>.counts`) of every input, so the merged matrix is the statistics of all the text, and an input measured on more chunks counts for more. That is why the page says, before and after: *a large published matrix can outweigh a small one of your own* (the result lists each parent's chunks and its share of the total; a note is added when one parent carries more than three quarters). The merged file's `imatrix.chunk_count` is whatever llama-imatrix writes; the entry's `chunks` is the sum of the parents' (`imatrix.chunk_count` read from their headers, or the library's own figure).
+
+### Owner decisions, as built
+
+| | |
+|---|---|
+| Inputs | entries of the library (a `.dat`-only entry is merged through its `.dat`), matrix files (`.gguf` / `.dat`, by path or Browse), and Unsloth's published matrix for a base model; at least two, the same file twice is refused (it would count double) |
+| The result | `imatrix/<id>/imatrix.gguf` + `imatrix.json` with `source_kind: "merged"`, `source: "a merge of <labels>"`, `via: "llama.cpp"`, `parents` (kind, label, library id, path, SHA-256, size, chunks; for the published one also `repo`, `file`, `base`, `url`), `merge_weights` (each parent's chunks and share), `chunks` (the sum when all are known), `notes` (the warnings, each starting "Warning:"), `llama_cpp`. Like every entry: usable in an export ("Use a saved matrix"), in Compare quants, saved as a copy, deleted. The parents cannot be deleted while the merge runs (the "in use" counter) |
+| Published matrix | repo and file name **as Unsloth's own code derives them** (see below), downloaded with plain HTTPS (`urllib`, `HF_ENDPOINT` for a mirror and for the tests) into `<project>/imatrix_downloads/<owner>--<repo>/imatrix_unsloth.gguf` (**not** inside the library, so it is not a library entry), once: a second merge finds the file with the size the Hub states and downloads nothing. The page's **Look it up** (`imatrix_published`) shows repo, file, **size** and the page address and says explicitly "This merge downloads N MB from huggingface.co ... once; nothing else is downloaded" before anything is fetched |
+| The token | only through the environment variable `HF_TOKEN` (set by the program from the token box, as in the other jobs); it is sent to the Hub's host only, **never to the download server a redirect leads to** (redirects are followed by hand), and scrubbed from every log line and error |
+| Compatibility | from the GGUF headers (the existing reader): architecture, layer count, and the tensors that only some of the inputs have; a mismatch is a yellow warning and the merge still runs; a file that cannot be read (a legacy `.dat`) gets a warning that it could not be checked. llama-imatrix's own refusal is quoted in plain words ("refused to combine them: its message is ... The matrices were probably made from different models", "could not combine the matrices ... If one of the files is not an importance matrix, take it out") |
+| Honest notes | always, when the published matrix is a parent: "describes the UNMODIFIED base model, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model" |
+| Create form | the tick **Also merge Unsloth's published matrix for the base model** (shown only when the model has a base on the Hub) makes a second, merged entry after the creation; the first is kept; if the base is a folder, the Hub is unreachable or there is no published matrix, the matrix you made is kept and the reason is shown next to it (`merge_error`) |
+| Stop | the STOP file as for the other jobs: a download is ended at once (the `.part` file removed), `llama-imatrix` is killed, the half-made folder removed, "Cancelled."; the program kills the worker 20 s later if it has not ended |
+
+### Which repository? (read, not guessed)
+
+`unsloth/save.py` `_gguf_repo_candidates(model)` (unsloth 2026.11.4): for the model's base name (a local folder has none), after `get_model_name(name, load_in_4bit=False)`, `repo = name if name.endswith("-GGUF") else f"unsloth/{name.split('/')[-1]}-GGUF"`. `unsloth_zoo.llama_cpp.resolve_imatrix_file` lists the repo's files and takes the first of `imatrix_unsloth.dat`, `imatrix_unsloth.gguf_file`, `imatrix_unsloth.gguf` that exists; a `.gguf_file` is renamed `.gguf` locally ("so the Hub does not list it as a model"). `imatrixmerge.published_repo` and `UPSTREAM_NAMES` do the same. Of `get_model_name` only the well-known suffixes `-unsloth-bnb-4bit` and `-bnb-4bit` are undone here (its full table is Unsloth's and cannot be read without running it). For example `Qwen/Qwen3.8-27B` gives `unsloth/Qwen3.8-27B-GGUF`, which holds `imatrix_unsloth.gguf` (reported as present and not gated by the person who asked for this feature, who checked the Hub API; this program has never run the lookup against the real Hub).
+
+### Tests of merging
+
+- Worker `worker/tests/test_imatrix_merge.py` (a stand-in Hub as a local HTTP server, a stand-in `llama-imatrix`): the repo derivation table and the file-name order; the lookup (repo, file, size, page, gated, cached); `.gguf_file` renamed; the download with progress, once only, a cached file of another size downloaded again, the token sent to the Hub and **not** to the redirect target, a cut-off download removed, Stop; every Hub problem (not found, private, no file, gated, local folder, HTTP 500, offline) with its message; the exact merge command line (no `-m`, no `-f`), the registration (files, json fields, parents with hashes, weights), progress that never goes back, the published matrix as a parent with its warnings, three inputs, models that differ, a merged entry used by an export (`use_saved_file`), compatibility warnings (architecture, layers, tensor sets, a `.dat`), every refusal, each llama-imatrix failure message, the retry without `--output-format`, no llama.cpp, Stop (a hanging tool is killed, no folder left), not enough disk, the worker entry.
+- Rust `crates/ndforge-core/tests/imatrix_merge.rs`: the choice and old specs, Hub ids, the base of a source, the job and every refusal, the base models offered, fake-worker runs (unix only: a merge holding its parents, Stop, failures, the lookup, a creation that also merges, keeps its own matrix when the merge fails or the base is a folder).
+- Window `ui/smoke/imatrix_merge.test.mjs`: the ticks, the honest text, files, the published matrix (choice, lookup, size and download notice, cached, gated, every error), the spec that is sent, progress / Stop / result with warnings and weights, the Create tick, and a creation that also merged or failed to.
+
+### Deviations (merging)
+
+- **`source_kind: "merged"`**, not `source: "merged"`: in this project's entries `source` is the sentence ("the trained run run1") and `source_kind` the kind (`run` / `model` / `gguf` / `imported` / `export`); the merged entry follows that (its `source` says "a merge of ...").
+- The published matrix is downloaded with `urllib` against the Hub's plain HTTP API (`/api/models/<repo>?blobs=true`, `/<repo>/resolve/main/<file>`), not `huggingface_hub`: nothing to import, testable with a local server.
+- The merged entry has no statistics (`--show-statistics` needs a model file next to it) and no `ctx`.
+- A merged entry's `chunks` is the sum of its parents' counts, which is what the page shows; llama-imatrix's own `imatrix.chunk_count` in the file may differ (it counts the chunks it saw).
+
 ## Not verified yet (needs llama.cpp and a GPU)
 
 Nothing below has run. Do not rely on any of it until checked on the owner's PC:
@@ -214,6 +256,13 @@ Matrix library (everything above, and in addition):
 - `explorer` / `open` / `xdg-open` for "Open folder" on Windows, macOS and Linux (the program only reports a failure to start the tool).
 - That `llama-imatrix --in-file ... --show-statistics` and `--output-format dat` do not take long enough on a large matrix to need their own progress (no progress is shown for them).
 - Windows paths with spaces or non-ASCII characters through the stand-in tools only (the tests do not use real llama.cpp).
+
+Merging matrices (in addition):
+
+- **`llama-imatrix --in-file a --in-file b -o out`** on the user's build: that it needs neither `-m` nor `-f` (the README's usage line says they are mandatory; its combine example and `imatrix.cpp` say otherwise), that `--output-format gguf` is accepted next to it, and the exact text it prints when the inputs do not fit (the page quotes the line that mentions the mismatch).
+- **That `llama-quantize` accepts a merged matrix** (the merged file's header, its `imatrix.datasets`, a chunk count that is the sum), and that a merge of a **legacy `.dat`** with a GGUF matrix works on that build.
+- **Unsloth's real published matrix**: that `unsloth/<Model>-GGUF` has the file named as expected for the models in this project's list (checked by hand for `Qwen/Qwen3.8-27B` only), that the Hub's `siblings` list carries the `size` with `?blobs=true` as the stand-in does, how big the real files are, that a real redirect to the download server works with the manual redirect following and that Windows corporate proxies let it through; the name derivation for models whose Unsloth mirror has another name (`get_model_name`).
+- Whether a published matrix measured on the unmodified base is a **useful** start for the person's fine-tune, and with what weight: that is a question for Compare quants (make the same size with and without the merge and compare).
 
 ## Deviations from the brief
 

@@ -29,6 +29,16 @@ Every matrix has a label (yours), the model it was made for, its size, the amoun
 
 **Stop** ends the measuring at once and keeps nothing. When the matrix is ready the page shows any notes and, when your llama-imatrix supports it, a few lines of statistics (how many tensors, the largest and the mean value).
 
+## Merge matrices
+
+Tick two or more matrices in the list (and/or add matrix files, and/or use **Unsloth's published matrix** for the base model) and press **Merge**: llama.cpp (`llama-imatrix --in-file a --in-file b`) combines them into a **new** entry; the matrices you merged are not changed. The new entry is used in exports and in **Compare quants** like any other.
+
+- **Merging adds the statistics.** A matrix measured on more text outweighs one measured on less: a large published matrix can drown a small one of your own. The page tells you how much each one weighs. To give yours more say, make it with more chunks.
+- **Unsloth's published matrix describes the unmodified base model**, not your fine-tune. It is a reasonable start for a light LoRA, less so for a heavily changed model.
+- The published matrix is **downloaded from the Hugging Face Hub** (the repository `unsloth/<model name>-GGUF`, the way Unsloth's own code names it). Press **Look it up** first: the page shows the repository, the file and its **size**, and says what will be downloaded (once, into the project's `imatrix_downloads` folder). Offline, no such repository, a private or gated one, or a model that is a folder on this computer are all explained in plain words.
+- The matrices are compared from their headers (architecture, layers, tensors). A mismatch is a **yellow warning**, never a refusal; if llama-imatrix refuses, its own message is shown.
+- In **Create a matrix**, the tick *Also merge Unsloth's published matrix for the base model* makes a second, merged entry after yours; yours is kept even if the download fails.
+
 ## Use a saved matrix in an export
 
 In Step 5, tick *Better small sizes (importance matrix)*, then choose **Use a saved matrix**. Nothing is measured: the file is copied into the export and given to `llama-quantize` (or Unsloth) as it is. Before the export the page compares the matrix with the model (architecture and number of layers, when they can be read). A **yellow warning** means "this does not look like the same model", or that the file could not be read; it never stops you, `llama-quantize` has the last word. **Add a matrix file from my computer…** is there too.
