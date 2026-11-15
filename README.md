@@ -28,6 +28,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | Importance matrix for the small GGUF sizes (optional, Step 5) | built and tested with stand-in llama.cpp tools; not run with a real llama.cpp or GPU (docs/IMATRIX.md, "Not verified yet") |
 | Importance matrices as a separate function (make one without any GGUF export, keep a library, reuse it in exports, save a copy or a legacy .dat) | built and tested with stand-in tools and a stand-in browser; not run with a real llama.cpp (docs/IMATRIX.md, "The matrix library" and "Not verified yet") |
 | Compare quants (KL divergence of each quantised GGUF from the 16-bit model, a table, a chart with the Pareto line and a plain verdict) | built and tested with stand-in llama.cpp tools and a stand-in browser; not run with a real llama.cpp or GPU (docs/QUANT_COMPARE.md, "Not verified yet") |
+| Merge importance matrices (also with Unsloth's published matrix for the base model, downloaded from the Hub) | built and tested with stand-in tools, a stand-in Hub and a stand-in browser; not run with a real llama.cpp or the real Hub (docs/IMATRIX.md, "Merging matrices" and "Not verified yet") |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ## Install
