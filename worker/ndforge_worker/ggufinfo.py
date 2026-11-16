@@ -30,7 +30,7 @@ def type_name(t: int) -> str:
 
 def read(path) -> dict:
     """{"version", "meta": {key: value}, "tensors": [{"name", "dims", "type", "offset"}], "data_start": int}. An array value is None and its length is under
-    `<key>#len`. `offset` is relative to `data_start`. Raises ValueError when the file is not a readable GGUF (not one, version below 2, truncated, absurd sizes)."""
+    `<key>#len`; an array of strings with at most 64 entries (an importance matrix's `imatrix.datasets`) also has them under `<key>#items`. `offset` is relative to `data_start`. Raises ValueError when the file is not a readable GGUF (not one, version below 2, truncated, absurd sizes)."""
     try:
         with open(path, "rb") as fh:
             def take(fmt):
@@ -60,10 +60,11 @@ def read(path) -> dict:
                     inner, n = take("I"), take("Q")
                     if inner in _FIXED_SIZE:
                         fh.seek(_FIXED_SIZE[inner] * n, 1)
-                    else:
-                        for _ in range(n):
-                            value(inner, False)
-                    return ("array", n)
+                        return ("array", n, None)
+                    items = []
+                    for _ in range(n):
+                        items.append(value(inner, keep and inner == 8 and n <= 64))
+                    return ("array", n, items if keep and inner == 8 and n <= 64 else None)
                 raise ValueError("unknown value type")
 
             if fh.read(4) != b"GGUF":
@@ -80,6 +81,8 @@ def read(path) -> dict:
                 v = value(take("I"))
                 if isinstance(v, tuple):
                     meta[key + "#len"] = v[1]
+                    if v[2] is not None:
+                        meta[key + "#items"] = v[2]
                     v = None
                 meta[key] = v
             tensors = []

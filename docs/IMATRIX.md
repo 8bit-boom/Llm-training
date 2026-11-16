@@ -227,6 +227,23 @@ llama-imatrix --in-file a.gguf --in-file b.gguf -o imatrix.partial.gguf --output
 - The merged entry has no statistics (`--show-statistics` needs a model file next to it) and no `ctx`.
 - A merged entry's `chunks` is the sum of its parents' counts, which is what the page shows; llama-imatrix's own `imatrix.chunk_count` in the file may differ (it counts the chunks it saw).
 
+## Verified on the real published file
+
+On 2026-11-16 the file `imatrix_unsloth.gguf` of the Hub repository `unsloth/Qwen3.8-27B-GGUF` (13,642,656 bytes, 13.6 MB; downloaded by the owner) was read by every reader of this program. It was only parsed, never executed. The evidence is committed: `worker/tests/data/imatrix_unsloth_qwen38_27b_header.txt` (31 lines, the header dump), the scaled-down generator `worker/tests/imatrix_fixture.py` that writes exactly this layout (used by every CI test that needs a matrix), and `worker/tests/test_imatrix_real_format.py` (the dump's structure is reproduced for 64 layers; the readers are checked on the fixture and, with `NDFORGE_REAL_IMATRIX=<path>`, on the real file; the Rust twin: `NDFORGE_REAL_IMATRIX=<path> cargo test -p ndforge-core real_published`).
+
+| Fact | Value |
+|---|---|
+| Format | GGUF version 3, alignment 32 (no `general.alignment` key); the tensor data starts at the 32-aligned end of the tensor-info block and every tensor, also the one-value `counts`, is padded to 32 bytes |
+| Key-values | exactly four: `general.type = "imatrix"`, `imatrix.datasets` (array of strings: `["unsloth_calibration_dataset"]`), `imatrix.chunk_count` (uint32, 1251), `imatrix.chunk_size` (uint32, 8192). **No `general.architecture`**: a check that needs the model must infer it from names and shapes |
+| Tensors | 992, all float32 (type 0), all **one-dimensional** (`[5120]`, not `[1, N]`); sorted by the name of the weight as text (`blk.0`, `blk.1`, `blk.10` ... `blk.19`, `blk.2` ...), `<weight>.in_sum2` then `<weight>.counts` |
+| Names | `blk.<L>.<tensor>.weight.in_sum2` (length = the input width of that weight: the sum over tokens of the squared input per channel) and `blk.<L>.<tensor>.weight.counts` (length 1) |
+| Counts | `counts` is 1149614.0 for every tensor; `in_sum2 / counts` is the mean square activation per channel. No NaN, no zero |
+| Layers | 0 to 63. Full attention at 3, 7, ..., 63 (16 layers): `attn_q`, `attn_k`, `attn_v` (input 5120), `attn_output` (input 6144). The other 48 (linear attention): `attn_gate`, `attn_qkv`, `ssm_alpha`, `ssm_beta` (input 5120), `ssm_out` (input 6144). All 64: `ffn_down` (input 17408, the MLP intermediate size), `ffn_gate`, `ffn_up` (input 5120, the hidden size). 48 x 10 + 16 x 8 + 64 x 6 = 992 |
+| Not in it | no `output.weight`, no token embedding, no MTP / NextN entries |
+| Scale | the mean of `in_sum2` of `ffn_down` is about 103 in layer 0 and about 2.8 million in layer 63 (per count: 9e-5 and 2.5): layers differ by orders of magnitude, which is why layers must be dropped, not averaged |
+
+What the readers did with it: the header reader, `matrix_summary`, `read_importance` (`in_sum2` one-dimensional with one count: its `n_in x n_experts` description now says both layouts) and the Rust `gguf_meta.rs` read the file correctly; what changed is what they report and compare. `matrix_summary` also returns `chunk_size`, `datasets`, `kinds` (how many layers have each tensor kind), `hidden` (input of `ffn_gate`), `intermediate` (input of `ffn_down`) and `tokens` (the `counts` value: what a merge adds up); `ggufinfo.read` keeps a short string array under `<key>#items`; `compat_warnings` compares the hidden size and the MLP size when the matrix has no architecture (and says what a thinner `ffn_down` means); the Rust twin has the same fields and texts (`read_tensors` returns the dimensions).
+
 ## Not verified yet (needs llama.cpp and a GPU)
 
 Nothing below has run. Do not rely on any of it until checked on the owner's PC:
@@ -249,7 +266,7 @@ Matrix library (everything above, and in addition):
 - **`--show-statistics` output**: its real text (the README only describes the columns); the parser looks for a `(N tensors)` line and a tab-separated header with `Min` / `Max` / `μ` / `% Active`, and whether `-m <model>` is needed next to `--in-file` (the README example has both).
 - **`--in-file x.gguf --output-format dat -o y.dat`** (and the extension-only fallback) on the user's build, that the `.dat` it writes is read by `llama-quantize` and by Unsloth's quantiser, and that a `.dat` imported from elsewhere is accepted by them.
 - **Compatibility between matrices and files**: that a matrix made on a merged model fits quantising a different source file of the same model (for example the one an export converts, or another GGUF of the same weights), and that a matrix made on a Q8_0 GGUF is as good as one made on F16.
-- **The header of a real matrix**: the reader assumes keys like `general.architecture` (maybe absent), `imatrix.chunk_count`, and tensor names `blk.N.<name>.in_sum2` / `.counts`; the layer comparison for hybrid or MTP models (the MTP layers are allowed as extra) is a guess from the configs.
+- **The layer comparison for hybrid or MTP models** (the MTP layers are allowed as extra): a guess from the configs; the published matrix has no MTP entries (see below), so only a matrix measured with `--nextn` shows how an MTP head is named in the statistics.
 - **Hugging Face download** of a model folder with `snapshot_download` (ignored patterns: gguf, onnx, msgpack, h5, pth, `original/*`, md), gated models and the token path, the disk use of a big model, and that `convert_hf_to_gguf.py` accepts the downloaded folder.
 - Merging a trained run for the library (memory, time, that STOP during the merge ends within the 20 s grace), the 16-bit file of an export being really newer than the weights check, and the time of the conversion (the page only says "plus the time to convert the model").
 - The chat template of a typed folder or Hub id with the family `generic`, and of a GGUF whose "made from" model is a different quantisation of the same family.
