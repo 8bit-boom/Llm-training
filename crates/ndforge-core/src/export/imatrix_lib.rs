@@ -711,6 +711,11 @@ pub fn published_bases(p: &Project) -> Vec<Value> {
             }
         }
     }
+    for c in super::imatrix_adapt::cut_models(p) {
+        if let (Some(repo), Some(n)) = (c["origin_repo"].as_str(), c["name"].as_str()) {
+            add(repo, format!("{repo} (the original of the cut model {n})"));
+        }
+    }
     for m in crate::train::catalog::models() {
         add(&m.repo, m.repo.clone());
     }
@@ -731,11 +736,15 @@ pub fn state(p: &Project) -> Value {
     }
     let models: Vec<Value> = crate::train::catalog::models().into_iter().map(|m| {
         estimates.insert(format!("model:{}", m.id), est(Some(m.params_b)));
-        json!({"id": m.id, "name": m.name, "repo": m.repo, "family": m.family, "params_b": m.params_b, "reshape": m.reshape})
+        json!({"id": m.id, "name": m.name, "repo": m.repo, "family": m.family, "params_b": m.params_b, "reshape": m.reshape,
+               "cut_origin": super::imatrix_adapt::origin_repo(Path::new(&m.repo)).filter(|r| is_hub_id(r))})
     }).collect();
     estimates.insert("default".into(), est(None));
     json!({"entries": list(p), "exports": exports_with_matrix(p), "runs": runs.iter().map(|r| json!({"name": r["name"], "model": r["model"], "status": r["status"], "loss": r["loss"],
-                                               "base": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from)).filter(|r| is_hub_id(r))})).collect::<Vec<_>>(),
+                                               "base": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from))
+                                                   .and_then(|r| if is_hub_id(&r) { Some(r) } else { super::imatrix_adapt::origin_repo(Path::new(&r)).filter(|o| is_hub_id(o)) }),
+                                               "cut": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from))
+                                                   .is_some_and(|r| !is_hub_id(&r) && super::imatrix_adapt::origin_repo(Path::new(&r)).is_some())})).collect::<Vec<_>>(),
            "models": models, "cut_models": super::imatrix_adapt::cut_models(p), "published_bases": published_bases(p), "data_version": crate::train::runs::latest_version(p).map(|(n, _)| n), "chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX,
            "general_share": IMATRIX_GENERAL_SHARE, "estimates": estimates, "general": crate::general::state(Some(p)),
            "env_ready": crate::envmgr::health::env_installed(&env_dir())})

@@ -347,6 +347,29 @@ fn the_state_of_the_page_lists_the_cut_models() {
     assert_eq!((s["cut_models"][0]["name"].as_str(), s["cut_models"][0]["layers_after"].as_u64()), (Some("slim"), Some(8)));
 }
 
+#[test]
+fn the_page_knows_which_runs_and_models_were_cut_and_offers_their_original() {
+    let d = tempdir().unwrap();
+    let p = plain_project(d.path());
+    let cut = cut_model(&p, "slim", &KEEP, 16, Some((24, 10)), |_| {});
+    let rdir = ndforge_core::train::runs::runs_dir(&p).join("runcut");
+    std::fs::create_dir_all(rdir.join("model")).unwrap();
+    std::fs::write(rdir.join("model/config.json"), "{}").unwrap();
+    std::fs::write(rdir.join("config.json"), json!({"model": {"repo": cut.join("model").display().to_string(), "family": "qwen3_5"}}).to_string()).unwrap();
+    std::fs::write(rdir.join("state.json"), json!({"name": "runcut", "status": "done", "model": "slim", "method": "full"}).to_string()).unwrap();
+    let rdir2 = ndforge_core::train::runs::runs_dir(&p).join("runhub");
+    std::fs::create_dir_all(rdir2.join("model")).unwrap();
+    std::fs::write(rdir2.join("model/config.json"), "{}").unwrap();
+    std::fs::write(rdir2.join("config.json"), json!({"model": {"repo": "Qwen/Qwen3.5-4B", "family": "qwen3_5"}}).to_string()).unwrap();
+    std::fs::write(rdir2.join("state.json"), json!({"name": "runhub", "status": "done", "model": "q", "method": "full"}).to_string()).unwrap();
+    let st = lib::state(&p);
+    let run = |n: &str| st["runs"].as_array().unwrap().iter().find(|r| r["name"] == n).cloned().unwrap_or_else(|| panic!("{n} not offered: {}", st["runs"]));
+    assert_eq!((run("runcut")["base"].as_str(), run("runcut")["cut"].clone()), (Some("Qwen/Qwen3.8-27B"), json!(true)), "a run on a cut model: its original from the record, flagged as cut");
+    assert_eq!((run("runhub")["base"].as_str(), run("runhub")["cut"].clone()), (Some("Qwen/Qwen3.5-4B"), json!(false)));
+    let bases = st["published_bases"].as_array().unwrap();
+    assert!(bases.iter().any(|b| b["repo"] == "Qwen/Qwen3.8-27B" && b["label"].as_str().unwrap().contains("the original of the cut model slim")), "{bases:?}");
+}
+
 // ------------------------------------------------------------------------------------------------------------------ fake workers (unix)
 
 #[cfg(unix)]
