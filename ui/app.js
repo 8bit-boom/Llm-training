@@ -872,7 +872,7 @@ function wireUse() {
 // ------------------------------------------------------------------------------------------- importance matrices (the matrix library)
 // A matrix made on its own (no GGUF export), kept in the project (imatrix/<id>/), reused by exports ("Use a saved matrix" on Step 5) and copied out. docs/IMATRIX.md.
 let im = { state: null, src: "run", run: "", model: "", modelPath: "", gguf: "", tokenizer: "", cal: "data", textFile: "", share: 20, chunks: 128, nextn: true, dat: false, label: "",
-  addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", mergePicked: [], mergeFiles: [], mergeFileInput: "", mergePub: false, mergePubBase: "", mergePubInfo: null, mergePubBusy: false, mergePubError: "", mergeLabel: "", mergePub2: false, running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
+  addOpen: false, addLabel: "", addExport: "", copyFor: "", copyDir: "", mergePicked: [], mergeFiles: [], mergeFileInput: "", mergePub: false, mergePubBase: "", mergePubInfo: null, mergePubBusy: false, mergePubError: "", mergeLabel: "", mergePub2: false, mergeWeights: {}, adSrc: "published", adId: "", adFile: "", adBase: "", adModel: "", adWeight: "1", adKept: "", adLabel: "", adPubInfo: null, adPubBusy: false, adPubError: "", adPreview: null, adPreviewKey: "", running: false, pending: null, step: "", progress: null, log: [], error: null, ok: null, result: null, saved: null };
 
 const IM_INTRO = `<p>An <strong>importance matrix</strong> is a short measurement: the model reads some typical text, and llama.cpp notes how strongly each part of it is used. When the model is later shrunk to about 4 or 5 bits (Q4_K_M, Q5_K_M, Q6_K), the rounding then takes more care of the parts that matter, so the small file loses less quality. For Q8_0 and F16 it does nothing.</p>
   <p class="dim">You can make one here without making any GGUF file, keep it, use it in later exports (Step 5, "Use a saved matrix"), or save a copy to use with <code>llama-quantize</code> on another computer or to share. It needs llama.cpp (<code>llama-imatrix</code>): the program can install it for you (the button appears below when it is missing; <strong>Training setup</strong> has the same). A copy of your own in <code>LLAMA_CPP_DIR</code> always wins.</p>`;
@@ -891,10 +891,11 @@ function imEntryHtml(e) {
   const stats = e.statistics && e.statistics.lines && e.statistics.lines.length ? `<details><summary>What the matrix looks like</summary><ul class="small">${e.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></details>` : "";
   const notes = (e.notes || []).length ? `<p class="dim small">${e.notes.map(esc).join(" ")}</p>` : "";
   const off = im.running || e.in_use;
-  const parents = e.source_kind === "merged" && (e.parents || []).length ? `<br><span class="dim small">Parents: ${e.parents.map((x) => esc(x.label || x.path) + (x.chunks != null ? ` (${x.chunks} chunks)` : "") + (x.kind === "published" ? ` · from ${esc(x.repo || "the Hub")}` : "")).join(" + ")}</span>` : "";
-  return `<li class="imentry"><label class="opt" title="Tick two or more matrices to merge them (see Merge matrices below)"><input type="checkbox" class="im-pick" value="${esc(e.id)}" ${im.mergePicked.includes(e.id) ? "checked" : ""} ${im.running ? "disabled" : ""}></label> <strong>${esc(e.label || e.id)}</strong> <span class="dim">${esc(e.id)}</span>${e.source_kind === "merged" ? ` <span class="tag">merged</span>` : ""}<br>
+  const parents = (e.source_kind === "merged" || e.source_kind === "adapted") && (e.parents || []).length ? `<br><span class="dim small">Parents: ${e.parents.map((x) => esc(x.label || x.path) + (x.chunks != null ? ` (${x.chunks} chunks)` : "") + (x.kind === "published" ? ` · from ${esc(x.repo || "the Hub")}` : "")).join(" + ")}</span>` : "";
+  const ad = e.source_kind === "adapted" && e.adapt ? `<br><span class="dim small">Adapted to ${esc(e.adapt.model)}: keeps ${e.adapt.layers_after} of ${e.adapt.layers_before} layers; ffn_down ${(e.adapt.ffn_down_before || 0).toLocaleString("en")}${e.adapt.ffn_down_after !== e.adapt.ffn_down_before ? " → " + (e.adapt.ffn_down_after || 0).toLocaleString("en") : ""} per layer${e.adapt.weight != null && e.adapt.weight !== 1 ? "; weight " + e.adapt.weight : ""}. It still describes the unmodified model's activations.</span>` : "";
+  return `<li class="imentry"><label class="opt" title="Tick two or more matrices to merge them (see Merge matrices below)"><input type="checkbox" class="im-pick" value="${esc(e.id)}" ${im.mergePicked.includes(e.id) ? "checked" : ""} ${im.running ? "disabled" : ""}></label> <strong>${esc(e.label || e.id)}</strong> <span class="dim">${esc(e.id)}</span>${e.source_kind === "merged" ? ` <span class="tag">merged</span>` : ""}${e.source_kind === "adapted" ? ` <span class="tag">adapted</span>` : ""}<br>
     <span class="dim small">Model: ${esc(e.model || "not stated")} · ${e.size_mb} MB · ${e.chunks != null ? e.chunks + " chunks" : "unknown amount of text"} · ${esc(g)} · ${esc(head)} · ${esc(String(e.created || "").slice(0, 10))} · made by ${esc(e.via || "unknown")}${e.has_dat ? " · legacy .dat too" : ""}${e.has_gguf ? "" : " · legacy .dat only"}</span><br>
-    <span class="dim small">Made from: ${esc(e.source || "unknown")}${e.calibration ? " · text: " + esc(e.calibration) : ""}</span>${parents}${e.in_use ? ` <span class="warn small">in use right now</span>` : ""}
+    <span class="dim small">Made from: ${esc(e.source || "unknown")}${e.calibration ? " · text: " + esc(e.calibration) : ""}</span>${parents}${ad}${e.in_use ? ` <span class="warn small">in use right now</span>` : ""}
     <div class="row"><button class="secondary im-copy" data-id="${esc(e.id)}" ${im.running ? "disabled" : ""}>Save a copy…</button><button class="secondary im-open" data-id="${esc(e.id)}">Open folder</button>
       ${e.has_gguf && !e.has_dat ? `<button class="secondary im-dat" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="llama-imatrix converts the matrix to the old format some tools still read">Make a .dat (legacy)</button>` : ""}
       <button class="secondary im-del" data-id="${esc(e.id)}" ${off ? "disabled" : ""} title="${e.in_use ? "A job uses this matrix right now" : "Deletes the matrix from the project"}">Delete</button></div>${copying}${stats}${notes}</li>`;
@@ -903,8 +904,15 @@ function imEntryHtml(e) {
 // the Hugging Face id of the model a new matrix is made from, when the Hub has one ("also merge Unsloth's published matrix" is offered only then)
 function imBase(st) {
   if (im.src === "run") { const r = (st.runs || []).find((x) => x.name === im.run); return r && r.base ? r.base : ""; }
-  if (im.src === "model") { if (im.model === "__typed") return /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(im.modelPath.trim()) ? im.modelPath.trim() : ""; const m = (st.models || []).find((x) => x.id === im.model); return m && /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(m.repo) ? m.repo : ""; }
+  if (im.src === "model") { if (im.model === "__typed") return /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(im.modelPath.trim()) ? im.modelPath.trim() : ""; const m = (st.models || []).find((x) => x.id === im.model); return m && /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(m.repo) ? m.repo : m && m.cut_origin ? m.cut_origin : ""; }
   return /^[^/\\:.][^/\\:]*\/[^/\\:]+$/.test(im.tokenizer.trim()) ? im.tokenizer.trim() : "";
+}
+
+// is the model of the Create form one made on the Slim page? (its published matrix is then ADAPTED to it, never merged raw)
+function imCutSource(st) {
+  if (im.src === "run") { const r = (st.runs || []).find((x) => x.name === im.run); return !!(r && r.cut); }
+  if (im.src === "model") { const m = (st.models || []).find((x) => x.id === im.model); return !!(m && m.cut_origin); }
+  return false;
 }
 
 function imFormHtml(st) {
@@ -942,7 +950,8 @@ function imFormHtml(st) {
       <label class="opt"><input type="checkbox" id="im-dat" ${im.dat ? "checked" : ""}> Also make a legacy .dat file</label></div>
     <div class="row"><label>Label <input type="text" id="im-label" value="${esc(im.label)}" maxlength="80" placeholder="for example: Q4 test with my own text"></label></div>
     ${imBase(st) ? `<div class="row"><label class="opt" title="After the matrix is made, a second entry is made by merging it with the matrix Unsloth published for ${esc(imBase(st))}"><input type="checkbox" id="im-mergepub2" ${im.mergePub2 ? "checked" : ""}> Also merge Unsloth's published matrix for the base model (${esc(imBase(st))})</label></div>
-      ${im.mergePub2 ? `<p class="dim small">A second entry is made after yours (yours is kept). It downloads the published matrix from the Hub, adds its statistics to yours (a large published matrix can outweigh a small one of your own), and describes the unmodified base model. If the download or the merge fails, your matrix is kept and the reason is shown.</p>` : ""}` : ""}`;
+      ${im.mergePub2 ? `<p class="dim small">A second entry is made after yours (yours is kept). It downloads the published matrix from the Hub, adds its statistics to yours (a large published matrix can outweigh a small one of your own), and describes the unmodified base model. If the download or the merge fails, your matrix is kept and the reason is shown.</p>
+      ${imCutSource(st) ? `<p class="warn small" id="im-mergepub2-cut"><strong>This model was cut on the Slim page.</strong> The published matrix describes the original model, so it is first adapted to your cut model (the layers it kept, the MLP cut the way yours was) and only then merged with yours: it is never merged as it is. It still describes the unmodified model's activations, so it is an approximation. Use the <em>Adapt to my cut model</em> card to choose a weight (the published matrix has far more text and otherwise outweighs yours).</p>` : ""}` : ""}` : ""}`;
   const incomplete = im.src === "run" ? !runs.length : im.src === "model" ? (im.model === "__typed" ? !im.modelPath.trim() : !im.model) : !im.gguf.trim();
   const calMissing = im.cal === "text" ? !im.textFile.trim() : st.data_version == null;
   const why = !st.env_ready && im.src !== "gguf" ? "The training software is not installed yet (Training setup)." : incomplete ? "Choose the model first." : calMissing ? (im.cal === "text" ? "Choose the text file." : "Save a version of the training data first.") : blocked;
@@ -964,7 +973,11 @@ function imMergeHtml(st) {
       Source: <code>${esc(info.page)}</code></div>` : "";
   const files = im.mergeFiles.map((f, i) => `<li><span>${esc(f)}</span> <button class="link im-unmergefile" data-i="${i}">Remove</button></li>`).join("");
   const n = im.mergePicked.length + im.mergeFiles.length + (im.mergePub ? 1 : 0);
-  const why = !st.env_ready ? "The merge runs in the training software's worker, which is not set up yet (open Training setup)." : n < 2 ? "Tick two or more matrices above, or add a file, or use Unsloth's published matrix: a merge needs at least two things." : im.mergePub && !im.mergePubBase ? "Choose the base model." : "";
+  const badWeight = imMergeInputs().some((i) => !(imWeightOf(i.key) > 0));
+  const cutNames = [...new Set(im.mergePicked.map((id) => ((st.entries || []).find((e) => e.id === id) || {}).cut_model).filter(Boolean).map((c) => c.name))];
+  const cutInfo = im.mergePub && cutNames.length ? cutNames.map((nm) => { const c = (st.cut_models || []).find((x) => x.name === nm); return `<p class="ok small" id="im-merge-autoadapt">The published matrix is <strong>adapted first</strong> to your cut model <strong>${esc(nm)}</strong>${c ? ` (it keeps ${c.layers_after} of ${c.layers_before} layers${c.thinner ? `; ffn_down ${c.intermediate_before.toLocaleString("en")} → ${c.intermediate_after.toLocaleString("en")} per layer` : ""})` : ""}, because the matrix you ticked was measured on that model. It is never merged as it is: its layers would not be yours. See <em>Adapt to my cut model</em> below.</p>`; }).join("") : "";
+  const wrows = imMergeInputs().map((i) => `<li>${esc(i.label)} <label class="opt">weight <input type="number" class="im-mw" data-key="${esc(i.key)}" min="0" step="any" value="${esc(String(im.mergeWeights[i.key] ?? "1"))}" style="width:90px"></label></li>`).join("");
+  const why = !st.env_ready ? "The merge runs in the training software's worker, which is not set up yet (open Training setup)." : n < 2 ? "Tick two or more matrices above, or add a file, or use Unsloth's published matrix: a merge needs at least two things." : im.mergePub && !im.mergePubBase ? "Choose the base model." : badWeight ? "A weight must be a number above 0." : "";
   const prog = im.running && im.pending === "merge" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
   return `<div class="card wide" id="im-merge"><h2>Merge matrices</h2>${llamaNotice("merge")}
     <p>Combine two or more matrices into a new one: matrices of your own (tick them in the list above), matrix files, and/or <strong>Unsloth's published matrix</strong> for the base model. llama.cpp (<code>llama-imatrix --in-file a --in-file b</code>) does it; the matrices you merge are not changed.</p>
@@ -976,15 +989,100 @@ function imMergeHtml(st) {
       ${im.mergePub && bases.length ? `<label>Base model <select id="im-mergepubbase">${bases.map((b) => `<option value="${esc(b.repo)}" ${im.mergePubBase === b.repo ? "selected" : ""}>${esc(b.label)}</option>`).join("")}</select></label><button class="secondary" id="im-pub-lookup" ${im.mergePubBusy ? "disabled" : ""}>Look it up</button>` : ""}</div>
     ${bases.length ? "" : `<p class="dim small">No base model on the Hugging Face Hub is known in this project yet (train a run on a model of the list first).</p>`}
     ${im.mergePub ? `<p class="dim small">The repository is named the way Unsloth's own code does it: <code>unsloth/&lt;model name&gt;-GGUF</code>, file <code>imatrix_unsloth.gguf</code> (or <code>.dat</code>). It is downloaded from the Hub, so this one step needs the internet; offline, not found and gated are explained in plain words.</p>${pubInfo}` : ""}
+    ${cutInfo}
+    ${wrows ? `<details id="im-merge-weights"${Object.keys(im.mergeWeights).length ? " open" : ""}><summary>Weights (optional)</summary><p class="dim small">Merging adds the sums and the counts, so a matrix measured on more text counts more. A weight multiplies the sums <em>and</em> the counts of one matrix before they are merged: its mean square per channel stays, it just counts that many times as strongly. Unsloth's published matrix counts about 1,149,614 rows of text; 128 chunks of your own at a context of 512 are about 65,000, so merged as they are the published one outweighs yours about 17 to 1. A weight of 0.05 on the published one makes them about even. The result lists the weights that were used.</p><ul class="small">${wrows}</ul></details>` : ""}
     <div class="row"><label>Label <input type="text" id="im-mergelabel" value="${esc(im.mergeLabel)}" maxlength="80" placeholder="for example: mine + Unsloth's"></label></div>
     ${why ? `<p class="dim small" id="im-merge-why">${esc(why)}</p>` : ""}
     <div class="row"><button class="primary" id="im-merge-go" ${im.running || why ? "disabled" : ""}>Merge</button></div>${prog}</div>`;
 }
 
+// what is in the merge, in the order it is sent, with the key its weight is kept under
+function imMergeInputs() {
+  const st = im.state || {};
+  const out = im.mergePicked.map((id) => { const e = (st.entries || []).find((x) => x.id === id); return { key: "lib:" + id, label: (e && (e.label || e.id)) || id, spec: { kind: "library", id } }; });
+  im.mergeFiles.forEach((file) => out.push({ key: "file:" + file, label: file, spec: { kind: "file", file } }));
+  if (im.mergePub) out.push({ key: "pub", label: "Unsloth's published matrix", spec: { kind: "published", base: im.mergePubBase } });
+  return out;
+}
+function imWeightOf(key) { const v = im.mergeWeights[key]; return v === undefined || String(v).trim() === "" ? 1 : Number(v); }
+
 function imMergeSpec() {
-  const inputs = im.mergePicked.map((id) => ({ kind: "library", id })).concat(im.mergeFiles.map((file) => ({ kind: "file", file })));
-  if (im.mergePub) inputs.push({ kind: "published", base: im.mergePubBase });
+  // a weight is sent only when it is not the default 1, so a merge without weights is the spec it always was
+  const inputs = imMergeInputs().map((i) => { const w = imWeightOf(i.key); return w !== 1 ? { ...i.spec, weight: w } : i.spec; });
   return { inputs, label: im.mergeLabel.trim() };
+}
+
+// ---- "Adapt to my cut model": a matrix of the ORIGINAL model cut to a model made on the Slim page (layers kept and renumbered, ffn_down sliced). docs/IMATRIX.md.
+function imAdaptSource(st) {
+  const entries = (st.entries || []).filter((e) => e.has_gguf && e.source_kind !== "adapted");
+  if (im.adSrc === "library") { if (!entries.some((e) => e.id === im.adId)) im.adId = entries.length ? entries[0].id : ""; return im.adId ? { kind: "library", id: im.adId } : null; }
+  if (im.adSrc === "file") return im.adFile.trim() ? { kind: "file", file: im.adFile.trim() } : null;
+  const cut = (st.cut_models || []).find((c) => c.name === im.adModel);
+  const bases = st.published_bases || [];
+  if (!im.adBase) im.adBase = (cut && cut.origin_repo && bases.some((b) => b.repo === cut.origin_repo) ? cut.origin_repo : bases.length ? bases[0].repo : "");
+  return im.adBase ? { kind: "published", base: im.adBase } : null;
+}
+
+function imAdaptSpec(st) {
+  const source = imAdaptSource(st);
+  const kept = im.adKept.split(/[\s,;]+/).filter(Boolean).map(Number);
+  const w = im.adWeight.trim() === "" ? 1 : Number(im.adWeight);
+  const size = im.adSrc === "published" && im.adPubInfo && im.adPubInfo.size ? im.adPubInfo.size : null;
+  return { source, model: im.adModel, weight: w === 1 ? null : w, label: im.adLabel.trim(), kept_layers: kept.length ? kept : null, source_size: size };
+}
+
+async function imAdaptPreview() {
+  const st = im.state;
+  if (!st || page !== "imatrix") return;
+  const spec = imAdaptSpec(st);
+  if (!spec.source || !spec.model || !(spec.weight === null || spec.weight > 0)) { im.adPreview = null; im.adPreviewKey = ""; return; }
+  const key = JSON.stringify(spec);
+  if (key === im.adPreviewKey) return;
+  im.adPreviewKey = key; im.adPreview = null;
+  try { im.adPreview = await invoke("imatrix_adapt_preview", { spec }); } catch (e) { im.adPreview = { ok: false, code: "error", text: String(e) }; }
+  if (page === "imatrix" && im.adPreviewKey === key) render();
+}
+
+function imAdaptHtml(st) {
+  imAdaptSource(st);                         // fills in the default list entry / base model before the form is drawn
+  const cuts = st.cut_models || [];
+  if (!im.adModel || !cuts.some((c) => c.name === im.adModel)) im.adModel = cuts.length ? cuts[0].name : "";
+  const cut = cuts.find((c) => c.name === im.adModel);
+  const entries = (st.entries || []).filter((e) => e.has_gguf && e.source_kind !== "adapted");
+  const bases = st.published_bases || [];
+  const srcOpts = [["published", "Unsloth's published matrix for the base model"], ["library", "A matrix of my list (of the original model)"], ["file", "A matrix file (of the original model)"]]
+    .map(([k, t]) => `<option value="${k}" ${im.adSrc === k ? "selected" : ""}>${t}</option>`).join("");
+  let src = "";
+  if (im.adSrc === "library") src = entries.length ? `<div class="row"><label>Matrix <select id="im-ad-lib">${entries.map((e) => `<option value="${esc(e.id)}" ${im.adId === e.id ? "selected" : ""}>${esc(e.label || e.id)} · ${esc(e.id)}</option>`).join("")}</select></label></div>` : `<p class="dim small">There is no matrix of the original model in your list.</p>`;
+  else if (im.adSrc === "file") src = `<div class="row"><label>Matrix file <input type="text" id="im-ad-file" value="${esc(im.adFile)}" placeholder="C:\\matrices\\imatrix.gguf" style="min-width:300px"></label><button class="secondary" id="im-ad-filebrowse">Browse…</button></div>`;
+  else {
+    const info = im.adPubInfo;
+    src = bases.length ? `<div class="row"><label>Base model <select id="im-ad-base">${bases.map((b) => `<option value="${esc(b.repo)}" ${im.adBase === b.repo ? "selected" : ""}>${esc(b.label)}</option>`).join("")}</select></label><button class="secondary" id="im-ad-lookup" ${im.adPubBusy ? "disabled" : ""}>Look it up</button></div>`
+      : `<p class="dim small">No base model on the Hugging Face Hub is known in this project yet.</p>`;
+    src += im.adPubBusy ? `<p class="dim small">Looking it up on the Hub…</p>` : im.adPubError ? `<div class="warn small" id="im-ad-pub-error">${esc(im.adPubError)}</div>`
+      : info ? `<div class="small" id="im-ad-pub-info"><strong>${esc(info.repo)}</strong> · ${info.size != null ? (info.size / 1048576).toFixed(1) + " MB" : "size not stated"}${info.gated ? " · <strong>gated</strong>" : ""}<br>${info.cached ? "Already downloaded; nothing will be downloaded." : `<strong>Adapting downloads ${info.size != null ? (info.size / 1048576).toFixed(1) + " MB" : "the file"} from huggingface.co</strong> into this project's <code>imatrix_downloads</code> folder, once.`}</div>` : "";
+  }
+  const model = cuts.length ? `<div class="row"><label>My cut model <select id="im-ad-model">${cuts.map((c) => `<option value="${esc(c.name)}" ${im.adModel === c.name ? "selected" : ""}>${esc(c.name)} · ${c.layers_after} of ${c.layers_before} layers${c.thinner ? ", MLP " + c.intermediate_before.toLocaleString("en") + " → " + c.intermediate_after.toLocaleString("en") : ""}${c.healed ? " · healed" : ""}</option>`).join("")}</select></label></div>
+    ${cut && cut.refusal && !cut.needs_layer_map ? `<div class="warn small" id="im-ad-refusal">${esc(cut.refusal)}</div>` : ""}`
+    : `<p class="dim small" id="im-ad-nomodel">There is no model made on the "Slim or grow a model" page in this project yet. Make one there (cut layers and/or thin the MLP), then come back.</p>`;
+  const pv = im.adPreview;
+  const needMap = (cut && cut.needs_layer_map) || (pv && pv.code === "needs_layer_map");
+  const kept = needMap ? `<div class="row"><label>Layers of the original it kept <input type="text" id="im-ad-kept" value="${esc(im.adKept)}" placeholder="0, 1, 2, 3, 8, 9, 10, 11" style="min-width:300px"></label></div>
+    <p class="dim small">This model was made by an older version of the program that did not write down which layers it kept. Type their numbers in the original model, counted from 0 (the program cannot guess them).</p>` : "";
+  const preview = pv ? (pv.ok ? `<p class="ok small" id="im-ad-preview"><strong>${esc(pv.text)}</strong>${pv.exact ? "" : " (an estimate until the matrix file is at hand)"}.${(pv.notes || []).map((t) => " " + esc(t)).join("")}</p>` : `<div class="warn small" id="im-ad-preview-refusal">${esc(pv.text)}</div>`) : "";
+  const wnum = im.adWeight.trim() === "" ? 1 : Number(im.adWeight);
+  const why = !st.env_ready ? "The adaptation runs in the training software's worker, which is not set up yet (open Training setup)." : !cuts.length ? "Make a cut model first." : cut && cut.refusal && !cut.needs_layer_map ? cut.refusal
+    : !imAdaptSource(st) ? "Choose the matrix to adapt." : !(wnum > 0) ? "The weight must be a number above 0." : pv && pv.ok === false ? pv.text : "";
+  const prog = im.running && im.pending === "adapt" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
+  return `<div class="card wide" id="im-adapt"><h2>Adapt to my cut model</h2>
+    <p>A model you cut on the <strong>Slim or grow a model</strong> page has fewer layers and/or thinner MLPs than the model a matrix was measured on. Unsloth publishes the matrix it used for the original model; this card <strong>adapts</strong> a matrix like that to your cut model <em>without measuring anything</em>: the layers your model dropped are dropped from the matrix and the others are renumbered, and the per-neuron statistics of <code>ffn_down</code> are cut to the neurons your model kept. Nothing else of the matrix changes (the other entries look at the hidden state, which Slim does not change).</p>
+    <div class="warn small" id="im-ad-honest"><strong>What this is, honestly.</strong> The adapted matrix still describes the <em>unmodified</em> model's activations. For a model that was cut and healed it is an <em>approximation</em>; it is best merged with a matrix of your own, measured on the healed model (use the weight below, and the Merge card). It is <strong>not Unsloth's Dynamic recipe</strong>, which is unpublished and cannot be reproduced here. Whether it improves the small sizes of your cut model is measured with <em>Compare quants</em>; that has not been tried yet.</div>
+    <div class="row"><label>The matrix comes from <select id="im-ad-src" ${im.running ? "disabled" : ""}>${srcOpts}</select></label></div>${src}${model}${kept}
+    <div class="row"><label>Weight <input type="number" id="im-ad-weight" min="0" step="any" value="${esc(im.adWeight)}" style="width:100px"></label><span class="dim small">1 = as it is</span></div>
+    <p class="dim small" id="im-ad-weight-text">Merging <em>adds</em> the statistics, so a matrix with more text outweighs one with less. The published matrix counts about 1,149,614 rows of text; a matrix of your own measured on 128 chunks of 512 about 65,000. Merged as they are, the published one outweighs yours about 17 to 1. The weight multiplies the sums <em>and</em> the counts of the adapted matrix (its mean square per channel stays), so it only changes how strongly it counts when merged: 0.05 makes the two about even, 0.1 about 2 to 1. Leave it at 1 if you only want the adapted matrix.</p>
+    <div class="row"><label>Label <input type="text" id="im-ad-label" value="${esc(im.adLabel)}" maxlength="80" placeholder="for example: Unsloth's, cut to my 16B"></label></div>
+    ${preview}${why ? `<p class="dim small" id="im-ad-why">${esc(why)}</p>` : ""}
+    <div class="row"><button class="primary" id="im-adapt-go" ${im.running || why ? "disabled" : ""}>Adapt</button></div>${prog}</div>`;
 }
 
 function renderImatrix() {
@@ -1002,8 +1100,10 @@ function renderImatrix() {
   const mergedPart = r && r.merged && r.merged.entry ? `<div class="ok" id="im-merged-result"><strong>Also merged with Unsloth's published matrix:</strong> ${esc(r.merged.entry.label || r.merged.entry.id)} (${r.merged.entry.size_mb} MB). Your own matrix is kept as well.${(r.merged.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}</div>` : r && r.merge_error ? `<div class="warn" id="im-merge-error">${esc(r.merge_error)}</div>` : "";
   const mergeResult = r && r.kind === "merge" && r.entry ? `<div class="ok" id="im-merge-result"><strong>Merged matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB). It is in the list above and can be used in exports and in Compare quants like any other.</div>
       ${(r.warnings || []).map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
-      ${(r.weights || []).length ? `<ul class="small">${r.weights.map((w) => `<li>${esc(w.label)}: ${w.chunks != null ? w.chunks + " chunks" : "amount of text unknown"}${w.share != null ? ` · about ${Math.round(w.share * 100)} % of the merged statistics` : ""}</li>`).join("")}</ul>` : ""}` : "";
-  const result = mergeResult || (r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
+      ${(r.weights || []).length ? `<ul class="small" id="im-merge-weights-used">${r.weights.map((w) => `<li>${esc(w.label)}: ${w.tokens != null ? Math.round(w.tokens).toLocaleString("en") + " rows of text" : w.chunks != null ? w.chunks + " chunks" : "amount of text unknown"}${w.weight != null && w.weight !== 1 ? ` (weight ${w.weight} used)` : ""}${w.share != null ? ` · about ${Math.round(w.share * 100)} % of the merged statistics` : ""}</li>`).join("")}</ul>` : ""}` : "";
+  const adaptResult = r && r.kind === "adapt" && r.entry ? `<div class="ok" id="im-adapt-result"><strong>Adapted matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB)${r.numbers ? `: keeps ${r.numbers.layers_after} of ${r.numbers.layers_before} layers; ffn_down ${(r.numbers.ffn_down_before || 0).toLocaleString("en")} → ${(r.numbers.ffn_down_after || 0).toLocaleString("en")} per layer` : ""}${r.adapted && r.adapted.weight !== 1 ? `; weight ${r.adapted.weight}` : ""}. It is in the list above; merge it with a matrix of your own on the cut model (Merge card), or use it in exports and Compare quants like any other.</div>
+      ${(r.notes || []).map((t) => `<div class="${t.startsWith("Warning") ? "warn " : "dim "}small">${esc(t)}</div>`).join("")}` : "";
+  const result = adaptResult || mergeResult || (r && r.entry ? `<div class="ok"><strong>Matrix ready:</strong> ${esc(r.entry.label || r.entry.id)} (${r.entry.size_mb} MB).${(r.notes || []).length ? "<br>" + r.notes.map(esc).join("<br>") : ""}
       ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>${mergedPart}` : "");
   const msg = `${errBox(im.error, "imatrix")}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
   const log = im.log.length ? `<details><summary>Log</summary><pre class="log">${im.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
@@ -1011,7 +1111,7 @@ function renderImatrix() {
   return `<h1>Importance matrices</h1><p class="lead">Measure which parts of a model matter most, keep the result, and use it for better small GGUF files.</p>
     <div class="card wide"><h2>What it is</h2>${IM_INTRO}${llamaNotice("imatrix")}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
     <div class="card wide"><h2>Your matrices</h2>${list}${add}${prog}</div>
-    ${imMergeHtml(st)}${imFormHtml(st)}${msg}${result}${log}`;
+    ${imMergeHtml(st)}${imAdaptHtml(st)}${imFormHtml(st)}${msg}${result}${log}`;
 }
 
 async function imRefresh() {
@@ -1033,12 +1133,13 @@ function onImatrixEvent(p) {
     im.running = false; im.progress = null; im.step = "";
     const d = p.data || {};
     if (im.pending === "dat") im.ok = "The legacy .dat file was made.";
-    else if (im.pending === "merge") { im.result = { ...d, kind: "merge" }; im.ok = null; im.mergePicked = []; im.mergeFiles = []; im.mergeLabel = ""; }
+    else if (im.pending === "merge") { im.result = { ...d, kind: "merge" }; im.ok = null; im.mergePicked = []; im.mergeFiles = []; im.mergeLabel = ""; im.mergeWeights = {}; }
+    else if (im.pending === "adapt") { im.result = { ...d, kind: "adapt" }; im.ok = null; im.adLabel = ""; }
     else { im.result = d; im.ok = null; im.label = ""; }
     imRefresh();
   } else if (p.kind === "error") {
     im.running = false; im.progress = null; im.step = "";
-    im.error = p.text === "Cancelled." ? (im.pending === "create" ? "Cancelled. Nothing was kept." : "Cancelled. Nothing was kept; the matrices you merge are unchanged.") : p.text;
+    im.error = p.text === "Cancelled." ? (im.pending === "create" || im.pending === "adapt" ? "Cancelled. Nothing was kept." : "Cancelled. Nothing was kept; the matrices you merge are unchanged.") : p.text;
     imRefresh();
   }
   if (page === "imatrix") render();
@@ -1083,6 +1184,18 @@ function wireImatrix() {
     im.mergePubBusy = false; render();
   });
   on("im-merge-go", () => imRun("merge", "imatrix_merge", { spec: imMergeSpec() }));
+  document.querySelectorAll(".im-mw").forEach((i) => i.onchange = () => { im.mergeWeights[i.dataset.key] = i.value; render(); });
+  const adBind = (id, key, redraw) => { const e = $(id); if (e) e.onchange = () => { im[key] = e.value; if (key === "adSrc" || key === "adBase") { im.adPubInfo = null; im.adPubError = ""; } if (redraw) render(); }; };
+  adBind("im-ad-src", "adSrc", true); adBind("im-ad-lib", "adId", true); adBind("im-ad-file", "adFile", true); adBind("im-ad-base", "adBase", true); adBind("im-ad-model", "adModel", true);
+  adBind("im-ad-kept", "adKept", true); adBind("im-ad-weight", "adWeight", true); adBind("im-ad-label", "adLabel", false);
+  on("im-ad-filebrowse", async () => { const f = await tauri.dialog.open({ multiple: false, title: "Choose an importance matrix file", filters: [{ name: "Importance matrix", extensions: ["gguf"] }, { name: "All files", extensions: ["*"] }] }); if (f) { im.adFile = f; render(); } });
+  on("im-ad-lookup", async () => {
+    im.adPubBusy = true; im.adPubError = ""; im.adPubInfo = null; render();
+    try { im.adPubInfo = await invoke("imatrix_published", { base: im.adBase }); } catch (e) { im.adPubError = String(e); }
+    im.adPubBusy = false; render();
+  });
+  on("im-adapt-go", () => imRun("adapt", "imatrix_adapt", { spec: imAdaptSpec(im.state) }));
+  imAdaptPreview();
   on("im-stop", () => invoke("imatrix_stop"));
   on("im-tostep5", () => go("use"));
   // the list

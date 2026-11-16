@@ -77,10 +77,11 @@ def main(argv: list) -> int:
             traceback.print_exc()
             protocol.error(_code(exc, "export_failed"), str(exc) if _code(exc, "") else _explain(exc))
             return 1
-    if kind in ("imatrix_make", "imatrix_dat", "imatrix_merge", "imatrix_published"):
-        from . import imatrix, imatrixjob, imatrixmerge
+    if kind in ("imatrix_make", "imatrix_dat", "imatrix_merge", "imatrix_published", "imatrix_adapt", "imatrix_adapt_preview"):
+        from . import imatrix, imatrixadapt, imatrixjob, imatrixmerge
         try:
-            return {"imatrix_make": imatrixjob.run, "imatrix_dat": imatrixjob.run_dat, "imatrix_merge": imatrixmerge.run, "imatrix_published": imatrixmerge.run_published}[kind](job)
+            return {"imatrix_make": imatrixjob.run, "imatrix_dat": imatrixjob.run_dat, "imatrix_merge": imatrixmerge.run, "imatrix_published": imatrixmerge.run_published,
+                    "imatrix_adapt": imatrixadapt.run, "imatrix_adapt_preview": imatrixadapt.run_preview}[kind](job)
         except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
             protocol.error("imatrix_stopped", "Cancelled.")
             return 1

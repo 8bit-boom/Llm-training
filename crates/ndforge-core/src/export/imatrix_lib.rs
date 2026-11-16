@@ -142,7 +142,7 @@ pub fn id_at(p: &Project, stamp: &str, name: &str) -> String {
     id
 }
 
-fn tidy_label(label: &str) -> String {
+pub(crate) fn tidy_label(label: &str) -> String {
     label.trim().chars().filter(|c| !c.is_control()).take(LABEL_MAX).collect()
 }
 
@@ -499,11 +499,11 @@ fn name_for(job: &Value) -> String {
     job["model_name"].as_str().unwrap_or("matrix").to_string()
 }
 
-fn event(e: WorkerEvent) -> Value {
+pub(crate) fn event(e: WorkerEvent) -> Value {
     crate::reshape::runs::event_json(e)
 }
 
-fn python() -> Result<PathBuf> {
+pub(crate) fn python() -> Result<PathBuf> {
     let py = python_path(&env_dir());
     if !py.is_file() {
         return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
@@ -523,7 +523,10 @@ pub fn create(p: &Project, spec: &MakeSpec, kill: &AtomicBool, on_event: &mut dy
     result["entry"] = entry(&lib_dir(p).join(&id)).unwrap_or(Value::Null);
     if spec.merge_published {
         // a merge after the creation: the matrix just made stays whatever happens (offline, no published matrix, Stop); the reason is told next to it
-        let outcome = match base_repo_of(&job["source"]) {
+        // a model cut on the Slim page has its original in its record: the published matrix of THAT is adapted to the cut model first (build_merge_job finds the cut model in the
+        // entry just made), never merged raw
+        let cut_origin = super::imatrix_adapt::entry_cut_model(&result["entry"]).and_then(|(dir, _)| super::imatrix_adapt::origin_repo(Path::new(&dir))).filter(|r| is_hub_id(r));
+        let outcome = match base_repo_of(&job["source"]).or(cut_origin) {
             None => Err(Error::new("The model has no base model on the Hugging Face Hub, so there is no published matrix to merge with. The matrix you made is kept.")),
             Some(base) => merge(p, &MergeSpec { inputs: vec![MergeInput { kind: "library".into(), id: Some(id.clone()), ..Default::default() }, MergeInput { kind: "published".into(), base: Some(base), ..Default::default() }],
                                                 label: format!("{} + Unsloth's published matrix", if spec.label.trim().is_empty() { id.as_str() } else { spec.label.trim() }) }, kill, on_event),
@@ -579,6 +582,12 @@ pub struct MergeInput {
     pub id: Option<String>,
     pub file: Option<String>,
     pub base: Option<String>,
+    /// a number above 0 (None = 1): the sums and counts of this matrix are multiplied by it in a copy before they are merged, so the merge counts it that many times as strongly.
+    /// Old specs have none.
+    pub weight: Option<f64>,
+    /// the made model (its folder name under `models/`) to adapt this matrix to first (depth and width, imatrix_adapt.rs): "adapted published matrix + my own matrix" in one step.
+    /// Left out for a published matrix, it is filled in when a library input was measured on a cut model.
+    pub adapt_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -595,17 +604,26 @@ pub fn downloads_dir(p: &Project) -> PathBuf {
 
 /// The job for the worker. Everything the person could get wrong is a plain message here.
 pub fn build_merge_job(p: &Project, spec: &MergeSpec, id: &str, stop_file: &Path) -> Result<Value> {
+    use super::imatrix_adapt as adapt;
     if spec.inputs.len() < 2 {
         return Err(Error::new("Choose at least two matrices to merge (matrices of the library, a file, or Unsloth's published matrix)."));
     }
     let (mut inputs, mut seen) = (vec![], std::collections::HashSet::new());
+    let mut cuts: Vec<(String, String)> = vec![];           // the cut models the library inputs were measured on
     for i in &spec.inputs {
+        let weight = adapt::check_weight(i.weight)?;
         let key = match i.kind.as_str() {
             "library" => {
                 let lid = i.id.as_deref().filter(|x| !x.is_empty()).ok_or_else(|| Error::new("Choose a saved matrix."))?;
                 let (dir, e) = get(p, lid)?;
                 let f = matrix_file(&dir).ok_or_else(|| Error::new("That saved matrix has no file any more."))?;
-                inputs.push(json!({"kind": "library", "id": lid, "file": f, "label": if e["label"].as_str().is_some_and(|l| !l.is_empty()) { e["label"].clone() } else { json!(lid) }, "model": e["model"], "chunks": e["chunks"]}));
+                if let Some(c) = adapt::entry_cut_model(&e) {
+                    if !cuts.contains(&c) {
+                        cuts.push(c);
+                    }
+                }
+                inputs.push(json!({"kind": "library", "id": lid, "file": f, "label": if e["label"].as_str().is_some_and(|l| !l.is_empty()) { e["label"].clone() } else { json!(lid) }, "model": e["model"], "chunks": e["chunks"],
+                                   "source_kind": e["source_kind"], "cut_model": e["cut_model"], "weight": weight}));
                 format!("library:{lid}")
             }
             "file" => {
@@ -614,18 +632,41 @@ pub fn build_merge_job(p: &Project, spec: &MergeSpec, id: &str, stop_file: &Path
                 if !Path::new(f).is_file() {
                     return Err(Error::new(format!("The file {f} was not found.")));
                 }
-                inputs.push(json!({"kind": "file", "file": f}));
+                inputs.push(json!({"kind": "file", "file": f, "weight": weight}));
                 format!("file:{f}")
             }
             "published" => {
                 let b = i.base.as_deref().map(str::trim).filter(|b| !b.is_empty()).ok_or_else(|| Error::new("Choose the base model whose published matrix to use."))?;
-                inputs.push(json!({"kind": "published", "base": b}));
+                inputs.push(json!({"kind": "published", "base": b, "weight": weight}));
                 format!("published:{b}")
             }
             _ => return Err(Error::new("One of the things to merge is neither a saved matrix, a file nor the published matrix.")),
         };
         if !seen.insert(key) {
             return Err(Error::new("The same matrix is in the merge twice: it would count double. Take one out."));
+        }
+        // an explicit "adapt to this made model"
+        if let Some(name) = i.adapt_to.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            let dir = adapt::model_dir(p, name)?;
+            if let Some((_, text)) = adapt::cut_facts(&dir, name, None).and_then(|f| f.refusal) {
+                return Err(Error::new(text));
+            }
+            let last = inputs.len() - 1;
+            inputs[last]["adapt_to"] = json!({"model_dir": dir, "model_name": name});
+        }
+    }
+    // the published matrix describes the ORIGINAL model: when a library input was measured on a model cut on the Slim page it is adapted to that model first, never merged raw
+    if inputs.iter().any(|i| i["kind"] == "published" && i["adapt_to"].is_null()) && !cuts.is_empty() {
+        if cuts.len() > 1 {
+            return Err(Error::new(format!("The matrices you chose were measured on different cut models ({}). A published matrix can be adapted to only one of them: merge matrices of one cut model.", cuts.iter().map(|c| c.1.clone()).collect::<Vec<_>>().join(", "))));
+        }
+        let (dir, name) = &cuts[0];
+        if let Some((_, text)) = adapt::cut_facts(Path::new(dir), name, None).and_then(|f| f.refusal) {
+            return Err(Error::new(text));
+        }
+        for i in inputs.iter_mut().filter(|i| i["kind"] == "published" && i["adapt_to"].is_null()) {
+            i["adapt_to"] = json!({"model_dir": dir, "model_name": name});
+            i["auto_adapted"] = json!(true);
         }
     }
     let base_repo = spec.inputs.iter().find(|i| i.kind == "published").and_then(|i| i.base.as_deref()).map(|b| b.trim().to_string());
@@ -670,6 +711,11 @@ pub fn published_bases(p: &Project) -> Vec<Value> {
             }
         }
     }
+    for c in super::imatrix_adapt::cut_models(p) {
+        if let (Some(repo), Some(n)) = (c["origin_repo"].as_str(), c["name"].as_str()) {
+            add(repo, format!("{repo} (the original of the cut model {n})"));
+        }
+    }
     for m in crate::train::catalog::models() {
         add(&m.repo, m.repo.clone());
     }
@@ -690,12 +736,16 @@ pub fn state(p: &Project) -> Value {
     }
     let models: Vec<Value> = crate::train::catalog::models().into_iter().map(|m| {
         estimates.insert(format!("model:{}", m.id), est(Some(m.params_b)));
-        json!({"id": m.id, "name": m.name, "repo": m.repo, "family": m.family, "params_b": m.params_b, "reshape": m.reshape})
+        json!({"id": m.id, "name": m.name, "repo": m.repo, "family": m.family, "params_b": m.params_b, "reshape": m.reshape,
+               "cut_origin": super::imatrix_adapt::origin_repo(Path::new(&m.repo)).filter(|r| is_hub_id(r))})
     }).collect();
     estimates.insert("default".into(), est(None));
     json!({"entries": list(p), "exports": exports_with_matrix(p), "runs": runs.iter().map(|r| json!({"name": r["name"], "model": r["model"], "status": r["status"], "loss": r["loss"],
-                                               "base": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from)).filter(|r| is_hub_id(r))})).collect::<Vec<_>>(),
-           "models": models, "published_bases": published_bases(p), "data_version": crate::train::runs::latest_version(p).map(|(n, _)| n), "chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX,
+                                               "base": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from))
+                                                   .and_then(|r| if is_hub_id(&r) { Some(r) } else { super::imatrix_adapt::origin_repo(Path::new(&r)).filter(|o| is_hub_id(o)) }),
+                                               "cut": r["name"].as_str().and_then(|n| read_json(&runs_dir(p).join(n).join("config.json"))).and_then(|c| c["model"]["repo"].as_str().map(String::from))
+                                                   .is_some_and(|r| !is_hub_id(&r) && super::imatrix_adapt::origin_repo(Path::new(&r)).is_some())})).collect::<Vec<_>>(),
+           "models": models, "cut_models": super::imatrix_adapt::cut_models(p), "published_bases": published_bases(p), "data_version": crate::train::runs::latest_version(p).map(|(n, _)| n), "chunks": IMATRIX_CHUNKS, "default_chunks": IMATRIX_DEFAULT_CHUNKS, "ctx": IMATRIX_CTX,
            "general_share": IMATRIX_GENERAL_SHARE, "estimates": estimates, "general": crate::general::state(Some(p)),
            "env_ready": crate::envmgr::health::env_installed(&env_dir())})
 }

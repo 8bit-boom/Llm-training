@@ -192,9 +192,10 @@ def estimate(info: dict, rules, p: dict) -> dict:
 # ------------------------------------------------------------------------------------------------------------------ the importance of each tensor, from a matrix
 
 def read_importance(path) -> dict:
-    """{weight tensor name: mean squared input activation} from a GGUF-format importance matrix: for every `<name>.in_sum2` (the sum of the squared inputs, shape n_in x n_experts) and
-    `<name>.counts` (how many rows were summed per expert) the mean of in_sum2 / counts over all inputs and experts (llama.cpp's `imatrix.cpp` writes both as float32). Raises
-    FitError (plain words) when the file cannot be read this way (a legacy .dat, a matrix without those tensors)."""
+    """{weight tensor name: mean squared input activation} from a GGUF-format importance matrix: for every `<name>.in_sum2` (the sum of the squared inputs) and `<name>.counts`
+    (how many rows were summed) the mean of in_sum2 / counts over all inputs and experts (float32). Two layouts are read: the one of a dense model, as in the real published
+    matrix (verified: `in_sum2` has ONE dimension, [n_in], and `counts` one value, [1]), and the one of a mixture-of-experts model (`in_sum2` [n_in, n_experts] with one count
+    per expert). Raises FitError (plain words) when the file cannot be read this way (a legacy .dat, a matrix without those tensors)."""
     try:
         info = ggufinfo.read(path)
     except (OSError, ValueError) as exc:

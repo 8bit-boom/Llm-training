@@ -12,7 +12,10 @@ each parent weighs. The published matrix describes the UNMODIFIED base model, no
 
 Job: {"job": "imatrix_published", "base": "Qwen/Qwen3.8-27B", "cache": folder}
 and  {"job": "imatrix_merge", "root": library folder, "id", "label", "stop_file", "cache": folder, "notes": [text], "inputs": [{"kind": "library", "id", "file", "label", "model", "chunks"} |
-{"kind": "file", "file"} | {"kind": "published", "base": "owner/name"}]}.
+{"kind": "file", "file"} | {"kind": "published", "base": "owner/name"}]}. Every input may also have "weight" (a number above 0, default 1: its sums AND counts are multiplied by it in
+a copy that llama-imatrix reads, so the merge counts it that many times as strongly) and "adapt_to" ({"model_dir", "model_name", "kept_layers"}: the matrix is first adapted to that
+cut model, imatrixadapt.py, "adapted published matrix + my own matrix" in one step). A published matrix is NEVER merged raw with a matrix that was measured on a model with other
+layers or another MLP width (a model cut on the Slim page): it must be adapted (adapt_to) or the merge is refused and the Adapt button is offered.
 The Hugging Face token reaches the worker only as the environment variable HF_TOKEN; HF_ENDPOINT (default https://huggingface.co) is read for mirrors and for the tests."""
 import hashlib
 import json
@@ -25,7 +28,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import imatrix, protocol
+from . import imatrix, imatrixadapt, protocol
+from .imatrixadapt import AdaptRefused
 from .imatrixjob import MatrixError, check_space, find_tools, free_bytes, plain  # noqa: F401  (free_bytes is replaced by the tests)
 
 # the file names Unsloth's zoo looks for, in its order (unsloth_zoo.llama_cpp.IMATRIX_UPSTREAM_NAMES, version 2026.11.4); the GGUF one is named `.gguf_file` so that the Hub does
@@ -211,19 +215,49 @@ def compat(inputs: list) -> list:
 
 
 def weights(inputs: list) -> tuple:
-    """([{"label", "chunks", "share"}], note): how much each parent weighs. The statistics are ADDED, so a matrix made from more text weighs more. `share` is None when a chunk count is
-    not known; the note is "" unless one parent carries more than three quarters of all text."""
+    """([{"label", "chunks", "tokens", "weight", "share"}], note): how much each parent weighs. The statistics are ADDED, so a matrix made from more text weighs more, and a parent's
+    weight factor multiplies it. `share` is of the rows (tokens: the `counts` value) when every parent has them, else of the chunks, else None; the note is "" unless one parent
+    carries more than three quarters of all text."""
     chunks = [i.get("chunks") for i in inputs]
-    total = sum(c for c in chunks if isinstance(c, int))
-    rows = [{"label": i["label"], "chunks": c if isinstance(c, int) else None, "share": round(c / total, 3) if isinstance(c, int) and all(isinstance(x, int) for x in chunks) and total else None}
-            for i, c in zip(inputs, chunks)]
+    toks = [i.get("tokens") for i in inputs]
+    w = [float(i.get("weight") or 1.0) for i in inputs]
+    use = toks if all(isinstance(t, (int, float)) and t > 0 for t in toks) else chunks if all(isinstance(c, int) for c in chunks) else None
+    eff = [u * x for u, x in zip(use, w)] if use else None
+    total = sum(eff) if eff else 0
+    rows = [{"label": i["label"], "chunks": c if isinstance(c, int) else None, "tokens": t if isinstance(t, (int, float)) else None, "weight": x,
+             "share": round(e / total, 3) if eff and total else None} for i, c, t, x, e in zip(inputs, chunks, toks, w, eff or [None] * len(inputs))]
     note = ""
-    if all(isinstance(c, int) for c in chunks) and total:
-        big = max(zip(chunks, inputs), key=lambda t: t[0])
+    if eff and total:
+        big = max(zip(eff, inputs, chunks, toks), key=lambda t: t[0])
         if big[0] / total > 0.75:
-            note = (f"{big[1]['label']} was measured on {big[0]} chunks of text and carries about {round(big[0] / total * 100)} % of the merged statistics: merging adds them, so the larger "
-                    "matrix outweighs the smaller. To give your own matrix more say, make it with more chunks.")
+            how = f"{big[3]:,.0f} rows of text" if use is toks else f"{big[2]} chunks of text"
+            note = (f"{big[1]['label']} was measured on {how} and carries about {round(big[0] / total * 100)} % of the merged statistics: merging adds them, so the larger "
+                    "matrix outweighs the smaller. To give your own matrix more say, make it with more chunks, or give the larger one a smaller weight (the weight box of the merge).")
     return rows, note
+
+
+def guard_raw(resolved: list) -> None:
+    """The published matrix describes the ORIGINAL model. Merged as it is with a matrix that was measured on a model with other layers or another MLP width (a model cut on the Slim
+    page) it would silently put the statistics of the wrong layers together: refused, with the way out. A published matrix that is adapted (adapt_to) is not raw."""
+    for p in resolved:
+        if p["kind"] != "published" or p.get("adapt_to"):
+            continue
+        sp = imatrix.matrix_summary(p["file"])
+        for q in resolved:
+            if q is p or q.get("adapt_to"):
+                continue
+            sq = imatrix.matrix_summary(q["file"])
+            if not sp or not sq:
+                continue
+            diff = []
+            if sp["layers"] and sq["layers"] and sp["layers"] != sq["layers"]:
+                diff.append(f"{sq['layers']} layers instead of {sp['layers']}")
+            if sp["intermediate"] and sq["intermediate"] and sp["intermediate"] != sq["intermediate"]:
+                diff.append(f"an MLP width of {sq['intermediate']} instead of {sp['intermediate']}")
+            if diff:
+                raise AdaptRefused("cut_model", f"{p['label']} describes the original model, but {q['label']} was measured on a model with {' and '.join(diff)} (a model cut on the Slim or grow page). "
+                                                "Merging them as they are would add up the statistics of different layers. Adapt the published matrix to your cut model first (the button \"Adapt to my cut model\" in "
+                                                "Importance matrices: it keeps the layers your model kept and cuts the MLP the way yours was cut), then merge the adapted matrix with yours.")
 
 
 # ------------------------------------------------------------------------------------------------------------------ llama-imatrix's own words
@@ -268,7 +302,8 @@ def merge(job: dict) -> dict:
             f = Path(i.get("file") or "")
             if not f.is_file():
                 raise MatrixError(f"The saved matrix {i.get('label') or i.get('id')} has no file any more. Take it out of the merge.")
-            resolved.append({"kind": "library", "id": i.get("id"), "file": f, "label": i.get("label") or i.get("id") or f.name, "model": i.get("model"), "chunks": i.get("chunks")})
+            resolved.append({"kind": "library", "id": i.get("id"), "file": f, "label": i.get("label") or i.get("id") or f.name, "model": i.get("model"), "chunks": i.get("chunks"),
+                             "source_kind": i.get("source_kind"), "cut_model": i.get("cut_model")})
         elif kind == "file":
             f = Path(i.get("file") or "")
             if not f.is_file():
@@ -283,6 +318,12 @@ def merge(job: dict) -> dict:
             resolved.append({"kind": "published", "file": f, "label": f"Unsloth's published matrix for {info['base']}", "model": None, "chunks": None, "hub": info})
         else:
             raise MatrixError("One of the things to merge is neither a saved matrix, a file nor the published matrix.")
+        w = i.get("weight")
+        w = 1.0 if w is None else w
+        if not (isinstance(w, (int, float)) and not isinstance(w, bool) and 0 < w <= imatrixadapt.WEIGHT_MAX and w == w):
+            raise AdaptRefused("bad_weight", f"The weight of {resolved[-1]['label']} must be a number above 0 (and at most {imatrixadapt.WEIGHT_MAX:g}), not {w!r}.")
+        resolved[-1]["weight"] = float(w)
+        resolved[-1]["adapt_to"] = i.get("adapt_to") if isinstance(i.get("adapt_to"), dict) and i["adapt_to"].get("model_dir") else None
         if imatrix.stop_requested(im):
             raise imatrix.Stopped()
     paths = [str(r["file"]) for r in resolved]
@@ -292,22 +333,56 @@ def merge(job: dict) -> dict:
         s = imatrix.matrix_summary(r["file"])
         if s and not isinstance(r.get("chunks"), int) and isinstance(s.get("chunks"), int):
             r["chunks"] = s["chunks"]
-    warnings = compat(resolved)
-    rows, weight_note = weights(resolved)
-    if any(r["kind"] == "published" for r in resolved):
-        warnings.append("Unsloth's published matrix describes the UNMODIFIED base model, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model.")
-    if weight_note:
-        warnings.append(weight_note)
-    for w in warnings:
-        protocol.log("Warning: " + w)
-    notes += ["Warning: " + w for w in warnings]
+        r["tokens"] = s.get("tokens") if s else None
+    guard_raw(resolved)
+    notes_base = [w for w in (job.get("notes") or [])]
     root.mkdir(parents=True, exist_ok=True)
     check_space(root, int(sum(Path(p).stat().st_size for p in paths) * 1.1), "the merged matrix")
     out.mkdir()
     try:
+        # --- a parent that is adapted to a cut model and/or given another weight is written as a copy first (the merge job's own work folder); llama-imatrix reads the copies
+        work = out / "work"
+        adapted_info = {}
+        for k, r in enumerate(resolved):
+            r["merge_file"] = r["file"]
+            if r["adapt_to"]:
+                protocol.progress("imatrix", 0.3, f"Adapting {r['label']} to the cut model")
+                cut = imatrixadapt.read_cut(r["adapt_to"]["model_dir"], r["adapt_to"].get("model_name") or "", r["adapt_to"].get("kept_layers"))
+                work.mkdir(exist_ok=True)
+                res = imatrixadapt.adapt_file(r["file"], work / f"parent{k}.gguf", cut, r["weight"])
+                r["merge_file"] = work / f"parent{k}.gguf"
+                adapted_info[k] = {"model": cut.name, "layers_before": res["numbers"]["layers_before"], "layers_after": res["numbers"]["layers_after"], "kept_layers": res["numbers"]["kept"],
+                                   "ffn_down_before": res["numbers"]["ffn_down_before"], "ffn_down_after": res["numbers"]["ffn_down_after"]}
+                r["label"] = f"{r['label']} (adapted to {cut.name})"
+            elif r["weight"] != 1.0:
+                protocol.progress("imatrix", 0.3, f"Giving {r['label']} the weight {r['weight']:g}")
+                work.mkdir(exist_ok=True)
+                imatrixadapt.scale_file(r["file"], work / f"parent{k}.gguf", r["weight"])
+                r["merge_file"] = work / f"parent{k}.gguf"
+            if r["merge_file"] != r["file"]:
+                s2 = imatrix.matrix_summary(r["merge_file"]) or {}
+                r["tokens"] = s2.get("tokens", r["tokens"])
+            if imatrix.stop_requested(im):
+                raise imatrix.Stopped()
+        # the tokens of a copy are those of the file that is merged (already multiplied by the weight): the share must not count the weight twice
+        rows_in = [{**r, "weight": 1.0} if r["merge_file"] != r["file"] and isinstance(r.get("tokens"), (int, float)) else r for r in resolved]
+        warnings = compat([{"label": r["label"], "file": r["merge_file"]} for r in resolved])
+        rows, weight_note = weights(rows_in)
+        for row, r in zip(rows, resolved):
+            row["weight"] = r["weight"]
+        if any(r["kind"] == "published" for r in resolved):
+            warnings.append("Unsloth's published matrix describes the UNMODIFIED base model, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model.")
+        for r in resolved:
+            if r["adapt_to"]:
+                warnings.append(f"{r['label']}: the statistics still describe the unmodified model's activations; for the cut model they are an approximation. Merged with a matrix measured on the cut (and healed) model they are a start, not Unsloth's Dynamic recipe.")
+        if weight_note:
+            warnings.append(weight_note)
+        for w in warnings:
+            protocol.log("Warning: " + w)
+        notes = notes_base + ["Warning: " + w for w in warnings]
         protocol.progress("imatrix", 0.6, "Combining the matrices")
         partial = out / "imatrix.partial.gguf"
-        base = imatrix.launcher(tool) + [x for p in paths for x in ("--in-file", p)] + ["-o", partial]
+        base = imatrix.launcher(tool) + [x for r in resolved for x in ("--in-file", str(r["merge_file"]))] + ["-o", partial]
         rc, tail = imatrix.run_streaming(base + ["--output-format", "gguf"], im, 1, "imatrix", (0.6, 0.95), what="Combining the matrices")
         if rc != 0 and any("output-format" in line for line in tail):          # an older llama-imatrix: its default format is the one asked for
             protocol.log("This llama-imatrix has no --output-format; trying without it.")
@@ -318,10 +393,14 @@ def merge(job: dict) -> dict:
             raise MatrixError(explain_failure(rc, tail))
         target = out / "imatrix.gguf"
         os.replace(partial, target)
+        shutil.rmtree(work, ignore_errors=True)
         summary = imatrix.matrix_summary(target) or {}
         parents = []
-        for r in resolved:
-            p = {"kind": r["kind"], "label": r["label"], "id": r.get("id"), "path": str(r["file"]), "sha256": sha(r["file"]), "size": Path(r["file"]).stat().st_size, "chunks": r.get("chunks")}
+        for k, r in enumerate(resolved):
+            p = {"kind": r["kind"], "label": r["label"], "id": r.get("id"), "path": str(r["file"]), "sha256": sha(r["file"]), "size": Path(r["file"]).stat().st_size, "chunks": r.get("chunks"),
+                 "weight": r["weight"]}
+            if k in adapted_info:
+                p["adapted"] = adapted_info[k]
             if r["kind"] == "published":
                 p.update(repo=r["hub"]["repo"], file=r["hub"]["file"], base=r["hub"]["base"], url=r["hub"]["url"])
             parents.append(p)
@@ -334,6 +413,10 @@ def merge(job: dict) -> dict:
                 "entries": summary.get("entries"), "size": target.stat().st_size, "has_dat": False, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "llama_cpp": imatrix.tool_version(tool), "base_repo": job.get("base_repo"), "calibration": "the text the parents were measured on", "calibration_kind": "merged",
                 "notes": notes, "statistics": None}
+        cuts = [r["adapt_to"] for r in resolved if r["adapt_to"]]
+        own_cut = next((r.get("cut_model") for r in resolved if r.get("cut_model")), None)
+        if cuts or own_cut:
+            info["cut_model"] = own_cut or {"dir": cuts[0]["model_dir"], "name": cuts[0].get("model_name") or ""}
         (out / "imatrix.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
         protocol.progress("imatrix", 1.0, "Merged matrix ready")
         return {"id": mid, "dir": str(out), "file": str(target), "dat": None, "size_mb": round(target.stat().st_size / 1048576, 2), "info": info, "notes": notes, "warnings": warnings,

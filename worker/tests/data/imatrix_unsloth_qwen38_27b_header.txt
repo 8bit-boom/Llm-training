@@ -1,0 +1,31 @@
+GGUF version 3 | tensors 992 | key-values 4
+ kv general.type = imatrix
+ kv imatrix.datasets = ['unsloth_calibration_dataset']
+ kv imatrix.chunk_count = 1251
+ kv imatrix.chunk_size = 8192
+layers: 64 (0, 63)
+distinct tensor kinds: 24
+  blk.N.attn_gate.weight.in_sum2 x 48 | example blk.0.attn_gate.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.attn_gate.weight.counts x 48 | example blk.0.attn_gate.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.attn_qkv.weight.in_sum2 x 48 | example blk.0.attn_qkv.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.attn_qkv.weight.counts x 48 | example blk.0.attn_qkv.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ffn_down.weight.in_sum2 x 64 | example blk.0.ffn_down.weight.in_sum2 [17408] type 0 | shapes: [(17408,)]
+  blk.N.ffn_down.weight.counts x 64 | example blk.0.ffn_down.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ffn_gate.weight.in_sum2 x 64 | example blk.0.ffn_gate.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.ffn_gate.weight.counts x 64 | example blk.0.ffn_gate.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ffn_up.weight.in_sum2 x 64 | example blk.0.ffn_up.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.ffn_up.weight.counts x 64 | example blk.0.ffn_up.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ssm_alpha.weight.in_sum2 x 48 | example blk.0.ssm_alpha.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.ssm_alpha.weight.counts x 48 | example blk.0.ssm_alpha.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ssm_beta.weight.in_sum2 x 48 | example blk.0.ssm_beta.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.ssm_beta.weight.counts x 48 | example blk.0.ssm_beta.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.ssm_out.weight.in_sum2 x 48 | example blk.0.ssm_out.weight.in_sum2 [6144] type 0 | shapes: [(6144,)]
+  blk.N.ssm_out.weight.counts x 48 | example blk.0.ssm_out.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.attn_k.weight.in_sum2 x 16 | example blk.11.attn_k.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.attn_k.weight.counts x 16 | example blk.11.attn_k.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.attn_output.weight.in_sum2 x 16 | example blk.11.attn_output.weight.in_sum2 [6144] type 0 | shapes: [(6144,)]
+  blk.N.attn_output.weight.counts x 16 | example blk.11.attn_output.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.attn_q.weight.in_sum2 x 16 | example blk.11.attn_q.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.attn_q.weight.counts x 16 | example blk.11.attn_q.weight.counts [1] type 0 | shapes: [(1,)]
+  blk.N.attn_v.weight.in_sum2 x 16 | example blk.11.attn_v.weight.in_sum2 [5120] type 0 | shapes: [(5120,)]
+  blk.N.attn_v.weight.counts x 16 | example blk.11.attn_v.weight.counts [1] type 0 | shapes: [(1,)]

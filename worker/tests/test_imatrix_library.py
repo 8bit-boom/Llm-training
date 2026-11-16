@@ -528,7 +528,8 @@ def test_a_file_that_is_no_readable_gguf_raises_value_error_and_gives_none(tmp_p
 def test_the_matrix_summary_counts_layers_and_entries(tmp_path):
     f = tmp_path / "imatrix.gguf"
     f.write_bytes(matrix_gguf(layers=3, arch="qwen3"))
-    assert imatrix.matrix_summary(f) == {"arch": "qwen3", "layers": 3, "entries": 3, "chunks": 64}
+    assert imatrix.matrix_summary(f) == {"arch": "qwen3", "layers": 3, "entries": 3, "chunks": 64, "chunk_size": None, "datasets": [], "kinds": {"attn_k": 3}, "hidden": None,
+                                         "intermediate": None, "tokens": None}      # a header with no data behind it: no counts to read
 
 
 def test_the_compatibility_check_warns_but_never_refuses(tmp_path):

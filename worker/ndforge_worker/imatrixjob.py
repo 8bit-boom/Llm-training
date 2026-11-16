@@ -270,6 +270,7 @@ def _size_mb(path) -> float:
 
 def make(job: dict) -> dict:
     """Makes a matrix into <root>/<id>/. Returns the result. Raises MatrixError (plain text) or imatrix.Stopped; the folder is removed again then."""
+    from . import imatrixadapt          # (it imports this module: a late import)
     root, mid = Path(job["root"]), str(job["id"])
     if not mid or mid.startswith("_") or "/" in mid or "\\" in mid or ".." in mid:
         raise MatrixError("That is not a valid name for a matrix.")
@@ -357,7 +358,8 @@ def make(job: dict) -> dict:
         summary = imatrix.matrix_summary(target) or {}
         info.update(id=mid, label=str(job.get("label") or "").strip()[:80], source=described, source_kind=src["kind"], calibration=what, calibration_kind=cal["kind"],
                     run=src.get("run") if src["kind"] == "run" else None, size=target.stat().st_size, arch=summary.get("arch"), layers=summary.get("layers"), entries=summary.get("entries"),
-                    via="llama.cpp", has_dat=False, notes=notes)
+                    via="llama.cpp", has_dat=False, notes=notes,
+                    cut_model=imatrixadapt.cut_model_of(src.get("model") if src["kind"] == "model" else (src.get("base") or {}).get("repo") if src["kind"] == "run" else src.get("tokenizer")))
         (out / "imatrix.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
         protocol.progress("imatrix", 0.96, "Reading the matrix")
         statistics = show_statistics(tool, f16, target, im) if job.get("statistics", True) else None

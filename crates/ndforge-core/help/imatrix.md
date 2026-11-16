@@ -36,8 +36,25 @@ Tick two or more matrices in the list (and/or add matrix files, and/or use **Uns
 - **Merging adds the statistics.** A matrix measured on more text outweighs one measured on less: a large published matrix can drown a small one of your own. The page tells you how much each one weighs. To give yours more say, make it with more chunks.
 - **Unsloth's published matrix describes the unmodified base model**, not your fine-tune. It is a reasonable start for a light LoRA, less so for a heavily changed model.
 - The published matrix is **downloaded from the Hugging Face Hub** (the repository `unsloth/<model name>-GGUF`, the way Unsloth's own code names it). Press **Look it up** first: the page shows the repository, the file and its **size**, and says what will be downloaded (once, into the project's `imatrix_downloads` folder). Offline, no such repository, a private or gated one, or a model that is a folder on this computer are all explained in plain words.
+- **Weights (optional).** Each matrix in the merge can have a weight (default 1): its sums and its counts are multiplied by it in a copy before they are merged, so it counts that many times as strongly (its mean square per channel stays). Unsloth's published matrix counts about 1,149,614 rows of text; 128 chunks of your own about 65,000: merged as they are, the published one outweighs yours about 17 to 1. A weight of 0.05 on the published one makes them about even. The result lists the weights that were used.
+- **A model cut on the Slim page.** Unsloth's published matrix describes the original model, with all its layers. It is never merged as it is with a matrix measured on a cut model (that would add up the statistics of different layers): it is first adapted to your cut model (see below), or, if that is not possible, the merge is refused with the reason and the way out.
 - The matrices are compared from their headers (architecture, layers, tensors). A mismatch is a **yellow warning**, never a refusal; if llama-imatrix refuses, its own message is shown.
 - In **Create a matrix**, the tick *Also merge Unsloth's published matrix for the base model* makes a second, merged entry after yours; yours is kept even if the download fails.
+
+## Adapt to my cut model
+
+Unsloth publishes the importance matrix it used for the original model (`imatrix_unsloth.gguf` in the repository `unsloth/<model name>-GGUF`). A model you cut on the **Slim or grow a model** page has fewer layers and/or thinner MLPs, so the matrix cannot be used as it is. **Adapt to my cut model** cuts it the same way, **without measuring anything**:
+
+- **Layers** your model dropped are dropped from the matrix; the layers it kept are renumbered (`blk.12` can become `blk.4`). The program reads exactly which layers your model kept from its record (`ndforge_reshape.json`).
+- **MLP width**: the per-neuron statistics of `ffn_down` are cut to the neurons your model kept in each layer (the list your model saved). The other entries (`ffn_gate`, `ffn_up`, the attention and linear-attention ones) take the hidden state as input, which Slim does not change: they are copied. The counts are copied.
+- **Weight** (default 1): multiplies the sums and the counts (see *Weights* above).
+- The matrix can be Unsloth's published one (looked up and downloaded once, as in *Merge matrices*), one of your list that was measured on the original model, or a file. The page shows what will happen before you press **Adapt**: *keeps 32 of 64 layers; ffn_down 17,408 -> 10,752 per layer; about N MB*. The result is a new entry marked **adapted** (the original is not changed); the program reads the written file back and checks it against what it predicted.
+
+**What it is, honestly.** The adapted matrix still describes the **unmodified** model's activations. For a model that was cut and healed it is an **approximation**: it is best merged with a matrix of your own measured on the healed model (the Merge card, with a weight). It is **not the recipe behind Unsloth's own special GGUF sizes**, which is unpublished and cannot be reproduced here. Whether it makes the small sizes of your cut model better is measured with **Compare quants**; that has not been tried with a real llama.cpp yet.
+
+The program **refuses**, in plain words, a model that was made thinner in more than its MLP (the attention heads or linear-attention heads were cut: experimental), a grown model, a model that was not made on the Slim page (no `ndforge_reshape.json`), a matrix that is not the original's (other number of layers or MLP width), and a matrix that was already adapted. A model made by an older version that recorded only counts asks you which layers of the original it kept.
+
+In **Create a matrix**, the tick *Also merge Unsloth's published matrix for the base model* does this automatically for a model cut on the Slim page: the published matrix is adapted to it first, never merged raw.
 
 ## Use a saved matrix in an export
 

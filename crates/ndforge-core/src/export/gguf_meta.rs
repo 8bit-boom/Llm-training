@@ -16,10 +16,40 @@ pub struct MatrixSummary {
     /// number of tensors measured
     pub entries: u64,
     pub chunks: Option<u64>,
+    /// `imatrix.chunk_size`
+    pub chunk_size: Option<u64>,
+    /// the input width of `ffn_gate` (the model's hidden size); the real published matrix has no `general.architecture`, so shapes tell what it was measured on
+    pub hidden: Option<u64>,
+    /// the input width of `ffn_down` (the MLP intermediate size)
+    pub intermediate: Option<u64>,
+}
+
+/// One tensor of the header: its name and dimensions (the real matrix has ONE dimension per tensor).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorInfo {
+    pub name: String,
+    pub dims: Vec<u64>,
 }
 
 /// (keys with a number or a string value, tensor names), or None when the file is no readable GGUF (a legacy .dat, a truncated file, an absurd header).
 pub fn read_header(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<String>)> {
+    read_tensors(path).map(|(m, t)| (m, t.into_iter().map(|t| t.name).collect()))
+}
+
+/// Like `read_header`, with the dimensions of every tensor.
+pub fn read_tensors(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<TensorInfo>)> {
+    read_full(path).map(|h| (h.meta, h.tensors))
+}
+
+/// The whole header: keys, tensors with their dimensions, and where the key-values end and the tensor infos end (needed to predict the size of a file with other tensors).
+pub struct Header {
+    pub meta: BTreeMap<String, Value>,
+    pub tensors: Vec<TensorInfo>,
+    pub kv_end: u64,
+    pub info_end: u64,
+}
+
+pub fn read_full(path: &Path) -> Option<Header> {
     let mut fh = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     fn take<const N: usize>(fh: &mut impl Read) -> Option<[u8; N]> {
         let mut b = [0u8; N];
@@ -56,15 +86,18 @@ pub fn read_header(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<String>)
                 let (inner, n) = (u32_(fh)?, u64_(fh)?);
                 if let Some(w) = fixed(inner) {
                     fh.seek(SeekFrom::Current((w.checked_mul(n)?) as i64)).ok()?;
+                    Value::Null
                 } else {
                     if n > 1 << 26 {
                         return None;
                     }
+                    let mut items = Vec::new();
                     for _ in 0..n {
-                        value(fh, inner)?;
+                        items.push(value(fh, inner)?);
                     }
+                    // a short array of strings (an importance matrix's `imatrix.datasets`) is kept
+                    if inner == 8 && n <= 64 { Value::Array(items) } else { Value::Null }
                 }
-                Value::Null
             }
             _ => return None,
         })
@@ -82,20 +115,30 @@ pub fn read_header(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<String>)
         let kind = u32_(&mut fh)?;
         meta.insert(key, value(&mut fh, kind)?);
     }
+    let kv_end = fh.stream_position().ok()?;
     let mut names = Vec::new();
     for _ in 0..tensors {
-        names.push(string(&mut fh)?);
-        for _ in 0..u32_(&mut fh)? {
-            u64_(&mut fh)?;
+        let name = string(&mut fh)?;
+        let nd = u32_(&mut fh)?;
+        if nd > 8 {
+            return None;
+        }
+        let mut dims = Vec::new();
+        for _ in 0..nd {
+            dims.push(u64_(&mut fh)?);
         }
         u32_(&mut fh)?;
         u64_(&mut fh)?;
+        names.push(TensorInfo { name, dims });
     }
-    Some((meta, names))
+    let info_end = fh.stream_position().ok()?;
+    Some(Header { meta, tensors: names, kv_end, info_end })
 }
 
 pub fn matrix_summary(path: &Path) -> Option<MatrixSummary> {
-    let (meta, names) = read_header(path)?;
+    let (meta, tensors) = read_tensors(path)?;
+    let names: Vec<&String> = tensors.iter().map(|t| &t.name).collect();
+    let width = |kind: &str| tensors.iter().find(|t| t.name.ends_with(&format!(".{kind}.weight.in_sum2")) && t.dims.len() == 1).map(|t| t.dims[0]);
     let blocks = names.iter().filter_map(|n| n.strip_prefix("blk.")?.split('.').next()?.parse::<u64>().ok());
     let sums = names.iter().filter(|n| n.ends_with(".in_sum2")).count() as u64;
     Some(MatrixSummary {
@@ -103,6 +146,9 @@ pub fn matrix_summary(path: &Path) -> Option<MatrixSummary> {
         layers: blocks.max().map(|m| m + 1),
         entries: if sums > 0 { sums } else { names.len() as u64 / 2 },
         chunks: meta.get("imatrix.chunk_count").and_then(|v| v.as_u64()),
+        chunk_size: meta.get("imatrix.chunk_size").and_then(|v| v.as_u64()),
+        hidden: width("ffn_gate"),
+        intermediate: width("ffn_down"),
     })
 }
 
@@ -112,6 +158,9 @@ pub struct ModelFacts {
     pub arch: Option<String>,
     pub layers: Option<u64>,
     pub mtp_layers: u64,
+    /// `hidden_size` and `intermediate_size` of config.json
+    pub hidden: Option<u64>,
+    pub intermediate: Option<u64>,
 }
 
 /// From a model folder's config.json (also inside `text_config`).
@@ -121,6 +170,8 @@ pub fn folder_facts(dir: &Path) -> ModelFacts {
     for d in [&cfg, &cfg["text_config"]] {
         f.arch = f.arch.or_else(|| d["model_type"].as_str().map(String::from));
         f.layers = f.layers.or_else(|| d["num_hidden_layers"].as_u64());
+        f.hidden = f.hidden.or_else(|| d["hidden_size"].as_u64());
+        f.intermediate = f.intermediate.or_else(|| d["intermediate_size"].as_u64());
         for k in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
             f.mtp_layers = f.mtp_layers.max(d[k].as_u64().unwrap_or(0));
         }
@@ -144,6 +195,16 @@ pub fn compat_warnings(matrix: &Path, model: &ModelFacts) -> Vec<String> {
     if let (Some(m), Some(l)) = (s.layers, model.layers) {
         if m != l && m != l + model.mtp_layers {
             out.push(format!("This matrix has data for {m} layers, but the model has {l}. It was probably made from a different model; llama-quantize decides whether it can use it."));
+        }
+    }
+    if let (Some(m), Some(h)) = (s.hidden, model.hidden) {
+        if m != h {
+            out.push(format!("This matrix was measured on a model with hidden size {m} (the input width of its ffn_gate), but this model's is {h}. It was made from a different model; llama-quantize decides whether it can use it."));
+        }
+    }
+    if let (Some(m), Some(i)) = (s.intermediate, model.intermediate) {
+        if m != i {
+            out.push(format!("In this matrix the input of ffn_down is {m} wide, in the model {i}. That is what a model made thinner on the Slim or grow page looks like: \"Adapt to my cut model\" (Importance matrices) cuts a matrix to such a model; llama-quantize cannot use this one as it is."));
         }
     }
     out
@@ -178,6 +239,7 @@ pub(crate) fn build_for_tests(kvs: &[(&str, Value)], tensors: &[&str]) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn matrix(layers: u32, arch: Option<&str>) -> Vec<u8> {
         let names: Vec<String> = (0..layers).flat_map(|i| ["in_sum2", "counts"].map(|x| format!("blk.{i}.attn_k.weight.{x}"))).collect();
@@ -192,10 +254,81 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("imatrix.gguf");
         std::fs::write(&f, matrix(3, Some("qwen3"))).unwrap();
-        assert_eq!(matrix_summary(&f), Some(MatrixSummary { arch: Some("qwen3".into()), layers: Some(3), entries: 3, chunks: Some(64) }));
+        assert_eq!(matrix_summary(&f), Some(MatrixSummary { arch: Some("qwen3".into()), layers: Some(3), entries: 3, chunks: Some(64), chunk_size: None, hidden: None, intermediate: None }));
         let (meta, names) = read_header(&f).unwrap();
         assert_eq!(meta["general.type"], json!("imatrix"));
         assert_eq!(names.len(), 6);
+    }
+
+
+    /// The real published layout, scaled down: GGUF 3, alignment 32, four keys (an array of strings among them), no architecture, every tensor float32 and ONE-dimensional,
+    /// `<weight>.in_sum2` then `<weight>.counts` (one value), full-attention layers at 3, 7, ...
+    fn real_layout(layers: u32, hidden: u64, inter: u64) -> Vec<u8> {
+        let s = |x: &str| { let mut v = (x.len() as u64).to_le_bytes().to_vec(); v.extend(x.as_bytes()); v };
+        let mut bases: Vec<(String, u64)> = vec![];
+        for l in 0..layers {
+            let kinds: &[&str] = if l % 4 == 3 { &["attn_q", "attn_k", "attn_v", "attn_output"] } else { &["attn_gate", "attn_qkv", "ssm_alpha", "ssm_beta", "ssm_out"] };
+            for k in kinds.iter().chain(["ffn_down", "ffn_gate", "ffn_up"].iter()) {
+                let w = match *k { "ffn_down" => inter, "attn_output" | "ssm_out" => hidden + 4, _ => hidden };
+                bases.push((format!("blk.{l}.{k}.weight"), w));
+            }
+        }
+        bases.sort();
+        let mut infos = vec![];
+        let (mut data, mut off) = (vec![], 0u64);
+        for (b, w) in &bases {
+            for (suffix, n) in [("in_sum2", *w), ("counts", 1)] {
+                infos.extend(s(&format!("{b}.{suffix}")));
+                infos.extend(1u32.to_le_bytes());
+                infos.extend(n.to_le_bytes());
+                infos.extend(0u32.to_le_bytes());
+                infos.extend(off.to_le_bytes());
+                let bytes = (n * 4).next_multiple_of(32);
+                data.resize(data.len() + bytes as usize, 0u8);
+                off += bytes;
+            }
+        }
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend(((bases.len() * 2) as u64).to_le_bytes());
+        out.extend(4u64.to_le_bytes());
+        out.extend(s("general.type")); out.extend(8u32.to_le_bytes()); out.extend(s("imatrix"));
+        out.extend(s("imatrix.datasets")); out.extend(9u32.to_le_bytes()); out.extend(8u32.to_le_bytes()); out.extend(1u64.to_le_bytes()); out.extend(s("unsloth_calibration_dataset"));
+        out.extend(s("imatrix.chunk_count")); out.extend(4u32.to_le_bytes()); out.extend(1251u32.to_le_bytes());
+        out.extend(s("imatrix.chunk_size")); out.extend(4u32.to_le_bytes()); out.extend(8192u32.to_le_bytes());
+        out.extend(infos);
+        out.resize(out.len().next_multiple_of(32), 0);
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn the_real_layout_has_no_architecture_and_is_compared_by_its_shapes() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("imatrix.gguf");
+        std::fs::write(&f, real_layout(8, 16, 24)).unwrap();
+        let s = matrix_summary(&f).unwrap();
+        assert_eq!((s.arch.clone(), s.layers, s.entries, s.chunks, s.chunk_size, s.hidden, s.intermediate), (None, Some(8), 62, Some(1251), Some(8192), Some(16), Some(24)));
+        let (meta, tensors) = read_tensors(&f).unwrap();
+        assert_eq!(meta["imatrix.datasets"], json!(["unsloth_calibration_dataset"]));
+        assert!(tensors.iter().all(|t| t.dims.len() == 1) && tensors.len() == 124);
+        let facts = |layers: u64, hidden: u64, inter: u64| ModelFacts { arch: Some("qwen3_5_text".into()), layers: Some(layers), mtp_layers: 0, hidden: Some(hidden), intermediate: Some(inter) };
+        assert!(compat_warnings(&f, &facts(8, 16, 24)).is_empty());
+        let w = compat_warnings(&f, &facts(4, 16, 12));
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("data for 8 layers, but the model has 4") && w[1].contains("ffn_down is 24 wide, in the model 12") && w[1].contains("Adapt to my cut model"));
+        assert!(compat_warnings(&f, &facts(8, 32, 24))[0].contains("hidden size 16"));
+    }
+
+    /// Run once on the real published file: NDFORGE_REAL_IMATRIX=/path/imatrix_unsloth.gguf cargo test -p ndforge-core real_published
+    #[test]
+    fn real_published_file_is_read_like_the_worker_reads_it() {
+        let Some(path) = std::env::var_os("NDFORGE_REAL_IMATRIX").map(PathBuf::from).filter(|p| p.is_file()) else { return };
+        let s = matrix_summary(&path).expect("readable");
+        assert_eq!((s.arch, s.layers, s.entries, s.chunks, s.chunk_size, s.hidden, s.intermediate), (None, Some(64), 496, Some(1251), Some(8192), Some(5120), Some(17408)));
+        let (_, t) = read_tensors(&path).unwrap();
+        assert_eq!(t.len(), 992);
+        assert!(t.iter().all(|t| t.dims.len() == 1));
     }
 
     #[test]
@@ -219,7 +352,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("imatrix.gguf");
         std::fs::write(&f, matrix(2, Some("llama"))).unwrap();
-        let facts = |arch: Option<&str>, layers: Option<u64>, mtp: u64| ModelFacts { arch: arch.map(String::from), layers, mtp_layers: mtp };
+        let facts = |arch: Option<&str>, layers: Option<u64>, mtp: u64| ModelFacts { arch: arch.map(String::from), layers, mtp_layers: mtp, ..Default::default() };
         assert!(compat_warnings(&f, &facts(Some("llama"), Some(2), 0)).is_empty());
         assert!(compat_warnings(&f, &facts(None, None, 0)).is_empty(), "nothing to compare");
         assert!(compat_warnings(&f, &facts(Some("llama"), Some(1), 1)).is_empty(), "an MTP layer adds one");
@@ -237,7 +370,7 @@ mod tests {
     fn a_model_folder_tells_its_layers_and_head() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("config.json"), r#"{"text_config": {"model_type": "qwen3_5_text", "num_hidden_layers": 32, "mtp_num_hidden_layers": 1}}"#).unwrap();
-        assert_eq!(folder_facts(d.path()), ModelFacts { arch: Some("qwen3_5_text".into()), layers: Some(32), mtp_layers: 1 });
+        assert_eq!(folder_facts(d.path()), ModelFacts { arch: Some("qwen3_5_text".into()), layers: Some(32), mtp_layers: 1, ..Default::default() });
         assert_eq!(folder_facts(&d.path().join("none")), ModelFacts::default());
     }
 }

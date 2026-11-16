@@ -25,7 +25,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import data, protocol
+from . import data, ggufinfo, protocol
 
 FORMAT = 1
 NO_IMATRIX = ("q8_0", "f16", "bf16")        # high precision: the matrix does (almost) nothing there
@@ -191,19 +191,62 @@ def gguf_has_mtp(path):
 
 # ------------------------------------------------------------------------------------------------------------------ does a matrix fit a model? (a light check, never a refusal)
 
-def matrix_summary(path):
-    """What a GGUF-format matrix says about itself, from its header: {"arch": str | None, "layers": int | None (the highest `blk.N.` plus one), "entries": number of
-    tensors measured, "chunks": int | None}. None when the file cannot be read as a GGUF (a legacy .dat, a stand-in, a truncated file)."""
+def _counts_tokens(path, info) -> float | None:
+    """The number of rows (tokens) a matrix was measured on, from its `.counts` tensors: the largest value among the first few (float32 only). llama.cpp's imatrix writes
+    one `.counts` value per weight tensor (per expert for a mixture-of-experts model); the published matrix of a 27B model has the same 1149614.0 everywhere. None when
+    it cannot be read. This, not `imatrix.chunk_count`, is what a merge adds up (docs/IMATRIX.md, "Merging matrices")."""
+    best = None
     try:
-        meta, names = read_gguf_header(path)
+        with open(path, "rb") as fh:
+            for t in [t for t in info["tensors"] if t["name"].endswith(".counts") and t["type"] == 0][:8]:
+                n = ggufinfo.numel(t)
+                if not 0 < n <= 4096:
+                    continue
+                fh.seek(info["data_start"] + t["offset"])
+                raw = fh.read(4 * n)
+                if len(raw) != 4 * n:
+                    return None
+                top = max(struct.unpack("<%df" % n, raw))
+                best = top if best is None else max(best, top)
+    except (OSError, struct.error):
+        return None
+    return best
+
+
+def _kind_of(name: str):
+    """(layer number, kind, suffix) of `blk.12.ffn_down.weight.in_sum2` -> (12, "ffn_down", "in_sum2"); None for a name that is not a per-layer statistic."""
+    m = re.match(r"blk\.(\d+)\.(.+)\.weight\.(in_sum2|counts)$", name)
+    return (int(m.group(1)), m.group(2), m.group(3)) if m else None
+
+
+def matrix_summary(path):
+    """What a GGUF-format matrix says about itself, from its header (the real file layout is in docs/IMATRIX.md, "Verified on the real published file"):
+    {"arch": str | None (the real file has no `general.architecture`), "layers": int | None (the highest `blk.N.` plus one), "entries": number of tensors measured,
+    "chunks": int | None, "chunk_size": int | None, "datasets": [str], "kinds": {tensor kind: how many layers have it} (`ffn_down`, `attn_qkv`, `ssm_out`, ...),
+    "hidden": int | None (the input width of `ffn_gate`: the hidden size of the model), "intermediate": int | None (the input width of `ffn_down`), "tokens": float | None
+    (the rows the statistics were summed over, the `.counts` value)}. None when the file cannot be read as a GGUF (a legacy .dat, a stand-in, a truncated file)."""
+    try:
+        info = ggufinfo.read(path)
     except (OSError, ValueError):
         return None
+    meta, names = info["meta"], [t["name"] for t in info["tensors"]]
     blocks = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
     sums = [n for n in names if n.endswith(".in_sum2")]
     arch = meta.get("general.architecture")
-    chunks = meta.get("imatrix.chunk_count")
+    chunks, size = meta.get("imatrix.chunk_count"), meta.get("imatrix.chunk_size")
+    kinds: dict = {}
+    widths: dict = {}
+    for t in info["tensors"]:
+        k = _kind_of(t["name"])
+        if k and k[2] == "in_sum2":
+            kinds[k[1]] = kinds.get(k[1], 0) + 1
+            if len(t["dims"]) == 1:
+                widths.setdefault(k[1], t["dims"][0])
+    datasets = meta.get("imatrix.datasets#items")
     return {"arch": arch if isinstance(arch, str) else None, "layers": max(blocks) + 1 if blocks else None, "entries": len(sums) or len(names) // 2,
-            "chunks": chunks if isinstance(chunks, int) else None}
+            "chunks": chunks if isinstance(chunks, int) else None, "chunk_size": size if isinstance(size, int) else None,
+            "datasets": [d for d in datasets if isinstance(d, str)] if isinstance(datasets, list) else [], "kinds": dict(sorted(kinds.items())),
+            "hidden": widths.get("ffn_gate"), "intermediate": widths.get("ffn_down"), "tokens": _counts_tokens(path, info)}
 
 
 def gguf_model_facts(path):
@@ -238,9 +281,26 @@ def folder_model_facts(folder):
     return typ, layers, mtp
 
 
-def compat_warnings(matrix, model_arch=None, model_layers=None, mtp_layers: int = 0) -> list:
-    """Plain-language warnings about using `matrix` (a file) for a model with this architecture and layer count (None = not known). [] when it looks fine or nothing
-    can be compared. Never a refusal: llama-quantize itself decides."""
+def folder_model_sizes(folder):
+    """(hidden size, MLP intermediate size) from a model folder's config.json (also inside `text_config`); None where it is not readable."""
+    import json
+    try:
+        cfg = json.loads((Path(folder) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    hid = inter = None
+    for d in (cfg, cfg.get("text_config") if isinstance(cfg, dict) else None):
+        if isinstance(d, dict):
+            h, i = d.get("hidden_size"), d.get("intermediate_size")
+            hid = hid if hid is not None else (h if isinstance(h, int) and not isinstance(h, bool) else None)
+            inter = inter if inter is not None else (i if isinstance(i, int) and not isinstance(i, bool) else None)
+    return hid, inter
+
+
+def compat_warnings(matrix, model_arch=None, model_layers=None, mtp_layers: int = 0, model_sizes=(None, None)) -> list:
+    """Plain-language warnings about using `matrix` (a file) for a model with this architecture and layer count (None = not known); `model_sizes` is (hidden size, MLP
+    intermediate size). [] when it looks fine or nothing can be compared. Never a refusal: llama-quantize itself decides. The real published matrix has no
+    `general.architecture`, so the model is also compared by the shapes of the statistics (the input widths of ffn_gate and ffn_down)."""
     info = matrix_summary(matrix)
     if info is None:
         return [f"The matrix file {Path(matrix).name} could not be read here (a legacy .dat file or an unusual file), so it could not be checked against this model. llama-quantize will tell if it does not fit."]
@@ -249,6 +309,12 @@ def compat_warnings(matrix, model_arch=None, model_layers=None, mtp_layers: int 
         out.append(f"This matrix says it was made for the architecture \"{info['arch']}\", but the model is \"{model_arch}\". It will most likely not fit.")
     if info["layers"] is not None and model_layers is not None and info["layers"] not in (model_layers, model_layers + max(mtp_layers, 0)):
         out.append(f"This matrix has data for {info['layers']} layers, but the model has {model_layers}. It was probably made from a different model; llama-quantize decides whether it can use it.")
+    hidden, inter = model_sizes
+    if info["hidden"] and hidden and info["hidden"] != hidden:
+        out.append(f"This matrix was measured on a model with hidden size {info['hidden']} (the input width of its ffn_gate), but this model's is {hidden}. It was made from a different model; llama-quantize decides whether it can use it.")
+    if info["intermediate"] and inter and info["intermediate"] != inter:
+        out.append(f"In this matrix the input of ffn_down is {info['intermediate']} wide, in the model {inter}. That is what a model made thinner on the Slim or grow page looks like: "
+                   "\"Adapt to my cut model\" (Importance matrices) cuts a matrix to such a model; llama-quantize cannot use this one as it is.")
     return out
 
 
@@ -617,6 +683,26 @@ def model_facts(cfg: dict, merged, f16=None):
     return None, None, 0
 
 
+def model_sizes_of(cfg: dict, merged, f16=None):
+    """(hidden size, MLP intermediate size) of the model being exported: from its 16-bit GGUF (`<arch>.embedding_length`, `<arch>.feed_forward_length`) when there is one, else from a
+    model folder's config.json, searched as in model_facts. (None, None) when it cannot be read."""
+    if f16 is not None and not callable(f16) and Path(f16).is_file():
+        try:
+            meta, _ = read_gguf_header(f16)
+            arch = meta.get("general.architecture")
+            h, i = meta.get(f"{arch}.embedding_length"), meta.get(f"{arch}.feed_forward_length")
+            if isinstance(h, int) and not isinstance(h, bool):
+                return h, i if isinstance(i, int) and not isinstance(i, bool) else None
+        except (OSError, ValueError):
+            pass
+    for f in [merged, cfg.get("full_model"), cfg["base"].get("repo")] + hf_cache_dirs(cfg["base"].get("repo") or ""):
+        if f and Path(f).is_dir():
+            h, i = folder_model_sizes(f)
+            if h is not None or i is not None:
+                return h, i
+    return None, None
+
+
 def use_saved_file(cfg: dict, merged, out: Path, f16, im: dict, report: dict):
     """The export uses a matrix from the library (im["use_file"], a .gguf or a legacy .dat; im["use_id"] is its library id): it is copied into the export folder as
     imatrix.gguf / imatrix.dat (with its imatrix.json when it has one) and given to llama-quantize / Unsloth exactly like a freshly measured one. A light check against
@@ -641,7 +727,7 @@ def use_saved_file(cfg: dict, merged, out: Path, f16, im: dict, report: dict):
     info["from_library"] = im.get("use_id")
     (out / "imatrix.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
     arch, layers, mtp = model_facts(cfg, merged, f16)
-    for w in compat_warnings(target, arch, layers, mtp):
+    for w in compat_warnings(target, arch, layers, mtp, model_sizes_of(cfg, merged, f16)):
         note("Warning: " + w)
         protocol.log("Warning: " + w)
     report.update(made=False, reused=True, file=str(target), info=info, nextn=bool(info.get("nextn")), from_library=im.get("use_id"))
