@@ -38,6 +38,18 @@ pub fn read_header(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<String>)
 
 /// Like `read_header`, with the dimensions of every tensor.
 pub fn read_tensors(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<TensorInfo>)> {
+    read_full(path).map(|h| (h.meta, h.tensors))
+}
+
+/// The whole header: keys, tensors with their dimensions, and where the key-values end and the tensor infos end (needed to predict the size of a file with other tensors).
+pub struct Header {
+    pub meta: BTreeMap<String, Value>,
+    pub tensors: Vec<TensorInfo>,
+    pub kv_end: u64,
+    pub info_end: u64,
+}
+
+pub fn read_full(path: &Path) -> Option<Header> {
     let mut fh = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     fn take<const N: usize>(fh: &mut impl Read) -> Option<[u8; N]> {
         let mut b = [0u8; N];
@@ -74,15 +86,18 @@ pub fn read_tensors(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<TensorI
                 let (inner, n) = (u32_(fh)?, u64_(fh)?);
                 if let Some(w) = fixed(inner) {
                     fh.seek(SeekFrom::Current((w.checked_mul(n)?) as i64)).ok()?;
+                    Value::Null
                 } else {
                     if n > 1 << 26 {
                         return None;
                     }
+                    let mut items = Vec::new();
                     for _ in 0..n {
-                        value(fh, inner)?;
+                        items.push(value(fh, inner)?);
                     }
+                    // a short array of strings (an importance matrix's `imatrix.datasets`) is kept
+                    if inner == 8 && n <= 64 { Value::Array(items) } else { Value::Null }
                 }
-                Value::Null
             }
             _ => return None,
         })
@@ -100,6 +115,7 @@ pub fn read_tensors(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<TensorI
         let kind = u32_(&mut fh)?;
         meta.insert(key, value(&mut fh, kind)?);
     }
+    let kv_end = fh.stream_position().ok()?;
     let mut names = Vec::new();
     for _ in 0..tensors {
         let name = string(&mut fh)?;
@@ -115,7 +131,8 @@ pub fn read_tensors(path: &Path) -> Option<(BTreeMap<String, Value>, Vec<TensorI
         u64_(&mut fh)?;
         names.push(TensorInfo { name, dims });
     }
-    Some((meta, names))
+    let info_end = fh.stream_position().ok()?;
+    Some(Header { meta, tensors: names, kv_end, info_end })
 }
 
 pub fn matrix_summary(path: &Path) -> Option<MatrixSummary> {
@@ -293,7 +310,7 @@ mod tests {
         let s = matrix_summary(&f).unwrap();
         assert_eq!((s.arch.clone(), s.layers, s.entries, s.chunks, s.chunk_size, s.hidden, s.intermediate), (None, Some(8), 62, Some(1251), Some(8192), Some(16), Some(24)));
         let (meta, tensors) = read_tensors(&f).unwrap();
-        assert_eq!(meta["imatrix.datasets"], Value::Null);
+        assert_eq!(meta["imatrix.datasets"], json!(["unsloth_calibration_dataset"]));
         assert!(tensors.iter().all(|t| t.dims.len() == 1) && tensors.len() == 124);
         let facts = |layers: u64, hidden: u64, inter: u64| ModelFacts { arch: Some("qwen3_5_text".into()), layers: Some(layers), mtp_layers: 0, hidden: Some(hidden), intermediate: Some(inter) };
         assert!(compat_warnings(&f, &facts(8, 16, 24)).is_empty());
