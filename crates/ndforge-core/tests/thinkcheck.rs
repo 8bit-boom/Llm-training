@@ -95,7 +95,7 @@ fn the_job_names_the_files_the_worker_writes_and_reads() {
     s.batch = Some(4);
     s.load = Some("4bit".into());
     let j = build_job(&p, &s).unwrap();
-    let t = p.folder.join("models/slim-a/think_check");
+    let t = p.folder.join("models").join("slim-a").join("think_check");     // joined part by part: the expected paths have the same separators as the job's
     assert_eq!((j["job"].clone(), j["backend"].clone(), j["quick"].clone(), j["load"].clone(), j["batch"].clone(), j["control"].clone()), (json!("think_check"), json!("hf"), json!(true), json!("4bit"), json!(4), json!(true)));
     assert_eq!((j["cache_file"].clone(), j["stop_file"].clone()), (json!(t.join("cut.quick.json")), json!(t.join("STOP"))));
     s.quick = false;
@@ -154,7 +154,7 @@ fn the_gguf_files_of_the_exports_are_offered() {
     let d = tempdir().unwrap();
     let p = project(d.path());
     made(&p, "slim-a", false);
-    let e = p.folder.join("exports/run1-q4_k_m");
+    let e = p.folder.join("exports").join("run1-q4_k_m");
     std::fs::create_dir_all(&e).unwrap();
     std::fs::write(e.join("model-q4_k_m.gguf"), "GGUF").unwrap();
     std::fs::write(e.join("meta.json"), json!({"name": "run1-q4_k_m", "gguf_file": "model-q4_k_m.gguf"}).to_string()).unwrap();
