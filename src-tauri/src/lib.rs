@@ -350,35 +350,10 @@ fn parse_choice(method: &str, preset: &str) -> Out<(Method, Preset)> {
 fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, method: String, preset: String, overrides: Value, resume: Option<String>, server: Option<String>) -> Out<String> {
     let (method, preset) = parse_choice(&method, &preset)?;
     let job = lock(&s).train_job(&model, method, preset, &overrides, resume.as_deref(), server.as_deref()).map_err(|e| e.to_string())?;
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop, name) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone(), job.name.clone());
-    let (shutdown_after, shutdown_cancel) = (tasks.shutdown_after.clone(), tasks.shutdown_cancel.clone());
-    let keep_awake = lock(&s).settings.keep_awake;
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
-        // the computer stays awake for as long as the guard lives (this also covers a run on a server: this program fetches the result)
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        if !awake.note.is_empty() {
-            emit(serde_json::json!({"kind": "log", "text": awake.note}));
-        }
-        let r = run_training(&job, stop, &mut emit);
-        drop(awake);
-        drop(busy);
-        // only a run that finished (not stopped, not failed) switches the computer off
-        let finished = matches!(&r, Ok(data) if data["stopped"] != true);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
-        };
-        let _ = app.emit("train-event", end);
-        if finished && shutdown_after.swap(false, Ordering::SeqCst) {
-            shutdown_with_warning(&app, &shutdown_cancel, std::time::Duration::from_secs(1), 60);
-        }
-    });
+    let (name, keep_awake) = (job.name.clone(), lock(&s).settings.keep_awake);
+    let opts = JobOpts { awake: if keep_awake { Awake::Noted } else { Awake::Off }, kind: "train", shutdown_after: true, ..JobOpts::new("train-event") };
+    // a run on a server is fetched by this program too: the computer stays awake for all of it
+    spawn_job(app, &tasks, opts, move |stop, emit| run_training(&job, stop, emit).map_err(|e| e.to_string()))?;
     Ok(name)
 }
 
@@ -668,43 +643,31 @@ fn retrain_info(s: State<App>) -> Out<Value> {
 #[tauri::command]
 fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from_previous: bool, export_after: bool, install_url: Option<String>, ollama_name: Option<String>) -> Out<String> {
     let job = lock(&s).retrain_job(from_previous).map_err(|e| e.to_string())?;
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop, name) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone(), job.name.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
+    let name = job.name.clone();
+    spawn_job(app, &tasks, JobOpts { kind: "train", ..JobOpts::new("train-event") }, move |stop, emit| {
         emit(serde_json::json!({"kind": "stage", "text": "Training the new run"}));
-        let train = run_training(&job, stop.clone(), &mut emit);
-        let outcome: Result<Value, String> = match train {
+        let train = run_training(&job, stop.clone(), emit);
+        match train {
             Err(e) => Err(e.to_string()),
             Ok(result) if result["stopped"] == true => Ok(result),
             Ok(result) => (|| {
                 if export_after {
                     emit(serde_json::json!({"kind": "stage", "text": "Making the files for nd-world"}));
                     let quant = ndforge_core::export::runs::list_exports(&job.project).first().and_then(|m| m["quant"].as_str().map(String::from)).unwrap_or_else(|| "q4_k_m".into());
-                    let meta = ndforge_core::export::runs::execute(&job.project, &job.name, &quant, 8192, &stop, &mut emit).map_err(|e| e.to_string())?;
+                    let meta = ndforge_core::export::runs::execute(&job.project, &job.name, &quant, 8192, &stop, emit).map_err(|e| e.to_string())?;
                     if let Some(url) = install_url.filter(|u| !u.is_empty()) {
                         emit(serde_json::json!({"kind": "stage", "text": "Installing into Ollama"}));
                         let export = meta["name"].as_str().unwrap_or("").to_string();
                         let name = ollama_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| meta["ollama_name"].as_str().unwrap_or("world-gm").to_string());
                         let gguf = job.project.folder.join("exports").join(&export).join(meta["gguf_file"].as_str().unwrap_or("model.gguf"));
-                        ndforge_core::export::install::install(&url, &name, &gguf, &job.model.family, 8192, &mut emit).map_err(|e| e.to_string())?;
+                        ndforge_core::export::install::install(&url, &name, &gguf, &job.model.family, 8192, emit).map_err(|e| e.to_string())?;
                         ndforge_core::export::runs::record_install(&job.project, &export, &url, &name).map_err(|e| e.to_string())?;
                     }
                 }
                 Ok(result)
             })(),
-        };
-        drop(busy);
-        let end = match outcome {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e}),
-        };
-        let _ = app.emit("train-event", end);
-    });
+        }
+    })?;
     Ok(name)
 }
 
@@ -852,23 +815,9 @@ fn reshape_measurement(s: State<App>, model: String, samples: u32, len: u32, loa
 #[tauri::command]
 fn reshape_measure(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, samples: u32, len: u32, load: String, force: Option<bool>) -> Out<()> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
-        let r = ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, &mut emit);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "measure"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "measure"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    spawn_job(app, &tasks, JobOpts { phase: Some("measure"), kind: "measure", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+        ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, emit).map_err(|e| e.to_string())
+    })
 }
 
 /// "Try first": how many cuts a request needs, how many are kept already and how long the rest takes. Loads nothing; runs on its own thread (the worker is started).
@@ -893,23 +842,9 @@ fn reshape_try_results(s: State<App>, model: String, samples: u32, len: u32, loa
 fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::reshape::runs::TrySpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("try"); let _ = emitter.emit("reshape-event", v); };
-        let r = ndforge_core::reshape::runs::try_run(&p, &spec, stop, &mut emit);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "try"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "try"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    spawn_job(app, &tasks, JobOpts { phase: Some("try"), tag_events: true, kind: "try", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+        ndforge_core::reshape::runs::try_run(&p, &spec, stop, emit).map_err(|e| e.to_string())
+    })
 }
 
 /// The thinking check (docs/THINKING_CHECK.md): what the result page shows for a made model (saved numbers of every model checked, the gates, the GGUF files of the exports).
@@ -936,25 +871,8 @@ fn think_check_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
     drop(m);
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("think"); let _ = emitter.emit("reshape-event", v); };
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        let r = ndforge_core::reshape::thinkcheck::run(&p, &spec, stop, &mut emit);
-        drop(awake);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "think"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "think"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    let opts = JobOpts { phase: Some("think"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "think_check", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::reshape::thinkcheck::run(&p, &spec, stop, emit).map_err(|e| e.to_string()))
 }
 
 // ------------------------------------------------------------------------------------------------ Auto-cut (docs/AUTO_CUT.md)
@@ -979,32 +897,16 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
     drop(m);
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("auto"); let _ = emitter.emit("reshape-event", v); };
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        let r = {
-            let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), &mut emit);
-            match (&resume, spec) {
-                (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
-                (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
-                _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
-            }
-        };
-        drop(awake);
-        drop(busy);
-        let end = match r {
-            Ok(st) => serde_json::json!({"kind": "done", "data": st, "phase": "auto"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "auto"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    let opts = JobOpts { phase: Some("auto"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "auto", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| {
+        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), emit);
+        match (&resume, spec) {
+            (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
+            (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
+            _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
+        }
+        .map(|st| serde_json::json!(st)).map_err(|e| e.to_string())
+    })
 }
 
 /// Stop: the running job ends at its next safe point, the run keeps its state and can be continued.
@@ -1088,29 +990,9 @@ fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: S
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
     drop(m);
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
-        // healing takes hours: the computer stays awake, like during training
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        if !awake.note.is_empty() {
-            emit(serde_json::json!({"kind": "log", "text": awake.note}));
-        }
-        let r = ndforge_core::reshape::runs::heal(&p, &name, &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
-        drop(awake);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    let opts = JobOpts { phase: Some("heal"), awake: if keep_awake { Awake::Noted } else { Awake::Off }, kind: "heal", ..JobOpts::new("reshape-event") };
+    // healing takes hours: the computer stays awake, like during training
+    spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::reshape::runs::heal(&p, &name, &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), emit).map_err(|e| e.to_string()))
 }
 
 // ---- Heal a model: any model, not only the ones the Slim page made (docs/HEAL_ANY_MODEL.md). Job types and event names are the same as above.
@@ -1174,28 +1056,10 @@ fn heal_source_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
     drop(m);
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        if !awake.note.is_empty() {
-            emit(serde_json::json!({"kind": "log", "text": awake.note}));
-        }
-        let r = ndforge_core::reshape::heal_source::heal_from_source(&p, &student, teacher.as_ref(), &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
-        drop(awake);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    let opts = JobOpts { phase: Some("heal"), awake: if keep_awake { Awake::Noted } else { Awake::Off }, kind: "heal", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| {
+        ndforge_core::reshape::heal_source::heal_from_source(&p, &student, teacher.as_ref(), &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), emit).map_err(|e| e.to_string())
+    })
 }
 
 /// The Stop button of healing: the worker saves a checkpoint and stops; healing continues from it later.
@@ -1212,29 +1076,9 @@ fn reshape_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
     drop(m);
-    if tasks.busy.swap(true, Ordering::SeqCst) {
-        return Err("Another job is still running. Wait for it or press Cancel.".into());
-    }
-    tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
-    std::thread::spawn(move || {
-        let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
-        // writing a model of tens of gigabytes takes a while: the computer stays awake, like during training
-        let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
-        if !awake.note.is_empty() {
-            emit(serde_json::json!({"kind": "log", "text": awake.note}));
-        }
-        let r = ndforge_core::reshape::runs::execute(&p, &spec, stop, &mut emit);
-        drop(awake);
-        drop(busy);
-        let end = match r {
-            Ok(data) => serde_json::json!({"kind": "done", "data": data}),
-            Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
-        };
-        let _ = app.emit("reshape-event", end);
-    });
-    Ok(())
+    // writing a model of tens of gigabytes takes a while: the computer stays awake, like during training
+    let opts = JobOpts { awake: if keep_awake { Awake::Noted } else { Awake::Off }, kind: "cut", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::reshape::runs::execute(&p, &spec, stop, emit).map_err(|e| e.to_string()))
 }
 
 /// The Stop button: the worker stops between tensors and removes the half-written model.
@@ -1267,24 +1111,80 @@ fn reshape_remove(s: State<App>, name: String) -> Out<Value> {
     lock(&s).reshape_state().map_err(|e| e.to_string())
 }
 
-/// Runs `job` on a thread; its progress goes to the window as "env-event" events, the end as {"kind": "done"|"error"}.
-fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
+/// Does the computer stay awake while a job runs, and does the window hear why.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Awake {
+    Off,
+    /// keeps the computer awake
+    Quiet,
+    /// the same, and a log line when that is not possible here
+    Noted,
+}
+
+/// How a job is started: where its events go and what its end carries.
+#[derive(Clone, Copy)]
+struct JobOpts {
+    event: &'static str,
+    /// the "phase" the end event carries (and every event, with `tag_events`)
+    phase: Option<&'static str>,
+    tag_events: bool,
+    awake: Awake,
+    /// what the job is (the queue and the notifications name it)
+    kind: &'static str,
+    /// a run that finished (not stopped, not failed) may switch the computer off when the person asked for it
+    shutdown_after: bool,
+}
+
+impl JobOpts {
+    fn new(event: &'static str) -> JobOpts {
+        JobOpts { event, phase: None, tag_events: false, awake: Awake::Off, kind: "task", shutdown_after: false }
+    }
+}
+
+/// The one way a job is started: one job at a time (`busy`, released also when the thread panics), the cancel flag reset, the computer kept awake when asked, the events tagged the way
+/// the window expects, and the end ({"kind": "done"|"error"}) sent after the flag is released. `body` gets the cancel flag and the event sender.
+fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnOnce(Arc<AtomicBool>, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
     if tasks.busy.swap(true, Ordering::SeqCst) {
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
     let (busy, cancel) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
+    let (shutdown_after, shutdown_cancel) = (tasks.shutdown_after.clone(), tasks.shutdown_cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
-        let mut emit = move |v: Value| { let _ = emitter.emit(channel, v); };
-        let end = match job(&cancel, &mut emit) {
+        let (channel, phase, tag) = (opts.event, opts.phase, opts.tag_events);
+        let mut emit = move |mut v: Value| {
+            if let (true, Some(p)) = (tag, phase) {
+                v["phase"] = serde_json::json!(p);
+            }
+            let _ = emitter.emit(channel, v);
+        };
+        let awake = if opts.awake == Awake::Off { ndforge_core::power::KeepAwake::off() } else { ndforge_core::power::KeepAwake::start() };
+        if opts.awake == Awake::Noted && !awake.note.is_empty() {
+            emit(serde_json::json!({"kind": "log", "text": awake.note}));
+        }
+        let r = body(cancel, &mut emit);
+        drop(awake);
+        drop(busy);
+        let finished = matches!(&r, Ok(data) if data["stopped"] != true);
+        let mut end = match &r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(msg) => serde_json::json!({"kind": "error", "text": msg}),
         };
-        drop(busy);
+        if let Some(p) = phase {
+            end["phase"] = serde_json::json!(p);
+        }
         let _ = app.emit(channel, end);
+        if opts.shutdown_after && finished && shutdown_after.swap(false, Ordering::SeqCst) {
+            shutdown_with_warning(&app, &shutdown_cancel, std::time::Duration::from_secs(1), 60);
+        }
     });
     Ok(())
+}
+
+/// Runs `job` on a thread; its progress goes to the window as events on `channel`, the end as {"kind": "done"|"error"}.
+fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
+    spawn_job(app, tasks, JobOpts::new(channel), move |cancel, emit| job(&cancel, emit))
 }
 
 #[tauri::command]
