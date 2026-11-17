@@ -1180,7 +1180,7 @@ fn stop_and_continue_inside_the_comparison_makes_the_call_again_and_nothing_else
     let d = tempdir().unwrap();
     let p = project(d.path());
     let mut plain = Mock::new();
-    start(&p, &mut plain, tspec(14.0)).unwrap();
+    let plain_run = start(&p, &mut plain, tspec(14.0)).unwrap();
     let n = plain.all.iter().position(|a| a == "compare").unwrap() + 1;
     let d2 = tempdir().unwrap();
     let q = project(d2.path());
@@ -1192,7 +1192,9 @@ fn stop_and_continue_inside_the_comparison_makes_the_call_again_and_nothing_else
     assert!(!fx.done.iter().any(|d| d.starts_with("remove export")), "the reference is kept while the comparison is not done");
     let last = resume(&q, &mut fx, &first.id).unwrap();
     assert_eq!(last.status, "done", "{:?}", last.error);
-    assert_eq!(fx.done, plain.done);
+    // the names of the exports carry the id of the run (a time stamp): the two runs are told apart by it only
+    let norm = |v: &[String], id: &str| v.iter().map(|d| d.replace(id, "RUN")).collect::<Vec<_>>();
+    assert_eq!(norm(&fx.done, &first.id), norm(&plain.done, &plain_run.id));
     assert_eq!(fx.all.len(), plain.all.len() + 1);
 }
 
