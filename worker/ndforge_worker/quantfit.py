@@ -18,11 +18,13 @@ reference engine a rounding that is not the importance-matrix rounding. The judg
 from __future__ import annotations
 
 import heapq
+import json
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import ggufinfo, mixedquant, quantmeasure
+from . import ggufinfo, mixedquant, protocol, quantmeasure
 
 ID = "mixed_measured"
 LABEL = "Mixed: measured fit to a size"
@@ -341,7 +343,7 @@ def uniform(measures: dict, info: dict, rung: str, base_fixed: int) -> tuple:
 
 def report(info: dict, measures: dict, plan: Plan, simulated: dict | None = None) -> dict:
     """What the page shows. {"rows": [{"id", "label", "bytes", "gb", "bpw", "error"}] (the plan, the uniform rungs, the simulated plain sizes: `error` is sqrt(sum D / sum N) over all measured
-    tensors), "types": {type: {"tensors", "params"}}, "bpw_by_role", "bpw_by_layer", "notes", "caveats", "norm2"}. `simulated` is {"Q4_K_M": {tensor: rung}, ...} (default: simulate_plain)."""
+    tensors), "types": {type: {"tensors", "params"}}, "bpw_by_role", "bpw_by_layer", "notes", "caveats", "norm2"}. `simulated` is {"Q4_K_M": {tensor: rung or {"eff", "err", "bytes"}}, ...}: the llama engine gives the exact assignment of llama-quantize's own plain file, else simulate_plain approximates it."""
     tensors = measures["tensors"]
     params = _params(info)
     nonq = info["data_start"] + sum(_src_bytes(t) for t in info["tensors"] if not mixedquant.quantizable(t["name"], t["dims"]))
@@ -366,8 +368,8 @@ def report(info: dict, measures: dict, plan: Plan, simulated: dict | None = None
     for ft, assign in sims.items():
         b, e = int(nonq), 0.0
         for name, rec in tensors.items():
-            rung = assign.get(name, "Q4_K")
-            ty = rec["types"].get(rung) or rec["types"]["Q4_K"]
+            pick = assign.get(name, "Q4_K")
+            ty = pick if isinstance(pick, dict) else (rec["types"].get(pick) or rec["types"]["Q4_K"])        # exact (read from llama-quantize's own file) or approximated (a rung)
             b += ty["bytes"]
             e += ty["err"]
         row("plain_" + ft.lower(), f"Plain {ft} (as llama.cpp's mixture is approximated here)", b, e)
@@ -387,3 +389,267 @@ def report(info: dict, measures: dict, plan: Plan, simulated: dict | None = None
     return {"rows": rows, "types": types, "bpw_by_role": {k: round(v[0] / v[1], 3) for k, v in sorted(role_bits.items()) if v[1]},
             "bpw_by_layer": {str(k): round(v[0] / v[1], 3) for k, v in sorted(layer_bits.items()) if v[1]}, "notes": list(plan.notes) + list(measures.get("notes") or []),
             "caveats": quantmeasure.CAVEATS, "norm2": norm2}
+
+
+# ------------------------------------------------------------------------------------------------------------------ the jobs
+
+class QuantFitError(Exception):
+    """A failure with a plain-language text for the person (the job's error code is `quantfit_failed`)."""
+
+
+# what is assumed, not measured, in the estimate of the minutes (said so wherever it is shown)
+ASSUMED_LLAMA_SPEEDUP = 5.0
+ASSUMED_READ_MB_PER_S = 200.0
+ASSUMED_Q8_VS_Q6 = 8.0
+ASSUMED_THREAD_EFFICIENCY = 0.8
+
+
+def size_range(info: dict, floor: str, ceiling: str, target_bytes: float | None = None) -> tuple:
+    """(smallest, largest) size in bytes of the whole file with every planned tensor at `floor` / at `ceiling` (header, kept tensors, pinned tensors and the margin included)."""
+    allowed_rungs(floor, ceiling)
+    pin = pins(target_bytes if target_bytes else plain_bytes(info, "Q4_K_M"), info)
+    pinned = pinned_types(info, pin)
+    fixed = fixed_bytes(info, pin)
+    lo = hi = 0.0
+    for t in info["tensors"]:
+        if mixedquant.quantizable(t["name"], t["dims"]) and t["name"] not in pinned:
+            n = ggufinfo.numel(t)
+            lo += n * ggufinfo.BPW[mixedquant.effective_type(floor, t["dims"][0])] / 8
+            hi += n * ggufinfo.BPW[mixedquant.effective_type(ceiling, t["dims"][0])] / 8
+    m = margin(info)
+    return int(fixed + lo + m), int(fixed + hi + m)
+
+
+def _llama_quantize():
+    from . import llamacpp
+    _, quantize = llamacpp.find_llama_cpp()
+    return quantize
+
+
+def _engine_for(requested: str, quantize) -> str:
+    return "llama" if requested in ("auto", "llama", None, "") and quantize is not None else "reference"
+
+
+def estimate_job(job: dict) -> dict:
+    """Job `quantfit_estimate` {"gguf", "matrix": file | None, "target_gb": optional, "sample_rows", "engine", "floor", "ceiling"}: what the measured fit will do, from the header only (about a second).
+    {"params", "sampled_weights", "read_bytes", "disk_need", "min_gb", "max_gb", "plain_estimates": {ftype: gb}, "engine", "llama_quantize", "llama_version", "tensor_type_file", "minutes_estimate",
+    "minutes_note", "speed", "matrix_ok", "notes"}."""
+    from . import ggufrows, llamacpp, quantmeasure
+    try:
+        src = ggufrows.open_source(job.get("gguf") or "")
+    except ggufrows.SourceError as exc:
+        raise QuantFitError(str(exc))
+    n_rows = int(job.get("sample_rows") or quantmeasure.DEFAULT_SAMPLE_ROWS)
+    floor, ceiling = job.get("floor") or DEFAULT_FLOOR, job.get("ceiling") or DEFAULT_CEILING
+    try:
+        allowed_rungs(floor, ceiling)
+    except PlanError as exc:
+        raise QuantFitError(str(exc))
+    picks = ggufrows.sample_plan(src, n_rows, int(job.get("seed") or 0))
+    by = {t["name"]: t for t in src["tensors"]}
+    weights = sum(len(ggufrows.flat_rows(p)) * p["cols"] for p in picks.values())
+    read = sum(len(ggufrows.flat_rows(p)) * p["cols"] * ggufrows.value_bytes(by[n]) for n, p in picks.items())
+    quantize = _llama_quantize()
+    engine = _engine_for(job.get("engine"), quantize)
+    notes = []
+    if job.get("engine") == "llama" and quantize is None:
+        notes.append("llama-quantize was not found, so the numpy engine will measure (its rounding is not the importance-matrix rounding of an export).")
+    matrix_ok = None
+    if job.get("matrix"):
+        try:
+            quantmeasure.importance(job["matrix"], src)
+            matrix_ok = True
+        except quantmeasure.MeasureError as exc:
+            matrix_ok = False
+            notes.append(str(exc))
+    else:
+        notes.append("No importance matrix was chosen: the measurement would count every input channel the same. Choose a matrix (an adapted one for a cut model).")
+    target = float(job["target_gb"]) * 1e9 if job.get("target_gb") else None
+    lo, hi = size_range(src, floor, ceiling, target)
+    speed = quantmeasure.speed_probe()
+    threads = quantmeasure.default_threads() * ASSUMED_THREAD_EFFICIENCY
+    ref_s = 0.0
+    for rung in quantmeasure.RUNGS:
+        v = speed.get(rung) or speed["Q6_K"] * ASSUMED_Q8_VS_Q6
+        ref_s += weights / (v * max(threads, 1.0))
+    read_s = read / (ASSUMED_READ_MB_PER_S * 1e6)
+    llama_s = ref_s / len(quantmeasure.RUNGS) / ASSUMED_LLAMA_SPEEDUP * (len(quantmeasure.RUNGS) + 3)
+    chosen = (llama_s if engine == "llama" else ref_s) + read_s
+    version = ""
+    if engine == "llama":
+        from . import imatrix
+        version = imatrix.tool_version(quantize)
+    return {"params": ggufinfo.n_parameters(src), "sampled_weights": weights, "read_bytes": read, "disk_need": int(read * 2.2 * 2.2) if engine == "llama" else 0,
+            "min_gb": round(lo / 1e9, 3), "max_gb": round(hi / 1e9, 3), "plain_estimates": {ft: round(plain_bytes(src, ft) / 1e9, 2) for ft in PLAIN_SIZES},
+            "engine": engine, "llama_quantize": str(quantize) if quantize else None, "llama_version": version,
+            "tensor_type_file": bool(quantize and llamacpp.quantize_supports(quantize, "--tensor-type-file")),
+            "minutes_estimate": {"reference": round((ref_s + read_s) / 60, 1), "llama": round((llama_s + read_s) / 60, 1), "chosen": round(chosen / 60, 1)},
+            "minutes_note": f"About {max(1, round(chosen / 60))} minutes (an estimate: the numpy speed was measured just now; the {ASSUMED_LLAMA_SPEEDUP:.0f} times faster llama engine and a disk "
+                            f"read speed of {ASSUMED_READ_MB_PER_S:.0f} MB/s are assumptions).",
+            "speed": {k: round(v) for k, v in speed.items()}, "matrix_ok": matrix_ok, "notes": notes}
+
+
+def run_estimate(job: dict) -> int:
+    protocol.reserve_stdout()
+    protocol.result(estimate_job(job))
+    return 0
+
+
+def _matrix_path(job_matrix, export_matrix):
+    return str(job_matrix) if job_matrix else (str(export_matrix) if export_matrix else None)
+
+
+def measure_and_plan(gguf, matrix, cfg: dict, quantize=None, im=None, notes=None) -> dict:
+    """Measure (or load from the cache) and plan. `cfg`: {"target_gb", "floor", "ceiling", "sample_rows", "engine", "cache_dir", "seed"}. Returns {"src", "measures", "plan", "rules", "report",
+    "key", "engine", "notes"}. Raises QuantFitError (plain text), quantmeasure.Stopped, quantmeasure.MeasureError, ggufrows.SourceError, PlanError."""
+    from . import ggufrows, imatrix, quantmeasure
+    notes = notes if notes is not None else []
+    target = float(cfg.get("target_gb") or 0) * 1e9
+    if target <= 0:
+        raise QuantFitError("Give the size you want, in GB (for example 10.6).")
+    floor, ceiling = cfg.get("floor") or DEFAULT_FLOOR, cfg.get("ceiling") or DEFAULT_CEILING
+    src = ggufrows.open_source(gguf)
+    n_rows = int(cfg.get("sample_rows") or quantmeasure.DEFAULT_SAMPLE_ROWS)
+    seed = int(cfg.get("seed") or 0)
+    engine = _engine_for(cfg.get("engine"), quantize)
+    imp, imp_notes = quantmeasure.importance(matrix, src)
+    notes += imp_notes
+    version = imatrix.tool_version(quantize) if engine == "llama" else ""
+    key = quantmeasure.cache_key(quantmeasure.fingerprint_model(src["path"], src), quantmeasure.fingerprint_file(matrix) if matrix else "none", n_rows, seed, engine, version)
+    cache = Path(cfg.get("cache_dir") or Path(gguf).parent / "quantfit") / key
+    opts = {"sample_rows": n_rows, "seed": seed, "key": key, "engine": engine, "rungs": quantmeasure.RUNGS, "threads": cfg.get("threads")}
+    total = len([t for t in src["tensors"] if ggufrows.is_sampled(t)])
+
+    def progress(done, n, name):
+        protocol.progress("quantfit", 0.7 * min(done / max(n or total, 1), 1.0), f"Measuring ({done} of {n or total}): {name}")
+    protocol.progress("quantfit", 0.0, "Reading the weights")
+    with protocol.timed("measure", engine=engine, rows=n_rows):
+        measures = quantmeasure.measure_any(src, imp, opts, cache, quantize=quantize if engine == "llama" else None, matrix=matrix, im=im, progress=progress)
+    with protocol.timed("allocate"):
+        plan = plan_for(src, measures, target, floor, ceiling)
+        rs = rules(plan, src)
+        sims = measures.get("simulated") or None
+        rep = report(src, measures, plan, sims)
+    notes += [n for n in measures.get("notes", []) if n not in notes]
+    return {"src": src, "measures": measures, "plan": plan, "rules": rs, "report": rep, "key": key, "engine": measures.get("engine", engine), "notes": notes}
+
+
+def _plain_neighbours(src: dict, target: float) -> list:
+    """The plain sizes just below and just above the target: [("Q4_K_M", ...), ...] by the size table."""
+    sizes = sorted((plain_bytes(src, ft), ft) for ft in PLAIN_SIZES)
+    below = [ft for b, ft in sizes if b <= target]
+    above = [ft for b, ft in sizes if b > target]
+    return ([below[-1]] if below else []) + ([above[0]] if above else [])
+
+
+def _save_plan(cache_dir: Path, target_gb, result: dict) -> None:
+    from . import fsutil
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / "plan.tmp"
+    tmp.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+    fsutil.replace_retry(tmp, cache_dir / f"plan-{float(target_gb):g}.json")
+
+
+def run_job(job: dict) -> dict:
+    """Job `quantfit`: {"gguf" (16-bit), "matrix" (file | None), "target_gb", "floor", "ceiling", "sample_rows", "engine", "cache_dir", "stop_file", "make": bool, "neighbours": bool, "out_dir"}.
+    Measures (resuming from the cache), plans, saves `plan-<gb>.json` next to the measures and, with `make`, writes `model-mixed_measured.gguf` (and with `neighbours` the plain sizes just
+    below and above the target) into `out_dir`. Result: {"plan", "report", "rules", "flags", "files": [{"path", "label", "group", "matrix", "mixed"}], "measure_key", "engine", "notes", "fits"}."""
+    from . import exportjob, ggufrows, imatrix, llamacpp, quantmeasure
+    quantize = _llama_quantize()
+    gguf = job.get("gguf") or ""
+    matrix = job.get("matrix") or None
+    im = {"stop_file": job.get("stop_file")} if job.get("stop_file") else {}
+    if job.get("make") and quantize is None:
+        raise llamacpp.LlamaCppMissing(llamacpp.not_found_text("the file cannot be made (llama-quantize makes it)"))
+    notes: list = []
+    try:
+        r = measure_and_plan(gguf, matrix, job, quantize, im, notes)
+    except ggufrows.SourceError as exc:
+        raise QuantFitError(str(exc))
+    except quantmeasure.MeasureError as exc:
+        raise QuantFitError(str(exc))
+    except PlanError as exc:
+        raise QuantFitError(str(exc))
+    plan, rs, src = r["plan"], r["rules"], r["src"]
+    target = float(job["target_gb"]) * 1e9
+    out_dir = Path(job.get("out_dir") or Path(gguf).parent)
+    use_file = bool(quantize and llamacpp.quantize_supports(quantize, "--tensor-type-file"))
+    type_file = out_dir / f"{ID}.tensor-types.txt" if use_file else None
+    fl = flags(plan, rs, type_file)
+    result = {"plan": plan.to_dict(), "report": r["report"], "rules": [f"{rx}={t}" for rx, t in rs], "flags": fl, "files": [], "measure_key": r["key"], "engine": r["engine"], "notes": r["notes"],
+              "fits": plan.fits, "min_gb": round(plan.min_bytes / 1e9, 3), "target_gb": float(job["target_gb"]), "base": base_ftype(plan.total * 8 / max(_params(src), 1))}
+    result["plan"]["assign"] = plan.assign
+    _save_plan(Path(job.get("cache_dir") or Path(gguf).parent / "quantfit") / r["key"], job["target_gb"], {k: result[k] for k in ("plan", "report", "rules", "engine", "measure_key", "notes", "fits")})
+    if job.get("make"):
+        if not plan.fits:
+            result["notes"].append(f"The file was not made: even the lowest types need {plan.min_bytes / 1e9:.2f} GB, more than the {job['target_gb']} GB asked for.")
+        else:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            base = imatrix.launcher(quantize)
+            final = out_dir / f"model-{ID}.gguf"
+            protocol.progress("quantfit", 0.72, "Making the measured file")
+            made = make_file(base, Path(gguf), final, plan, rs, matrix, im, type_file, result["notes"])
+            result["files"].append({"path": str(final), "label": LABEL, "group": LABEL, "matrix": bool(matrix) and made["matrix_used"], "mixed": ID})
+            if job.get("neighbours"):
+                for i, ft in enumerate(_plain_neighbours(src, target)):
+                    protocol.progress("quantfit", 0.8 + 0.18 * i / 2, f"Making the plain {ft} to compare")
+                    path = out_dir / f"model-{ft.lower()}.gguf"
+                    used = False
+                    if matrix:
+                        rc, ok = exportjob.quantize_to(base, Path(gguf), path, ft, ["--imatrix", matrix], im)
+                        used = rc == 0 and ok
+                        if not used:
+                            result["notes"].append(f"llama-quantize did not accept the importance matrix for {ft}; that size was made without it.")
+                    if not used:
+                        run_quantize(base, Path(gguf), path, ft, [], im, f"The quantisation ({ft})")
+                    result["files"].append({"path": str(path), "label": f"{ft}, with matrix" if used else ft, "group": ft, "matrix": used if matrix else None, "mixed": None})
+            result["actual_bytes"] = final.stat().st_size if final.is_file() else None
+    protocol.progress("quantfit", 1.0, "Done")
+    return result
+
+
+def make_file(base: list, f16: Path, final: Path, plan: Plan, rs: list, matrix, im: dict, type_file, notes: list) -> dict:
+    """llama-quantize for the plan: `[--imatrix M] flags f16 final BASE`, once more without the matrix when llama-quantize refuses it. The rules go in a type file when `type_file` is given
+    (written here), else as repeated `--tensor-type` arguments (QuantFitError above the command-length limit). Returns {"matrix_used"}."""
+    from . import exportjob, quantmeasure
+
+    ftype = base_ftype(_avg_bpw(plan, f16))
+    if type_file is not None:
+        Path(type_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(type_file).write_text(type_file_text(rs), encoding="utf-8")
+    fl = flags(plan, rs, type_file)
+    cmd_len = len(" ".join(str(x) for x in list(base) + fl + [str(f16), str(final), ftype])) + (len(str(matrix)) + 12 if matrix else 0)
+    if type_file is None and cmd_len >= quantmeasure.COMMAND_LIMIT:
+        raise QuantFitError(f"The plan has {len(rs)} rules, too many for the command line of this system, and this llama-quantize has no --tensor-type-file: update llama.cpp (this plan needs --tensor-type-file).")
+    used = False
+    if matrix:
+        rc, ok = exportjob.quantize_to(base, f16, final, ftype, ["--imatrix", matrix] + fl, im)
+        if rc == 0 and ok:
+            used = True
+        else:
+            msg = f"llama-quantize did not accept the importance matrix for {LABEL} (exit code {rc}); that size was made without it."
+            notes.append(msg)
+            protocol.log(msg)
+    if not used:
+        run_quantize(base, f16, final, ftype, fl, im, f"The quantisation ({LABEL})")
+    return {"matrix_used": used}
+
+
+def run_quantize(base, f16, final, kind, flags, im, label) -> None:
+    """llama-quantize without a matrix, stoppable (the STOP file kills it); QuantFitError when it fails."""
+    from . import exportjob
+    rc, ok = exportjob.quantize_to(base, f16, final, kind, flags, im if im is not None else {}, label)
+    if not ok:
+        raise QuantFitError(f"{label} failed (llama-quantize exit code {rc}). See the log.")
+
+
+def _avg_bpw(plan: Plan, f16) -> float:
+    from . import ggufinfo as gi
+    n = gi.n_parameters(gi.read(f16))
+    return plan.total * 8 / n if n else 4.9
+
+
+def run(job: dict) -> int:
+    protocol.reserve_stdout()
+    protocol.result(run_job(job))
+    return 0
