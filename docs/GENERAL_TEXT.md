@@ -182,3 +182,12 @@ Nothing here was run against the real Hub, a real model or a GPU (the datasets-s
 - The thinking rendering was tested with the real Qwen3.5 template through jinja (`worker/tests/test_thinking_render.py`), not with the real tokenizer or the real faunix rows: whether their inline thinking has exactly the `<think>...</think>` shape is still unverified.
 - A heal or an export on the owner's PC with the new default; the memory and time of long rows (about 5,750 tokens) at sequence length 4096; `.parquet` with a real `pyarrow`.
 - The Tauri commands (`general_*`, `hf_token_*`) and the window itself: `src-tauri` was not built here (disk), only `ndforge-core` and the page in a stand-in browser.
+
+## The saved copy of a Hub dataset
+
+The rows a job reads from the Hub are kept in `<settings folder>/general_cache/<hash>.jsonl.gz` (job key `general.cache_dir`, set by `general::job_block` for every dataset that is not a local file; the hash is
+of the dataset id, config, split and seed, so the share and the column are not part of it). They are the raw rows in the order of the stream, before the chat template, so the copy does not depend on the model.
+The next job reads them first and goes to the Hub only for rows beyond them (skipping the ones it has), and saves those too (in blocks of 500; the first block through a temporary file, a block cut short by a crash is
+ignored and mended). A Hub that cannot be reached after the saved rows are used up ends the reading quietly with the log line "the saved copy (N rows) is used"; without a copy the error is the same as before.
+At most 300,000 rows are kept per dataset. The copy is not checked against a newer version of the dataset: delete the file to read it again. A folder that cannot be written never stops a job.
+

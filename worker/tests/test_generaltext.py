@@ -356,3 +356,100 @@ def test_a_cache_is_judged_by_its_dataset_not_by_the_training_runs_seed():
     assert not gt.same_general(made, None, 0.5)                               # general text switched off
     assert gt.same_general(gt.general_key(None, 0.0, 3407), None, 0.0)        # off then and off now
     assert not gt.same_general({}, src, 0.5)                                  # an old cache without a key
+
+
+# ------------------------------------------------------------------------------------------------------------ the saved copy of a Hub dataset
+
+def numbered(n, start=0):
+    return [{"text": f"row number {i} " * 3} for i in range(start, start + n)]
+
+
+def hub_rows_loader(rows, fail_after=None):
+    """a stand-in Hub stream that counts how many rows were pulled from it"""
+    def load(source, token):
+        load.opened += 1
+
+        def gen():
+            for i, r in enumerate(rows):
+                if fail_after is not None and i >= fail_after:
+                    raise ConnectionError("offline")
+                load.pulled += 1
+                yield r
+        return gen()
+    load.opened = load.pulled = 0
+    return load
+
+
+def take(src, n):
+    g = gt.texts(src)
+    got = [t for _, t in zip(range(n), g)]
+    g.close()
+    return got
+
+
+def test_rows_read_from_the_hub_are_saved_and_read_again_without_it(tmp_path):
+    src = {"id": "org/set", "seed": 5, "cache_dir": str(tmp_path / "gc")}
+    first = hub_rows_loader(numbered(20))
+    a = take({**src, "loader": first}, 6)
+    assert len(a) == 6 and first.pulled >= 6
+    files = list((tmp_path / "gc").glob("*.jsonl.gz"))
+    assert len(files) == 1 and len(gt.read_snapshot(files[0])) == 6, "what was read is kept (the rest of a block is not pulled)"
+    offline = hub_rows_loader(numbered(3), fail_after=0)
+    b = take({**src, "loader": offline}, 6)
+    assert b == a and offline.opened == 0, "the same rows, and the Hub is not even asked for them"
+
+
+def test_a_bigger_budget_streams_only_the_rest_and_saves_it(tmp_path):
+    src = {"id": "org/set", "seed": 5, "cache_dir": str(tmp_path / "gc")}
+    rows = numbered(30)
+    take({**src, "loader": hub_rows_loader(rows)}, 5)
+    more = hub_rows_loader(rows)
+    got = take({**src, "loader": more}, 12)
+    assert got == [t["text"] for t in rows[:12]], "the saved rows come first, then the stream goes on after them, without a repeat"
+    assert more.opened == 1
+    assert len(gt.read_snapshot(next((tmp_path / "gc").glob("*.jsonl.gz")))) == 12
+
+
+def test_offline_with_a_saved_copy_uses_it_and_says_so_without_one_it_fails_as_before(tmp_path, monkeypatch):
+    logs = []
+    monkeypatch.setattr(protocol, "log", logs.append)
+    src = {"id": "org/set", "seed": 5, "cache_dir": str(tmp_path / "gc")}
+    take({**src, "loader": hub_rows_loader(numbered(4))}, 4)
+    out = list(gt.texts({**src, "loader": hub_rows_loader(numbered(10), fail_after=0)}))
+    assert len(out) == 4 and any("saved copy" in m and "could not be reached" in m for m in logs), logs
+    with pytest.raises(ConnectionError):
+        list(gt.texts({"id": "org/other", "seed": 5, "cache_dir": str(tmp_path / "gc"), "loader": hub_rows_loader(numbered(3), fail_after=0)}))
+
+
+def test_the_copy_belongs_to_the_dataset_config_split_and_seed_and_local_files_are_never_copied(tmp_path):
+    base = {"cache_dir": str(tmp_path / "gc"), "id": "org/set", "seed": 5}
+    names = {gt.snapshot_file(s).name for s in (base, {**base, "seed": 6}, {**base, "config": "c"}, {**base, "split": "test"}, {**base, "id": "org/x"})}
+    assert len(names) == 5
+    assert gt.snapshot_file({**base, "share": 0.9, "column": "z", "render": None}) == gt.snapshot_file(base), "the share and the column are not part of it"
+    assert gt.snapshot_file({"file": "x.jsonl", "cache_dir": str(tmp_path)}) is None and gt.snapshot_file({"id": "a/b"}) is None
+    f = jl(tmp_path / "l.jsonl", numbered(3))
+    assert len(list(gt.texts({"file": f, "cache_dir": str(tmp_path / "gc")}))) == 3 and not (tmp_path / "gc").exists()
+
+
+def test_a_damaged_copy_keeps_its_good_rows_and_is_mended(tmp_path):
+    import gzip
+    src = {"id": "org/set", "seed": 5, "cache_dir": str(tmp_path / "gc")}
+    rows = numbered(20)
+    take({**src, "loader": hub_rows_loader(rows)}, 5)
+    f = next((tmp_path / "gc").glob("*.jsonl.gz"))
+    with gzip.open(f, "ab") as fh:
+        fh.write(b'{"text": "cut short')                                   # a block cut short by a crash
+    assert len(gt.read_snapshot(f)) == 5
+    got = take({**src, "loader": hub_rows_loader(rows)}, 8)
+    assert got == [r["text"] for r in rows[:8]]
+    assert gt.read_snapshot_checked(f) == (rows[:8], True), "mended, and the new rows follow the good ones"
+    f.write_bytes(b"not gzip at all")
+    assert gt.read_snapshot_checked(f)[0] == []
+    assert take({**src, "loader": hub_rows_loader(rows)}, 3) == [r["text"] for r in rows[:3]]
+
+
+def test_an_unwritable_copy_folder_never_stops_the_job(tmp_path):
+    blocker = tmp_path / "file-not-folder"
+    blocker.write_text("x")
+    src = {"id": "org/set", "seed": 5, "cache_dir": str(blocker / "gc"), "loader": hub_rows_loader(numbered(5))}
+    assert len(list(gt.texts(src))) == 5
