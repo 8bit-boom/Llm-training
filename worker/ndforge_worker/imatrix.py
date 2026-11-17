@@ -500,7 +500,7 @@ def settings_key(cfg: dict, im: dict, data_hash: str, nextn: bool = False) -> di
     from . import generaltext
     share = float(im.get("general_share", DEFAULT_SHARE))
     return {"model": im.get("model") or "", "weights": weights_fingerprint(cfg), "data_hash": data_hash, "chunks": int(im.get("chunks", 128)),
-            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407))), "nextn": bool(nextn)}
+            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407)), render=None), "nextn": bool(nextn)}
 
 
 def _saved_value(info: dict, k: str):

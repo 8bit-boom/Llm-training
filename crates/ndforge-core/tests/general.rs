@@ -139,7 +139,7 @@ fn the_job_block_and_the_key_follow_every_part_of_the_dataset() {
     let g = job_block(&src, 0.5);
     assert_eq!(g, json!({"share": 0.5, "id": "a/b", "config": "c", "split": "train"}));
     let k = key(&g, 3407);
-    assert_eq!(k, json!({"used": true, "id": "a/b", "file": null, "config": "c", "split": "train", "column": null, "share": 0.5, "seed": 3407}), "the same literal as the worker's general_key");
+    assert_eq!(k, json!({"used": true, "id": "a/b", "file": null, "config": "c", "split": "train", "column": null, "share": 0.5, "seed": 3407, "render": 2}), "the same literal as the worker's general_key");
     let other = |f: fn(&mut GeneralSource)| { let mut s = src.clone(); f(&mut s); key(&job_block(&s, 0.5), 3407) };
     assert_ne!(other(|s| s.id = Some("a/c".into())), k);
     assert_ne!(other(|s| s.config = Some("d".into())), k);
@@ -212,4 +212,17 @@ fn tokens_are_scrubbed_from_texts_and_problem_reports() {
     assert_eq!(scrub("hf_short and hf_ and half_value"), "hf_short and hf_ and half_value");
     assert_eq!(scrub("sk-unsloth-abc123 and hf_"), "[key] and hf_");
     assert!(!ndforge_core::diagnose::report(None, &ndforge_core::settings::Settings::default()).contains("hf_"));
+}
+
+#[test]
+fn the_key_is_the_one_in_the_shared_cases() {
+    let t: serde_json::Value = serde_json::from_slice(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker/tests/data/general_key_cases.json")).unwrap()).unwrap();
+    assert_eq!(t["render_version"], json!(ndforge_core::general::RENDER_VERSION));
+    for c in t["cases"].as_array().unwrap() {
+        assert_eq!(key(&c["general"], c["seed"].as_u64().unwrap()), c["expect"], "{}", c["name"]);
+    }
+    // a cache made before the rendering was part of the key is other data
+    let mut old = key(&json!({"share": 0.5, "id": "a/b"}), 3407);
+    old.as_object_mut().unwrap().remove("render");
+    assert_ne!(old, key(&json!({"share": 0.5, "id": "a/b"}), 3407));
 }

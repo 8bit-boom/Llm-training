@@ -10,7 +10,8 @@ which then adds an empty "<think>\\n\\n</think>\\n\\n"; Gemma 4's non-thinking p
 """
 
 FAMILIES = {
-    "qwen3_5": {"prompt_kwargs": {"enable_thinking": False}, "end": "<|im_end|>\n", "loader": "FastLanguageModel"},
+    # "thinks": the template writes a reasoning block ("<think>\n...\n</think>\n\n") before the answer of the last turn and takes enable_thinking
+    "qwen3_5": {"prompt_kwargs": {"enable_thinking": False}, "end": "<|im_end|>\n", "loader": "FastLanguageModel", "thinks": True},
     "gemma4": {"prompt_kwargs": {"enable_thinking": False}, "end": "<turn|>\n", "loader": "FastModel"},
     # anything else with a chat template: the tokenizer's own end-of-sequence token closes the answer
     "generic": {"prompt_kwargs": {}, "end": None, "loader": "FastLanguageModel"},

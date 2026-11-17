@@ -1,0 +1,103 @@
+{
+ "render_version": 2,
+ "cases": [
+  {
+   "name": "hub dataset with config, split",
+   "general": {
+    "share": 0.5,
+    "id": "a/b",
+    "config": "c",
+    "split": "train"
+   },
+   "seed": 3407,
+   "expect": {
+    "used": true,
+    "id": "a/b",
+    "file": null,
+    "config": "c",
+    "split": "train",
+    "column": null,
+    "share": 0.5,
+    "seed": 3407,
+    "render": 2
+   }
+  },
+  {
+   "name": "a file has no id",
+   "general": {
+    "share": 0.25,
+    "file": "notes.jsonl"
+   },
+   "seed": 1,
+   "expect": {
+    "used": true,
+    "id": null,
+    "file": "notes.jsonl",
+    "config": null,
+    "split": null,
+    "column": null,
+    "share": 0.25,
+    "seed": 1,
+    "render": 2
+   }
+  },
+  {
+   "name": "nothing named means the default dataset",
+   "general": {
+    "share": 0.5
+   },
+   "seed": 3407,
+   "expect": {
+    "used": true,
+    "id": "mlabonne/open-perfectblend",
+    "file": null,
+    "config": null,
+    "split": null,
+    "column": null,
+    "share": 0.5,
+    "seed": 3407,
+    "render": 2
+   }
+  },
+  {
+   "name": "empty strings count as not given",
+   "general": {
+    "share": 0.5,
+    "id": "a/b",
+    "config": "",
+    "column": ""
+   },
+   "seed": 3407,
+   "expect": {
+    "used": true,
+    "id": "a/b",
+    "file": null,
+    "config": null,
+    "split": null,
+    "column": null,
+    "share": 0.5,
+    "seed": 3407,
+    "render": 2
+   }
+  },
+  {
+   "name": "share 0 is off",
+   "general": {
+    "share": 0,
+    "id": "a/b"
+   },
+   "seed": 3407,
+   "expect": {
+    "used": false
+   }
+  },
+  {
+   "name": "no general text is off",
+   "general": null,
+   "seed": 3407,
+   "expect": {
+    "used": false
+   }
+  }
+ ]
+}

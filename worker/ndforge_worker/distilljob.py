@@ -231,7 +231,7 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
         stats["general_source"] = name
         inner = data._inner(tokenizer)
         report: dict = {}
-        g.update(seed=seed, report=report, render=lambda msgs: data.render_chat(tokenizer, msgs, fam_name)[1])
+        g.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
         try:
             grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed)

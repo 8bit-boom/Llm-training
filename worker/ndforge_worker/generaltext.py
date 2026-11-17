@@ -58,14 +58,22 @@ def source_name(source: dict) -> str:
     return source.get("file") or source.get("id") or DEFAULT_ID
 
 
-def general_key(source, share, seed) -> dict:
+RENDER_VERSION = 2          # how chat rows become text: 2 = a row with thinking is written with the thinking-ON template (data.render_chat_full); 1 (no field) = always thinking off
+
+
+def general_key(source, share, seed, render: int | None = RENDER_VERSION) -> dict:
     """What makes one general text a different one: part of the keys of the teacher cache and of the saved importance matrix. The app's Rust code builds
-    the same dict (crates/ndforge-core/src/general.rs `key`); keep them identical."""
+    the same dict (crates/ndforge-core/src/general.rs `key`; both read tests/data/general_key_cases.json); keep them identical. `render` is part of the key
+    because a teacher cache holds the rendered rows: a cache made with the old rendering is other data. The importance matrix passes render=None (its text is not
+    rendered this way yet, so a saved matrix stays valid)."""
     if not source or not float(share or 0) > 0:
         return {"used": False}
     sid = source.get("id") or (None if source.get("file") else DEFAULT_ID)
-    return {"used": True, "id": sid, "file": source.get("file") or None, "config": source.get("config") or None, "split": source.get("split") or None,
-            "column": source.get("column") or None, "share": float(share), "seed": int(seed)}
+    key = {"used": True, "id": sid, "file": source.get("file") or None, "config": source.get("config") or None, "split": source.get("split") or None,
+           "column": source.get("column") or None, "share": float(share), "seed": int(seed)}
+    if render is not None:
+        key["render"] = int(render)
+    return key
 
 
 def same_general(index_key, source, share) -> bool:

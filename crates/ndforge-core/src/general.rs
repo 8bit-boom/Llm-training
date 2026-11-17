@@ -20,6 +20,9 @@ use crate::project::Project;
 pub const DEFAULT_ID: &str = "mlabonne/open-perfectblend";
 /// The seed of the general text's sample (healing and the importance matrix both use it).
 pub const SEED: u64 = 3407;
+/// How chat rows become text (the worker's `generaltext.RENDER_VERSION`): 2 = a row with thinking is written with the thinking-ON template. Part of the key, so a
+/// teacher cache made with the old rendering is other data.
+pub const RENDER_VERSION: u64 = 2;
 pub const TOKEN_SECRET: &str = "huggingface";
 
 /// One dataset the program knows. `kind`: "chat" or "text".
@@ -255,7 +258,7 @@ pub fn job_block(src: &GeneralSource, share: f64) -> Value {
 }
 
 /// What makes this general text a different one, as the worker computes it (`generaltext.general_key`): part of the keys of the teacher cache and of the
-/// saved matrix. `general` is a job block or Null.
+/// saved matrix. `general` is a job block or Null. Both sides read worker/tests/data/general_key_cases.json.
 pub fn key(general: &Value, seed: u64) -> Value {
     let share = general["share"].as_f64().unwrap_or(0.0);
     if !general.is_object() || share <= 0.0 {
@@ -264,7 +267,7 @@ pub fn key(general: &Value, seed: u64) -> Value {
     let s = |k: &str| general[k].as_str().filter(|x| !x.is_empty()).map(String::from);
     let file = s("file");
     let id = s("id").or_else(|| if file.is_none() { Some(DEFAULT_ID.to_string()) } else { None });
-    json!({"used": true, "id": id, "file": file, "config": s("config"), "split": s("split"), "column": s("column"), "share": share, "seed": seed})
+    json!({"used": true, "id": id, "file": file, "config": s("config"), "split": s("split"), "column": s("column"), "share": share, "seed": seed, "render": RENDER_VERSION})
 }
 
 fn choice_file(p: &Project) -> std::path::PathBuf {
