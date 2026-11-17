@@ -285,8 +285,7 @@ pub(crate) fn read_json(path: &std::path::Path) -> Option<Value> {
 }
 
 pub(crate) fn write_json(path: &std::path::Path, v: &Value) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(v)?)?;
-    Ok(())
+    crate::fsx::write_json_atomic(path, v)
 }
 
 /// Runs that can be exported: they have a saved adapter. Newest first.

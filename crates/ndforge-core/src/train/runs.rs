@@ -20,13 +20,7 @@ pub fn runs_dir(p: &Project) -> PathBuf {
 }
 
 fn write_json(path: &Path, v: &Value) -> Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::fsx::write_json_atomic(path, v)
 }
 
 fn read_json(path: &Path) -> Option<Value> {

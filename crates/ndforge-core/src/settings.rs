@@ -82,12 +82,15 @@ pub struct Settings {
     pub studio_share: Option<StudioShare>,
     pub teacher: TeacherSettings,
     pub recent_projects: Vec<String>,
+    /// Set (for this run of the program only, never saved) when `settings.json` could not be read: where the damaged file was kept. The window shows it once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_note: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true,
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), recent_projects: Vec::new() }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), recent_projects: Vec::new(), load_note: None }
     }
 }
 
@@ -96,18 +99,37 @@ impl Settings {
         config_dir().join("settings.json")
     }
 
+    /// A missing file gives the defaults. A file that cannot be read is kept as `settings.json.broken-<time>` (not overwritten), the defaults are used and
+    /// `load_note` says what happened.
     pub fn load() -> Settings {
-        std::fs::read_to_string(Self::file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        let f = Self::file();
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            return match f.is_file() {
+                false => Settings::default(),
+                true => Self::broken(&f),
+            };
+        };
+        match serde_json::from_str::<Settings>(&text) {
+            Ok(mut s) => {
+                s.load_note = None;
+                s
+            }
+            Err(_) => Self::broken(&f),
+        }
+    }
+
+    fn broken(f: &Path) -> Settings {
+        let note = match crate::fsx::set_aside_broken(f) {
+            Some(kept) => format!("The settings file could not be read, so the standard settings are used. The old file was kept as {}.", kept.display()),
+            None => "The settings file could not be read, so the standard settings are used.".to_string(),
+        };
+        Settings { load_note: Some(note), ..Settings::default() }
     }
 
     pub fn save(&self) {
-        let f = Self::file();
-        if let Some(dir) = f.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(f, text);
-        }
+        let mut plain = self.clone();
+        plain.load_note = None;
+        let _ = crate::fsx::write_json_atomic(&Self::file(), &plain);
     }
 
     pub fn remember_project(&mut self, folder: &Path) {

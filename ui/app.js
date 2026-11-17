@@ -3261,6 +3261,8 @@ async function go(key) {
 
 async function init() {
   setState(await invoke("get_state"));
+  // a damaged settings file was set aside (core: settings.rs); say so once
+  if (state && state.settings && state.settings.load_note) message = { kind: "err", text: state.settings.load_note };
   $("expert").onchange = async (e) => setState(await invoke("set_setting", { key: "expert_mode", value: e.target.checked })) || render();
   $("night").onchange = async (e) => { setState(await invoke("set_theme", { theme: e.target.checked ? "dark" : "light" })); render(); };
   $("helptoggle").onchange = async (e) => { setState(await invoke("set_setting", { key: "show_help_panel", value: e.target.checked })); render(); };

@@ -28,13 +28,7 @@ fn draft_dir(p: &Project) -> PathBuf {
 }
 
 fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::fsx::write_atomic(path, data)
 }
 
 fn to_jsonl(examples: &[Example]) -> Result<Vec<u8>> {

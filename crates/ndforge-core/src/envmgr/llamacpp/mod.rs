@@ -715,7 +715,7 @@ pub fn install(cfg: &Config, machine: &Machine, opts: &Options, runner: &dyn Run
         installed_at: chrono::Utc::now().to_rfc3339(), os: machine.os.label().to_string(), arch: machine.arch.label().to_string(),
         versions: st.versions.clone(), converter_check: st.converter.clone(), via: if building { "build".into() } else { "download".into() },
     };
-    std::fs::write(root.join("install.json"), serde_json::to_vec_pretty(&info).map_err(Error::from)?)?;
+    crate::fsx::write_json_atomic(&root.join("install.json"), &info)?;
     em.step("finish", "Putting it in place");
     em.progress("finish", 0.97, "Putting it in place", None);
     check_cancel(cancel)?;

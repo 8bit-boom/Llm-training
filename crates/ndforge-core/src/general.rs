@@ -142,11 +142,7 @@ fn load() -> Store {
 
 fn save(s: &Store) -> Result<()> {
     let f = store_file();
-    if let Some(d) = f.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(f, serde_json::to_vec_pretty(s)?)?;
-    Ok(())
+    crate::fsx::write_json_atomic(&f, s)
 }
 
 pub fn custom_list() -> Vec<GeneralSource> {

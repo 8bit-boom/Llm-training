@@ -654,8 +654,15 @@ fn stopping_asks_politely_and_then_kills() {
     assert!(catalog::custom_models().is_empty());
     // a worker that ignores it is killed after the grace period
     fake_worker(d.path(), "mkdir -p \"$out\"\nexec sleep 30");
-    let stop = Arc::new(AtomicBool::new(true));
+    // (the stop request comes after the quick inspection: a request that is already there when a program starts now ends it at once)
+    let stop = Arc::new(AtomicBool::new(false));
+    let s3 = stop.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        s3.store(true, Ordering::SeqCst);
+    });
     let e = rruns::execute_with_grace(&p, &drop_spec(), stop, Duration::from_millis(300), &mut |_| {}).unwrap_err();
+    t.join().unwrap();
     assert_eq!(e.0, "Stopped.");
     let list = rruns::list(&p);
     assert_eq!((list.len(), list[0]["status"].as_str()), (2, Some("stopped")));
