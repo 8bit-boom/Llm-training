@@ -77,11 +77,23 @@ of `</think>` among the generated token ids. Events: `progress` (step `load`, th
 **The saved numbers of a model.** With `cache_file` in the job, a finished check is saved (keyed by the model's weights fingerprint, backend, load, suite version and all settings) and the next
 identical check is answered from it (`"cached": true`): the original is checked once however often it is compared. A stopped check is never saved. A Hub id is keyed by its name, not its revision.
 
+## Backend 2: llama-server (`backend: "llama"`)
+
+Checks a **GGUF file** the way llama.cpp-based programs (Unsloth Studio, LM Studio) will run it: chat template, quantisation and all. `thinkcheck_llama.py` finds `llama-server` with the
+same search as the other llama.cpp tools (`llamacpp.find_tool`; a missing one gives the error code `llama_cpp_missing`, so the page offers the installer), starts it on a free port of
+this computer (`-m file.gguf --host 127.0.0.1 --port N --jinja -np 4 -c 16384 -ngl 99`: 4 questions at a time, 4096 tokens each), waits for `/health` (up to 15 minutes), asks the
+questions through `/v1/chat/completions` with `chat_template_kwargs: {"enable_thinking": true | false}` and the sampling above, and stops the server in every case (done, Stop, error;
+on Linux it also ends if the worker is killed). A server that splits the reasoning into `reasoning_content` and one that leaves `<think>...</think>` in the text are both understood. The Stop
+file is looked at twice a second while questions run. The trace length is estimated (a quarter of the characters), the loop test uses words instead of token ids.
+
 ## Not verified yet
 
 * Nothing here ran on a real model: the scorer was tested on written outputs and the job on a stand-in backend. Whether the suite is easy or hard for a real Qwen3.8 27B (and for the
   cut), how long its traces are, and whether the gates are in the right place need the owner's runs.
 * The gates' numbers come from the plan, not from measurements; expect to adjust them after the first real comparisons.
+* The llama backend was tested against a stand-in `llama-server` (a script that speaks the same HTTP), not against a real llama.cpp: the flags (`--jinja`, `-np`, `-c`, `-ngl`), the
+  `chat_template_kwargs` field, `top_k` and `seed` in the request, `/health` and the shape of the answer are from llama.cpp's documentation as remembered. On Windows a killed worker
+  cannot stop the server (no parent-death signal); the Stop file does. Whether Unsloth Studio's own chat default matches `enable_thinking` as sent here is not known.
 * Batched sampling of a model with linear-attention layers and left padding: the tiny test model (the real architecture, random weights) runs it, but whether the real 27B answers the same batched as
   one at a time is not checked (use `batch: 1` or the llama backend if the numbers look odd).
 * The loop test on word lists (the llama backend has no token ids) is a rough stand-in for the token version.

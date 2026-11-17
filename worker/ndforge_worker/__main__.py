@@ -170,7 +170,7 @@ def main(argv: list) -> int:
         except Exception as exc:
             import traceback
             traceback.print_exc()
-            protocol.error("think_check_failed", _explain(exc))
+            protocol.error(_code(exc, "think_check_failed"), str(exc) if _code(exc, "") else _explain(exc))   # llama_cpp_missing: the page offers the installer
             return 1
     if kind == "general_check":
         from . import generaltext
