@@ -71,7 +71,7 @@ def _make_answer_fn(model, tokenizer, fam_name, backend, loader, max_new):
     def answer(q):
         msgs = [{"role": "system", "content": q["system"]}, {"role": "user", "content": q["question"]}, {"role": "assistant", "content": ""}]
         prompt, _ = render_chat(tokenizer, msgs, fam_name)
-        tok = _inner(tokenizer)
+        tok = text_tokenizer(tokenizer)
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
         dev = next(model.parameters()).device
         backends.to_inference(backend, loader, model)
