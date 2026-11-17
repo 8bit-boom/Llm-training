@@ -222,3 +222,23 @@ def test_bad_slice_and_data_plans_are_refused(tmp_path):
     if __import__("importlib").util.find_spec("numpy"):
         with pytest.raises(ValueError, match="produced"):          # a slice that does not produce the promised size
             st.write_shards([st.OutTensor("a", "BF16", (3, 3), ref["a.weight"], (1, (0, 1)))], tmp_path / "o2")
+
+
+def test_producers_may_return_bytes_bytearray_memoryview_or_a_numpy_array(tmp_path):
+    np = pytest.importorskip("numpy")
+    raw = bytes(range(48))
+    arr = np.frombuffer(raw, dtype="<u2").reshape(4, 6).copy()               # 2-D, 16-bit: 48 bytes
+    producers = {"bytes": lambda: raw, "bytearray": lambda: bytearray(raw), "memoryview": lambda: memoryview(raw),
+                 "numpy": lambda: arr, "numpy_flat_bytes": lambda: arr.reshape(-1).view(np.uint8), "numpy_view": lambda: memoryview(arr)}
+    for label, make in producers.items():
+        plan = [st.OutTensor("w", "BF16", (4, 6), None, None, make)]
+        out = tmp_path / label
+        seen = []
+        st.write_shards(plan, out, chunk=7, on_progress=lambda d, n: seen.append(d))
+        assert read_file(out / "model.safetensors")["w"] == ("BF16", (4, 6), raw), label
+        assert seen[-1] == 48, label
+    # a wrong size is still refused, whatever the type
+    with pytest.raises(ValueError, match="produced 4 bytes"):
+        st.write_shards([st.OutTensor("w", "BF16", (4, 6), None, None, lambda: np.zeros(2, dtype="<u2"))], tmp_path / "bad")
+    with pytest.raises(ValueError, match="exactly 48 bytes"):
+        st.write_shards([st.OutTensor("w", "BF16", (4, 6), None, None, np.zeros(2, dtype="<u2"))], tmp_path / "bad2")
