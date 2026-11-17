@@ -60,7 +60,7 @@ a time on one card, with the Stop button on the same flag). Worker events are fo
 | `sN.check_heal` | thinking check of the healed model against the original's numbers (the gates of docs/THINKING_CHECK.md). A failure is retried, backed off, or ends the run ("Gates, retry and back-off" below) |
 | `export` | the GGUF sizes (Q4_K_M and the chosen ones) of the last healed model, its chat template keeping thinking (`thinking_default: "keep"`) |
 | `check_gguf` | thinking check of the Q4_K_M GGUF through llama-server (covers the template and the quantisation) |
-| `studio_publish` | only when asked (docs/UNSLOTH_API_CONTRACT.md, "Publish") |
+| `studio_publish` | only when asked: the GGUF files into Studio's share ("Publishing to Unsloth Studio" below) |
 
 Models that do not think (*keep thinking* off) skip the thinking checks and the reasoning text; everything else is the same.
 
@@ -99,7 +99,18 @@ made again at any time, also for a stopped run. It holds: the model, the size as
 tokens, KL at the start and the end of the heal, the loss before and after and the teacher's loss, the tries and their verdicts; the thinking-check table (original, every cut, every healed model, the GGUF) with
 the gates that were missed; the exported files; where Studio has them; the notes (retries, back-offs, the halves of Try first that disagreed); every step with its status and seconds.
 
+## Publishing to Unsloth Studio (`unsloth/publish.rs`)
+
+The step `studio_publish` (only when asked) copies the GGUF files into Studio's share and says where they are inside Studio's container. The rules, the calls and what is checked are in
+docs/UNSLOTH_API_CONTRACT.md, "Publish"; the settings are **Studio share**, **Path inside the container**, *tell Studio about the exports folder* (default on) and *fine-tune handoff* (default off), in
+`Settings.studio_share`. In short: `.partial` folder then rename, a free-space check first, the container path from the settings or from `outputs_dir` of `GET /api/models/checkpoints` (with an API key), the share
+confirmed against Studio's run folders, `POST /api/models/scan-folders` only when `GET` says 200. The folder is named `<model> cut to <size>B`. Not set up, the drive missing or the wrong folder is a note on the step, not a failure
+of the run; a full disk is a failure that Continue retries. Files are never written outside `<share>/exports`.
+
+Deviations: Studio answers 201 (not 400) for a folder it already has, so there is no "duplicate" case (a 400 containing "already" is still taken as success); under an API key Studio hides the paths of its folder list, so
+the registration is not checked against that list.
+
 ## Not verified yet
 
-Nothing here ran on a real model, card or Studio. The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
+Nothing here ran on a real model, card or Studio (the publish ran against a stand-in server and temporary folders only). The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
 is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs) has only been compiled and read, not run against a worker.

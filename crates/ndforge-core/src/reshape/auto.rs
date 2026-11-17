@@ -892,7 +892,9 @@ fn step_check_gguf(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let export = st.export.clone().ok_or_else(|| Error::new("There is nothing to publish: the export is missing."))?;
-    let name = st.original.as_ref().map(|o| o.name.clone()).unwrap_or_default();
+    // the folder is named after the model and the size it was cut to, so it is never taken for the original
+    let size = st.stages.last().map(|s| s.plan.params_b).unwrap_or(st.spec.target_b);
+    let name = format!("{} cut to {size:.1}B", st.original.as_ref().map(|o| o.name.clone()).unwrap_or_default());
     let r = out!(fx.publish(&export, &name)?);
     let note = if r["published"] == true { None } else { r["why"].as_str().map(String::from) };
     st.publish = Some(r);

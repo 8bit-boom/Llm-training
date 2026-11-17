@@ -194,10 +194,38 @@ impl Effects for RealEffects<'_> {
             let (q, f, n) = (m["quant"].as_str()?, m["gguf_file"].as_str()?, m["name"].as_str()?);
             Some(json!({"quant": q, "path": exports.join(n).join(f), "export": n, "size_gb": std::fs::metadata(exports.join(n).join(f)).map(|x| (x.len() as f64 / 1e8).round() / 10.0).ok()}))
         }).collect();
-        Ok(Out::Done(json!({"dir": exports, "ggufs": ggufs, "exports": metas.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()})))
+        Ok(Out::Done(json!({"dir": exports, "hf_dir": healed.dir, "ggufs": ggufs, "exports": metas.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()})))
     }
 
-    fn publish(&mut self, _export: &Value, _model_name: &str) -> Result<Out<Value>> {
-        Ok(Out::Done(json!({"published": false, "why": "Publishing to Unsloth Studio is not set up."})))
+    fn publish(&mut self, export: &Value, model_name: &str) -> Result<Out<Value>> {
+        use crate::unsloth::{client::UnslothClient, publish};
+        let settings = crate::settings::Settings::load();
+        let Some(share) = settings.studio_share.clone().filter(|s| !s.host_path.trim().is_empty()) else {
+            return Ok(Out::Done(json!({"published": false, "why": "Unsloth Studio's share is not set up (Settings: \"Studio share\")."})));
+        };
+        // the API key is optional here: with it the container path is found out and Studio is told about the folder
+        let client = settings.unsloth.as_ref().and_then(|u| crate::secrets::get(&format!("unsloth:{}", u.url)).filter(|k| !k.trim().is_empty()).map(|k| UnslothClient::new(&u.url, &k)));
+        let files: Vec<std::path::PathBuf> = export["ggufs"].as_array().map(|a| a.iter().filter_map(|g| g["path"].as_str()).map(std::path::PathBuf::from).collect()).unwrap_or_default();
+        let readme = format!("# {model_name}, cut and healed by ND Lore Forge (Auto-cut)\n\nGGUF files: {}.\n\nThis model was cut (blocks removed, MLP thinned) and healed against the original, which is its teacher. It can think: in the chat, switch\nthe Think option on. Its chat template keeps the thinking default of the original.\n",
+                             files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy().to_string()).collect::<Vec<_>>().join(", "));
+        let spec = publish::PublishSpec { name: model_name.to_string(), files, hf_folder: export["hf_dir"].as_str().map(std::path::PathBuf::from), readme: Some(readme) };
+        let free = crate::envmgr::health::free_disk_gb(std::path::Path::new(share.host_path.trim()));
+        let ctx = publish::Ctx { client: client.as_ref(), free_gb: free, stop: &self.stop };
+        let step = self.step.clone();
+        let mut last = 0.0f64;
+        let mut events = Vec::new();
+        let r = publish::publish(&share, &spec, &ctx, &mut |f| {
+            if f - last >= 0.02 || f >= 1.0 {
+                last = f;
+                events.push(json!({"kind": "progress", "phase": "auto", "auto_step": step, "step": "publish", "value": f, "text": "Copying to the Unsloth Studio share"}));
+            }
+        });
+        for e in events {
+            (self.on_event)(e);
+        }
+        match r {
+            Err(e) if e.0 == "Stopped." => Ok(Out::Stopped),
+            r => r.map(Out::Done),
+        }
     }
 }

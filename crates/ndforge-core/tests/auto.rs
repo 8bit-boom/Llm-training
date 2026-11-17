@@ -670,7 +670,7 @@ fn publishing_is_a_step_only_when_asked_and_a_missing_studio_is_a_note_not_a_fai
     let st = start(&p2, &mut fx2, AutoSpec { studio_publish: true, quants: vec!["q8_0".into()], ..spec(21.1) }).unwrap();
     assert_eq!(st.steps.last().unwrap().id, "studio_publish");
     assert_eq!(st.publish.as_ref().unwrap()["published"], true);
-    assert!(fx2.done.last().unwrap().starts_with("publish Qwen3.8 27B 2"), "{:?}", fx2.done.last());
+    assert!(fx2.done.last().unwrap().starts_with("publish Qwen3.8 27B cut to 21.1B 2"), "{:?}", fx2.done.last());
     assert!(fx2.done.iter().any(|d| d.contains("[\"q4_k_m\", \"q8_0\"]")));
     let d3 = tempdir().unwrap();
     let p3 = project(d3.path());
