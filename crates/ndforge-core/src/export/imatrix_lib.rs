@@ -408,11 +408,13 @@ pub struct MakeSpec {
     pub label: String,
     /// after the matrix is made, also merge it with Unsloth's published matrix for the base model (a second entry; the first is kept). Old specs have none.
     pub merge_published: bool,
+    /// conversations with thinking in the calibration text ("data" only): that share of its tokens (docs/IMATRIX.md, "Thinking models"). None = none.
+    pub reasoning: Option<crate::reshape::plan::ReasoningCalib>,
 }
 
 impl Default for MakeSpec {
     fn default() -> Self {
-        MakeSpec { source: SourceSpec::default(), calibration: "data".into(), text_file: None, general: None, general_share: None, chunks: IMATRIX_DEFAULT_CHUNKS, nextn: true, dat: false, label: String::new(), merge_published: false }
+        MakeSpec { source: SourceSpec::default(), calibration: "data".into(), text_file: None, general: None, general_share: None, chunks: IMATRIX_DEFAULT_CHUNKS, nextn: true, dat: false, label: String::new(), merge_published: false, reasoning: None }
     }
 }
 
@@ -485,8 +487,15 @@ pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Re
                 return Err(Error::new("The share of general text is between 0 and 50 %."));
             }
             let general = if share > 0.0 { crate::general::job_block(&crate::general::resolve(spec.general.as_ref(), true)?, share) } else { Value::Null };
+            let reasoning = match &spec.reasoning {
+                Some(r) => {
+                    r.validate()?;
+                    r.json()
+                }
+                None => Value::Null,
+            };
             json!({"kind": "data", "train": p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"), "data_version": version, "general_share": share,
-                   "general": general, "seed": crate::general::SEED})
+                   "general": general, "reasoning": reasoning, "seed": crate::general::SEED})
         }
         _ => return Err(Error::new("Choose the calibration text: your saved data, or a text file of your own.")),
     };

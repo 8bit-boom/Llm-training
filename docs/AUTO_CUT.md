@@ -70,7 +70,7 @@ original model, and nothing from a stage that did not pass. The test records eve
 
 **Deviations from the plan** (the code won): the state is in `models/_auto/<run>/`, not `models/<name>/auto.json` (a run makes several models); the check of the original runs after the first cut, not
 before the first step (the worker finds the original through the cut's record: `think_check` target `original`); the export measures its importance matrix on the finished model instead of adapting a
-matrix of the original (`imatrix_adapt` needs a saved matrix of the original, which a run does not have; docs/IMATRIX.md); stage A heals with 40 million tokens (the plan said 20 in one place and 40 per
+matrix of the original (`imatrix_adapt` needs a saved matrix of the original, which a run does not have; docs/IMATRIX.md); the export's importance matrix is switched on (it was off in the state machine's first version) and, with *keep it able to think*, measured with reasoning text in the calibration (docs/IMATRIX.md, "Thinking models"), so "the adapted matrix" of the plan is a matrix measured on the cut model with thinking rows; stage A heals with 40 million tokens (the plan said 20 in one place and 40 per
 stage in another).
 
 ## Gates, retry and back-off (`reshape/auto.rs`, `gate_failed`)

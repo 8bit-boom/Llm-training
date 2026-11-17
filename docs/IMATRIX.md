@@ -349,3 +349,18 @@ Merging matrices (in addition):
 
 - Ask for `--nextn` support before the run (the page now learns it only from a note afterwards).
 - Accept a saved matrix made with more chunks than asked for.
+
+## Thinking models: conversations with thinking in the calibration text
+
+For a model that thinks (Qwen3.5 / 3.8, a cut one above all), the calibration text can hold conversations **with their thinking**, written the way the model writes them with thinking on
+(`data.render_chat_full`: the model's own template over the whole conversation, `<|im_start|>assistant\n<think>\n{trace}\n</think>\n\n{answer}`, no empty block in front of a trace). The importance matrix then
+weighs the weights by text that looks like what the quantised model will be asked, not only by thinking-off practice conversations. It matters for the small sizes (Q4_K_M and below), where the matrix steers the rounding.
+
+- **Option**: `reasoning` in the worker's calibration, `{"source": {"id" | "file"}, "share": 0.5, "max_len": 2048}` (the same request and the same key as the reshape measuring's; default source the teacher's own
+  traces, `faunix/Qwen3.8-27B-Distillation-40K`). In Rust: `ImatrixOptions.reasoning` (export) and `MakeSpec.reasoning` (matrix library), both a `ReasoningCalib`. Off by default: without it nothing changes.
+- **How**: `share` of the calibration tokens (at most 90 %) are conversations with a thinking trace, each cut to its first `max_len` tokens (a later part would lack the question and the chat frame); conversations without
+  a trace are passed over for a model that thinks. They are mixed evenly with the project's text and the general text through the file, so `--chunks` cuts none of the kinds out.
+- **Key**: the reasoning request is part of what a saved matrix was made from (`reasoning` in `imatrix.json`, with `reasoning_used` and `reasoning_tokens`). A matrix made without it is not used when it is wanted, another share or
+  row length is another matrix, and one made while the text could not be read (offline: a note, the matrix is made without it) is not used when the text is wanted.
+- **Auto-cut** switches the importance matrix on for its export and passes this option when *keep it able to think* is on: the matrix of the finished model is measured on project text, general text and reasoning text.
+  Tests: `worker/tests/test_imatrix.py` (the text, the cut, the fallback, the key), `tests/export.rs`, `tests/imatrix_library.rs` (the job's request).

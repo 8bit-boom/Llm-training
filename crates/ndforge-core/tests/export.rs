@@ -365,7 +365,7 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
     let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
-    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true, use_saved: None });
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true, use_saved: None, reasoning: None });
     assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
     // the speculative-decoding head: on by default (the worker uses it only when there is one and llama-imatrix knows --nextn); an old spec without the field loads as on
     assert!(o.nextn && sent.nextn);
@@ -388,6 +388,12 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!(b["stop_file"], json!(out.join("STOP")));
     assert_eq!(b["nextn"], json!(true));
     assert_eq!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { nextn: false, ..on() }, &out).unwrap().unwrap()["nextn"], json!(false));
+    // conversations with thinking in the calibration text: none unless asked, then the worker's own request shape (the same one the measuring uses)
+    assert!(b["reasoning"].is_null());
+    let r = exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { reasoning: Some(ndforge_core::reshape::plan::ReasoningCalib::default()), ..on() }, &out).unwrap().unwrap()["reasoning"].clone();
+    assert_eq!((r["source"]["id"].clone(), r["share"].clone(), r["max_len"].clone()), (json!(ndforge_core::reshape::plan::THINKING_GENERAL_ID), json!(0.5), json!(2048)));
+    let bad = ndforge_core::reshape::plan::ReasoningCalib { share: 0.95, ..Default::default() };
+    assert!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { reasoning: Some(bad), ..on() }, &out).is_err());
     // the general text: the open default, with its split; another dataset is passed on as chosen; an acknowledgement is needed where the preset says so
     assert_eq!((b["general"]["id"].clone(), b["general"]["split"].clone(), b["general"]["share"].clone(), b["seed"].clone()), (json!("mlabonne/open-perfectblend"), json!("train"), json!(0.2), json!(3407)));
     let own = exports::ImatrixOptions { general: Some(ndforge_core::general::GeneralSource { file: Some("notes.jsonl".into()), ..Default::default() }), ..on() };

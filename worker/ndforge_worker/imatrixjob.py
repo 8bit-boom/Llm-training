@@ -12,7 +12,8 @@ Job: {"job": "imatrix_make", "root": library folder, "id": folder name, "label":
 "source": {"kind": "run", "run": name, "adapter": folder | None, "full_model": folder | None, "base": {"repo", "family"}, "f16_candidates": [GGUF files that may be reused]}
         | {"kind": "model", "model": folder or Hugging Face id, "family": ..., "name": ...}
         | {"kind": "gguf", "file": path, "tokenizer": folder or Hugging Face id | None, "family": ...},
-"calibration": {"kind": "data", "train": train.jsonl, "data_version": n, "general_share": 0.2, "general": {"id" | "file", ...} | None, "seed": 3407}
+"calibration": {"kind": "data", "train": train.jsonl, "data_version": n, "general_share": 0.2, "general": {"id" | "file", ...} | None, "seed": 3407,
+"reasoning": {"source": {"id" | "file"}, "share": 0.5, "max_len": 2048} | None (conversations with thinking, written the way the model thinks)}
              | {"kind": "text", "file": path}}.
 The Hugging Face token reaches the worker only as the environment variable HF_TOKEN."""
 import errno
@@ -285,7 +286,7 @@ def make(job: dict) -> dict:
         raise MatrixError("Choose where the model comes from: a trained run, a model, or a GGUF file.")
     if cal.get("kind") not in ("data", "text"):
         raise MatrixError("Choose the calibration text: your saved data, or a text file of your own.")
-    im = {"stop_file": job.get("stop_file"), "general": cal.get("general"), "seed": int(cal.get("seed", 3407)), "data_version": cal.get("data_version")}
+    im = {"stop_file": job.get("stop_file"), "general": cal.get("general"), "seed": int(cal.get("seed", 3407)), "data_version": cal.get("data_version"), "reasoning": cal.get("reasoning")}
     notes: list = []
     # the tools and the inputs are checked before anything is made
     conv, tool = find_tools(need_convert=src["kind"] != "gguf")
@@ -352,7 +353,7 @@ def make(job: dict) -> dict:
         target = out / "imatrix.gguf"
         os.replace(partial, target)
         key = {"model": job.get("model_name") or "", "weights": hashlib.sha256(weights.encode()).hexdigest() if src["kind"] == "gguf" else weights, "data_hash": data_hash,
-               "chunks": chunks, "ctx": ctx, "general_share": share, "general": None, "nextn": want_nextn}
+               "chunks": chunks, "ctx": ctx, "general_share": share, "general": None, "nextn": want_nextn, "reasoning": imatrix.reasoning_key(im) if cal["kind"] == "data" else None}
         base_repo = (src.get("base") or {}).get("repo") or (src.get("model") if src["kind"] == "model" else None)
         info = imatrix.matrix_info(key, {**im, "general": cal.get("general") if share > 0 else None}, base_repo, stats, general, gnote, used_nextn, want_nextn, left_out, tool)
         summary = imatrix.matrix_summary(target) or {}

@@ -430,10 +430,74 @@ def fetch_general(source: dict, tokenizer, budget: int, ctx: int, should_stop=la
         return [], note
 
 
-def build_calibration(tokenizer, rows: list, fam_name: str, ctx: int, chunks: int, general: list, share: float = DEFAULT_SHARE, seed: int = 3407):
+def reasoning_key(im: dict):
+    """What makes the reasoning part of the calibration text another one (None when there is none): `im["reasoning"]` is {"source": {"id" | "file", ...}, "share": 0.5,
+    "max_len": 2048}, the same request as the reshape measuring's (reshapejob.reasoning_key; one definition of the key). Part of the key of a saved matrix."""
+    from . import reshapejob
+    return reshapejob.reasoning_key(im or {})
+
+
+def fetch_reasoning(key: dict, tokenizer, budget: int, should_stop=lambda: False, fam_name: str = None, seed: int = 3407, report: dict = None):
+    """(texts, note): conversations WITH thinking of about `budget` tokens, written the way the model thinks (data.render_chat_full: the template over the whole
+    conversation, thinking on, `...<think>\n{trace}\n</think>\n\n{answer}`), each cut to key["max_len"] tokens (the first part only: a later part would have neither the
+    question nor the chat frame). Conversations without a trace are passed over for a family that thinks. Any problem gives ([], plain note) and the matrix is made
+    without the reasoning text."""
+    from . import distilljob, generaltext, reshapejob
+    from .families import family
+    src = {k: key[k] for k in ("id", "file", "config", "split", "column") if key.get(k)}
+    name = src.get("file") or src.get("id") or reshapejob.REASONING_ID
+    rep = report if report is not None else {}
+    src.update(seed=seed, report=rep)
+    thinks = bool(fam_name) and bool(family(fam_name).get("thinks"))
+    if fam_name:
+        src["render"] = lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1]
+    cap = int(key["max_len"])
+    try:
+        texts, got, scanned = [], 0, 0
+        for text in distilljob._general_texts(src):
+            if should_stop():
+                raise Stopped()
+            scanned += 1
+            if thinks and "</think>" not in text.replace("<think>\n\n</think>", ""):
+                if scanned >= reshapejob.REASONING_SCAN * 64:
+                    break
+                continue
+            n = count_tokens(tokenizer, text)
+            if n < distilljob.MIN_GENERAL_ROW:
+                continue
+            if n > cap:
+                text, n = text[: int(len(text) * cap / n)], cap
+            texts.append(text)
+            got += n
+            if got >= budget:
+                break
+        if not texts:
+            return [], f"The reasoning text ({name}) had no conversation with a thinking trace. The matrix is made without it."
+        return texts, ""
+    except Stopped:
+        raise
+    except Exception as exc:    # noqa: BLE001 - offline, gated, wrong id: the same plain way as the general text
+        note, code = generaltext.failure_note(exc, src, "read", "The matrix is made without the reasoning text.", reshapejob.REASONING_ID)
+        rep["error_code"] = code
+        return [], note
+
+
+def _interleave(a: list, b: list):
+    """The texts of `a` and `b` (lists of (text, tokens)) mixed evenly by tokens, each in its own order."""
+    out, ai, bi, at, bt = [], 0, 0, 0, 0
+    ta, tb = sum(n for _, n in a), sum(n for _, n in b)
+    while ai < len(a) or bi < len(b):
+        if bi >= len(b) or (ai < len(a) and at * max(tb, 1) <= bt * max(ta, 1)):
+            out.append(a[ai]); at += a[ai][1]; ai += 1
+        else:
+            out.append(b[bi]); bt += b[bi][1]; bi += 1
+    return out
+
+
+def build_calibration(tokenizer, rows: list, fam_name: str, ctx: int, chunks: int, general: list, share: float = DEFAULT_SHARE, seed: int = 3407, reasoning: list = None, reasoning_share: float = 0.0):
     """(text, stats). About ctx x chunks tokens: `share` of them general text (when `general` has any), the rest the project's own rows (shuffled with `seed`,
     repeated when the data is smaller than that). Both kinds are mixed evenly through the file, so that --chunks cuts nothing out of one of them.
-    The same rows, settings and general text always give the same file."""
+    `reasoning` (conversations with thinking, `reasoning_share` of the tokens) is mixed in with the general text. The same rows, settings and texts always give the same file."""
     budget = int(ctx * chunks * SLACK) + 1
     docs, skipped = render_rows(tokenizer, rows, fam_name)
     if not docs:
@@ -446,6 +510,17 @@ def build_calibration(tokenizer, rows: list, fam_name: str, ctx: int, chunks: in
         n = count_tokens(tokenizer, text)
         gen.append((text, n))
         g_tok += n
+    rsn, r_tok = [], 0
+    r_budget = int(budget * reasoning_share) if reasoning else 0
+    for text in (reasoning or []):
+        if r_tok >= r_budget:
+            break
+        n = count_tokens(tokenizer, text)
+        rsn.append((text, n))
+        r_tok += n
+    if rsn:
+        gen = _interleave(rsn, gen)             # the reasoning text and the general text are one stream next to the project's own
+    g_tok_general, g_tok = g_tok, g_tok + r_tok
     p_budget = max(budget - g_tok, 1)
     random.Random(seed).shuffle(docs)
     sized = [(d, count_tokens(tokenizer, d)) for d in docs]
@@ -468,7 +543,7 @@ def build_calibration(tokenizer, rows: list, fam_name: str, ctx: int, chunks: in
             gt += gen[gi][1]
             gi += 1
     stats = {"project_rows": len(docs), "project_rows_used": len(proj), "project_tokens": p_tok, "unique_project_tokens": unique_tokens, "repeated": i > len(sized),
-             "general_rows": len(gen), "general_tokens": g_tok, "skipped_rows": skipped, "tokens": p_tok + g_tok, "wanted_tokens": ctx * chunks}
+             "general_rows": len(gen) - len(rsn), "general_tokens": g_tok_general, "reasoning_rows": len(rsn), "reasoning_tokens": r_tok, "skipped_rows": skipped, "tokens": p_tok + g_tok, "wanted_tokens": ctx * chunks}
     return "\n".join(t.strip("\n") for t in out) + "\n", stats
 
 
@@ -500,7 +575,8 @@ def settings_key(cfg: dict, im: dict, data_hash: str, nextn: bool = False) -> di
     from . import generaltext
     share = float(im.get("general_share", DEFAULT_SHARE))
     return {"model": im.get("model") or "", "weights": weights_fingerprint(cfg), "data_hash": data_hash, "chunks": int(im.get("chunks", 128)),
-            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407)), render=None), "nextn": bool(nextn)}
+            "ctx": int(im.get("ctx", DEFAULT_CTX)), "general_share": share, "general": generaltext.general_key(im.get("general") or {"id": generaltext.DEFAULT_ID}, share, int(im.get("seed", 3407)), render=None), "nextn": bool(nextn),
+            "reasoning": reasoning_key(im)}
 
 
 def _saved_value(info: dict, k: str):
@@ -511,7 +587,7 @@ def _saved_value(info: dict, k: str):
     return info.get(k)
 
 
-def find_saved(dirs, key: dict, general_wanted: bool):
+def find_saved(dirs, key: dict, general_wanted: bool, reasoning_wanted: bool = False):
     """The newest folder whose imatrix.gguf + imatrix.json were made from exactly `key`. A matrix made without the general text (offline then) is not reused
     when the general text is wanted now."""
     import json
@@ -524,6 +600,8 @@ def find_saved(dirs, key: dict, general_wanted: bool):
             if not f.is_file() or info.get("format") != FORMAT or any(_saved_value(info, k) != v for k, v in key.items()):
                 continue
             if general_wanted and not info.get("general_used"):
+                continue
+            if reasoning_wanted and not info.get("reasoning_used"):
                 continue
             if best is None or f.stat().st_mtime > best[0]:
                 best = (f.stat().st_mtime, d, info)
@@ -559,16 +637,28 @@ def calibration_text(tokenizer, rows: list, fam_name: str, im: dict, ctx: int, c
         if gnote:
             note(gnote)
             protocol.log(gnote)
-    text, stats = build_calibration(tokenizer, rows, fam_name, ctx, chunks, general, share)
+    reasoning, rkey, rshare = [], reasoning_key(im), 0.0
+    if rkey:
+        rshare = float(rkey["share"])
+        protocol.progress("imatrix", at, "Getting the reasoning text")
+        reasoning, rnote = fetch_reasoning(rkey, tokenizer, int(ctx * chunks * SLACK * rshare), lambda: stop_requested(im), fam_name, seed)
+        if reasoning:
+            protocol.log(f"Reasoning text for the matrix: {len(reasoning)} conversations with thinking from {rkey.get('file') or rkey.get('id')} (cut to {rkey['max_len']} tokens).")
+        if rnote:
+            note(rnote)
+            protocol.log(rnote)
+            gnote = (gnote + " " + rnote).strip() if gnote else rnote
+    text, stats = build_calibration(tokenizer, rows, fam_name, ctx, chunks, general, share, seed, reasoning, rshare)
     protocol.log(f"Calibration text: {stats['project_rows_used']} project texts ({stats['project_tokens']:,} tokens"
-                 + (f", your data repeated to fill it" if stats["repeated"] else "") + f") and {stats['general_rows']} general texts ({stats['general_tokens']:,} tokens).")
+                 + (f", your data repeated to fill it" if stats["repeated"] else "") + f"), {stats['general_rows']} general texts ({stats['general_tokens']:,} tokens)"
+                 + (f" and {stats['reasoning_rows']} conversations with thinking ({stats['reasoning_tokens']:,} tokens)." if stats["reasoning_rows"] else "."))
     return text, stats, general, gnote
 
 
 def matrix_info(key: dict, im: dict, base_repo, stats: dict, general: list, gnote: str, used_nextn: bool, want_nextn: bool, left_out: str, tool) -> dict:
     """The contents of imatrix.json (what the matrix was made from)."""
     g = im.get("general") or {}
-    return {"format": FORMAT, **key, "nextn": used_nextn, "nextn_asked": want_nextn, "data_version": im.get("data_version"), "base_repo": base_repo, "general_used": bool(general),
+    return {"format": FORMAT, **key, "nextn": used_nextn, "nextn_asked": want_nextn, "data_version": im.get("data_version"), "base_repo": base_repo, "general_used": bool(general), "reasoning_used": bool(stats.get("reasoning_rows")), "reasoning_tokens": stats.get("reasoning_tokens", 0),
             "general_source": g.get("file") or g.get("id") or ("default" if general else None), "general_error": gnote or None, "project_tokens": stats["project_tokens"],
             "general_tokens": stats["general_tokens"], "nextn_note": left_out or None, "llama_cpp": tool_version(tool), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
@@ -774,7 +864,7 @@ def prepare(cfg: dict, merged: Path, out: Path, f16, quantize, quants: list, rep
         share = key["general_share"]
         target = out / "imatrix.gguf"
         if im.get("reuse", True):
-            folder, info = find_saved(im.get("reuse_dirs"), key, general_wanted=share > 0)
+            folder, info = find_saved(im.get("reuse_dirs"), key, general_wanted=share > 0, reasoning_wanted=bool(key.get("reasoning")))
             if folder is not None:
                 if (folder / "imatrix.gguf").resolve() != target.resolve():
                     shutil.copy2(folder / "imatrix.gguf", target)

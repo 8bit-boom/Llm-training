@@ -181,7 +181,9 @@ impl Effects for RealEffects<'_> {
         let stop = self.stop.clone();
         let mut events = Vec::new();
         let dir = std::path::PathBuf::from(&healed.dir);
-        let r = crate::export::runs::execute_model_folder(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &ImatrixOptions::default(), &stop, &mut |e| events.push(e));
+        // the matrix for the small sizes is measured on the finished model, on text that looks like what it will be asked: with thinking when it keeps thinking (docs/IMATRIX.md)
+        let imatrix = ImatrixOptions { enabled: true, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
+        let r = crate::export::runs::execute_model_folder(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, &stop, &mut |e| events.push(e));
         for e in events {
             self.forward(e);
         }

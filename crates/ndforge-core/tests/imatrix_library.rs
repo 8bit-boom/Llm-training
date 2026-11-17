@@ -348,6 +348,9 @@ fn the_job_for_a_run_names_the_adapter_the_base_and_any_16_bit_file_of_an_earlie
     // a full fine-tune is named by its folder
     fake_done_run(&p, "run3", None, true);
     let job = lib::build_job(&p, &lib::MakeSpec { source: lib::SourceSpec { kind: "run".into(), run: Some("run3".into()), ..Default::default() }, ..Default::default() }, "x", Path::new("STOP")).unwrap();
+    assert!(job["calibration"]["reasoning"].is_null(), "nothing changes without the option");
+    let with = lib::build_job(&p, &lib::MakeSpec { source: lib::SourceSpec { kind: "run".into(), run: Some("run3".into()), ..Default::default() }, reasoning: Some(Default::default()), ..Default::default() }, "x", Path::new("STOP")).unwrap();
+    assert_eq!((with["calibration"]["reasoning"]["share"].clone(), with["calibration"]["reasoning"]["max_len"].clone()), (json!(0.5), json!(2048)));
     assert!(job["source"]["adapter"].is_null() && job["source"]["full_model"].as_str().unwrap().ends_with("model"));
 }
 

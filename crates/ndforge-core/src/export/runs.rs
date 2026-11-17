@@ -76,6 +76,10 @@ pub struct ImatrixOptions {
     /// the id of a matrix of the library (`export::imatrix_lib`) to use as it is: nothing is measured. Old specs have none.
     #[serde(default)]
     pub use_saved: Option<String>,
+    /// conversations with thinking (written the way a thinking model writes them) in the calibration text: that share of its tokens. None = the project's text and the
+    /// general text only. The matrix of a model that thinks is then measured on text that looks like what it will be asked (docs/IMATRIX.md, "Thinking models").
+    #[serde(default)]
+    pub reasoning: Option<crate::reshape::plan::ReasoningCalib>,
 }
 
 fn default_nextn() -> bool {
@@ -84,7 +88,7 @@ fn default_nextn() -> bool {
 
 impl Default for ImatrixOptions {
     fn default() -> Self {
-        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true, use_saved: None }
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true, use_saved: None, reasoning: None }
     }
 }
 
@@ -228,12 +232,19 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
     let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
     let general = crate::general::job_block(&crate::general::resolve(opts.general.as_ref(), true)?, IMATRIX_GENERAL_SHARE);
+    let reasoning = match &opts.reasoning {
+        Some(r) => {
+            r.validate()?;
+            r.json()
+        }
+        None => Value::Null,
+    };
     // a saved matrix of the library: nothing is measured, the worker copies the file into the export folder and gives it to llama-quantize / Unsloth as a fresh one
     let (use_file, use_id) = match opts.use_saved.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => { let (id, f) = super::imatrix_lib::for_export(p, id)?; (json!(f), json!(id)) }
         None => (Value::Null, Value::Null),
     };
-    Ok(Some(json!({"use_file": use_file, "use_id": use_id, "enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+    Ok(Some(json!({"use_file": use_file, "use_id": use_id, "enabled": true, "general": general, "reasoning": reasoning, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
                    "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
