@@ -8,3 +8,4 @@ tools/
 build/
 *.egg-info/
 worker/Q6_K
+worker/unsloth_compiled_cache/

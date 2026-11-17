@@ -27,3 +27,8 @@ Both builds are in `.github/workflows/release.yml` (tag `v*` or run by hand) and
 
 ## Without Unsloth, with a model you already have
 All you need is this program and a model. **⚙ Training setup → "Install without Unsloth"** installs only the standard libraries (Transformers, PEFT, TRL): the program fetches Python, PyTorch and these itself with `uv`, nothing else has to be installed by hand. A model is either downloaded from Hugging Face the first time (the five built-in ones, or any open model added in Step 3) or taken from a folder on this computer (Step 3, *Add a model from Hugging Face…* → *Choose a folder…*). Without Unsloth training is slower and can use more graphics memory; *Training engine* in Expert mode chooses per run (auto, unsloth, standard).
+
+## Troubleshooting
+
+- A `docs/.github` folder is not used by GitHub; delete it.
+- Unsloth writes a `worker/unsloth_compiled_cache/` folder while it runs; it is safe to delete and is ignored by git.
