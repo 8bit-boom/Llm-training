@@ -56,7 +56,7 @@ fn a_tiny_real_model_goes_through_measure_try_cut_heal_and_the_thinking_check() 
     // the tiny model: the worker's own test helper builds it (random weights, a real tokenizer and chat template)
     let worker = repo().join("worker");
     let tiny = d.path().join("tiny");
-    let script = "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); from tinymodel import build_arch_dir; build_arch_dir(Path(sys.argv[3]), 'qwen3_5', num_layers=4)";
+    let script = "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); from tinymodel import build_arch_dir; build_arch_dir(Path(sys.argv[3]), 'qwen3_5', num_layers=4, intermediate=512)";
     let out = std::process::Command::new(&py).args(["-c", script]).arg(worker.join("tests")).arg(&worker).arg(&tiny).output().unwrap();
     assert!(out.status.success(), "the tiny model could not be built: {}", String::from_utf8_lossy(&out.stderr));
     ndforge_core::train::catalog::add_custom(serde_json::from_value(json!({"id": "custom-tiny", "name": "Tiny Qwen3.5", "family": "qwen3_5", "repo": tiny, "official": "", "params_b": 0.001, "license": "test",
@@ -78,13 +78,13 @@ fn a_tiny_real_model_goes_through_measure_try_cut_heal_and_the_thinking_check() 
     // measure, then try one width on a few samples
     done("measure", fx.measure("custom-tiny", 8, "16bit", None));
     lap("measured");
-    let try_spec: TrySpec = serde_json::from_value(json!({"model_id": "custom-tiny", "samples": 8, "measure_samples": 8, "load": "16bit", "widths": [96]})).unwrap();
+    let try_spec: TrySpec = serde_json::from_value(json!({"model_id": "custom-tiny", "samples": 8, "measure_samples": 8, "load": "16bit", "widths": [256]})).unwrap();
     let analysis = done("try", fx.try_run(&try_spec));
     assert!(analysis.is_object() || analysis.is_array(), "{analysis}");
     lap("tried");
 
-    // cut: thinner layers (the MLP from 128 to 96), no block removed
-    let spec = serde_json::from_value(json!({"source_model_id": "custom-tiny", "mode": "prune", "blocks": 0, "calib_samples": 8, "calib_len": 128, "load": "16bit", "width": {"intermediate": 96}, "width_samples": 8})).unwrap();
+    // cut: thinner layers (the MLP from 512 to 256), no block removed
+    let spec = serde_json::from_value(json!({"source_model_id": "custom-tiny", "mode": "prune", "blocks": 0, "calib_samples": 8, "calib_len": 128, "load": "16bit", "width": {"intermediate": 256}, "width_samples": 8})).unwrap();
     let cut = done("cut", fx.cut(&spec));
     let cut_dir = models_dir(&p).join(&cut.name);
     assert!(cut_dir.join("model").join("config.json").is_file(), "the cut model is saved");
