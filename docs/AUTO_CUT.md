@@ -4,7 +4,7 @@ Auto-cut chains the steps of the Slim page that a person would do by hand: look 
 files into Unsloth Studio's share. It reuses the existing jobs (`reshape_inspect`, `reshape_measure`, `reshape_try`, `reshape`, the heal jobs, `think_check`, export, imatrix adapt); it
 adds a planner, a state machine that can be stopped and continued, gates after every stage, and a report. Nothing in it has run on a real model yet ("Not verified yet" at the end).
 
-This file is written in steps: the planner (this commit), then the orchestrator, the Studio publish and the page.
+This file is written in steps: the planner, the orchestrator (state machine, then gates, retry and report), the Studio publish and the page.
 
 ## The planner (`crates/ndforge-core/src/reshape/auto_plan.rs`)
 
@@ -37,6 +37,43 @@ written) and **308.7 GB** without it (at the export); 110.7 GB are left at the e
 
 **Backing off** (`back_off`): the step Auto-cut takes back after a stage failed twice: one block less while there are blocks, else 1,024 more of the MLP (four stops).
 
+## The orchestrator (`reshape/auto.rs`, effects in `reshape/auto_fx.rs`)
+
+A state machine, `auto::start(project, effects, spec)` / `auto::resume(project, effects, run)`. Its state is **`models/_auto/<run>/auto.json`**, written atomically after every step (the folder
+name starts with an underscore like `_scores`, so the model list does not show it). A run is `running | stopped | failed | done | gates_failed`; a run that was `running` when the program
+closed is marked `stopped` at the next start (`mark_interrupted`), and **Continue** runs the first step that is not done. Every step looks at the state first (a cut that was made is not made
+again; the first answer of Try first is kept between its two requests), so *stopping at any call and continuing gives the same run as one that was never stopped*: the test stops at every one
+of the calls of a whole run and compares the finished calls and the saved state.
+
+What the steps do is behind the `Effects` trait (the tests use a stand-in that only records; `RealEffects` calls the jobs of the Slim page, the Heal card, the Thinking check and the export, one at
+a time on one card, with the Stop button on the same flag). Worker events are forwarded unchanged with `phase: "auto"` and `auto_step` added; the run's own events are
+`{"kind": "auto", "phase": "auto", "auto_step", "status": "running|done|skipped|stopped|failed", "note"}`.
+
+| Step | What it does |
+|---|---|
+| `plan` | the model's layout (`reshape_inspect`), the training data, the card and the disk; the planner above. A blocker ends the run before any job starts, with the numbers in the message |
+| `measure` | `reshape_measure` of the original on the reasoning-aware text (docs/RESHAPE.md, "Measuring on reasoning"): 256 samples, loaded the way the card allows |
+| `try` | Try first for the (up to three) candidates: first the widths and the best run of every block count, then the combined cut (those blocks and that width). The cheapest wins; when the two halves of the text name different winners, everything is asked again with 256 samples. The blocks of the winner are cut as Try first found them (explicit layers) |
+| `sN.cut` | `reshape` of the stage (the input is the original, or the healed model of the stage before; a width is measured on THAT model, on the reasoning-aware text) |
+| `sN.check_cut` | thinking check of the cut (information only). The first one also checks the original, once, from the folder of the first cut (that is where its record of the original is) |
+| `sN.heal` | the Heal card's job with the thinking recipe and the stage's tokens; **the teacher is always the original model** (`heal_from_source` with the original as the teacher, also for stage 2) |
+| `sN.check_heal` | thinking check of the healed model against the original's numbers (the gates of docs/THINKING_CHECK.md). A failure ends the run with `gates_failed` for now |
+| `export` | the GGUF sizes (Q4_K_M and the chosen ones) of the last healed model, its chat template keeping thinking (`thinking_default: "keep"`) |
+| `check_gguf` | thinking check of the Q4_K_M GGUF through llama-server (covers the template and the quantisation) |
+| `studio_publish` | only when asked (docs/UNSLOTH_API_CONTRACT.md, "Publish") |
+
+Models that do not think (*keep thinking* off) skip the thinking checks and the reasoning text; everything else is the same.
+
+**Clean-up** (`keep_intermediate` off): after the check of stage N passed, its unhealed cut (`model/` and its entry in the model list) and the teacher's saved answers are deleted, and the healed
+model of stage N-1; the healed model of the last stage is never deleted. Only what the run made is ever deleted (the run keeps the list, `made`, and the real effects refuse anything else), never the
+original model, and nothing from a stage that did not pass. The test records every deletion and compares it with the plan's disk timeline.
+
+**Deviations from the plan** (the code won): the state is in `models/_auto/<run>/`, not `models/<name>/auto.json` (a run makes several models); the check of the original runs after the first cut, not
+before the first step (the worker finds the original through the cut's record: `think_check` target `original`); the export measures its importance matrix on the finished model instead of adapting a
+matrix of the original (`imatrix_adapt` needs a saved matrix of the original, which a run does not have; docs/IMATRIX.md); stage A heals with 40 million tokens (the plan said 20 in one place and 40 per
+stage in another).
+
 ## Not verified yet
 
-Nothing here ran on a real model, card or Studio. The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates.
+Nothing here ran on a real model, card or Studio. The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
+is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs) has only been compiled and read, not run against a worker.

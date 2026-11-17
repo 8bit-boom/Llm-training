@@ -315,6 +315,31 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
     }
 }
 
+/// Auto-cut's clean-up of a made model whose heal has passed its check: the unhealed model (`model/`, and its entry in the model list) and the teacher's saved answers go;
+/// the folder, its records, the thinking checks and a healed model stay. Refused while the model is being made.
+pub fn remove_cut(p: &Project, name: &str) -> Result<()> {
+    valid_name(name)?;
+    let dir = models_dir(p).join(name);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    if active().lock().map(|a| a.contains(&dir)).unwrap_or(false) {
+        return Err(Error::new("This model is being made right now. Stop it first."));
+    }
+    let model = dir.join("model");
+    let repo = model.canonicalize().unwrap_or(model.clone()).to_string_lossy().to_string();
+    if let Some(id) = catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.id) {
+        catalog::remove_custom(&id)?;
+    }
+    for sub in [model, dir.join("distill").join("cache")] {
+        if sub.is_dir() {
+            std::fs::remove_dir_all(sub)?;
+        }
+    }
+    set_state(&dir, json!({"model_removed": true}));
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------------------------- the list
 
 /// Adds `models/<name>/model` to the model list so it can be chosen as a base model in Step 3. Returns the model's id (the same one when called again).

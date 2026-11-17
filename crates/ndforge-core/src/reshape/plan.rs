@@ -35,7 +35,7 @@ impl Mode {
 }
 
 /// What the worker's `reshape_inspect` job found out about a model (extra keys it sends are ignored).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Inspect {
     #[serde(default)]
     pub model_type: String,
