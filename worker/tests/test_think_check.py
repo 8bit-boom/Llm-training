@@ -268,3 +268,50 @@ def test_quick_without_control_and_stop(monkeypatch, tmp_path):
     res = lines_of()[-1]["data"]
     assert len(be.asked) == 16 and all(r["max_new"] == 2048 for r in be.asked)
     assert res["main"]["n"] == 5 and res["control"]["n"] == 0 and res["stopped"] is True
+
+
+# ------------------------------------------------------------------------------------------------------------ the saved numbers of a model
+
+def test_a_finished_check_is_answered_from_the_cache_and_a_changed_setting_is_not(monkeypatch, tmp_path):
+    lines_of = captured(monkeypatch)
+    model = tmp_path / "orig"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"x" * 10)
+    be = FakeBackend()
+    monkeypatch.setattr(tc, "load_backend", lambda name: be)
+    job = {"job": "think_check", "model": str(model), "backend": "hf", "cache_file": str(tmp_path / "c" / "orig.json")}
+    assert tc.run(dict(job)) == 0
+    first = lines_of()[-1]["data"]
+    assert first["cached"] is False and (tmp_path / "c" / "orig.json").is_file() and not (tmp_path / "c" / "orig.json.partial").exists()
+    asked = len(be.asked)
+    be.asked = []
+    assert tc.run(dict(job)) == 0
+    again = lines_of()[-1]["data"]
+    assert again["cached"] is True and be.asked == [] and again["main"] == first["main"] and asked == 40
+    # another setting, another backend, another load, or other weights: asked again
+    for change in ({"quick": True}, {"temperature": 0.7}, {"backend": "llama"}, {"load": "4bit"}, {"control": False}):
+        be.asked = []
+        tc.run({**job, **change})
+        assert be.asked, change
+    (model / "model.safetensors").write_bytes(b"x" * 11)
+    be.asked = []
+    tc.run(dict(job))
+    assert be.asked
+
+
+def test_a_stopped_check_is_not_saved(monkeypatch, tmp_path):
+    captured(monkeypatch)
+    cache = tmp_path / "c.json"
+    monkeypatch.setattr(tc, "load_backend", lambda name: FakeBackend(stop_after=3))
+    tc.run({"job": "think_check", "model": "org/x", "cache_file": str(cache)})
+    assert not cache.exists()
+
+
+def test_fingerprints(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(b"GGUF")
+    assert tc.fingerprint(str(f)).startswith("file:m.gguf:4:") and tc.fingerprint("org/name") == "repo:org/name"
+    d = tmp_path / "d"
+    d.mkdir()
+    assert tc.fingerprint(str(d)).startswith("dir:")

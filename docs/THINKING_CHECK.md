@@ -67,9 +67,21 @@ Judged against **the original model's** numbers, from the same suite and the sam
 
 New job types and events only; nothing existing was renamed.
 
+## Backend 1: transformers (`backend: "hf"`, the default)
+
+`thinkcheck_hf.py` loads the model the way the other jobs do (16-bit, 4-bit NF4 or spread over card and memory, `load: auto` picks by the free graphics memory), writes each question with the
+model's own chat template (thinking on: the prompt ends with `<think>\n`; off: with the empty block), and generates in **batches of 8** with left padding and sampling (the seed is
+set per batch, so the same questions in the same batches give the same answers). Out of memory halves the batch and goes on; `"batch": 1` asks one at a time. The trace length is read from the position
+of `</think>` among the generated token ids. Events: `progress` (step `load`, then step `think`) and one `think_item` per answered question.
+
+**The saved numbers of a model.** With `cache_file` in the job, a finished check is saved (keyed by the model's weights fingerprint, backend, load, suite version and all settings) and the next
+identical check is answered from it (`"cached": true`): the original is checked once however often it is compared. A stopped check is never saved. A Hub id is keyed by its name, not its revision.
+
 ## Not verified yet
 
 * Nothing here ran on a real model: the scorer was tested on written outputs and the job on a stand-in backend. Whether the suite is easy or hard for a real Qwen3.8 27B (and for the
   cut), how long its traces are, and whether the gates are in the right place need the owner's runs.
 * The gates' numbers come from the plan, not from measurements; expect to adjust them after the first real comparisons.
+* Batched sampling of a model with linear-attention layers and left padding: the tiny test model (the real architecture, random weights) runs it, but whether the real 27B answers the same batched as
+  one at a time is not checked (use `batch: 1` or the llama backend if the numbers look odd).
 * The loop test on word lists (the llama backend has no token ids) is a rough stand-in for the token version.

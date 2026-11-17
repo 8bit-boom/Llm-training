@@ -350,18 +350,67 @@ def result_of(model: str, backend: str, settings: dict, run: dict, seconds: floa
             "items": run["items"] + run["control"], "stopped": run["stopped"], "seconds": round(seconds, 1)}
 
 
+CACHE_FORMAT = 1
+
+
+def fingerprint(model: str) -> str:
+    """What identifies the model that is checked: a GGUF file by name, size and time; a folder by its config and weight files (`reshapetry.weights_fingerprint`);
+    a Hub id by the id itself (the revision is not looked at: the answer of an original that was updated on the Hub is not noticed)."""
+    p = Path(model)
+    if p.is_file():
+        st = p.stat()
+        return f"file:{p.name}:{st.st_size}:{int(st.st_mtime)}"
+    if p.is_dir():
+        from . import reshapetry
+        return reshapetry.weights_fingerprint(p)
+    return f"repo:{model}"
+
+
+def cache_key(job: dict, backend: str, settings: dict) -> dict:
+    """What the numbers depend on: the model, the way it is run and loaded, the suite and every setting. The same key is the same question."""
+    return {"format": CACHE_FORMAT, "model": fingerprint(str(job.get("model") or "")), "backend": backend, "load": job.get("load") or "auto", "suite_version": SUITE_VERSION,
+            "settings": settings}
+
+
+def _cached(path: Path, key: dict):
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    res = saved.get("result") if isinstance(saved, dict) else None
+    return res if saved.get("key") == key and isinstance(res, dict) and not res.get("stopped") else None
+
+
+def _save_cache(path: Path, key: dict, res: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".partial")
+    tmp.write_text(json.dumps({"key": key, "result": res}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
 def run(job: dict) -> int:
-    """job think_check: {"model": folder or repo, "backend": "hf" | "llama", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path, ...}.
-    Result: see `result_of` (the numbers of `summarize` for the questions and for the thinking-off control, and one entry per question)."""
+    """job think_check: {"model": folder, GGUF file or Hub id, "backend": "hf" | "llama", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path,
+    "cache_file": path (optional)}. With a cache_file, a finished check of the same model, backend, load, suite and settings is answered from it ("cached": true) and a new
+    one is saved there (the original model is checked once, however often it is compared). Result: see `result_of` (the numbers of `summarize` for the questions and for the
+    thinking-off control, and one entry per question)."""
     protocol.reserve_stdout()
     started = time.monotonic()
     name = job.get("backend") or "hf"
     backend = load_backend(name)
     suite = load_suite()
     settings = settings_of(job)
+    cache = Path(job["cache_file"]) if job.get("cache_file") else None
+    key = cache_key(job, name, settings) if cache else None
+    if cache and (hit := _cached(cache, key)) is not None:
+        protocol.log("This model was checked before with the same settings; the saved numbers are used.")
+        protocol.result({**hit, "cached": True})
+        return 0
     main, control = questions(suite, settings)
     stop_file = Path(job["stop_file"]) if job.get("stop_file") else None
     should_stop = (lambda: stop_file.exists()) if stop_file else (lambda: False)
     run_ = run_items(backend, main, control, settings, should_stop, job)
-    protocol.result(result_of(str(job.get("model") or ""), name, settings, run_, time.monotonic() - started))
+    res = {**result_of(str(job.get("model") or ""), name, settings, run_, time.monotonic() - started), "cached": False}
+    if cache and not res["stopped"]:
+        _save_cache(cache, key, res)
+    protocol.result(res)
     return 0
