@@ -178,7 +178,8 @@ echo "{\"type\":\"result\",\"data\":{\"steps\":$i,\"total_steps\":99,\"stopped\"
     let e = runs::execute(&p, &m, Method::Lora, &base_hyper(Preset::Quick), "run3", job, Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap_err();
     assert!(e.0.contains("ran out of memory"));
     let r3 = runs::list_runs(&p).into_iter().find(|r| r["name"] == "run3").unwrap();
-    assert_eq!((r3["status"].as_str(), r3["error"].as_str()), (Some("failed"), Some("The graphics card ran out of memory.")));
+    assert_eq!(r3["status"].as_str(), Some("failed"));
+    assert!(r3["error"].as_str().unwrap_or("").starts_with("The graphics card ran out of memory."), "{r3}");
 }
 
 #[test]

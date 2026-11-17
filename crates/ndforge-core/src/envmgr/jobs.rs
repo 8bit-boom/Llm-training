@@ -56,10 +56,12 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
         cmd.env(k, v);
     }
     let scrub = crate::unsloth::client::scrub;
+    let mut log = super::joblog::JobLog::open(job);
     let mut result: Option<Value> = None;
     let mut failure: Option<String> = None;
     let mut failure_code = String::new();
     let status = run_lines(cmd, cancel, &mut |stream: Stream, line: &str| {
+        log.line(if stream == Stream::Err { "err" } else { "out" }, line);
         if stream == Stream::Err {
             on_event(WorkerEvent::Log(scrub(line)));
             return;
@@ -82,14 +84,36 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
         }
     });
     let _ = std::fs::remove_dir_all(&dir);
-    let status = status?;
-    if let Some(msg) = failure {
-        // the page offers "Install llama.cpp now" when it finds this mark (the text above it stays as the worker wrote it, for logs)
-        return Err(Error::new(if failure_code == LLAMA_CPP_MISSING { format!("{msg} {LLAMA_CPP_MISSING_MARK}") } else { msg }));
-    }
-    match (status.success(), result) {
-        (true, Some(r)) => Ok(r),
-        (true, None) => Err(Error::new("The worker finished without an answer.")),
-        (false, _) => Err(Error::new(format!("The worker stopped unexpectedly (exit code {}).", status.code().unwrap_or(-1)))),
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => {
+            log.finish(if e.is_cancelled() { "stopped on request" } else { "could not run" }, "", if e.is_cancelled() { None } else { Some(&e.0) });
+            return Err(e);
+        }
+    };
+    let outcome: Result<Value> = if let Some(msg) = failure.clone() {
+        Err(Error::new(msg))
+    } else {
+        match (status.success(), result) {
+            (true, Some(r)) => Ok(r),
+            (true, None) => Err(Error::new("The worker finished without an answer.")),
+            (false, _) => Err(Error::new(format!("The worker stopped unexpectedly (exit code {}).", status.code().unwrap_or(-1)))),
+        }
+    };
+    log.finish(&format!("exit code {}", status.code().map(|c| c.to_string()).unwrap_or_else(|| "none".into())), &failure_code, outcome.as_ref().err().map(|e| e.0.as_str()));
+    match outcome {
+        Ok(r) => Ok(r),
+        // the text points at the saved log; the page offers "Install llama.cpp now" when it finds the mark, which stays at the very end
+        Err(e) => {
+            let mut text = e.0;
+            // a stop answered by the worker ("Cancelled.") stays exactly that word: callers compare it
+            if let Some(name) = log.short_name().filter(|_| text != crate::error::CANCELLED) {
+                text = format!("{text} (details: {name})");
+            }
+            if failure_code == LLAMA_CPP_MISSING {
+                text = format!("{text} {LLAMA_CPP_MISSING_MARK}");
+            }
+            Err(Error::new(text))
+        }
     }
 }

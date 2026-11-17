@@ -116,6 +116,8 @@ fn the_real_worker_answers_hello_and_explains_a_missing_torch() {
 #[test]
 fn worker_events_and_crashes_are_reported() {
     use std::os::unix::fs::PermissionsExt;
+    let cfg = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", cfg.path());
     // a fake "python" that prints protocol lines
     let d = tempfile::tempdir().unwrap();
     let fake = d.path().join("python");
@@ -128,9 +130,12 @@ fn worker_events_and_crashes_are_reported() {
     std::fs::write(&fake, "#!/bin/sh\nexit 7\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("exit code 7"));
     std::fs::write(&fake, "#!/bin/sh\necho '{\"type\":\"error\",\"code\":\"c\",\"message\":\"Plain words\"}'\nexit 1\n").unwrap();
-    assert_eq!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0, "Plain words");
+    // the message is the worker's, followed by where the saved log is
+    let msg = run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(msg.starts_with("Plain words (details: logs/jobs/") && msg.ends_with(".log)"), "{msg}");
     std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("without an answer"));
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
 
 #[cfg(unix)]

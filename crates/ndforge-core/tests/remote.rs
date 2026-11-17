@@ -298,7 +298,8 @@ fn problems_are_explained_in_plain_words() {
     let e = go(&p, &m, job, &failing.target(), Arc::new(AtomicBool::new(false)), false, &mut Vec::new()).unwrap_err();
     assert!(e.0.contains("ran out of memory"), "{e}");
     let st = runs::list_runs(&p).into_iter().find(|r| r["name"] == "run1").unwrap();
-    assert_eq!((st["status"].as_str(), st["error"].as_str()), (Some("failed"), Some("The graphics card ran out of memory.")));
+    assert_eq!(st["status"].as_str(), Some("failed"));
+    assert!(st["error"].as_str().unwrap_or("").starts_with("The graphics card ran out of memory."), "{st}");
 }
 
 /// A tiny Ollama: /api/ps lists two loaded models, /api/generate records the unloads.

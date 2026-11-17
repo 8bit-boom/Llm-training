@@ -2,6 +2,7 @@
 //! running jobs in the Python worker (`worker/`). Nothing here needs a GPU to compile or test.
 pub mod gpu;
 pub mod health;
+pub mod joblog;
 pub mod jobs;
 pub mod llamacpp;
 pub mod process;
