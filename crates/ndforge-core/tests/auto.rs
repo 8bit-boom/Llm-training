@@ -68,13 +68,19 @@ struct Mock {
     try_acc: BTreeMap<u32, (Vec<(u32, f64)>, BTreeMap<u32, Vec<Value>>, Vec<Value>)>,
     fail_heal_once: bool,
     publish_ok: bool,
+    /// the measured file beats the plain file of its size in the comparison
+    promote: bool,
+    /// the comparison fails with this text
+    compare_error: Option<String>,
+    /// the export folders the run made (a 16-bit export may be removed)
+    exports_made: BTreeSet<String>,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true,
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(),
         }
     }
 
@@ -201,7 +207,7 @@ impl Effects for Mock {
         Ok(Out::Done(HealRef { model_id: format!("id-{name}-healed"), dir: format!("models/{name}/healed"), tokens_m: spec.tokens_m, name, summary: Some(json!({"kd_first": 1.5, "kd_last": 0.5, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0})) }))
     }
     fn remove(&mut self, what: &Made) -> Result<()> {
-        assert!(self.made.contains(&what.name), "only what Auto-cut made may be removed: {what:?}");
+        assert!(self.made.contains(&what.name) || (what.kind == "export" && self.exports_made.contains(&what.name)), "only what Auto-cut made may be removed: {what:?}");
         assert!(!what.name.contains("Qwen") && what.name != "org/Qwen3.8-27B", "never the original: {what:?}");
         self.removed.push(what.clone());
         self.done.push(format!("remove {} {}", what.kind, what.name));
@@ -217,8 +223,26 @@ impl Effects for Mock {
             return Ok(Out::Stopped);
         }
         self.done.push(format!("export {} {family} {quants:?} thinking={keep_thinking}", healed.name));
-        let ggufs: Vec<Value> = quants.iter().map(|q| json!({"quant": q, "path": format!("exports/{run}-{q}/model-{q}.gguf")})).collect();
+        let ggufs: Vec<Value> = quants.iter().map(|q| json!({"quant": q, "path": format!("exports/{run}-{q}/model-{q}.gguf"), "export": format!("{run}-{q}")})).collect();
+        self.exports_made.extend(quants.iter().map(|q| format!("{run}-{q}")));
         Ok(Out::Done(json!({"dir": format!("exports/{run}"), "ggufs": ggufs})))
+    }
+    fn export_measured(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, target_gb: f64) -> Result<Out<Value>> {
+        self.done.push(format!("target {target_gb}"));
+        self.export(run, healed, family, quants, keep_thinking)
+    }
+    fn compare_quants(&mut self, reference: &str, picks: &[Value]) -> Result<Out<Value>> {
+        if self.stop_here("compare".into()) {
+            return Ok(Out::Stopped);
+        }
+        self.done.push(format!("compare {reference} {}", picks.iter().map(|p| p["path"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string()).collect::<Vec<_>>().join(",")));
+        if let Some(e) = &self.compare_error {
+            return Err(Error::new(e.clone()));
+        }
+        let rows: Vec<Value> = picks.iter().enumerate().map(|(i, p)| json!({"id": i.to_string(), "label": p["label"], "mixed": p["mixed"], "size": 1.0e10 + i as f64 * 1e9, "mean_kld": 0.03 + i as f64 * 0.001, "kld_unc": 0.0005, "same_top": 93.0})).collect();
+        let mi = picks.iter().position(|p| p["mixed"] == "mixed_measured").unwrap();
+        let promotion = json!([{"id": mi.to_string(), "against": "0", "promoted": self.promote, "reason": if self.promote { "The measured file is clearly closer." } else { "A tie within measurement noise." }, "delta_pct": 3.0, "noise": 0.0007}]);
+        Ok(Out::Done(json!({"rows": rows, "promotion": promotion, "verdict": ["A sentence."], "entry": {"id": "20261101-1000-ref"}})))
     }
     fn publish(&mut self, export: &Value, name: &str) -> Result<Out<Value>> {
         if self.stop_here("publish".into()) {
@@ -1024,4 +1048,165 @@ fn the_report_says_where_the_time_went_from_the_job_logs_of_the_run() {
     std::env::remove_var("NDFORGE_CONFIG_DIR");
     assert!(none.get("timings").is_none() || none["timings"].is_null());
     assert!(!markdown(&none).contains("Where the time went"));
+}
+
+// ------------------------------------------------------------------------------------------------------------------ a target size: the measured file and its comparison
+
+/// the spec of the target-size tests: the cut model is about 21 B, so Q4_K_M is about 12.9 GB and Q5_K_M about 15 GB
+fn tspec(gb: f64) -> AutoSpec {
+    AutoSpec { target_gb: Some(gb), ..spec(21.1) }
+}
+
+fn step_ids(st: &AutoState) -> Vec<&str> {
+    st.steps.iter().map(|s| s.id.as_str()).collect()
+}
+
+#[test]
+fn without_a_target_nothing_changes_and_with_one_the_steps_and_the_export_list_grow() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let plain = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert!(!step_ids(&plain).contains(&"compare_quants") && plain.compare.is_none());
+    assert!(fx.done.iter().any(|d| d.contains("[\"q4_k_m\"]")) && !fx.done.iter().any(|d| d.starts_with("target") || d.starts_with("compare")));
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    let st = start(&p2, &mut fx2, AutoSpec { studio_publish: true, ..tspec(14.0) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let ids = step_ids(&st);
+    let pos = |s: &str| ids.iter().position(|x| *x == s).unwrap();
+    assert!(pos("export") < pos("check_gguf") && pos("check_gguf") < pos("compare_quants") && pos("compare_quants") < pos("studio_publish"), "{ids:?}");
+    assert!(fx2.done.iter().any(|d| d == "target 14"));
+    assert!(fx2.done.iter().any(|d| d.contains("[\"q4_k_m\", \"q5_k_m\", \"mixed_measured\", \"f16\"]")), "{:?}", fx2.done);
+    let cmp = fx2.done.iter().find(|d| d.starts_with("compare")).unwrap();
+    assert!(cmp.contains("model-f16.gguf") && cmp.ends_with("model-q4_k_m.gguf,model-q5_k_m.gguf,model-mixed_measured.gguf"), "{cmp}");
+    assert_eq!(st.compare.as_ref().unwrap()["promoted"], false);
+    // the quants a person chose are still made, once each
+    let d3 = tempdir().unwrap();
+    let p3 = project(d3.path());
+    let mut fx3 = Mock::new();
+    start(&p3, &mut fx3, AutoSpec { quants: vec!["q4_k_m".into(), "q8_0".into()], ..tspec(10.0) }).unwrap();
+    assert!(fx3.done.iter().any(|d| d.contains("[\"q4_k_m\", \"q8_0\", \"mixed_measured\", \"f16\"]")), "a target below Q4_K_M: the plain size above it is Q4_K_M itself, {:?}", fx3.done);
+}
+
+#[test]
+fn a_run_with_a_target_is_checked_and_an_old_state_loads() {
+    assert!(AutoSpec { target_gb: Some(0.0), ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { target_gb: Some(f64::NAN), ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { target_gb: Some(-4.0), ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { target_gb: Some(12.5), ..gspec(21.1) }.validate().is_ok());
+    let spec_json = serde_json::to_value(spec(21.1)).unwrap();
+    let mut old = spec_json.clone();
+    old.as_object_mut().unwrap().remove("target_gb");
+    assert!(serde_json::from_value::<AutoSpec>(old).unwrap().target_gb.is_none());
+    // an auto.json saved before the comparison existed
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let mut v = serde_json::to_value(&st).unwrap();
+    v.as_object_mut().unwrap().remove("compare");
+    v["spec"].as_object_mut().unwrap().remove("target_gb");
+    let old: AutoState = serde_json::from_value(v).unwrap();
+    assert!(old.compare.is_none() && old.spec.target_gb.is_none());
+}
+
+#[test]
+fn the_plan_counts_the_measured_file_the_16_bit_reference_and_the_minutes() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let with = ndforge_core::reshape::auto::preview(&qwen27(), &tspec(14.0), Some(32.0), Some(900.0), true);
+    let without = ndforge_core::reshape::auto::preview(&qwen27(), &spec(21.1), Some(32.0), Some(900.0), true);
+    let _ = (&p, &mut fx);
+    assert!(with["plan"]["measured_minutes"].is_array() && without["plan"]["measured_minutes"].is_null());
+    let steps: Vec<String> = with["plan"]["disk"]["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap().to_string()).collect();
+    assert!(steps.iter().any(|s| s.contains("sample file")) && steps.iter().any(|s| s.contains("the comparison: the 16-bit GGUF deleted")), "{steps:?}");
+    assert!(with["plan"]["disk"]["peak_gb"].as_f64().unwrap() >= without["plan"]["disk"]["peak_gb"].as_f64().unwrap());
+    // a target no 3-bit file could reach is a blocker
+    let tiny = ndforge_core::reshape::auto::preview(&qwen27(), &tspec(1.0), Some(32.0), Some(900.0), true);
+    assert_eq!(tiny["plan"]["ok"], false);
+    assert!(tiny["plan"]["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().contains("smaller than the cut model can be made")));
+}
+
+#[test]
+fn the_16_bit_file_goes_after_the_comparison_unless_the_intermediate_files_are_kept() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, tspec(14.0)).unwrap();
+    let removed: Vec<(&str, String)> = fx.removed.iter().filter(|m| m.kind == "export").map(|m| (m.kind.as_str(), m.name.clone())).collect();
+    assert_eq!(removed.len(), 1, "{:?}", fx.removed);
+    assert!(removed[0].1.ends_with("-f16"));
+    let pos = |what: &str| fx.done.iter().position(|d| d.starts_with(what)).unwrap();
+    assert!(pos("remove export") > pos("compare"), "{:?}", fx.done);
+    assert!(st.made.iter().any(|m| m.kind == "export" && m.removed));
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut keep = Mock::new();
+    start(&p2, &mut keep, AutoSpec { keep_intermediate: true, ..tspec(14.0) }).unwrap();
+    assert!(!keep.done.iter().any(|d| d.starts_with("remove export")));
+    // a person who chose f16 keeps it
+    let d3 = tempdir().unwrap();
+    let p3 = project(d3.path());
+    let mut f16 = Mock::new();
+    start(&p3, &mut f16, AutoSpec { quants: vec!["q4_k_m".into(), "f16".into()], ..tspec(14.0) }).unwrap();
+    assert!(!f16.done.iter().any(|d| d.starts_with("remove export")));
+}
+
+#[test]
+fn only_a_promoted_measured_file_is_published_and_a_16_bit_reference_never_is() {
+    for (promote, expect) in [(false, 2), (true, 3)] {
+        let d = tempdir().unwrap();
+        let p = project(d.path());
+        let mut fx = Mock::new();
+        fx.promote = promote;
+        let st = start(&p, &mut fx, AutoSpec { studio_publish: true, ..tspec(14.0) }).unwrap();
+        assert_eq!(st.status, "done", "{:?}", st.error);
+        assert_eq!(st.compare.as_ref().unwrap()["promoted"], promote);
+        assert!(fx.done.iter().any(|d| d.ends_with(&format!("cut to 21.1B {expect}"))), "promote={promote}: {:?}", fx.done.iter().filter(|d| d.starts_with("publish")).collect::<Vec<_>>());
+        let rep: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
+        assert_eq!(rep["compare"]["promoted"], promote);
+        let md = std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.md")).unwrap();
+        assert!(md.contains("## Measured file against the plain sizes") && md.contains("| File | GB | Mean KLD | Same top answer | Promoted |"), "{md}");
+        assert!(md.contains(if promote { "was published with the others" } else { "was not published" }));
+        assert!(md.contains("0.0300 ± 0.0005") && md.contains("93.0 %"));
+    }
+}
+
+#[test]
+fn stop_and_continue_inside_the_comparison_makes_the_call_again_and_nothing_else() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut plain = Mock::new();
+    start(&p, &mut plain, tspec(14.0)).unwrap();
+    let n = plain.all.iter().position(|a| a == "compare").unwrap() + 1;
+    let d2 = tempdir().unwrap();
+    let q = project(d2.path());
+    let mut fx = Mock::new();
+    fx.stop_at = Some(n);
+    let first = start(&q, &mut fx, tspec(14.0)).unwrap();
+    assert_eq!(first.status, "stopped");
+    assert!(first.compare.is_none() && first.steps.iter().find(|s| s.id == "compare_quants").unwrap().status != "done");
+    assert!(!fx.done.iter().any(|d| d.starts_with("remove export")), "the reference is kept while the comparison is not done");
+    let last = resume(&q, &mut fx, &first.id).unwrap();
+    assert_eq!(last.status, "done", "{:?}", last.error);
+    assert_eq!(fx.done, plain.done);
+    assert_eq!(fx.all.len(), plain.all.len() + 1);
+}
+
+#[test]
+fn a_comparison_that_fails_does_not_lose_the_files_the_reference_stays_and_the_measured_file_is_not_published() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.compare_error = Some("llama-perplexity was not found.".into());
+    let st = start(&p, &mut fx, AutoSpec { studio_publish: true, ..tspec(14.0) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let c = st.compare.as_ref().unwrap();
+    assert_eq!(c["promoted"], false);
+    assert!(c["skipped"].as_str().unwrap().contains("llama-perplexity was not found") && c["skipped"].as_str().unwrap().contains("not published"));
+    assert!(!fx.done.iter().any(|d| d.starts_with("remove export")), "the 16-bit file is kept so that Compare quants can be run by hand");
+    assert!(fx.done.iter().any(|d| d.ends_with("cut to 21.1B 2")));
 }

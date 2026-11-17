@@ -97,6 +97,7 @@ pub fn build(st: &AutoState) -> Value {
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
         "think_gate": st.think_gate, "guardrails": guardrails(st),
+        "compare": st.compare, "target_gb": st.spec.target_gb,
     })
 }
 
@@ -222,6 +223,31 @@ pub fn markdown(r: &Value) -> String {
         s.push_str("\n## Files\n\n");
         for f in g {
             s.push_str(&format!("- {}: `{}`\n", f["quant"].as_str().unwrap_or(""), f["path"].as_str().unwrap_or("")));
+        }
+    }
+    if r["compare"].is_object() {
+        let c = &r["compare"];
+        s.push_str(&format!("\n## Measured file against the plain sizes{}\n\n", r["target_gb"].as_f64().map(|t| format!(" (about {t} GB asked for)")).unwrap_or_default()));
+        if let Some(why) = c["skipped"].as_str() {
+            s.push_str(&format!("Not compared: {why}\n"));
+        } else {
+            s.push_str("| File | GB | Mean KLD | Same top answer | Promoted |\n|---|---|---|---|---|\n");
+            for row in c["rows"].as_array().cloned().unwrap_or_default() {
+                let promoted = c["promotion"].as_array().and_then(|a| a.iter().find(|p| p["id"] == row["id"])).map(|p| if p["promoted"] == true { "yes" } else { "no" }).unwrap_or("");
+                let kld = match (row["mean_kld"].as_f64(), row["kld_unc"].as_f64()) {
+                    (Some(k), Some(u)) => format!("{k:.4} ± {u:.4}"),
+                    (Some(k), None) => format!("{k:.4}"),
+                    _ => "-".to_string(),
+                };
+                let gb = row["size"].as_f64().map(|b| format!("{:.2}", b / 1e9)).unwrap_or_else(|| "-".into());
+                let top = row["same_top"].as_f64().map(|t| format!("{t:.1} %")).unwrap_or_else(|| "-".into());
+                s.push_str(&format!("| {} | {gb} | {kld} | {top} | {promoted} |\n", row["label"].as_str().unwrap_or("")));
+            }
+            for line in c["promotion"].as_array().cloned().unwrap_or_default() {
+                s.push_str(&format!("\n- {}\n", line["reason"].as_str().unwrap_or("")));
+            }
+            s.push_str(if c["promoted"] == true { "\nThe measured file was published with the others.\n" } else { "\nThe measured file is kept in the exports but was not published: it is not better than the plain file of its size beyond the measurement noise.\n" });
+            s.push_str("\nThe predicted error of the fit is a measurement of the weights with a diagonal approximation of the importance matrix, on a sample of the rows, with every layer counted the same; only this comparison (KL divergence) says how the files really differ.\n");
         }
     }
     if r["studio"].is_object() {

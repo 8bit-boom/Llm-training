@@ -2626,7 +2626,7 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
+let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
 const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
@@ -2640,7 +2640,7 @@ function acDefaults() {
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
 function acSpec() {
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish, ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2696,6 +2696,8 @@ function autoCard() {
       <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
     ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
+    <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
+    ${ac.gbOn ? `<p class="dim small" id="ac-gbnote">Each tensor gets the type that spends the bytes best (measured on the healed model's weights, weighted by its importance matrix), then <strong>Compare quants</strong> (KL divergence) checks the file against the plain sizes next to it. It is published only when it is clearly better than the plain file of its size.${pl && pl.measured_minutes ? ` About ${Math.round(pl.measured_minutes[0])} min to measure and ${Math.round(pl.measured_minutes[1])} min to compare (guesses). The 16-bit file is kept until the comparison is done, so this needs more disk.` : ""}${!(+ac.gb > 0) ? ` <span class="warn" id="ac-gbwhy">Give the size in GB.</span>` : ""}</p>` : ""}
     ${studio}
     ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
@@ -2768,6 +2770,7 @@ function wireAuto() {
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
   set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
+  set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
   const share = () => ({ host_path: ($("ac-sh-host") || {}).value || "", container_path: ($("ac-sh-cont") || {}).value || "", register_scan_folder: !!($("ac-sh-reg") || {}).checked, finetune_handoff: !!($("ac-sh-hf") || {}).checked });
