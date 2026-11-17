@@ -1,8 +1,8 @@
 //! Export runs: `exports/<run>-<quant>/` holds model-<quant>.gguf, Modelfile, MODEL_CARD.md, meta.json (what it was made from and where it was
 //! installed) and export.json (the worker's summary).
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -291,29 +291,10 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
 /// Runs the export job. The Stop button first writes a STOP file (the worker kills llama-imatrix / the converter / llama-quantize and ends cleanly) and kills the
 /// worker only after IMATRIX_STOP_GRACE (`graceful: None` kills at once; the program always gives a grace time).
 pub(crate) fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
-    let Some(grace) = graceful else { return run_job(py, &worker_dir(), job, kill, on_event) };
-    let (inner, done, stop_file) = (AtomicBool::new(false), AtomicBool::new(false), out.join("STOP"));
-    let _ = std::fs::remove_file(&stop_file);
-    let result = std::thread::scope(|s| {
-        s.spawn(|| {
-            let mut asked: Option<Instant> = None;
-            while !done.load(Ordering::SeqCst) {
-                if kill.load(Ordering::SeqCst) && asked.is_none() {
-                    let _ = std::fs::write(&stop_file, b"");
-                    asked = Some(Instant::now());
-                }
-                if asked.is_some_and(|t| t.elapsed() > grace) {
-                    inner.store(true, Ordering::SeqCst);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
-        let r = run_job(py, &worker_dir(), job, &inner, on_event);
-        done.store(true, Ordering::SeqCst);
-        r
-    });
-    let _ = std::fs::remove_file(&stop_file);
-    result
+    match graceful {
+        None => run_job(py, &worker_dir(), job, kill, on_event),
+        Some(grace) => crate::envmgr::jobs::run_with_grace(py, job, &out.join("STOP"), kill, grace, on_event),
+    }
 }
 
 pub fn exports_dir(p: &Project) -> PathBuf {
@@ -737,6 +718,8 @@ Pictures are not part of the training: the model will not know your world's maps
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     fn fake_python(dir: &std::path::Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -744,31 +727,6 @@ mod tests {
         std::fs::write(&py, format!("#!/bin/sh\nout=$(sed -n 's/.*\"stop_file\":\"\\([^\"]*\\)\".*/\\1/p' \"$5\")\n{body}\n")).unwrap();
         std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
         py
-    }
-
-    #[test]
-    fn the_disk_an_export_needs_follows_the_sizes_asked_for() {
-        let q = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        // 10 billion weights, a LoRA run: merged model 20 GB + 16-bit file 20 GB
-        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m"]), false), 40.0), "converting needs the merged model and the 16-bit file: {}", export_need_gb(10.0, true, &q(&["q4_k_m"]), false));
-        // keeping the merged model: while shrinking it is still there next to the 16-bit file and the sizes
-        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m", "q8_0"]), true), 20.0 + 20.0 + 10.0 * 4.85 / 8.0 + 10.0 * 8.5 / 8.0));
-        // a full fine-tune has nothing to merge; the 16-bit file as an output is not counted twice
-        assert!(close(export_need_gb(10.0, false, &q(&["f16"]), false), 20.0));
-        assert!(close(export_need_gb(10.0, false, &q(&["q6_k", "q5_k_m"]), false), 20.0 + 10.0 * 6.6 / 8.0 + 10.0 * 5.7 / 8.0));
-        // a mixed size counts 5.5 bits per weight; "merged model only" is just the merged model, or nothing for a full model
-        assert!(close(export_need_gb(10.0, false, &q(&["mixed_4"]), false), 20.0 + 10.0 * 5.5 / 8.0));
-        assert!(close(export_need_gb(10.0, true, &[], true), 20.0) && close(export_need_gb(10.0, false, &[], true), 0.0));
-    }
-
-    #[test]
-    fn an_export_that_does_not_fit_is_refused_with_both_numbers() {
-        let dir = std::path::Path::new("exports");
-        let e = check_export_disk(40.0, Some(41.0), dir).unwrap_err().0;
-        assert!(e.contains("about 40.0 GB are needed") && e.contains("41.0 GB are free") && e.contains("not enough free space"), "{e}");
-        assert!(check_export_disk(40.0, Some(42.0), dir).is_ok(), "5 % to spare is enough");
-        assert!(check_export_disk(40.0, None, dir).is_ok() && check_export_disk(0.0, Some(0.0), dir).is_ok(), "an unknown disk never refuses");
     }
 
     /// Stop with the importance matrix: a STOP file first (a worker that obeys ends by itself), the kill only after the grace time (a worker that does not).
@@ -795,5 +753,35 @@ mod tests {
         let r = run_export_job(&py, &job, d.path(), Some(Duration::from_millis(400)), &kill, &mut |_| {});
         assert_eq!(r.unwrap_err().0, "Cancelled.");
         assert!(t0.elapsed() < Duration::from_secs(20) && !stop.exists());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    #[test]
+    fn the_disk_an_export_needs_follows_the_sizes_asked_for() {
+        let q = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 10 billion weights, a LoRA run: merged model 20 GB + 16-bit file 20 GB
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m"]), false), 40.0), "converting needs the merged model and the 16-bit file: {}", export_need_gb(10.0, true, &q(&["q4_k_m"]), false));
+        // keeping the merged model: while shrinking it is still there next to the 16-bit file and the sizes
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m", "q8_0"]), true), 20.0 + 20.0 + 10.0 * 4.85 / 8.0 + 10.0 * 8.5 / 8.0));
+        // a full fine-tune has nothing to merge; the 16-bit file as an output is not counted twice
+        assert!(close(export_need_gb(10.0, false, &q(&["f16"]), false), 20.0));
+        assert!(close(export_need_gb(10.0, false, &q(&["q6_k", "q5_k_m"]), false), 20.0 + 10.0 * 6.6 / 8.0 + 10.0 * 5.7 / 8.0));
+        // a mixed size counts 5.5 bits per weight; "merged model only" is just the merged model, or nothing for a full model
+        assert!(close(export_need_gb(10.0, false, &q(&["mixed_4"]), false), 20.0 + 10.0 * 5.5 / 8.0));
+        assert!(close(export_need_gb(10.0, true, &[], true), 20.0) && close(export_need_gb(10.0, false, &[], true), 0.0));
+    }
+
+    #[test]
+    fn an_export_that_does_not_fit_is_refused_with_both_numbers() {
+        let dir = std::path::Path::new("exports");
+        let e = check_export_disk(40.0, Some(41.0), dir).unwrap_err().0;
+        assert!(e.contains("about 40.0 GB are needed") && e.contains("41.0 GB are free") && e.contains("not enough free space"), "{e}");
+        assert!(check_export_disk(40.0, Some(42.0), dir).is_ok(), "5 % to spare is enough");
+        assert!(check_export_disk(40.0, None, dir).is_ok() && check_export_disk(0.0, Some(0.0), dir).is_ok(), "an unknown disk never refuses");
     }
 }

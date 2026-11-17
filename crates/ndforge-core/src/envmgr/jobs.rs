@@ -2,7 +2,7 @@
 //! Protocol: worker/ndforge_worker/protocol.py.
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -139,4 +139,35 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
             Err(Error::new(text))
         }
     }
+}
+
+/// Runs `job` like `run_job`, but a stop request (`stop` becomes true) is first passed on politely: the file `stop_file` is written, which a worker that looks for it answers
+/// by saving what it has and ending by itself. Only when it is still running `grace` later is it killed (its error is then "Cancelled."). The file is removed before the start
+/// (a left-over one would stop the next job at once) and afterwards.
+pub fn run_with_grace(py: &Path, job: &Value, stop_file: &Path, stop: &AtomicBool, grace: Duration, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
+    if let Some(dir) = stop_file.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(stop_file);
+    let (kill, done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut asked: Option<std::time::Instant> = None;
+            while !done.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) && asked.is_none() {
+                    let _ = std::fs::write(stop_file, b"");
+                    asked = Some(std::time::Instant::now());
+                }
+                if asked.is_some_and(|t| t.elapsed() > grace) {
+                    kill.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let r = run_job(py, &super::worker_dir(), job, &kill, on_event);
+        done.store(true, Ordering::SeqCst);
+        r
+    });
+    let _ = std::fs::remove_file(stop_file);
+    result
 }

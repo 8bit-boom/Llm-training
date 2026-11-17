@@ -93,3 +93,38 @@ fn a_silent_worker_gets_a_stall_warning_that_repeats_and_nothing_is_stopped() {
     assert_eq!(ndforge_core::envmgr::jobs::stall_minutes(&json!({"job": "train", "stall_minutes": 5})), 5.0);
     std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
+
+#[test]
+fn run_with_grace_asks_with_a_file_first_and_kills_only_after_the_grace_time() {
+    use ndforge_core::envmgr::jobs::run_with_grace;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(py) = python() else { return };
+    let cfg = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", cfg.path());
+    std::env::set_var("NDFORGE_WORKER_DIR", work.path());
+    let stop_file = work.path().join("run").join("STOP");
+    // a worker that looks for the file and ends by itself
+    stub_worker(work.path(), &format!("import os, time\nf = {:?}\nwhile not os.path.exists(f):\n    time.sleep(0.02)\nprint('{{\"type\":\"result\",\"data\":{{\"stopped\":true}}}}', flush=True)\n", stop_file.to_string_lossy()));
+    let stop = AtomicBool::new(false);
+    let t0 = Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            stop.store(true, Ordering::SeqCst);
+        });
+        run_with_grace(std::path::Path::new(py), &json!({"job": "x"}), &stop_file, &stop, Duration::from_secs(30), &mut |_| {})
+    });
+    assert_eq!(r.unwrap()["stopped"], true);
+    assert!(t0.elapsed() < Duration::from_secs(20) && !stop_file.exists(), "it ended by itself and the file is removed");
+    // a worker that ignores the file is killed once the grace time is over
+    stub_worker(work.path(), "import time\ntime.sleep(60)\n");
+    let stop = AtomicBool::new(true);
+    let t0 = Instant::now();
+    let e = run_with_grace(std::path::Path::new(py), &json!({"job": "x"}), &stop_file, &stop, Duration::from_millis(400), &mut |_| {}).unwrap_err();
+    assert!(e.is_cancelled() && t0.elapsed() < Duration::from_secs(20), "{e}");
+    std::env::remove_var("NDFORGE_WORKER_DIR");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
