@@ -9,3 +9,4 @@ accelerate
 pytest
 pytest-xdist
 ruff
+gguf
