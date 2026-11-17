@@ -1749,6 +1749,9 @@ fn the_teachers_answers_are_made_again_when_the_amount_of_text_the_file_or_the_t
     go(10, "auto").unwrap();
     assert_eq!(caches(), 1);
     assert!(jobs_seen(d.path())[0]["rows_key"].as_str().is_some_and(|k| k.len() == 32), "the job carries the key");
+    let first = &jobs_seen(d.path())[0];
+    assert_eq!(first["shared_cache"], true, "the teacher's answers are kept in the shared folder");
+    assert!(first["shared_dir"].as_str().is_some_and(|s| std::path::Path::new(s).ends_with("_teacher_cache")), "{first}");
     go(10, "auto").unwrap();
     assert_eq!(caches(), 1, "nothing changed: the answers are kept");
     go(20, "auto").unwrap();
@@ -1770,6 +1773,69 @@ fn the_teachers_answers_are_made_again_when_the_amount_of_text_the_file_or_the_t
     std::fs::write(&idx, j.to_string()).unwrap();
     go(20, "4bit").unwrap();
     assert_eq!(caches(), 4);
+}
+
+/// A model folder whose own `distill/cache/` points at a shared folder, as the worker leaves it.
+fn model_using_store(p: &Project, name: &str, store: &str) -> std::path::PathBuf {
+    let view = rruns::models_dir(p).join(name).join("distill").join("cache");
+    std::fs::create_dir_all(&view).unwrap();
+    std::fs::write(view.join("index.json"), json!({"store": format!("../../../_teacher_cache/{store}"), "parts": [{"file": "part-00001.npz"}], "complete": true}).to_string()).unwrap();
+    std::fs::write(rruns::models_dir(p).join(name).join("state.json"), json!({"name": name, "status": "done"}).to_string()).unwrap();
+    view
+}
+
+fn shared_folder(p: &Project, id: &str) -> std::path::PathBuf {
+    let d = rruns::teacher_cache_dir(p).join(id);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("part-00001.npz"), vec![0u8; 2000]).unwrap();
+    d
+}
+
+#[test]
+fn the_shared_teacher_answers_go_only_when_nothing_that_still_needs_them_is_left() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project(d.path());
+    let (s1, s2) = (shared_folder(&p, "s1"), shared_folder(&p, "s2"));
+    for m in ["a", "b", "c"] {
+        model_using_store(&p, m, "s1");
+    }
+    // nobody uses s2: a sweep takes it, s1 stays
+    assert_eq!(rruns::sweep_teacher_caches(&p), 1);
+    assert!(s1.is_dir() && !s2.exists());
+    // the end of an Auto-cut run that made a and b: c (a heal of the person's own) still uses s1, so it stays, and so do the views
+    assert_eq!(rruns::drop_teacher_caches_of(&p, &["a".to_string(), "b".to_string()]), 0);
+    assert!(s1.is_dir() && rruns::models_dir(&p).join("a/distill/cache/index.json").is_file());
+    // the person deletes c and b: a sweep after each; s1 goes with the last user
+    rruns::remove(&p, "c").unwrap();
+    assert!(s1.is_dir(), "a and b still use it");
+    rruns::remove_keeping_teacher_cache(&p, "b").unwrap();
+    assert!(s1.is_dir(), "Auto-cut's own removal never sweeps");
+    rruns::remove(&p, "a").unwrap();
+    assert!(!s1.exists(), "the last user is gone");
+    // a run's end with only its own models using a folder: the folder and the links go
+    let s3 = shared_folder(&p, "s3");
+    model_using_store(&p, "x", "s3");
+    model_using_store(&p, "y", "s3");
+    assert_eq!(rruns::drop_teacher_caches_of(&p, &["x".to_string(), "y".to_string(), "z".to_string()]), 1);
+    assert!(!s3.exists() && !rruns::models_dir(&p).join("x/distill/cache").exists() && rruns::models_dir(&p).join("y").is_dir(), "the models stay, only their link to the answers goes");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
+
+#[test]
+fn a_models_cache_size_counts_the_parts_it_uses_in_the_shared_folder() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project(d.path());
+    shared_folder(&p, "s1");
+    model_using_store(&p, "a", "s1");
+    let list = rruns::list(&p);
+    let a = list.iter().find(|m| m["name"] == "a").expect("listed");
+    assert!(a["cache_gb"].as_f64().is_some());
+    assert!(rruns::list(&p).iter().all(|m| m["name"] != "_teacher_cache"), "the shared folder is no model");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
 
 #[cfg(unix)]

@@ -134,3 +134,15 @@ a LoRA on the light-prepared model gets non-zero gradients from the KL loss; `lo
 ## The key of the teacher's rows (`rows_key`)
 
 `cache_complete` also compares `rows_key`: a fingerprint of the training file (path, size, modification time), the amount of text (tokens), the teacher and how it is loaded. The worker stores it, with `teacher_load`, in the cache's `index.json`; it is not part of `distilljob.cache_matches` (the rows' own hash is). Changing the amount of text, the file or the teacher load therefore makes the teacher answer again instead of reusing answers for other rows. A cache made before the key existed has none and is judged as before.
+
+## The shared teacher cache
+
+The heavy part files of the teacher's answers live in `<project>/models/_teacher_cache/<id>/` (job keys `shared_cache: true`, `shared_dir`). The worker chooses the folder: `<id>` is a hash of the
+teacher (folder and config), the tokenizer, `k`, the length, how the teacher is loaded, the general text **without its share** (the share is the budget), the seed, the model family and the training
+file. Next to the parts the folder keeps `rowhashes.npy` (the sha1 of every answered row's token ids). A run whose rows start with the rows already answered (or are the start of them) uses that
+folder and only asks the teacher for the rows that are missing; when the first rows differ it gets `<id>-2` ... and the first folder is never touched, because another model may still read it.
+
+The model's own `distill/cache/` keeps `index.json` (the parts its rows need, `store` = the shared folder, relative to it), `rows.npz` and nothing heavy, so the student and the program's skip
+decision work as before. A cache an older version made in the model's own folder is still read; a partly made one is continued as before. The shared folder goes when no model points at it any more
+(a model was deleted) and, for Auto-cut, at the end of the run (docs/AUTO_CUT.md). The disk check before a heal still counts the whole cache (it does not know what is already there).
+

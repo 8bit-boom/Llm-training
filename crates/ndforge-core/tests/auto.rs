@@ -53,6 +53,8 @@ struct Mock {
     heals: u32,
     made: BTreeSet<String>,
     removed: Vec<Made>,
+    /// the models named when the shared teacher answers were let go (one entry per call)
+    dropped: Vec<Vec<String>>,
     specs: Vec<Value>,
     free_gb: Option<f64>,
     vram: Option<f64>,
@@ -71,7 +73,7 @@ struct Mock {
 impl Mock {
     fn new() -> Self {
         Mock {
-            ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), specs: Vec::new(),
+            ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
             free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true,
         }
     }
@@ -205,6 +207,11 @@ impl Effects for Mock {
         self.done.push(format!("remove {} {}", what.kind, what.name));
         Ok(())
     }
+    fn drop_teacher_cache(&mut self, models: &[String]) -> Result<()> {
+        assert!(models.iter().all(|m| self.made.contains(m)), "only models of this run: {models:?}");
+        self.dropped.push(models.to_vec());
+        Ok(())
+    }
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {
         if self.stop_here(format!("export {}", healed.name)) {
             return Ok(Out::Stopped);
@@ -318,6 +325,11 @@ fn what_is_removed_is_only_what_the_run_made_and_only_after_the_next_step_worked
     assert_eq!(st2.status, "done");
     assert!(keep.removed.is_empty() && !keep.done.iter().any(|d| d.starts_with("remove")));
     assert!(st2.made.iter().all(|m| !m.removed));
+    // the teacher's shared answers go once, when the last stage has passed, and only without keep_intermediate
+    assert_eq!(fx.dropped.len(), 1, "{:?}", fx.dropped);
+    assert!(fx.dropped[0].contains(&"cut-1".to_string()) && fx.dropped[0].contains(&"cut-2".to_string()));
+    assert!(fx.done.iter().position(|d| d == "remove cut cut-2").is_some());
+    assert!(keep.dropped.is_empty(), "keeping the intermediate files keeps the answers too");
 }
 
 #[test]

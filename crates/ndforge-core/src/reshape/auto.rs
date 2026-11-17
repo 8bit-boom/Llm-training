@@ -107,6 +107,10 @@ pub trait Effects {
     fn heal(&mut self, student: &Student, teacher_repo: &str, spec: &HealSpec) -> Result<Out<HealRef>>;
     /// Deletes what Auto-cut made (only ever something in the state's list of `Made`).
     fn remove(&mut self, what: &Made) -> Result<()>;
+    /// The last stage has passed: the teacher's shared answers that only the models named here use are not needed any more. Nothing to do for an effects object that has none.
+    fn drop_teacher_cache(&mut self, _models: &[String]) -> Result<()> {
+        Ok(())
+    }
     /// The GGUF files of the healed model: `{"dir", "ggufs": [{"quant", "path"}]}`.
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>>;
     /// Puts the GGUF files into Unsloth Studio's share (docs/UNSLOTH_API_CONTRACT.md); `{"published": false, "why": ...}` when Studio is not set up.
@@ -849,6 +853,11 @@ fn cleanup_after(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result
         let m = st.made[i].clone();
         fx.remove(&m)?;
         st.made[i].removed = true;
+    }
+    // the teacher is not needed again once the last stage has passed
+    if idx + 1 >= st.stages.len() {
+        let names: Vec<String> = st.made.iter().map(|m| m.name.clone()).collect();
+        fx.drop_teacher_cache(&names)?;
     }
     Ok(())
 }

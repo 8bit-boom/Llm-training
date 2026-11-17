@@ -172,9 +172,14 @@ impl Effects for RealEffects<'_> {
     fn remove(&mut self, what: &Made) -> Result<()> {
         match what.kind.as_str() {
             "cut" => runs::remove_cut(self.p, &what.name),
-            "healed" => runs::remove(self.p, &what.name),
+            "healed" => runs::remove_keeping_teacher_cache(self.p, &what.name),
             other => Err(Error::new(format!("Auto-cut did not make a {other}."))),
         }
+    }
+
+    fn drop_teacher_cache(&mut self, models: &[String]) -> Result<()> {
+        runs::drop_teacher_caches_of(self.p, models);
+        Ok(())
     }
 
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {

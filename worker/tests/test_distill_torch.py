@@ -386,3 +386,34 @@ def test_the_settings_follow_the_students_size_unless_the_job_names_them(tmp_pat
     assert dj._decide_checkpointing({"student_b": 21.0, "max_seq": 1024, "batch": 2}, base, 100.0) is True
     assert dj._decide_checkpointing({"student_b": 0.1, "max_seq": 128, "batch": 2}, base, 100.0) is False
     assert dj._decide_checkpointing({"student_b": 0.1, "max_seq": 128, "batch": 2, "checkpointing": "on"}, base, 100.0) is True
+
+
+def test_a_bigger_shared_cache_run_only_asks_the_teacher_for_the_new_rows(tmp_path, base, monkeypatch):
+    shared = tmp_path / "shared"
+    cfg_a = cache_cfg(tmp_path, base, shared_cache=True, shared_dir=str(shared), out=str(tmp_path / "a" / "cache"))
+    cfg_a["data"] = {**cfg_a["data"], "tokens": 600}
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg_a)
+    ra = ev[-1]["data"]
+    assert code == 0 and ra["reused"] is False and ra["stats"]["general_rows"] > 0
+    cfg_b = cache_cfg(tmp_path, base, shared_cache=True, shared_dir=str(shared), out=str(tmp_path / "b" / "cache"))
+    cfg_b["data"] = {**cfg_b["data"], "tokens": 4000}
+    calls = []
+    real = dj._teacher_answers
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: calls.append(len(part)) or real(model, part, *a))
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg_b)
+    rb = ev[-1]["data"]
+    assert code == 0 and rb["rows"] > ra["rows"] and sum(calls) == rb["rows"] - ra["rows"], (calls, ra["rows"], rb["rows"])
+    assert len([d for d in shared.iterdir() if d.is_dir()]) == 1, "one shared folder for both"
+    # the student's own checks pass on both views
+    for name, r in (("a", ra), ("b", rb)):
+        folder = tmp_path / name / "cache"
+        reader = dj.CacheReader(folder)
+        rows = dj.load_rows(folder)
+        assert reader.index["rows"] == len(rows) == r["rows"] and dj.data_hash(rows) == reader.index["data_hash"] and reader.done_rows >= len(rows)
+        ids, lp, rs = reader.get(len(rows) - 1)
+        assert ids.shape[0] == len(rows[-1]["input_ids"])
+    # a third run for the small size is complete at once
+    monkeypatch.setattr(dj, "_teacher_answers", lambda *a: (_ for _ in ()).throw(AssertionError("must not run")))
+    cfg_c = {**cfg_a, "out": str(tmp_path / "c" / "cache")}
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg_c)
+    assert code == 0 and ev[-1]["data"]["reused"] is True
