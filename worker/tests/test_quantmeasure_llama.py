@@ -1,5 +1,5 @@
 """The llama engine of the measured fit (quantmeasure.measure_llama / measure_any) against a stand-in llama-quantize that really quantizes with the numpy encoders
-(tests/tools/llama_quantize_standin.py). This proves the plumbing, the read-back, the self-check, the stop and the fallbacks. It proves nothing about llama.cpp itself."""
+(tests/standins/llama_quantize_standin.py). This proves the plumbing, the read-back, the self-check, the stop and the fallbacks. It proves nothing about llama.cpp itself."""
 import json
 import os
 
@@ -12,7 +12,7 @@ from test_quantmeasure import make_matrix
 
 from ndforge_worker import ggufrows, imatrix, llamacpp, quantmeasure as qm
 
-STANDIN = Path(__file__).parent / "tools" / "llama_quantize_standin.py"
+STANDIN = Path(__file__).parent / "standins" / "llama_quantize_standin.py"
 RUNGS = ("Q3_K", "Q4_K", "Q6_K")
 
 

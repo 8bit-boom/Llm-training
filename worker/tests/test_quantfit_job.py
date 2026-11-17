@@ -11,7 +11,7 @@ from test_quantmeasure import make_matrix
 from ndforge_worker import __main__ as entry
 from ndforge_worker import ggufinfo, ggufrows, imatrix, llamacpp, mixedquant, protocol, quantblocks, quantfit, quantmeasure as qm
 
-STANDIN = Path(__file__).parent / "tools" / "llama_quantize_standin.py"
+STANDIN = Path(__file__).parent / "standins" / "llama_quantize_standin.py"
 KV = [("general.architecture", "str", "qwen35"), ("general.alignment", "u32", 32), ("qwen35.block_count", "u32", 4)]
 
 
