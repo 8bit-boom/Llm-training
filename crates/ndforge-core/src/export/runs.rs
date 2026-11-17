@@ -101,6 +101,46 @@ pub const IMATRIX_GENERAL_SHARE: f64 = 0.2;
 /// After Stop the worker has this long to end the matrix step by itself (it kills llama-imatrix at once); then the worker is killed.
 pub(crate) const IMATRIX_STOP_GRACE: Duration = Duration::from_secs(20);
 
+/// Bits per weight of the plain GGUF sizes (llama.cpp's own table, rounded up a little); a mixed size is taken as 5.5.
+fn bits_per_weight(quant: &str) -> f64 {
+    match quant {
+        "q4_k_m" => 4.85,
+        "q5_k_m" => 5.7,
+        "q6_k" => 6.6,
+        "q8_0" => 8.5,
+        "f16" => 16.0,
+        _ => 5.5,
+    }
+}
+
+/// The most disk space an export needs at one moment, in GB: the merged 16-bit model (2 bytes per weight, only when there is an adapter to merge), the 16-bit GGUF
+/// (2 bytes per weight) and the sizes made from it. Converting needs merged + 16-bit; shrinking needs the 16-bit file + every size (+ the merged model while it is kept).
+/// No sizes (a "merged model only" export) needs just the merged model. `params_b` in billions.
+pub fn export_need_gb(params_b: f64, has_adapter: bool, quants: &[String], keep_merged: bool) -> f64 {
+    let merged = if has_adapter { 2.0 * params_b } else { 0.0 };
+    if quants.is_empty() {
+        return merged;
+    }
+    let f16 = 2.0 * params_b;
+    let sizes: f64 = quants.iter().filter(|q| q.as_str() != "f16").map(|q| params_b * bits_per_weight(q) / 8.0).sum();
+    (merged + f16).max(if keep_merged { merged } else { 0.0 } + f16 + sizes)
+}
+
+/// Refuses an export that would run the disk full, in plain words with both numbers. `free_gb` None (not known) never refuses.
+pub fn check_export_disk(need_gb: f64, free_gb: Option<f64>, dir: &std::path::Path) -> Result<()> {
+    match free_gb {
+        Some(free) if need_gb > 0.0 && free < need_gb * 1.05 => Err(Error::new(format!(
+            "There is not enough free space for this export: about {need_gb:.1} GB are needed in {} and {free:.1} GB are free. Free some space, or choose fewer or smaller file sizes.", dir.display()))),
+        _ => Ok(()),
+    }
+}
+
+/// Billions of weights of a model folder, from the size of its 16-bit safetensors files (a rough figure for the disk check).
+fn folder_params_b(dir: &std::path::Path) -> f64 {
+    let bytes: u64 = std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+    bytes as f64 / 2e9
+}
+
 /// Does the importance matrix do anything for this size? Not for Q8_0 and the 16-bit files.
 pub fn imatrix_helps(quant: &str) -> bool {
     !matches!(quant, "q8_0" | "f16" | "bf16")
@@ -390,6 +430,12 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     let origin = read_json(&std::path::Path::new(&repo).join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
                      "max_seq": cfg["hyper"]["max_seq"], "thinking_default": thinking_default(std::path::Path::new(&repo))});
+    // the disk is checked before anything is made (the worker looks again before it starts: `need_gb`)
+    if let Some(m) = crate::train::catalog::find(cfg["model"]["id"].as_str().unwrap_or("")) {
+        let need = export_need_gb(m.params_b, !is_full, if want_gguf { &list } else { &[] }, keep_merged);
+        check_export_disk(need, crate::envmgr::health::free_disk_gb(&exports_dir(p)), &exports_dir(p))?;
+        job["need_gb"] = json!((need * 10.0).round() / 10.0);
+    }
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
@@ -543,6 +589,9 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     let origin = read_json(&model_dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": work, "quant": list[0], "quants": list, "backend": "auto", "gguf": true, "keep_merged": false,
                          "max_seq": 4096, "thinking_default": if thinking { "keep" } else { "off" }, "full_model": model_dir});
+    let need = export_need_gb(folder_params_b(model_dir), false, &list, false);
+    check_export_disk(need, crate::envmgr::health::free_disk_gb(&exports_dir(p)), &exports_dir(p))?;
+    job["need_gb"] = json!((need * 10.0).round() / 10.0);
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
@@ -695,6 +744,31 @@ mod tests {
         std::fs::write(&py, format!("#!/bin/sh\nout=$(sed -n 's/.*\"stop_file\":\"\\([^\"]*\\)\".*/\\1/p' \"$5\")\n{body}\n")).unwrap();
         std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
         py
+    }
+
+    #[test]
+    fn the_disk_an_export_needs_follows_the_sizes_asked_for() {
+        let q = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 10 billion weights, a LoRA run: merged model 20 GB + 16-bit file 20 GB
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m"]), false), 40.0), "converting needs the merged model and the 16-bit file: {}", export_need_gb(10.0, true, &q(&["q4_k_m"]), false));
+        // keeping the merged model: while shrinking it is still there next to the 16-bit file and the sizes
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m", "q8_0"]), true), 20.0 + 20.0 + 10.0 * 4.85 / 8.0 + 10.0 * 8.5 / 8.0));
+        // a full fine-tune has nothing to merge; the 16-bit file as an output is not counted twice
+        assert!(close(export_need_gb(10.0, false, &q(&["f16"]), false), 20.0));
+        assert!(close(export_need_gb(10.0, false, &q(&["q6_k", "q5_k_m"]), false), 20.0 + 10.0 * 6.6 / 8.0 + 10.0 * 5.7 / 8.0));
+        // a mixed size counts 5.5 bits per weight; "merged model only" is just the merged model, or nothing for a full model
+        assert!(close(export_need_gb(10.0, false, &q(&["mixed_4"]), false), 20.0 + 10.0 * 5.5 / 8.0));
+        assert!(close(export_need_gb(10.0, true, &[], true), 20.0) && close(export_need_gb(10.0, false, &[], true), 0.0));
+    }
+
+    #[test]
+    fn an_export_that_does_not_fit_is_refused_with_both_numbers() {
+        let dir = std::path::Path::new("exports");
+        let e = check_export_disk(40.0, Some(41.0), dir).unwrap_err().0;
+        assert!(e.contains("about 40.0 GB are needed") && e.contains("41.0 GB are free") && e.contains("not enough free space"), "{e}");
+        assert!(check_export_disk(40.0, Some(42.0), dir).is_ok(), "5 % to spare is enough");
+        assert!(check_export_disk(40.0, None, dir).is_ok() && check_export_disk(0.0, Some(0.0), dir).is_ok(), "an unknown disk never refuses");
     }
 
     /// Stop with the importance matrix: a STOP file first (a worker that obeys ends by itself), the kill only after the grace time (a worker that does not).

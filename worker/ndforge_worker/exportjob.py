@@ -28,6 +28,23 @@ class ExportLlamaMissing(RuntimeError, llamacpp.LlamaCppMissing):
     """The export needs llama.cpp and it is not there (error code llama_cpp_missing)."""
 
 
+class ExportDiskFull(RuntimeError):
+    """The disk cannot hold the export (error code disk_full)."""
+    code = "disk_full"
+
+
+def check_disk(cfg: dict, out: Path):
+    """The program works out how much the export needs (`need_gb`) and checks before it starts; this looks again just before the work, because the disk may have filled in between.
+    A job without `need_gb` (an older program) is not checked."""
+    need = cfg.get("need_gb")
+    if not isinstance(need, (int, float)) or need <= 0:
+        return
+    free = shutil.disk_usage(out).free
+    if free < need * 1e9 * 1.05:
+        raise ExportDiskFull(f"There is not enough free space for this export: about {need:.1f} GB are needed in {out} and {free / 1e9:.1f} GB are free. "
+                             "Free some space, or choose fewer or smaller file sizes.")
+
+
 def _vision_source(cfg: dict) -> str:
     """Whose picture abilities (and official vision file) the exported model keeps. Normally the base model itself; for a base that was made by
     "Slim or grow a model" (vision part copied unchanged) it is the original model it was made from (`base.vision_repo`), which has the official GGUF repo."""
@@ -386,6 +403,7 @@ def run(cfg: dict) -> int:
         if q not in QUANTS:
             raise ValueError(f"Unknown quantisation: {q}")
     quant = quants[0]
+    check_disk(cfg, out)
     backend = backends.prepare(cfg.get("backend", "auto"))
     full_model = cfg.get("full_model")
     merged = Path(full_model) if full_model else out / "merged"
