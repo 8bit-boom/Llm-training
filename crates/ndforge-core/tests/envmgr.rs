@@ -158,10 +158,14 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let mut events = Vec::new();
     run_setup(&plan, &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
     let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
-    // venv, PyTorch (with its sister libraries), the freeze that pins them, Unsloth, the worker
-    assert_eq!(lines.len(), 5, "{lines:?}");
+    // venv, PyTorch (with its sister libraries), the freeze that pins them, Unsloth, the fast kernels (on this path too), the worker
+    let kernels = ndforge_core::envmgr::setup::kernel_extras();
+    assert_eq!(lines.len(), 5 + kernels.len(), "{lines:?}");
     assert!(lines[0].starts_with("venv --python 3.13 --seed") && lines[1].contains("https://download.pytorch.org/whl/cu128") && lines[1].contains("torch torchvision torchaudio")
-            && lines[2].starts_with("pip freeze") && lines[3].contains("unsloth") && lines[4].contains("worker"));
+            && lines[2].starts_with("pip freeze") && lines[3].contains("unsloth") && lines.last().unwrap().contains("worker"));
+    for (i, k) in kernels.iter().enumerate() {
+        assert!(lines[4 + i].contains(k) && lines[4 + i].contains("--only-binary=:all:"), "{}", lines[4 + i]);
+    }
     assert_eq!(events.iter().filter(|e| matches!(e, Event::Step { total: 5, .. })).count(), 5);
     assert!(std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": true"));
     assert!(events.contains(&Event::Log("running pip".into())));
@@ -180,10 +184,10 @@ fn setup_runs_the_uv_steps_in_order_and_writes_the_marker() {
     let mut ev3 = Vec::new();
     run_setup(&plan3, &AtomicBool::new(false), &mut |e| ev3.push(e)).unwrap();
     let lines3: Vec<String> = std::fs::read_to_string(&log2).unwrap().lines().map(String::from).collect();
-    // venv, torch, freeze, Unsloth (fails), the standard libraries, their optional extras (flash-linear-attention; on Windows also triton-windows), the worker
-    let n_extras = if cfg!(windows) { 2 } else { 1 };
+    // venv, torch, freeze, Unsloth (fails), the standard libraries, the fast kernels, the worker
+    let n_extras = ndforge_core::envmgr::setup::kernel_extras().len();
     assert_eq!(lines3.len(), 6 + n_extras, "{lines3:?}");
-    assert!(lines3[4].contains("transformers>=5") && lines3[4].contains("peft") && lines3[4].contains("bitsandbytes") && lines3[4 + n_extras].contains("flash-linear-attention") && lines3.last().unwrap().contains("worker"));
+    assert!(lines3[4].contains("transformers>=5") && lines3[4].contains("peft") && lines3[4].contains("bitsandbytes") && lines3[5].contains("flash-linear-attention") && lines3.last().unwrap().contains("worker"));
     assert!(ev3.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth could not be installed"))));
     assert!(std::fs::read_to_string(plan3.env_dir.join("ndforge_env.json")).unwrap().contains("\"unsloth\": false"));
 }
@@ -292,9 +296,9 @@ fn setup_without_unsloth_installs_only_the_standard_libraries_and_never_fails_on
     assert!(lib.contains("transformers>=5") && lib.contains("trl") && lib.contains("peft") && lib.contains("accelerate") && lib.contains("--extra-index-url https://download.pytorch.org/whl/cu128"));
     assert!(text.lines().any(|l| l.contains("flash-linear-attention")) && text.lines().last().unwrap().contains("worker"));
     assert!(events.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Unsloth is skipped, as you chose"))));
-    assert!(events.iter().any(|e| matches!(e, Event::Log(l) if l.contains("Optional: flash-linear-attention could not be installed") && l.contains("Qwen3.5 will be much slower"))));
+    assert!(events.iter().any(|e| matches!(e, Event::Log(l) if l.contains("flash-linear-attention could not be installed") && l.contains("several times slower"))));
     let marker = std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap();
-    assert!(marker.contains("\"unsloth\": false") && marker.contains("\"engine\": \"standard\"") && marker.contains("\"extras\": []"), "{marker}");
+    assert!(marker.contains("\"unsloth\": false") && marker.contains("\"engine\": \"standard\"") && marker.contains("causal-conv1d") && !marker.contains("\"flash-linear-attention\""), "{marker}");
     assert_eq!(env_engine(&plan.env_dir).as_deref(), Some("standard"));
     // the libraries themselves cannot be installed: that is an error (an environment without them cannot train)
     std::fs::write(&uv, "#!/bin/sh\ncase \"$*\" in *bitsandbytes*) exit 5;; esac\nexit 0\n").unwrap();
@@ -373,4 +377,47 @@ fn the_fast_kernels_light_follows_the_environment_and_never_blocks_the_install()
     std::fs::create_dir_all(&win).unwrap();
     std::fs::create_dir(win.join("flash_linear_attention-0.4.1.dist-info")).unwrap();
     assert_eq!(env_fast_kernels(e.path()), Some(true));
+}
+
+#[test]
+fn a_kernel_package_is_installed_from_a_ready_made_wheel_only_and_a_failure_is_plain_words() {
+    use ndforge_core::envmgr::setup::{kernel_extra_args, kernel_extras};
+    let args = kernel_extra_args("flash-linear-attention", "/env/bin/python");
+    assert_eq!(args, vec!["pip", "install", "--python", "/env/bin/python", "--only-binary=:all:", "flash-linear-attention"]);
+    let names = kernel_extras();
+    assert!(names.contains(&"flash-linear-attention") && names.contains(&"causal-conv1d"));
+    assert_eq!(names.contains(&"triton-windows"), cfg!(windows));
+    assert_eq!(names.iter().position(|n| *n == "flash-linear-attention").unwrap() > names.iter().position(|n| *n == "triton-windows").unwrap_or(0) || !cfg!(windows), true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kernel_that_cannot_be_installed_is_a_note_and_the_rest_goes_on_and_the_button_updates_the_marker() {
+    use ndforge_core::envmgr::setup::{run_kernels_only, run_setup, Event, SetupPlan};
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("uv.log");
+    let uv = d.path().join("uv");
+    std::fs::write(&uv, format!("#!/bin/sh\necho \"$@\" >> {}\ncase \"$*\" in *causal-conv1d*) exit 1;; esac\nexit 0\n", log.display())).unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = SetupPlan { env_dir: d.path().join("env"), uv, worker_dir: d.path().join("worker"), wheel: "cu128".into(), python_version: "3.13".into(), unsloth: true };
+    let mut ev = Vec::new();
+    // no environment yet: the button says so
+    assert!(run_kernels_only(&plan, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("not installed yet"));
+    // the full setup (its fake Python is missing: the CUDA check cannot be asked and the install still writes the marker)
+    run_setup(&plan, &AtomicBool::new(false), &mut |e| ev.push(e)).unwrap();
+    assert!(ev.iter().any(|e| matches!(e, Event::Log(l) if l.starts_with("causal-conv1d has no ready-made package"))), "{ev:?}");
+    let marker = std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap();
+    assert!(marker.contains("flash-linear-attention") && !marker.contains("\"causal-conv1d\""), "{marker}");
+    // the button: only the kernels are tried again, the marker keeps its other keys
+    std::fs::create_dir_all(plan.env_dir.join("bin")).unwrap();
+    std::fs::write(plan.env_dir.join("bin").join("python"), "").unwrap();
+    std::fs::write(&log, "").unwrap();
+    let done = run_kernels_only(&plan, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(done, vec!["flash-linear-attention".to_string()]);
+    let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
+    assert_eq!(lines.len(), ndforge_core::envmgr::setup::kernel_extras().len());
+    assert!(lines.iter().all(|l| l.contains("--only-binary=:all:")));
+    let after = std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap();
+    assert!(after.contains("\"unsloth\": true") && after.contains("flash-linear-attention"), "{after}");
 }

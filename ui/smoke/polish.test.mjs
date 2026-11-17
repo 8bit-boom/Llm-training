@@ -96,3 +96,16 @@ test("every command the window calls is one the program has", () => {
   const unused = handler.filter((h) => !called.has(h));
   assert.ok(unused.length < 40, `commands nobody calls: ${unused.join(", ")}`);
 });
+
+test("the setup page offers the fast-kernels button only when that light is not green", () => {
+  const b = makeBrowser();
+  const page = (checks, installed = true) => {
+    b.run(`state = {project: {name: "P", folder: "/p"}, steps: [], bundle: {world: "W"}, settings: {theme: "light", expert_mode: false}, worlds: [], recent: []}; page = "setup"; env.status = ${JSON.stringify({ checks, can_install: true, env_installed: installed })}; lc.status = null;`);
+    return b.run("renderSetup()");
+  };
+  const k = (light) => ({ id: "kernels", label: "Fast kernels for Qwen3.5 linear attention", light, detail: "d", fix: "f" });
+  assert.match(page([k("warn")]), /id="kernels"[^>]*>Install the fast kernels<\/button>/);
+  assert.doesNotMatch(page([k("ok")]), /id="kernels"/);
+  assert.doesNotMatch(page([]), /id="kernels"/, "no light, no button");
+  assert.doesNotMatch(page([k("warn")], false), /id="kernels"/, "nothing to add to before the install");
+});

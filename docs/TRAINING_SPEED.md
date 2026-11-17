@@ -17,6 +17,18 @@ Researched 2026-11-10 for an RTX 5090 (Blackwell, sm_120, 32 GB, Windows) and a 
 | Fused / chunked cross-entropy (Liger, cut cross-entropy) | Later, plain-libraries path only | ~250k-token vocabularies make the logits large; Unsloth already handles it. Liger support for Qwen3.5 / Gemma 4 not confirmed. |
 | Tesla T10 | Few options | No bf16, no FlashAttention (needs sm_80+): fp16 and PyTorch's memory-efficient attention. Gemma in fp16 stability: unverified. |
 
+## Fast kernels for Qwen3.5's linear-attention layers
+
+Measuring, trying, healing and the thinking check load the model with plain Transformers (not Unsloth), so they use these packages when they are installed; otherwise Transformers falls back to a pure-PyTorch version. Only training with Unsloth uses Unsloth's own kernels.
+
+| Package | What it speeds up | Installed by the setup | Notes |
+| --- | --- | --- | --- |
+| flash-linear-attention | the delta-rule scan (most of the time) | with and without Unsloth | a pure Python wheel; needs Triton |
+| triton-windows | Triton for the package above | Windows only | PyTorch does not ship Triton for Windows |
+| causal-conv1d | the short convolution (a small part of the time) | tried, binary wheels only (`--only-binary=:all:`) | it ships as source: a ready-made package is rarely found, and a failure is only a log line |
+
+Each package is tried on its own with the same pins as the rest of the install, so PyTorch is never swapped; a failure never fails the install. The setup page has a light for flash-linear-attention and a button "Install the fast kernels" that runs only this step. What really runs is read from the loaded model (`speed.gdn_kernels`): the job logs `kernels: {...}` and the result carries a `kernels` key; `hello` reports the versions in `accelerators`. Unverified on Windows: whether the wheels install there and the real speed-up; whether the kernel choice of Transformers matches what is read from the model.
+
 ## What is built (worker `speed.py`, `trainjob.py`, `callbacks.py`)
 - **Bucketing** (`bucket` = `auto` | `on` | `off` in the job's hyper settings; default `auto`): before each stage the padding of random batches is estimated; when it is 8 % or more, batches are made of examples of similar length (shuffled in pieces of 8 batches, sorted inside each piece, batch order shuffled, a new grouping every epoch). Measured on a tiny CPU run with a deliberately mixed-length set: padding 49.7 % -> 8.3 %, real tokens per second +47 %, training time -25 %. This shows the mechanism only.
 - **A side effect to watch**: with bucketing, a batch holds examples of one kind more often (length goes with kind: long world-book text, short answers), so the loss moves more from one step to the next; each optimizer step still averages several shuffled batches when gradient accumulation is above 1. In Expert mode, *Batches by length* switches it `off` (or `on`). Whether it changes what the model learns has not been measured: compare two runs on your data before you rely on it.

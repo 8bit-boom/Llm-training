@@ -31,14 +31,29 @@ const TOTAL: usize = 5;
 /// The libraries the plain Transformers + PEFT + TRL fallback needs (what Unsloth would otherwise bring along).
 const FALLBACK_LIBS: [&str; 6] = ["transformers>=5", "trl", "peft", "datasets", "accelerate", "bitsandbytes"];
 
-/// Optional extras of the standard path, each tried on its own: a failure never fails the install. (flash-linear-attention: Qwen3.5's fast kernels;
-/// triton-windows: the Triton they need, which PyTorch does not ship for Windows.)
-fn standard_extras() -> Vec<&'static str> {
-    let mut v = vec!["flash-linear-attention"];
+/// The fast kernels of Qwen3.5's linear-attention layers, each tried on its own on both paths (with and without Unsloth): a failure never fails the install.
+/// triton-windows: the Triton they need, which PyTorch does not ship for Windows; flash-linear-attention: the delta-rule kernels (the big speed-up);
+/// causal-conv1d: the short convolution (a small part of the time; it only comes as source, so a ready-made package is rarely found).
+pub fn kernel_extras() -> Vec<&'static str> {
+    let mut v = vec!["flash-linear-attention", "causal-conv1d"];
     if cfg!(windows) {
         v.insert(0, "triton-windows");
     }
     v
+}
+
+/// The `uv` arguments that install one kernel package: ready-made packages only (never a build from source), into this Python. The pins are added by the caller.
+pub fn kernel_extra_args(pkg: &str, py: &str) -> Vec<String> {
+    ["pip", "install", "--python", py, "--only-binary=:all:", pkg].iter().map(|s| s.to_string()).collect()
+}
+
+/// What the log says when a kernel package could not be installed.
+fn kernel_failure_note(pkg: &str) -> String {
+    match pkg {
+        "causal-conv1d" => "causal-conv1d has no ready-made package for this system; the short convolution uses the PyTorch version (a small part of the time).".into(),
+        "flash-linear-attention" => "flash-linear-attention could not be installed: Qwen3.5's linear-attention layers will be several times slower when measuring, healing and checking.".into(),
+        other => format!("{other} could not be installed; flash-linear-attention may not work without it."),
+    }
 }
 
 fn step(on_event: &mut dyn FnMut(Event), index: usize, text: &str) {
@@ -96,6 +111,7 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
         v
     };
 
+    // (the kernel packages are installed after step 3, see `install_kernels`)
     // Unsloth (fast, small memory) is preferred when asked for; if it cannot be installed (it is picky about versions and about Windows) or was not wanted,
     // the standard libraries are installed instead and training still works, only slower and with more memory.
     let t3 = if plan.unsloth { "Installing Unsloth and the training libraries" } else { "Installing the training libraries (without Unsloth)" };
@@ -118,15 +134,8 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
         if !st.success() {
             return Err(fail(t3, st.code()));
         }
-        for extra in standard_extras() {
-            let st = run_uv(plan, &with_pins(a(&["pip", "install", "--python", &py, extra])), cancel, on_event)?;
-            if st.success() {
-                extras.push(extra.to_string());
-            } else {
-                on_event(Event::Log(format!("Optional: {extra} could not be installed. Training works without it; {}.", if extra == "flash-linear-attention" { "Qwen3.5 will be much slower" } else { "some speed-ups are unavailable" })));
-            }
-        }
     }
+    extras.extend(install_kernels(plan, &py, &with_pins, cancel, on_event)?);
 
     let t4 = "Installing the ND Lore Forge worker";
     step(on_event, 4, t4);
@@ -161,6 +170,58 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
     std::fs::write(plan.env_dir.join("ndforge_env.json"), marker)?;
     let _ = std::fs::remove_file(plan.env_dir.join("selftest.json")); // a new environment has to pass the test again
     Ok(())
+}
+
+/// Tries each kernel package (see `kernel_extras`), with the same pins as everything else so that PyTorch is never swapped. Returns the ones that were installed;
+/// a failure is only logged in plain words. An error is returned only when the install was cancelled.
+fn install_kernels(plan: &SetupPlan, py: &str, with_pins: &dyn Fn(Vec<String>) -> Vec<String>, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<Vec<String>> {
+    let mut done = Vec::new();
+    for pkg in kernel_extras() {
+        let st = run_uv(plan, &with_pins(kernel_extra_args(pkg, py)), cancel, on_event)?;
+        if st.success() {
+            done.push(pkg.to_string());
+        } else {
+            on_event(Event::Log(kernel_failure_note(pkg)));
+        }
+    }
+    Ok(done)
+}
+
+/// The "Install the fast kernels" button: only the kernel packages, into the environment that exists. Updates `extras` in the marker. Returns what was installed.
+pub fn run_kernels_only(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<Vec<String>> {
+    let py = python_path(&plan.env_dir).to_string_lossy().to_string();
+    if !std::path::Path::new(&py).is_file() || !plan.env_dir.join("ndforge_env.json").is_file() {
+        return Err(Error::new("The training software is not installed yet. Press \"Install the training software\" first."));
+    }
+    let index = format!("https://download.pytorch.org/whl/{}", plan.wheel);
+    let constraints = plan.env_dir.join("constraints.txt");
+    let tested = plan.worker_dir.join("constraints.txt");
+    let with_pins = |mut v: Vec<String>| -> Vec<String> {
+        for c in [&constraints, &tested] {
+            if c.is_file() {
+                v.extend(["--constraint".to_string(), c.to_string_lossy().to_string()]);
+            }
+        }
+        v.extend(["--extra-index-url".to_string(), index.clone(), "--index-strategy".to_string(), "unsafe-best-match".to_string()]);
+        v
+    };
+    let done = install_kernels(plan, &py, &with_pins, cancel, on_event)?;
+    // the marker keeps what was installed (the other keys stay as they are)
+    let marker = plan.env_dir.join("ndforge_env.json");
+    if let Ok(mut v) = std::fs::read(&marker).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).map_err(|e| e.to_string())) {
+        let mut all: Vec<String> = v["extras"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        for d in &done {
+            if !all.contains(d) {
+                all.push(d.clone());
+            }
+        }
+        v["extras"] = serde_json::json!(all);
+        if let Ok(t) = serde_json::to_string_pretty(&v) {      // pretty: the checks that read the marker look for `"key": value` with the space
+            let _ = std::fs::write(&marker, t + "\n");
+        }
+    }
+    on_event(Event::Log(if done.is_empty() { "No fast kernel could be installed.".to_string() } else { format!("Installed: {}.", done.join(", ")) }));
+    Ok(done)
 }
 
 /// Writes `constraints.txt` with the exact versions of the torch libraries that are installed now; false when they could not be read.
