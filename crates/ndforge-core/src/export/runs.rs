@@ -299,6 +299,16 @@ pub fn list_exports(p: &Project) -> Vec<Value> {
     out
 }
 
+/// What the exported chat template does about thinking (the worker's job key `thinking_default`): "keep" when the base model was healed with the thinking recipe
+/// (`healed.recipe == "thinking"` in its `ndforge_reshape.json`: it was taught to think, so the template stays as the model ships it), else "off" (answers without
+/// thinking unless asked, what a model trained thinking-off expects).
+pub fn thinking_default(base: &std::path::Path) -> &'static str {
+    match read_json(&base.join("ndforge_reshape.json")) {
+        Some(m) if m["healed"]["recipe"].as_str() == Some("thinking") => "keep",
+        _ => "off",
+    }
+}
+
 /// Makes the GGUF of a run in the worker and writes the Modelfile and the model card next to it.
 pub fn execute(p: &Project, run: &str, quant: &str, num_ctx: u32, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
     execute_what(p, run, quant, num_ctx, "gguf", kill, on_event)
@@ -369,7 +379,7 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     // a base made by "Slim or grow a model" keeps the original's vision part: its vision file comes from the original model
     let origin = read_json(&std::path::Path::new(&repo).join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
-                     "max_seq": cfg["hyper"]["max_seq"]});
+                     "max_seq": cfg["hyper"]["max_seq"], "thinking_default": thinking_default(std::path::Path::new(&repo))});
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }

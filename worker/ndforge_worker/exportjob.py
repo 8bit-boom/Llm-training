@@ -43,9 +43,20 @@ def _run(cmd, label):
         raise RuntimeError(f"{label} failed (exit code {p.returncode}). See the log.")
 
 
-def patch_template_dir(folder: Path, family: str):
-    """Make the saved tokenizer's chat template answer WITHOUT thinking by default (what the model was trained on), for llama.cpp / Unsloth Studio."""
-    if family != "qwen3_5":
+THINKING_DEFAULTS = ("off", "keep")
+
+
+def thinking_default_of(cfg: dict) -> str:
+    """job key `thinking_default`: "off" (default; the exported template answers without thinking unless asked, what a model trained thinking-off expects) or "keep"
+    (the model's own template stays as it is: it thinks unless the client switches thinking off, which is what a model healed with reasoning data expects)."""
+    v = cfg.get("thinking_default", "off")
+    return v if v in THINKING_DEFAULTS else "off"
+
+
+def patch_template_dir(folder: Path, family: str, thinking_default: str = "off"):
+    """Make the saved tokenizer's chat template answer WITHOUT thinking by default (what the model was trained on), for llama.cpp / Unsloth Studio.
+    With thinking_default="keep" the template is left exactly as the model ships it."""
+    if family != "qwen3_5" or thinking_default == "keep":
         return
     f = folder / "chat_template.jinja"
     cfg = folder / "tokenizer_config.json"
@@ -95,7 +106,7 @@ def merge_hf(cfg, merged: Path):
     copied = vision.copy_processor_files(cfg["base"]["repo"], merged)
     if copied:
         protocol.log("Image processor files copied from the base model: " + ", ".join(copied))
-    patch_template_dir(merged, cfg["base"]["family"])
+    patch_template_dir(merged, cfg["base"]["family"], thinking_default_of(cfg))
 
 
 def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, report, im, mixed_report: dict):
@@ -412,11 +423,11 @@ def run(cfg: dict) -> int:
         if cfg.get("keep_merged") and not full_model:   # the GGUF path above leaves no merged model behind: save it too, from the loaded model
             protocol.progress("merge", 0.85, "Saving the merged 16-bit model")
             model.save_pretrained_merged(str(merged), tokenizer, save_method="merged_16bit")
-            patch_template_dir(merged, cfg["base"]["family"])
+            patch_template_dir(merged, cfg["base"]["family"], thinking_default_of(cfg))
     else:
         if full_model:
             protocol.progress("merge", 0.5, "Using the fully trained model")
-            patch_template_dir(merged, cfg["base"]["family"])
+            patch_template_dir(merged, cfg["base"]["family"], thinking_default_of(cfg))
         else:
             merge_hf(cfg, merged)
         if cfg.get("gguf", True):

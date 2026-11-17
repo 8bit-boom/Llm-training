@@ -597,3 +597,38 @@ exit 1"#);
     assert_eq!(r.unwrap_err().0, "Cancelled.");
     assert!(t0.elapsed().as_secs() < 15 && !p.folder.join("exports/run1-q4_k_m/STOP").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_export_keeps_thinking_only_for_a_base_healed_with_the_thinking_recipe() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"cp "$5" "$out/job.json"
+printf 'GGUF' > "$out/model-$quant.gguf"
+echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let sent = || serde_json::from_str::<Value>(&std::fs::read_to_string(p.folder.join("exports/run1-q4_k_m/job.json")).unwrap()).unwrap()["thinking_default"].clone();
+    // a base from the model list: no record of a healing, the template answers without thinking as before
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("off"));
+    // a base folder healed with the thinking recipe, and one healed without it
+    let base = d.path().join("healed");
+    std::fs::create_dir_all(&base).unwrap();
+    let point_at = |dir: &std::path::Path| {
+        let f = truns::runs_dir(&p).join("run1/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        cfg["model"]["repo"] = json!(dir.to_string_lossy());
+        std::fs::write(&f, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    };
+    point_at(&base);
+    std::fs::write(base.join("ndforge_reshape.json"), json!({"healed": {"recipe": "thinking"}}).to_string()).unwrap();
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("keep"));
+    std::fs::write(base.join("ndforge_reshape.json"), json!({"healed": {"lora_rank": 32}}).to_string()).unwrap();
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("off"));
+    assert_eq!(exports::thinking_default(&d.path().join("nowhere")), "off");
+}

@@ -74,6 +74,10 @@ WITHOUT thinking (or with an empty block) keeps the thinking-off rendering (`<th
 fields are ignored. Only families that think (`families.py`, `"thinks"`: Qwen3.5) are rendered this way; the importance matrix still renders thinking-off (its key does not carry the rendering,
 so saved matrices stay valid).
 
+**The exported template.** Until now every Qwen3.5 export had its chat template rewritten so the model answers WITHOUT thinking unless the client asks for it (`families.default_non_thinking`; right for a
+model trained thinking-off). The export job takes the key `thinking_default`: `"off"` (the default, nothing changes for old callers such as nd-world) or `"keep"` (the template stays as the
+model ships it). The app sends `"keep"` when the base model's `ndforge_reshape.json` says `healed.recipe == "thinking"` (the recipe is written by a later step; until then it is always `"off"`).
+
 **Local files**, read the same way: `.jsonl`/`.ndjson` (one JSON per line), `.json` (a list, an object holding a list, or JSON lines), `.txt`/`.md` (blocks separated by blank lines are the
 documents), `.csv`/`.tsv` (header row), `.parquet` (only when `pyarrow` is installed in the training software; otherwise a plain message). A file is read line by line where the format allows.
 

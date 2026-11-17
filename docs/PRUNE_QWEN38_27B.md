@@ -69,6 +69,8 @@ Every layer keeps its shape except the MLP, which loses neurons (multiples of 25
    **Heal card** does this: the original answers first and saves its answers to disk (about 4 GB for 20 million tokens), then the thinner model learns; the result is a new base model, *healed*.
 7. **Heal with more than your world.** One world teaches the world, not the general ability the cut took away. Keep the *general chat* share of the training data higher than usual (Step 2) when training a slimmed model, and
    if the model should keep thinking before it answers, keep **at least 75 % reasoning-style examples** (Unsloth's advice for Qwen3.8; in nd-world's export this is the *Reasoning share* option).
+   Reasoning rows of the general text are now written the way the model thinks (`<think>` + trace + `</think>` + answer, once; see GENERAL_TEXT.md "Thinking"), and a model healed
+   with the thinking recipe is **exported with the model's own chat template** (it thinks unless the client switches thinking off); any other model still answers without thinking by default.
 8. **Do not stack changes.** Slim first, test, heal, test again. Do not grow the same model, change the training data and change the settings at once: you will not know what helped.
 9. **Keep the original.** The program never changes it; do not delete it until the slim model has passed your own test.
 
