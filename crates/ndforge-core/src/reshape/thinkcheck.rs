@@ -144,6 +144,11 @@ pub fn think_dir(p: &Project, name: &str) -> PathBuf {
     models_dir(p).join(name).join("think_check")
 }
 
+/// Has the cut of the made model `name` had a thinking check of either size (saved by the worker)?
+pub fn cut_checked(p: &Project, name: &str) -> bool {
+    valid_name(name).is_ok() && [true, false].iter().any(|q| think_dir(p, name).join(file_name("cut", *q)).is_file())
+}
+
 fn file_name(target: &str, quick: bool) -> String {
     format!("{target}.{}.json", if quick { "quick" } else { "full" })
 }
@@ -245,6 +250,20 @@ fn saved(dir: &Path, target: &str, quick: bool) -> Option<Value> {
     (r.is_object() && r["suite_version"] == json!(SUITE_VERSION) && r["main"].is_object()).then_some(r)
 }
 
+/// The ways a made cut goes beyond what Auto-cut does by itself (see `auto_plan::guardrail_messages`), read from the cut's own record (`ndforge_reshape.json`): the MLP kept
+/// below `WIDTH_FIRST_KEEP` of the original's, more than `MAX_BLOCKS_FREE` blocks removed. Empty for a cut inside the rules or a record that cannot be read.
+pub fn cut_guardrails(dir: &Path) -> Vec<String> {
+    let Some(meta) = read_json(&dir.join("model").join("ndforge_reshape.json")) else { return Vec::new() };
+    if meta["mode"] != json!("prune") {
+        return Vec::new();
+    }
+    let blocks = (meta["dropped"].as_array().map(|d| d.len()).unwrap_or(0) as u32) / meta["period"].as_u64().unwrap_or(4).max(1) as u32;
+    let w = &meta["width"]["intermediate_size"];
+    let (full, after) = (w[0].as_u64().map(|x| x as u32), w[1].as_u64().map(|x| x as u32));
+    let floor = full.map(|f| (f as f64 * super::auto_plan::WIDTH_FIRST_KEEP).ceil() as u32);
+    super::auto_plan::guardrail_messages(blocks, after, full, floor)
+}
+
 /// What the result page shows: `{"suite_version", "modes": {"full": {"rows": {target: result}, "gates": {target: gates}}, "quick": {...}}, "targets": {"cut": bool, ...}, "ggufs": [...]}`.
 /// The gates are there for every row once the original of the same mode has been checked. A result of another suite version is not shown.
 pub fn results(p: &Project, name: &str) -> Result<Value> {
@@ -274,7 +293,7 @@ pub fn results(p: &Project, name: &str) -> Result<Value> {
             let path = Path::new(m["dir"].as_str()?).join(m["gguf_file"].as_str()?);
             Some(json!({"name": m["name"], "path": path}))
         }).collect();
-    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "ggufs": ggufs,
+    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "ggufs": ggufs, "guardrails": cut_guardrails(&dir),
               "targets": {"original": heal_source::read_origin(&dir).is_ok(), "cut": dir.join("model").join("config.json").is_file() || heal_source::student_folder(&dir).ok().flatten().is_some(),
                           "healed": dir.join("healed").join("config.json").is_file()}}))
 }

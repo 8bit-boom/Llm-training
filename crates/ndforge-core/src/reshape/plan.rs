@@ -472,6 +472,13 @@ pub fn warnings(spec: &ReshapeSpec, ins: &Inspect, vram_gb: Option<f64>) -> Vec<
             out.push("Thinning the attention layers is experimental: nobody has published how well it works for this kind of model.".to_string());
         }
     }
+    if spec.mode == Mode::Prune && ins.model_type == "qwen3_5" {
+        // a model that thinks: the error before healing does not say whether it can still think
+        let inter = spec.width.as_ref().map(|w| w.intermediate);
+        out.extend(super::auto_plan::beyond_guardrails(ins, blocks, inter).into_iter().map(|g| format!("{g} Reasoning suffers first when a cut goes this far.")));
+        let mins = super::auto_plan::think_check_minutes(ins, blocks, inter, true);
+        out.push(format!("Check its thinking before healing (Thinking check, \"Check the cut model\": about {mins:.0} minutes in Quick): a lower text-prediction error does not mean it can still think."));
+    }
     match spec.mode {
         Mode::Prune => {
             if blocks * 4 > ins.blocks {

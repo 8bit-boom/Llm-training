@@ -180,11 +180,11 @@ pub fn width_floor(ins: &Inspect) -> Option<u32> {
     widths(ins).into_iter().find(|w| *w as f64 >= want)
 }
 
-/// The ways a cut goes beyond what the program does by itself (the width-first rule keeps at least `WIDTH_FIRST_KEEP` of the MLP and removes at most `MAX_BLOCKS_FREE` blocks
-/// without asking), as plain sentences; empty when it stays inside. Used to warn about a cut made by hand and to explain a chosen one.
-pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) -> Vec<String> {
+/// The sentences for a cut that goes beyond what the program does by itself: the MLP kept below the floor (`full` is the original's width, `floor` the thinnest width
+/// the rule allows) and more than `MAX_BLOCKS_FREE` blocks removed. Empty when the cut stays inside.
+pub fn guardrail_messages(blocks: u32, intermediate: Option<u32>, full: Option<u32>, floor: Option<u32>) -> Vec<String> {
     let mut out = Vec::new();
-    if let (Some(i), Some(full), Some(floor)) = (intermediate, full_width(ins), width_floor(ins)) {
+    if let (Some(i), Some(full), Some(floor)) = (intermediate, full, floor) {
         if i < floor {
             out.push(format!("The MLP is thinned to {i} of {full} ({:.1} % kept); Auto-cut does not go below {floor} ({:.1} % kept).", i as f64 / full as f64 * 100.0, floor as f64 / full as f64 * 100.0));
         }
@@ -195,12 +195,23 @@ pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) 
     out
 }
 
+/// The ways a cut goes beyond what the program does by itself (the width-first rule keeps at least `WIDTH_FIRST_KEEP` of the MLP and removes at most `MAX_BLOCKS_FREE` blocks
+/// without asking), as plain sentences; empty when it stays inside. Used to warn about a cut made by hand and to explain a chosen one.
+pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) -> Vec<String> {
+    guardrail_messages(blocks, intermediate, full_width(ins), width_floor(ins))
+}
+
 /// About how many minutes the thinking check of one cut before healing takes: writing the cut (about 500 MB per second) plus the check (15 minutes for the full suite, 10 for the
 /// quick one, per 17 B of the model, at least once). An estimate: the real time depends on the computer.
-pub fn think_gate_minutes(ins: &Inspect, cand: &Candidate, quick: bool) -> f64 {
-    let write = size_of(ins, cand.blocks, cand.intermediate) as f64 * ins.bytes_per_param.max(1.0) / 500e6 / 60.0;
-    let check = (if quick { 10.0 } else { 15.0 }) * (cand.params as f64 / 1e9 / 17.0).max(1.0);
+pub fn think_check_minutes(ins: &Inspect, blocks: u32, intermediate: Option<u32>, quick: bool) -> f64 {
+    let params = size_of(ins, blocks, intermediate) as f64;
+    let write = params * ins.bytes_per_param.max(1.0) / 500e6 / 60.0;
+    let check = (if quick { 10.0 } else { 15.0 }) * (params / 1e9 / 17.0).max(1.0);
     ((write + check) * 10.0).round() / 10.0
+}
+
+pub fn think_gate_minutes(ins: &Inspect, cand: &Candidate, quick: bool) -> f64 {
+    think_check_minutes(ins, cand.blocks, cand.intermediate, quick)
 }
 
 /// The most blocks the model allows (never the first or last block, at most half).

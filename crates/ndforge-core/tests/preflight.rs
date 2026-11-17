@@ -9,7 +9,7 @@ static ENV: Mutex<()> = Mutex::new(());
 fn ready(kind: &str) -> Inputs {
     Inputs {
         kind: kind.into(), windows: false, non_ascii_path: false, env_installed: true, selftest_passed: true, card: None, llama: Need::No, llama_found: true, llama_what: "",
-        free_gb: Some(500.0), need_gb: None, has_data: None, verdict: None, blockers: vec![], other_instance: false, share_reachable: None, sleep: None, keep_awake: true,
+        free_gb: Some(500.0), need_gb: None, has_data: None, verdict: None, blockers: vec![], other_instance: false, share_reachable: None, sleep: None, keep_awake: true, think_cut_missing: None,
     }
 }
 
@@ -214,4 +214,38 @@ fn sleep_facts_exist_only_on_windows_and_the_action_is_left_out_of_json_when_the
     assert_eq!(sleep["action"], "keep_awake_on");
     let env = v.as_array().unwrap().iter().find(|c| c["id"] == "env").unwrap();
     assert!(env.get("action").is_none(), "{env}");
+}
+
+#[test]
+fn a_heal_of_a_model_that_thinks_warns_until_its_cut_has_had_a_thinking_check() {
+    use ndforge_core::reshape::thinkcheck::{cut_checked, think_dir};
+    let mut i = ready("heal");
+    i.think_cut_missing = Some(24.0);
+    let checks = evaluate(&i);
+    let c = checks.iter().find(|c| c.id == "think_cut").expect("the warning");
+    assert_eq!(c.light, Light::Warn, "never red");
+    assert!(c.detail.contains("has not had a thinking check yet (about 24 min)") && c.detail.contains("Lower loss does not mean it can still think."), "{c:?}");
+    assert!(can_start(&checks));
+    i.think_cut_missing = Some(0.0);
+    assert!(evaluate(&i).iter().find(|c| c.id == "think_cut").unwrap().detail.starts_with("The cut has not had a thinking check yet."), "no minutes when they are not known");
+    i.think_cut_missing = None;
+    assert!(evaluate(&i).iter().all(|c| c.id != "think_cut"));
+    // the real look: the saved check of the cut, either size
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_ENV_DIR", d.path().join("no-env"));
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = ndforge_core::project::Project::create(d.path(), "P").unwrap();
+    let spec = json!({"thinks": true, "name": "20261113-150000-q-slim-w10752", "think_minutes": 18.0});
+    assert!(check(Some(&p), "heal", &spec).iter().any(|c| c.id == "think_cut" && c.detail.contains("about 18 min")));
+    assert!(check(Some(&p), "heal", &json!({"thinks": false, "name": "x"})).iter().all(|c| c.id != "think_cut"), "a model that does not think is not asked");
+    assert!(check(Some(&p), "heal", &json!({"thinks": true})).iter().all(|c| c.id != "think_cut"), "without a name there is nothing to look for");
+    let tdir = think_dir(&p, "20261113-150000-q-slim-w10752");
+    std::fs::create_dir_all(&tdir).unwrap();
+    assert!(!cut_checked(&p, "20261113-150000-q-slim-w10752"));
+    std::fs::write(tdir.join("cut.full.json"), "{}").unwrap();
+    assert!(cut_checked(&p, "20261113-150000-q-slim-w10752"));
+    assert!(check(Some(&p), "heal", &spec).iter().all(|c| c.id != "think_cut"), "checked: no warning");
+    std::env::remove_var("NDFORGE_ENV_DIR");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
 }

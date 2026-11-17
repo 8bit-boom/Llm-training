@@ -2272,7 +2272,7 @@ function healCard(m, pair) {
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
-    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text })}
+    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
     <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
@@ -2467,7 +2467,7 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
+let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
   run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
 const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
@@ -2481,7 +2481,7 @@ function acDefaults() {
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
 function acSpec() {
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2532,6 +2532,7 @@ function autoCard() {
     <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
+    ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
     <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
       <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
@@ -2606,7 +2607,7 @@ function wireAuto() {
   const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
   set("ac-target", (e) => { ac.target = +e.value; });
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
-  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
+  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
@@ -2660,7 +2661,14 @@ function thinkCard(m) {
       <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
   const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
   const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
-  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>
+  // a cut that goes beyond what Auto-cut does by itself (the program names how): the thinking numbers of the cut when it was checked, else a pointer to the button
+  const guard = d && d.guardrails && d.guardrails.length ? (() => {
+    const cm = rows.cut ? rows.cut.main : null;
+    const nums = cm ? `Checked before healing: it finished its reasoning in ${Math.round((cm.closed_rate || 0) * 100)} % of the answers and looped in ${Math.round((cm.loop_rate || 0) * 100)} %${rows.original ? ` (the original: ${Math.round((rows.original.main.closed_rate || 0) * 100)} %)` : ""}.`
+      : `It has not been checked for thinking yet: press “Check the cut model” below.`;
+    return `<p class="warn" id="tk-guard">${d.guardrails.map(esc).join(" ")} ${esc(nums)}</p>`;
+  })() : "";
+  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>${guard}
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
     ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
@@ -2869,6 +2877,13 @@ function tryVerdict(a, r, what) {
 
 const TRY_HONEST = (a) => `<p class="dim small">This is the error <strong>before</strong> healing: healing usually wins back part of it. A cheap cut now is not a guarantee that it heals well, and an expensive one can still heal into a usable model; nobody has measured how the two relate for your model yet. The colours are rules of thumb (under +${Math.round(a.bands.edges[0] * 100)} %, +${Math.round(a.bands.edges[0] * 100)} to +${Math.round(a.bands.edges[1] * 100)} %, over +${Math.round(a.bands.edges[1] * 100)} % of the original's error), not promises. Removing two blocks costs more than the two single costs added up; the "My choice" pass is the honest number. Small differences between two options are noise: the two halves of your text are compared below the chart.</p>`;
 
+// For a model that thinks (Qwen3.5 / 3.8): the error before healing is not a thinking test. When the choice has a LOWER error than the original, both may have been measured differently.
+function tryThinkNote(ins, a, hit) {
+  if (!ins || ins.model_type !== "qwen3_5") return "";
+  const lower = hit && hit.loss != null && a && a.base && a.base.loss != null && hit.loss < a.base.loss;
+  return `<p class="warn small" id="tr-think-note">A lower text-prediction error does not mean the model can still think. Make the cut, then run “Check the cut model” in the Thinking check before healing.${lower ? " This choice's error is lower than the original's: check that both were measured the same way (a cut that predicts text better than the model it came from is a reason to doubt the measurement)." : ""}</p>`;
+}
+
 function tryCard() {
   const op = rs.options, ins = op && op.inspect, st = rs.state, tr = rs.tr;
   if (!ins || !ins.supported || rs.mode !== "prune" || !(op.options.length > 0 || tryWidthOnShape())) return "";
@@ -2896,7 +2911,7 @@ function tryCard() {
     const ch = tryChoice(), hit = tryLookup(a, ch);
     const label = (ch.blocks.length ? `blocks ${ranges(ch.blocks)}` : "") + (ch.blocks.length && ch.width != null ? " and " : "") + (ch.width != null ? `MLP ${thou(ch.width)}` : "");
     const verdict = hit ? tryVerdict(a, hit, "Your choice (" + label + ")") : (ch.blocks.length || ch.width != null) ? `<p class="dim">Your choice (${esc(label)}) has not been tried yet: choose “My choice” above and press Try.</p>` : "";
-    parts.push(`<h4>Verdict</h4>${verdict}<p>Original: error ${a.base.loss.toFixed(3)}, perplexity ${a.base.ppl}.</p>${TRY_HONEST(a)}
+    parts.push(`<h4>Verdict</h4>${verdict}<p>Original: error ${a.base.loss.toFixed(3)}, perplexity ${a.base.ppl}.</p>${TRY_HONEST(a)}${tryThinkNote(ins, a, hit)}
       <div class="row"><button class="primary" id="tr-use" ${hit && !run && !rs.running ? "" : "disabled"}>Use this choice</button><span class="dim small">${hit ? "fills the Make form below so the model is cut exactly as it was tried" : "try the choice first, then it can be used"}</span></div>`);
     body = parts.join("");
   }

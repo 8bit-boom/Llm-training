@@ -56,7 +56,7 @@ test("the spec follows the choices, the plan is asked with the model's descripti
   b.run(`ac.target = 18; ac.stages = 1; ac.quick = true; ac.keep = true; ac.many = true; ac.publish = true; acRefresh()`);
   await tick();
   const c = b.calls.find((x) => x[0] === "auto_plan");
-  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", target_b: 18, keep_thinking: true, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true });
+  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true });
   assert.equal(c[1].inspect.total_params, 27.78e9);
   assert.equal(b.run("ac.plan.ok"), true);
   const n = b.calls.filter((x) => x[0] === "auto_plan").length;
@@ -134,4 +134,20 @@ test("the Studio share fields appear with the publish box, are saved and checked
   b.run("wireAuto()"); b.els["ac-sh-save"].onclick(); await tick();
   assert.equal(b.calls.find((x) => x[0] === "studio_share_set")[1].share.host_path, "Y:\\studio");
   assert.match(card(b), /id="ac-sh-note">Saved\./);
+});
+
+test("the thinking gate has a checkbox that is on with keep thinking, shows its minutes and goes into the spec", async () => {
+  const b = browser({ auto_plan: { plan: { ...plan(), think_gate_minutes: 61.4 } }, auto_start: null });
+  open(b);
+  b.run("acRefresh()"); await tick();
+  const html = card(b);
+  assert.match(html, /id="ac-gate" checked/);
+  assert.match(html, /Check the thinking of the best 2 cuts before healing \(about 61 min more\)/);
+  assert.equal(b.run("acSpec().think_gate"), true);
+  b.run("ac.gate = false");
+  assert.equal(b.run("acSpec().think_gate"), false);
+  assert.doesNotMatch(card(b), /id="ac-gate" checked/);
+  b.run("ac.gate = true; ac.thinking = false");
+  assert.equal(b.run("acSpec().think_gate"), false, "without keep thinking there is no gate");
+  assert.doesNotMatch(card(b), /id="ac-gate"/);
 });

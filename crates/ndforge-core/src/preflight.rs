@@ -47,6 +47,8 @@ pub struct Inputs {
     pub sleep: Option<crate::power::SleepFacts>,
     /// the setting "Keep this computer awake" is on
     pub keep_awake: bool,
+    /// a heal of a model that thinks whose cut has had no thinking check yet: `Some(about minutes of the check, 0 when not known)`; None: checked, or not asked
+    pub think_cut_missing: Option<f64>,
 }
 
 fn c(id: &'static str, label: &'static str, light: Light, detail: impl Into<String>, fix: impl Into<String>) -> Check {
@@ -113,6 +115,11 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         } else {
             c("share", "Unsloth Studio folder", Light::Warn, "The Studio share folder cannot be reached; the files will stay in the exports folder.", "Check the folder in the Auto-cut card (\"Check the folder\"), or untick publishing.")
         });
+    }
+    if let Some(m) = i.think_cut_missing {
+        let when = if m > 0.0 { format!(" (about {m:.0} min)") } else { String::new() };
+        out.push(c("think_cut", "Thinking check of the cut", Light::Warn, format!("The cut has not had a thinking check yet{when}. Lower loss does not mean it can still think."),
+                   "Run \"Check the cut model\" in the Thinking check of this model before healing: a cut that has lost its thinking is better cut again than healed."));
     }
     if let Some(s) = i.sleep {
         out.push(sleep_check(&s, i.keep_awake));
@@ -234,6 +241,8 @@ pub fn gather(p: Option<&Project>, kind: &str, spec: &Value) -> Inputs {
         blockers: strs(&spec["blockers"]),
         other_instance: crate::instance::other_running(&crate::paths::config_dir()),
         sleep: crate::power::sleep_facts(),
+        think_cut_missing: (kind == "heal" && spec["thinks"].as_bool() == Some(true) && spec["name"].as_str().is_some_and(|n| p.is_some_and(|p| !crate::reshape::thinkcheck::cut_checked(p, n))))
+            .then(|| spec["think_minutes"].as_f64().unwrap_or(0.0)),
         keep_awake: crate::settings::Settings::load().keep_awake,
         share_reachable: publishing.then(|| crate::settings::Settings::load().studio_share.is_some_and(|s| !s.host_path.trim().is_empty() && std::path::Path::new(s.host_path.trim()).is_dir())),
     }

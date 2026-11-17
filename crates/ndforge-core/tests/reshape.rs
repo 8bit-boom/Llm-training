@@ -2585,3 +2585,23 @@ fn the_reasoning_text_reaches_the_worker_and_gets_its_own_measurement() {
     rruns::measure(&p, "qwen3.5-4b", 128, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
     assert!(jobs_seen(d.path())[1]["calibration"].get("reasoning").is_none());
 }
+
+#[test]
+fn the_manual_slim_page_warns_about_the_guardrails_and_the_thinking_of_a_model_that_thinks() {
+    let ins = qwen27();
+    // cut A of a real run, made by hand: three blocks and the MLP at 10,240 (58.8 % kept; Auto-cut stops at 10,752)
+    let w = warnings(&wspec(3, 10240), &ins, Some(32.0));
+    assert!(w.iter().any(|x| x.contains("10240 of 17408") && x.contains("58.8 %") && x.contains("10752")), "{w:?}");
+    assert!(w.iter().any(|x| x.contains("Check its thinking before healing") && x.contains("minutes in Quick") && x.contains("does not mean it can still think")), "{w:?}");
+    // inside the rules: no guardrail sentence, but the thinking is still mentioned
+    let ok = warnings(&wspec(1, 12288), &ins, Some(32.0));
+    assert!(!ok.iter().any(|x| x.contains("Auto-cut does not")), "{ok:?}");
+    assert!(ok.iter().any(|x| x.contains("Check its thinking before healing")));
+    // more than four blocks
+    assert!(warnings(&wspec(5, 17408), &ins, None).iter().any(|x| x.contains("5 whole blocks are removed")));
+    // a model that does not think (or a growing model) has none of it
+    let mut plain = qwen27();
+    plain.model_type = "llama".into();
+    assert!(!warnings(&wspec(3, 10240), &plain, None).iter().any(|x| x.contains("Check its thinking")));
+    assert!(!warnings(&spec(Mode::Grow, 2), &ins, None).iter().any(|x| x.contains("Check its thinking")));
+}

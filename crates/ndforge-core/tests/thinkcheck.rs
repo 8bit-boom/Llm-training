@@ -254,3 +254,23 @@ fn a_cut_is_chosen_by_how_it_thinks_and_by_loss_only_when_the_thinking_ties() {
     assert!(!lost_much(&main(0.97, 0.0, 0.0), &main(0.60, 0.1, 0.0)));
     assert!(!lost_much(&json!({}), &main(0.1, 0.0, 0.0)));
 }
+
+#[test]
+fn the_results_page_names_how_a_cut_goes_beyond_the_guardrails() {
+    use ndforge_core::reshape::thinkcheck::cut_guardrails;
+    let d = tempdir().unwrap();
+    let dir = d.path().join("m");
+    std::fs::create_dir_all(dir.join("model")).unwrap();
+    assert!(cut_guardrails(&dir).is_empty(), "no record, no guess");
+    let meta = |dropped: usize, after: u32| json!({"mode": "prune", "period": 4, "dropped": (0..dropped).collect::<Vec<_>>(), "width": {"intermediate_size": [17408, after]}});
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(12, 10240).to_string()).unwrap();      // cut A: three blocks, 58.8 % of the MLP
+    let g = cut_guardrails(&dir);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert!(g[0].contains("10240 of 17408") && g[0].contains("58.8 %"), "{g:?}");
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(20, 10240).to_string()).unwrap();
+    assert_eq!(cut_guardrails(&dir).len(), 2);
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(8, 12288).to_string()).unwrap();
+    assert!(cut_guardrails(&dir).is_empty(), "inside the rules");
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), json!({"mode": "grow", "period": 4, "dropped": []}).to_string()).unwrap();
+    assert!(cut_guardrails(&dir).is_empty());
+}
