@@ -52,17 +52,24 @@ def sliced_bytes(ref: TensorRef, axis: int, idx) -> bytes:
 def bf16_to_f32(u16):
     """bf16 bit patterns (uint16 array) -> float32 values"""
     n = np()
-    return (n.asarray(u16, dtype="<u2").astype(n.uint32) << 16).view(n.float32)
+    u = n.asarray(u16, dtype="<u2").astype(n.uint32)           # the only copy: shifted in place, then looked at as float32
+    u <<= 16
+    return u.view(n.float32)
 
 
 def f32_to_bf16(f32):
     """float32 array -> bf16 bit patterns (uint16), round to nearest even; NaN stays NaN"""
     n = np()
     f = n.ascontiguousarray(f32, dtype=n.float32)
-    u = f.view(n.uint32).astype(n.uint64)
-    rounded = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(n.uint16)
+    u = f.view(n.uint32)
+    r = (u >> 16) & 1                       # one uint32 temporary; the rounding is done on it in place (no uint64)
+    r += u
+    r += 0x7FFF
+    r >>= 16
+    rounded = r.astype(n.uint16)
+    del r
     nan = n.isnan(f)
-    if nan.any():
+    if nan.any():                           # the sum can only wrap (modulo 2**32) for NaN patterns, which are replaced here
         rounded = n.where(nan, ((u >> 16) | 0x40).astype(n.uint16), rounded)
     return rounded
 
@@ -157,6 +164,52 @@ def _from_f32(x, dtype: str) -> bytes:
     raise ReshapeError(f"Tensors of type {dtype} cannot be merged.")
 
 
+CHUNK_F32_BYTES = 64 * 2**20          # the merge works on this many bytes of float32 at a time
+
+
+class _RawWeight:
+    """A weight as it is stored (bf16 / f16 as raw uint16, f32 as float32); converted to float32 a block of rows at a time."""
+
+    def __init__(self, raw, dtype: str):
+        if dtype not in ("BF16", "F16", "F32", "F64"):
+            raise ReshapeError(f"Tensors of type {dtype} cannot be merged.")
+        self.raw, self.dtype, self.shape = raw, dtype, tuple(raw.shape)
+
+    def f32(self, lo: int, hi: int):
+        n = np()
+        part = self.raw[lo:hi]
+        if self.dtype == "BF16":
+            return bf16_to_f32(part)
+        if self.dtype == "F16":
+            return part.view(n.float16).astype(n.float32)
+        return part.astype(n.float32)
+
+
+def _merged_bytes(w: "_RawWeight", a, b, scaling: float, dtype: str):
+    """W + scaling * (B @ A) in the weight's own type, a block of rows at a time (about 64 MB of float32 per block, not six full-size copies): returns a 1-D uint8 memoryview."""
+    n = np()
+    if dtype not in ("BF16", "F16", "F32"):
+        raise ReshapeError(f"Tensors of type {dtype} cannot be merged.")
+    rows = w.shape[0]
+    cols = int(n.prod(w.shape[1:])) if len(w.shape) > 1 else 1
+    step = max(1, CHUNK_F32_BYTES // (4 * max(1, cols)))
+    out = n.empty(w.shape, dtype="<f4" if dtype == "F32" else "<u2")
+    for lo in range(0, rows, step):
+        hi = min(rows, lo + step)
+        blk = w.f32(lo, hi)
+        d = b[lo:hi] @ a
+        d *= scaling
+        blk += d
+        del d
+        if dtype == "BF16":
+            out[lo:hi] = f32_to_bf16(blk)
+        elif dtype == "F16":
+            out[lo:hi] = blk.astype("<f2").view("<u2")
+        else:
+            out[lo:hi] = blk
+    return memoryview(out.reshape(-1).view(n.uint8))
+
+
 def merge_lora(base: dict, adapter_dir, out_dir, on_progress=None, should_stop=None, shard_bytes: int = 5 * 2**30, clock: dict | None = None) -> dict:
     """Adds a plain LoRA into the base weights without loading the model: W' = W + (alpha / r) * B @ A for every adapted Linear weight (numpy, float32, one tensor
     at a time), rounded back to the tensor's own type (bf16: to nearest even). Everything else is copied as raw bytes. base: {name: TensorRef} of the base
@@ -186,13 +239,14 @@ def merge_lora(base: dict, adapter_dir, out_dir, on_progress=None, should_stop=N
             if should_stop and should_stop():
                 raise st.Cancelled()
             t0 = time.monotonic()
-            w = _to_f32(ref)
+            raw = read_array(ref)
             a, b = _to_f32(adapter[ab["lora_A"]]), _to_f32(adapter[ab["lora_B"]])
             t1 = time.monotonic()
+            w = _RawWeight(raw, ref.dtype)
             if a.shape[0] != r or b.shape[1] != r or b.shape[0] != w.shape[0] or a.shape[1] != w.shape[1]:
                 raise ReshapeError(MISMATCH)
             merged[0] += 1
-            out = _from_f32(w + scaling * (b @ a), ref.dtype)
+            out = _merged_bytes(w, a, b, scaling, ref.dtype)
             if clock is not None:
                 clock["read"] = clock.get("read", 0.0) + (t1 - t0)
                 clock["compute"] = clock.get("compute", 0.0) + (time.monotonic() - t1)

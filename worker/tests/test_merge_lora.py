@@ -202,3 +202,26 @@ def test_a_stop_file_cancels_the_merge_job(tmp_path):
     (Path(j["out"]).parent / "STOP").write_text("")
     code, ev = run_job(tmp_path, j)
     assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None} and not Path(j["final"]).exists()
+
+
+@pytest.mark.parametrize("dtype", ["BF16", "F16", "F32"])
+def test_the_chunked_merge_equals_the_unchunked_one_within_one_ulp(tmp_path, monkeypatch, dtype):
+    rng = np.random.default_rng(3)
+    rows, cols = 37, 29
+    base = rng.normal(size=(rows, cols)).astype("<f4")
+    a, b = rng.normal(size=(R, cols)).astype("<f4"), rng.normal(size=(rows, R)).astype("<f4")
+    raw = {"BF16": slice_io.f32_to_bf16(base), "F16": base.astype("<f2").view("<u2"), "F32": base}[dtype]
+    w = slice_io._RawWeight(raw, dtype)
+    one = bytes(slice_io._merged_bytes(w, a, b, 2.0, dtype))                          # one block
+    monkeypatch.setattr(slice_io, "CHUNK_F32_BYTES", 4 * cols * 5)                    # five rows per block
+    many = bytes(slice_io._merged_bytes(w, a, b, 2.0, dtype))
+    assert len(one) == len(many) == raw.nbytes
+    if dtype == "F32":
+        x, y = np.frombuffer(one, "<f4"), np.frombuffer(many, "<f4")
+        assert np.allclose(x, y, rtol=1e-6, atol=1e-6)
+    else:
+        x, y = np.frombuffer(one, "<u2").astype(np.int64), np.frombuffer(many, "<u2").astype(np.int64)
+        assert np.abs(x - y).max() <= 1
+    want = base.astype(np.float64) + 2.0 * (b.astype(np.float64) @ a.astype(np.float64))
+    got = {"BF16": lambda: slice_io.bf16_to_f32(np.frombuffer(many, "<u2")), "F16": lambda: np.frombuffer(many, "<f2").astype(np.float32), "F32": lambda: np.frombuffer(many, "<f4")}[dtype]()
+    assert np.allclose(got.reshape(rows, cols), want, rtol=2e-2, atol=2e-2)
