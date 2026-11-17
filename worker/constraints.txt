@@ -1,0 +1,11 @@
+# Upper bounds of what the setup installs, from the versions the CI's worker tests passed with (see .github/workflows/ci.yml, worker job).
+# They stop a new major release that has not been tried from being installed by the next "Install the training software"; raise them on purpose, together with
+# ENV_REQUIREMENTS_VERSION in crates/ndforge-core/src/envmgr/health.rs. Unsloth and PyTorch are not listed: Unsloth is left free (it needs newer libraries first), PyTorch is pinned by the setup itself.
+transformers<6
+peft<1
+trl<2
+accelerate<2
+datasets<6
+safetensors<1
+huggingface-hub<3
+numpy<3

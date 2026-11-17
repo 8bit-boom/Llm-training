@@ -35,7 +35,13 @@ pub struct Facts {
     pub selftest_passed: bool,
     /// the environment was made by a setup that did not yet check PyTorch for CUDA (its PyTorch may be the CPU-only build)
     pub env_cuda_unchecked: bool,
+    /// the requirements version the installed environment was made with (`ENV_REQUIREMENTS_VERSION` of its setup); None: an older setup that did not write one
+    pub env_requirements: Option<u32>,
 }
+
+/// The version of what the setup installs (the upper bounds in `worker/constraints.txt`, the order of the steps). Raise it when a program version needs another environment: the setup page then
+/// asks to install again. The environment's marker file keeps the version it was made with.
+pub const ENV_REQUIREMENTS_VERSION: u32 = 1;
 
 const DISK_FAIL_GB: f64 = 15.0;
 const DISK_WARN_GB: f64 = 40.0;
@@ -82,7 +88,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         check("uv", "Installer tool (uv)", Light::Fail, "The tool that installs the training software (uv) was not found.",
               "Install it from https://docs.astral.sh/uv/ (one command), then press \"Check again\".")
     });
-    out.push(if f.env_installed && f.env_cuda_unchecked {
+    out.push(if f.env_installed && f.env_requirements.is_none_or(|v| v < ENV_REQUIREMENTS_VERSION) && !f.env_cuda_unchecked {
+        check("env", "Training software", Light::Warn, "Installed, but made by an older version of this program.",
+              "Press \"Install the training software\" once more so that it matches this program (downloads are reused).")
+    } else if f.env_installed && f.env_cuda_unchecked {
         check("env", "Training software", Light::Warn, "Installed, but PyTorch was not checked for the graphics card when it was installed.",
               "Press \"Install the training software\" once more: it checks PyTorch and, if it is the CPU-only build, replaces it with the NVIDIA build (downloads are reused).")
     } else if f.env_installed {
@@ -132,6 +141,12 @@ pub fn env_engine(env: &Path) -> Option<String> {
     Some(if t.contains("\"unsloth\": true") { "unsloth" } else { "standard" }.to_string())
 }
 
+/// The requirements version written in the marker file.
+pub fn env_requirements(env: &Path) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(env.join("ndforge_env.json")).ok()?).ok()?;
+    v["requirements"].as_u64().map(|n| n as u32)
+}
+
 pub fn selftest_passed(env: &Path) -> bool {
     env.join("selftest.json").is_file()
 }
@@ -145,5 +160,6 @@ pub fn gather() -> Facts {
         env_installed: env_installed(&env),
         selftest_passed: selftest_passed(&env),
         env_cuda_unchecked: env_cuda_unchecked(&env),
+        env_requirements: env_requirements(&env),
     }
 }

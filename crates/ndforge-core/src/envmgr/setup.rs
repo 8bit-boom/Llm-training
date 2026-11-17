@@ -83,9 +83,14 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
     // torchvision and others whose own requirements would otherwise pull in a CPU-only torch from PyPI.
     let constraints = plan.env_dir.join("constraints.txt");
     let pinned = pin_torch(plan, &py, &torch_libs, &constraints);
+    // the upper bounds the CI's worker tests proved (worker/constraints.txt); Unsloth is not pinned
+    let tested = plan.worker_dir.join("constraints.txt");
     let with_pins = |mut v: Vec<String>| -> Vec<String> {
         if pinned {
             v.extend(a(&["--constraint", &constraints.to_string_lossy()]));
+        }
+        if tested.is_file() {
+            v.extend(a(&["--constraint", &tested.to_string_lossy()]));
         }
         v.extend(a(&["--extra-index-url", &index, "--index-strategy", "unsafe-best-match"]));
         v
@@ -151,8 +156,8 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
 
     std::fs::create_dir_all(&plan.env_dir)?;
     let extras_json = extras.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
-    let marker = format!("{{\"wheel\": \"{}\", \"python\": \"{}\", \"unsloth\": {}, \"engine\": \"{}\", \"extras\": [{}], \"cuda_torch\": {}}}\n",
-                         plan.wheel, plan.python_version, unsloth, if unsloth { "unsloth" } else { "standard" }, extras_json, verified.unwrap_or(false));
+    let marker = format!("{{\"wheel\": \"{}\", \"python\": \"{}\", \"unsloth\": {}, \"engine\": \"{}\", \"extras\": [{}], \"cuda_torch\": {}, \"requirements\": {}}}\n",
+                         plan.wheel, plan.python_version, unsloth, if unsloth { "unsloth" } else { "standard" }, extras_json, verified.unwrap_or(false), super::health::ENV_REQUIREMENTS_VERSION);
     std::fs::write(plan.env_dir.join("ndforge_env.json"), marker)?;
     let _ = std::fs::remove_file(plan.env_dir.join("selftest.json")); // a new environment has to pass the test again
     Ok(())

@@ -200,6 +200,13 @@ When a job or the queue ends the program shows a system notification ("Healing f
 POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
 computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
 
+## Versions of the training software
+
+The worker's `hello` job answers `{"worker", "protocol": 1, "packages": {torch, transformers, peft, trl, accelerate, bitsandbytes, unsloth, datasets}}` (versions from the installed metadata, nothing is imported).
+`worker/constraints.txt` holds upper bounds taken from the versions the CI's worker tests passed with; the setup passes it as a second constraint file (Unsloth and PyTorch are not pinned there). The setup writes
+`"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
+(`envmgr/health.rs`) together with the bounds when a program version needs another environment.
+
 ## Before you start
 
 Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the
