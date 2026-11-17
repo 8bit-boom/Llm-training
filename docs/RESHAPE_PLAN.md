@@ -1,5 +1,7 @@
 # ND Lore Forge: "Slim or grow a model" (layer pruning + depth up-scaling) — implementation plan
 
+> **Historical.** A plan written before its code, kept as it was. What is built is in [RESHAPE.md](RESHAPE.md); the current documents are listed in [README.md](README.md).
+
 Status: plan only. Nothing in `/home/user/Llm-training` was changed. Written 2026-11-13 against the checkout in `/home/user/Llm-training`,
 Unsloth Studio sparse clone `.../scratchpad/src/unsloth` (commit 1bbf9c3, 2026-11-13), transformers 5.22.2 (wheel source read) and llama.cpp
 `master` (converter + `src/models/qwen35.cpp` read on 2026-11-13).

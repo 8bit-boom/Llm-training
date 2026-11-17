@@ -717,3 +717,41 @@ fn the_window_gets_a_plan_without_a_job_and_the_report_of_the_newest_run() {
     }
     assert!(report_of(&p, Some("nope")).is_err());
 }
+
+#[test]
+fn a_run_and_a_heal_that_were_cut_off_are_found_for_going_on_by_themselves() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert!(!st.interrupted);
+    // the program was closed while the run was running
+    let file = run_dir(&p, &st.id).join("auto.json");
+    let mut j: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    j["status"] = json!("running");
+    std::fs::write(&file, j.to_string()).unwrap();
+    assert!(ndforge_core::queue::interrupted_work(&p).is_empty(), "not marked yet");
+    assert_eq!(mark_interrupted(&p), 1);
+    let work = ndforge_core::queue::interrupted_work(&p);
+    assert_eq!(work, vec![("auto".to_string(), json!({"spec": null, "resume": st.id}))]);
+    // a heal that was cut off, of a model the run did not make
+    let m = ndforge_core::reshape::runs::models_dir(&p).join("other");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("state.json"), json!({"status": "done"}).to_string()).unwrap();
+    std::fs::write(m.join("heal.json"), json!({"status": "stopped", "interrupted": true, "spec": {"tokens_m": 10}}).to_string()).unwrap();
+    // and one that was stopped by the person (not interrupted)
+    let n = ndforge_core::reshape::runs::models_dir(&p).join("quiet");
+    std::fs::create_dir_all(&n).unwrap();
+    std::fs::write(n.join("heal.json"), json!({"status": "stopped", "interrupted": false, "spec": {"tokens_m": 10}}).to_string()).unwrap();
+    // and a heal that belongs to the interrupted run
+    let own = ndforge_core::reshape::runs::models_dir(&p).join("cut-1");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("heal.json"), json!({"status": "stopped", "interrupted": true, "spec": {"tokens_m": 10}}).to_string()).unwrap();
+    let work = ndforge_core::queue::interrupted_work(&p);
+    let kinds: Vec<(String, String)> = work.iter().map(|(k, a)| (k.clone(), a["name"].as_str().unwrap_or("").to_string())).collect();
+    assert_eq!(kinds, vec![("auto".into(), "".into()), ("heal".into(), "other".into())], "the person's own stop is left alone and the run's own heals go on with the run: {work:?}");
+    // going on clears the mark
+    let mut fx2 = Mock::new();
+    let again = resume(&p, &mut fx2, &st.id).unwrap();
+    assert!(!again.interrupted);
+}

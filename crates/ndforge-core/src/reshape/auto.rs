@@ -168,6 +168,9 @@ impl StageState {
 pub struct AutoState {
     pub format: u32,
     pub id: String,
+    /// the program was closed while this run was running (set when it is marked stopped); cleared when the run goes on. `auto_continue_interrupted` looks at it.
+    #[serde(default)]
+    pub interrupted: bool,
     pub spec: AutoSpec,
     /// running | stopped | failed | done | gates_failed
     pub status: String,
@@ -200,7 +203,7 @@ pub struct AutoState {
 impl AutoState {
     fn new(id: &str, spec: AutoSpec) -> Self {
         AutoState {
-            format: FORMAT, id: id.into(), spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
+            format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
             stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(),
         }
@@ -374,6 +377,7 @@ pub fn resume(p: &Project, fx: &mut dyn Effects, id: &str) -> Result<AutoState> 
         other => return Err(Error::new(format!("This run cannot be continued ({other})."))),
     }
     st.status = "running".into();
+    st.interrupted = false;
     st.error = None;
     for s in st.steps.iter_mut().filter(|s| s.status == "failed" || s.status == "stopped" || s.status == "running") {
         s.status = "pending".into();
@@ -390,6 +394,7 @@ pub fn mark_interrupted(p: &Project) -> usize {
             let dir = run_dir(p, &st.id);
             if let Some(mut s) = load(&dir) {
                 s.status = "stopped".into();
+                s.interrupted = true;
                 for r in s.steps.iter_mut().filter(|r| r.status == "running") {
                     r.status = "pending".into();
                 }

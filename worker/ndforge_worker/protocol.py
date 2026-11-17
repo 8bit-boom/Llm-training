@@ -11,6 +11,9 @@ import os
 import re
 import sys
 
+# bumped when a line of the protocol changes shape (never for a new job, event or key: those are only added). The program reads it from the `hello` job.
+PROTOCOL_VERSION = 1
+
 # the protocol goes to the REAL stdout; libraries that print (the Trainer's log dicts ...) are moved to stderr by `reserve_stdout`
 _out = sys.stdout
 

@@ -633,7 +633,7 @@ pub fn mark_interrupted(p: &Project) -> usize {
         // healing that was cut off can be continued: its checkpoints and the teacher's answers are kept
         if !live && read_json(&dir.join("heal.json")).is_some_and(|h| h["status"] == "running") {
             let _ = std::fs::remove_dir_all(dir.join("healed.partial"));
-            set_heal(&dir, json!({"status": "stopped", "error": "The program was closed while this model was being healed. Continue to go on where it stopped."}));
+            set_heal(&dir, json!({"status": "stopped", "interrupted": true, "error": "The program was closed while this model was being healed. Continue to go on where it stopped."}));
             n += 1;
         }
         if st["status"] == "running" && !live {
@@ -705,6 +705,9 @@ fn lr_default() -> f64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealSpec {
     pub tokens_m: u32,
+    /// The exact number of tokens, instead of `tokens_m` million: only for tests and the end-to-end run on a tiny model (the window never sends it; 1,000 to 100,000,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_exact: Option<u64>,
     /// the share of the heal tokens that is general text (0 = the project's own text only, no download)
     #[serde(default = "half")]
     pub general_share: f64,
@@ -775,9 +778,17 @@ impl HealSpec {
         self.recipe.as_deref() == Some(plan::THINKING_RECIPE)
     }
 
+    /// How many tokens the heal reads.
+    pub fn tokens(&self) -> u64 {
+        self.tokens_exact.unwrap_or(self.tokens_m as u64 * 1_000_000)
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if !plan::HEAL_TOKENS_M.contains(&self.tokens_m) {
-            return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens."));
+        match self.tokens_exact {
+            Some(n) if !(1_000..=100_000_000).contains(&n) => return Err(Error::new("The exact number of tokens must be between 1,000 and 100,000,000.")),
+            Some(_) => {}
+            None if !plan::HEAL_TOKENS_M.contains(&self.tokens_m) => return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens.")),
+            None => {}
         }
         if !(0.0..=0.9).contains(&self.general_share) || !(0.0..=1.0).contains(&self.alpha) || !self.rank.is_none_or(|r| (4..=256).contains(&r)) || !(1e-6..=1e-2).contains(&self.lr) {
             return Err(Error::new("Healing settings out of range: general share 0 to 0.9, KL weight 0 to 1, LoRA size 4 to 256, learning rate 0.000001 to 0.01."));
@@ -976,9 +987,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     if !hp.fits {
         return Err(Error::new(hp.why.clone().unwrap_or_else(|| "Healing does not fit this card.".into())));
     }
-    let train_key = heal_train_key(spec, &ch, spec.tokens_m as u64 * 1_000_000);
+    let train_key = heal_train_key(spec, &ch, spec.tokens());
     let mode = spec.mode.clone().unwrap_or_else(|| hp.mode.to_string());
-    let tokens = spec.tokens_m as u64 * 1_000_000;
+    let tokens = spec.tokens();
     let source = spec.general_source()?;
     let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
     let general_key = crate::general::key(&general, crate::general::SEED);
@@ -1007,7 +1018,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
-    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
+    set_heal(&dir, json!({"status": "running", "interrupted": false, "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
     let stopped = |step: &str| {
         set_heal(&dir, json!({"status": "stopped", "step": step}));
         json!({"stopped": true, "name": name})

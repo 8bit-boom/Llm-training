@@ -83,7 +83,7 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
     for (k, v) in super::llamacpp::worker_env(&super::llamacpp::Config::from_env()) {
         cmd.env(k, v);
     }
-    let scrub = crate::unsloth::client::scrub;
+    let scrub = crate::secrets::redact;
     let mut log = super::joblog::JobLog::open(job);
     let mut result: Option<Value> = None;
     let mut failure: Option<String> = None;

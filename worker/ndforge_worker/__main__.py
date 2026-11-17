@@ -10,6 +10,21 @@ def _code(exc: Exception, default: str) -> str:
     return getattr(exc, "code", None) or default
 
 
+# the libraries a problem report wants the versions of; read from the installed metadata, never imported (importing torch takes seconds and needs the card)
+PACKAGES = ("torch", "transformers", "peft", "trl", "accelerate", "bitsandbytes", "unsloth", "datasets")
+
+
+def _package_versions() -> dict:
+    from importlib import metadata
+    out = {}
+    for name in PACKAGES:
+        try:
+            out[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
 def _explain(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
@@ -51,7 +66,7 @@ def main(argv: list) -> int:
         return 1
     kind = job.get("job")
     if kind == "hello":
-        protocol.result({"worker": __version__})
+        protocol.result({"worker": __version__, "protocol": protocol.PROTOCOL_VERSION, "packages": _package_versions()})
         return 0
     if kind == "selftest":
         from . import selftest

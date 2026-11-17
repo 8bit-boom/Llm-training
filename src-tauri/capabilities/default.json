@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "The main window may use the core API and the file dialog.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "dialog:default", "notification:default"]
 }

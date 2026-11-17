@@ -2,8 +2,12 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"        # nightly: only the end-to-end job (below) runs
 jobs:
   core:
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +48,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "install.bat -Check failed ($LASTEXITCODE)" }
           if (-not (Test-Path run.bat)) { throw "run.bat missing" }
   worker:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,3 +61,26 @@ jobs:
       # only the errors that are always bugs (syntax, undefined names, bad format strings); no style rules
       - run: ruff check --isolated --select E9,F63,F7,F82 worker/ndforge_worker
       - run: cd worker && python -m pytest -q -n auto --durations=25 tests
+  # The program's own steps on a tiny REAL model, on a CPU (crates/ndforge-core/tests/e2e.rs, #[ignore]d): inspect, measure, try, cut, heal, thinking check. Not on pull requests: it runs
+  # on pushes to main, nightly, by hand, and on a push whose commit message says [e2e] (to try a change before it is merged).
+  e2e-cpu:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements-ci.txt
+      - name: Python with CPU PyTorch and the worker's libraries
+        run: |
+          python -m venv "$RUNNER_TEMP/e2e-venv"
+          "$RUNNER_TEMP/e2e-venv/bin/pip" install -r worker/requirements-ci.txt
+      - name: The end-to-end test
+        env:
+          NDFORGE_E2E_PYTHON: ${{ runner.temp }}/e2e-venv/bin/python
+        run: cargo test -p ndforge-core --test e2e -- --ignored --nocapture

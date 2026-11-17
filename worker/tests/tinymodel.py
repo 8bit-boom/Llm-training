@@ -65,18 +65,19 @@ def write_jsonl(path: Path, rows: list):
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
 
 
-def build_arch_dir(path: Path, family: str, num_layers: int = 4, heads: int = 4, kv_heads: int = 2, lin_v_heads: int = 4):
+def build_arch_dir(path: Path, family: str, num_layers: int = 4, heads: int = 4, kv_heads: int = 2, lin_v_heads: int = 4, intermediate: int = 128):
     """A tiny random model of the REAL architecture (Qwen3.5: gated linear attention + full attention; Gemma 4: sliding/full attention with shared KV
     and per-layer inputs), from the text part of the real config with the sizes shrunk.
     `num_layers` (default 4) repeats the real layer pattern: Qwen3.5 in blocks of 3 linear-attention + 1 full-attention layers (a whole number of blocks
     when num_layers is a multiple of 4, which the "Slim or grow" tests rely on), Gemma 4 as sliding/full pairs.
-    `heads`, `kv_heads` (attention) and `lin_v_heads` (Qwen3.5 linear-attention value heads, a multiple of the 2 key heads) are the width-pruning tests' knobs."""
+    `heads`, `kv_heads` (attention) and `lin_v_heads` (Qwen3.5 linear-attention value heads, a multiple of the 2 key heads) are the width-pruning tests' knobs.
+    `intermediate` is the MLP width (the program cuts it in steps of 256, so a model that is to be thinned needs 512 or more)."""
     import torch
     import transformers as T
     torch.manual_seed(0)
     tok = build_tokenizer(family)
     t = json.loads((DATA / f"{family}_config.json").read_text())["text_config"]
-    common = {"hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": num_layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads, "head_dim": 16,
+    common = {"hidden_size": 64, "intermediate_size": intermediate, "num_hidden_layers": num_layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads, "head_dim": 16,
               "vocab_size": len(tok), "max_position_embeddings": 512, "pad_token_id": tok.pad_token_id, "eos_token_id": tok.eos_token_id}
     if family == "qwen3_5":
         qwen_block = ["linear_attention"] * 3 + ["full_attention"]

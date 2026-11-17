@@ -183,6 +183,51 @@ Training and healing check a checkpoint before they continue from it (`worker/nd
 
 The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
 
+The documents are listed in [docs/README.md](docs/README.md); `PLAN.md`, `docs/RESHAPE_PLAN.md` and `docs/RESHAPE_V2_PLAN.md` are historical plans.
+
+## The job queue
+
+"Add to queue" next to Start (Auto-cut, export, heal, thinking check, Compare quants) puts the job in `<settings folder>/queue.json` (`ndforge_core::queue`; the arguments are the ones the Start button would send).
+The Home page lists the queue: move a waiting entry, remove it, pause or run the queue. When a job ends, the program takes the next waiting entry, asks its preflight checklist and starts it; an entry that fails
+the checklist is skipped with the reason, a failed one is marked and the queue goes on, a job that was stopped pauses the queue. After a restart what was running is "stopped" and the queue waits until
+"Run the queue" is pressed. Entries of another project than the open one are skipped. Commands: `queue_list`, `queue_add`, `queue_remove`, `queue_move`, `queue_pause`, `queue_clear_finished`; the window hears `queue-event`.
+
+Setting `auto_continue_interrupted` (default off; the checkbox on the Home page): when a project is opened, an Auto-cut run or a heal that was cut off by closing the program or a crash (`interrupted: true`
+in `auto.json` / `heal.json`, set when it is marked stopped) is put in the queue and the queue runs. A stop by the person is left alone, and a heal that belongs to the interrupted Auto-cut goes on with the run.
+
+## Notifications and shutdown
+
+When a job or the queue ends the program shows a system notification ("Healing finished", or "Healing failed" with the first sentence of the error; `tauri-plugin-notification`, isolated in the `Notifier` trait in
+`src-tauri/src/lib.rs`; setting `notifications`, default on) and, when the queue has run out, how many entries ended each way. An optional web address (`webhook_url`, an ntfy-style topic, default empty) gets one plain-text
+POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
+computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
+
+## The end-to-end test
+
+`crates/ndforge-core/tests/e2e.rs` (ignored by default) runs the program's own steps on a tiny random Qwen3.5-shaped model with the real worker on a CPU: inspect, measure, try, cut (thinner layers), heal
+(the teacher's answers into the shared cache, the student learns, the LoRA is merged; `HealSpec.tokens_exact` = 20,000 tokens, never sent by the window) and the thinking check of the original, the cut and the healed
+model (`ThinkSpec.max_new` = 8). Run it with `NDFORGE_E2E_PYTHON=<venv>/bin/python cargo test -p ndforge-core --test e2e -- --ignored --nocapture`. CI job `e2e-cpu`: on pushes to main, nightly, by hand, and on a
+push whose commit message contains `[e2e]`; never on pull requests. It does not make GGUF files (llama.cpp is not installed there) and it does not drive the Auto-cut state machine itself (its target size starts at 1
+billion parameters, a tiny model is far below it): the steps are the ones Auto-cut calls.
+
+## The worker's contract
+
+`worker/ndforge_worker/contract.json` lists the job types, event types and error codes of the worker, with the protocol number; names are only ever added (docs/WORKER_CONTRACT.md). Tests in both languages check it, and the
+Unsloth fixtures nd-world copies are recorded in `tests/fixtures/unsloth/SHA256SUMS`. The weekly workflow `contract-drift.yml` compares nd-world's copies when the secret `NDWORLD_READ_TOKEN` exists and skips without it.
+
+## The diagnostics file
+
+Help > "Save a diagnostics file..." (`diagnostics_save`, `ndforge_core::diagnose::bundle`) writes one zip to a folder you choose: the problem report, the last 10 job logs, the settings (addresses and names, no keys: those are in `secrets.json`,
+which is never read for it; a webhook address is shown as "(set)"), the environment's marker, what the worker says about itself (`hello`), the llama.cpp install record, the newest Auto-cut run and its report, the newest heal and export
+records and the graphics card. Every text goes through `secrets::redact`, and the home folder name becomes `~`. The file is for the person to look at and attach; the program sends nothing anywhere.
+
+## Versions of the training software
+
+The worker's `hello` job answers `{"worker", "protocol": 1, "packages": {torch, transformers, peft, trl, accelerate, bitsandbytes, unsloth, datasets}}` (versions from the installed metadata, nothing is imported).
+`worker/constraints.txt` holds upper bounds taken from the versions the CI's worker tests passed with; the setup passes it as a second constraint file (Unsloth and PyTorch are not pinned there). The setup writes
+`"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
+(`envmgr/health.rs`) together with the bounds when a program version needs another environment.
+
 ## Before you start
 
 Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the

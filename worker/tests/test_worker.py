@@ -15,7 +15,9 @@ def run(tmp_path, job):
 
 def test_hello(tmp_path):
     code, ev = run(tmp_path, {"job": "hello"})
-    assert code == 0 and ev == [{"type": "result", "data": {"worker": "0.1.0"}}]
+    assert code == 0 and len(ev) == 1 and ev[0]["type"] == "result"
+    data = ev[0]["data"]
+    assert data["worker"] == "0.1.0" and data["protocol"] == 1 and set(data["packages"]) >= {"torch", "transformers", "peft", "trl", "unsloth"}, data
 
 
 def test_unknown_job_and_bad_file(tmp_path):

@@ -13,4 +13,4 @@ dependencies = []
 packages = ["ndforge_worker"]
 
 [tool.setuptools.package-data]
-ndforge_worker = ["suites/*.jsonl"]
+ndforge_worker = ["suites/*.jsonl", "contract.json"]
