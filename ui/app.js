@@ -328,7 +328,7 @@ function renderTrain() {
     ${state.settings.expert_mode && !tr.server && fullInfo.reasons.length === 1 && fullInfo.reasons[0].includes("needs about") ? `<label class="opt"><input type="checkbox" id="tr-anyway" ${tr.tryAnyway ? "checked" : ""}> Try anyway (the memory figure is an estimate; it may run out of memory)</label>` : ""}` : "";
   const last = st.runs[0];
   const canResume = last && last.resumable && !tr.running;
-  const ctrl = `<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
+  const ctrl = `${pfBox("train", { server: tr.server || "" })}<div class="row"><button class="primary" id="tr-start" ${tr.running || !tr.model || (!tr.server && !st.env_ready) || (tr.server && !(srvStatus && srvStatus.gpu && !srvStatus.busy)) || pfBlocked("train") ? "disabled" : ""}>${tr.server && srv ? "Start training on " + esc(srv.name) : "Start training"}</button>
     <button class="secondary" id="tr-stop" title="Finishes the current step, saves a checkpoint and stops. The run can be continued later, even after closing the program." ${tr.running && !tr.stopping ? "" : "disabled"}>${tr.stopping ? "Stopping…" : "Stop and save"}</button>
     ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)}${last.step ? `, from step ${last.step}${last.total_steps ? " of " + last.total_steps : ""}` : ""})</button>` : ""}</div>
     <div class="row power"><label class="opt" title="Stops the computer from going to sleep while a training runs (the screen may still turn off). Applies from the next start."><input type="checkbox" id="tr-awake" ${state.settings.keep_awake ? "checked" : ""} ${tr.running ? "disabled" : ""}> Keep this computer awake during training</label>
@@ -737,7 +737,8 @@ function renderUse() {
     <div class="row"><label>Make <select id="us-what"><option value="gguf" ${us.what === "gguf" ? "selected" : ""}>GGUF + Modelfile (for Ollama)</option><option value="gguf_merged" ${us.what === "gguf_merged" ? "selected" : ""}>GGUF + the merged model (safetensors)</option><option value="merged" ${us.what === "merged" ? "selected" : ""}>Only the merged model (safetensors, no GGUF)</option></select></label></div>
     ${mixedBox(st)}${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
+    ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
@@ -959,7 +960,7 @@ function imFormHtml(st) {
   return `<div class="card wide"><h2>Create a matrix</h2>
     <div class="row"><label>The model comes from <select id="im-src" ${im.running ? "disabled" : ""}>${srcOpts}</select></label></div>${src}${cal}${chunks}
     ${why ? `<p class="dim small" id="im-why">${esc(why)}</p>` : ""}
-    <div class="row"><button class="primary" id="im-create" ${im.running || why ? "disabled" : ""}>Create the matrix</button></div>${prog}</div>`;
+    ${pfBox("imatrix_make", {})}<div class="row"><button class="primary" id="im-create" ${im.running || why || pfBlocked("imatrix_make") ? "disabled" : ""}>Create the matrix</button></div>${prog}</div>`;
 }
 
 // "Merge matrices": the ticked matrices of the library, files, and/or Unsloth's published matrix for a base model, combined by llama-imatrix into a new entry. docs/IMATRIX.md.
@@ -1360,7 +1361,7 @@ function qkFormHtml(st) {
       <label class="opt"><input type="checkbox" id="qk-keep" ${qk.keep ? "checked" : ""}> Keep the 16-bit model's answers afterwards</label></div>${qkPlanHtml()}
     <p class="dim small">More text gives steadier figures but a bigger temporary file and a longer run: the 16-bit model reads the text once, then every file reads it again.</p>
     ${why ? `<p class="dim small" id="qk-why">${esc(why)}</p>` : ""}
-    <div class="row"><button class="primary" id="qk-start" ${qk.running || why ? "disabled" : ""}>Compare</button></div>${prog}</div>`;
+    ${pfBox("quantcheck", {})}<div class="row"><button class="primary" id="qk-start" ${qk.running || why || pfBlocked("quantcheck") ? "disabled" : ""}>Compare</button></div>${prog}</div>`;
 }
 
 function renderQuantcheck() {
@@ -1577,6 +1578,33 @@ function onUnslothEvent(p) {
   if (page === "setup") render();
 }
 
+// ------------------------------------------------------------------------------------------------------------ the preflight checklist (crates/ndforge-core/src/preflight.rs)
+// One list above a Start button: what the job needs and whether it is there (green / yellow / red). A red light disables Start. The program is asked again when the page's
+// facts change, after 15 seconds, or when something that fixes a light has finished (pfReset).
+const pf = {};
+function pfReset() { for (const k of Object.keys(pf)) delete pf[k]; }
+function pfAsk(kind, spec) {
+  const key = JSON.stringify(spec || {});
+  const e = pf[kind] || (pf[kind] = { key: null, asked: null, at: 0, checks: null, can_start: true, busy: false });
+  if (e.busy || (e.asked === key && Date.now() - e.at < 15000)) return e;
+  e.asked = key;
+  e.busy = true;
+  Promise.resolve(invoke("preflight", { kind, spec: spec || {} }))
+    .then((r) => { e.checks = r && Array.isArray(r.checks) ? r.checks : null; e.can_start = !(r && r.can_start === false); })
+    .catch(() => { e.checks = null; e.can_start = true; })
+    .finally(() => { e.key = key; e.at = Date.now(); e.busy = false; try { render(); } catch (_) { /* a preview without a window */ } });
+  return e;
+}
+function pfBox(kind, spec) {
+  const e = pfAsk(kind, spec);
+  if (!e.checks || !e.checks.length) return "";
+  const bad = e.checks.some((c) => c.light === "fail");
+  const mark = { ok: "✓", warn: "!", fail: "✕" };
+  const rows = e.checks.map((c) => `<li class="pf-${esc(c.light)}"><span class="pf-dot" aria-hidden="true">${mark[c.light] || "·"}</span> <strong>${esc(c.label)}</strong> ${esc(c.detail)}${c.fix && c.light !== "ok" ? ` <span class="dim">${esc(c.fix)}</span>` : ""}</li>`).join("");
+  return `<div class="pf ${bad ? "pf-bad" : ""}" role="status" aria-live="polite" data-pf="${esc(kind)}"><div class="small dim">Before you start</div><ul>${rows}</ul></div>`;
+}
+const pfBlocked = (kind) => { const e = pf[kind]; return !!(e && e.checks && e.can_start === false); };
+
 // ------------------------------------------------------------------------------------------------------------ llama.cpp: the installer (docs/LLAMA_CPP_INSTALL.md)
 // One state for every place that needs llama.cpp (Training setup, Step 5, Importance matrices, Compare quants): the status the workers will find, the plan to confirm, the progress.
 let lc = { status: null, planning: false, confirm: null, running: false, step: "", progress: null, bytes: null, log: [], error: null, result: null, update: null, updating: false, backend: "auto", pendingAuto: false };
@@ -1597,7 +1625,9 @@ function lcGap(need) {
 }
 
 async function lcRefresh() {
+  const had = !!(lc.status && lc.status.found);
   try { lc.status = await invoke("llamacpp_status"); } catch (_) { lc.status = null; }
+  if (had !== !!(lc.status && lc.status.found)) pfReset();            // llama.cpp appeared or went: the lists must be asked again
   if (["setup", "use", "imatrix", "quantcheck"].includes(page)) render();
 }
 
@@ -1797,7 +1827,7 @@ function onEnvEvent(p) {
   if (p.kind === "log") env.log.push(p.text);
   else if (p.kind === "step") { env.step = `Step ${p.index} of ${p.total}: ${p.text}`; env.progress = (p.index - 1) / p.total; }
   else if (p.kind === "progress") { env.step = p.text || p.step; env.progress = p.value; }
-  else if (p.kind === "done") { env.running = false; env.progress = 1; env.step = "Finished."; if (p.data && p.data.device_name) env.result = p.data; refreshEnv(); }
+  else if (p.kind === "done") { env.running = false; env.progress = 1; env.step = "Finished."; if (p.data && p.data.device_name) env.result = p.data; pfReset(); refreshEnv(); }
   else if (p.kind === "error") { env.running = false; env.progress = null; env.error = p.text; refreshEnv(); }
   if (page === "setup") { render(); const l = $("log"); if (l) l.scrollTop = l.scrollHeight; }
 }
@@ -2141,7 +2171,8 @@ function healCard(m, pair) {
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
-    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text })}
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
     ${prog}${charts}</div>`;
@@ -2398,7 +2429,8 @@ function autoCard() {
     ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
     ${studio}
     ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
-    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready ? "disabled" : ""}>Start Auto-cut</button>
+    ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
+    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
@@ -2464,7 +2496,7 @@ function thinkCard(m) {
   const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
   const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
   const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
-  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>`;
+  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) || pfBlocked("think_check") ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>`;
   const cols = TK_TARGETS.filter(([t]) => rows[t]);
   const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
       ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
@@ -2476,7 +2508,7 @@ function thinkCard(m) {
   return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
-    <div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
     ${tk.run && tk.run.name === m.name ? `<div class="stepline">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
     ${tk.err ? `<p class="err">${esc(tk.err)}</p>` : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
@@ -2830,7 +2862,7 @@ function renderReshape() {
   const noData = !grow && !st.dataset_version && (rs.shape !== "depth" || !(dropList && dropList.length));
   const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : noData ? "Save a training-data version in Step 2 first." : diskBad ? `Not enough free disk space: ${needGb} GB needed, ${st.free_disk_gb} GB free.` : dropList === null ? "The layer list is not valid." : rsWidthOn() && !wo ? "Choose how thin the layers become." : "";
   const make = `<div class="card wide"><h2>3 · Make the model</h2>
-    <div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || rs.tr.running || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
+    ${pfBox("cut", {})}<div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || rs.tr.running || why || pfBlocked("cut") ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
     ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && (wo || (!rsWidthOn() && o)) ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
     ${rs.running ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
     ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;

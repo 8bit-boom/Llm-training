@@ -16,6 +16,7 @@ pub mod instance;
 pub mod model;
 pub mod paths;
 pub mod power;
+pub mod preflight;
 pub mod project;
 pub mod secrets;
 pub mod remote;

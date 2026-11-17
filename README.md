@@ -183,6 +183,13 @@ Training and healing check a checkpoint before they continue from it (`worker/nd
 
 The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
 
+## Before you start
+
+Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the
+`preflight` command): the training software, the card (and its self-test), llama.cpp (a red light where the job cannot go without it, yellow where it can), free disk against the job's estimate (an export's
+from the model and sizes, healing's answers, Auto-cut's plan), the card's memory estimate, a saved training-data version, a Windows folder name with accents (llama.cpp), another program using the same settings folder
+and the Unsloth Studio folder. A red light disables Start and says what to do; yellow lights only warn. The list is asked for again after 15 seconds, when the page's facts change and when the install or llama.cpp finishes.
+
 ## One program at a time
 
 The program takes an exclusive lock on `<settings folder>/instance.lock` as it starts (`ndforge_core::instance`) and keeps it until it ends; the system lets go of it when the program dies, however it dies. A second
