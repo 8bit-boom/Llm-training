@@ -1,0 +1,11 @@
+# Everything the worker tests need on a CPU-only machine (CI). The local version "+cpu" of torch wins over the plain PyPI build.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers>=5
+trl
+peft
+datasets
+accelerate
+pytest
+pytest-xdist
+ruff

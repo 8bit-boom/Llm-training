@@ -643,10 +643,10 @@ def test_mixed_sizes_without_llama_cpp_say_so_before_anything_is_made(unsloth_wo
     assert unsloth_world.loaded == [] and unsloth_world.merges == []
 
 
-def test_an_unknown_size_is_still_refused_and_the_mixed_ones_are_known():
+def test_an_unknown_size_is_still_refused_and_the_mixed_ones_are_known(tmp_path):
     assert "mixed_4" in exportjob.QUANTS and "mixed_fit" in exportjob.QUANTS and exportjob.QUANTS[:5] == ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
     with pytest.raises(ValueError, match="Unknown quantisation"):
-        exportjob.run({"out": "x", "quants": ["mixed_9"], "base": {"repo": "a", "family": "b"}})
+        exportjob.run({"out": str(tmp_path / "x"), "quants": ["mixed_9"], "base": {"repo": "a", "family": "b"}})
 
 
 def test_an_export_that_cannot_read_the_16_bit_file_for_the_recipe_fails_plainly(world):
