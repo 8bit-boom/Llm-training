@@ -825,8 +825,23 @@ fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBoo
 /// The teacher's answers are all there AND were made from this general text (an older cache has no key and counts as made from other data), with this many
 /// answers per token (`k`) and for this sequence length (`seq`). Student-side settings (batch, accumulation, checkpointing, rank, optimizer, KL chunk, learning
 /// rate) are not part of it: the answers stay when only those change.
-fn cache_complete(cache: &Path, want: &Value, k: u32, seq: u32) -> bool {
-    read_json(&cache.join("index.json")).is_some_and(|i| i["complete"] == true && i["general_key"] == *want && i["k"] == k && i["max_len"] == seq)
+///
+/// `rows_key` (see `rows_key()`) says which rows the answers are for: the training file, the amount of text, the teacher and how it was loaded. A cache made before the
+/// key was kept has none and is judged as before; one that has it must match.
+fn cache_complete(cache: &Path, want: &Value, k: u32, seq: u32, rows_key: &str) -> bool {
+    read_json(&cache.join("index.json")).is_some_and(|i| {
+        i["complete"] == true && i["general_key"] == *want && i["k"] == k && i["max_len"] == seq && i.get("rows_key").and_then(|v| v.as_str()).is_none_or(|have| have == rows_key)
+    })
+}
+
+/// A fingerprint of what decides the teacher's rows besides the general text: the training file (path, size, modification time), the amount of text in tokens, the
+/// teacher and how it is loaded. The worker stores it as `rows_key` in the cache's index.json; the program compares it before skipping the teacher pass.
+pub fn rows_key(train: &Path, tokens: u64, teacher_repo: &str, teacher_load: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::metadata(train).ok();
+    let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load}).to_string();
+    Sha256::digest(text.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 fn training_done(run: &Path) -> bool {
@@ -871,7 +886,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
     let general_key = crate::general::key(&general, crate::general::SEED);
     let (cache_dir, run_dir) = (dir.join("distill").join("cache"), dir.join("distill").join("run"));
-    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq) {
+    let teacher_load = ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string());
+    let rows_key = rows_key(&train, tokens, &origin, &teacher_load);
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let need = tokens as f64 * 196.0 / 1e9;
         if let Some(free) = crate::envmgr::health::free_disk_gb(&dir).filter(|f| *f < need * 1.05) {
             return Err(Error::new(format!("The teacher's answers need {need:.1} GB in {}; {free:.1} GB free.", cache_dir.display())));
@@ -914,11 +931,11 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             heal_source::fetch_student(&dir, &stop, on_event).map_err(failed)?
         }
     };
-    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq) {
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let job = json!({
             "job": "distill_cache", "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "student": model, "model": {"family": family},
             "data": {"train": train, "tokens": tokens, "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
-            "out": cache_dir, "stop_file": stop_file,
+            "out": cache_dir, "stop_file": stop_file, "rows_key": rows_key,
         });
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {

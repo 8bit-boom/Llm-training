@@ -721,6 +721,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
+    /// Jobs save a log in the settings folder: these tests use a private one for the whole run.
+    fn private_config_dir() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+        std::env::set_var("NDFORGE_CONFIG_DIR", d.path());
+    }
+
     fn fake_python(dir: &std::path::Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let py = dir.join("python");
@@ -732,6 +739,7 @@ mod tests {
     /// Stop with the importance matrix: a STOP file first (a worker that obeys ends by itself), the kill only after the grace time (a worker that does not).
     #[test]
     fn stop_writes_the_stop_file_first_and_kills_only_after_the_grace_time() {
+        private_config_dir();
         let d = tempfile::tempdir().unwrap();
         let stop = d.path().join("STOP");
         let job = json!({"job": "export", "stop_file": stop});

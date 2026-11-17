@@ -219,3 +219,19 @@ def test_build_rows_counts_the_long_conversations_and_says_so(tmp_path, monkeypa
     rows, st = dj.build_rows(ChatCharTok(), {"train": "x", "tokens": 400, "general": {"share": 0.5, "file": g}}, "generic", 32)
     assert st["general_cut_rows"] >= 1 and st["general_skipped_long"] >= 1 and st["general_error"] is None
     assert all(len(r["input_ids"]) <= 32 for r in rows)
+
+
+def test_the_cache_index_keeps_the_teacher_load_and_the_rows_key_but_they_do_not_decide_a_match(tmp_path):
+    (tmp_path / "tokenizer.json").write_text('{"v": 1}')
+    rows = [{"input_ids": [1, 2, 3], "completion_mask": [0, 1, 1]}]
+    stats = {"project_rows": 1, "general_rows": 0, "general_source": None}
+    cfg = {"teacher": {"repo": "org/T", "load": "4bit"}, "rows_key": "abc123", "data": {"train": "x"}}
+    meta = dj.cache_meta(cfg, rows, stats, tmp_path, 8, 128)
+    assert meta["teacher_load"] == "4bit" and meta["rows_key"] == "abc123" and meta["k"] == 8 and meta["max_len"] == 128
+    old = dj.cache_meta({"teacher": {"repo": "org/T"}, "data": {}}, rows, stats, tmp_path, 8, 128)
+    assert old["teacher_load"] == "auto" and old["rows_key"] is None
+    assert dj.cache_matches(meta, {**meta, "rows_key": "other", "teacher_load": "auto"}), "the program judges these two before it starts the job"
+    w = dj.CacheWriter(tmp_path / "c", meta, part_tokens=8)
+    w.close()
+    idx = json.loads((tmp_path / "c" / "index.json").read_text())
+    assert idx["teacher_load"] == "4bit" and idx["rows_key"] == "abc123"

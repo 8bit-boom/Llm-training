@@ -1158,7 +1158,7 @@ if kind == "distill_cache":
     os.makedirs(job["out"], exist_ok=True)
     g = job["data"].get("general")
     key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"], "render": 2}}
-    json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key, "k": job["k"], "max_len": job["max_seq"]}}, open(os.path.join(job["out"], "index.json"), "w"))
+    json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key, "k": job["k"], "max_len": job["max_seq"], "rows_key": job.get("rows_key")}}, open(os.path.join(job["out"], "index.json"), "w"))
     out(type="progress", step="cache", value=0.5, text="The original model answers your texts")
     out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."]}})
 elif kind == "distill":
@@ -1729,6 +1729,47 @@ fn another_dataset_never_reuses_the_teachers_answers_or_the_old_checkpoints() {
     std::fs::remove_file(d.path().join("stop-train")).unwrap();
     go("a/two").unwrap();
     assert_eq!(kinds().iter().filter(|k| *k == "distill_cache").count(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_teachers_answers_are_made_again_when_the_amount_of_text_the_file_or_the_teacher_load_changes() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let go = |tokens_m: u32, load: &str| {
+        let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": tokens_m, "general": {"id": "a/one"}, "teacher_load": load})).unwrap();
+        rruns::heal(&p, "slim", &spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {})
+    };
+    let caches = || jobs_seen(d.path()).iter().filter(|j| j["job"] == "distill_cache").count();
+    std::fs::write(d.path().join("stop-train"), "").unwrap();
+    go(10, "auto").unwrap();
+    assert_eq!(caches(), 1);
+    assert!(jobs_seen(d.path())[0]["rows_key"].as_str().is_some_and(|k| k.len() == 32), "the job carries the key");
+    go(10, "auto").unwrap();
+    assert_eq!(caches(), 1, "nothing changed: the answers are kept");
+    go(20, "auto").unwrap();
+    assert_eq!(caches(), 2, "another amount of text: the rows differ, so the teacher answers again");
+    go(20, "4bit").unwrap();
+    assert_eq!(caches(), 3, "another way of loading the teacher");
+    go(20, "4bit").unwrap();
+    assert_eq!(caches(), 3);
+    let train = p.folder.join("datasets/v1/train.jsonl");
+    let mut text = std::fs::read_to_string(&train).unwrap();
+    text.push('\n');
+    std::fs::write(&train, text).unwrap();
+    go(20, "4bit").unwrap();
+    assert_eq!(caches(), 4, "the training file changed");
+    // an older cache that has no key is judged as before (the key is only compared when the cache has one)
+    let idx = p.folder.join("models/slim/distill/cache/index.json");
+    let mut j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&idx).unwrap()).unwrap();
+    j.as_object_mut().unwrap().remove("rows_key");
+    std::fs::write(&idx, j.to_string()).unwrap();
+    go(20, "4bit").unwrap();
+    assert_eq!(caches(), 4);
 }
 
 #[cfg(unix)]

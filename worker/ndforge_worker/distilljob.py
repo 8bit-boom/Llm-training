@@ -461,6 +461,17 @@ def _teacher_answers(model, batch_rows: list, k: int, chunk: int, pad_id: int):
     return out
 
 
+def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int) -> dict:
+    """What index.json says about a teacher cache (the first eight keys decide `cache_matches`)."""
+    gen = (cfg.get("data") or {}).get("general")
+    return {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
+            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
+            "general_key": generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407))),
+            "general_source": stats["general_source"],
+            # who made the answers and for which rows: the program compares `rows_key` before it skips the teacher pass (it is not part of cache_matches: the rows' own hash is)
+            "teacher_load": cfg["teacher"].get("load", "auto"), "rows_key": cfg.get("rows_key")}
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
@@ -479,10 +490,7 @@ def run_cache(cfg: dict) -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(student))
     rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
-    meta = {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
-            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
-            "general_key": generaltext.general_key((cfg["data"] or {}).get("general"), ((cfg["data"] or {}).get("general") or {}).get("share", 0), int(cfg.get("seed", 3407))),
-            "general_source": stats["general_source"]}
+    meta = cache_meta(cfg, rows, stats, student, k, max_seq)
     writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
     save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []

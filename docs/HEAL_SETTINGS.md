@@ -73,7 +73,7 @@ Each retry writes "Out of memory: trying again with ..." to the log and a `heal_
 what was tried, and what to change next in this order: shorter sequence length, QLoRA (if not already), lower LoRA size, smaller model. The page then shows that text, the retries, and **Try again with safer settings**,
 which fills in the next rung (`plan::heal_next_safer`, the same rules as `healmem.next_safer`; both are tested against `worker/tests/data/heal_cases.json`) instead of a blind Continue. Other failures keep "Continue".
 Settings that change the maths (sequence length, rank, method, top-k, learning rate, tokens, warm-up, sequences per update) are kept in `heal.json` as `train_key`; if it differs the old checkpoints are deleted and the learning starts again, and a changed sequence length or top-k makes the teacher answer again
-(`cache_complete` checks `k` and `max_len`). The teacher's answers are **kept** when only student-side settings (batch, accumulation, checkpointing, optimizer, loss chunk, teacher loading) change.
+(`cache_complete` checks `k` and `max_len`). The teacher's answers are **kept** when only student-side settings (batch, accumulation, checkpointing, optimizer, loss chunk) change; a change of the teacher's loading (`auto` or `4bit`) or of the amount of text makes it answer again (see `rows_key` below).
 An out-of-memory error in the teacher step or while loading gets its own plain message with the next actions.
 
 ## Deviations from the brief
@@ -130,3 +130,7 @@ a LoRA on the light-prepared model gets non-zero gradients from the KL loss; `lo
 * Whether `expandable_segments` helps here.
 * That an in-process retry after a real `CUDA error: out of memory` (AcceleratorError) recovers; the tests raise a fake `torch.OutOfMemoryError` on a CPU.
 * That a checkpoint saved with one batch size resumes cleanly with the halved batch on the real model (it does on the tiny CPU model in the tests).
+
+## The key of the teacher's rows (`rows_key`)
+
+`cache_complete` also compares `rows_key`: a fingerprint of the training file (path, size, modification time), the amount of text (tokens), the teacher and how it is loaded. The worker stores it, with `teacher_load`, in the cache's `index.json`; it is not part of `distilljob.cache_matches` (the rows' own hash is). Changing the amount of text, the file or the teacher load therefore makes the teacher answer again instead of reusing answers for other rows. A cache made before the key existed has none and is judged as before.

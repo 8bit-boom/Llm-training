@@ -96,8 +96,16 @@ fn worker_dir() -> std::path::PathBuf {
     ndforge_core::envmgr::worker_dir()
 }
 
+/// Every job saves a log in the settings folder: these tests get a private one (kept for the whole test run), never the real one.
+fn private_config_dir() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path());
+}
+
 #[test]
 fn the_real_worker_answers_hello_and_explains_a_missing_torch() {
+    private_config_dir();
     let Some(py) = python3() else { return };
     let mut events = Vec::new();
     let r = run_job(&py, &worker_dir(), &json!({"job": "hello"}), &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
@@ -116,8 +124,7 @@ fn the_real_worker_answers_hello_and_explains_a_missing_torch() {
 #[test]
 fn worker_events_and_crashes_are_reported() {
     use std::os::unix::fs::PermissionsExt;
-    let cfg = tempfile::tempdir().unwrap();
-    std::env::set_var("NDFORGE_CONFIG_DIR", cfg.path());
+    private_config_dir();
     // a fake "python" that prints protocol lines
     let d = tempfile::tempdir().unwrap();
     let fake = d.path().join("python");
@@ -135,7 +142,6 @@ fn worker_events_and_crashes_are_reported() {
     assert!(msg.starts_with("Plain words (details: logs/jobs/") && msg.ends_with(".log)"), "{msg}");
     std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("without an answer"));
-    std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
 
 #[cfg(unix)]

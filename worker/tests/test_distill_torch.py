@@ -52,6 +52,7 @@ def test_the_teacher_writes_its_top_k_answers_for_every_row(tmp_path, base, monk
     idx = json.loads((tmp_path / "distill" / "cache" / "index.json").read_text())
     assert idx["rows"] == r["rows"] == idx["done_rows"] and idx["complete"] and idx["k"] == 8 and idx["max_len"] == 128 and len(idx["parts"]) > 1
     assert idx["tokens"] == r["tokens"] and idx["teacher"] == str(base) and len(idx["data_hash"]) == 64 and len(idx["tokenizer_hash"]) == 64
+    assert idx["teacher_load"] == "16bit" and idx["rows_key"] == cfg.get("rows_key")
     assert r["stats"]["project_rows"] == 16 and r["stats"]["general_rows"] > 0 and not r["notes"] and r["reused"] is False
     # row 0 against a direct forward pass of the same teacher
     from transformers import AutoTokenizer
