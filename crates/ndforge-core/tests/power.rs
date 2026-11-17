@@ -100,3 +100,10 @@ fn keep_awake_is_a_remembered_setting_that_defaults_to_on() {
     std::fs::write(d.path().join("cfg/settings.json"), r#"{"expert_mode": true}"#).unwrap();
     assert_eq!(AppModel::load().state()["settings"]["keep_awake"], true);
 }
+
+#[test]
+fn the_worker_is_told_not_to_keep_the_computer_awake_only_when_the_setting_is_off() {
+    use ndforge_core::envmgr::jobs::power_env;
+    assert!(power_env(true).is_empty());
+    assert_eq!(power_env(false), vec![("NDFORGE_KEEP_AWAKE".to_string(), "0".to_string())]);
+}
