@@ -130,3 +130,141 @@ test("a mixed size in the list of files says whose recipe it is, its estimate, a
   b.run(`onExportEvent({kind: "done", data: {name: "run1-mixed_4", run: "run1", exports: [{imatrix: null, mixed: {note: "The mixed-precision sizes need llama-quantize's per-tensor types, which Unsloth's export cannot do, so this export was made with llama.cpp."}}]}})`);
   assert.match(b.run("renderUse()"), /so this export was made with llama.cpp/);
 });
+
+// ------------------------------------------------------------------------------------------------ Mixed: measured fit to a size
+const measuredQuants = [...mixedQuants, { id: "mixed_measured", name: "Mixed: measured fit to a size · Mixed precision (our own recipe): each tensor's error measured on your weights, weighted by the importance matrix", label: "Mixed: measured fit to a size", mixed: true }];
+const qfState = (over = {}) => ({ references: [{ path: "/p/exports/run1-q4_k_m/model-f16.gguf", label: "run1-q4_k_m: model-f16.gguf" }, { path: "/p/exports/other/model-f16.gguf", label: "other: model-f16.gguf" }], ladder: ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"],
+  plans: [], verdict: null, caveats: "The error is measured with a diagonal approximation ... Compare quants (KL divergence) is the judge, not this number.", ...over });
+const estimate = (over = {}) => ({ engine: "llama", llama_quantize: "/l/llama-quantize", llama_version: "version: 5000 (abc)", tensor_type_file: true, minutes_note: "About 2 minutes (an estimate: the numpy speed was measured just now; the 5 times faster llama engine and a disk read speed of 200 MB/s are assumptions).",
+  sampled_weights: 280e6, read_bytes: 560e6, disk_need: 2.7e9, min_gb: 8.1, max_gb: 17.2, plain_estimates: { Q4_K_M: 10.6, Q5_K_M: 12.4, Q6_K: 14.3, Q8_0: 18.5 }, matrix_ok: true, notes: [], ...over });
+const result = (over = {}) => ({ fits: true, engine: "llama", plan: { total: 10.59e9 }, report: { rows: [{ id: "plan", label: "Measured plan", gb: 10.59, error: 0.07 }, { id: "uniform_q4_k", label: "Every tensor Q4_K", gb: 10.4, error: 0.084 }, { id: "plain_q4_k_m", label: "Plain Q4_K_M (as llama.cpp's mixture is approximated here)", gb: 10.6, error: 0.081 }],
+  types: { Q4_K: { tensors: 100, params: 1 }, Q6_K: { tensors: 20, params: 1 } }, bpw_by_role: { ffn_up: 4.2, attn_k: 6.5 }, caveats: "The error is measured with a diagonal approximation ... Compare quants (KL divergence) is the judge, not this number." },
+  rules: ["blk\\.(?:0|1)\\.attn_k\\.weight$=Q6_K"], flags: ["--output-tensor-type", "Q6_K", "--token-embedding-type", "Q4_K", "--tensor-type-file", "t.txt"], notes: ["One note."], files: [], ...over });
+const qfPage = (b, extra = "") => page(b, exportState({ mixed_quants: measuredQuants }), `qf.open = true; qf.state = ${JSON.stringify(qfState())}; ${extra}`);
+
+test("the measured size is listed with the others and asks for a target and a matrix when ticked", () => {
+  const b = browser();
+  let html = page(b, exportState({ mixed_quants: measuredQuants }));
+  assert.match(html, /Mixed: measured fit to a size<\/label>/); assert.doesNotMatch(html, /id="us-mmbox"/);
+  html = page(b, exportState({ mixed_quants: measuredQuants }), `us.quants = ["mixed_measured"]`);
+  assert.match(html, /id="us-mmbox"/); assert.match(html, /id="us-mmtargetwhy"/); assert.match(html, /id="us-make" disabled/);
+  b.els["us-mmtarget"].value = " 10.6 "; b.els["us-mmtarget"].onchange();
+  b.els["us-mmmatrix"].value = "m1"; b.els["us-mmmatrix"].onchange();
+  html = redraw(b);
+  assert.doesNotMatch(html, /id="us-mmtargetwhy"/); assert.doesNotMatch(html, /id="us-make" disabled/);
+  assert.doesNotMatch(html, /Dynamic|UD-/i);
+});
+
+test("what Make sends for the measured size, alone and next to Fit to a size", async () => {
+  const b = browser({ export_start: null });
+  page(b, exportState({ mixed_quants: measuredQuants }), `us.quants = ["mixed_measured"]; us.mm.target = "10.6"; us.mm.matrix = "m1"`);
+  b.run(`us.running = false`); redraw(b);
+  await b.els["us-make"].onclick();
+  const args = b.calls.find((c) => c[0] === "export_start")[1];
+  assert.deepEqual(args.quants, ["mixed_measured"]); assert.deepEqual(args.mixed, { measured: { target_gb: 10.6, matrix: "m1" } });
+  b.run(`us.running = false; us.quants = ["mixed_fit", "mixed_measured", "q4_k_m"]; us.mx.target = "12"; us.mx.matrix = ""`); redraw(b);
+  await b.els["us-make"].onclick();
+  const both = b.calls.filter((c) => c[0] === "export_start").at(-1)[1];
+  assert.deepEqual(both.mixed, { fit: { target_gb: 12, matrix: null }, measured: { target_gb: 10.6, matrix: "m1" } });
+});
+
+test("the measured-fit box: the file, the matrix, the target in GB and GiB, and the caveat before anything runs", () => {
+  const b = browser();
+  const html = qfPage(b, `qf.target = "10.6"`);
+  assert.match(html, /<summary><strong>Fit to a size \(measured\)<\/strong>/); assert.match(html, /<option value="\/p\/exports\/run1-q4_k_m\/model-f16.gguf" selected>run1-q4_k_m: model-f16.gguf/);
+  assert.match(html, /A 16-bit GGUF I choose…/); assert.match(html, /every channel counts the same/); assert.match(html, /my matrix/);
+  assert.match(html, /id="qf-gib">= 9.87 GiB/); assert.match(html, /measurement of the weights, not of the model<\/strong>: <strong>Compare quants<\/strong> \(KL divergence\) is the judge/);
+  assert.match(html, /id="qf-q4" disabled/); assert.match(html, /id="qf-run" >Measure and plan/); assert.match(html, /id="qf-estbtn" >Estimate/);
+  assert.doesNotMatch(html, /Dynamic|UD-/i);
+  assert.match(qfPage(browser()), /id="qf-run" disabled>Measure and plan/); assert.match(qfPage(browser()), /id="qf-why">Give the size in GB\./);
+});
+
+test("Estimate shows the minutes as an estimate, the engine, the type-file support, the disk and the range; the same-size buttons fill the target", async () => {
+  const b = browser({ quantfit_estimate: estimate() });
+  qfPage(b, `qf.target = "10.6"`);
+  await b.els["qf-estbtn"].onclick();
+  assert.deepEqual(b.calls.at(-1)[0], "quantfit_estimate");
+  const sent = b.calls.at(-1)[1].spec;
+  assert.equal(sent.gguf, "/p/exports/run1-q4_k_m/model-f16.gguf"); assert.equal(sent.target_gb, 10.6); assert.equal(sent.make, false); assert.equal(sent.engine, "auto"); assert.equal(sent.floor, "Q3_K"); assert.equal(sent.sample_rows, 128);
+  const html = b.run("renderUse()");
+  assert.match(html, /About 2 minutes \(an estimate:/); assert.match(html, /Engine: llama \(llama-quantize found, version: 5000 \(abc\); <code>--tensor-type-file<\/code> yes\)/);
+  assert.match(html, /Looks at 280 million weights \(0.56 GB read\), needs about 2.7 GB of free disk/); assert.match(html, /Smallest 8.10 GB, largest 17.20 GB/); assert.match(html, /Q5_K_M about 12.4 GB/);
+  assert.doesNotMatch(html, /id="qf-q4" disabled/);
+  b.run("wireUse()"); b.els["qf-q5"].onclick();
+  assert.match(b.run("qf.target"), /12.4/); assert.match(b.run("renderUse()"), /id="qf-gib">= 11.55 GiB/);
+  // a target below the smallest is said before anything runs
+  b.run(`qf.target = "5"`);
+  assert.match(b.run("renderUse()"), /id="qf-below">5 GB is below the smallest this model can be with Q3_K as the lowest type \(8.10 GB\)/);
+});
+
+test("an estimate that fails (a matrix of another model) is shown in the worker's words", async () => {
+  const b = browser({ quantfit_estimate: new Error("The matrix does not fit this model: blk.1.attn_k.weight has 5120 input channels. This matrix is not of this model; adapt it first.") });
+  qfPage(b, `qf.target = "10.6"`);
+  await b.els["qf-estbtn"].onclick();
+  assert.match(b.run("renderUse()"), /id="qf-esterror">[^]*not of this model; adapt it first/);
+});
+
+test("Measure and plan sends the choice, shows progress with a Stop button, and the table, the rules and the caveat when it is done", async () => {
+  const b = browser({ quantfit_start: null, quantfit_stop: null, quantfit_state: qfState() });
+  qfPage(b, `qf.target = "10.6"; qf.matrix = "m1"; qf.rows = 256; qf.floor = "Q2_K"; qf.engine = "reference"`);
+  await b.els["qf-run"].onclick();
+  const spec = b.calls.find((c) => c[0] === "quantfit_start")[1].spec;
+  assert.deepEqual(spec, { gguf: "/p/exports/run1-q4_k_m/model-f16.gguf", matrix: "m1", target_gb: 10.6, floor: "Q2_K", ceiling: "Q8_0", sample_rows: 256, engine: "reference", make: false, neighbours: false, compare: null });
+  b.run(`onQuantfitEvent(${JSON.stringify({ kind: "progress", value: 0.4, text: "Measuring (40 of 100): blk.3.attn_q.weight" })})`);
+  let html = b.run("renderUse()");
+  assert.match(html, /id="qf-step">Measuring \(40 of 100\)/); assert.match(html, /id="qf-stop">Stop/); assert.match(html, /id="qf-run" disabled>/);
+  b.run("wireUse()"); b.els["qf-stop"].onclick();
+  assert.equal(b.calls.at(-1)[0], "quantfit_stop");
+  b.run(`onQuantfitEvent(${JSON.stringify({ kind: "done", data: result() })})`);
+  html = b.run("renderUse()");
+  assert.match(html, /<td>Measured plan<\/td><td>10.59 GB<\/td><td>0.07<\/td>/); assert.match(html, /<td>Every tensor Q4_K<\/td>/); assert.match(html, /Plain Q4_K_M \(as llama.cpp&#39;s mixture is approximated here\)|Plain Q4_K_M \(as llama.cpp's mixture is approximated here\)/);
+  assert.match(html, /Types chosen: Q4_K: 100 tensors, Q6_K: 20 tensors/); assert.match(html, /ffn_up 4.2 · attn_k 6.5/); assert.match(html, /The 1 rules this gives/); assert.match(html, /--tensor-type blk\\\.\(\?:0\|1\)\\\.attn_k\\\.weight\$=Q6_K/);
+  assert.match(html, /One note\./); assert.match(html, /id="qf-caveat">The error is measured with a diagonal approximation/); assert.match(html, /id="qf-ok">The plan is ready\./);
+  assert.match(html, /id="qf-run" >Measure and plan/);
+});
+
+test("Stop keeps what was measured and the button says Resume; a refusal is shown as it is", async () => {
+  const b = browser({ quantfit_start: null });
+  qfPage(b, `qf.target = "10.6"`);
+  await b.els["qf-run"].onclick();
+  b.run(`onQuantfitEvent(${JSON.stringify({ kind: "error", text: "Cancelled." })})`);
+  let html = b.run("renderUse()");
+  assert.match(html, /id="qf-error">Stopped\. What was measured is kept: press Resume to go on\./); assert.match(html, /id="qf-run" >Resume/);
+  b.run(`onQuantfitEvent(${JSON.stringify({ kind: "error", text: "This matrix is not of this model; adapt it first." })})`);
+  assert.match(b.run("renderUse()"), /id="qf-error">This matrix is not of this model/);
+  const b2 = browser({ quantfit_start: new Error("Give the size in GB that the measured fit should aim for.") });
+  qfPage(b2, `qf.target = "10.6"`); await b2.els["qf-run"].onclick();
+  assert.match(b2.run("renderUse()"), /id="qf-error">(Error: )?Give the size in GB/);
+});
+
+test("Make the file and Make and compare send the files options, and the promotion verdict is shown", async () => {
+  const b = browser({ quantfit_start: null, quantfit_state: qfState() });
+  qfPage(b, `qf.target = "10.6"; us.run = "run1"`);
+  b.els["qf-make"].checked = true; b.els["qf-make"].onchange();
+  let html = b.run("renderUse()");
+  assert.doesNotMatch(html, /id="qf-compare" checked/); assert.doesNotMatch(html, /id="qf-compare" ><|id="qf-compare"  disabled/);
+  await b.els["qf-run"].onclick();
+  let spec = b.calls.filter((c) => c[0] === "quantfit_start").at(-1)[1].spec;
+  assert.equal(spec.make, true); assert.equal(spec.neighbours, true); assert.equal(spec.compare, null);
+  b.run(`qf.running = false`); b.run("renderUse()"); b.run("wireUse()");
+  b.els["qf-compare"].checked = true; b.els["qf-compare"].onchange();
+  b.run("renderUse()"); b.run("wireUse()");
+  b.els["qf-text"].value = "general"; b.els["qf-text"].onchange();
+  await b.els["qf-run"].onclick();
+  spec = b.calls.filter((c) => c[0] === "quantfit_start").at(-1)[1].spec;
+  assert.deepEqual(spec.compare, { kind: "general", run: "run1" });
+  b.run(`onQuantfitEvent(${JSON.stringify({ kind: "done", data: result({ files: [{ path: "/q/a.gguf" }], comparison: { promotion: [{ id: "1", promoted: true, reason: "Mixed: measured fit to a size (0.00 GB smaller than Q4_K_M) is 25.0 % closer to the 16-bit model, more than the measurement noise: it is worth keeping." }], verdict: ["Mixed is better."] } }) })})`);
+  html = b.run("renderUse()");
+  assert.match(html, /id="qf-promotion">Mixed: measured fit to a size \(0.00 GB smaller than Q4_K_M\) is 25.0 % closer[^<]*worth keeping/); assert.match(html, /id="qf-verdict"><li>Mixed is better\.<\/li>/); assert.match(html, /id="qf-ok">The files are made\./);
+  assert.doesNotMatch(html, /Dynamic|UD-/i);
+});
+
+test("the page loads the box's state when it is opened, and a refusal below the minimum is shown", async () => {
+  const b = browser({ quantfit_state: qfState() });
+  page(b, exportState({ mixed_quants: measuredQuants }), `qf.open = true; qf.state = null`);
+  await b.run("qfLoad()");
+  assert.equal(b.calls.at(-1)[0], "quantfit_state");
+  assert.match(b.run("renderUse()"), /<option value="\/p\/exports\/other\/model-f16.gguf"/);
+  b.run(`qf.state.verdict = {target_gb: 10.6, verdict: ["Mixed is better."]}`);
+  assert.match(b.run("renderUse()"), /id="qf-lastverdict">Last verdict \(10.6 GB\): Mixed is better\./);
+});

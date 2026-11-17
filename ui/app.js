@@ -644,6 +644,7 @@ function mixedBox(st) {
   const files = (st.mixed && st.mixed.files) || [];
   const boxes = mixed.map(usQuantBox).join(" ");
   const fitOn = us.quants.includes("mixed_fit");
+  const measuredOn = us.quants.includes("mixed_measured");
   const lib = (st.imatrix && st.imatrix.library) || [];
   const fileOpts = files.map((f) => `<option value="${esc(f.path)}" ${usMixedFile(st) === f.path ? "selected" : ""}>${esc(f.label)}</option>`).join("") + `<option value="__typed" ${us.mx.file === "__typed" ? "selected" : ""}>A GGUF file I choose…</option>`;
   const detail = any ? `${us.im ? "" : llamaNotice("all")}<p class="dim small" id="us-mxwhy">Made with llama.cpp: <code>llama-quantize</code> gives single tensors their own types. If Unsloth is the back end that would make the files, llama.cpp makes the <em>whole batch</em> instead (Unsloth cannot do per-tensor types) and the result says so. More bits go to the embedding and output tensors, the attention k / v / output, the linear-attention projections, ffn_down and the first and last layers; fewer to the ffn_up / gate of the middle layers. The importance matrix, when you use one, is applied to these sizes too. <strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}</strong>: they are our own recipes, not copies of anyone else's, and nobody has measured yet whether they beat the plain sizes: that is what <strong>Compare quants</strong> is for.</p>
@@ -652,8 +653,140 @@ function mixedBox(st) {
     ${fitOn ? `<div class="row" id="us-mxfitbox"><strong>Fit to a size (experimental)</strong> <label>Target size <input type="text" id="us-mxtarget" value="${esc(us.mx.target)}" placeholder="12.5" style="min-width:80px;flex:0"> GB</label>
       <label>Statistics from <select id="us-mxmatrix"><option value="">the matrix of this export</option>${lib.map((e) => `<option value="${esc(e.id)}" ${us.mx.matrix === e.id ? "selected" : ""}>${esc(e.label || e.id)}</option>`).join("")}</select></label><button class="secondary" id="us-mxfitbtn" ${us.mx.busy || !usMixedFile(st) || !(+us.mx.target > 0) ? "disabled" : ""}>Work out the rules</button></div>
       <p class="dim small">Experimental, and said so: every large tensor starts at the lowest type and the ones the matrix says matter most per extra byte get more bits until the size is used. It is a <strong>guess</strong> from the matrix's per-tensor statistics, not a measurement. It needs a saved matrix (without one, the closest recipe is used instead and the result says so). Press the button to see the rules before you export.</p>${!(+us.mx.target > 0) ? `<p class="warn small" id="us-mxtargetwhy">Give the size in GB that the fit should aim for.</p>` : ""}` : ""}
+    ${measuredOn ? measuredFields(lib) : ""}
     ${mixedPlanHtml()}` : "";
-  return `<div class="row mixedbox"><span class="quants"><strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}:</strong> ${boxes}</span></div>${detail}`;
+  return `<div class="row mixedbox"><span class="quants"><strong>${esc((st.mixed || {}).recipe || "Mixed precision (our own recipe)")}:</strong> ${boxes}</span></div>${detail}${qfBox()}`;
+}
+
+// ------------------------------------------------------------------------------------------------ Mixed: measured fit to a size (docs/MIXED_QUANTS.md "Fit to a size (measured)")
+const QF_LADDER = ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"];
+const qf = { open: false, state: null, loading: false, file: "", typed: "", matrix: "", target: "", floor: "Q3_K", ceiling: "Q8_0", rows: 128, engine: "auto", est: null, estBusy: false, estError: "",
+  running: false, step: "", progress: null, log: [], result: null, error: "", ok: "", stopped: false, make: false, compare: false, text: "data" };
+
+function qfFile() {
+  if (qf.file === "__typed") return qf.typed.trim();
+  if (qf.file) return qf.file;
+  const r = ((qf.state || {}).references || [])[0];
+  return r ? r.path : "";
+}
+
+function qfSpec(extra) {
+  return { gguf: qfFile(), matrix: qf.matrix || null, target_gb: Number(qf.target) || 0, floor: qf.floor, ceiling: qf.ceiling, sample_rows: Number(qf.rows) || 0, engine: qf.engine,
+    make: qf.make, neighbours: qf.make, compare: qf.make && qf.compare ? { kind: qf.text === "general" ? "general" : "data", run: us.run || null } : null, ...(extra || {}) };
+}
+
+const qfGb = (n) => (n == null ? "?" : (+n).toFixed(2));
+
+function qfResultHtml() {
+  const r = qf.result;
+  if (!r) return "";
+  const rep = r.report || {};
+  const rows = (rep.rows || []).map((x) => `<tr${x.id === "plan" ? ' class="qk-front"' : ""}><td>${esc(x.label)}</td><td>${qfGb(x.gb)} GB</td><td>${x.error}</td></tr>`).join("");
+  const types = Object.entries(rep.types || {}).map(([t, v]) => `${esc(t)}: ${v.tensors} tensors`).join(", ");
+  const roles = Object.entries(rep.bpw_by_role || {}).map(([k, v]) => `${esc(k)} ${v}`).join(" · ");
+  const cmp = r.comparison || null;
+  const prom = ((cmp && cmp.promotion) || []).map((x) => `<p class="${x.promoted ? "ok" : "dim"} small" id="qf-promotion">${esc(x.reason)}</p>`).join("");
+  const verdict = cmp && cmp.verdict ? `<ul class="small" id="qf-verdict">${cmp.verdict.map((v) => `<li>${esc(v)}</li>`).join("")}</ul>` : "";
+  return `<div id="qf-result"><p class="small"><strong>${r.fits ? "Plan" : "The size is below the smallest this model can be"}:</strong> ${qfGb((r.plan || {}).total / 1e9)} GB (measured with the ${esc(r.engine)} engine${r.fits ? "" : ", the smallest plan is shown"}).</p>
+    <table class="qk-table"><thead><tr><th>${esc("Plan against the plain sizes")}</th><th>Size</th><th>Predicted weighted error</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="dim small">Types chosen: ${types}.<br>Bits per weight by role: ${roles}.</p>
+    <details><summary>The ${(r.rules || []).length} rules this gives</summary><pre class="log">${(r.flags || []).slice(0, 4).concat((r.rules || []).map((x) => "--tensor-type " + x)).map(esc).join("\n")}</pre></details>
+    ${(r.notes || []).map((n) => `<p class="warn small">${esc(n)}</p>`).join("")}
+    <p class="dim small" id="qf-caveat">${esc(rep.caveats || (qf.state || {}).caveats || "")}</p>${prom}${verdict}</div>`;
+}
+
+function qfBox() {
+  const q = qf.state;
+  const refs = (q && q.references) || [];
+  const lib = ((us.state || {}).imatrix || {}).library || [];
+  const opts = (list, cur) => list.map((x) => `<option value="${x}" ${cur === x ? "selected" : ""}>${x}</option>`).join("");
+  const fileOpts = refs.map((f) => `<option value="${esc(f.path)}" ${qfFile() === f.path ? "selected" : ""}>${esc(f.label)}</option>`).join("") + `<option value="__typed" ${qf.file === "__typed" ? "selected" : ""}>A 16-bit GGUF I choose…</option>`;
+  const e = qf.est;
+  const plain = e && e.plain_estimates ? e.plain_estimates : {};
+  const gb = Number(qf.target) || 0;
+  const why = !qfFile() ? "Choose the 16-bit GGUF file." : !(gb > 0) ? "Give the size in GB." : "";
+  const below = e && e.min_gb != null && gb > 0 && gb < e.min_gb ? `<p class="warn small" id="qf-below">${gb} GB is below the smallest this model can be with ${esc(qf.floor)} as the lowest type (${qfGb(e.min_gb)} GB). Ask for more, or lower the lowest type.</p>` : "";
+  const estHtml = qf.estBusy ? `<p class="dim small">Reading the file's header…</p>` : qf.estError ? `<p class="warn small" id="qf-esterror">${esc(qf.estError)}</p>` : e ? `<div class="small" id="qf-est"><strong>${esc(e.minutes_note || "")}</strong>
+      <br>Engine: ${esc(e.engine)}${e.llama_quantize ? ` (llama-quantize found${e.llama_version ? ", " + esc(e.llama_version) : ""}; <code>--tensor-type-file</code> ${e.tensor_type_file ? "yes" : "no"})` : " (llama-quantize not found: the numpy engine measures; making the file needs llama.cpp)"}.
+      <br>Looks at ${(e.sampled_weights / 1e6).toFixed(0)} million weights (${(e.read_bytes / 1e9).toFixed(2)} GB read)${e.disk_need ? `, needs about ${(e.disk_need / 1e9).toFixed(1)} GB of free disk for its sample file` : ""}. Smallest ${qfGb(e.min_gb)} GB, largest ${qfGb(e.max_gb)} GB (the vision file is separate and not counted). Plain sizes: ${Object.entries(plain).map(([k, v]) => `${esc(k)} about ${v} GB`).join(", ")}.
+      ${(e.notes || []).map((n) => `<br><span class="warn">${esc(n)}</span>`).join("")}</div>` : "";
+  const prog = qf.running ? `<div class="progress"><div style="width:${Math.round((qf.progress || 0) * 100)}%"></div></div><p class="dim small" id="qf-step">${esc(qf.step)}</p>` : "";
+  const busy = qf.running;
+  return `<details id="qf-box" ${qf.open ? "open" : ""}><summary><strong>Fit to a size (measured)</strong> · each tensor's error is measured on your weights</summary>
+    <p class="dim small">Starts from a <strong>16-bit GGUF</strong> (the <code>model-f16.gguf</code> an export makes) and an importance matrix. It measures what every type (Q2_K to Q8_0) does to every tensor on a sample of rows, weighted by the matrix, and gives each tensor the type that spends the bytes best for the size you ask. It is a <strong>measurement of the weights, not of the model</strong>: <strong>Compare quants</strong> (KL divergence) is the judge.</p>
+    ${q ? "" : `<p class="dim small">Loading…</p>`}
+    <div class="row"><label>16-bit file <select id="qf-file">${fileOpts}</select></label>${qf.file === "__typed" ? `<input type="text" id="qf-typed" value="${esc(qf.typed)}" placeholder="C:\\models\\model-f16.gguf" style="min-width:260px">` : ""}
+      <label>Importance matrix <select id="qf-matrix"><option value="">none (every channel counts the same)</option>${lib.map((m) => `<option value="${esc(m.id)}" ${qf.matrix === m.id ? "selected" : ""}>${esc(m.label || m.id)}</option>`).join("")}</select></label></div>
+    <p class="dim small">For a model you cut or healed, use the matrix adapted to it (Importance matrices page, Adapt); a matrix of another model is refused.</p>
+    <div class="row"><label>Target size <input type="text" id="qf-target" value="${esc(qf.target)}" placeholder="10.6" style="min-width:80px;flex:0"> GB</label>${gb > 0 ? `<span class="dim small" id="qf-gib">= ${(gb * 1e9 / 1073741824).toFixed(2)} GiB</span>` : ""}
+      <button class="secondary" id="qf-q4" ${plain.Q4_K_M ? "" : "disabled"} title="Needs the estimate">same size as Q4_K_M</button><button class="secondary" id="qf-q5" ${plain.Q5_K_M ? "" : "disabled"} title="Needs the estimate">same size as Q5_K_M</button></div>
+    <details><summary>More settings</summary><div class="row"><label>Rows looked at per tensor <select id="qf-rows">${[64, 128, 256, 512].map((n) => `<option value="${n}" ${+qf.rows === n ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+      <label>Lowest type <select id="qf-floor">${opts(QF_LADDER, qf.floor)}</select></label><label>Highest type <select id="qf-ceiling">${opts(QF_LADDER, qf.ceiling)}</select></label>
+      <label>Measured with <select id="qf-engine">${opts(["auto", "llama", "reference"], qf.engine)}</select></label></div></details>
+    <div class="row"><button class="secondary" id="qf-estbtn" ${busy || qf.estBusy || !qfFile() ? "disabled" : ""}>Estimate</button>
+      <button class="primary" id="qf-run" ${busy || why ? "disabled" : ""}>${qf.stopped ? "Resume" : "Measure and plan"}</button>${busy ? `<button class="secondary" id="qf-stop">Stop</button>` : ""}</div>
+    <div class="row"><label class="opt"><input type="checkbox" id="qf-make" ${qf.make ? "checked" : ""}> Make the file (and the plain sizes next to it)</label>
+      <label class="opt"><input type="checkbox" id="qf-compare" ${qf.compare ? "checked" : ""} ${qf.make ? "" : "disabled"}> and compare them</label>
+      <label>on <select id="qf-text" ${qf.make && qf.compare ? "" : "disabled"}><option value="data" ${qf.text === "data" ? "selected" : ""}>the held-out part of my saved data</option><option value="general" ${qf.text === "general" ? "selected" : ""}>general text</option></select></label></div>
+    ${why ? `<p class="dim small" id="qf-why">${esc(why)}</p>` : ""}${below}${estHtml}${prog}
+    ${qf.error ? `<div class="warn small" id="qf-error">${esc(qf.error)}</div>` : ""}${qf.ok ? `<p class="ok small" id="qf-ok">${esc(qf.ok)}</p>` : ""}${qfResultHtml()}
+    ${q && q.verdict && !qf.result ? `<p class="dim small" id="qf-lastverdict">Last verdict (${esc(String(q.verdict.target_gb))} GB): ${esc(((q.verdict.verdict || [])[0]) || "")}</p>` : ""}</details>`;
+}
+
+async function qfLoad() {
+  if (qf.loading) return;
+  qf.loading = true;
+  try { qf.state = await invoke("quantfit_state"); } catch (e) { qf.error = String(e); }
+  qf.loading = false;
+  if (page === "use") render();
+}
+
+async function qfEstimate() {
+  qf.estBusy = true; qf.estError = ""; qf.est = null; render();
+  try { qf.est = await invoke("quantfit_estimate", { spec: qfSpec({ make: false, neighbours: false, compare: null }) }); } catch (e) { qf.estError = String(e); }
+  qf.estBusy = false; render();
+}
+
+async function qfRun() {
+  qf.running = true; qf.error = ""; qf.ok = ""; qf.result = null; qf.log = []; qf.step = "Starting…"; qf.progress = null; qf.stopped = false; render();
+  try { await invoke("quantfit_start", { spec: qfSpec() }); } catch (e) { qf.running = false; qf.error = String(e); qf.step = ""; render(); }
+}
+
+function onQuantfitEvent(p) {
+  if (p.kind === "log") qf.log.push(p.text);
+  else if (p.kind === "progress") { if (p.text) qf.step = p.text; if (p.value != null) qf.progress = p.value; }
+  else if (p.kind === "done") {
+    qf.running = false; qf.progress = null; qf.step = ""; qf.stopped = false; qf.result = p.data || null; qf.error = "";
+    qf.ok = qf.result && qf.result.files && qf.result.files.length ? "The files are made." : "The plan is ready.";
+    qfLoad();
+  } else if (p.kind === "error") {
+    qf.running = false; qf.progress = null; qf.step = "";
+    if (p.text === "Cancelled.") { qf.stopped = true; qf.error = "Stopped. What was measured is kept: press Resume to go on."; } else qf.error = p.text;
+  }
+  if (page === "use") render();
+}
+
+function wireQuantfit() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const sel = (id, key, redraw) => { const e = $(id); if (e) e.onchange = () => { qf[key] = e.value; qf.stopped = false; if (redraw) render(); }; };
+  const d = $("qf-box"); if (d) d.ontoggle = () => { qf.open = !!d.open; if (qf.open && !qf.state) qfLoad(); };
+  if (qf.open && !qf.state && !qf.loading) qfLoad();
+  sel("qf-file", "file", true); sel("qf-typed", "typed", true); sel("qf-matrix", "matrix", false); sel("qf-rows", "rows", false); sel("qf-floor", "floor", true); sel("qf-ceiling", "ceiling", false); sel("qf-engine", "engine", false); sel("qf-text", "text", false);
+  const tg = $("qf-target"); if (tg) tg.onchange = () => { qf.target = tg.value.trim(); qf.stopped = false; render(); };
+  const mk = $("qf-make"); if (mk) mk.onchange = () => { qf.make = mk.checked; if (!qf.make) qf.compare = false; render(); };
+  const cp = $("qf-compare"); if (cp) cp.onchange = () => { qf.compare = cp.checked; render(); };
+  on("qf-q4", () => { if (qf.est && qf.est.plain_estimates.Q4_K_M) { qf.target = String(qf.est.plain_estimates.Q4_K_M); render(); } });
+  on("qf-q5", () => { if (qf.est && qf.est.plain_estimates.Q5_K_M) { qf.target = String(qf.est.plain_estimates.Q5_K_M); render(); } });
+  on("qf-estbtn", qfEstimate);
+  on("qf-run", qfRun);
+  on("qf-stop", () => invoke("quantfit_stop"));
+}
+
+// the measured size on the export page: the target and the matrix that weights it (the same fields as "Fit to a size")
+function measuredFields(lib) {
+  return `<div class="row" id="us-mmbox"><strong>Mixed: measured fit to a size</strong> <label>Target size <input type="text" id="us-mmtarget" value="${esc(us.mm.target)}" placeholder="10.6" style="min-width:80px;flex:0"> GB</label>
+      <label>Importance matrix <select id="us-mmmatrix"><option value="">the matrix of this export</option>${lib.map((e) => `<option value="${esc(e.id)}" ${us.mm.matrix === e.id ? "selected" : ""}>${esc(e.label || e.id)}</option>`).join("")}</select></label></div>
+      <p class="dim small">Measures what every type does to every tensor of this model after it is converted (a sample of the rows, weighted by the matrix) and gives each tensor the type that spends the bytes best. The measures are kept, so a second size is quick. If it cannot be done, the guessed fit is used and the result says so. Judge it with <strong>Compare quants</strong>.</p>${!(+us.mm.target > 0) ? `<p class="warn small" id="us-mmtargetwhy">Give the size in GB that the measured fit should aim for.</p>` : ""}`;
 }
 
 async function usMixedPlan(withFit) {
@@ -664,7 +797,7 @@ async function usMixedPlan(withFit) {
 }
 
 
-let us = { mx: { file: "", typed: "", target: "", matrix: "", plan: null, busy: false, error: "", key: "" }, state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", imCheck: null, imAdd: false, imAddLabel: "", server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
+let us = { mx: { file: "", typed: "", target: "", matrix: "", plan: null, busy: false, error: "", key: "" }, mm: { target: "", matrix: "" }, state: null, run: "", what: "gguf", quant: "q4_k_m", quants: ["q4_k_m"], numCtx: 8192, im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", imCheck: null, imAdd: false, imAddLabel: "", server: "", modelName: "", running: false, step: "", progress: null, log: [], error: null, ok: null, probe: null, check: null, adding: false };
 const copyBtn = (text) => `<button class="link" data-copy="${esc(text)}">Copy</button>`;
 
 function nextnHtml(im) {
@@ -743,7 +876,7 @@ function renderUse() {
     ${mixedBox(st)}${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
     ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) || (us.what !== "merged" && us.quants.includes("mixed_measured") && !(+us.mm.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
@@ -813,7 +946,9 @@ async function setState_() { try { setState(await invoke("get_state")); } catch 
 function usMakeArgs() {
   return { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
     imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null,
-    ...(us.what !== "merged" && us.quants.includes("mixed_fit") ? { mixed: { fit: { target_gb: Number(us.mx.target), matrix: us.mx.matrix || null } } } : {}) };
+    ...(us.what !== "merged" && (us.quants.includes("mixed_fit") || us.quants.includes("mixed_measured"))
+      ? { mixed: { ...(us.quants.includes("mixed_fit") ? { fit: { target_gb: Number(us.mx.target), matrix: us.mx.matrix || null } } : {}),
+                   ...(us.quants.includes("mixed_measured") ? { measured: { target_gb: Number(us.mm.target), matrix: us.mm.matrix || null } } : {}) } } : {}) };
 }
 
 async function usRun(kind, cmd, args) {
@@ -833,6 +968,9 @@ function wireUse() {
   const mxt = $("us-mxtyped"); if (mxt) mxt.onchange = () => { us.mx.typed = mxt.value; us.mx.plan = null; };
   const mxg = $("us-mxtarget"); if (mxg) mxg.onchange = () => { us.mx.target = mxg.value.trim(); render(); };
   const mxm = $("us-mxmatrix"); if (mxm) mxm.onchange = () => { us.mx.matrix = mxm.value; };
+  const mmt = $("us-mmtarget"); if (mmt) mmt.onchange = () => { us.mm.target = mmt.value.trim(); render(); };
+  const mmm = $("us-mmmatrix"); if (mmm) mmm.onchange = () => { us.mm.matrix = mmm.value; };
+  wireQuantfit();
   on("us-mxplanbtn", () => usMixedPlan(false));
   on("us-mxfitbtn", () => usMixedPlan(true));
   const imx = $("us-im"); if (imx) imx.onchange = () => { us.im = imx.checked; render(); };
@@ -3497,7 +3635,7 @@ async function go(key) {
 }
 
 // A job that has written nothing for a long time (the program sends {kind: "stall", minutes} on the job's own channel): one banner for every page. It only warns.
-const STALL_CHANNELS = ["train-event", "reshape-event", "env-event", "export-event", "imatrix-event", "quantcheck-event", "unsloth-event", "server-event", "test-event", "teacher-event", "bench-event"];
+const STALL_CHANNELS = ["train-event", "reshape-event", "env-event", "export-event", "imatrix-event", "quantcheck-event", "quantfit-event", "unsloth-event", "server-event", "test-event", "teacher-event", "bench-event"];
 function onStallEvent(ev) {
   const box = $("stall");
   if (!box || !ev || typeof ev !== "object") return;
@@ -3537,6 +3675,7 @@ async function init() {
   try { await tauri.event.listen("export-event", (e) => onExportEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("imatrix-event", (e) => onImatrixEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("quantcheck-event", (e) => onQuantcheckEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("quantfit-event", (e) => onQuantfitEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }

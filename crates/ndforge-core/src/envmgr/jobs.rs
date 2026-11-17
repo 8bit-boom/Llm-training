@@ -73,7 +73,7 @@ pub fn stall_minutes(job: &Value) -> f64 {
         return m;
     }
     match job["job"].as_str() {
-        Some("distill_cache") | Some("export") | Some("imatrix_make") => 60.0,
+        Some("distill_cache") | Some("export") | Some("imatrix_make") | Some("quantfit") => 60.0,
         _ => 20.0,
     }
 }

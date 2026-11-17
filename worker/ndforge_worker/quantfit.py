@@ -579,7 +579,7 @@ def run_job(job: dict) -> dict:
     result = {"plan": plan.to_dict(), "report": r["report"], "rules": [f"{rx}={t}" for rx, t in rs], "flags": fl, "files": [], "measure_key": r["key"], "engine": r["engine"], "notes": r["notes"],
               "fits": plan.fits, "min_gb": round(plan.min_bytes / 1e9, 3), "target_gb": float(job["target_gb"]), "base": base_ftype(plan.total * 8 / max(_params(src), 1))}
     result["plan"]["assign"] = plan.assign
-    _save_plan(Path(job.get("cache_dir") or Path(gguf).parent / "quantfit") / r["key"], job["target_gb"], {k: result[k] for k in ("plan", "report", "rules", "engine", "measure_key", "notes", "fits")})
+    _save_plan(Path(job.get("cache_dir") or Path(gguf).parent / "quantfit") / r["key"], job["target_gb"], {k: result[k] for k in ("plan", "report", "rules", "engine", "measure_key", "notes", "fits", "target_gb")})
     if job.get("make"):
         if not plan.fits:
             result["notes"].append(f"The file was not made: even the lowest types need {plan.min_bytes / 1e9:.2f} GB, more than the {job['target_gb']} GB asked for.")

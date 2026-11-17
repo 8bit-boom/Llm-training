@@ -14,6 +14,7 @@ pub fn job_name(kind: &str) -> &'static str {
         "auto" => "Auto-cut",
         "export" => "The export",
         "quantcheck" => "Compare quants",
+        "quantfit" => "The measured fit",
         "imatrix_make" => "The importance matrix",
         _ => "The job",
     }

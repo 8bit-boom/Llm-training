@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::envmgr::health::{Check, Light};
 use crate::project::Project;
 
-pub const KINDS: [&str; 8] = ["auto", "heal", "export", "think_check", "quantcheck", "imatrix_make", "cut", "train"];
+pub const KINDS: [&str; 9] = ["auto", "heal", "export", "think_check", "quantcheck", "quantfit", "imatrix_make", "cut", "train"];
 
 /// How much a job needs llama.cpp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +206,7 @@ pub fn gather(p: Option<&Project>, kind: &str, spec: &Value) -> Inputs {
     let mixed = strs(&spec["quants"]).iter().any(|q| q.starts_with("mixed"));
     let llama = match kind {
         "quantcheck" | "imatrix_make" | "auto" => Need::Yes,
+        "quantfit" if spec["make"].as_bool() == Some(true) => Need::Yes,
         "export" if exports_gguf && (mixed || spec["imatrix"].as_bool() == Some(true)) => Need::Yes,
         "export" if exports_gguf => Need::Maybe,
         _ => Need::No,
