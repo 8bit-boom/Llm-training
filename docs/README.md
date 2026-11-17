@@ -21,7 +21,7 @@ Start with the root [README](../README.md). The documents below describe what is
 | [HEAL_ANY_MODEL.md](HEAL_ANY_MODEL.md), [HEAL_SETTINGS.md](HEAL_SETTINGS.md) | Healing: any model, the settings, graphics memory, the teacher cache |
 | [GENERAL_TEXT.md](GENERAL_TEXT.md) | The general text mixed into healing and the importance matrix |
 | [THINKING_CHECK.md](THINKING_CHECK.md) | The thinking check, and how Stop ends everything a job started |
-| [IMATRIX.md](IMATRIX.md), [MIXED_QUANTS.md](MIXED_QUANTS.md), [QUANT_COMPARE.md](QUANT_COMPARE.md) | The GGUF export: importance matrix, mixed sizes, comparing sizes |
+| [IMATRIX.md](IMATRIX.md), [MIXED_QUANTS.md](MIXED_QUANTS.md), [QUANT_COMPARE.md](QUANT_COMPARE.md) | The GGUF export: importance matrix, mixed sizes (including the measured fit to a size), comparing sizes |
 | [PRUNE_QWEN38_27B.md](PRUNE_QWEN38_27B.md) | A worked example with the 27B model |
 | [REAL_RUN_17B.md](REAL_RUN_17B.md) | A real run cutting a 27 B model to about 17 B: the numbers, what went wrong, and the rules that came out of it |
 
@@ -31,6 +31,11 @@ Start with the root [README](../README.md). The documents below describe what is
 | [BUNDLE_FORMAT.md](BUNDLE_FORMAT.md) | The `.ndtrain` training bundle |
 | [UNSLOTH_API_CONTRACT.md](UNSLOTH_API_CONTRACT.md) | The Unsloth calls both products share |
 | [WORKER_CONTRACT.md](WORKER_CONTRACT.md) | The worker's job types, events and error codes (`contract.json`) |
+
+## Licences
+| Document | What it is about |
+| --- | --- |
+| [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | The MIT-licensed work this program includes or is derived from (llama.cpp / ggml, gguf-py, quant-convert-gui) |
 
 ## Historical plans (not the current state)
 | Document | |

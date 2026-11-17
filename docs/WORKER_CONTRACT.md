@@ -15,3 +15,7 @@ What a consumer may rely on is written down in **`worker/ndforge_worker/contract
 The Unsloth side: `tests/fixtures/unsloth/*.json` and `docs/UNSLOTH_API_CONTRACT.md` are meant to be identical in both repositories. `tests/fixtures/unsloth/SHA256SUMS` records the fixtures (of the text with LF line endings);
 a test checks it, so a change to a fixture is always a conscious one. The workflow `contract-drift.yml` compares nd-world's copies with these (weekly, and by hand) when the secret `NDWORLD_READ_TOKEN` (a read-only token for
 nd-world) is set; without it the job says "skipped" and passes. Nothing in nd-world is changed by any of this.
+
+## The measured fit (added names)
+
+New jobs `quantfit_estimate` (what the measured fit will do, from the header of a 16-bit GGUF only) and `quantfit` (measure, plan, optionally make the file and the plain sizes next to it; its result has `plan`, `report`, `rules`, `flags`, `files`, `measure_key`, `engine`, `notes`, `fits`), and the error codes `quantfit_failed` (a plain-language text) and `quantfit_stopped`; `llama_cpp_missing` is also used when a file is to be made and llama.cpp is not there. No new event. The export job also accepts the size id `mixed_measured` with the job key `mixed_measured` and answers with `mixed[<size>].measured`; the results of `quantcheck` gain the key `promotion` and the test text the kind `general`. Only additions: nothing was renamed or removed. See docs/MIXED_QUANTS.md ("Fit to a size (measured)").

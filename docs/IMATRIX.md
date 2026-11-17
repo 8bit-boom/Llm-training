@@ -77,6 +77,10 @@ Per export folder (`exports/<run>-<size>/`), next to the GGUFs, in **every** exp
 
 **Reuse.** A later export of the same run reuses a saved matrix instead of measuring again when `model`, `weights`, `data_hash`, `chunks`, `ctx`, `general_share`, `general` (the dataset: id or file, config, split, column, share, seed; a matrix saved before this key existed counts as made from other data) and `nextn` (see below) are all equal (the checkbox "Reuse the saved matrix" is on whenever one exists; untick it to measure again). A matrix that was made without general text (offline at the time) is **not** reused while general text is wanted. The page checks only that a matrix of the run exists; the worker does the exact comparison.
 
+## How the measured fit uses the matrix
+
+"Mixed: measured fit to a size" (docs/MIXED_QUANTS.md) weights the error of every tensor by the matrix: `in_sum2` divided by the number of tokens is how much energy arrives on each input channel, and an error on a busy channel counts more. Use the matrix **made for the model you are fitting**: for a model you cut or healed, the one measured on it or the one adapted to it (Adapt, above); a matrix whose statistics do not match the tensors is refused ("this matrix is not of this model; adapt it first"). The real matrix has one dimension per tensor (`in_sum2` is `[n_in]`, `counts` one value) and no entry for `output.weight` or `token_embd.weight` unless `llama-imatrix` ran with `--process-output`; the measured fit pins those two tensors for that reason, and a tensor with no entry (the speculative-decoding head without `--nextn`) gets the median importance, with a note. A `.dat` matrix cannot be used. Without any matrix the fit counts every input channel the same and says so.
+
 ## Defaults (owner decisions)
 
 | | |

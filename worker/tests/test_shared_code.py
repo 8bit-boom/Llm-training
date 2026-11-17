@@ -27,3 +27,17 @@ def test_golden_fixture_is_the_one_ggml_made():
     p = Path(__file__).parent / "fixtures" / "kquants_golden.npz"
     assert p.stat().st_size < 40_000
     assert hashlib.sha256(p.read_bytes()).hexdigest() == "ad85273498165f6de953cf983705359995d7b63fa683daa07ea5c71fdf87df36"
+
+
+MIXEDQUANT_SHARED_SHA256 = "324b473046820b3a38f3348b5282308eb1e19a67f58a3c8854f7c218e8eec613"
+
+
+def test_mixedquant_shared_section_hash():
+    """quant-convert-gui's quant_gui/mixed_quant.py is a port of this file (from `import heapq` to just before `run_plan`; only the import line and `run_plan` differ there). A change to the
+    shared section is a change the port has to follow."""
+    text = (WORKER / "mixedquant.py").read_bytes().decode("utf-8")
+    shared = text[text.index("import heapq"):text.index("def run_plan")]
+    got = hashlib.sha256(shared.encode("utf-8")).hexdigest()
+    assert got == MIXEDQUANT_SHARED_SHA256, (
+        "quant-convert-gui/quant_gui/mixed_quant.py is a port of this file; update the port there (outside this repo) and this hash "
+        f"(the shared section of ndforge_worker/mixedquant.py now hashes to {got})")

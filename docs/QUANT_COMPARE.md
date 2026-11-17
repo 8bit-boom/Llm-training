@@ -43,6 +43,12 @@ For a 248,320-word vocabulary: 16 chunks of 512 = about **2.0 GB** (4,080 compar
 
 Sorted by size. The chart plots mean KLD (y, log scale when the values differ by more than a factor of 30) against size (x); the **Pareto line** joins the files that no smaller file beats (lower left is better), computed in the worker (`quantcheck.pareto`) and stored in `results.json`. The words (`quantcheck.verdict`): the smallest and the closest file, which files are on the line, which are not worth it (a smaller file is at least as close), "at about X GB, Y keeps the most", for sizes that exist with and without a matrix "Q4_K_M with an importance matrix is N % closer than without", for mixed-precision files the plain size nearest in file size, and the last sentence that KLD is a proxy.
 
+## Promotion of a measured file, and the general test text
+
+`results.json` has a key `promotion`: for every finished **mixed** row M, `quantcheck.promotion(rows)` names the plain row P to hold it against (the largest plain file with a size up to 1.01 x M's, else the smallest plain file) and says whether M is promoted: `M.mean_kld + sqrt(uM^2 + uP^2) < P.mean_kld`, where u are the plus-minus figures llama-perplexity prints (taken as 0 when one is missing, which the sentence says). A smaller difference is "a tie within measurement noise" and is not promoted. The sentence (`reason`) also says how the next bigger plain file compares ("Q5_K_M is 0.8 GB larger and X % closer"); the verdict list gets one such sentence per mixed row. Auto-cut publishes a measured file only when it is promoted.
+
+The test text has a third kind, `general`: `{"kind": "general", "source": ..., "tokenizer": ..., "seed": 1234}`, general text read like the calibration's general share (a Hugging Face dataset or a file). It is for a model folder that has no data of this project (Auto-cut without saved data). It may overlap the general sample the importance matrix was measured on a little, which makes every file look slightly better, about equally; a note says so.
+
 ## Everything that can go wrong (never fatal)
 
 | Situation | What the page says (shortened) |
