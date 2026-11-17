@@ -183,6 +183,8 @@ Training and healing check a checkpoint before they continue from it (`worker/nd
 
 The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
 
+The documents are listed in [docs/README.md](docs/README.md); `PLAN.md`, `docs/RESHAPE_PLAN.md` and `docs/RESHAPE_V2_PLAN.md` are historical plans.
+
 ## The job queue
 
 "Add to queue" next to Start (Auto-cut, export, heal, thinking check, Compare quants) puts the job in `<settings folder>/queue.json` (`ndforge_core::queue`; the arguments are the ones the Start button would send).

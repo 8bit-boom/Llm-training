@@ -2,31 +2,11 @@
 // stand-in browser that records HTML and every call to the program.
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import vm from "node:vm";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { makeBrowser, source } from "./_browser.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(here, "..", "app.js"), "utf8");
 
 function browser(answers = {}, dialogs = []) {
-  const els = {};
-  const el = (id) => (els[id] ??= { id, innerHTML: "", textContent: "", checked: false, value: "", classList: { toggle() {} }, querySelectorAll: () => [], onclick: null, onchange: null, oninput: null, onkeydown: null, scrollTop: 0 });
-  const calls = [];
-  const invoke = async (cmd, args) => {
-    calls.push([cmd, JSON.parse(JSON.stringify(args ?? {}))]);
-    if (cmd in answers) { const a = answers[cmd]; if (typeof a === "function") return a(args); if (a instanceof Error) throw a; return a; }
-    if (cmd === "help") return "<p>help</p>";
-    return null;
-  };
-  const win = { __TAURI__: { core: { invoke }, dialog: { open: async (o) => { calls.push(["dialog.open", o]); return dialogs.shift() ?? null; } }, event: { listen: async () => {} }, webview: { getCurrentWebview: () => ({ onDragDropEvent: async () => {} }) } }, matchMedia: () => ({ matches: false }) };
-  const groups = {};
-  const doc = { getElementById: el, querySelectorAll: (sel) => groups[sel] || [], querySelector: () => null, createElement: () => el("tmp"), body: { appendChild() {} }, documentElement: { setAttribute() {}, removeAttribute() {} } };
-  let confirmed = true;
-  const ctx = vm.createContext({ window: win, document: doc, console, confirm: () => confirmed, setTimeout, clearTimeout });
-  vm.runInContext(source, ctx);
-  return { els, calls, groups, run: (code) => vm.runInContext(code, ctx), confirm: (v) => { confirmed = v; } };
+  return makeBrowser({ answers, dialogs, cloneArgs: true, state: null });
 }
 
 const cand = (over = {}) => ({ path: "/p/exports/run1-q4_k_m/model-q4_k_m.gguf", export: "run1-q4_k_m", run: "run1", quant: "q4_k_m", label: "Q4_K_M, with matrix", group: "Q4_K_M", matrix: true, mixed: null, size_mb: 4100, ...over });

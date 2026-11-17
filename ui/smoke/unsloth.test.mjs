@@ -1,31 +1,11 @@
 // Smoke test of the Unsloth Desktop card in "Training setup" without a window: app.js runs in a stand-in browser that records HTML.
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import vm from "node:vm";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { makeBrowser, source } from "./_browser.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(here, "..", "app.js"), "utf8");
 
 function browser(answers = {}) {
-  const els = {};
-  const el = (id) => (els[id] ??= { id, innerHTML: "", textContent: "", checked: false, value: "", classList: { toggle() {} }, querySelectorAll: () => [], onclick: null, onchange: null, oninput: null, onkeydown: null, scrollTop: 0 });
-  const calls = [];
-  const invoke = async (cmd, args) => {
-    calls.push([cmd, args]);
-    if (cmd in answers) { const a = answers[cmd]; return typeof a === "function" ? a(args) : a; }
-    if (cmd === "get_state") return baseState();
-    if (cmd === "help") return "<p>help</p>";
-    if (cmd === "env_status") return { checks: [], env_installed: true, can_install: true };
-    return null;
-  };
-  const win = { __TAURI__: { core: { invoke }, dialog: {}, event: { listen: async () => {} }, webview: { getCurrentWebview: () => ({ onDragDropEvent: async () => {} }) } }, matchMedia: () => ({ matches: false }) };
-  const doc = { getElementById: el, querySelectorAll: () => [], querySelector: () => null, createElement: () => el("tmp"), body: { appendChild() {} }, documentElement: { setAttribute() {}, removeAttribute() {} } };
-  const ctx = vm.createContext({ window: win, document: doc, console, confirm: () => true, setTimeout, clearTimeout });
-  vm.runInContext(source, ctx);
-  return { ctx, els, calls, run: (code) => vm.runInContext(code, ctx) };
+  return makeBrowser({ answers: { env_status: { checks: [], env_installed: true, can_install: true }, ...answers }, state: baseState });
 }
 
 function baseState(unsloth = null) {

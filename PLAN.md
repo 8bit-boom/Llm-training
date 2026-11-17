@@ -1,5 +1,7 @@
 # ND Lore Forge — plan (revision 4)
 
+> **Historical.** This is the plan the program was started from, kept as it was. The code and the documents listed in [docs/README.md](docs/README.md) are right where they differ.
+
 A desktop program for **Windows and Linux** (written in **Rust**, with a small Python worker only for the training itself) with an easy, guided GUI that turns one nd-world world (its lore, rules and
 mechanics) into training data and fine-tunes a small model on it — **Qwen3.5 2B / 4B / 9B** or **Gemma 4 E2B / E4B**.
 The result is a small **GM model** made for that world, which nd-world can then use for AI Chat, Ask AI, Talk to NPCs and

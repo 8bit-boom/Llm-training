@@ -136,7 +136,7 @@ function renderDataset() {
         <button class="secondary" id="t-trial" ${tc.running ? "disabled" : ""}>Try on 5 pieces first</button>
         ${tc.running ? `<button class="secondary" id="t-stop">Stop</button>` : ""}
         <button class="secondary" id="t-clear" ${tc.running ? "disabled" : ""}>Remove all teacher examples</button></div>
-      ${tc.running || tc.text ? `<div class="stepline">${esc(tc.text)}</div>${tc.progress != null ? `<progress max="1" value="${tc.progress}"></progress>` : ""}` : ""}${rep}</div>`;
+      ${tc.running || tc.text ? `<div class="stepline" aria-live="polite">${esc(tc.text)}</div>${tc.progress != null ? `<progress max="1" value="${tc.progress}"></progress>` : ""}` : ""}${rep}</div>`;
   }
   let summary = "";
   if (sum) {
@@ -255,7 +255,7 @@ function benchHtml(st) {
     <p>Runs a few short real training runs (${16} steps each) with different settings and shows tokens per second and memory for each. Every run loads the model again, so it takes several minutes. Nothing from these runs is kept except the table.</p>
     ${local ? `<div class="row"><label class="opt"><input type="checkbox" id="bn-deep" ${b.deep ? "checked" : ""} ${b.running ? "disabled" : ""}> Also try the attention kernels (with Unsloth too) in a second round with the best batch size, each run twice, and torch.compile, Liger kernels and padding-free batching (much slower; the last three are ignored with Unsloth)</label></div>
     <div class="row"><button class="secondary" id="bn-start" ${b.running || !st.env_ready || tr.running ? "disabled" : ""}>Run the benchmark</button>${b.running ? `<button class="secondary" id="bn-stop">Stop</button>` : ""}</div>` : `<p class="dim">Choose "This computer" under "Where to train": a server's card is tried by training there.</p>`}
-    ${b.running || b.text ? `<div class="stepline">${esc(b.text)}</div>${b.progress != null ? `<progress max="1" value="${b.progress}"></progress>` : ""}` : ""}${b.error ? `<div class="err">${esc(b.error)}</div>` : ""}
+    ${b.running || b.text ? `<div class="stepline" aria-live="polite">${esc(b.text)}</div>${b.progress != null ? `<progress max="1" value="${b.progress}"></progress>` : ""}` : ""}${b.error ? `<div class="err">${esc(b.error)}</div>` : ""}
     ${r ? `<table class="tbl"><tr><th>Setting</th><th>Tokens/s</th><th>vs current</th><th>Memory peak</th></tr>${rows}</table>
       <p class="dim small">${esc(r.model)} · ${r.method} · ${r.steps} steps each · ${esc(r.created)}${r.stopped ? " · stopped early" : ""}. Speeds are measured after the start-up (the first quarter of the steps is left out). A short run can only show big differences${tied.length ? `; ${tied.length} setting${tied.length > 1 ? "s are" : " is"} within noise of the ★` : ""}. ${r.unsloth ? "Unsloth is installed here, so compile, Liger and padding-free were not tried." : ""}</p>
       <div class="row"><button class="primary" id="bn-use" ${useless ? "disabled" : ""}>Use the fastest settings</button>${useless ? `<span class="dim">${best ? "Your current settings are already the fastest." : "No run finished."}</span>` : ""}${b.used ? `<span class="ok">Will be used for the next run: ${esc(b.used)}</span>` : ""}</div>` : ""}</div>`;
@@ -339,7 +339,7 @@ function renderTrain() {
       <label class="opt" title="When a job has finished normally and the queue has nothing more to do, the computer is switched off after a 60-second warning that you can cancel. Not after a stop or an error. Switches itself off again after use."><input type="checkbox" id="tr-shutdown" ${tr.shutdownAfter ? "checked" : ""}> Shut down this computer when the training and the queue have finished</label></div>`;
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
   const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
-    ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
+    ${tr.stepText ? `<div class="stepline" aria-live="polite">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
     ${tr.error ? errDiv(tr.error) : ""}${tr.notice ? `<div class="ok">${esc(tr.notice)}</div>` : ""}
     ${(() => { const m = tr.metrics.at(-1); return m ? `<div class="stats"><span>Step <strong>${m.step}/${m.total_steps}</strong></span><span>Loss <strong>${(+m.loss).toFixed(3)}</strong></span><span>Memory peak <strong>${m.vram_mb ? (m.vram_mb / 1024).toFixed(1) + " GB" : "–"}</strong></span>${m.tok_s ? `<span>Speed <strong>${m.tok_s.toLocaleString()} tokens/s</strong></span>` : ""}${m.pad_pct != null ? `<span title="Share of the computed tokens that are padding (wasted)">Padding <strong>${m.pad_pct} %</strong></span>` : ""}<span>GPU <strong>${m.gpu_temp != null ? m.gpu_temp + " °C" : "–"}</strong></span><span>Time left <strong>${fmtEta(m.eta_s)}</strong></span></div>` : ""; })()}
     ${speedHtml()}${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
@@ -769,7 +769,7 @@ function renderUse() {
     <p><strong>On your TrueNAS server:</strong> add the server above (its Ollama must listen on the network: <code>OLLAMA_HOST=0.0.0.0</code>), install the model there, then set <code>OLLAMA_MODEL</code> as above. The model uses the server's graphics card like any other model.</p>
     <p><strong>nd-world with Unsloth Studio</strong>: the GGUF file in the folder above can be loaded in Studio's Model Hub (local model); then set <code>UNSLOTH_MODEL</code> to it and <code>LLM_CONTEXT_TOKENS</code> to the context length it was loaded with (${us.numCtx}). The chat template inside the file answers without thinking, as the model was trained.</p>
     <div class="warn"><strong>For the game master only.</strong> This model was trained on <em>all</em> of your world's text, including GM secrets, and it will repeat them. If players can use AI in this world ("players can use Ask AI"), turn that off, or keep players on another model.</div></div>` : "";
-  const prog = (us.running || us.step) ? `<div class="stepline">${esc(us.step)}</div>${us.progress != null ? `<progress max="1" value="${us.progress}"></progress>` : ""}${us.running && us.pending === "make" ? ` <button class="secondary" id="us-cancel" title="Stops the export; while the importance matrix is made, llama.cpp is stopped at once">Cancel</button>` : ""}` : "";
+  const prog = (us.running || us.step) ? `<div class="stepline" aria-live="polite">${esc(us.step)}</div>${us.progress != null ? `<progress max="1" value="${us.progress}"></progress>` : ""}${us.running && us.pending === "make" ? ` <button class="secondary" id="us-cancel" title="Stops the export; while the importance matrix is made, llama.cpp is stopped at once">Cancel</button>` : ""}` : "";
   const msg = `${errBox(us.error, "all")}${us.ok ? `<div class="ok">${esc(us.ok)}</div>` : ""}`;
   const log = us.log.length ? `<details><summary>Log</summary><pre class="log">${us.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
   return `<h1>Step 5 · Use in nd-world</h1><p class="lead">Turns the trained model into a file nd-world can use, installs it into Ollama and shows what to set. The help panel explains each part.</p>
@@ -965,7 +965,7 @@ function imFormHtml(st) {
   const incomplete = im.src === "run" ? !runs.length : im.src === "model" ? (im.model === "__typed" ? !im.modelPath.trim() : !im.model) : !im.gguf.trim();
   const calMissing = im.cal === "text" ? !im.textFile.trim() : st.data_version == null;
   const why = !st.env_ready && im.src !== "gguf" ? "The training software is not installed yet (Training setup)." : incomplete ? "Choose the model first." : calMissing ? (im.cal === "text" ? "Choose the text file." : "Save a version of the training data first.") : blocked;
-  const prog = im.running && im.pending === "create" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="llama.cpp is stopped at once; nothing is kept">Stop</button>` : "";
+  const prog = im.running && im.pending === "create" ? `<div class="stepline" aria-live="polite">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="llama.cpp is stopped at once; nothing is kept">Stop</button>` : "";
   return `<div class="card wide"><h2>Create a matrix</h2>
     <div class="row"><label>The model comes from <select id="im-src" ${im.running ? "disabled" : ""}>${srcOpts}</select></label></div>${src}${cal}${chunks}
     ${why ? `<p class="dim small" id="im-why">${esc(why)}</p>` : ""}
@@ -988,7 +988,7 @@ function imMergeHtml(st) {
   const cutInfo = im.mergePub && cutNames.length ? cutNames.map((nm) => { const c = (st.cut_models || []).find((x) => x.name === nm); return `<p class="ok small" id="im-merge-autoadapt">The published matrix is <strong>adapted first</strong> to your cut model <strong>${esc(nm)}</strong>${c ? ` (it keeps ${c.layers_after} of ${c.layers_before} layers${c.thinner ? `; ffn_down ${c.intermediate_before.toLocaleString("en")} → ${c.intermediate_after.toLocaleString("en")} per layer` : ""})` : ""}, because the matrix you ticked was measured on that model. It is never merged as it is: its layers would not be yours. See <em>Adapt to my cut model</em> below.</p>`; }).join("") : "";
   const wrows = imMergeInputs().map((i) => `<li>${esc(i.label)} <label class="opt">weight <input type="number" class="im-mw" data-key="${esc(i.key)}" min="0" step="any" value="${esc(String(im.mergeWeights[i.key] ?? "1"))}" style="width:90px"></label></li>`).join("");
   const why = !st.env_ready ? "The merge runs in the training software's worker, which is not set up yet (open Training setup)." : n < 2 ? "Tick two or more matrices above, or add a file, or use Unsloth's published matrix: a merge needs at least two things." : im.mergePub && !im.mergePubBase ? "Choose the base model." : badWeight ? "A weight must be a number above 0." : "";
-  const prog = im.running && im.pending === "merge" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
+  const prog = im.running && im.pending === "merge" ? `<div class="stepline" aria-live="polite">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
   return `<div class="card wide" id="im-merge"><h2>Merge matrices</h2>${llamaNotice("merge")}
     <p>Combine two or more matrices into a new one: matrices of your own (tick them in the list above), matrix files, and/or <strong>Unsloth's published matrix</strong> for the base model. llama.cpp (<code>llama-imatrix --in-file a --in-file b</code>) does it; the matrices you merge are not changed.</p>
     <div class="warn small"><strong>What merging does, honestly.</strong> Merging <em>adds</em> the statistics of the matrices. A matrix measured on more text therefore outweighs a smaller one: a large published matrix can drown a small one of your own (make yours with more chunks if you want it to count). And Unsloth's published matrix describes the <em>unmodified base model</em>, not your fine-tune: a reasonable start for a light LoRA, less so for a heavily changed model. Matrices are checked against each other from their headers; a mismatch is a warning, and if llama-imatrix refuses, its own message is shown.</div>
@@ -1083,7 +1083,7 @@ function imAdaptHtml(st) {
   const wnum = im.adWeight.trim() === "" ? 1 : Number(im.adWeight);
   const why = !st.env_ready ? "The adaptation runs in the training software's worker, which is not set up yet (open Training setup)." : !cuts.length ? "Make a cut model first." : cut && cut.refusal && !cut.needs_layer_map ? cut.refusal
     : !imAdaptSource(st) ? "Choose the matrix to adapt." : !(wnum > 0) ? "The weight must be a number above 0." : pv && pv.ok === false ? pv.text : "";
-  const prog = im.running && im.pending === "adapt" ? `<div class="stepline">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
+  const prog = im.running && im.pending === "adapt" ? `<div class="stepline" aria-live="polite">${esc(im.step)}</div>${im.progress != null ? `<progress max="1" value="${im.progress}"></progress>` : ""} <button class="secondary" id="im-stop" title="Stops at once; nothing is kept">Stop</button>` : "";
   return `<div class="card wide" id="im-adapt"><h2>Adapt to my cut model</h2>
     <p>A model you cut on the <strong>Slim or grow a model</strong> page has fewer layers and/or thinner MLPs than the model a matrix was measured on. Unsloth publishes the matrix it used for the original model; this card <strong>adapts</strong> a matrix like that to your cut model <em>without measuring anything</em>: the layers your model dropped are dropped from the matrix and the others are renumbered, and the per-neuron statistics of <code>ffn_down</code> are cut to the neurons your model kept. Nothing else of the matrix changes (the other entries look at the hidden state, which Slim does not change).</p>
     <div class="warn small" id="im-ad-honest"><strong>What this is, honestly.</strong> The adapted matrix still describes the <em>unmodified</em> model's activations. For a model that was cut and healed it is an <em>approximation</em>; it is best merged with a matrix of your own, measured on the healed model (use the weight below, and the Merge card). It is <strong>not Unsloth's Dynamic recipe</strong>, which is unpublished and cannot be reproduced here. Whether it improves the small sizes of your cut model is measured with <em>Compare quants</em>; that has not been tried yet.</div>
@@ -1117,7 +1117,7 @@ function renderImatrix() {
       ${r.statistics && r.statistics.lines && r.statistics.lines.length ? `<ul class="small">${r.statistics.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<span class="dim small"> (This llama-imatrix gave no statistics.)</span>`}</div>${mergedPart}` : "");
   const msg = `${errBox(im.error, "imatrix")}${im.ok ? `<div class="ok">${esc(im.ok)}</div>` : ""}`;
   const log = im.log.length ? `<details><summary>Log</summary><pre class="log">${im.log.slice(-100).map(esc).join("\n")}</pre></details>` : "";
-  const prog = im.running && im.pending === "dat" ? `<div class="stepline">${esc(im.step)}</div> <button class="secondary" id="im-stop">Stop</button>` : "";
+  const prog = im.running && im.pending === "dat" ? `<div class="stepline" aria-live="polite">${esc(im.step)}</div> <button class="secondary" id="im-stop">Stop</button>` : "";
   return `<h1>Importance matrices</h1><p class="lead">Measure which parts of a model matter most, keep the result, and use it for better small GGUF files.</p>
     <div class="card wide"><h2>What it is</h2>${IM_INTRO}${llamaNotice("imatrix")}<div class="row"><button class="secondary" id="im-tostep5">Go to Step 5 (make the files)</button></div></div>
     <div class="card wide"><h2>Your matrices</h2>${list}${add}${prog}</div>
@@ -1358,7 +1358,7 @@ function qkFormHtml(st) {
   const why = !st.env_ready ? "The training software is not installed yet (Training setup): it runs the comparison." : qk.refSel === "__file" && !qk.refFile.trim() ? "Choose the 16-bit file."
     : !total ? "Choose at least one file to compare." : qk.text === "file" && !qk.textFile.trim() ? "Choose the text file." : noData ? "Choose the test text (save a data version, or use a text file)."
     : pl && pl.refusal ? pl.refusal : chosen && !chosen.fits ? "That amount of text needs more free disk than there is. Choose fewer chunks." : "";
-  const prog = qk.running ? `<div class="stepline">${esc(qk.step)}</div>${qk.progress != null ? `<progress max="1" value="${qk.progress}"></progress>` : ""} <button class="secondary" id="qk-stop" title="llama.cpp is stopped at once; the files that are finished stay measured">Stop</button>` : "";
+  const prog = qk.running ? `<div class="stepline" aria-live="polite">${esc(qk.step)}</div>${qk.progress != null ? `<progress max="1" value="${qk.progress}"></progress>` : ""} <button class="secondary" id="qk-stop" title="llama.cpp is stopped at once; the files that are finished stay measured">Stop</button>` : "";
   return `<div class="card wide"><h2>New comparison</h2>
     <h3>1 · The 16-bit reference</h3><div class="row"><label>Reference <select id="qk-ref" ${qk.running ? "disabled" : ""}>${refOpts}</select></label></div>${refExtra}
     ${c.references.length ? "" : `<p class="dim small">No 16-bit file was found in your exports (a size "F16" in Step 5 makes one). Choose a file, or let llama.cpp make one.</p>`}
@@ -1550,7 +1550,7 @@ function renderUnsloth() {
       <input type="password" id="un-key" value="${esc(un.key)}" placeholder="${saved ? "API key (leave empty to keep the saved one)" : "API key (sk-unsloth-…)"}" style="min-width:260px" ${un.busy ? "disabled" : ""}><button class="secondary" id="un-test" ${un.busy ? "disabled" : ""}>Test</button></div>
     ${risk ? `<label class="opt"><input type="checkbox" id="un-ack" ${un.ack ? "checked" : ""}> This address is on the internet and not encrypted: the training data (with the GM's secrets) would cross it in plain text. I understand and want to use it anyway.</label>` : ""}
     <div class="row"><button class="primary" id="un-save" ${un.busy || (!un.key.trim() && !saved) ? "disabled" : ""}>Save</button>${saved ? `<button class="secondary" id="un-remove" ${un.busy ? "disabled" : ""}>Remove</button>` : ""}</div>
-    ${un.busy ? `<div class="stepline">Asking Unsloth…</div>` : ""}${un.result ? `<div class="ok">${esc(un.result)}</div>` : ""}${un.error ? `<div class="err">${esc(un.error)}</div>` : ""}</div>`;
+    ${un.busy ? `<div class="stepline" aria-live="polite">Asking Unsloth…</div>` : ""}${un.result ? `<div class="ok">${esc(un.result)}</div>` : ""}${un.error ? `<div class="err">${esc(un.error)}</div>` : ""}</div>`;
 }
 
 function wireUnsloth() {
@@ -1789,7 +1789,7 @@ function lcConfirmHtml(plan) {
 }
 
 function lcProgressHtml() {
-  return `<div class="lc-progress"><div class="stepline">${esc(lc.step)}</div>${lc.progress != null ? `<progress max="1" value="${lc.progress}"></progress>` : ""}${lc.bytes ? `<span class="dim small"> ${lcMb(lc.bytes[0])} of about ${lcMb(lc.bytes[1])}</span>` : ""}
+  return `<div class="lc-progress"><div class="stepline" aria-live="polite">${esc(lc.step)}</div>${lc.progress != null ? `<progress max="1" value="${lc.progress}"></progress>` : ""}${lc.bytes ? `<span class="dim small"> ${lcMb(lc.bytes[0])} of about ${lcMb(lc.bytes[1])}</span>` : ""}
     <div class="row"><button class="secondary lc-cancel">Cancel</button></div>${lc.log.length ? `<pre class="log" id="lc-log">${lc.log.slice(-60).map(esc).join("\n")}</pre>` : ""}</div>`;
 }
 
@@ -1894,7 +1894,7 @@ function renderSetup() {
       <button class="primary" id="selftest" ${busy || !st || !st.env_installed ? "disabled" : ""}>Test the graphics card</button>
       <button class="secondary" id="cancelenv" ${busy ? "" : "disabled"}>Cancel</button>
     </div>
-    ${env.step ? `<div class="stepline">${esc(env.step)}</div>` : ""}
+    ${env.step ? `<div class="stepline" aria-live="polite">${esc(env.step)}</div>` : ""}
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
@@ -1944,7 +1944,7 @@ function renderTest() {
       <button class="primary" id="te-go" ${busy || !st.env_ready ? "disabled" : ""}>Test this run</button>${busy ? `<button class="secondary" id="te-stop">Stop</button>` : ""}</div>
       <label class="opt"><input type="checkbox" id="te-judge" ${te.judge ? "checked" : ""} ${st.teacher_ready ? "" : "disabled"}> Grade lore and rules answers with the teacher model${st.teacher_ready ? ` (${esc(st.teacher_model)})` : " (choose a teacher in Step 2 first)"} — more accurate than counting matching words</label>
       ${!st.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
-      ${te.running || te.text ? `<div class="stepline">${esc(te.text)}</div>${te.progress != null ? `<progress max="1" value="${te.progress}"></progress>` : ""}` : ""}</div>`;
+      ${te.running || te.text ? `<div class="stepline" aria-live="polite">${esc(te.text)}</div>${te.progress != null ? `<progress max="1" value="${te.progress}"></progress>` : ""}` : ""}</div>`;
   let result = "";
   const r = te.result;
   if (r) {
@@ -1962,7 +1962,7 @@ function renderTest() {
   const chat = `<div class="card wide"><h2>Ask your own question</h2><p>Both models answer the same question. Loading the models takes a moment each time.</p>
       <details><summary>The instruction given to the model</summary><textarea id="te-sys" rows="4">${esc(te.system || st.default_system)}</textarea></details>
       <div class="row"><input type="text" id="te-q" placeholder="For example: Who is the leader of the Greyfather Pack?" style="min-width:300px" ${busy ? "disabled" : ""}><button class="primary" id="te-ask" ${busy || !st.env_ready ? "disabled" : ""}>Ask both</button></div>
-      ${te.asking ? `<div class="stepline">${esc(te.text)}</div>` : ""}
+      ${te.asking ? `<div class="stepline" aria-live="polite">${esc(te.text)}</div>` : ""}
       ${te.chat.map((c) => `<div class="ex"><div class="q">${esc(c.question)}</div><div class="two"><div><div class="dim small">Original</div><div class="ans">${esc(c.original)}</div></div><div><div class="dim small">Trained</div><div class="ans">${esc(c.trained)}</div></div></div></div>`).join("")}
       ${te.chat.length ? `<div class="row"><button class="secondary" id="te-save">Save this chat as a file</button></div>` : ""}</div>`;
   const cmp = st.compare.length ? `<div class="card wide"><h2>Compare runs</h2><table class="tbl"><tr><th>Run</th><th>Model</th><th>Type</th><th>Lore</th><th>Rules</th><th>Invents</th><th>General</th></tr>${st.compare.map((c, i) => `<tr><td>${i === 0 ? "★ " : ""}${esc(c.name)}</td><td>${esc(String(c.model).split("/").pop())}</td><td>${esc(c.method)}${c.stages ? ", " + esc(c.stages) : ""}</td><td>${pc(c.lore)} <span class="dim">(was ${pc(c.lore_original)})</span></td><td>${pc(c.rules)}</td><td>${pc(c.invented)}</td><td>${pc(c.general)}</td></tr>`).join("")}</table>
@@ -2234,7 +2234,7 @@ function healCard(m, pair) {
   const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>${verdictP}`
     : `<p class="dim small">${plan.mode === "online" ? `The original and ${thin} run at the same time` : `The original answers first and saves its answers to disk, then ${thin} learns (they take turns)`}: about ${plan.est_gb} GB of memory${h.vram_gb ? " (this card has " + h.vram_gb + " GB)" : ""}. ${pair ? "The model" : "The thinner model"} is trained as ${plan.student_method === "qlora" ? "QLoRA" : "LoRA"}.</p>${verdictP}`;
   const busy = rs.running || rs.testing || (run && run.running);
-  const prog = run && run.running ? `<div class="stepline">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
+  const prog = run && run.running ? `<div class="stepline" aria-live="polite">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
   const series = healSeries();
   const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true);
   const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : pair ? `<p class="dim small">Nothing is recorded about how well this model answered before. The error on your data is measured at the start of healing and shown in the chart.</p>` : "";
@@ -2442,7 +2442,7 @@ function madeCard(m) {
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
 }
 
 
@@ -2526,11 +2526,40 @@ function autoCard() {
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
-    ${live ? `<div class="stepline" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
+    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (an estimate; the checks and the export are counted at a fixed time)</p>` : ""}
+    ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
     ${ac.err ? errDiv(ac.err) : ""}${status}${steps}${rep}</div>`;
 }
 
+// "done around HH:MM": what is left of the plan (the running heal's own estimate when the training reports one, else the plan's hours) plus fixed allowances for the checks and the export
+const AC_CHECK_H = 0.25, AC_EXPORT_H = 0.5;
+function acEtaRange(run, eta, nowMs) {
+  if (!run || !run.steps || run.status === "done") return null;
+  const stages = (run.plan && run.plan.stages) || [];
+  let lo = 0, hi = 0;
+  for (const x of run.steps) {
+    if (x.status === "done" || x.status === "skipped") continue;
+    const m = /^s(\d+)\.(heal|check_cut|check_heal)$/.exec(x.id);
+    if (x.id === "export") { lo += AC_EXPORT_H; hi += AC_EXPORT_H; }
+    else if (x.id === "check_gguf" || (m && m[2] !== "heal")) { lo += AC_CHECK_H; hi += AC_CHECK_H; }
+    else if (m) {
+      const left = eta && eta.step === x.id && x.status === "running" ? Math.max(0, eta.s - ((nowMs || Date.now()) - eta.at) / 1000) / 3600 : null;
+      const g = stages[+m[1] - 1];
+      if (left != null) { lo += left; hi += left; } else if (g && g.hours) { lo += g.hours[0]; hi += g.hours[1]; }
+    }
+  }
+  return lo || hi ? { lo, hi } : null;
+}
+const acClock = (ms) => { const d = new Date(ms); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+function acEtaText(run, eta, nowMs) {
+  const r = acEtaRange(run, eta, nowMs);
+  if (!r) return "";
+  const now = nowMs || Date.now(), a = acClock(now + r.lo * 3600e3), b = acClock(now + r.hi * 3600e3);
+  return a === b ? `done around ${a}` : `done around ${a}–${b}`;
+}
+
 function onAutoEvent(p) {
+  if (p.eta_s != null && p.auto_step) ac.eta = { s: +p.eta_s, step: p.auto_step, at: Date.now() };
   if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
   if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
   else if (p.kind === "error") { ac.running = false; ac.err = p.text; ac.progress = null; acLoad(); return; }
@@ -2601,7 +2630,7 @@ function thinkCard(m) {
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
     ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
-    ${tk.run && tk.run.name === m.name ? `<div class="stepline">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
+    ${tk.run && tk.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
     ${tk.err ? errDiv(tk.err, "p") : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
 }
 
@@ -2821,7 +2850,7 @@ function tryCard() {
     : plan.passes_todo === 0 ? `<span class="dim">All ${plan.passes_total} answers are already kept; showing them costs nothing.</span>`
     : `<strong>${plan.passes_todo}</strong> pass${plan.passes_todo === 1 ? "" : "es"} over your text${plan.passes_cached ? ` (${plan.passes_cached} already kept)` : ""} × ${fmtDur(plan.seconds_per_pass).replace("about ", "")} each = <strong>${fmtDur(plan.seconds)}</strong>${plan.guess ? ` <span class="dim">(a guess from the model's size; the real time is measured on the first pass and kept)</span>` : ` <span class="dim">(from a pass that was timed)</span>`}`;
   const disabled = !spec || needM || run || rs.running || rs.testing || !!tr.planErr || (plan && plan.passes_todo === 0 && false);
-  const progress = run ? `<div class="stepline">${esc(tr.text)}${tr.total ? ` · ${tr.done} of ${tr.total} done` : ""}</div>${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}` : "";
+  const progress = run ? `<div class="stepline" aria-live="polite">${esc(tr.text)}${tr.total ? ` · ${tr.done} of ${tr.total} done` : ""}</div>${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}` : "";
   let body = "";
   if (a && a.base && a.base.loss != null) {
     const parts = [];
@@ -2955,7 +2984,7 @@ function renderReshape() {
   const make = `<div class="card wide"><h2>3 · Make the model</h2>
     ${pfBox("cut", {})}<div class="row"><button class="primary" id="rs-go" ${!ok || rs.running || rs.testing || rs.tr.running || why || pfBlocked("cut") ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
     ${ok && why ? `<div class="err">${esc(why)}</div>` : ""}${ok && (wo || (!rsWidthOn() && o)) ? `<div class="dim small">Needs about ${needGb} GB of free disk space${st.free_disk_gb != null ? " (" + st.free_disk_gb + " GB free)" : ""}. The new model is saved inside the project, in <code>models/</code>.</div>` : ""}
-    ${rs.running ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
+    ${rs.running ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
     ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
   const made = st.made.filter((m) => m.status === "done" && m.summary);
   const shown = made.find((m) => m.name === rs.view) || made[0];

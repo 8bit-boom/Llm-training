@@ -1,25 +1,13 @@
 // Smoke test of the "no sign of progress" banner (any job channel), without a window. Run with `node --test ui/smoke`.
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import vm from "node:vm";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { makeBrowser, plain as plainOf, tick as tickOf } from "./_browser.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(here, "..", "app.js"), "utf8");
 
 async function browser() {
-  const els = {};
-  const el = (id) => (els[id] ??= { id, innerHTML: "", textContent: "", hidden: true, checked: false, value: "", classList: { toggle() {} }, querySelectorAll: () => [], onclick: null, onchange: null, oninput: null, onkeydown: null, style: {}, dataset: {} });
-  const listeners = {};
-  const invoke = async (cmd) => (cmd === "get_state" ? { project: null, steps: [], bundle: null, settings: { theme: "light", expert_mode: false, show_help_panel: true }, worlds: [], recent: [] } : cmd === "help" ? "<p>help</p>" : null);
-  const win = { __TAURI__: { core: { invoke }, dialog: {}, event: { listen: async (name, fn) => { (listeners[name] ??= []).push(fn); } }, webview: { getCurrentWebview: () => ({ onDragDropEvent: async () => {} }) } }, matchMedia: () => ({ matches: false }) };
-  const doc = { getElementById: el, querySelectorAll: () => [], querySelector: () => null, createElement: () => el("tmp"), body: { appendChild() {} }, documentElement: { setAttribute() {}, removeAttribute() {} } };
-  const ctx = vm.createContext({ window: win, document: doc, console, confirm: () => true, setTimeout, clearTimeout });
-  vm.runInContext(source, ctx);
+  const b = makeBrowser({ state: () => ({ project: null, steps: [], bundle: null, settings: { theme: "light", expert_mode: false, show_help_panel: true }, worlds: [], recent: [] }) });
   await new Promise((r) => setTimeout(r, 20));
-  return { els, el, send: (channel, payload) => (listeners[channel] || []).forEach((f) => f({ payload })), listeners };
+  return b;
 }
 
 test("a stall event on any job channel shows the banner and the next event hides it", async () => {
