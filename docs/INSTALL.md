@@ -32,3 +32,23 @@ All you need is this program and a model. **⚙ Training setup → "Install with
 
 - A `docs/.github` folder is not used by GitHub; delete it.
 - Unsloth writes a `worker/unsloth_compiled_cache/` folder while it runs; it is safe to delete and is ignored by git.
+
+## Long jobs and sleep (Windows)
+
+A computer that falls asleep stops a job that runs for hours. The program holds the computer awake itself (the setting "Keep this computer awake", on by default) while a long job runs: Auto-cut, healing, cutting, measuring, trying, the thinking check, an export, an importance matrix, a quant comparison. A job started straight from the worker (`python -m ndforge_worker job.json`) holds its own keep-awake too; `NDFORGE_KEEP_AWAKE=0` or `"keep_awake": false` in the job file switches that off. The screen may still turn off; the setting "Keep the screen on too" also keeps it on.
+
+Before a long job the checklist has a line "Sleep while the job runs". It is yellow, never red, when:
+
+- "Keep this computer awake" is off and the power plan puts the computer to sleep or hibernation after some idle time while plugged in (the button next to the line switches the setting on), or
+- Windows can still put the computer to sleep although the program asks it not to: Modern Standby (the system log then shows Kernel-Power event 566 when the computer enters it) or the plan's "unattended sleep timeout". Windows may ignore the request on such computers. Keeping the screen on, or switching sleep off in the power plan, is then the reliable way.
+
+To switch sleep off in the current power plan while plugged in, run in a command window:
+
+```
+powercfg -setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
+powercfg -setacvalueindex SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 0
+powercfg -setacvalueindex SCHEME_CURRENT SUB_SLEEP UNATTENDSLEEP 0
+powercfg -setactive SCHEME_CURRENT
+```
+
+The program never changes a power plan by itself. Not verified on a real Windows computer: whether the request beats Modern Standby, and the exact values the checklist reads.

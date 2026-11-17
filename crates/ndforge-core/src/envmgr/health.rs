@@ -21,6 +21,9 @@ pub struct Check {
     pub detail: String,
     /// what to do about it (empty when green)
     pub fix: String,
+    /// a button the window can offer next to the fix (`"keep_awake_on"`: switch the setting on); absent when there is none
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
 }
 
 /// Everything the checks look at, gathered once (so the rules can be tested without a real machine).
@@ -49,7 +52,7 @@ const DISK_WARN_GB: f64 = 40.0;
 const VRAM_MIN_GB: f64 = 5.5;
 
 fn check(id: &'static str, label: &'static str, light: Light, detail: impl Into<String>, fix: impl Into<String>) -> Check {
-    Check { id, label, light, detail: detail.into(), fix: fix.into() }
+    Check { id, label, light, detail: detail.into(), fix: fix.into(), action: None }
 }
 
 pub fn evaluate(f: &Facts) -> Vec<Check> {

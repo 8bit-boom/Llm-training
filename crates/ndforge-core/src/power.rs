@@ -28,15 +28,23 @@ pub struct KeepAwake {
 
 impl KeepAwake {
     pub fn start() -> KeepAwake {
+        Self::start_with(false)
+    }
+
+    /// `display`: keep the screen on too (Windows: ES_DISPLAY_REQUIRED). Away mode is never used.
+    #[allow(unused_variables)]
+    pub fn start_with(display: bool) -> KeepAwake {
         #[cfg(windows)]
         {
             const ES_CONTINUOUS: u32 = 0x8000_0000;
             const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+            const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+            let flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | if display { ES_DISPLAY_REQUIRED } else { 0 };
             // the setting belongs to the thread that made it: a thread of its own holds it until told to stop
             let stop = Arc::new(AtomicBool::new(false));
             let s = stop.clone();
             let thread = std::thread::spawn(move || {
-                unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+                unsafe { SetThreadExecutionState(flags) };
                 while !s.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -124,4 +132,74 @@ pub fn shutdown_now() -> Result<()> {
         }
     }
     Err(Error::new(format!("The computer could not be switched off ({last}). Switch it off yourself.")))
+}
+
+
+/// What the active power plan does when the computer is idle on mains power, read through the power API (never `powercfg` text: it is translated).
+/// A time of 0 seconds means "never".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SleepFacts {
+    pub ac_standby_s: Option<u32>,
+    pub ac_hibernate_s: Option<u32>,
+    pub ac_unattend_s: Option<u32>,
+    /// the computer uses Modern Standby (S0 low power idle)
+    pub modern_standby: Option<bool>,
+}
+
+/// The sleep facts of this computer: Windows only (None elsewhere, or when nothing could be read). Cached for a minute.
+pub fn sleep_facts() -> Option<SleepFacts> {
+    #[cfg(windows)]
+    {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static CACHE: Mutex<Option<(Instant, Option<SleepFacts>)>> = Mutex::new(None);
+        let mut g = CACHE.lock().ok()?;
+        if let Some((at, v)) = *g {
+            if at.elapsed() < Duration::from_secs(60) {
+                return v;
+            }
+        }
+        let v = windows_sleep_facts();
+        *g = Some((Instant::now(), v));
+        v
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_sleep_facts() -> Option<SleepFacts> {
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::System::Power::{CallNtPowerInformation, PowerGetActiveScheme, PowerReadACValueIndex, SystemPowerCapabilities, SYSTEM_POWER_CAPABILITIES};
+    // GUID_SLEEP_SUBGROUP and the three settings (docs: Power setting GUIDs)
+    const SUB_SLEEP: GUID = GUID { data1: 0x238C9FA8, data2: 0x0AAD, data3: 0x41ED, data4: [0x83, 0xF4, 0x97, 0xBE, 0x24, 0x2C, 0x8F, 0x20] };
+    const STANDBYIDLE: GUID = GUID { data1: 0x29F6C1DB, data2: 0x86DA, data3: 0x48C5, data4: [0x9F, 0xDB, 0xF2, 0xB6, 0x7B, 0x1F, 0x44, 0xDA] };
+    const HIBERNATEIDLE: GUID = GUID { data1: 0x9D7815A6, data2: 0x7EE4, data3: 0x497E, data4: [0x88, 0x88, 0x51, 0x5A, 0x05, 0xF0, 0x23, 0x64] };
+    const UNATTENDSLEEP: GUID = GUID { data1: 0x7BC4A2F9, data2: 0xD8FC, data3: 0x4469, data4: [0xB0, 0x7B, 0x33, 0xEB, 0x78, 0x5A, 0xAC, 0xA0] };
+    let mut facts = SleepFacts::default();
+    let mut any = false;
+    unsafe {
+        let mut scheme: *mut GUID = std::ptr::null_mut();
+        if PowerGetActiveScheme(0, &mut scheme) == 0 && !scheme.is_null() {
+            let read = |setting: &GUID| -> Option<u32> {
+                let mut v = 0u32;
+                (PowerReadACValueIndex(0, scheme, &SUB_SLEEP, setting, &mut v) == 0).then_some(v)
+            };
+            facts.ac_standby_s = read(&STANDBYIDLE);
+            facts.ac_hibernate_s = read(&HIBERNATEIDLE);
+            facts.ac_unattend_s = read(&UNATTENDSLEEP);
+            any = true;
+            LocalFree(scheme as _);
+        }
+        let mut caps: SYSTEM_POWER_CAPABILITIES = std::mem::zeroed();
+        let status = CallNtPowerInformation(SystemPowerCapabilities, std::ptr::null(), 0, &mut caps as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<SYSTEM_POWER_CAPABILITIES>() as u32);
+        if status == 0 {
+            facts.modern_standby = Some(caps.AoAc != 0);
+            any = true;
+        }
+    }
+    any.then_some(facts)
 }

@@ -56,12 +56,14 @@ pub fn job_env(job: &Value) -> Vec<(String, String)> {
 }
 
 /// The worker holds the computer awake itself (`ndforge_worker/power.py`); it is told not to when the setting "Keep this computer awake" is off.
-pub fn power_env(keep_awake: bool) -> Vec<(String, String)> {
-    if keep_awake {
-        Vec::new()
-    } else {
-        vec![("NDFORGE_KEEP_AWAKE".to_string(), "0".to_string())]
+pub fn power_env(keep_awake: bool, keep_display_on: bool) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    if !keep_awake {
+        v.push(("NDFORGE_KEEP_AWAKE".to_string(), "0".to_string()));
+    } else if keep_display_on {
+        v.push(("NDFORGE_KEEP_DISPLAY".to_string(), "1".to_string()));
     }
+    v
 }
 
 /// How many minutes without any output make the program say "no sign of progress": the job key `stall_minutes`, else 60 for the jobs that are quiet for long
@@ -88,7 +90,8 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
     for (k, v) in job_env(job) {
         cmd.env(k, v);
     }
-    for (k, v) in power_env(crate::settings::Settings::load().keep_awake) {
+    let st = crate::settings::Settings::load();
+    for (k, v) in power_env(st.keep_awake, st.keep_display_on) {
         cmd.env(k, v);
     }
     // the llama.cpp this program installed (docs/LLAMA_CPP_INSTALL.md): the worker's finder looks there after an explicit LLAMA_CPP_DIR

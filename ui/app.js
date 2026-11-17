@@ -56,6 +56,7 @@ function renderWelcome() {
     <div class="row"><button class="secondary" id="openp">Open an existing project…</button></div>
     ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}
     ${state.project ? `<div class="row"><label class="opt" title="An Auto-cut or a healing that was cut off by closing the program (or a crash) is put in the queue and goes on where it stopped, when the project is opened."><input type="checkbox" id="auto-continue" ${state.settings.auto_continue_interrupted ? "checked" : ""}> Go on by itself with what was cut off when I open the project</label></div>
+    <div class="row"><label class="opt" title="Also keeps the screen on while a long job runs. On a computer with Modern Standby this may be the only way to stop it from sleeping. Needs Keep this computer awake."><input type="checkbox" id="keep-display" ${state.settings.keep_display_on ? "checked" : ""}> Keep the screen on too while a long job runs</label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="notify-on" ${state.settings.notifications !== false ? "checked" : ""}> Tell me when a job or the queue has finished (a message from the system)</label></div>
     <div class="row"><label>Web address that gets one line when a job ends (optional, for example an ntfy topic) <input type="text" id="webhook-url" value="${esc(state.settings.webhook_url || "")}" placeholder="https://ntfy.sh/my-topic" style="min-width:280px"></label><button class="secondary" id="webhook-save">Save</button></div>
     <p class="dim small">The line says only what kind of job it was and how it ended, never a name or a folder.</p>` : ""}`;
@@ -1658,9 +1659,17 @@ function pfBox(kind, spec) {
   if (!e.checks || !e.checks.length) return "";
   const bad = e.checks.some((c) => c.light === "fail");
   const mark = { ok: "✓", warn: "!", fail: "✕" };
-  const rows = e.checks.map((c) => `<li class="pf-${esc(c.light)}"><span class="pf-dot" aria-hidden="true">${mark[c.light] || "·"}</span> <strong>${esc(c.label)}</strong> ${esc(c.detail)}${c.fix && c.light !== "ok" ? ` <span class="dim">${esc(c.fix)}</span>` : ""}</li>`).join("");
+  const rows = e.checks.map((c) => `<li class="pf-${esc(c.light)}"><span class="pf-dot" aria-hidden="true">${mark[c.light] || "·"}</span> <strong>${esc(c.label)}</strong> ${esc(c.detail)}${c.fix && c.light !== "ok" ? ` <span class="dim">${esc(c.fix)}</span>` : ""}${c.action === "keep_awake_on" && c.light !== "ok" ? ` <button class="secondary" data-pf-action="keep_awake_on">Keep the computer awake</button>` : ""}</li>`).join("");
   return `<div class="pf ${bad ? "pf-bad" : ""}" role="status" aria-live="polite" data-pf="${esc(kind)}"><div class="small dim">Before you start</div><ul>${rows}</ul></div>`;
 }
+// a button next to a light (the program names it in the check's `action`): "keep_awake_on" switches the setting on, then the list is asked again
+async function pfAction(act) {
+  if (act !== "keep_awake_on") return;
+  try { setState(await invoke("set_setting", { key: "keep_awake", value: true })); } catch (_) { /* the list stays as it was */ }
+  pfReset();
+  try { render(); } catch (_) { /* a preview without a window */ }
+}
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-pf-action]"); if (t) pfAction(t.dataset.pfAction); }); } catch (_) { /* a preview without a window */ }
 const pfBlocked = (kind) => { const e = pf[kind]; return !!(e && e.checks && e.can_start === false); };
 
 // ------------------------------------------------------------------------------------------------------------ llama.cpp: the installer (docs/LLAMA_CPP_INSTALL.md)
@@ -3304,6 +3313,7 @@ function wire() {
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   wireQueue();
+  const kd = $("keep-display"); if (kd) kd.onchange = async () => { try { setState(await invoke("set_setting", { key: "keep_display_on", value: kd.checked })); } catch (e) { alert(String(e)); } };
   const nf = $("notify-on"); if (nf) nf.onchange = async () => { try { setState(await invoke("set_setting", { key: "notifications", value: nf.checked })); } catch (e) { alert(String(e)); } };
   const wh = $("webhook-save"); if (wh) wh.onclick = async () => { try { setState(await invoke("webhook_set", { url: ($("webhook-url") || {}).value || "" })); } catch (e) { alert(String(e)); } };
   const ac2 = $("auto-continue"); if (ac2) ac2.onchange = async () => { try { setState(await invoke("set_setting", { key: "auto_continue_interrupted", value: ac2.checked })); } catch (e) { alert(String(e)); } };

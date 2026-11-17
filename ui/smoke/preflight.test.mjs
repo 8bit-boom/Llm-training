@@ -74,3 +74,22 @@ test("a finished install or llama.cpp check asks again", async () => {
   await tick();
   assert.equal(asked(b, "think_check"), 2);
 });
+
+test("a sleep warning with an action shows a button that switches Keep awake on and asks again", async () => {
+  const sleep = { checks: [{ id: "sleep", label: "Sleep while the job runs", light: "warn", detail: "Keep awake is off.", fix: "Tick it.", action: "keep_awake_on" }], can_start: true };
+  const b = browser({ preflight: sleep, set_setting: () => baseState() });
+  open(b, [model()], results());
+  card(b);
+  await tick();
+  const html = card(b);
+  assert.match(html, /<button class="secondary" data-pf-action="keep_awake_on">Keep the computer awake<\/button>/);
+  await b.run(`pfAction("keep_awake_on")`);
+  const call = b.calls.find((c) => c[0] === "set_setting");
+  assert.deepEqual(plain(call[1]), { key: "keep_awake", value: true });
+  assert.doesNotMatch(card(b), /data-pf-action/, "forgotten until the program has answered again");
+  const green = browser({ preflight: { checks: [{ id: "sleep", label: "Sleep while the job runs", light: "ok", detail: "ok", fix: "", action: "keep_awake_on" }], can_start: true } });
+  open(green, [model()], results());
+  card(green);
+  await tick();
+  assert.doesNotMatch(card(green), /data-pf-action/, "a green light has no button");
+});

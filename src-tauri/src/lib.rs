@@ -866,7 +866,7 @@ fn reshape_measurement(s: State<App>, model: String, samples: u32, len: u32, loa
 #[tauri::command]
 fn reshape_measure(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, samples: u32, len: u32, load: String, force: Option<bool>) -> Out<()> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_job(app, &tasks, JobOpts { phase: Some("measure"), kind: "measure", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+    spawn_job(app, &tasks, JobOpts { phase: Some("measure"), awake: awake_if_set(), kind: "measure", ..JobOpts::new("reshape-event") }, move |stop, emit| {
         ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, emit).map_err(|e| e.to_string())
     })
 }
@@ -893,7 +893,7 @@ fn reshape_try_results(s: State<App>, model: String, samples: u32, len: u32, loa
 fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::reshape::runs::TrySpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_job(app, &tasks, JobOpts { phase: Some("try"), tag_events: true, kind: "try", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+    spawn_job(app, &tasks, JobOpts { phase: Some("try"), tag_events: true, awake: awake_if_set(), kind: "try", ..JobOpts::new("reshape-event") }, move |stop, emit| {
         ndforge_core::reshape::runs::try_run(&p, &spec, stop, emit).map_err(|e| e.to_string())
     })
 }
@@ -1369,6 +1369,11 @@ enum Awake {
     Noted,
 }
 
+/// `Quiet` when the setting "Keep this computer awake" is on, else `Off`.
+fn awake_if_set() -> Awake {
+    if ndforge_core::settings::Settings::load().keep_awake { Awake::Quiet } else { Awake::Off }
+}
+
 /// How a job is started: where its events go and what its end carries.
 #[derive(Clone, Copy)]
 struct JobOpts {
@@ -1407,7 +1412,7 @@ fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnO
             }
             let _ = emitter.emit(channel, v);
         };
-        let awake = if opts.awake == Awake::Off { ndforge_core::power::KeepAwake::off() } else { ndforge_core::power::KeepAwake::start() };
+        let awake = if opts.awake == Awake::Off { ndforge_core::power::KeepAwake::off() } else { ndforge_core::power::KeepAwake::start_with(ndforge_core::settings::Settings::load().keep_display_on) };
         if opts.awake == Awake::Noted && !awake.note.is_empty() {
             emit(serde_json::json!({"kind": "log", "text": awake.note}));
         }
@@ -1439,7 +1444,9 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: 
 
 /// `spawn_task` for a job the person wants to hear about (and the queue can hold): `kind` names it.
 fn spawn_task_as(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, kind: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
-    spawn_job(app, tasks, JobOpts { kind, ..JobOpts::new(channel) }, move |cancel, emit| job(&cancel, emit))
+    // an export, a matrix or a quant check runs for a long time: the computer is kept awake like for the other long jobs (setting "Keep this computer awake")
+    let awake = if kind == "task" { Awake::Off } else { awake_if_set() };
+    spawn_job(app, tasks, JobOpts { kind, awake, ..JobOpts::new(channel) }, move |cancel, emit| job(&cancel, emit))
 }
 
 #[tauri::command]
