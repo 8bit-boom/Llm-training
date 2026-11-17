@@ -24,6 +24,9 @@ struct Tasks {
     shutdown_cancel: Arc<AtomicBool>,
 }
 
+/// The job queue (ndforge_core::queue), shared by the commands and the runner that starts the next job when one ends.
+struct QueueState(Mutex<ndforge_core::queue::Queue>);
+
 /// Holds the "a job is running" flag for the life of a job thread: the flag goes back to false when the guard is dropped, also when the thread panics.
 struct BusyGuard(Arc<AtomicBool>);
 impl Drop for BusyGuard {
@@ -1111,6 +1114,154 @@ fn reshape_remove(s: State<App>, name: String) -> Out<Value> {
     lock(&s).reshape_state().map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------------------------------------ the job queue (ndforge_core::queue)
+
+fn queue_changed(app: &tauri::AppHandle) {
+    let _ = app.emit("queue-event", serde_json::json!({"kind": "changed"}));
+}
+
+fn queue_view(app: &tauri::AppHandle) -> Value {
+    app.state::<QueueState>().0.lock().unwrap_or_else(|e| e.into_inner()).view()
+}
+
+/// Runs `f` on the queue and saves it afterwards.
+fn queue_edit<R>(app: &tauri::AppHandle, f: impl FnOnce(&mut ndforge_core::queue::Queue) -> R) -> R {
+    let st = app.state::<QueueState>();
+    let mut q = st.0.lock().unwrap_or_else(|e| e.into_inner());
+    let r = f(&mut q);
+    let _ = q.save();
+    r
+}
+
+/// Starts the job of a queue item the way its page would (the same commands, the same events).
+fn queue_start_item(app: &tauri::AppHandle, it: &ndforge_core::queue::Item) -> Out<()> {
+    let a = &it.spec;
+    let (s, t) = (app.state::<App>(), app.state::<Tasks>());
+    let text = |k: &str| a[k].as_str().unwrap_or("").to_string();
+    let bad = |e: serde_json::Error| format!("The saved choice is not valid any more: {e}");
+    match it.kind.as_str() {
+        "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from)),
+        "export" => export_start(app.clone(), s, t, text("run"), text("quant"), a["num_ctx"].as_u64().or(a["numCtx"].as_u64()).unwrap_or(8192) as u32, a["what"].as_str().map(String::from),
+            serde_json::from_value(a["quants"].clone()).map_err(bad)?, serde_json::from_value(a["imatrix"].clone()).map_err(bad)?, serde_json::from_value(a["mixed"].clone()).map_err(bad)?),
+        "heal" => heal_start(app.clone(), s, t, text("name"), a["spec"].clone()),
+        "think_check" => think_check_start(app.clone(), s, t, a["spec"].clone()),
+        "quantcheck" => quantcheck_start(app.clone(), s, t, a["spec"].clone()),
+        "imatrix_make" => imatrix_create(app.clone(), s, t, a["spec"].clone()),
+        "train" => train_start(app.clone(), s, t, text("model"), text("method"), text("preset"), a["overrides"].clone(), a["resume"].as_str().map(String::from), a["server"].as_str().map(String::from)).map(|_| ()),
+        other => Err(format!("{other} cannot be queued.")),
+    }
+}
+
+/// Starts the next waiting item when the queue may (not paused, nothing running): its preflight list first, and an item that fails it is skipped with the reason, then the next is tried.
+fn queue_kick(app: &tauri::AppHandle) {
+    for _ in 0..1000 {
+        let tasks = app.state::<Tasks>();
+        if tasks.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(it) = queue_edit(app, |q| q.next_runnable().map(|i| q.items[i].clone())) else { return };
+        let project = app.state::<App>().0.lock().unwrap_or_else(|e| e.into_inner()).project.clone();
+        let skip = |why: String| { let _ = queue_edit(app, |q| q.mark(&it.id, "skipped", Some(why), None)); queue_changed(app); };
+        let Some(project) = project.filter(|p| p.folder.to_string_lossy() == it.project) else {
+            skip(format!("The project {} is not the one that is open. Open it and put the job in the queue again.", it.project));
+            continue;
+        };
+        let checks = ndforge_core::preflight::check(Some(&project), &it.kind, &ndforge_core::queue::preflight_spec(&it.kind, &it.spec));
+        if !ndforge_core::preflight::can_start(&checks) {
+            let why: Vec<String> = checks.iter().filter(|c| c.light == ndforge_core::envmgr::health::Light::Fail).map(|c| format!("{}: {} {}", c.label, c.detail, c.fix).trim().to_string()).collect();
+            skip(why.join(" "));
+            continue;
+        }
+        let _ = queue_edit(app, |q| q.mark(&it.id, "running", None, None));
+        match queue_start_item(app, &it) {
+            Ok(()) => { queue_changed(app); return; }
+            Err(e) if e.starts_with("Another job is still running") => {
+                let _ = queue_edit(app, |q| q.mark(&it.id, "queued", None, None));      // somebody else got in first: it waits
+                return;
+            }
+            Err(e) => { let _ = queue_edit(app, |q| q.mark(&it.id, "failed", Some(e), None)); queue_changed(app); }
+        }
+    }
+}
+
+/// A job has ended (its end event is sent and the busy flag is free): the queue item that was running gets its result, and the next one starts.
+fn job_ended(app: &tauri::AppHandle, _kind: &str, r: &Result<Value, String>) {
+    let stopped = match r {
+        Ok(data) => data["stopped"] == true,
+        Err(msg) => msg == ndforge_core::error::CANCELLED,
+    };
+    let (status, error) = match r {
+        Ok(_) if stopped => ("stopped", None),
+        Ok(_) => ("done", None),
+        Err(_) if stopped => ("stopped", None),
+        Err(msg) => ("failed", Some(msg.clone())),
+    };
+    let log = error.as_deref().and_then(|m| m.split("(details: ").nth(1)).and_then(|t| t.split(')').next()).map(String::from);
+    let had = queue_edit(app, |q| {
+        let id = q.running().map(|i| i.id.clone());
+        if let Some(id) = &id {
+            let _ = q.mark(id, status, error.clone(), log.clone());
+            if status == "stopped" {
+                q.paused = true;                    // Stop means stop: the rest waits until the person presses Run
+            }
+        }
+        id.is_some()
+    });
+    if had {
+        queue_changed(app);
+    }
+    queue_kick(app);
+}
+
+#[tauri::command(async)]
+fn queue_list(app: tauri::AppHandle) -> Value {
+    queue_view(&app)
+}
+
+/// Puts a job in the queue: `kind` and the arguments its start command takes (the same ones the Start button sends). Starts at once when nothing runs and the queue is not paused.
+#[tauri::command(async)]
+fn queue_add(app: tauri::AppHandle, s: State<App>, kind: String, args: Value) -> Out<Value> {
+    let folder = lock(&s).project.as_ref().map(|p| p.folder.to_string_lossy().to_string()).ok_or("Open a project first.")?;
+    queue_edit(&app, |q| q.enqueue(&folder, &kind, args)).map_err(|e| e.to_string())?;
+    queue_changed(&app);
+    queue_kick(&app);
+    Ok(queue_view(&app))
+}
+
+#[tauri::command(async)]
+fn queue_remove(app: tauri::AppHandle, id: String) -> Out<Value> {
+    queue_edit(&app, |q| q.remove(&id)).map_err(|e| e.to_string())?;
+    queue_changed(&app);
+    Ok(queue_view(&app))
+}
+
+/// Moves a waiting entry to position `to` (0 = first).
+#[tauri::command(async)]
+fn queue_move(app: tauri::AppHandle, id: String, to: usize) -> Out<Value> {
+    queue_edit(&app, |q| q.reorder(&id, to)).map_err(|e| e.to_string())?;
+    queue_changed(&app);
+    Ok(queue_view(&app))
+}
+
+/// Pause: nothing new starts (what runs goes on). Resume (`on` false) starts the next one.
+#[tauri::command(async)]
+fn queue_pause(app: tauri::AppHandle, on: bool) -> Value {
+    queue_edit(&app, |q| q.paused = on);
+    queue_changed(&app);
+    if !on {
+        queue_kick(&app);
+    }
+    queue_view(&app)
+}
+
+/// Takes the finished entries out of the list.
+#[tauri::command(async)]
+fn queue_clear_finished(app: tauri::AppHandle) -> Value {
+    queue_edit(&app, |q| q.clear_finished());
+    queue_changed(&app);
+    queue_view(&app)
+}
+
 /// Does the computer stay awake while a job runs, and does the window hear why.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Awake {
@@ -1175,6 +1326,7 @@ fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnO
             end["phase"] = serde_json::json!(p);
         }
         let _ = app.emit(channel, end);
+        job_ended(&app, opts.kind, &r);
         if opts.shutdown_after && finished && shutdown_after.swap(false, Ordering::SeqCst) {
             shutdown_with_warning(&app, &shutdown_cancel, std::time::Duration::from_secs(1), 60);
         }
@@ -1295,9 +1447,15 @@ pub fn run() {
             }
             Ok(())
         })
+        .manage(QueueState(Mutex::new({
+            let mut q = ndforge_core::queue::Queue::load();
+            q.recover();
+            let _ = q.save();
+            q
+        })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -54,7 +54,7 @@ function renderWelcome() {
       <button class="primary" id="create">Create a new project</button></div>
     ${msgHtml()}
     <div class="row"><button class="secondary" id="openp">Open an existing project…</button></div>
-    ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}`;
+    ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}`;
 }
 
 function bundleCard() {
@@ -738,7 +738,7 @@ function renderUse() {
     ${mixedBox(st)}${imatrixBox(st)}
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
     ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
-    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button><button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
+    <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
@@ -804,6 +804,13 @@ function onExportEvent(p) {
 
 async function setState_() { try { setState(await invoke("get_state")); } catch (_) { /* ignore */ } }
 
+// what "Make the files" sends to export_start (the queue keeps the same)
+function usMakeArgs() {
+  return { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
+    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null,
+    ...(us.what !== "merged" && us.quants.includes("mixed_fit") ? { mixed: { fit: { target_gb: Number(us.mx.target), matrix: us.mx.matrix || null } } } : {}) };
+}
+
 async function usRun(kind, cmd, args) {
   us.running = true; us.error = null; us.ok = null; us.log = []; us.step = "Starting…"; us.progress = null; us.pending = kind;
   if (kind === "probe") us.probe = null; if (kind === "check") us.check = null;
@@ -848,9 +855,7 @@ function wireUse() {
   on("us-cancel", () => invoke("env_cancel"));
   const nm = $("us-name"); if (nm) nm.onchange = () => { us.modelName = nm.value.trim(); render(); };
   document.querySelectorAll("[data-copy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); } catch (_) { b.textContent = "Select and copy by hand"; } });
-  on("us-make", () => usRun("make", "export_start", { run: us.run, quant: us.quant, numCtx: us.numCtx, what: us.what, quants: us.what === "merged" ? [us.quants[0] || "q4_k_m"] : us.quants,
-    imatrix: us.what !== "merged" && us.im ? { enabled: true, chunks: us.imChunks, reuse: us.imReuse === null ? !!((us.state.imatrix.saved || {})[us.run]) : us.imReuse, nextn: nextnState(us.state.imatrix).on, general: gcSource("imatrix"), ...(us.imSaved ? { use_saved: us.imSaved } : {}) } : null,
-    ...(us.what !== "merged" && us.quants.includes("mixed_fit") ? { mixed: { fit: { target_gb: Number(us.mx.target), matrix: us.mx.matrix || null } } } : {}) }));
+  on("us-make", () => usRun("make", "export_start", usMakeArgs()));
   on("us-lora", async () => {
     const dest = await tauri.dialog.open({ directory: true, title: "Choose where to put the LoRA add-on" });
     if (!dest) return;
@@ -1361,7 +1366,7 @@ function qkFormHtml(st) {
       <label class="opt"><input type="checkbox" id="qk-keep" ${qk.keep ? "checked" : ""}> Keep the 16-bit model's answers afterwards</label></div>${qkPlanHtml()}
     <p class="dim small">More text gives steadier figures but a bigger temporary file and a longer run: the 16-bit model reads the text once, then every file reads it again.</p>
     ${why ? `<p class="dim small" id="qk-why">${esc(why)}</p>` : ""}
-    ${pfBox("quantcheck", {})}<div class="row"><button class="primary" id="qk-start" ${qk.running || why || pfBlocked("quantcheck") ? "disabled" : ""}>Compare</button></div>${prog}</div>`;
+    ${pfBox("quantcheck", {})}<div class="row"><button class="primary" id="qk-start" ${qk.running || why || pfBlocked("quantcheck") ? "disabled" : ""}>Compare</button>${quBtn("quantcheck", why ? "disabled" : "")}</div>${prog}</div>`;
 }
 
 function renderQuantcheck() {
@@ -1576,6 +1581,55 @@ function onUnslothEvent(p) {
   if (p.kind === "done") { un.result = p.data.summary; if (p.data.url) un.url = p.data.url; un.error = null; }
   else { un.error = p.text; un.result = null; }
   if (page === "setup") render();
+}
+
+// ------------------------------------------------------------------------------------------------------------ the job queue (crates/ndforge-core/src/queue.rs)
+// Jobs the person wants done one after the other. "Add to queue" sits next to Start; the list is on the Home page. The program starts the next job by itself when one ends
+// (after its checklist: an entry that fails it is skipped with the reason) and waits after a restart or a Stop until "Run the queue" is pressed.
+const qu = { view: null, loaded: false, note: "" };
+async function quLoad() {
+  try { qu.view = await invoke("queue_list"); } catch (_) { qu.view = null; }
+  qu.loaded = true;
+  if (page === "welcome") render();
+}
+async function quDo(cmd, args) {
+  try { qu.view = await invoke(cmd, args || {}); qu.note = ""; } catch (e) { qu.note = String(e); }
+  render();
+}
+const quBtn = (kind, extra) => `<button class="secondary" data-quadd="${kind}" ${extra || ""} title="Runs after what is running now; the program starts it by itself when the computer is free">Add to queue</button>`;
+const QU_ARGS = {
+  auto: () => ({ spec: acSpec(), resume: null }),
+  export: () => usMakeArgs(),
+  heal: () => ({ name: rs.hl.name, spec: rsHealSpec() }),
+  quantcheck: () => ({ spec: qkSpec() }),
+  think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null } }; },
+};
+async function quAdd(kind, btn) {
+  const make = QU_ARGS[kind];
+  if (!make) return;
+  try { qu.view = await invoke("queue_add", { kind, args: make(btn) }); qu.note = "Added to the queue (see the Home page)."; } catch (e) { qu.note = String(e); }
+  render();
+}
+const QU_STATUS = { queued: "waiting", running: "running", done: "done", failed: "failed", stopped: "stopped", skipped: "skipped" };
+function quCard() {
+  const v = qu.view;
+  if (!v || !v.items || !v.items.length) return qu.note ? `<p class="dim small">${esc(qu.note)}</p>` : "";
+  const rows = v.items.map((i, n) => `<li class="qu-${esc(i.status)}"><strong>${esc(i.label || i.kind)}</strong> · ${esc(QU_STATUS[i.status] || i.status)}${i.error ? ` <span class="dim">${esc(fixActions(i.error).text)}</span>` : ""}
+      ${i.status === "queued" ? `<button class="secondary" data-qumove="${esc(i.id)}" data-to="${n - 1}" aria-label="Move up">↑</button><button class="secondary" data-qumove="${esc(i.id)}" data-to="${n + 1}" aria-label="Move down">↓</button>` : ""}
+      ${i.status !== "running" ? `<button class="secondary" data-quremove="${esc(i.id)}">Remove</button>` : ""}</li>`).join("");
+  const waiting = v.queued || 0;
+  return `<div class="card wide" id="qu-card"><h2>Job queue</h2><ul class="qu-list">${rows}</ul>
+    <div class="row">${v.paused ? `<button class="primary" id="qu-run" ${waiting ? "" : "disabled"}>Run the queue</button><span class="dim small">The queue is waiting${waiting ? ": nothing starts until you press Run" : ""}.</span>` : `<button class="secondary" id="qu-pause">Pause the queue</button>`}
+      <button class="secondary" id="qu-clear">Clear the finished entries</button></div>${qu.note ? `<p class="dim small">${esc(qu.note)}</p>` : ""}</div>`;
+}
+function wireQueue() {
+  document.querySelectorAll("[data-quadd]").forEach((b) => b.onclick = () => quAdd(b.dataset.quadd, b));
+  document.querySelectorAll("[data-quremove]").forEach((b) => b.onclick = () => quDo("queue_remove", { id: b.dataset.quremove }));
+  document.querySelectorAll("[data-qumove]").forEach((b) => b.onclick = () => quDo("queue_move", { id: b.dataset.qumove, to: Math.max(0, +b.dataset.to) }));
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("qu-run", () => quDo("queue_pause", { on: false }));
+  on("qu-pause", () => quDo("queue_pause", { on: true }));
+  on("qu-clear", () => quDo("queue_clear_finished"));
 }
 
 // ------------------------------------------------------------------------------------------------------------ the preflight checklist (crates/ndforge-core/src/preflight.rs)
@@ -2205,7 +2259,7 @@ function healCard(m, pair) {
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
     ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text })}
-    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button><button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
+    <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
     ${prog}${charts}</div>`;
@@ -2463,7 +2517,7 @@ function autoCard() {
     ${studio}
     ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
-    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>
+    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
@@ -2529,7 +2583,7 @@ function thinkCard(m) {
   const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
   const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
   const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
-  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) || pfBlocked("think_check") ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>`;
+  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) || pfBlocked("think_check") ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>${quBtn("think_check", `data-target="${t}" ${!rs.state.env_ready || !can(t) ? "disabled" : ""}`)}`;
   const cols = TK_TARGETS.filter(([t]) => rows[t]);
   const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
       ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
@@ -3193,6 +3247,7 @@ function wire() {
   });
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
+  wireQueue();
   on("choose", async () => {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });
     if (f) checkFile(f);
@@ -3368,6 +3423,8 @@ async function init() {
   try { await tauri.event.listen("quantcheck-event", (e) => onQuantcheckEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
+  quLoad();
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   for (const ch of STALL_CHANNELS) { try { await tauri.event.listen(ch, (e) => onStallEvent(e.payload)); } catch (_) { /* previews */ } }
   go("welcome");

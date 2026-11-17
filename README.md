@@ -183,6 +183,13 @@ Training and healing check a checkpoint before they continue from it (`worker/nd
 
 The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
 
+## The job queue
+
+"Add to queue" next to Start (Auto-cut, export, heal, thinking check, Compare quants) puts the job in `<settings folder>/queue.json` (`ndforge_core::queue`; the arguments are the ones the Start button would send).
+The Home page lists the queue: move a waiting entry, remove it, pause or run the queue. When a job ends, the program takes the next waiting entry, asks its preflight checklist and starts it; an entry that fails
+the checklist is skipped with the reason, a failed one is marked and the queue goes on, a job that was stopped pauses the queue. After a restart what was running is "stopped" and the queue waits until
+"Run the queue" is pressed. Entries of another project than the open one are skipped. Commands: `queue_list`, `queue_add`, `queue_remove`, `queue_move`, `queue_pause`, `queue_clear_finished`; the window hears `queue-event`.
+
 ## Before you start
 
 Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the

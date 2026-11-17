@@ -18,6 +18,7 @@ pub mod paths;
 pub mod power;
 pub mod preflight;
 pub mod project;
+pub mod queue;
 pub mod secrets;
 pub mod remote;
 pub mod reshape;
