@@ -24,6 +24,14 @@ struct Tasks {
     shutdown_cancel: Arc<AtomicBool>,
 }
 
+/// Holds the "a job is running" flag for the life of a job thread: the flag goes back to false when the guard is dropped, also when the thread panics.
+struct BusyGuard(Arc<AtomicBool>);
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Asks the running job to stop and waits until it has ended, at most `max`. A training run saves a checkpoint when it is stopped, so it can be
 /// continued later. true = it ended in time.
 fn stop_and_wait(busy: &AtomicBool, cancel: &AtomicBool, max: std::time::Duration) -> bool {
@@ -337,7 +345,7 @@ fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model:
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop, name) = (tasks.busy.clone(), tasks.cancel.clone(), job.name.clone());
+    let (busy, stop, name) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone(), job.name.clone());
     let (shutdown_after, shutdown_cancel) = (tasks.shutdown_after.clone(), tasks.shutdown_cancel.clone());
     let keep_awake = lock(&s).settings.keep_awake;
     std::thread::spawn(move || {
@@ -350,7 +358,7 @@ fn train_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model:
         }
         let r = run_training(&job, stop, &mut emit);
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         // only a run that finished (not stopped, not failed) switches the computer off
         let finished = matches!(&r, Ok(data) if data["stopped"] != true);
         let end = match r {
@@ -655,7 +663,7 @@ fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop, name) = (tasks.busy.clone(), tasks.cancel.clone(), job.name.clone());
+    let (busy, stop, name) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone(), job.name.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("train-event", v); };
@@ -681,7 +689,7 @@ fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from
                 Ok(result)
             })(),
         };
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match outcome {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(e) => serde_json::json!({"kind": "error", "text": e}),
@@ -830,12 +838,12 @@ fn reshape_measure(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, mo
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
         let r = ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, &mut emit);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "measure"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "measure"}),
@@ -871,12 +879,12 @@ fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("try"); let _ = emitter.emit("reshape-event", v); };
         let r = ndforge_core::reshape::runs::try_run(&p, &spec, stop, &mut emit);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "try"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "try"}),
@@ -914,14 +922,14 @@ fn think_check_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("think"); let _ = emitter.emit("reshape-event", v); };
         let awake = if keep_awake { ndforge_core::power::KeepAwake::start() } else { ndforge_core::power::KeepAwake::off() };
         let r = ndforge_core::reshape::thinkcheck::run(&p, &spec, stop, &mut emit);
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "think"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "think"}),
@@ -957,7 +965,7 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |mut v: Value| { v["phase"] = serde_json::json!("auto"); let _ = emitter.emit("reshape-event", v); };
@@ -971,7 +979,7 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
             }
         };
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(st) => serde_json::json!({"kind": "done", "data": st, "phase": "auto"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "auto"}),
@@ -1066,7 +1074,7 @@ fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: S
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
@@ -1077,7 +1085,7 @@ fn heal_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: S
         }
         let r = ndforge_core::reshape::runs::heal(&p, &name, &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
@@ -1152,7 +1160,7 @@ fn heal_source_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
@@ -1162,7 +1170,7 @@ fn heal_source_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
         }
         let r = ndforge_core::reshape::heal_source::heal_from_source(&p, &student, teacher.as_ref(), &spec, card_vram_gb(), stop, std::time::Duration::from_secs(120), &mut emit);
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data, "phase": "heal"}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string(), "phase": "heal"}),
@@ -1190,7 +1198,7 @@ fn reshape_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, stop) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, stop) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit("reshape-event", v); };
@@ -1201,7 +1209,7 @@ fn reshape_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec
         }
         let r = ndforge_core::reshape::runs::execute(&p, &spec, stop, &mut emit);
         drop(awake);
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let end = match r {
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(e) => serde_json::json!({"kind": "error", "text": e.to_string()}),
@@ -1247,7 +1255,7 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: 
         return Err("Another job is still running. Wait for it or press Cancel.".into());
     }
     tasks.cancel.store(false, Ordering::SeqCst);
-    let (busy, cancel) = (tasks.busy.clone(), tasks.cancel.clone());
+    let (busy, cancel) = (BusyGuard(tasks.busy.clone()), tasks.cancel.clone());
     std::thread::spawn(move || {
         let emitter = app.clone();
         let mut emit = move |v: Value| { let _ = emitter.emit(channel, v); };
@@ -1255,7 +1263,7 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: 
             Ok(data) => serde_json::json!({"kind": "done", "data": data}),
             Err(msg) => serde_json::json!({"kind": "error", "text": msg}),
         };
-        busy.store(false, Ordering::SeqCst);
+        drop(busy);
         let _ = app.emit(channel, end);
     });
     Ok(())
@@ -1358,6 +1366,22 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn the_busy_flag_is_released_when_a_job_thread_panics() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = BusyGuard(flag.clone());
+        let t = std::thread::spawn(move || {
+            let _held = guard;
+            panic!("job crashed");
+        });
+        assert!(t.join().is_err());
+        assert!(!flag.load(Ordering::SeqCst));
+        // dropping it in the normal way does the same
+        flag.store(true, Ordering::SeqCst);
+        drop(BusyGuard(flag.clone()));
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn closing_stops_the_job_and_waits_for_it_to_save() {
