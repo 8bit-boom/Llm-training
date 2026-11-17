@@ -4,3 +4,4 @@
 pub mod heal_source;
 pub mod plan;
 pub mod runs;
+pub mod thinkcheck;

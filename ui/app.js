@@ -1901,7 +1901,9 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
-  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null };
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null,
+  // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
+  tk: { name: null, data: null, quick: null, gguf: "", run: null, err: null, ok: null } };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
 // labelled experimental, and stays switched off until the measurements on a real graphics card (docs/RESHAPE.md, "Not verified yet") are done:
@@ -2312,7 +2314,85 @@ function madeCard(m) {
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
+}
+
+
+// ------------------------------------------------------------------------------------------------------------ the thinking check
+// Does the model still think before it answers, after it was cut and healed? A small suite is asked with thinking on (worker job think_check, docs/THINKING_CHECK.md);
+// the table sets the numbers of the original, the cut, the healed model and a GGUF file side by side, and the gates say pass, warn or fail for each.
+const TK_TARGETS = [["original", "Original"], ["cut", "Cut model"], ["healed", "Healed"], ["gguf", "GGUF file"]];
+const TK_NUMBERS = [["think_rate", "Writes a reasoning trace", "rate"], ["closed_rate", "Finishes its reasoning and answers", "rate"], ["accuracy", "Right answers", "rate"], ["loop_rate", "Loops (lower is better)", "rate"],
+  ["garbage_rate", "Garbled text (lower is better)", "rate"], ["truncated_rate", "Cut off by the length limit", "rate"], ["median_think_tokens", "Typical length of the reasoning (tokens)", "n"]];
+const TK_GATE_WORD = { closed_rate: "finishing its reasoning", accuracy: "right answers", loop_rate: "loops", garbage_rate: "garbled text", median_think_tokens: "length of the reasoning" };
+
+function tkQuick(m) {
+  if (rs.tk.quick != null) return rs.tk.quick;
+  const b = m && m.summary ? (m.summary.params_after || 0) / 1e9 : 0;
+  return b >= 15;
+}
+const tkCell = (v, kind) => v == null ? "–" : kind === "rate" ? Math.round(v * 100) + " %" : thou(Math.round(v));
+
+function thinkCard(m) {
+  const sm = m.summary;
+  if (!sm || m.status !== "done") return "";
+  const tk = rs.tk, d = tk.name === m.name ? tk.data : null;
+  const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
+  const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
+  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
+  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>`;
+  const cols = TK_TARGETS.filter(([t]) => rows[t]);
+  const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
+      ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
+      <tr><td>Thinking off (control): right answers</td>${cols.map(([t]) => `<td>${tkCell(rows[t].control && rows[t].control.n ? rows[t].control.accuracy : null, "rate")}</td>`).join("")}</tr>
+      <tr><td><strong>Compared with the original</strong></td>${cols.map(([t]) => { const g = gates[t]; return `<td>${t === "original" ? "–" : g ? `<strong class="${g.verdict === "pass" ? "ok" : g.verdict === "warn" ? "warn" : "err"}" data-tkverdict="${t}">${g.verdict === "pass" ? "Pass" : g.verdict === "warn" ? "Close to the limit" : "Fail"}</strong>${g.failed.length ? `<br><span class="dim small">too weak: ${g.failed.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : g.warned.length ? `<br><span class="dim small">near the limit: ${g.warned.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : ""}` : "<span class=\"dim small\">check the original first</span>"}</td>`; }).join("")}</tr></table>
+      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
+  const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
+  const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
+  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>
+    <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
+    <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
+    <div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
+    ${tk.run && tk.run.name === m.name ? `<div class="stepline">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
+    ${tk.err ? `<p class="err">${esc(tk.err)}</p>` : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
+}
+
+async function tkLoad(name) {
+  rs.tk.name = name;
+  try { rs.tk.data = await invoke("think_check_results", { name }); } catch (e) { rs.tk.data = null; rs.tk.err = String(e); }
+  if (page === "reshape") render();
+}
+
+function tkStart(m, target) {
+  const tk = rs.tk;
+  tk.run = { name: m.name, target, text: "Starting…", progress: null, done: 0 }; tk.err = null; tk.ok = null; render();
+  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
+}
+
+function onThinkEvent(p) {
+  const tk = rs.tk;
+  if (p.kind === "progress") { if (tk.run) { tk.run.text = p.step === "load" ? (p.text || "Loading the model…") : (p.text || p.step); tk.run.progress = p.value; } }
+  else if (p.kind === "think_item") { if (tk.run) tk.run.done++; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "error") { tk.run = null; tk.err = p.text; }
+  else if (p.kind === "done") {
+    const name = tk.run && tk.run.name;
+    tk.run = null;
+    tk.ok = p.data && p.data.stopped ? "Stopped. Nothing was saved from this check." : p.data && p.data.cached ? "Done (the saved numbers of this model were used)." : "Done. The numbers are in the table.";
+    if (name) { tkLoad(name); return; }
+  }
+  if (page === "reshape") render();
+}
+
+function wireThink() {
+  const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
+  const tk = rs.tk;
+  document.querySelectorAll("input[name=tk-mode]").forEach((r) => r.onchange = () => { tk.quick = r.value === "quick"; render(); });
+  document.querySelectorAll("[data-tkgo]").forEach((b) => b.onclick = () => { if (m) tkStart(m, b.dataset.tkgo); });
+  const pick = $("tk-gguf-pick"); if (pick) pick.onchange = () => { tk.gguf = pick.value; render(); };
+  const gf = $("tk-gguf"); if (gf) gf.onchange = () => { tk.gguf = gf.value.trim(); render(); };
+  const st = $("tk-stop"); if (st) st.onclick = () => { if (tk.run) tk.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
 
 // ------------------------------------------------------------------------------------------------------- try before cutting
@@ -2690,6 +2770,8 @@ async function rsMeasInfo() {
 // the person's Heal card needs the options of the model that is shown
 function rsAfterState() {
   const st = rs.state; if (!st) return;
+  const done = st.made.filter((m) => m.status === "done" && m.summary), on = done.find((m) => m.name === rs.view) || done[0];
+  if (on && (rs.tk.name !== on.name || !rs.tk.data) && !rs.tk.run) tkLoad(on.name);                // the thinking check card shows the saved numbers of the shown model
   if (rs.hl && rs.hl.pair) { if (rs.hl.stale) hsReloadPair(); return; }          // a pair chosen in the Heal section: it is reloaded as a pair
   const made = st.made.filter((m) => m.status === "done" && m.summary);
   const shown = made.find((m) => m.name === rs.view) || made[0];
@@ -2719,6 +2801,7 @@ function onHealEvent(p) {
 }
 
 function onReshapeEvent(p) {
+  if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "try") return onTryEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
@@ -2855,6 +2938,7 @@ function wireReshape() {
   on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
   wireHealSection();
+  wireThink();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {

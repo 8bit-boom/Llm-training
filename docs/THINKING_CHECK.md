@@ -86,8 +86,21 @@ questions through `/v1/chat/completions` with `chat_template_kwargs: {"enable_th
 on Linux it also ends if the worker is killed). A server that splits the reasoning into `reasoning_content` and one that leaves `<think>...</think>` in the text are both understood. The Stop
 file is looked at twice a second while questions run. The trace length is estimated (a quarter of the characters), the loop test uses words instead of token ids.
 
+## In the app
+
+On the result card of a made model (Slim or grow a model page), under the Heal card: **Thinking check**. Choose Quick (16 questions, shorter limit; the default for a model of 15 B or more) or
+Full (32), then *Check the original*, *Check the cut model*, *Check the healed model* (when there is one), or choose / type a GGUF file and *Check this GGUF* (the llama-server way). The table
+sets the numbers side by side; the last row is the verdict against the original: **Pass**, **Close to the limit** (all gates met, one within 5 %) or **Fail** (with the gates that were missed,
+in words). The original is checked once and kept: a repeated check of the same weights, settings and suite is answered from the saved file. Quick and Full are kept apart; a result of another suite
+version is not shown. Stop ends the check between questions and saves nothing.
+
+Where things are: `models/<name>/think_check/<target>.<full|quick>.json` (written by the worker: its key and its result), `STOP` while stopping. Rust: `crates/ndforge-core/src/reshape/thinkcheck.rs`
+(the job, the saved results, the gates, tested against `worker/tests/data/think_gate_cases.json`); Tauri commands `think_check_results`, `think_check_plan`, `think_check_start` (events on `reshape-event`
+with `phase: "think"`; the Stop button is `reshape_stop`); page `ui/app.js` (`thinkCard`), smoke test `ui/smoke/thinkcheck.test.mjs`.
+
 ## Not verified yet
 
+* The card and the Tauri commands were not run in a real window (the commands compile with the program; the page was tested in a stand-in browser and the Rust side with a fake worker).
 * Nothing here ran on a real model: the scorer was tested on written outputs and the job on a stand-in backend. Whether the suite is easy or hard for a real Qwen3.8 27B (and for the
   cut), how long its traces are, and whether the gates are in the right place need the owner's runs.
 * The gates' numbers come from the plan, not from measurements; expect to adjust them after the first real comparisons.

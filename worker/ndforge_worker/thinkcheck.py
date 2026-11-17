@@ -347,7 +347,8 @@ def run_items(backend, main: list, control: list, settings: dict, should_stop=la
 
 def result_of(model: str, backend: str, settings: dict, run: dict, seconds: float) -> dict:
     return {"model": model, "backend": backend, "suite_version": SUITE_VERSION, "settings": settings, "main": summarize(run["items"]), "control": summarize(run["control"]),
-            "items": run["items"] + run["control"], "stopped": run["stopped"], "seconds": round(seconds, 1)}
+            "items": run["items"] + run["control"], "stopped": run["stopped"], "seconds": round(seconds, 1),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
 CACHE_FORMAT = 1
