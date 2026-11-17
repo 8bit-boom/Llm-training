@@ -680,3 +680,28 @@ fn publishing_is_a_step_only_when_asked_and_a_missing_studio_is_a_note_not_a_fai
     assert_eq!(st.status, "done");
     assert_eq!(st.steps.last().unwrap().note.as_deref(), Some("Unsloth Studio's share is not set up."));
 }
+
+#[test]
+fn the_window_gets_a_plan_without_a_job_and_the_report_of_the_newest_run() {
+    // the plan: no training data is a blocker, the rest is the planner's
+    let ins = qwen27();
+    let ok = preview(&ins, &spec(21.1), Some(32.0), Some(900.0), true);
+    assert_eq!(ok["plan"]["ok"], true);
+    assert_eq!(ok["plan"]["stages"].as_array().unwrap().len(), 2);
+    let no = preview(&ins, &spec(21.1), Some(32.0), Some(900.0), false);
+    assert_eq!(no["plan"]["ok"], false);
+    assert!(no["plan"]["blockers"][0].as_str().unwrap().contains("training-data version"));
+    // the report: none before a run, then the newest run's data and Markdown
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    assert!(report_of(&p, None).unwrap_err().0.contains("no Auto-cut run"));
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    for id in [None, Some(st.id.as_str())] {
+        let r = report_of(&p, id).unwrap();
+        assert_eq!(r["run"], json!(st.id));
+        assert_eq!(r["report"]["status"], "done");
+        assert!(r["markdown"].as_str().unwrap().starts_with("# Auto-cut report: Qwen3.8 27B"));
+    }
+    assert!(report_of(&p, Some("nope")).is_err());
+}

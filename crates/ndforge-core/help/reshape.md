@@ -88,3 +88,14 @@ A step-by-step guide is in the program's folder under `docs/PRUNE_QWEN38_27B.md`
 - **Measure in 4-bit with 256 samples** of your own text; **heal with the default 20 million tokens** (general text on), then train in Step 3 with QLoRA. To keep a model thinking, keep at least 75 % reasoning-style examples.
 - **Test the original first**, write down its three numbers, and compare every step against them.
 - You need about 200 GB of free disk for thinning and healing (the original, the thinned model, the healed model and the teacher's answers).
+
+## Auto-cut (one click)
+
+The card at the top does the whole Slim page for you: **measure** the model on reasoning text, **try** a few cuts, **cut** and **heal** in two stages (the original is always the teacher), **check that it still thinks** after every stage, and **export** the GGUF files.
+
+- Move the slider to the size you want (below about 20 B a model that thinks gets clearly weaker; the card says so). The plan under it shows the stages, the healing time, the card and the disk it needs; Start stays off while the plan has a red line.
+- **Keep it able to think** (Qwen3.5 / 3.8) uses reasoning examples for measuring and healing, checks the answers, and keeps the thinking template in the GGUF.
+- If a healed model fails the thinking check, Auto-cut heals it again with 40 million more tokens, then backs the cut off one step and does that stage again; after that it stops and says why. Nothing is deleted from a stage that did not pass.
+- **Stop** ends the current step safely; **Continue** goes on where it was, also after you closed the program. It takes many hours.
+- "Put the GGUF files into Unsloth Studio's share" needs the folder Studio keeps its files in (as this computer sees it) and the same folder inside Studio's container; with an Unsloth API key (Training setup) the container path is found out for you.
+- **Show the report** gives the numbers of the whole run. Only the intermediate files that Auto-cut itself made are ever deleted; never your original model.

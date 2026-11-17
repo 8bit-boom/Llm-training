@@ -4,7 +4,7 @@ Auto-cut chains the steps of the Slim page that a person would do by hand: look 
 files into Unsloth Studio's share. It reuses the existing jobs (`reshape_inspect`, `reshape_measure`, `reshape_try`, `reshape`, the heal jobs, `think_check`, export, imatrix adapt); it
 adds a planner, a state machine that can be stopped and continued, gates after every stage, and a report. Nothing in it has run on a real model yet ("Not verified yet" at the end).
 
-This file is written in steps: the planner, the orchestrator (state machine, gates, retry and report), the Studio publish and the page.
+This file covers the planner, the orchestrator (state machine, gates, retry and report), the Studio publish and the page.
 
 ## The planner (`crates/ndforge-core/src/reshape/auto_plan.rs`)
 
@@ -110,7 +110,19 @@ of the run; a full disk is a failure that Continue retries. Files are never writ
 Deviations: Studio answers 201 (not 400) for a folder it already has, so there is no "duplicate" case (a 400 containing "already" is still taken as success); under an API key Studio hides the paths of its folder list, so
 the registration is not checked against that list.
 
+## The page (`ui/app.js`, "Auto-cut (one click)")
+
+A card at the top of the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
+Full or Quick, *keep the intermediate files*, the confirmation of more than 4 blocks (only when the plan says it is needed), and the Studio publish box with the share fields (Save and Check). Under them the plan: blockers (red, Start
+disabled), warnings, the stages (size, cut, healing tokens and hours, card) and the disk. Start / Stop / Continue / Show the report, then a **stepper** of the run's steps (done, running, pending, skipped, failed, with the note of the step), the live text
+and bar of the running job, and the report as text.
+
+Tauri commands (`src-tauri/src/lib.rs`): `auto_plan(spec, inspect)` (the planner for the model description the page already has; no job runs), `auto_start(spec, resume)` (a new run, or `resume` = run id; one job at a time, the
+same busy flag as the other jobs), `auto_stop` (the Stop flag of the other jobs), `auto_status` (the newest run's state, whether a job runs, the saved Studio share; a run left "running" by a closed program is marked stopped here),
+`auto_report(run)` (data and Markdown), `studio_share_set` and `studio_share_check` (the share settings, and the comparison with Studio's outputs folder). Events: `reshape-event` with `phase: "auto"`; the page reloads the state
+file at every step event, so the stepper is what the file says. Tests: `ui/smoke/autocut.test.mjs` (the card, the plan request, start / stop / continue, the stepper, the end states, the share), `tests/auto.rs` (`preview`, `report_of`).
+
 ## Not verified yet
 
 Nothing here ran on a real model, card or Studio (the publish ran against a stand-in server and temporary folders only). The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
-is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs) has only been compiled and read, not run against a worker.
+is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs, including `publish`, which reads the global settings) has only been compiled and read, not run against a worker; the page was only run in a stand-in browser, never in the window.

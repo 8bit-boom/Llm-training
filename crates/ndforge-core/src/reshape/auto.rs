@@ -900,3 +900,24 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     st.publish = Some(r);
     Ok(Flow::Done(note))
 }
+
+/// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
+pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
+    let mut plan = auto_plan::plan(ins, spec, vram_gb, free_gb);
+    if !has_training_data {
+        plan.ok = false;
+        plan.blockers.push("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text.".into());
+    }
+    json!({"plan": plan})
+}
+
+/// A run (the newest when `id` is None) and its report as data and as Markdown, made from the saved state.
+pub fn report_of(p: &Project, id: Option<&str>) -> Result<Value> {
+    let st = match id {
+        Some(i) => load(&run_dir(p, i)),
+        None => latest(p),
+    }
+    .ok_or_else(|| Error::new("There is no Auto-cut run yet."))?;
+    let r = auto_report::build(&st);
+    Ok(json!({"run": st.id, "report": r, "markdown": auto_report::markdown(&r)}))
+}

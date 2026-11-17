@@ -2324,6 +2324,124 @@ function madeCard(m) {
 }
 
 
+// ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
+// The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
+// program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
+let ac = { target: null, thinking: null, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
+  run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
+const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
+const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
+
+function acIns() { return rs.options && rs.options.inspect && rs.options.inspect.supported ? rs.options.inspect : null; }
+function acDefaults() {
+  const ins = acIns(); if (!ins) return;
+  const total = ins.total_params / 1e9;
+  if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
+  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
+}
+function acSpec() {
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
+}
+async function acLoad() {
+  try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
+  if (page === "reshape") render();
+}
+// keeps the plan in step with the choices; asks the program only when the request changed
+function acRefresh() {
+  if (page !== "reshape" || !rs.state) return;
+  if (!ac.loaded) { ac.loaded = true; acLoad(); }
+  const ins = acIns(); acDefaults();
+  if (!ins || ac.target == null) return;
+  const sig = JSON.stringify([acSpec(), rs.state.dataset_version]);
+  if (sig === ac.planFor) return;
+  ac.planFor = sig; ac.plan = null; ac.planErr = null;
+  const token = ++ac.planTok;
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
+    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+}
+
+function autoCard() {
+  const ins = acIns();
+  if (!rs.state) return "";
+  acDefaults();
+  const run = ac.run, live = ac.running || (run && run.status === "running");
+  const total = ins ? ins.total_params / 1e9 : 0;
+  const pl = ac.plan;
+  const canThink = !!ins && ins.model_type === "qwen3_5";
+  const lock = live ? "disabled" : "";
+  const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
+    ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
+  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") : "";
+  const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
+  const status = run ? `<p><strong id="ac-status">${esc(AC_STATUS[run.status] || run.status)}</strong>${run.error ? `: ${esc(run.error)}` : ""} <span class="dim small">${esc(run.id)}</span></p>` : "";
+  const ended = run && ["done", "gates_failed", "failed"].includes(run.status);
+  const sh = ac.share || {};
+  const studio = `<label class="opt"><input type="checkbox" id="ac-publish" ${ac.publish ? "checked" : ""} ${lock}> Put the GGUF files into Unsloth Studio's share when done</label>
+    ${ac.publish || ac.shareOpen ? `<div class="grid" id="ac-share">
+      <label>Studio share (the folder as this computer sees it)<input type="text" id="ac-sh-host" value="${esc(sh.host_path || "")}" placeholder="Y:\\unsloth\\studio"></label>
+      <label>Path inside the container<input type="text" id="ac-sh-cont" value="${esc(sh.container_path || "")}" placeholder="/workspace (empty: found out from Studio)"></label>
+      <label><input type="checkbox" id="ac-sh-reg" ${sh.register_scan_folder ? "checked" : ""}> Tell Studio about the exports folder</label>
+      <label><input type="checkbox" id="ac-sh-hf" ${sh.finetune_handoff ? "checked" : ""}> Also copy the healed model for fine-tuning in Studio (large)</label>
+      <div class="row"><button class="secondary" id="ac-sh-save">Save</button><button class="secondary" id="ac-sh-check">Check</button></div>
+      ${ac.shareNote ? `<p class="dim small" id="ac-sh-note">${esc(ac.shareNote)}</p>` : ""}</div>` : ""}`;
+  const rep = ac.report ? `<details open id="ac-report"><summary>Report</summary><pre class="log">${esc(ac.report)}</pre></details>` : "";
+  return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
+    <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
+    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “1 · Start from”.</p>` : `
+    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
+    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
+    <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
+    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
+      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
+    <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
+    ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
+    ${studio}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
+    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready ? "disabled" : ""}>Start Auto-cut</button>
+      ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
+      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
+      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
+    ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
+    ${live ? `<div class="stepline" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
+    ${ac.err ? `<div class="err">${esc(ac.err)}</div>` : ""}${status}${steps}${rep}</div>`;
+}
+
+function onAutoEvent(p) {
+  if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
+  if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
+  else if (p.kind === "error") { ac.running = false; ac.err = p.text; ac.progress = null; acLoad(); return; }
+  else if (p.kind === "done") { ac.running = false; ac.progress = null; ac.text = ""; if (p.data) ac.run = p.data; acLoad(); return; }
+  if (page === "reshape") render();
+}
+
+function wireAuto() {
+  const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
+  set("ac-target", (e) => { ac.target = +e.value; });
+  const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
+  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
+  set("ac-publish", (e) => { ac.publish = e.checked; });
+  document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
+  document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
+  const share = () => ({ host_path: ($("ac-sh-host") || {}).value || "", container_path: ($("ac-sh-cont") || {}).value || "", register_scan_folder: !!($("ac-sh-reg") || {}).checked, finetune_handoff: !!($("ac-sh-hf") || {}).checked });
+  const sv = $("ac-sh-save"); if (sv) sv.onclick = async () => { ac.share = share(); try { setState(await invoke("studio_share_set", { share: ac.share })); ac.shareNote = "Saved."; } catch (e) { ac.shareNote = String(e); } render(); };
+  const ck = $("ac-sh-check"); if (ck) ck.onclick = async () => { ac.share = share(); ac.shareNote = "Checking…"; render(); try { const r = await invoke("studio_share_check", { share: ac.share }); ac.shareNote = r.note; } catch (e) { ac.shareNote = String(e); } render(); };
+  const go = $("ac-go");
+  if (go) go.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Starting…"; ac.progress = null; render();
+    try { await invoke("auto_start", { spec: acSpec(), resume: null }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+  const co = $("ac-continue");
+  if (co) co.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing…"; render();
+    try { await invoke("auto_start", { spec: null, resume: ac.run.id }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+  const st = $("ac-stop"); if (st) st.onclick = () => { ac.text = "Stopping…"; invoke("auto_stop"); render(); };
+  const rp = $("ac-report-btn");
+  if (rp) rp.onclick = async () => { try { const r = await invoke("auto_report", { run: ac.run ? ac.run.id : null }); ac.report = r.markdown; } catch (e) { ac.err = String(e); } render(); };
+  acRefresh();
+}
+
 // ------------------------------------------------------------------------------------------------------------ the thinking check
 // Does the model still think before it answers, after it was cut and healed? A small suite is asked with thinking on (worker job think_check, docs/THINKING_CHECK.md);
 // the table sets the numbers of the original, the cut, the healed model and a GGUF file side by side, and the gates say pass, warn or fail for each.
@@ -2722,7 +2840,7 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + pick + size + tryCard() + make + healSection() + result + list;
+  return head + msg + intro + autoCard() + pick + size + tryCard() + make + healSection() + result + list;
 }
 
 async function rsRefresh(stale) {
@@ -2807,6 +2925,7 @@ function onHealEvent(p) {
 }
 
 function onReshapeEvent(p) {
+  if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "try") return onTryEvent(p);
@@ -2954,6 +3073,7 @@ function wireReshape() {
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
   wireHealSection();
   wireThink();
+  wireAuto();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {

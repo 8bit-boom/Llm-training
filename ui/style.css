@@ -135,3 +135,11 @@ p.hs-warn { color: #8a5a00; }
 .qk-table th, .qk-table td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: right; white-space: nowrap; }
 .qk-table th:first-child, .qk-table td:first-child { text-align: left; white-space: normal; }
 .qk-table th { color: var(--dim); font-weight: 600; }
+
+.stepper { list-style: none; padding-left: 0; margin: 8px 0; }
+.stepper li { padding: 2px 0; }
+.stepper li span:first-child { display: inline-block; width: 1.4em; }
+.stepper .ac-done span:first-child { color: var(--ok, #2a7); }
+.stepper .ac-failed span:first-child { color: var(--err, #c33); }
+.stepper .ac-running { font-weight: 600; }
+.stepper .ac-pending, .stepper .ac-skipped { opacity: .6; }
