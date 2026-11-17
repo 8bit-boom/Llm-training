@@ -160,6 +160,18 @@ def main(argv: list) -> int:
         except Exception as exc:
             protocol.error("heal_check_failed", _explain(exc))
             return 1
+    if kind in ("think_check", "think_check_plan"):
+        from . import thinkcheck
+        try:
+            return {"think_check": thinkcheck.run, "think_check_plan": thinkcheck.run_plan}[kind](job)
+        except thinkcheck.ThinkCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error(exc.code, str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("think_check_failed", _explain(exc))
+            return 1
     if kind == "general_check":
         from . import generaltext
         return generaltext.run_check(job)
