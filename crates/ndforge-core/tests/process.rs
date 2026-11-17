@@ -60,3 +60,47 @@ fn cancellation_is_one_value_with_an_unchanged_text() {
     assert!(e.is_cancelled() && !ndforge_core::Error::new("Stopped.").is_cancelled());
     assert_eq!(ndforge_core::error::CANCELLED, "Cancelled.");
 }
+
+fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // signal 0 only asks whether the process exists; a zombie that nobody collected yet still counts as gone below
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r != 0 {
+            return false;
+        }
+        // a killed grandchild whose parent is gone is collected by init; wait until its state is not Z
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| !s.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z')).unwrap_or(true)
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        out.split_whitespace().any(|w| w == pid.to_string())
+    }
+}
+
+#[test]
+fn stopping_ends_the_programs_the_program_started() {
+    let Some(py) = python() else { return };
+    let code = "import subprocess, sys, time\nc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\nprint(c.pid, flush=True)\ntime.sleep(60)\n";
+    let mut cmd = Command::new(py);
+    cmd.arg("-c").arg(code);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let grandchild = Arc::new(std::sync::Mutex::new(None::<u32>));
+    let (c2, g2) = (cancel.clone(), grandchild.clone());
+    let r = run_lines(cmd, &cancel, &mut |s, l| {
+        if s == Stream::Out {
+            if let Ok(pid) = l.trim().parse::<u32>() {
+                *g2.lock().unwrap() = Some(pid);
+                c2.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    assert_eq!(r.unwrap_err().0, "Cancelled.");
+    let pid = grandchild.lock().unwrap().expect("the program printed the pid of what it started");
+    let started = Instant::now();
+    while alive(pid) && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(pid), "the grandchild {pid} is still running");
+}

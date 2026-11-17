@@ -171,6 +171,10 @@ What was researched (FlashAttention, SageAttention, `torch.compile`, quantizatio
 
 Training setup has **Install without Unsloth** (standard libraries only; the program fetches Python and PyTorch itself) and Expert mode has *Training engine* (auto / unsloth / standard). A model can also be a folder on this computer (Step 3, *Add a model from Hugging Face…* → *Choose a folder…*; checked like a Hugging Face model, trained on this computer only). Details: `docs/INSTALL.md`, `docs/TRAINING_SPEED.md`.
 
+## Stopping
+
+Stop (and closing the program) ends the worker and every program it started: its own process group on Linux and macOS, a Job Object on Windows. Details and what is not verified: `docs/THINKING_CHECK.md`, "Stopping". A line of worker output that is not valid UTF-8 (a Windows console in cp1252) is kept with the bad bytes replaced; it no longer stops the reading.
+
 ## Saved files
 
 Settings, the access keys (`secrets.json`), run states and the other small files are written to `<name>.tmp` first and renamed, so a crash or a full disk leaves the old file, never half a file (`crates/ndforge-core/src/fsx.rs`; on Windows a rename that is refused for a moment is tried again). A settings or keys file that cannot be read is kept as `settings.json.broken-<time>` (or `secrets.json.broken-<time>`), the standard settings are used, and the window says so once at the start.

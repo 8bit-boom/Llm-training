@@ -23,6 +23,77 @@ pub fn quiet(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// The program and everything it starts, so that a stop (or the end of this program) takes the whole family down, not only the first process: llama-server,
+/// llama-quantize, llama-imatrix and the converter are children of the worker and would otherwise keep running (and keep the graphics card full).
+/// Linux / macOS: the program gets its own process group and a stop kills the group. Windows: the program is put into a Job Object that kills everything in it
+/// when the stop is asked for or when the handle closes (this program ends, however it ends).
+struct ProcessTree {
+    #[cfg(windows)]
+    job: isize,
+    #[cfg(unix)]
+    pid: i32,
+}
+
+impl ProcessTree {
+    /// Call right after the spawn. Failing is not fatal (a Job Object may be refused inside another job on an old Windows): the plain kill still works.
+    fn attach(child: &std::process::Child) -> ProcessTree {
+        #[cfg(unix)]
+        {
+            ProcessTree { pid: child.id() as i32 }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::JobObjects::*;
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job == 0 {
+                    eprintln!("note: no Job Object ({}); only the first program is stopped on Stop", std::io::Error::last_os_error());
+                    return ProcessTree { job: 0 };
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const std::ffi::c_void, std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+                if ok == 0 || AssignProcessToJobObject(job, child.as_raw_handle() as isize) == 0 {
+                    eprintln!("note: could not put the program into a Job Object ({}); only the first program is stopped on Stop", std::io::Error::last_os_error());
+                    CloseHandle(job);
+                    return ProcessTree { job: 0 };
+                }
+                ProcessTree { job }
+            }
+        }
+    }
+
+    /// Kills the program and what it started, then reaps the program.
+    fn kill(&self, child: &mut std::process::Child) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if self.job != 0 {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if self.job != 0 {
+            // KILL_ON_JOB_CLOSE: whatever is left of the program's family ends here
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+        }
+    }
+}
+
 /// Starts the program. Linux answers "text file busy" (ETXTBSY) when the program file was written a moment ago while another thread of this program was
 /// starting a process: the child it made inherits the still-open write handle until it executes. It goes away within milliseconds, so wait and retry.
 fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
@@ -61,7 +132,13 @@ fn pump(src: impl Read, stream: Stream, tx: mpsc::Sender<(Stream, String)>) {
 pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(Stream, &str)) -> Result<ExitStatus> {
     quiet(&mut cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = spawn_retrying(&mut cmd).map_err(|e| Error::new(format!("Could not start {:?}: {e}", cmd.get_program())))?;
+    let tree = ProcessTree::attach(&child);
     let (tx, rx) = mpsc::channel::<(Stream, String)>();
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -76,8 +153,7 @@ pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(
     loop {
         // A chatty program never lets the receive time out, so look at the stop request on every turn.
         if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            tree.kill(&mut child);
             return Err(Error::cancelled());
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
