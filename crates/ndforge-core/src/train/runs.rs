@@ -1,7 +1,7 @@
 //! Training runs: `runs/<name>/` holds config.json (the job), state.json (status), metrics.jsonl (what the charts draw), the checkpoints and the
 //! adapter. Starting, stopping (a STOP file the worker honours after the current step, then a kill after a grace period) and resuming.
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use super::catalog::ModelEntry;
 use super::plan::{Hyper, Method};
-use crate::envmgr::jobs::{run_job, WorkerEvent};
-use crate::envmgr::{env_dir, python_path, worker_dir};
+use crate::envmgr::jobs::WorkerEvent;
+use crate::envmgr::{env_dir, python_path};
 use crate::error::{Error, Result};
 use crate::paths::config_dir;
 use crate::project::Project;
@@ -20,13 +20,7 @@ pub fn runs_dir(p: &Project) -> PathBuf {
 }
 
 fn write_json(path: &Path, v: &Value) -> Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::fsx::write_json_atomic(path, v)
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -253,29 +247,7 @@ pub fn mark_interrupted(p: &Project) -> usize {
 /// exit (a STOP file in `out_dir`); after `grace` it is killed. Returns the worker's result, or an error (a kill is "Cancelled.").
 pub fn drive(py: &Path, out_dir: &Path, job: &Value, stop: Arc<AtomicBool>, grace: Duration, on_worker: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
     std::fs::create_dir_all(out_dir)?;
-    let kill = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    let watcher = {
-        let (kill, done, stop, stop_file) = (kill.clone(), done.clone(), stop, out_dir.join("STOP"));
-        std::thread::spawn(move || {
-            let mut asked: Option<std::time::Instant> = None;
-            while !done.load(Ordering::SeqCst) {
-                if stop.load(Ordering::SeqCst) && asked.is_none() {
-                    let _ = std::fs::write(&stop_file, b"");
-                    asked = Some(std::time::Instant::now());
-                }
-                if asked.is_some_and(|t| t.elapsed() > grace) {
-                    kill.store(true, Ordering::SeqCst);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        })
-    };
-    let outcome = run_job(py, &worker_dir(), job, &kill, on_worker);
-    done.store(true, Ordering::SeqCst);
-    let _ = watcher.join();
-    let _ = std::fs::remove_file(out_dir.join("STOP"));
-    outcome
+    crate::envmgr::jobs::run_with_grace(py, job, &out_dir.join("STOP"), &stop, grace, on_worker)
 }
 
 /// Runs the job on this PC to the end, stopping or failing, and keeps the run's state. Every event goes to `on_event` as JSON ({"kind": ...}).
@@ -314,7 +286,7 @@ pub fn finish(dir: &Path, m: &ModelEntry, method: Method, hyper: &Hyper, outcome
             }
             Ok(result)
         }
-        Err(e) if e.0 == "Cancelled." => {
+        Err(e) if e.is_cancelled() => {
             // killed after the grace period: the last checkpoint is kept and the run can be continued
             set_state(dir, json!({"status": "stopped"}));
             Err(Error::new("Stopped. The run can be continued from its last saved point."))
@@ -363,6 +335,6 @@ pub fn resumable(p: &Project, name: &str) -> bool {
     }
     // one stage keeps its checkpoints directly in checkpoints/, a two-stage run in checkpoints/<stage>/
     let d = runs_dir(p).join(name).join("checkpoints");
-    let has = |dir: &Path| std::fs::read_dir(dir).map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false);
+    let has = |dir: &Path| std::fs::read_dir(dir).map(|r| r.flatten().any(|e| { let n = e.file_name().to_string_lossy().to_string(); n.starts_with("checkpoint-") && !n.contains(".broken") })).unwrap_or(false);
     has(&d) || std::fs::read_dir(&d).map(|r| r.flatten().any(|e| e.path().is_dir() && has(&e.path()))).unwrap_or(false)
 }

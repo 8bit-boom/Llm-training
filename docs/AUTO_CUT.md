@@ -64,7 +64,13 @@ a time on one card, with the Stop button on the same flag). Worker events are fo
 
 Models that do not think (*keep thinking* off) skip the thinking checks and the reasoning text; everything else is the same.
 
-**Clean-up** (`keep_intermediate` off): after the check of stage N passed, its unhealed cut (`model/` and its entry in the model list) and the teacher's saved answers are deleted, and the healed
+**The teacher's answers are shared.** Every stage heals with the same teacher, tokenizer, text and settings, so the teacher's answers are kept once in `models/_teacher_cache/<id>/` and each
+model's own `distill/cache/` only holds its index (which says where the parts are) and its rows. A stage that needs more rows (a retry with more tokens) adds only the rows that are missing;
+a stage that needs fewer reuses the start. In the disk timeline the answers therefore count once (the biggest run), not once per stage. Without *keep the intermediate files* the shared answers go
+when the **last stage has passed** its check (and the links of the run's models to them), never earlier, and never while any other model, such as a heal started on the Slim page, still uses them.
+A shared folder nobody uses is also removed when a model is deleted. See docs/HEAL_SETTINGS.md ("The shared teacher cache").
+
+**Clean-up** (`keep_intermediate` off): after the check of stage N passed, its unhealed cut (`model/` and its entry in the model list) are deleted (its own cache folder is only a link), and the healed
 model of stage N-1; the healed model of the last stage is never deleted. Only what the run made is ever deleted (the run keeps the list, `made`, and the real effects refuse anything else), never the
 original model, and nothing from a stage that did not pass. The test records every deletion and compares it with the plan's disk timeline.
 

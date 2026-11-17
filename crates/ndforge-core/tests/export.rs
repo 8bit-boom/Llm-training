@@ -606,6 +606,39 @@ exit 1"#);
 
 #[cfg(unix)]
 #[test]
+fn stop_during_a_plain_export_also_lets_the_worker_end_by_itself() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    // no importance matrix: the job still carries `stop_file`, and the program waits the grace time instead of killing at once
+    fake_worker(d.path(), r#"cp "$5" "$out/../job-seen.json"
+touch "$out/waiting"
+while [ ! -f "$out/STOP" ]; do sleep 0.05; done
+echo '{"type":"error","code":"export_stopped","message":"Cancelled."}'
+exit 1"#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let kill = AtomicBool::new(false);
+    let waiting = p.folder.join("exports/run1-q4_k_m/waiting");
+    let t0 = std::time::Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !waiting.exists() && t0.elapsed().as_secs() < 20 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            kill.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        exports::execute_many_with(&p, "run1", &["q4_k_m".to_string()], 8192, "gguf", &exports::ImatrixOptions::default(), &kill, &mut |_| {})
+    });
+    assert_eq!(r.unwrap_err().0, "Cancelled.");
+    assert!(t0.elapsed().as_secs() < 15 && !p.folder.join("exports/run1-q4_k_m/STOP").exists());
+    let job: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p.folder.join("exports/job-seen.json")).unwrap()).unwrap();
+    assert!(job["stop_file"].as_str().unwrap_or("").ends_with("STOP"), "{job}");
+}
+
+#[cfg(unix)]
+#[test]
 fn the_export_keeps_thinking_only_for_a_base_healed_with_the_thinking_recipe() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let d = tempdir().unwrap();

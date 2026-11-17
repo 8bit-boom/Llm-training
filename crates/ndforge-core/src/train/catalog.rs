@@ -48,11 +48,7 @@ pub fn custom_models() -> Vec<ModelEntry> {
 
 fn save_custom(list: &[ModelEntry]) -> crate::error::Result<()> {
     let f = custom_file();
-    if let Some(d) = f.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(f, serde_json::to_vec_pretty(list)?)?;
-    Ok(())
+    crate::fsx::write_json_atomic(&f, list)
 }
 
 pub fn add_custom(m: ModelEntry) -> crate::error::Result<()> {

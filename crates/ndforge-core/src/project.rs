@@ -154,10 +154,7 @@ impl Project {
             choices: self.choices.clone(), worlds: self.extra_worlds.clone(),
         };
         let text = toml::to_string_pretty(&f).map_err(|e| Error::new(format!("Could not save the project: {e}")))?;
-        let tmp = self.folder.join("project.toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(tmp, self.file())?;
-        Ok(())
+        crate::fsx::write_atomic(&self.file(), text.as_bytes())
     }
 
     // ----------------------------------------------------------------- sources

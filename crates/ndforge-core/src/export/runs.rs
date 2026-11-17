@@ -1,8 +1,8 @@
 //! Export runs: `exports/<run>-<quant>/` holds model-<quant>.gguf, Modelfile, MODEL_CARD.md, meta.json (what it was made from and where it was
 //! installed) and export.json (the worker's summary).
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -100,6 +100,46 @@ pub const IMATRIX_CTX: u32 = 512;
 pub const IMATRIX_GENERAL_SHARE: f64 = 0.2;
 /// After Stop the worker has this long to end the matrix step by itself (it kills llama-imatrix at once); then the worker is killed.
 pub(crate) const IMATRIX_STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// Bits per weight of the plain GGUF sizes (llama.cpp's own table, rounded up a little); a mixed size is taken as 5.5.
+fn bits_per_weight(quant: &str) -> f64 {
+    match quant {
+        "q4_k_m" => 4.85,
+        "q5_k_m" => 5.7,
+        "q6_k" => 6.6,
+        "q8_0" => 8.5,
+        "f16" => 16.0,
+        _ => 5.5,
+    }
+}
+
+/// The most disk space an export needs at one moment, in GB: the merged 16-bit model (2 bytes per weight, only when there is an adapter to merge), the 16-bit GGUF
+/// (2 bytes per weight) and the sizes made from it. Converting needs merged + 16-bit; shrinking needs the 16-bit file + every size (+ the merged model while it is kept).
+/// No sizes (a "merged model only" export) needs just the merged model. `params_b` in billions.
+pub fn export_need_gb(params_b: f64, has_adapter: bool, quants: &[String], keep_merged: bool) -> f64 {
+    let merged = if has_adapter { 2.0 * params_b } else { 0.0 };
+    if quants.is_empty() {
+        return merged;
+    }
+    let f16 = 2.0 * params_b;
+    let sizes: f64 = quants.iter().filter(|q| q.as_str() != "f16").map(|q| params_b * bits_per_weight(q) / 8.0).sum();
+    (merged + f16).max(if keep_merged { merged } else { 0.0 } + f16 + sizes)
+}
+
+/// Refuses an export that would run the disk full, in plain words with both numbers. `free_gb` None (not known) never refuses.
+pub fn check_export_disk(need_gb: f64, free_gb: Option<f64>, dir: &std::path::Path) -> Result<()> {
+    match free_gb {
+        Some(free) if need_gb > 0.0 && free < need_gb * 1.05 => Err(Error::new(format!(
+            "There is not enough free space for this export: about {need_gb:.1} GB are needed in {} and {free:.1} GB are free. Free some space, or choose fewer or smaller file sizes.", dir.display()))),
+        _ => Ok(()),
+    }
+}
+
+/// Billions of weights of a model folder, from the size of its 16-bit safetensors files (a rough figure for the disk check).
+fn folder_params_b(dir: &std::path::Path) -> f64 {
+    let bytes: u64 = std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+    bytes as f64 / 2e9
+}
 
 /// Does the importance matrix do anything for this size? Not for Q8_0 and the 16-bit files.
 pub fn imatrix_helps(quant: &str) -> bool {
@@ -248,32 +288,13 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
                    "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
-/// Runs the export job. With the importance matrix the Stop button first writes a STOP file (the worker kills llama-imatrix and ends cleanly) and kills the
-/// worker only after IMATRIX_STOP_GRACE; without it the worker is killed at once, as before.
+/// Runs the export job. The Stop button first writes a STOP file (the worker kills llama-imatrix / the converter / llama-quantize and ends cleanly) and kills the
+/// worker only after IMATRIX_STOP_GRACE (`graceful: None` kills at once; the program always gives a grace time).
 pub(crate) fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
-    let Some(grace) = graceful else { return run_job(py, &worker_dir(), job, kill, on_event) };
-    let (inner, done, stop_file) = (AtomicBool::new(false), AtomicBool::new(false), out.join("STOP"));
-    let _ = std::fs::remove_file(&stop_file);
-    let result = std::thread::scope(|s| {
-        s.spawn(|| {
-            let mut asked: Option<Instant> = None;
-            while !done.load(Ordering::SeqCst) {
-                if kill.load(Ordering::SeqCst) && asked.is_none() {
-                    let _ = std::fs::write(&stop_file, b"");
-                    asked = Some(Instant::now());
-                }
-                if asked.is_some_and(|t| t.elapsed() > grace) {
-                    inner.store(true, Ordering::SeqCst);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
-        let r = run_job(py, &worker_dir(), job, &inner, on_event);
-        done.store(true, Ordering::SeqCst);
-        r
-    });
-    let _ = std::fs::remove_file(&stop_file);
-    result
+    match graceful {
+        None => run_job(py, &worker_dir(), job, kill, on_event),
+        Some(grace) => crate::envmgr::jobs::run_with_grace(py, job, &out.join("STOP"), kill, grace, on_event),
+    }
 }
 
 pub fn exports_dir(p: &Project) -> PathBuf {
@@ -285,8 +306,7 @@ pub(crate) fn read_json(path: &std::path::Path) -> Option<Value> {
 }
 
 pub(crate) fn write_json(path: &std::path::Path, v: &Value) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(v)?)?;
-    Ok(())
+    crate::fsx::write_json_atomic(path, v)
 }
 
 /// Runs that can be exported: they have a saved adapter. Newest first.
@@ -391,6 +411,12 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     let origin = read_json(&std::path::Path::new(&repo).join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
                      "max_seq": cfg["hyper"]["max_seq"], "thinking_default": thinking_default(std::path::Path::new(&repo))});
+    // the disk is checked before anything is made (the worker looks again before it starts: `need_gb`)
+    if let Some(m) = crate::train::catalog::find(cfg["model"]["id"].as_str().unwrap_or("")) {
+        let need = export_need_gb(m.params_b, !is_full, if want_gguf { &list } else { &[] }, keep_merged);
+        check_export_disk(need, crate::envmgr::health::free_disk_gb(&exports_dir(p)), &exports_dir(p))?;
+        job["need_gb"] = json!((need * 10.0).round() / 10.0);
+    }
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
@@ -412,7 +438,8 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     } else {
         job["adapter"] = json!(adapter);
     }
-    let result = run_export_job(&py, &job, &out, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
+    job["stop_file"] = json!(out.join("STOP"));
+    let result = run_export_job(&py, &job, &out, Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
@@ -543,6 +570,9 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     let origin = read_json(&model_dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": work, "quant": list[0], "quants": list, "backend": "auto", "gguf": true, "keep_merged": false,
                          "max_seq": 4096, "thinking_default": if thinking { "keep" } else { "off" }, "full_model": model_dir});
+    let need = export_need_gb(folder_params_b(model_dir), false, &list, false);
+    check_export_disk(need, crate::envmgr::health::free_disk_gb(&exports_dir(p)), &exports_dir(p))?;
+    job["need_gb"] = json!((need * 10.0).round() / 10.0);
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
@@ -558,7 +588,8 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     if let Some(m) = &matrix {
         job["imatrix"] = m.clone();
     }
-    let result = run_export_job(&py, &job, &work, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
+    job["stop_file"] = json!(work.join("STOP"));
+    let result = run_export_job(&py, &job, &work, Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
@@ -687,6 +718,15 @@ Pictures are not part of the training: the model will not know your world's maps
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    /// Jobs save a log in the settings folder: these tests use a private one for the whole run.
+    fn private_config_dir() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+        std::env::set_var("NDFORGE_CONFIG_DIR", d.path());
+    }
 
     fn fake_python(dir: &std::path::Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -699,6 +739,7 @@ mod tests {
     /// Stop with the importance matrix: a STOP file first (a worker that obeys ends by itself), the kill only after the grace time (a worker that does not).
     #[test]
     fn stop_writes_the_stop_file_first_and_kills_only_after_the_grace_time() {
+        private_config_dir();
         let d = tempfile::tempdir().unwrap();
         let stop = d.path().join("STOP");
         let job = json!({"job": "export", "stop_file": stop});
@@ -720,5 +761,35 @@ mod tests {
         let r = run_export_job(&py, &job, d.path(), Some(Duration::from_millis(400)), &kill, &mut |_| {});
         assert_eq!(r.unwrap_err().0, "Cancelled.");
         assert!(t0.elapsed() < Duration::from_secs(20) && !stop.exists());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    #[test]
+    fn the_disk_an_export_needs_follows_the_sizes_asked_for() {
+        let q = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 10 billion weights, a LoRA run: merged model 20 GB + 16-bit file 20 GB
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m"]), false), 40.0), "converting needs the merged model and the 16-bit file: {}", export_need_gb(10.0, true, &q(&["q4_k_m"]), false));
+        // keeping the merged model: while shrinking it is still there next to the 16-bit file and the sizes
+        assert!(close(export_need_gb(10.0, true, &q(&["q4_k_m", "q8_0"]), true), 20.0 + 20.0 + 10.0 * 4.85 / 8.0 + 10.0 * 8.5 / 8.0));
+        // a full fine-tune has nothing to merge; the 16-bit file as an output is not counted twice
+        assert!(close(export_need_gb(10.0, false, &q(&["f16"]), false), 20.0));
+        assert!(close(export_need_gb(10.0, false, &q(&["q6_k", "q5_k_m"]), false), 20.0 + 10.0 * 6.6 / 8.0 + 10.0 * 5.7 / 8.0));
+        // a mixed size counts 5.5 bits per weight; "merged model only" is just the merged model, or nothing for a full model
+        assert!(close(export_need_gb(10.0, false, &q(&["mixed_4"]), false), 20.0 + 10.0 * 5.5 / 8.0));
+        assert!(close(export_need_gb(10.0, true, &[], true), 20.0) && close(export_need_gb(10.0, false, &[], true), 0.0));
+    }
+
+    #[test]
+    fn an_export_that_does_not_fit_is_refused_with_both_numbers() {
+        let dir = std::path::Path::new("exports");
+        let e = check_export_disk(40.0, Some(41.0), dir).unwrap_err().0;
+        assert!(e.contains("about 40.0 GB are needed") && e.contains("41.0 GB are free") && e.contains("not enough free space"), "{e}");
+        assert!(check_export_disk(40.0, Some(42.0), dir).is_ok(), "5 % to spare is enough");
+        assert!(check_export_disk(40.0, None, dir).is_ok() && check_export_disk(0.0, Some(0.0), dir).is_ok(), "an unknown disk never refuses");
     }
 }

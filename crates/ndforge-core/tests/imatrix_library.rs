@@ -522,10 +522,10 @@ fn a_missing_llama_cpp_carries_its_code_and_the_worker_is_told_where_the_install
     std::fs::create_dir_all(d.path().join("cfg/llama.cpp")).unwrap();
     fake_worker(d.path(), r#"echo "{\"type\":\"error\",\"code\":\"imatrix_failed\",\"message\":\"saw $NDFORGE_LLAMA_CPP_DIR\"}"; exit 1"#);
     let e = lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
-    assert!(e.ends_with("cfg/llama.cpp"), "{e}");
+    assert!(e.contains("saw ") && e.contains("cfg/llama.cpp (details: "), "{e}");
     std::fs::remove_dir_all(d.path().join("cfg/llama.cpp")).unwrap();
     let e = lib::create(&p, &spec, &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
-    assert_eq!(e, "saw ", "no folder, no variable");
+    assert!(e.starts_with("saw  (details: ") && !e.contains("cfg/llama.cpp"), "no folder, no variable: {e}");
 }
 
 #[cfg(unix)]

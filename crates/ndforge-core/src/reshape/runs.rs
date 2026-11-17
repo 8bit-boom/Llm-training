@@ -28,13 +28,7 @@ pub fn models_dir(p: &Project) -> PathBuf {
 }
 
 pub(super) fn write_json(path: &Path, v: &Value) -> Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    crate::fsx::write_json_atomic(path, v)
 }
 
 pub(super) fn read_json(path: &Path) -> Option<Value> {
@@ -302,7 +296,7 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
             result["model_id"] = json!(id);
             Ok(result)
         }
-        Err(e) if e.0 == "Cancelled." => {
+        Err(e) if e.is_cancelled() => {
             let _ = std::fs::remove_dir_all(&partial);
             set_state(&dir, json!({"status": "stopped"}));
             Err(Error::new("Stopped."))
@@ -461,6 +455,92 @@ fn dir_size(dir: &Path) -> u64 {
     std::fs::read_dir(dir).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()).unwrap_or(0)
 }
 
+// ------------------------------------------------------------------------------------------------------ the shared teacher cache
+// The teacher's answers (the heavy part files) live in `models/_teacher_cache/<id>/`, shared by every heal that has the same teacher, tokenizer and rows (the worker
+// chooses the folder, see distilljob.py "the shared cache"). A model's own `distill/cache/` then only holds index.json (whose `store` says where the parts are) and rows.npz.
+
+/// The folder of the shared teacher answers of this project.
+pub fn teacher_cache_dir(p: &Project) -> PathBuf {
+    models_dir(p).join("_teacher_cache")
+}
+
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The shared folder a model's cache points at (`store` in its index.json, relative to the cache folder), or None for a cache of its own.
+fn store_of(cache: &Path) -> Option<PathBuf> {
+    let store = read_json(&cache.join("index.json"))?["store"].as_str()?.to_string();
+    Some(lexical(&cache.join(store)))
+}
+
+/// Disk the model's teacher answers take: its own folder and the parts it uses in the shared one.
+fn cache_bytes(cache: &Path) -> u64 {
+    let own = dir_size(cache);
+    let shared: u64 = match (store_of(cache), read_json(&cache.join("index.json"))) {
+        (Some(store), Some(idx)) => idx["parts"].as_array().map(|ps| ps.iter().filter_map(|p| p["file"].as_str()).filter_map(|f| std::fs::metadata(store.join(f)).ok()).map(|m| m.len()).sum()).unwrap_or(0),
+        _ => 0,
+    };
+    own + shared
+}
+
+/// Every shared teacher cache folder with the models whose cache points at it.
+fn teacher_cache_uses(p: &Project) -> Vec<(PathBuf, Vec<String>)> {
+    let base = teacher_cache_dir(p);
+    let mut out: Vec<(PathBuf, Vec<String>)> = std::fs::read_dir(&base).map(|d| d.flatten().filter(|e| e.path().is_dir()).map(|e| (lexical(&e.path()), Vec::new())).collect()).unwrap_or_default();
+    if let Ok(rd) = std::fs::read_dir(models_dir(p)) {
+        for e in rd.flatten() {
+            if let Some(store) = store_of(&e.path().join("distill").join("cache")) {
+                if let Some(slot) = out.iter_mut().find(|(d, _)| *d == store) {
+                    slot.1.push(e.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn any_heal_active() -> bool {
+    active().lock().map(|a| !a.is_empty()).unwrap_or(true)
+}
+
+/// Deletes the shared teacher answers that no model uses any more (after a model was deleted). Does nothing while a model is being made: its cache folder may not
+/// point at its shared folder yet. Returns how many folders went.
+pub fn sweep_teacher_caches(p: &Project) -> usize {
+    if any_heal_active() {
+        return 0;
+    }
+    teacher_cache_uses(p).into_iter().filter(|(_, users)| users.is_empty()).filter(|(d, _)| std::fs::remove_dir_all(d).is_ok()).count()
+}
+
+/// The end of an Auto-cut run: the shared teacher answers that only models of this run (`names`) use are not needed any more (the last stage has been healed), so they go,
+/// and so do those models' links to them. A shared folder that any other model uses, such as a heal the person started on the Slim page, stays. Returns how many went.
+pub fn drop_teacher_caches_of(p: &Project, names: &[String]) -> usize {
+    if any_heal_active() {
+        return 0;
+    }
+    let mut gone = 0;
+    for (dir, users) in teacher_cache_uses(p) {
+        if users.iter().all(|u| names.contains(u)) && std::fs::remove_dir_all(&dir).is_ok() {
+            for u in users {
+                let _ = std::fs::remove_dir_all(models_dir(p).join(u).join("distill").join("cache"));
+            }
+            gone += 1;
+        }
+    }
+    gone
+}
+
 /// Every made model, newest first, with its state, a short summary of the result and whether it has been tested.
 pub fn list(p: &Project) -> Vec<Value> {
     let mut out: Vec<Value> = std::fs::read_dir(models_dir(p)).map(|d| d.flatten().filter_map(|e| {
@@ -479,7 +559,7 @@ pub fn list(p: &Project) -> Vec<Value> {
         st["heal"] = read_json(&dir.join("heal.json")).unwrap_or(Value::Null);
         st["healed"] = json!(dir.join("healed").join("config.json").is_file());
         st["test_healed"] = read_json(&dir.join("test_healed.json")).map(|t| json!({"scores": t["scores"], "verdict": t["verdict"], "n": t["n"], "method": t["method"], "created": t["created"], "against": t["against"], "loaded": t["loaded"], "original": t["original"]})).unwrap_or(Value::Null);
-        st["cache_gb"] = json!((dir_size(&dir.join("distill").join("cache")) as f64 / 1e9 * 10.0).round() / 10.0);
+        st["cache_gb"] = json!((cache_bytes(&dir.join("distill").join("cache")) as f64 / 1e9 * 10.0).round() / 10.0);
         let test = read_json(&dir.join("test.json"));
         st["tested"] = json!(test.is_some());
         // the headline and the scores (not the hundreds of answers) for the page
@@ -495,6 +575,17 @@ pub fn list(p: &Project) -> Vec<Value> {
 
 /// Deletes a made model (its folder and its entry in the model list). Refused while it is being made or while a training run used it as its base.
 pub fn remove(p: &Project, name: &str) -> Result<()> {
+    remove_model(p, name)?;
+    sweep_teacher_caches(p);
+    Ok(())
+}
+
+/// `remove` for Auto-cut's clean-up: the teacher's shared answers stay (the next stage still needs them; they go at the end of the run, see `drop_teacher_caches_of`).
+pub fn remove_keeping_teacher_cache(p: &Project, name: &str) -> Result<()> {
+    remove_model(p, name)
+}
+
+fn remove_model(p: &Project, name: &str) -> Result<()> {
     valid_name(name)?;
     let dir = models_dir(p).join(name);
     if !dir.is_dir() {
@@ -831,8 +922,23 @@ fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBoo
 /// The teacher's answers are all there AND were made from this general text (an older cache has no key and counts as made from other data), with this many
 /// answers per token (`k`) and for this sequence length (`seq`). Student-side settings (batch, accumulation, checkpointing, rank, optimizer, KL chunk, learning
 /// rate) are not part of it: the answers stay when only those change.
-fn cache_complete(cache: &Path, want: &Value, k: u32, seq: u32) -> bool {
-    read_json(&cache.join("index.json")).is_some_and(|i| i["complete"] == true && i["general_key"] == *want && i["k"] == k && i["max_len"] == seq)
+///
+/// `rows_key` (see `rows_key()`) says which rows the answers are for: the training file, the amount of text, the teacher and how it was loaded. A cache made before the
+/// key was kept has none and is judged as before; one that has it must match.
+fn cache_complete(cache: &Path, want: &Value, k: u32, seq: u32, rows_key: &str) -> bool {
+    read_json(&cache.join("index.json")).is_some_and(|i| {
+        i["complete"] == true && i["general_key"] == *want && i["k"] == k && i["max_len"] == seq && i.get("rows_key").and_then(|v| v.as_str()).is_none_or(|have| have == rows_key)
+    })
+}
+
+/// A fingerprint of what decides the teacher's rows besides the general text: the training file (path, size, modification time), the amount of text in tokens, the
+/// teacher and how it is loaded. The worker stores it as `rows_key` in the cache's index.json; the program compares it before skipping the teacher pass.
+pub fn rows_key(train: &Path, tokens: u64, teacher_repo: &str, teacher_load: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::metadata(train).ok();
+    let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load}).to_string();
+    Sha256::digest(text.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 fn training_done(run: &Path) -> bool {
@@ -877,7 +983,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
     let general_key = crate::general::key(&general, crate::general::SEED);
     let (cache_dir, run_dir) = (dir.join("distill").join("cache"), dir.join("distill").join("run"));
-    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq) {
+    let teacher_load = ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string());
+    let rows_key = rows_key(&train, tokens, &origin, &teacher_load);
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let need = tokens as f64 * 196.0 / 1e9;
         if let Some(free) = crate::envmgr::health::free_disk_gb(&dir).filter(|f| *f < need * 1.05) {
             return Err(Error::new(format!("The teacher's answers need {need:.1} GB in {}; {free:.1} GB free.", cache_dir.display())));
@@ -905,7 +1013,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         json!({"stopped": true, "name": name})
     };
     let failed = |e: Error| {
-        if e.0 == "Cancelled." {
+        if e.is_cancelled() {
             set_heal(&dir, json!({"status": "stopped"}));
             return Error::new("Stopped. Healing can be continued where it stopped.");
         }
@@ -920,11 +1028,11 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             heal_source::fetch_student(&dir, &stop, on_event).map_err(failed)?
         }
     };
-    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq) {
+    if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let job = json!({
             "job": "distill_cache", "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "student": model, "model": {"family": family},
             "data": {"train": train, "tokens": tokens, "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
-            "out": cache_dir, "stop_file": stop_file,
+            "out": cache_dir, "stop_file": stop_file, "rows_key": rows_key, "shared_cache": true, "shared_dir": teacher_cache_dir(p),
         });
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {

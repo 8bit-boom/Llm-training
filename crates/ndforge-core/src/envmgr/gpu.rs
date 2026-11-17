@@ -103,6 +103,22 @@ pub fn detect_gpus() -> Result<Vec<Gpu>, String> {
     Ok(gpus)
 }
 
+/// `detect_gpus`, remembered for 60 seconds: every page that wants the card's memory asks (a program is started each time), and the window's commands ask many times.
+pub fn detect_gpus_cached() -> Result<Vec<Gpu>, String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<Mutex<Option<(Instant, Result<Vec<Gpu>, String>)>>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+    if let Some((at, r)) = cell.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if at.elapsed() < Duration::from_secs(60) {
+            return r.clone();
+        }
+    }
+    let fresh = detect_gpus();          // not under the lock: it starts a program
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+    fresh
+}
+
 /// "570.133.07" -> (570, 133)
 pub fn driver_version(v: &str) -> Option<(u32, u32)> {
     let mut it = v.trim().split('.');

@@ -559,11 +559,11 @@ def test_a_mixed_size_is_one_llama_quantize_call_with_the_recipes_flags_before_t
     files, rep, out = mw.export(["mixed_4", "q4_k_m"])
     mixed, plain = quantize_calls(mw)
     assert mixed[:2] == ["--imatrix", str(out / "imatrix.gguf")] and mixed[2:6] == ["--output-tensor-type", "Q6_K", "--token-embedding-type", "Q5_K"]
-    assert mixed[-3:] == [str(out / "model-f16.gguf"), str(out / "model-mixed_4.gguf"), "Q4_K_M"], "the files last, then the base type of the 4-bit recipe"
+    assert mixed[-3:] == [str(out / "model-f16.gguf"), str(out / "model-mixed_4.gguf.partial"), "Q4_K_M"], "the files last, then the base type of the 4-bit recipe"
     rules = [mixed[i + 1] for i, x in enumerate(mixed) if x == "--tensor-type"]
     assert len(rules) == 9 and rules[0].endswith("=Q6_K") and all(r.count("=") == 1 for r in rules)
     assert mixed[6:-3] == [x for r in rules for x in ("--tensor-type", r)], "options first, then the files (the position llama-quantize's README shows)"
-    assert plain == ["--imatrix", str(out / "imatrix.gguf"), str(out / "model-f16.gguf"), str(out / "model-q4_k_m.gguf"), "Q4_K_M"], "the plain size is made exactly as before"
+    assert plain == ["--imatrix", str(out / "imatrix.gguf"), str(out / "model-f16.gguf"), str(out / "model-q4_k_m.gguf.partial"), "Q4_K_M"], "the plain size is made exactly as before (written under the .partial name)"
     assert files["mixed_4"] == out / "model-mixed_4.gguf" and files["mixed_4"].read_bytes() == b"GGUF-Q4_K_M+imatrix" and files["q4_k_m"].is_file()
     assert rep["applied"] == ["mixed_4", "q4_k_m"] and rep["notes"] == [], "the matrix is given to the mixed size like to the plain ones"
 
@@ -643,13 +643,48 @@ def test_mixed_sizes_without_llama_cpp_say_so_before_anything_is_made(unsloth_wo
     assert unsloth_world.loaded == [] and unsloth_world.merges == []
 
 
-def test_an_unknown_size_is_still_refused_and_the_mixed_ones_are_known():
+def test_an_unknown_size_is_still_refused_and_the_mixed_ones_are_known(tmp_path):
     assert "mixed_4" in exportjob.QUANTS and "mixed_fit" in exportjob.QUANTS and exportjob.QUANTS[:5] == ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16")
     with pytest.raises(ValueError, match="Unknown quantisation"):
-        exportjob.run({"out": "x", "quants": ["mixed_9"], "base": {"repo": "a", "family": "b"}})
+        exportjob.run({"out": str(tmp_path / "x"), "quants": ["mixed_9"], "base": {"repo": "a", "family": "b"}})
 
 
 def test_an_export_that_cannot_read_the_16_bit_file_for_the_recipe_fails_plainly(world):
     (world.lcpp / "convert_hf_to_gguf.py").write_text("import sys\na = sys.argv\nopen(a[a.index('--outfile') + 1], 'wb').write(b'GGUF-f16')\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="The 16-bit GGUF could not be read to plan the mixed-precision size"):
         world.export(["mixed_4"])
+
+
+# ------------------------------------------------------------------------------------------------------------------ partial files
+
+HALF_WRITER = '''import sys
+a = sys.argv[1:]
+open(a[-2], "wb").write(b"GGUF-half")           # the output file is the second but last argument
+print("error: out of disk space while writing")
+sys.exit(1)
+'''
+
+
+def test_a_quantize_that_fails_mid_write_leaves_no_final_file_and_no_partial(mw):
+    (mw.lcpp / "llama-quantize.py").write_text(HALF_WRITER, encoding="utf-8")
+    out = mw.root / "out_fail"
+    out.mkdir()
+    with pytest.raises(RuntimeError, match="The quantisation failed"):
+        exportjob.gguf_with_llama_cpp(mw.cfg(), mw.merged, out, ["q4_k_m"], None)
+    assert not (out / "model-q4_k_m.gguf").exists(), "a half file must never carry the real name"
+    assert list(out.glob("*.partial")) == []
+    # the same with the importance matrix and with a mixed size
+    out2 = mw.root / "out_fail2"
+    out2.mkdir()
+    with pytest.raises(RuntimeError):
+        exportjob.gguf_with_llama_cpp(mw.cfg(), mw.merged, out2, ["mixed_4"], exportjob.new_report(), {})
+    assert not (out2 / "model-mixed_4.gguf").exists() and list(out2.glob("*.partial")) == []
+
+
+def test_a_stale_partial_of_an_earlier_job_is_removed_and_a_good_run_replaces_the_name(mw):
+    out = mw.root / "out_stale"
+    out.mkdir()
+    (out / "model-q4_k_m.gguf.partial").write_bytes(b"old half file")
+    (out / "model-q6_k.gguf.partial").write_bytes(b"old half file")
+    mw.export(["q4_k_m"], out=out)
+    assert (out / "model-q4_k_m.gguf").is_file() and list(out.glob("*.partial")) == []

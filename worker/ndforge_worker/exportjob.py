@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backends, imatrix, llamacpp, mixedquant, protocol, vision
+from . import backends, fsutil, imatrix, llamacpp, mixedquant, protocol, vision
 from .families import default_non_thinking
 
 QUANTS = ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16") + mixedquant.MIXED_IDS      # the last ones are "Mixed precision (our own recipe)": llama.cpp only, see mixedquant.py
@@ -28,19 +28,81 @@ class ExportLlamaMissing(RuntimeError, llamacpp.LlamaCppMissing):
     """The export needs llama.cpp and it is not there (error code llama_cpp_missing)."""
 
 
+class ExportDiskFull(RuntimeError):
+    """The disk cannot hold the export (error code disk_full)."""
+    code = "disk_full"
+
+
+def check_disk(cfg: dict, out: Path):
+    """The program works out how much the export needs (`need_gb`) and checks before it starts; this looks again just before the work, because the disk may have filled in between.
+    A job without `need_gb` (an older program) is not checked."""
+    need = cfg.get("need_gb")
+    if not isinstance(need, (int, float)) or need <= 0:
+        return
+    free = shutil.disk_usage(out).free
+    if free < need * 1e9 * 1.05:
+        raise ExportDiskFull(f"There is not enough free space for this export: about {need:.1f} GB are needed in {out} and {free / 1e9:.1f} GB are free. "
+                             "Free some space, or choose fewer or smaller file sizes.")
+
+
 def _vision_source(cfg: dict) -> str:
     """Whose picture abilities (and official vision file) the exported model keeps. Normally the base model itself; for a base that was made by
     "Slim or grow a model" (vision part copied unchanged) it is the original model it was made from (`base.vision_repo`), which has the official GGUF repo."""
     return cfg["base"].get("vision_repo") or cfg["base"]["repo"]
 
 
+_JOB = {"cfg": None}      # the export job being run: `_run` looks for its stop file here (the tools are started from many places)
+
+
+def _stop_info(cfg) -> dict:
+    """Where the Stop button's file is: the job key `stop_file`, else the one inside the importance-matrix block (older program versions)."""
+    cfg = cfg or {}
+    return {"stop_file": cfg.get("stop_file") or (cfg.get("imatrix") or {}).get("stop_file")}
+
+
 def _run(cmd, label):
-    protocol.log("$ " + " ".join(str(c) for c in cmd))
-    p = subprocess.run([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    for line in p.stdout.splitlines()[-40:]:
-        protocol.log(line)
-    if p.returncode != 0:
-        raise RuntimeError(f"{label} failed (exit code {p.returncode}). See the log.")
+    """Runs a tool of llama.cpp (converter, quantize). With a stop file in the job (`stop_file`) the Stop button ends the tool at once: raises imatrix.Stopped."""
+    rc, _tail = imatrix.run_streaming([str(c) for c in cmd], _stop_info(_JOB["cfg"]), 1, label=None, log_tail=True)
+    if rc != 0:
+        raise RuntimeError(f"{label} failed (exit code {rc}). See the log.")
+
+
+def convert_to(conv, source, final: Path, label="The GGUF conversion", extra=()):
+    """convert_hf_to_gguf.py into `<final>.partial`, then the file gets its real name: a stopped or failed conversion never leaves a half `final`."""
+    part = fsutil.partial_of(final)
+    part.unlink(missing_ok=True)
+    try:
+        _run([sys.executable, conv, source, *extra, "--outfile", part, "--outtype", "f16"], label)
+        if not part.is_file():
+            raise RuntimeError(f"{label} finished but wrote no file. See the log.")
+        fsutil.replace_retry(part, final)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _quantize_plain(prefix, f16, final: Path, kind: str, flags=(), label="The quantisation"):
+    _, made = quantize_to(prefix, f16, final, kind, flags, None, label)
+    if not made:
+        raise RuntimeError(f"{label} finished but wrote no file. See the log.")
+
+
+def quantize_to(prefix, f16, final: Path, kind: str, flags=(), im=None, label="The quantisation"):
+    """llama-quantize into `<final>.partial`, then the real name. With `im` (the matrix block) the call is streamed so that Stop ends it and its exit code is returned instead of
+    raised: returns (exit code, made) where `made` says whether `final` now exists. Without `im` a failure raises RuntimeError."""
+    part = fsutil.partial_of(final)
+    part.unlink(missing_ok=True)
+    try:
+        if im is None:
+            _run(list(prefix) + list(flags) + [f16, part, kind], label)
+            rc = 0
+        else:
+            rc, _ = imatrix.run_streaming(list(prefix) + list(flags) + [f16, part, kind], im, 1, None)
+        if rc == 0 and part.is_file():
+            fsutil.replace_retry(part, final)
+            return rc, True
+        return rc, False
+    finally:
+        part.unlink(missing_ok=True)
 
 
 THINKING_DEFAULTS = ("off", "keep")
@@ -119,12 +181,11 @@ def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, repor
         raise RuntimeError(f"The 16-bit GGUF could not be read to plan the mixed-precision size ({exc}).")
     for n in info["notes"]:
         protocol.log(n)
-    tail = info["flags"] + [f16, final, info["base"]]
     base = imatrix.launcher(quantize)
     used = False
     if matrix is not None:
-        rc, _ = imatrix.run_streaming(base + ["--imatrix", matrix] + tail, im, 1, None)
-        if rc == 0 and final.is_file():
+        rc, made = quantize_to(base, f16, final, info["base"], ["--imatrix", matrix] + info["flags"], im)
+        if rc == 0 and made:
             report["applied"].append(quant)
             used = True
         else:
@@ -132,9 +193,8 @@ def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, repor
             report["notes"].append(msg)
             report["not_applied"][quant] = "llama-quantize refused the matrix"
             protocol.log(msg)
-            final.unlink(missing_ok=True)
     if not used:
-        _run(base + tail, f"The quantisation ({info['label']})")
+        _quantize_plain(base, f16, final, info["base"], info["flags"], f"The quantisation ({info['label']})")
     mixed_report[quant] = {"id": info["id"], "requested": quant, "label": info["label"], "recipe": mixedquant.LABEL, "base": info["base"], "embd": info["embd"], "output": info["output"], "rules": info["rules"],
                            "estimate": {k: info["estimate"][k] for k in ("bytes", "gb", "bpw", "unmatched", "dead_rules")}, "notes": info["notes"], "fit": info.get("fit"), "matrix_used": used,
                            "actual_bytes": final.stat().st_size if final.is_file() else None}
@@ -144,6 +204,7 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
     """Converts once to f16, then makes every wanted size from it. Returns {quant: file}. With cfg["imatrix"] and a `report` dict (see new_report) the
     importance matrix is made (or reused) after the conversion and given to every size below q8_0; the report says what happened. Raises imatrix.Stopped on Stop."""
     quants = [quants] if isinstance(quants, str) else list(quants)
+    _JOB["cfg"] = cfg
     conv, quantize = find_llama_cpp()
     if conv is None:
         raise ExportLlamaMissing("To make a GGUF file without Unsloth, llama.cpp is needed (convert_hf_to_gguf.py and llama-quantize). Install it from "
@@ -151,7 +212,8 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
                                  f"{llamacpp.SEARCH_ORDER} {llamacpp.CAN_INSTALL} The merged model is saved in {merged}.")
     f16 = out / "model-f16.gguf"
     protocol.progress("gguf", 0.2, "Converting to GGUF")
-    _run([sys.executable, conv, merged, "--outfile", f16, "--outtype", "f16"], "The GGUF conversion")
+    fsutil.remove_partials(out)
+    convert_to(conv, merged, f16)
     files = {}
     others = [q for q in quants if q != "f16"]
     im = cfg.get("imatrix") if report is not None else None
@@ -169,8 +231,8 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
             if matrix is not None and quant in imatrix.NO_IMATRIX:
                 report["not_applied"][quant] = "high precision: the matrix would change almost nothing"
             if matrix is not None and quant not in imatrix.NO_IMATRIX:
-                rc, _ = imatrix.run_streaming(imatrix.launcher(quantize) + ["--imatrix", matrix, f16, final, quant.upper()], im, 1, None)
-                if rc == 0 and final.is_file():
+                rc, made = quantize_to(imatrix.launcher(quantize), f16, final, quant.upper(), ["--imatrix", matrix], im)
+                if rc == 0 and made:
                     report["applied"].append(quant)
                     files[quant] = final
                     continue
@@ -178,8 +240,7 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
                 report["notes"].append(msg)
                 report["not_applied"][quant] = "llama-quantize refused the matrix"
                 protocol.log(msg)
-                final.unlink(missing_ok=True)
-            _run(imatrix.launcher(quantize) + [f16, final, quant.upper()], "The quantisation")
+            _quantize_plain(imatrix.launcher(quantize), f16, final, quant.upper())
             files[quant] = final
     except imatrix.Stopped:
         f16.unlink(missing_ok=True)
@@ -293,7 +354,7 @@ def matrix_for_unsloth(cfg: dict, merged: Path, out: Path, quants: list, report:
             made_merged.append(merged)
             _release_memory()
         protocol.progress("gguf", 0.15, "Converting to a 16-bit GGUF to measure the matrix")
-        _run([sys.executable, conv, merged, "--outfile", scratch, "--outtype", "f16"], "The GGUF conversion")
+        convert_to(conv, merged, scratch)
         return scratch
 
     try:
@@ -333,6 +394,7 @@ def find_gguf(dirs, quant: str, strict: bool = False):
 
 
 def run(cfg: dict) -> int:
+    _JOB["cfg"] = cfg
     protocol.reserve_stdout()
     out = Path(cfg["out"])
     out.mkdir(parents=True, exist_ok=True)
@@ -341,6 +403,7 @@ def run(cfg: dict) -> int:
         if q not in QUANTS:
             raise ValueError(f"Unknown quantisation: {q}")
     quant = quants[0]
+    check_disk(cfg, out)
     backend = backends.prepare(cfg.get("backend", "auto"))
     full_model = cfg.get("full_model")
     merged = Path(full_model) if full_model else out / "merged"
@@ -446,7 +509,7 @@ def run(cfg: dict) -> int:
                     conv, _ = find_llama_cpp()
                     if conv:
                         target = out / "mmproj-F16.gguf"
-                        _run([sys.executable, conv, cfg["base"]["repo"], "--mmproj", "--outfile", target, "--outtype", "f16"], "The vision conversion")
+                        convert_to(conv, cfg["base"]["repo"], target, "The vision conversion", ["--mmproj"])
                         mmproj, vnote = target, "Vision file converted from the base model with llama.cpp."
         except Exception as exc:   # the vision file is a bonus: the export itself is done
             mmproj, vnote = None, f"The vision file could not be added ({type(exc).__name__}: {str(exc)[:200]}). The GGUF understands text only."

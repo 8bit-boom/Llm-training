@@ -163,7 +163,6 @@ pub fn open_bundle(path: impl AsRef<Path>) -> Result<Bundle> {
         }
     }
     let world: Value = serde_json::from_slice(&read("world.json")?).map_err(|e| Error::new(format!("world.json is damaged ({e}).")))?;
-    drop(read);
     Ok(Bundle { path: path.to_path_buf(), manifest, world, sha256: file_sha256(path)?, counts })
 }
 

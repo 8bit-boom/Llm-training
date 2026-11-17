@@ -4,11 +4,23 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
+/// The text of the error a stopped job ends with. The window and several callers recognise it; use `Error::cancelled()` / `is_cancelled()`.
+pub const CANCELLED: &str = "Cancelled.";
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
         Error(msg.into())
+    }
+
+    /// The error of a job that was stopped on request (text: "Cancelled.").
+    pub fn cancelled() -> Self {
+        Error(CANCELLED.to_string())
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0 == CANCELLED
     }
 }
 

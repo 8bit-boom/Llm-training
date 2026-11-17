@@ -199,7 +199,7 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
     std::fs::create_dir_all(&dir)?;
     // the key is never written into the run folder
     job["unsloth"] = json!({"name": target.name, "url": target.url});
-    std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&job)?)?;
+    crate::fsx::write_json_atomic(&dir.join("config.json"), &job)?;
     let prior: Value = std::fs::read(dir.join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     set_run_state(&dir, json!({"name": name, "model_id": m.id, "model": m.name, "method": method, "status": "running", "server": target.name, "server_url": target.url, "backend": "unsloth",
                                "seq": hyper.max_seq, "batch": hyper.batch, "error": null, "created": prior["created"].as_str().unwrap_or(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())}));
@@ -259,7 +259,7 @@ pub fn execute_unsloth(p: &Project, m: &ModelEntry, method: Method, hyper: &Hype
             let body = job_body(m, method, hyper, name, &train_id, eval_id.as_deref())?;
             let started = client.start_job(&body)?;
             let started_id = started["id"].as_str().ok_or_else(|| Error::new("Unsloth did not give the job an id."))?.to_string();
-            std::fs::write(dir.join("unsloth.json"), serde_json::to_vec_pretty(&started)?)?;
+            crate::fsx::write_json_atomic(&dir.join("unsloth.json"), &started)?;
             set_run_state(&dir, json!({"unsloth_job": started_id, "unsloth_events_seen": null}));
             stage(on_event, if started["status"] == "queued" { "Waiting for Unsloth's graphics card (it is busy with another job)" } else { "Training in Unsloth" });
             id = started_id;

@@ -108,7 +108,7 @@ fn write_file(dest: &Path, rel: &[String], data: &mut dyn Read, mode: Option<u32
     let mut total = 0u64;
     loop {
         if cancel.load(Ordering::SeqCst) {
-            return Err(Error::new("Cancelled."));
+            return Err(Error::cancelled());
         }
         let n = data.read(&mut buf)?;
         if n == 0 {
@@ -198,7 +198,7 @@ fn unpack_zip(archive: &Path, dest: &Path, select: Selector, cancel: &AtomicBool
     let (mut out, mut budget) = (Unpacked::default(), MAX_UNPACKED);
     for i in 0..z.len() {
         if cancel.load(Ordering::SeqCst) {
-            return Err(Error::new("Cancelled."));
+            return Err(Error::cancelled());
         }
         let mut f = z.by_index(i).map_err(zip_err)?;
         let Some(parts) = safe_parts(f.name()) else { continue };
@@ -265,7 +265,7 @@ fn unpack_tar_gz(archive: &Path, dest: &Path, select: Selector, cancel: &AtomicB
     let (mut long_name, mut long_link, mut pax_path): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     while let Some(h) = read_tar_header(&mut *r)? {
         if cancel.load(Ordering::SeqCst) {
-            return Err(Error::new("Cancelled."));
+            return Err(Error::cancelled());
         }
         let mut name = tar_str(&h[0..100]);
         let typeflag = h[156];

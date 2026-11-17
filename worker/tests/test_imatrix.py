@@ -168,7 +168,7 @@ def test_the_matrix_is_made_once_and_given_only_to_the_sizes_below_q8(world):
     q = {c["args"][-1]: c["args"] for c in world.calls("quantize")}
     assert set(q) == {"Q4_K_M", "Q6_K", "Q8_0"}                       # f16 is the converter's own file, not quantised
     for size in ("Q4_K_M", "Q6_K"):
-        assert q[size][0] == "--imatrix" and q[size][1] == str(out / "imatrix.gguf") and q[size][2:4] == [str(out / "model-f16.gguf"), str(out / f"model-{size.lower()}.gguf")]
+        assert q[size][0] == "--imatrix" and q[size][1] == str(out / "imatrix.gguf") and q[size][2:4] == [str(out / "model-f16.gguf"), str(out / f"model-{size.lower()}.gguf.partial")]
     assert "--imatrix" not in q["Q8_0"]
     assert files["q4_k_m"].read_bytes() == b"GGUF-Q4_K_M+imatrix" and files["q8_0"].read_bytes() == b"GGUF-Q8_0" and files["f16"].read_bytes() == b"GGUF-f16"
     assert (out / "imatrix.gguf").read_bytes() == b"IMATRIX-FILE" and not (out / "imatrix.partial.gguf").exists() and not (out / "imatrix-calibration.txt").exists()

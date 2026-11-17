@@ -137,7 +137,12 @@ fn resolve_fills_the_gaps_from_the_preset_and_gates_the_acknowledgement() {
 fn the_job_block_and_the_key_follow_every_part_of_the_dataset() {
     let src = GeneralSource { id: Some("a/b".into()), config: Some("c".into()), split: Some("train".into()), ..Default::default() };
     let g = job_block(&src, 0.5);
-    assert_eq!(g, json!({"share": 0.5, "id": "a/b", "config": "c", "split": "train"}));
+    // a Hub dataset also names the folder where the rows read from it are kept (the key ignores it)
+    assert!(g["cache_dir"].as_str().is_some_and(|d| std::path::Path::new(d).ends_with("general_cache")), "{g}");
+    let mut plain = g.clone();
+    plain.as_object_mut().unwrap().remove("cache_dir");
+    assert_eq!(plain, json!({"share": 0.5, "id": "a/b", "config": "c", "split": "train"}));
+    assert!(job_block(&GeneralSource { file: Some("f.jsonl".into()), ..Default::default() }, 0.5).get("cache_dir").is_none(), "a local file is never copied");
     let k = key(&g, 3407);
     assert_eq!(k, json!({"used": true, "id": "a/b", "file": null, "config": "c", "split": "train", "column": null, "share": 0.5, "seed": 3407, "render": 2}), "the same literal as the worker's general_key");
     let other = |f: fn(&mut GeneralSource)| { let mut s = src.clone(); f(&mut s); key(&job_block(&s, 0.5), 3407) };

@@ -170,7 +170,7 @@ pub fn source_url(cfg: &Config, tag: &str) -> String {
 pub fn download(cfg: &Config, url: &str, dest: &Path, expected: u64, digest: Option<&str>, cancel: &AtomicBool, on_bytes: &mut dyn FnMut(u64)) -> std::result::Result<String, Failure> {
     use sha2::{Digest, Sha256};
     if cancel.load(Ordering::SeqCst) {
-        return Err(fail("cancelled", "Cancelled."));
+        return Err(fail("cancelled", crate::error::CANCELLED));
     }
     let resp = get(cfg, url, false, "application/octet-stream")?;
     let announced: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -187,7 +187,7 @@ pub fn download(cfg: &Config, url: &str, dest: &Path, expected: u64, digest: Opt
         if cancel.load(Ordering::SeqCst) {
             drop(out);
             let _ = std::fs::remove_file(&part);
-            return Err(fail("cancelled", "Cancelled."));
+            return Err(fail("cancelled", crate::error::CANCELLED));
         }
         let n = match reader.read(&mut buf) {
             Ok(n) => n,

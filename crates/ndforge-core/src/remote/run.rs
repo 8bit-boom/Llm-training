@@ -158,7 +158,7 @@ pub fn execute_remote(p: &Project, m: &ModelEntry, method: Method, hyper: &Hyper
         }
         match (final_state.as_str(), result, error) {
             ("done" | "stopped", Some(r), _) => Ok(r),
-            ("stopped", None, _) => Err(Error::new("Cancelled.")),
+            ("stopped", None, _) => Err(Error::cancelled()),
             (_, _, Some(e)) => Err(Error::new(e)),
             (s, _, _) => Err(Error::new(format!("The server ended the job as \"{s}\" without a result."))),
         }

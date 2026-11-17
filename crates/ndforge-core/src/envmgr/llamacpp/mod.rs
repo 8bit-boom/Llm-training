@@ -33,7 +33,7 @@ pub struct Failure {
 
 impl From<Error> for Failure {
     fn from(e: Error) -> Failure {
-        let code = if e.0 == "Cancelled." { "cancelled" } else { "error" };
+        let code = if e.is_cancelled() { "cancelled" } else { "error" };
         Failure { code, message: e.0 }
     }
 }
@@ -351,7 +351,7 @@ impl Runner for RealRunner {
         });
         match r {
             Ok(st) => RunOut { started: true, code: st.code(), output, timed_out: false },
-            Err(e) if e.0 == "Cancelled." => RunOut { started: true, code: None, output, timed_out: timer.load(Ordering::SeqCst) },
+            Err(e) if e.is_cancelled() => RunOut { started: true, code: None, output, timed_out: timer.load(Ordering::SeqCst) },
             Err(e) => RunOut { started: false, code: None, output: e.0, timed_out: false },
         }
     }
@@ -405,7 +405,7 @@ pub fn self_test(root: &Path, backend: &str, python: Option<&Path>, runner: &dyn
     let bin = quantize.parent().unwrap_or(root).to_path_buf();
     for name in ["llama-quantize", "llama-imatrix", "llama-perplexity"] {
         if cancel.load(Ordering::SeqCst) {
-            return Err(fail("cancelled", "Cancelled."));
+            return Err(fail("cancelled", crate::error::CANCELLED));
         }
         let p = bin.join(exe(name));
         if !p.is_file() {
@@ -413,7 +413,7 @@ pub fn self_test(root: &Path, backend: &str, python: Option<&Path>, runner: &dyn
         }
         let r = runner.run(&p, &["--help".to_string()], Some(&bin), Duration::from_secs(30), cancel);
         if cancel.load(Ordering::SeqCst) {
-            return Err(fail("cancelled", "Cancelled."));
+            return Err(fail("cancelled", crate::error::CANCELLED));
         }
         if !started_fine(&r) {
             let why = if r.timed_out { "it did not answer within 30 seconds".to_string() } else { first_line(&r.output) };
@@ -437,7 +437,7 @@ pub fn self_test(root: &Path, backend: &str, python: Option<&Path>, runner: &dyn
             let conv = root.join("convert_hf_to_gguf.py");
             let r = runner.run(py, &[conv.to_string_lossy().to_string(), "--help".to_string()], Some(root), Duration::from_secs(30), cancel);
             if cancel.load(Ordering::SeqCst) {
-                return Err(fail("cancelled", "Cancelled."));
+                return Err(fail("cancelled", crate::error::CANCELLED));
             }
             if r.timed_out {
                 "not checked: the converter did not answer within 30 seconds (the first start of PyTorch can be slow)".into()
@@ -601,7 +601,7 @@ fn mb(n: u64) -> String {
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Res<()> {
-    if cancel.load(Ordering::SeqCst) { Err(fail("cancelled", "Cancelled.")) } else { Ok(()) }
+    if cancel.load(Ordering::SeqCst) { Err(fail("cancelled", crate::error::CANCELLED)) } else { Ok(()) }
 }
 
 fn archive_of(a: &Asset) -> Archive {
@@ -715,7 +715,7 @@ pub fn install(cfg: &Config, machine: &Machine, opts: &Options, runner: &dyn Run
         installed_at: chrono::Utc::now().to_rfc3339(), os: machine.os.label().to_string(), arch: machine.arch.label().to_string(),
         versions: st.versions.clone(), converter_check: st.converter.clone(), via: if building { "build".into() } else { "download".into() },
     };
-    std::fs::write(root.join("install.json"), serde_json::to_vec_pretty(&info).map_err(Error::from)?)?;
+    crate::fsx::write_json_atomic(&root.join("install.json"), &info)?;
     em.step("finish", "Putting it in place");
     em.progress("finish", 0.97, "Putting it in place", None);
     check_cancel(cancel)?;

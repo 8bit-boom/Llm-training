@@ -99,3 +99,7 @@ Given a target size in GB and a saved matrix: every large tensor starts at the l
 
 ## Where llama.cpp comes from
 The mixed sizes need llama.cpp (`convert_hf_to_gguf.py` and `llama-quantize`). The program can install it for the person (**Install llama.cpp now** under the message, or Training setup): docs/LLAMA_CPP_INSTALL.md. A missing llama.cpp ends the export with the error code `llama_cpp_missing`; a copy named in `LLAMA_CPP_DIR` always wins.
+
+## Disk space
+
+The export checks the disk before it starts (see README, "Stopping" section): a mixed size is counted at 5.5 bits per weight (the real size comes from the plan, which is not used for this check). A GGUF made by `llama-quantize` is written as `model-<size>.gguf.partial` and renamed when complete.

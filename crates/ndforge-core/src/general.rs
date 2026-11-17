@@ -142,11 +142,7 @@ fn load() -> Store {
 
 fn save(s: &Store) -> Result<()> {
     let f = store_file();
-    if let Some(d) = f.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(f, serde_json::to_vec_pretty(s)?)?;
-    Ok(())
+    crate::fsx::write_json_atomic(&f, s)
 }
 
 pub fn custom_list() -> Vec<GeneralSource> {
@@ -254,7 +250,16 @@ pub fn job_block(src: &GeneralSource, share: f64) -> Value {
             v[k] = json!(x);
         }
     }
+    // a Hub dataset is kept as a saved copy of the rows read, in the settings folder (worker/ndforge_worker/generaltext.py "the saved copy")
+    if src.file.as_deref().is_none_or(|f| f.is_empty()) {
+        v["cache_dir"] = json!(snapshot_dir());
+    }
     v
+}
+
+/// Where the rows read from the Hub are kept: `<settings folder>/general_cache`.
+pub fn snapshot_dir() -> std::path::PathBuf {
+    crate::paths::config_dir().join("general_cache")
 }
 
 /// What makes this general text a different one, as the worker computes it (`generaltext.general_key`): part of the keys of the teacher cache and of the

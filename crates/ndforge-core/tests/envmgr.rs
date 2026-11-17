@@ -96,8 +96,16 @@ fn worker_dir() -> std::path::PathBuf {
     ndforge_core::envmgr::worker_dir()
 }
 
+/// Every job saves a log in the settings folder: these tests get a private one (kept for the whole test run), never the real one.
+fn private_config_dir() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path());
+}
+
 #[test]
 fn the_real_worker_answers_hello_and_explains_a_missing_torch() {
+    private_config_dir();
     let Some(py) = python3() else { return };
     let mut events = Vec::new();
     let r = run_job(&py, &worker_dir(), &json!({"job": "hello"}), &AtomicBool::new(false), &mut |e| events.push(e)).unwrap();
@@ -116,6 +124,7 @@ fn the_real_worker_answers_hello_and_explains_a_missing_torch() {
 #[test]
 fn worker_events_and_crashes_are_reported() {
     use std::os::unix::fs::PermissionsExt;
+    private_config_dir();
     // a fake "python" that prints protocol lines
     let d = tempfile::tempdir().unwrap();
     let fake = d.path().join("python");
@@ -128,7 +137,9 @@ fn worker_events_and_crashes_are_reported() {
     std::fs::write(&fake, "#!/bin/sh\nexit 7\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("exit code 7"));
     std::fs::write(&fake, "#!/bin/sh\necho '{\"type\":\"error\",\"code\":\"c\",\"message\":\"Plain words\"}'\nexit 1\n").unwrap();
-    assert_eq!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0, "Plain words");
+    // the message is the worker's, followed by where the saved log is
+    let msg = run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(msg.starts_with("Plain words (details: logs/jobs/") && msg.ends_with(".log)"), "{msg}");
     std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("without an answer"));
 }
@@ -297,4 +308,15 @@ fn setup_without_unsloth_installs_only_the_standard_libraries_and_never_fails_on
     run_setup(&plan3, &AtomicBool::new(false), &mut |_| {}).unwrap();
     assert_eq!(env_engine(&plan3.env_dir).as_deref(), Some("unsloth"));
     assert_eq!(env_engine(&d.path().join("nowhere")), None);
+}
+
+#[test]
+fn the_graphics_card_is_asked_once_a_minute_not_once_per_page() {
+    use ndforge_core::envmgr::gpu::detect_gpus_cached;
+    let first = detect_gpus_cached();
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        assert_eq!(detect_gpus_cached(), first, "the remembered answer is the same one");
+    }
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "no program is started for the remembered answer");
 }

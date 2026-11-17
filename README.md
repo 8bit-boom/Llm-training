@@ -170,3 +170,45 @@ What was researched (FlashAttention, SageAttention, `torch.compile`, quantizatio
 ## Without Unsloth
 
 Training setup has **Install without Unsloth** (standard libraries only; the program fetches Python and PyTorch itself) and Expert mode has *Training engine* (auto / unsloth / standard). A model can also be a folder on this computer (Step 3, *Add a model from Hugging Face…* → *Choose a folder…*; checked like a Hugging Face model, trained on this computer only). Details: `docs/INSTALL.md`, `docs/TRAINING_SPEED.md`.
+
+## Stopping
+
+Stop (and closing the program) ends the worker and every program it started: its own process group on Linux and macOS, a Job Object on Windows. Details and what is not verified: `docs/THINKING_CHECK.md`, "Stopping". A line of worker output that is not valid UTF-8 (a Windows console in cp1252) is kept with the bad bytes replaced; it no longer stops the reading. Stop during an export first writes a STOP file (the job key `stop_file`): the worker ends the converter or `llama-quantize` at once and exits cleanly; the program kills the worker only after a 20 s grace time.
+
+Every GGUF file (the 16-bit conversion, each `llama-quantize` size, the vision file) and every model folder made by the slim/heal jobs is written under a `.partial` name and renamed only when complete (the rename is tried again on Windows), so a stopped or failed job never leaves a file that looks finished; leftovers of an earlier interrupted job (`*.gguf.partial`) are removed when an export starts.
+
+An export first works out the disk it needs at one moment (the merged 16-bit model, the 16-bit GGUF, every size; Q4_K_M 4.85, Q5_K_M 5.7, Q6_K 6.6, Q8_0 8.5 bits per weight, a mixed size 5.5) and refuses with both numbers when the free space is under that plus 5 %; the worker looks again just before it starts (error code `disk_full`, job key `need_gb`). The figure is an estimate from the model's size, not measured against real files.
+
+Training and healing check a checkpoint before they continue from it (`worker/ndforge_worker/ckpt.py`): the state file must parse and the weights and optimizer files must not be empty. A checkpoint cut short by a crash is renamed `checkpoint-<step>.broken` (kept, never used) and the run continues from the one before it, or from the start when there is none.
+
+The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
+
+## Before you start
+
+Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the
+`preflight` command): the training software, the card (and its self-test), llama.cpp (a red light where the job cannot go without it, yellow where it can), free disk against the job's estimate (an export's
+from the model and sizes, healing's answers, Auto-cut's plan), the card's memory estimate, a saved training-data version, a Windows folder name with accents (llama.cpp), another program using the same settings folder
+and the Unsloth Studio folder. A red light disables Start and says what to do; yellow lights only warn. The list is asked for again after 15 seconds, when the page's facts change and when the install or llama.cpp finishes.
+
+## Fix-it buttons
+
+A worker error with one of the codes `disk_full`, `distill_oom`, `distill_unstable`, `reshape_refused`, `bad_job`, or a message about a missing Python library, ends with a mark (`[fix:<code>]`, `[fix:missing_module]`)
+after the `(details: logs/jobs/...)` part (`envmgr::jobs::fix_mark`); `[llama_cpp_missing]` is the older mark and stays last. The window (`fixActions` in `ui/app.js`) removes the marks from the text and
+shows a button under it: disk full opens the project folder, an out-of-memory heal offers the next safer setting (`heal_options`, the same one as "Try again with safer settings"), a missing library starts
+"Install the training software" again, llama.cpp offers its installer. The other codes only lose their mark. Marks are added to worker errors only, never to "Cancelled." or to a worker that died silently.
+
+## One program at a time
+
+The program takes an exclusive lock on `<settings folder>/instance.lock` as it starts (`ndforge_core::instance`) and keeps it until it ends; the system lets go of it when the program dies, however it dies. A second
+program with the same settings folder shows "ND Lore Forge is already open" and closes (a copy with its own `NDFORGE_CONFIG_DIR` runs next to it). `instance.pid` names the holder for the message only. If the
+settings folder cannot be used for the lock, the program starts without it. The dialog and the closing were not tried in a real window here.
+
+## Job logs
+
+Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).
+
+A job that writes nothing for 20 minutes (60 for the teacher's answers, an export and a matrix; job key `stall_minutes` changes it) makes the program send a `stall` event, again after each further period; the window shows "No sign of progress for N minutes. The job may be stuck; Stop is safe." It only warns, nothing is stopped.
+
+## Saved files
+
+Settings, the access keys (`secrets.json`), run states and the other small files are written to `<name>.tmp` first and renamed, so a crash or a full disk leaves the old file, never half a file (`crates/ndforge-core/src/fsx.rs`; on Windows a rename that is refused for a moment is tried again). A settings or keys file that cannot be read is kept as `settings.json.broken-<time>` (or `secrets.json.broken-<time>`), the standard settings are used, and the window says so once at the start.

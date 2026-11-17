@@ -134,7 +134,7 @@ import shutil  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import generaltext, healmem, protocol, safetensors_io  # noqa: E402
+from . import ckpt, fsutil, generaltext, healmem, protocol, safetensors_io  # noqa: E402
 from .reshape import ReshapeError  # noqa: E402
 
 CACHE_FORMAT = 1
@@ -365,6 +365,143 @@ class CacheWriter:
             self._write_index()
 
 
+# ------------------------------------------------------------------------------------------------------------ the shared cache
+# The teacher's answers for a row only depend on the row, the teacher, k and the length, not on which model is being healed or how many tokens the run wants. The parts of
+# a cache can therefore live in one shared folder (`shared_dir/<id>/`, job keys `shared_cache` + `shared_dir`) and be used by several heals: a bigger run only adds the rows
+# its smaller sibling did not have. The per-model folder (`out`) keeps its own index.json (a "view": the parts of the store this model's rows need, `store` = where they
+# are), rows.npz and nothing heavy, so everything that reads a cache (the student, the program's skip decision) works as before.
+
+def row_hashes(rows: list) -> list:
+    """sha1 of the token ids of every row (20 bytes each): what tells a shared cache that the new rows start with the rows it already answered."""
+    from array import array
+    return [hashlib.sha1(array("I", [int(x) for x in r["input_ids"]]).tobytes()).digest() for r in rows]
+
+
+def _file_sha256(path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int) -> str:
+    """The folder name of the shared cache these rows belong to: the teacher (its folder and config), the tokenizer, k, the length, how the teacher is loaded, the general text
+    WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file."""
+    data_cfg = cfg.get("data") or {}
+    g = data_cfg.get("general")
+    used = bool(g) and float(g.get("share", 0) or 0) > 0
+    gen = generaltext.general_key(g, 1.0 if used else 0, seed)
+    gen.pop("share", None)
+    ident = {"v": 1, "teacher": str(Path(teacher_dir).resolve()), "teacher_config": _file_sha256(Path(teacher_dir) / "config.json"), "tokenizer": tokenizer_hash(student), "k": int(k),
+             "max_len": int(max_seq), "load": (cfg.get("teacher") or {}).get("load", "auto"), "general": gen, "seed": int(seed),
+             "family": (cfg.get("model") or {}).get("family", "generic"), "train": _file_sha256(data_cfg.get("train") or "")}
+    return hashlib.sha256(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+
+
+def _read_hashes(folder):
+    from . import slice_io
+    np = slice_io.np()
+    try:
+        arr = np.load(Path(folder) / "rowhashes.npy")
+    except (OSError, ValueError):
+        return None
+    return arr if arr.ndim == 2 and arr.shape[1] == 20 else None
+
+
+def store_extends(folder, meta: dict, hashes: list) -> bool:
+    """True when the shared cache in `folder` (none yet counts as true) is for this teacher, tokenizer, k and length AND the rows it has answered are the first rows of `hashes`
+    (or `hashes` are the first rows of what it has answered: a smaller run)."""
+    old = read_cache_index(folder)
+    if old is None:
+        return True
+    if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len")):
+        return False
+    done = int(old.get("done_rows", 0))
+    if done == 0:
+        return True
+    have = _read_hashes(folder)
+    if have is None or len(have) < done:
+        return False
+    m = min(done, len(hashes))
+    return all(bytes(have[i]) == hashes[i] for i in range(m))
+
+
+def pick_store(base, store_id: str, meta: dict, hashes: list) -> Path:
+    """`base/<id>`, or `base/<id>-2` ... when the first ones hold answers for other rows (never overwritten: another model's view may still point at them)."""
+    base = Path(base)
+    for n in range(1, 100):
+        d = base / (store_id if n == 1 else f"{store_id}-{n}")
+        if store_extends(d, meta, hashes):
+            return d
+    raise ReshapeError("Too many different saved answers for this teacher: delete some of the models under models/_teacher_cache.")
+
+
+class SharedCacheWriter(CacheWriter):
+    """A CacheWriter whose parts live in `store` (see above) and that keeps the model's own index.json (the view) in `view`. The caller has chosen `store` with `pick_store`, so
+    whatever it already holds is a start of these rows: its parts are kept and the writer goes on after them."""
+
+    def __init__(self, store, view, meta: dict, hashes: list, part_tokens: int = 262144):
+        from . import slice_io
+        self.np = slice_io.np()
+        self.dir = Path(store)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.view = Path(view)
+        self.view.mkdir(parents=True, exist_ok=True)
+        self.meta = {"format": CACHE_FORMAT, **meta}
+        self.part_tokens = part_tokens
+        self.hashes = hashes
+        old = read_cache_index(self.dir)
+        self.parts = list(old["parts"]) if old else []
+        if not self.parts:
+            for f in self.dir.glob("part-*.npz"):
+                f.unlink()
+        self.done_rows = sum(p["rows"] for p in self.parts)
+        self.tokens = sum(p["tokens"] for p in self.parts)
+        self._buf: list = []
+        self._buf_tokens = 0
+        for f in self.view.glob("part-*.npz"):          # parts of an older, unshared cache of this model
+            f.unlink()
+        self._write_view()
+
+    def _write_hashes(self) -> None:
+        np = self.np
+        n = min(self.done_rows, len(self.hashes))
+        arr = np.frombuffer(b"".join(self.hashes[:n]), dtype=np.uint8).reshape(-1, 20) if n else np.zeros((0, 20), dtype=np.uint8)
+        tmp = self.dir / "rowhashes.partial.npy"
+        np.save(tmp, arr)
+        os.replace(tmp, self.dir / "rowhashes.npy")
+
+    def _store_ref(self) -> str:
+        try:
+            return os.path.relpath(self.dir, self.view).replace("\\", "/")
+        except ValueError:                              # another drive on Windows: the full path
+            return str(self.dir)
+
+    def _write_view(self) -> None:
+        need = [p for p in self.parts if p["first_row"] < self.meta["rows"]]
+        idx = {**self.meta, "done_rows": self.done_rows, "tokens": sum(p["tokens"] for p in need), "parts": need, "complete": self.done_rows >= self.meta["rows"],
+               "store": self._store_ref(), "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        tmp = self.view / "index.partial.json"
+        tmp.write_text(json.dumps(idx), encoding="utf-8")
+        os.replace(tmp, self.view / "index.json")
+
+    def _write_index(self) -> None:
+        self._write_hashes()
+        super()._write_index()
+        self._write_view()
+
+    def close(self) -> None:
+        self.flush()
+        if not self.parts:
+            self._write_index()
+        else:
+            self._write_view()
+
+
 def save_rows(folder, rows: list) -> None:
     """rows.npz next to the cache: the token ids of the rows the teacher answered, so the student learns from exactly these rows without making them again
     (and without a second download of the general text). Needs numpy."""
@@ -415,6 +552,9 @@ class CacheReader:
         if not self.index:
             raise ReshapeError("The teacher's saved answers are missing or unreadable; they will be made again.")
         self.parts = self.index["parts"]
+        # a shared cache keeps its parts in another folder (SharedCacheWriter); the index of this folder says where
+        store = self.index.get("store")
+        self.parts_dir = (self.dir / store).resolve() if store else self.dir
         self._loaded: dict = {}
 
     @property
@@ -425,7 +565,7 @@ class CacheReader:
         if p not in self._loaded:
             if len(self._loaded) >= 2:
                 self._loaded.pop(next(iter(self._loaded)))
-            with self.np.load(self.dir / self.parts[p]["file"]) as z:
+            with self.np.load(self.parts_dir / self.parts[p]["file"]) as z:
                 self._loaded[p] = {k: z[k] for k in z.files}
         return self._loaded[p]
 
@@ -454,11 +594,30 @@ def _teacher_answers(model, batch_rows: list, k: int, chunk: int, pad_id: int):
         weight = model.get_output_embeddings().weight
         for i, r in enumerate(batch_rows):
             h = hidden[i, :len(r["input_ids"])]
-            parts = []
-            for a in range(0, h.shape[0], chunk):
-                parts.append([t.cpu() for t in topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k)])
-            out.append(tuple(torch.cat([p[j] for p in parts]).numpy() for j in range(3)))
+            # the chunks stay on the card (the logits of one chunk at a time bound the memory), and the row comes back to the host in one go
+            parts = [topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+            out.append(tuple(torch.cat([p[j] for p in parts]).cpu().numpy() for j in range(3)))
     return out
+
+
+WINDOW_ROWS = 64            # rows answered together in length order before they are written in their own order
+SPEED_LOG_EVERY = 60.0      # seconds between the "cache_speed" lines
+
+
+def length_order(window: list) -> list:
+    """The positions of `window` from the longest row to the shortest (equal lengths keep their order): the order the teacher answers them in."""
+    return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
+
+
+def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int) -> dict:
+    """What index.json says about a teacher cache (the first eight keys decide `cache_matches`)."""
+    gen = (cfg.get("data") or {}).get("general")
+    return {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
+            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
+            "general_key": generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407))),
+            "general_source": stats["general_source"],
+            # who made the answers and for which rows: the program compares `rows_key` before it skips the teacher pass (it is not part of cache_matches: the rows' own hash is)
+            "teacher_load": cfg["teacher"].get("load", "auto"), "rows_key": cfg.get("rows_key")}
 
 
 def run_cache(cfg: dict) -> int:
@@ -479,22 +638,27 @@ def run_cache(cfg: dict) -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(student))
     rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
-    meta = {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
-            "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
-            "general_key": generaltext.general_key((cfg["data"] or {}).get("general"), ((cfg["data"] or {}).get("general") or {}).get("share", 0), int(cfg.get("seed", 3407))),
-            "general_source": stats["general_source"]}
-    writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
+    meta = cache_meta(cfg, rows, stats, student, k, max_seq)
+    legacy = read_cache_index(out)
+    if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
+        # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
+        hashes = row_hashes(rows)
+        store = pick_store(cfg["shared_dir"], shared_store_id(cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407))), meta, hashes)
+        writer = SharedCacheWriter(store, out, meta, hashes, int(cfg.get("part_tokens", 262144)))
+        protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
+    else:
+        writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
     save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
     total_tokens = sum(len(r["input_ids"]) for r in rows)
     result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
     if writer.done_rows >= len(rows):
         protocol.log("The teacher's saved answers are already complete for this data.")
-        result.update(reused=True, bytes=_dir_bytes(out), seconds=round(time.monotonic() - started, 1))
+        result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1))
         protocol.result(result)
         return 0
     need = (total_tokens - writer.tokens) * (k * 6 + 4)
-    free = shutil.disk_usage(out)[2]
+    free = shutil.disk_usage(writer.dir)[2]
     if free < need * 1.05:
         protocol.error("disk_full", f"The teacher's answers need {need / 1e9:.1f} GB in {out}; {free / 1e9:.1f} GB free.")
         return 1
@@ -505,6 +669,9 @@ def run_cache(cfg: dict) -> int:
     inner = getattr(tok, "tokenizer", tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
+    window_rows = max(WINDOW_ROWS, batch)
+    t0 = last_log = time.monotonic()
+    seen_tokens = 0
     try:
         i = writer.done_rows
         if i:
@@ -513,25 +680,52 @@ def run_cache(cfg: dict) -> int:
             if stop_file.exists():
                 result["stopped"] = True
                 break
-            part = rows[i:i + batch]
-            try:
-                answers = _teacher_answers(model, part, k, chunk, pad_id)
-            except RuntimeError as exc:
-                if not reshapejob._is_oom(exc) or len(part) == 1:
-                    raise
-                protocol.log("Out of memory; the original model answers one text at a time.")
-                reshapejob._free()
-                batch = 1
-                continue
-            for a in answers:
-                writer.add_row(*a)
-            i += len(part)
-            protocol.progress("cache", i / len(rows), f"The original model answers your texts: {i} of {len(rows)}")
+            # a window of rows is answered longest first (batches of similar length waste little on padding) and written in the order of the rows
+            window = rows[i:i + window_rows]
+            answers: dict = {}
+            order = length_order(window)
+            pos, cut_short = 0, False
+            while pos < len(order):
+                if stop_file.exists():
+                    cut_short = True
+                    break
+                idx = order[pos:pos + batch]
+                try:
+                    got = _teacher_answers(model, [window[j] for j in idx], k, chunk, pad_id)
+                except RuntimeError as exc:
+                    if not reshapejob._is_oom(exc) or len(idx) == 1:
+                        raise
+                    protocol.log("Out of memory; the original model answers one text at a time.")
+                    reshapejob._free()
+                    batch = 1
+                    continue
+                for j, a in zip(idx, got):
+                    answers[j] = a
+                    seen_tokens += len(window[j]["input_ids"])
+                pos += len(idx)
+                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}")
+                if time.monotonic() - last_log >= SPEED_LOG_EVERY:
+                    last_log = time.monotonic()
+                    protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far)")
+            # the rows that were answered, from the first one on without a gap, go to the cache in their own order
+            written = 0
+            while written < len(window) and written in answers:
+                writer.add_row(*answers[written])
+                written += 1
+                if stop_file.exists():                  # the Stop button was pressed while the cache was written (a part was saved just now)
+                    break
+            i += written
+            if cut_short:
+                result["stopped"] = True
+                break
     finally:
         writer.close()
         del model
         reshapejob._free()
-    result.update(bytes=_dir_bytes(out), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows)
+    tps = seen_tokens / max(time.monotonic() - t0, 1e-9)
+    if seen_tokens:
+        protocol.log(f"cache_speed: {tps:,.0f} tokens/s ({seen_tokens:,} tokens answered in {time.monotonic() - t0:,.0f} s)")
+    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows, tokens_per_s=round(tps, 1))
     protocol.result(result)
     return 0
 
@@ -923,7 +1117,7 @@ def run(cfg: dict) -> int:
             done["before"] = eval_fn()
             if done["before"] is not None:
                 protocol.emit("distill_eval", step=0, calib_loss=done["before"])
-        ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
+        ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
         resume = (bool(cfg.get("resume")) or n > 0) and bool(ckpts)
         if cfg.get("resume") and not ckpts and n == 0:
             protocol.log("No checkpoint to continue from; starting from the beginning.")
@@ -935,7 +1129,7 @@ def run(cfg: dict) -> int:
         if cuda:
             torch.cuda.reset_peak_memory_stats()
         try:
-            trainer.train(resume_from_checkpoint=True if resume else None)
+            trainer.train(resume_from_checkpoint=str(ckpts[-1]) if resume else None)
             after = None
             if eval_fn is not None and not live.stopped:
                 after = eval_fn()
@@ -1034,7 +1228,7 @@ def merge(cfg: dict) -> int:
         (out / "README.md").write_text(f"---\n{reshapejob._licence_front_matter(base / 'README.md')}---\n# {out.parent.name} (healed)\n\n"
                                        f"{label}, taught by {'its original model' if not external else (teacher or 'another model')} (distillation).\n\n"
                                        f"Made with ND Lore Forge ({'Heal a model' if external else 'Slim or grow a model'}). See ndforge_reshape.json for the details.\n", encoding="utf-8")
-        out.rename(final)
+        fsutil.replace_retry(out, final)
     except safetensors_io.Cancelled:
         shutil.rmtree(out, ignore_errors=True)
         protocol.result({"stopped": True, "model_dir": None})

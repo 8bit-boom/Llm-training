@@ -219,3 +219,156 @@ def test_build_rows_counts_the_long_conversations_and_says_so(tmp_path, monkeypa
     rows, st = dj.build_rows(ChatCharTok(), {"train": "x", "tokens": 400, "general": {"share": 0.5, "file": g}}, "generic", 32)
     assert st["general_cut_rows"] >= 1 and st["general_skipped_long"] >= 1 and st["general_error"] is None
     assert all(len(r["input_ids"]) <= 32 for r in rows)
+
+
+def test_the_cache_index_keeps_the_teacher_load_and_the_rows_key_but_they_do_not_decide_a_match(tmp_path):
+    (tmp_path / "tokenizer.json").write_text('{"v": 1}')
+    rows = [{"input_ids": [1, 2, 3], "completion_mask": [0, 1, 1]}]
+    stats = {"project_rows": 1, "general_rows": 0, "general_source": None}
+    cfg = {"teacher": {"repo": "org/T", "load": "4bit"}, "rows_key": "abc123", "data": {"train": "x"}}
+    meta = dj.cache_meta(cfg, rows, stats, tmp_path, 8, 128)
+    assert meta["teacher_load"] == "4bit" and meta["rows_key"] == "abc123" and meta["k"] == 8 and meta["max_len"] == 128
+    old = dj.cache_meta({"teacher": {"repo": "org/T"}, "data": {}}, rows, stats, tmp_path, 8, 128)
+    assert old["teacher_load"] == "auto" and old["rows_key"] is None
+    assert dj.cache_matches(meta, {**meta, "rows_key": "other", "teacher_load": "auto"}), "the program judges these two before it starts the job"
+    w = dj.CacheWriter(tmp_path / "c", meta, part_tokens=8)
+    w.close()
+    idx = json.loads((tmp_path / "c" / "index.json").read_text())
+    assert idx["teacher_load"] == "4bit" and idx["rows_key"] == "abc123"
+
+
+# ------------------------------------------------------------------------------------------------------------ the shared cache
+
+def rows_of(lengths, start=0):
+    return [{"input_ids": [start + i + 1] * n} for i, n in enumerate(lengths)]
+
+
+def shared_meta(rows, **over):
+    return {**META, "rows": len(rows), "data_hash": dj.data_hash(rows), **over}
+
+
+def fill(store, view, rows, only=None, part_tokens=8):
+    """a SharedCacheWriter that answers `rows` (the answers are made from the row's own ids, so a row has the same answer in every cache)"""
+    meta = shared_meta(rows)
+    hashes = dj.row_hashes(rows)
+    w = dj.SharedCacheWriter(store, view, meta, hashes, part_tokens)
+    made = []
+    for i in range(w.done_rows, len(rows) if only is None else only):
+        made.append(i)
+        w.add_row(*fake_row(len(rows[i]["input_ids"]), rows[i]["input_ids"][0]))
+    w.close()
+    return w, made
+
+
+def test_a_bigger_run_only_adds_the_rows_the_smaller_one_did_not_have(tmp_path):
+    base = tmp_path / "shared"
+    small, big = rows_of([4, 4, 4, 4]), rows_of([4, 4, 4, 4, 4, 4, 4])
+    meta_s, meta_b = shared_meta(small), shared_meta(big)
+    a = dj.pick_store(base, "id1", meta_s, dj.row_hashes(small))
+    w1, made1 = fill(a, tmp_path / "m1" / "cache", small)
+    assert made1 == [0, 1, 2, 3] and w1.done_rows == 4
+    b = dj.pick_store(base, "id1", meta_b, dj.row_hashes(big))
+    assert b == a, "the same teacher and the first rows are the same: the same shared folder"
+    w2, made2 = fill(b, tmp_path / "m2" / "cache", big)
+    assert made2 == [4, 5, 6], "only the new rows are answered"
+    # both views read their rows back, from the parts in the shared folder
+    r1, r2 = dj.CacheReader(tmp_path / "m1" / "cache"), dj.CacheReader(tmp_path / "m2" / "cache")
+    for i in range(4):
+        assert (r1.get(i)[0] == r2.get(i)[0]).all() and (r1.get(i)[0] == fake_row(4, small[i]["input_ids"][0])[0]).all()
+    assert (r2.get(6)[0] == fake_row(4, 7)[0]).all()
+    v1, v2 = (json.loads((tmp_path / m / "cache" / "index.json").read_text()) for m in ("m1", "m2"))
+    assert v1["rows"] == 4 and v1["complete"] and v1["store"] and v2["rows"] == 7 and v2["complete"] and v1["data_hash"] != v2["data_hash"]
+    assert not list((tmp_path / "m1" / "cache").glob("part-*.npz")), "no heavy file in the model's own folder"
+    assert sum(1 for _ in base.iterdir()) == 1
+
+
+def test_a_smaller_run_after_a_bigger_one_needs_nothing_new(tmp_path):
+    base = tmp_path / "shared"
+    big, small = rows_of([4] * 7), rows_of([4] * 4)
+    a = dj.pick_store(base, "id1", shared_meta(big), dj.row_hashes(big))
+    fill(a, tmp_path / "m1" / "cache", big)
+    assert dj.pick_store(base, "id1", shared_meta(small), dj.row_hashes(small)) == a
+    w, made = fill(a, tmp_path / "m2" / "cache", small)
+    assert made == [] and w.done_rows >= 4
+    v = json.loads((tmp_path / "m2" / "cache" / "index.json").read_text())
+    assert v["complete"] and v["rows"] == 4 and all(p["first_row"] < 4 for p in v["parts"])
+    assert dj.CacheReader(tmp_path / "m2" / "cache").done_rows >= 4
+    # the bigger model's view is untouched
+    assert json.loads((tmp_path / "m1" / "cache" / "index.json").read_text())["rows"] == 7
+
+
+def test_other_rows_or_another_teacher_get_a_new_folder_and_the_old_one_stays_whole(tmp_path):
+    base = tmp_path / "shared"
+    one = rows_of([4] * 4)
+    a = dj.pick_store(base, "id1", shared_meta(one), dj.row_hashes(one))
+    fill(a, tmp_path / "m1" / "cache", one)
+    before = sorted(p.name for p in a.iterdir())
+    other = rows_of([4] * 6, start=100)                                      # not an extension: the first rows differ
+    b = dj.pick_store(base, "id1", shared_meta(other), dj.row_hashes(other))
+    assert b != a and b.name == "id1-2"
+    fill(b, tmp_path / "m2" / "cache", other)
+    assert sorted(p.name for p in a.iterdir()) == before, "nothing of the first folder was touched"
+    assert (dj.CacheReader(tmp_path / "m1" / "cache").get(0)[0] == fake_row(4, 1)[0]).all()
+    assert dj.pick_store(base, "id1", shared_meta(one), dj.row_hashes(one)) == a, "the first rows still find their folder"
+    c = dj.pick_store(base, "id1", {**shared_meta(one), "teacher": "org/Other"}, dj.row_hashes(one))
+    assert c.name == "id1-3"
+    d = dj.pick_store(base, "id1", {**shared_meta(one), "tokenizer_hash": "t2"}, dj.row_hashes(one))
+    assert d.name == "id1-3"
+
+
+def test_a_stopped_shared_cache_goes_on_after_its_last_part(tmp_path):
+    base = tmp_path / "shared"
+    rows = rows_of([4] * 6)
+    store = dj.pick_store(base, "id1", shared_meta(rows), dj.row_hashes(rows))
+    _, made = fill(store, tmp_path / "m" / "cache", rows, only=3)
+    assert made == [0, 1, 2]
+    v = json.loads((tmp_path / "m" / "cache" / "index.json").read_text())
+    assert v["complete"] is False and v["done_rows"] == 3
+    again = dj.pick_store(base, "id1", shared_meta(rows), dj.row_hashes(rows))
+    assert again == store
+    _, made = fill(again, tmp_path / "m" / "cache", rows)
+    assert made == [3, 4, 5]
+    assert json.loads((tmp_path / "m" / "cache" / "index.json").read_text())["complete"] is True
+
+
+def test_a_damaged_row_hash_file_is_not_trusted(tmp_path):
+    base = tmp_path / "shared"
+    rows = rows_of([4] * 4)
+    store = dj.pick_store(base, "id1", shared_meta(rows), dj.row_hashes(rows))
+    fill(store, tmp_path / "m" / "cache", rows)
+    (store / "rowhashes.npy").write_bytes(b"junk")
+    assert dj.pick_store(base, "id1", shared_meta(rows), dj.row_hashes(rows)).name == "id1-2"
+
+
+def test_the_store_id_follows_everything_but_the_budget(tmp_path):
+    teacher = tmp_path / "teacher"
+    teacher.mkdir()
+    (teacher / "config.json").write_text('{"a": 1}')
+    student = tmp_path / "student"
+    student.mkdir()
+    (student / "tokenizer.json").write_text('{"v": 1}')
+    train = tmp_path / "train.jsonl"
+    train.write_text('{"x": 1}\n')
+
+    def sid(**over):
+        cfg = {"teacher": {"repo": "t", "load": "auto"}, "model": {"family": "qwen3_5"}, "data": {"train": str(train), "tokens": 1000, "general": {"id": "a/b", "share": 0.5}}, **over}
+        return dj.shared_store_id(cfg, teacher, student, 8, 128, 3407)
+    base = sid()
+    assert sid(data={"train": str(train), "tokens": 9000, "general": {"id": "a/b", "share": 0.2}}) == base, "tokens and share are the budget"
+    assert sid(data={"train": str(train), "tokens": 1000, "general": {"id": "a/c", "share": 0.5}}) != base
+    assert sid(data={"train": str(train), "tokens": 1000, "general": None}) != base
+    assert sid(teacher={"repo": "t", "load": "4bit"}) != base and sid(model={"family": "gemma4"}) != base
+    train.write_text('{"x": 2}\n')
+    assert sid() != base, "another training file"
+    train.write_text('{"x": 1}\n')
+    (teacher / "config.json").write_text('{"a": 2}')
+    assert sid() != base, "another teacher config"
+    assert len(base) == 20
+
+
+def test_rows_are_answered_longest_first_and_every_row_once():
+    window = [{"input_ids": [0] * n} for n in (5, 9, 5, 2, 9, 7)]
+    order = dj.length_order(window)
+    assert [len(window[j]["input_ids"]) for j in order] == [9, 9, 7, 5, 5, 2]
+    assert order == [1, 4, 5, 0, 2, 3], "equal lengths keep their order"
+    assert sorted(order) == list(range(6)) and dj.length_order([]) == []

@@ -1924,6 +1924,7 @@ dependencies = [
  "dirs 5.0.1",
  "flate2",
  "fs2",
+ "libc",
  "pulldown-cmark",
  "regex",
  "serde",
@@ -1933,6 +1934,7 @@ dependencies = [
  "tiny_http",
  "toml 0.8.23",
  "ureq",
+ "windows-sys 0.52.0",
  "zip",
 ]
 

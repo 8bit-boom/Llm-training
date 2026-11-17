@@ -44,7 +44,7 @@ impl<'a> RealEffects<'a> {
 fn was_stopped(r: &Result<Value>) -> bool {
     match r {
         Ok(v) => v["stopped"].as_bool().unwrap_or(false),
-        Err(e) => e.0 == "Cancelled." || e.0.starts_with("Stopped"),
+        Err(e) => e.is_cancelled() || e.0.starts_with("Stopped"),
     }
 }
 
@@ -97,7 +97,7 @@ impl Effects for RealEffects<'_> {
             self.forward(e);
         }
         match r {
-            Err(e) if e.0 == "Cancelled." => Ok(Out::Stopped),
+            Err(e) if e.is_cancelled() => Ok(Out::Stopped),
             r => r.map(Out::Done),
         }
     }
@@ -172,9 +172,14 @@ impl Effects for RealEffects<'_> {
     fn remove(&mut self, what: &Made) -> Result<()> {
         match what.kind.as_str() {
             "cut" => runs::remove_cut(self.p, &what.name),
-            "healed" => runs::remove(self.p, &what.name),
+            "healed" => runs::remove_keeping_teacher_cache(self.p, &what.name),
             other => Err(Error::new(format!("Auto-cut did not make a {other}."))),
         }
+    }
+
+    fn drop_teacher_cache(&mut self, models: &[String]) -> Result<()> {
+        runs::drop_teacher_caches_of(self.p, models);
+        Ok(())
     }
 
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {

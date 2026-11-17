@@ -17,6 +17,9 @@ Nothing here needs torch, transformers or the `datasets` library except `hub_loa
 from __future__ import annotations
 
 import csv
+import gzip
+import hashlib
+import itertools
 import json
 import os
 import random
@@ -191,13 +194,104 @@ def hub_loader(source: dict, token: str | None):
     return iter(ds)
 
 
+# ------------------------------------------------------------------------------------------------------------------ the saved copy
+# A Hub dataset is streamed, and the same rows (the same seed gives the same order) are read again by every job that uses it. The rows a job read are therefore kept in the
+# settings folder (job key general.cache_dir): `<hash of id, config, split, seed>.jsonl.gz`, one JSON row per line, in the order of the stream. The next job reads those first and
+# only goes to the Hub for rows beyond them (skipping the ones it has), so a network blip or an offline machine no longer changes the mix, and the same rows are not downloaded
+# again. The copy is the RAW rows (before the chat template), so it does not depend on the model. Appended in blocks (a gzip file may hold several); a block cut short by a crash is ignored.
+
+SNAPSHOT_MAX_ROWS = 300_000
+SNAPSHOT_BLOCK = 500
+
+
+def snapshot_file(source: dict) -> Path | None:
+    d = source.get("cache_dir")
+    if not d or source.get("file"):
+        return None
+    key = {"v": 1, "id": source.get("id") or DEFAULT_ID, "config": source.get("config") or None, "split": source.get("split") or "train", "seed": source.get("seed")}
+    return Path(d) / (hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:24] + ".jsonl.gz")
+
+
+def read_snapshot_checked(path: Path):
+    """(rows, clean): the rows saved in `path` ([] when there is none or it cannot be read) and whether the whole file was read (a cut-short end is left out)."""
+    rows: list = []
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    return rows, False
+    except FileNotFoundError:
+        return rows, True
+    except (OSError, EOFError, ValueError):
+        return rows, False                                          # a damaged tail: what was read before it is kept
+    return rows, True
+
+
+def read_snapshot(path: Path) -> list:
+    return read_snapshot_checked(path)[0]
+
+
+def _append_snapshot(path: Path, rows: list, first: bool) -> bool:
+    """Adds `rows` to the saved copy. The first block goes through a temporary file, so a half-made copy never has the real name."""
+    text = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows).encode("utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if first:
+            tmp = path.with_name(path.name + ".partial")
+            with gzip.open(tmp, "wb") as fh:
+                fh.write(text)
+            os.replace(tmp, path)
+        else:
+            with gzip.open(path, "ab") as fh:
+                fh.write(text)
+        return True
+    except OSError:
+        return False                                                # no room or no rights: the job goes on without the copy
+
+
+def saved_copy_rows(source: dict, stream):
+    """Rows of the saved copy, then (only when the reader wants more) the rest of `stream()` (a function that opens the Hub stream), which is saved too."""
+    path = snapshot_file(source)
+    if path is None:
+        yield from stream()
+        return
+    saved, clean = read_snapshot_checked(path)
+    if not clean and saved:
+        _append_snapshot(path, saved, first=True)                   # a damaged end: the good rows are written again, so that new rows can follow them
+    if saved:
+        protocol.log(f"General text ({source_name(source)}): the saved copy is read first ({len(saved):,} rows).")
+    yield from saved
+    block: list = []
+    n, recording = len(saved), True
+    try:
+        try:
+            for row in itertools.islice(stream(), len(saved), None):
+                if recording:
+                    block.append(row)
+                    n += 1
+                    if len(block) >= SNAPSHOT_BLOCK:
+                        recording = _append_snapshot(path, block, first=n == len(block)) and n < SNAPSHOT_MAX_ROWS
+                        block = []
+                yield row
+        except Exception:                                           # noqa: BLE001 - offline, gated ...: with a saved copy the job goes on with it
+            if not saved:
+                raise
+            protocol.log(f"General text ({source_name(source)}): the Hub could not be reached for more rows; the saved copy ({len(saved):,} rows) is used.")
+    finally:
+        if block and recording:
+            _append_snapshot(path, block, first=n == len(block))
+
+
 def open_rows(source: dict):
-    """An iterator over the rows (dicts). A local file is read the same way whatever its format; with a seed its rows are mixed (buffer_shuffle)."""
+    """An iterator over the rows (dicts). A local file is read the same way whatever its format; with a seed its rows are mixed (buffer_shuffle). A dataset from the Hub is read
+    from the saved copy first when the job names a folder for it (`cache_dir`)."""
     if source.get("file"):
         rows = _read_local(str(source["file"]))
         return buffer_shuffle(rows, int(source["seed"])) if source.get("seed") is not None else rows
     loader = source.get("loader") or hub_loader
-    return iter(loader({**source, "id": source.get("id") or DEFAULT_ID}, hub_token()))
+    return saved_copy_rows(source, lambda: iter(loader({**source, "id": source.get("id") or DEFAULT_ID}, hub_token())))
 
 
 # ------------------------------------------------------------------------------------------------------------------ formats

@@ -5,3 +5,6 @@ src-tauri/gen/
 __pycache__/
 .venv/
 tools/
+build/
+*.egg-info/
+worker/Q6_K

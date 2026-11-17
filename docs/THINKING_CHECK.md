@@ -103,6 +103,10 @@ Where things are: `models/<name>/think_check/<target>.<full|quick>.json` (writte
 (the job, the saved results, the gates, tested against `worker/tests/data/think_gate_cases.json`); Tauri commands `think_check_results`, `think_check_plan`, `think_check_start` (events on `reshape-event`
 with `phase: "think"`; the Stop button is `reshape_stop`); page `ui/app.js` (`thinkCard`), smoke test `ui/smoke/thinkcheck.test.mjs`.
 
+## Stopping
+
+Stop asks the worker to end (a STOP file) and, after a grace period, ends the worker **and everything it started**, so `llama-server` does not stay behind holding the graphics card. On Linux and macOS the worker runs in its own process group and the whole group is killed; on Windows the worker is put into a Job Object that is terminated on Stop and also closed when this program ends, however it ends (`crates/ndforge-core/src/envmgr/process.rs`, `ProcessTree`). The tests start a program that starts another one and check that the second is gone after a stop. Not checked: a real `llama-server` with CUDA on Windows.
+
 ## Not verified yet
 
 * The card and the Tauri commands were not run in a real window (the commands compile with the program; the page was tested in a stand-in browser and the Rust side with a fake worker).
@@ -110,8 +114,7 @@ with `phase: "think"`; the Stop button is `reshape_stop`); page `ui/app.js` (`th
   cut), how long its traces are, and whether the gates are in the right place need the owner's runs.
 * The gates' numbers come from the plan, not from measurements; expect to adjust them after the first real comparisons.
 * The llama backend was tested against a stand-in `llama-server` (a script that speaks the same HTTP), not against a real llama.cpp: the flags (`--jinja`, `-np`, `-c`, `-ngl`), the
-  `chat_template_kwargs` field, `top_k` and `seed` in the request, `/health` and the shape of the answer are from llama.cpp's documentation as remembered. On Windows a killed worker
-  cannot stop the server (no parent-death signal); the Stop file does. Whether Unsloth Studio's own chat default matches `enable_thinking` as sent here is not known.
+  `chat_template_kwargs` field, `top_k` and `seed` in the request, `/health` and the shape of the answer are from llama.cpp's documentation as remembered. On Windows the Job Object (see "Stopping") ends the server together with the worker; the Stop file does too. Whether Unsloth Studio's own chat default matches `enable_thinking` as sent here is not known.
 * Batched sampling of a model with linear-attention layers and left padding: the tiny test model (the real architecture, random weights) runs it, but whether the real 27B answers the same batched as
   one at a time is not checked (use `batch: 1` or the llama backend if the numbers look odd).
 * The loop test on word lists (the llama backend has no token ids) is a rough stand-in for the token version.
