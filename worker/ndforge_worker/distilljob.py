@@ -134,7 +134,7 @@ import shutil  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import fsutil, generaltext, healmem, protocol, safetensors_io  # noqa: E402
+from . import ckpt, fsutil, generaltext, healmem, protocol, safetensors_io  # noqa: E402
 from .reshape import ReshapeError  # noqa: E402
 
 CACHE_FORMAT = 1
@@ -923,7 +923,7 @@ def run(cfg: dict) -> int:
             done["before"] = eval_fn()
             if done["before"] is not None:
                 protocol.emit("distill_eval", step=0, calib_loss=done["before"])
-        ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
+        ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
         resume = (bool(cfg.get("resume")) or n > 0) and bool(ckpts)
         if cfg.get("resume") and not ckpts and n == 0:
             protocol.log("No checkpoint to continue from; starting from the beginning.")
@@ -935,7 +935,7 @@ def run(cfg: dict) -> int:
         if cuda:
             torch.cuda.reset_peak_memory_stats()
         try:
-            trainer.train(resume_from_checkpoint=True if resume else None)
+            trainer.train(resume_from_checkpoint=str(ckpts[-1]) if resume else None)
             after = None
             if eval_fn is not None and not live.stopped:
                 after = eval_fn()

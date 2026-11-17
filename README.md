@@ -179,6 +179,8 @@ Every GGUF file (the 16-bit conversion, each `llama-quantize` size, the vision f
 
 An export first works out the disk it needs at one moment (the merged 16-bit model, the 16-bit GGUF, every size; Q4_K_M 4.85, Q5_K_M 5.7, Q6_K 6.6, Q8_0 8.5 bits per weight, a mixed size 5.5) and refuses with both numbers when the free space is under that plus 5 %; the worker looks again just before it starts (error code `disk_full`, job key `need_gb`). The figure is an estimate from the model's size, not measured against real files.
 
+Training and healing check a checkpoint before they continue from it (`worker/ndforge_worker/ckpt.py`): the state file must parse and the weights and optimizer files must not be empty. A checkpoint cut short by a crash is renamed `checkpoint-<step>.broken` (kept, never used) and the run continues from the one before it, or from the start when there is none.
+
 ## Job logs
 
 Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).

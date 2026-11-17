@@ -12,7 +12,7 @@ import os
 import time
 from pathlib import Path
 
-from . import backends, protocol, speed
+from . import backends, ckpt, protocol, speed
 
 
 def _collator(pad_id: int):
@@ -210,12 +210,12 @@ def run(cfg: dict) -> int:
         trainer_kw = {"model": model, "args": args, "train_dataset": ds, "data_collator": counter.wrap(speed.flatten_collator(pad_id) if padding_free else _collator(pad_id)), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
         trainer = (_trainer_class(SFTTrainer, lambda: speed.make_sampler(lengths, h["batch"], h["seed"])) if bucket else SFTTrainer)(**trainer_kw)
-        ckpts = sorted(ckdir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])) if ckdir.exists() else []
+        ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
         resume = bool(cfg.get("resume")) and bool(ckpts)
         if cfg.get("resume") and not ckpts and not resumed_any:
             protocol.log("No checkpoint to continue from; starting from the beginning.")
         resumed_any = resumed_any or resume
-        trainer.train(resume_from_checkpoint=True if resume else None)
+        trainer.train(resume_from_checkpoint=str(ckpts[-1]) if resume else None)
         done_steps = trainer.state.global_step
         last_loss = live.last_loss if live.last_loss is not None else last_loss
         peak = max(peak, live._vram())

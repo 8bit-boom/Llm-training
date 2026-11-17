@@ -357,6 +357,6 @@ pub fn resumable(p: &Project, name: &str) -> bool {
     }
     // one stage keeps its checkpoints directly in checkpoints/, a two-stage run in checkpoints/<stage>/
     let d = runs_dir(p).join(name).join("checkpoints");
-    let has = |dir: &Path| std::fs::read_dir(dir).map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false);
+    let has = |dir: &Path| std::fs::read_dir(dir).map(|r| r.flatten().any(|e| { let n = e.file_name().to_string_lossy().to_string(); n.starts_with("checkpoint-") && !n.contains(".broken") })).unwrap_or(false);
     has(&d) || std::fs::read_dir(&d).map(|r| r.flatten().any(|e| e.path().is_dir() && has(&e.path()))).unwrap_or(false)
 }
