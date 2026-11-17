@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import data, exportjob, imatrix, llamacpp, protocol
+from . import data, exportjob, fsutil, imatrix, llamacpp, protocol
 
 SOURCES = ("run", "model", "gguf")
 DAT_NAME = "imatrix.dat"
@@ -90,11 +90,18 @@ def find_tools(need_convert: bool):
 def convert_to_f16(conv, folder, out_file, im: dict, span):
     """The export's conversion (convert_hf_to_gguf.py --outtype f16), run so that Stop ends it at once."""
     protocol.progress("imatrix", span[0], "Converting the model to a 16-bit GGUF file")
-    rc, _ = imatrix.run_streaming([sys.executable, conv, folder, "--outfile", out_file, "--outtype", "f16"], im, 1, None)
-    if rc != 0 or not Path(out_file).is_file():
-        Path(out_file).unlink(missing_ok=True)
-        raise MatrixError(f"llama.cpp could not turn this model into a GGUF file (exit code {rc}; the log has its last lines). Is it a full-precision Hugging Face model folder "
-                          "(safetensors files, the kind a trained model is saved as) of an architecture this llama.cpp knows? Update llama.cpp, or choose a GGUF file as the model.")
+    part = fsutil.partial_of(out_file)
+    part.unlink(missing_ok=True)
+    try:
+        rc, _ = imatrix.run_streaming([sys.executable, conv, folder, "--outfile", part, "--outtype", "f16"], im, 1, None)
+        if rc == 0 and part.is_file():
+            fsutil.replace_retry(part, out_file)
+            return
+    finally:
+        part.unlink(missing_ok=True)
+    Path(out_file).unlink(missing_ok=True)
+    raise MatrixError(f"llama.cpp could not turn this model into a GGUF file (exit code {rc}; the log has its last lines). Is it a full-precision Hugging Face model folder "
+                      "(safetensors files, the kind a trained model is saved as) of an architecture this llama.cpp knows? Update llama.cpp, or choose a GGUF file as the model.")
 
 
 def fetch_model_folder(repo: str, im: dict) -> Path:

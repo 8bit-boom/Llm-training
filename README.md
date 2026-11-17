@@ -175,6 +175,8 @@ Training setup has **Install without Unsloth** (standard libraries only; the pro
 
 Stop (and closing the program) ends the worker and every program it started: its own process group on Linux and macOS, a Job Object on Windows. Details and what is not verified: `docs/THINKING_CHECK.md`, "Stopping". A line of worker output that is not valid UTF-8 (a Windows console in cp1252) is kept with the bad bytes replaced; it no longer stops the reading. Stop during an export first writes a STOP file (the job key `stop_file`): the worker ends the converter or `llama-quantize` at once and exits cleanly; the program kills the worker only after a 20 s grace time.
 
+Every GGUF file (the 16-bit conversion, each `llama-quantize` size, the vision file) and every model folder made by the slim/heal jobs is written under a `.partial` name and renamed only when complete (the rename is tried again on Windows), so a stopped or failed job never leaves a file that looks finished; leftovers of an earlier interrupted job (`*.gguf.partial`) are removed when an export starts.
+
 ## Job logs
 
 Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).

@@ -12,7 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, vision
+from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, vision
 from .families import family
 from .reshape import ReshapeError
 
@@ -981,7 +981,7 @@ def run(cfg: dict) -> int:
             label += f" Every layer made thinner (MLP {dims['intermediate']} to {width['intermediate']})."
         (out / "README.md").write_text(f"---\n{_licence_front_matter(src_dir / 'README.md')}---\n# {out.parent.name}\n\n{label}\n\n"
                                         "Made with ND Lore Forge (Slim or grow a model). See ndforge_reshape.json for exactly which layers were used.\n", encoding="utf-8")
-        out.rename(final)
+        fsutil.replace_retry(out, final)
     except safetensors_io.Cancelled:
         shutil.rmtree(out, ignore_errors=True)
         protocol.result({"stopped": True, "model_dir": None})

@@ -134,7 +134,7 @@ import shutil  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import generaltext, healmem, protocol, safetensors_io  # noqa: E402
+from . import fsutil, generaltext, healmem, protocol, safetensors_io  # noqa: E402
 from .reshape import ReshapeError  # noqa: E402
 
 CACHE_FORMAT = 1
@@ -1034,7 +1034,7 @@ def merge(cfg: dict) -> int:
         (out / "README.md").write_text(f"---\n{reshapejob._licence_front_matter(base / 'README.md')}---\n# {out.parent.name} (healed)\n\n"
                                        f"{label}, taught by {'its original model' if not external else (teacher or 'another model')} (distillation).\n\n"
                                        f"Made with ND Lore Forge ({'Heal a model' if external else 'Slim or grow a model'}). See ndforge_reshape.json for the details.\n", encoding="utf-8")
-        out.rename(final)
+        fsutil.replace_retry(out, final)
     except safetensors_io.Cancelled:
         shutil.rmtree(out, ignore_errors=True)
         protocol.result({"stopped": True, "model_dir": None})
