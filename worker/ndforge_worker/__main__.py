@@ -25,6 +25,21 @@ def _package_versions() -> dict:
     return out
 
 
+# the fast-kernel packages for Qwen3.5's linear-attention layers (`speed.gdn_kernels` says what a loaded model really uses); versions from the metadata, nothing imported
+ACCELERATORS = ("flash-linear-attention", "causal-conv1d", "triton", "triton-windows")
+
+
+def _accelerators() -> dict:
+    from importlib import metadata
+    out = {}
+    for name in ACCELERATORS:
+        try:
+            out[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
 def _explain(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
@@ -72,7 +87,7 @@ def main(argv: list) -> int:
 
 def _run(kind, job: dict) -> int:
     if kind == "hello":
-        protocol.result({"worker": __version__, "protocol": protocol.PROTOCOL_VERSION, "packages": _package_versions()})
+        protocol.result({"worker": __version__, "protocol": protocol.PROTOCOL_VERSION, "packages": _package_versions(), "accelerators": _accelerators()})
         return 0
     if kind == "selftest":
         from . import selftest

@@ -50,7 +50,17 @@ def progress(step: str, value: float, text: str = "") -> None:
     emit("progress", step=step, value=round(float(value), 4), text=text)
 
 
+# keys the running job collects for its result (which kernels ran, the timings): `result` adds them to a dict answer unless the answer has the key already
+EXTRAS: dict = {}
+
+
+def add_extra(key: str, value) -> None:
+    EXTRAS[key] = value
+
+
 def result(data: dict) -> None:
+    if EXTRAS and isinstance(data, dict):
+        data = {**data, **{k: v for k, v in EXTRAS.items() if k not in data}}
     emit("result", data=data)
 
 

@@ -102,12 +102,63 @@ class TokenCounter:
         return counted
 
 
+def _origin(fn) -> str:
+    return str(getattr(fn, "__module__", "") or "")
+
+
+def gdn_kernels(model):
+    """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed:
+    the first module that has `chunk_gated_delta_rule` gives {"delta_rule": "fla" | "torch", "conv": "causal_conv1d" | "kernels-hub" | "torch", "module": its class's module}.
+    None when the model has no such layer (or cannot be looked at)."""
+    try:
+        for m in model.modules():
+            fn = getattr(m, "chunk_gated_delta_rule", None)
+            if fn is None:
+                continue
+            delta = "fla" if _origin(fn).split(".")[0] in ("fla", "flash_linear_attention") else "torch"
+            conv_fn = getattr(m, "causal_conv1d_fn", None)
+            origin = _origin(conv_fn)
+            conv = "torch" if conv_fn is None else "kernels-hub" if origin.split(".")[0] in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2] else "causal_conv1d"
+            return {"delta_rule": delta, "conv": conv, "module": type(m).__module__}
+    except Exception:       # noqa: BLE001 - looking must never stop a job
+        return None
+    return None
+
+
+def gdn_note(info) -> str:
+    """A plain sentence about slow kernels, or "" when the fast ones run (or there is nothing to say)."""
+    if not info:
+        return ""
+    if info.get("delta_rule") != "fla":
+        return "GatedDeltaNet runs on the slow PyTorch kernels (flash-linear-attention not installed)."
+    if info.get("conv") == "torch":
+        return "The short convolution of GatedDeltaNet uses the PyTorch version (causal-conv1d not installed); that is a small part of the time."
+    return ""
+
+
+def report_kernels(model):
+    """Looks at the loaded model, logs `kernels: {...}` once (and the note when the slow ones run) and adds `kernels` to the job's result. Returns the info or None."""
+    info = gdn_kernels(model)
+    if info is None:
+        return None
+    import json
+    from . import protocol
+    if protocol.EXTRAS.get("kernels") != info:
+        protocol.log("kernels: " + json.dumps(info, sort_keys=True))
+        note = gdn_note(info)
+        if note:
+            protocol.log(note)
+        protocol.add_extra("kernels", info)
+    return info
+
+
 def kernel_notes(family: str, backend: str, cuda: bool, capability=None) -> list:
-    """Plain-language notes about speed that the window shows next to the run."""
+    """Plain-language notes about speed that the window shows next to a TRAINING run (the other jobs report what really ran: `report_kernels`)."""
     notes = []
     if family == "qwen3_5":
         if backend == "unsloth":
-            notes.append("Qwen3.5 uses Unsloth's own fast kernels; the first steps can be slow while they compile.")
+            notes.append("Training with Unsloth: Qwen3.5 uses Unsloth's own fast kernels; the first steps can be slow while they compile. Measuring, healing and checking do not use Unsloth: they use the "
+                         "flash-linear-attention and causal-conv1d packages when installed.")
         else:
             missing = [n for n, mod in (("flash-linear-attention", "fla"), ("causal-conv1d", "causal_conv1d")) if importlib.util.find_spec(mod) is None]
             if missing:

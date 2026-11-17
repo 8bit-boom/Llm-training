@@ -37,7 +37,7 @@ fn picks_the_cuda_build_from_the_driver() {
 }
 
 fn facts(smi: Result<&str, &str>, disk: Option<f64>, uv: bool, env: bool, test: bool) -> Facts {
-    Facts { gpus: smi.map(parse_nvidia_smi).map_err(String::from), free_disk_gb: disk, uv_found: uv, env_installed: env, selftest_passed: test, env_cuda_unchecked: false, env_requirements: Some(ndforge_core::envmgr::health::ENV_REQUIREMENTS_VERSION) }
+    Facts { gpus: smi.map(parse_nvidia_smi).map_err(String::from), free_disk_gb: disk, uv_found: uv, env_installed: env, selftest_passed: test, env_cuda_unchecked: false, env_requirements: Some(ndforge_core::envmgr::health::ENV_REQUIREMENTS_VERSION), fast_kernels: None }
 }
 
 fn lights(f: &Facts) -> Vec<(&'static str, Light)> {
@@ -263,7 +263,7 @@ fn an_install_made_before_pytorch_was_checked_is_flagged() {
     assert!(env_cuda_unchecked(&env));
     std::fs::write(env.join("ndforge_env.json"), "{\"wheel\": \"cu128\", \"unsloth\": true, \"cuda_torch\": true}\n").unwrap();
     assert!(!env_cuda_unchecked(&env));
-    let facts = |unchecked| ndforge_core::envmgr::health::Facts { gpus: Ok(parse_nvidia_smi("NVIDIA GeForce RTX 5090, 32607, 576.80, 12.0")), free_disk_gb: Some(100.0), uv_found: true, env_installed: true, selftest_passed: false, env_cuda_unchecked: unchecked, env_requirements: Some(ndforge_core::envmgr::health::ENV_REQUIREMENTS_VERSION) };
+    let facts = |unchecked| ndforge_core::envmgr::health::Facts { gpus: Ok(parse_nvidia_smi("NVIDIA GeForce RTX 5090, 32607, 576.80, 12.0")), free_disk_gb: Some(100.0), uv_found: true, env_installed: true, selftest_passed: false, env_cuda_unchecked: unchecked, env_requirements: Some(ndforge_core::envmgr::health::ENV_REQUIREMENTS_VERSION), fast_kernels: None };
     let env_check = |f: &ndforge_core::envmgr::health::Facts| evaluate(f).into_iter().find(|c| c.id == "env").unwrap();
     let flagged = env_check(&facts(true));
     assert_eq!(flagged.light, Light::Warn);
@@ -341,4 +341,36 @@ fn an_environment_made_by_an_older_program_is_told_to_install_again_and_the_mark
     assert_eq!(f(Some(ENV_REQUIREMENTS_VERSION - 1)).light, Light::Warn);
     assert_eq!(f(Some(ENV_REQUIREMENTS_VERSION)).light, Light::Ok);
     assert_eq!(f(Some(ENV_REQUIREMENTS_VERSION + 1)).light, Light::Ok, "an environment newer than the program is not nagged");
+}
+
+#[test]
+fn the_fast_kernels_light_follows_the_environment_and_never_blocks_the_install() {
+    use ndforge_core::envmgr::health::{can_install, env_fast_kernels, evaluate, Light};
+    let smi = Ok("NVIDIA GeForce RTX 5090, 32607, 576.80, 12.0");
+    let find = |f: &Facts| evaluate(f).into_iter().find(|c| c.id == "kernels");
+    let mut f = facts(smi, Some(500.0), true, true, true);
+    assert!(find(&f).is_none(), "no answer, no light");
+    f.fast_kernels = Some(true);
+    assert_eq!(find(&f).unwrap().light, Light::Ok);
+    f.fast_kernels = Some(false);
+    let c = find(&f).unwrap();
+    assert_eq!(c.light, Light::Warn);
+    assert!(c.detail.contains("flash-linear-attention") && c.fix.contains("fast kernels"));
+    assert!(can_install(&evaluate(&f)));
+    // the real look: a fake environment folder with and without the package's dist-info (both layouts)
+    let d = tempfile::tempdir().unwrap();
+    assert_eq!(env_fast_kernels(d.path()), None, "no environment marker");
+    std::fs::write(d.path().join("ndforge_env.json"), "{}").unwrap();
+    assert_eq!(env_fast_kernels(d.path()), Some(false));
+    let unix = d.path().join("lib").join("python3.12").join("site-packages");
+    std::fs::create_dir_all(&unix).unwrap();
+    assert_eq!(env_fast_kernels(d.path()), Some(false));
+    std::fs::create_dir(unix.join("flash_linear_attention-0.4.1.dist-info")).unwrap();
+    assert_eq!(env_fast_kernels(d.path()), Some(true));
+    let e = tempfile::tempdir().unwrap();
+    std::fs::write(e.path().join("ndforge_env.json"), "{}").unwrap();
+    let win = e.path().join("Lib").join("site-packages");
+    std::fs::create_dir_all(&win).unwrap();
+    std::fs::create_dir(win.join("flash_linear_attention-0.4.1.dist-info")).unwrap();
+    assert_eq!(env_fast_kernels(e.path()), Some(true));
 }

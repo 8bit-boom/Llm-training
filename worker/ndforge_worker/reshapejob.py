@@ -12,7 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, vision
+from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, speed, vision
 from .families import family
 from .reshape import ReshapeError
 
@@ -467,6 +467,7 @@ def _score(src_dir: Path, cfg: dict, period: int):
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
+    speed.report_kernels(model)
     layers = _find_layers(model, n_layers)
     try:
         try:
@@ -718,6 +719,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
+    speed.report_kernels(model)
     layers = _find_layers(model, n_layers)
     timer = time.monotonic()
     try:
@@ -756,6 +758,7 @@ def _loss(folder, cfg: dict, mode: str):
     tok = AutoTokenizer.from_pretrained(str(folder))
     batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
     model = _load(folder, mode)
+    speed.report_kernels(model)
     try:
         dev = next(model.parameters()).device
         total, count = 0.0, 0

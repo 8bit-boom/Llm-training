@@ -66,7 +66,7 @@ def test_kernel_notes_name_what_is_missing(monkeypatch):
     assert len(n) == 1 and "flash-linear-attention and causal-conv1d" in n[0] and "slower" in n[0] and "Unsloth" in n[0]
     monkeypatch.setattr(iu, "find_spec", lambda n, *a, **k: object())
     assert speed.kernel_notes("qwen3_5", "hf", True, (12, 0)) == []
-    assert "Unsloth's own fast kernels" in speed.kernel_notes("qwen3_5", "unsloth", True, (12, 0))[0]
+    assert "Unsloth's own fast kernels" in speed.kernel_notes("qwen3_5", "unsloth", True, (12, 0))[0]       # (training only: the sentence says so)
     assert speed.kernel_notes("gemma4", "hf", True, (12, 0)) == []
     old = speed.kernel_notes("gemma4", "hf", True, (7, 5))
     assert len(old) == 1 and "no bf16" in old[0]
@@ -361,3 +361,68 @@ def test_the_base_models_vision_file_is_found_and_copied_and_problems_are_only_n
         def from_pretrained(repo):
             return Tok()
     assert vision.with_base_processor(tok, "x", auto_processor=TextOnly) is tok
+
+
+# --------------------------------------------------------------------------------------------------------- which kernels a loaded model really uses
+import types as _types  # noqa: E402
+
+
+def _fn(module, name="f"):
+    f = lambda *a, **k: None       # noqa: E731
+    f.__module__ = module
+    f.__name__ = name
+    return f
+
+
+class _Mod:
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
+
+
+class _Model:
+    def __init__(self, *mods):
+        self.mods = mods
+
+    def modules(self):
+        return iter(self.mods)
+
+
+def test_gdn_kernels_reads_the_model_and_names_fla_or_torch():
+    fast = _Model(_Mod(), _Mod(chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule.chunk"), causal_conv1d_fn=_fn("causal_conv1d.cpp_functions")))
+    assert speed.gdn_kernels(fast) == {"delta_rule": "fla", "conv": "causal_conv1d", "module": _Mod.__module__}
+    assert speed.gdn_note(speed.gdn_kernels(fast)) == ""
+    slow = _Model(_Mod(chunk_gated_delta_rule=_fn("transformers.models.qwen3_5.modeling_qwen3_5", "torch_chunk_gated_delta_rule"), causal_conv1d_fn=None))
+    info = speed.gdn_kernels(slow)
+    assert (info["delta_rule"], info["conv"]) == ("torch", "torch")
+    assert "slow PyTorch kernels" in speed.gdn_note(info) and "flash-linear-attention not installed" in speed.gdn_note(info)
+    half = speed.gdn_kernels(_Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops"), causal_conv1d_fn=None)))
+    assert half["delta_rule"] == "fla" and half["conv"] == "torch" and "short convolution" in speed.gdn_note(half)
+    hub = speed.gdn_kernels(_Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops"), causal_conv1d_fn=_fn("kernels.layer.causal_conv1d"))))
+    assert hub["conv"] == "kernels-hub"
+
+
+def test_a_model_without_linear_attention_has_no_kernel_info():
+    assert speed.gdn_kernels(_Model(_Mod(), _Mod())) is None
+    assert speed.gdn_kernels(object()) is None            # not a model: looking never raises
+    assert speed.gdn_note(None) == ""
+
+
+def test_report_kernels_logs_once_and_adds_the_result_key(monkeypatch):
+    from ndforge_worker import protocol
+    logs = []
+    monkeypatch.setattr(protocol, "log", logs.append)
+    monkeypatch.setattr(protocol, "EXTRAS", {})
+    slow = _Model(_Mod(chunk_gated_delta_rule=_fn("transformers.x"), causal_conv1d_fn=None))
+    info = speed.report_kernels(slow)
+    speed.report_kernels(slow)
+    assert info["delta_rule"] == "torch" and sum(l.startswith("kernels: ") for l in logs) == 1 and any("slow PyTorch" in l for l in logs)
+    emitted = []
+    monkeypatch.setattr(protocol, "emit", lambda kind, **f: emitted.append(f))
+    protocol.result({"a": 1})
+    assert emitted[0]["data"]["kernels"] == info and emitted[0]["data"]["a"] == 1
+    assert speed.report_kernels(_Model(_Mod())) is None
+
+
+def test_the_unsloth_sentence_is_about_training_only():
+    note = speed.kernel_notes("qwen3_5", "unsloth", True, (12, 0))[0]
+    assert "Training with Unsloth" in note and "Measuring, healing and checking do not use Unsloth" in note

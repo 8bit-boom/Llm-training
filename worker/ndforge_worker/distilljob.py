@@ -666,6 +666,8 @@ def run_cache(cfg: dict) -> int:
     mode = reshapejob._choose_load(cfg["teacher"].get("load", "auto"), est)
     protocol.progress("cache", 0.0, f"Loading the original model ({mode})")
     model = reshapejob._load(teacher_dir, mode)
+    from . import speed
+    speed.report_kernels(model)
     from .data import text_tokenizer
     inner = text_tokenizer(tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
@@ -1032,6 +1034,8 @@ def run(cfg: dict) -> int:
     upcast = method == "qlora" and bool(d.get("kbit_upcast", False))     # the old 32-bit copy of the embeddings and the output layer (QLoRA only); off for healing
     lcfg = {"model": cfg["model"], "method": method, "hyper": h, "kbit_upcast": upcast}
     model, tokenizer, _ = backends.load(lcfg, "hf")
+    from . import speed
+    speed.report_kernels(model)
     if mode == "online":
         dcfg = {"train": cfg["dataset"]["train"], "tokens": int(h["tokens"]), "general": (cfg["dataset"] or {}).get("general")}
         rows, stats = build_rows(tokenizer, dcfg, cfg["model"].get("family", "generic"), int(h["max_seq"]), int(h["seed"]))

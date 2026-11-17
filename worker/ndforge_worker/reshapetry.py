@@ -20,7 +20,7 @@ import os
 import time
 from pathlib import Path
 
-from . import protocol, reshape, reshape_width
+from . import protocol, reshape, reshape_width, speed
 from .reshape import ReshapeError
 
 TRY_FORMAT = 1
@@ -547,6 +547,7 @@ def run_try(cfg: dict) -> int:
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("try", 0.0, f"Loading the model ({mode})")
     model = reshapejob._load(src_dir, mode)
+    speed.report_kernels(model)
     layers = reshapejob._find_layers(model, n_layers)
     mlp = meas["mlp"] if meas else None
     size = dims["intermediate"] if dims else 0

@@ -60,7 +60,7 @@ def _generate_batch(model, enc, settings: dict, max_new: int, stops: list, pad_i
 def generate(requests: list, settings: dict, on_result, should_stop, job: dict) -> None:
     from transformers import AutoTokenizer
 
-    from . import reshapejob, safetensors_io
+    from . import reshapejob, safetensors_io, speed
     folder = reshapejob._resolve_source(str(job["model"]))
     tok = AutoTokenizer.from_pretrained(str(folder))
     inner = text_tokenizer(tok)
@@ -71,6 +71,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     mode = reshapejob._choose_load(job.get("load", "auto"), est)
     protocol.progress("load", 0.0, f"Loading the model ({mode})")
     model = reshapejob._load(folder, mode)
+    speed.report_kernels(model)
     model.config.use_cache = True
     protocol.progress("load", 1.0, "")
     stops = stop_ids(inner, model)
