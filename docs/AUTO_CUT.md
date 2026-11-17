@@ -132,3 +132,5 @@ file at every step event, so the stepper is what the file says. Tests: `ui/smoke
 
 Nothing here ran on a real model, card or Studio (the publish ran against a stand-in server and temporary folders only). The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
 is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs, including `publish`, which reads the global settings) has only been compiled and read, not run against a worker; the page was only run in a stand-in browser, never in the window.
+
+The finish time on the Auto-cut card names the day when an end of the range falls on another calendar day ("done around 18:49–tomorrow 14:49", or a short weekday name two or more days on), so the high end never reads as earlier than the low end.

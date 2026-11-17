@@ -2550,12 +2550,22 @@ function acEtaRange(run, eta, nowMs) {
   }
   return lo || hi ? { lo, hi } : null;
 }
-const acClock = (ms) => { const d = new Date(ms); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+const acHM = (d) => String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+// the clock time of `ms`; a time on another calendar day (local date, not 24 hours) says which: "tomorrow 14:49", or "Thu 14:49" two or more days on
+const acDay = (ms, nowMs) => {
+  const d = new Date(ms), n = new Date(nowMs);
+  const days = Math.round((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(n.getFullYear(), n.getMonth(), n.getDate())) / 864e5);
+  return days <= 0 ? "" : days === 1 ? "tomorrow" : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
+};
+const acClock = (ms, nowMs) => { const day = nowMs == null ? "" : acDay(ms, nowMs); return (day ? day + " " : "") + acHM(new Date(ms)); };
 function acEtaText(run, eta, nowMs) {
   const r = acEtaRange(run, eta, nowMs);
   if (!r) return "";
-  const now = nowMs || Date.now(), a = acClock(now + r.lo * 3600e3), b = acClock(now + r.hi * 3600e3);
-  return a === b ? `done around ${a}` : `done around ${a}–${b}`;
+  const now = nowMs || Date.now(), lo = now + r.lo * 3600e3, hi = now + Math.max(r.lo, r.hi) * 3600e3;
+  const a = acClock(lo, now), b = acClock(hi, now);
+  if (a === b) return `done around ${a}`;
+  const da = acDay(lo, now), db = acDay(hi, now);
+  return da === db ? `done around ${a}–${acHM(new Date(hi))}` : `done around ${a}–${b}`;      // one day word for both ends when they share it
 }
 
 function onAutoEvent(p) {

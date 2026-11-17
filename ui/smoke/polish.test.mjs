@@ -36,6 +36,25 @@ test("the text names the clock times of the range, or one time when there is no 
   assert.equal(text([]), "");
 });
 
+test("a finish time on another calendar day says so (local dates, not 24 hours)", () => {
+  const b = makeBrowser();
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const text = (now, lo, hi) => b.ctx.acEtaText({ status: "running", steps: [step("s1.heal", "pending")], plan: { stages: [{ hours: [lo, hi] }] } }, null, now);
+  const noon = new Date(2026, 0, 1, 12, 0, 0).getTime();
+  assert.equal(text(noon, 1, 3), "done around 13:00–15:00", "same day: unchanged");
+  const evening = new Date(2026, 0, 1, 18, 49, 0).getTime();
+  assert.equal(text(evening, 0, 20), "done around 18:49–tomorrow 14:49", "the case the owner saw: no longer reads as an earlier time");
+  assert.equal(text(noon, 12.5, 14.5), "done around tomorrow 00:30–02:30", "both ends tomorrow: the day word once");
+  const late = new Date(2026, 0, 1, 23, 30, 0).getTime();
+  assert.equal(text(late, 1.5, 1.5), "done around tomorrow 01:00", "a short wait that crosses midnight");
+  const far = new Date(noon + 50 * 3600e3);                 // two days on
+  assert.equal(text(noon, 4, 50), `done around 16:00–${DAYS[far.getDay()]} 14:00`);
+  // the low end is never shown as later than the high end
+  const lo = new Date(noon + 20 * 3600e3), hi = new Date(noon + 30 * 3600e3);
+  assert.equal(text(noon, 20, 30), "done around tomorrow 08:00–18:00");
+  assert.ok(lo < hi);
+});
+
 test("an Auto-cut event with a time left is remembered for the estimate", () => {
   const b = makeBrowser();
   b.run(`page = "welcome"; ac.running = true; onAutoEvent({ kind: "metric", eta_s: 1800, auto_step: "s1.heal" })`);
