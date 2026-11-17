@@ -1,0 +1,73 @@
+# Weekly check that the things nd-world copies from this repository have not drifted: the Unsloth fixtures and, when it embeds the worker, the worker's contract.json.
+# Needs a read-only token for the nd-world repository in the secret NDWORLD_READ_TOKEN. Without it the job says "skipped" and passes: nothing here ever needs the secret.
+name: Contract drift
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.NDWORLD_READ_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skipped without the token
+        if: env.HAS_TOKEN != 'true'
+        run: |
+          echo "skipped: the secret NDWORLD_READ_TOKEN is not set, so nd-world is not looked at." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check out nd-world (read only)
+        if: env.HAS_TOKEN == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 8bit-boom/nd-world
+          token: ${{ secrets.NDWORLD_READ_TOKEN }}
+          path: nd-world
+          persist-credentials: false
+      - name: Compare
+        if: env.HAS_TOKEN == 'true'
+        shell: bash
+        run: |
+          set -u
+          fail=0
+          { echo "## Contract drift"; echo; } >> "$GITHUB_STEP_SUMMARY"
+          # the Unsloth fixtures: every file of ours that nd-world has a copy of (by file name) must be identical
+          for f in tests/fixtures/unsloth/*.json; do
+            name=$(basename "$f")
+            copy=$(find nd-world -path nd-world/.git -prune -o -type f -name "$name" -path '*unsloth*' -print | head -1)
+            if [ -z "$copy" ]; then
+              echo "- $name: no copy in nd-world (not compared)" >> "$GITHUB_STEP_SUMMARY"
+            elif cmp -s <(tr -d '\r' < "$f") <(tr -d '\r' < "$copy"); then
+              echo "- $name: same" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- $name: DIFFERENT ($copy)" >> "$GITHUB_STEP_SUMMARY"; fail=1
+            fi
+          done
+          # the API contract text
+          copy=$(find nd-world -path nd-world/.git -prune -o -type f -name UNSLOTH_API_CONTRACT.md -print | head -1)
+          if [ -n "$copy" ]; then
+            if cmp -s <(tr -d '\r' < docs/UNSLOTH_API_CONTRACT.md) <(tr -d '\r' < "$copy"); then echo "- UNSLOTH_API_CONTRACT.md: same" >> "$GITHUB_STEP_SUMMARY"; else echo "- UNSLOTH_API_CONTRACT.md: DIFFERENT" >> "$GITHUB_STEP_SUMMARY"; fail=1; fi
+          fi
+          # the worker's contract: when nd-world embeds the worker, nothing we list may be missing from its copy and the protocol must match
+          copy=$(find nd-world -path nd-world/.git -prune -o -type f -name contract.json -path '*ndforge_worker*' -print | head -1)
+          if [ -z "$copy" ]; then
+            echo "- worker contract.json: nd-world has no embedded worker (not compared)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            python3 - "$copy" >> "$GITHUB_STEP_SUMMARY" <<'PY' || fail=1
+          import json, sys
+          ours = json.load(open("worker/ndforge_worker/contract.json"))
+          theirs = json.load(open(sys.argv[1]))
+          bad = []
+          if ours["protocol"] != theirs.get("protocol"):
+              bad.append(f"protocol {theirs.get('protocol')} there, {ours['protocol']} here")
+          for k in ("jobs", "events", "error_codes"):
+              gone = sorted(set(theirs.get(k, [])) - set(ours[k]))
+              if gone:
+                  bad.append(f"{k} that nd-world knows and this worker no longer has: {', '.join(gone)}")
+          print("- worker contract.json: " + ("; ".join(bad) if bad else "compatible (nothing nd-world uses is missing)"))
+          sys.exit(1 if bad else 0)
+          PY
+          fi
+          [ "$fail" = 0 ] || { echo "Drift found: see the summary." ; exit 1; }

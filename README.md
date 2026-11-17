@@ -200,6 +200,11 @@ When a job or the queue ends the program shows a system notification ("Healing f
 POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
 computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
 
+## The worker's contract
+
+`worker/ndforge_worker/contract.json` lists the job types, event types and error codes of the worker, with the protocol number; names are only ever added (docs/WORKER_CONTRACT.md). Tests in both languages check it, and the
+Unsloth fixtures nd-world copies are recorded in `tests/fixtures/unsloth/SHA256SUMS`. The weekly workflow `contract-drift.yml` compares nd-world's copies when the secret `NDWORLD_READ_TOKEN` exists and skips without it.
+
 ## The diagnostics file
 
 Help > "Save a diagnostics file..." (`diagnostics_save`, `ndforge_core::diagnose::bundle`) writes one zip to a folder you choose: the problem report, the last 10 job logs, the settings (addresses and names, no keys: those are in `secrets.json`,
