@@ -78,7 +78,7 @@ pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(
         if cancel.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::new("Cancelled."));
+            return Err(Error::cancelled());
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok((stream, line)) => on_line(stream, &line),

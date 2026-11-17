@@ -158,7 +158,7 @@ fn start_job(s: &Arc<Shared>, id: &str, mut job: Value) -> std::result::Result<(
                 set_job_state(&dir, status, json!({"result": result}));
             }
             Err(e) => {
-                let stopped = e.0 == "Cancelled.";
+                let stopped = e.is_cancelled();
                 append_event(&dir, &json!({"kind": "error", "text": if stopped { "Stopped.".to_string() } else { e.0.clone() }}));
                 set_job_state(&dir, if stopped { "stopped" } else { "failed" }, json!({"error": e.0}));
             }

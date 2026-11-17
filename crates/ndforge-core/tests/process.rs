@@ -52,3 +52,11 @@ fn a_chatty_program_is_still_cancelled_promptly() {
     assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
     assert!(n > 0);
 }
+
+#[test]
+fn cancellation_is_one_value_with_an_unchanged_text() {
+    let e = ndforge_core::Error::cancelled();
+    assert_eq!(e.0, "Cancelled.");
+    assert!(e.is_cancelled() && !ndforge_core::Error::new("Stopped.").is_cancelled());
+    assert_eq!(ndforge_core::error::CANCELLED, "Cancelled.");
+}

@@ -308,7 +308,7 @@ pub fn finish(dir: &Path, m: &ModelEntry, method: Method, hyper: &Hyper, outcome
             }
             Ok(result)
         }
-        Err(e) if e.0 == "Cancelled." => {
+        Err(e) if e.is_cancelled() => {
             // killed after the grace period: the last checkpoint is kept and the run can be continued
             set_state(dir, json!({"status": "stopped"}));
             Err(Error::new("Stopped. The run can be continued from its last saved point."))

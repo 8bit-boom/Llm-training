@@ -44,7 +44,7 @@ impl<'a> RealEffects<'a> {
 fn was_stopped(r: &Result<Value>) -> bool {
     match r {
         Ok(v) => v["stopped"].as_bool().unwrap_or(false),
-        Err(e) => e.0 == "Cancelled." || e.0.starts_with("Stopped"),
+        Err(e) => e.is_cancelled() || e.0.starts_with("Stopped"),
     }
 }
 
@@ -97,7 +97,7 @@ impl Effects for RealEffects<'_> {
             self.forward(e);
         }
         match r {
-            Err(e) if e.0 == "Cancelled." => Ok(Out::Stopped),
+            Err(e) if e.is_cancelled() => Ok(Out::Stopped),
             r => r.map(Out::Done),
         }
     }

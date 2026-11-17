@@ -296,7 +296,7 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
             result["model_id"] = json!(id);
             Ok(result)
         }
-        Err(e) if e.0 == "Cancelled." => {
+        Err(e) if e.is_cancelled() => {
             let _ = std::fs::remove_dir_all(&partial);
             set_state(&dir, json!({"status": "stopped"}));
             Err(Error::new("Stopped."))
@@ -899,7 +899,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         json!({"stopped": true, "name": name})
     };
     let failed = |e: Error| {
-        if e.0 == "Cancelled." {
+        if e.is_cancelled() {
             set_heal(&dir, json!({"status": "stopped"}));
             return Error::new("Stopped. Healing can be continued where it stopped.");
         }
