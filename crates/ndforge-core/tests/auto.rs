@@ -233,8 +233,19 @@ fn project(root: &std::path::Path) -> Project {
     Project::create(&root.join("projects"), "Ashfall Reach").unwrap()
 }
 
+/// the spec of most tests: without the thinking check before healing (its own tests below switch it on), so that the calls of the other steps stay easy to read
 fn spec(target: f64) -> AutoSpec {
+    AutoSpec { think_gate: false, ..AutoSpec::new("qwen3.8-27b", target) }
+}
+
+/// the same with the thinking check before healing
+fn gspec(target: f64) -> AutoSpec {
     AutoSpec::new("qwen3.8-27b", target)
+}
+
+/// the metrics of a cut that lost much of its thinking
+fn weak() -> Value {
+    json!({"closed_rate": 0.5, "accuracy": 0.28, "loop_rate": 0.5, "garbage_rate": 0.0, "median_think_tokens": 800})
 }
 
 /// what two runs must have in common: the state without ids and times
@@ -806,4 +817,175 @@ fn the_report_says_when_the_loss_of_a_cut_was_measured_in_try_first() {
     assert!(report["stages"][0]["cut_loss"].as_f64().is_some(), "{report}");
     let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
     assert!(md.contains("was measured in Try first"), "{md}");
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------ the thinking check before healing
+
+#[test]
+fn the_thinking_gate_chooses_by_how_the_cuts_think_and_plans_the_stages_again() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    // Try first likes the width-only cut best (cut-1) but it lost its thinking; the cut with a block removed (cut-2) still thinks
+    fx.checks.insert("cut-1/cut".into(), weak());
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let ids: Vec<&str> = st.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(&ids[..4], ["plan", "measure", "try", "think_gate"]);
+    let gate = st.think_gate.as_ref().unwrap();
+    assert_eq!(gate["rows"].as_array().unwrap().len(), 2);
+    assert_ne!(gate["rows"][0]["row"], gate["rows"][1]["row"]);
+    assert_eq!(st.chosen.as_ref().unwrap().blocks, 1, "{:?}", st.chosen);
+    assert!(st.notes.iter().any(|n| n.starts_with("Try first's lowest loss was") && n.contains("kept less of its thinking") && n.contains("closed 50 %")), "{:?}", st.notes);
+    // the gate's cuts are final cuts that Try first measured: their loss is not measured again
+    assert_eq!(fx.specs.len(), 2);
+    assert!(fx.specs.iter().all(|s| s["skip_check"] == json!(true)));
+    // one stage: the winner's cut and check are the stage's own; no other cut is made
+    assert_eq!(fx.cuts, 2);
+    let sta = |id: &str| st.steps.iter().find(|s| s.id == id).map(|s| (s.status.clone(), s.note.clone())).unwrap();
+    assert_eq!(sta("s1.cut"), ("skipped".into(), Some("made and checked in the thinking gate".into())));
+    assert_eq!(sta("s1.check_cut").0, "skipped");
+    assert!(st.stages[0].cut_loss.is_some());
+    // the loser went at once, the winner after its stage passed
+    let pos = |what: &str| fx.done.iter().position(|d| d == what).unwrap_or_else(|| panic!("{what} in {:?}", fx.done));
+    assert!(pos("remove cut cut-1") < pos("heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")"));
+    assert!(fx.done.iter().any(|d| d == "heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")"));
+    assert!(!fx.done.iter().any(|d| d.starts_with("heal cut-1")));
+    assert!(fx.removed.iter().any(|m| m.name == "cut-2"), "removed after its stage passed: {:?}", fx.removed);
+    // the original was checked once
+    assert_eq!(fx.asked.get("cut-1/original"), Some(&1));
+    assert_eq!(fx.asked.iter().filter(|(k, _)| k.ends_with("/original")).count(), 1);
+}
+
+#[test]
+fn a_tie_in_thinking_is_decided_by_the_loss_and_a_cut_that_lost_much_is_only_a_warning() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done");
+    assert_eq!(st.chosen.as_ref().unwrap().blocks, 0, "equal thinking: Try first's lowest loss stays");
+    assert!(!st.notes.iter().any(|n| n.starts_with("Try first's lowest loss was")));
+    // every cut lost much of its thinking: the run goes on, with the numbers in a warning
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    fx2.checks.insert("cut-1/cut".into(), weak());
+    fx2.checks.insert("cut-2/cut".into(), weak());
+    let st2 = start(&p2, &mut fx2, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st2.status, "done", "the gate never halts: {:?}", st2.error);
+    assert!(st2.notes.iter().any(|n| n.starts_with("Even the best cut has lost much of its ability to finish its reasoning before healing (closed 50 % against 100 %)")), "{:?}", st2.notes);
+    assert_eq!(st2.think_gate.as_ref().unwrap()["lost_much"], json!(true));
+}
+
+#[test]
+fn with_two_stages_the_checked_cuts_are_deleted_and_stage_one_makes_its_own() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, gspec(21.1)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(st.stages.len(), 2);
+    // two gate cuts (final cuts, skip_check) and then the two stages' own cuts (measured as before)
+    assert_eq!(fx.cuts, 4);
+    assert_eq!(fx.specs.iter().map(|s| s["skip_check"].clone()).collect::<Vec<_>>(), vec![json!(true), json!(true), json!(false), json!(false)]);
+    assert!(fx.done.iter().any(|d| d == "remove cut cut-1") && fx.done.iter().any(|d| d == "remove cut cut-2"), "{:?}", fx.done);
+    let sta = |id: &str| st.steps.iter().find(|s| s.id == id).map(|s| s.status.clone()).unwrap();
+    assert_eq!((sta("s1.cut"), sta("s1.check_cut"), sta("think_gate")), ("done".into(), "done".into(), "done".into()));
+    // keep_intermediate keeps every checked cut
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut keep = Mock::new();
+    let st2 = start(&p2, &mut keep, AutoSpec { keep_intermediate: true, ..gspec(21.1) }).unwrap();
+    assert_eq!(st2.status, "done");
+    assert!(keep.removed.is_empty(), "{:?}", keep.removed);
+}
+
+#[test]
+fn a_stop_at_every_call_of_a_run_with_the_gate_repeats_nothing() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut plain = Mock::new();
+    plain.checks.insert("cut-1/cut".into(), weak());
+    let full = start(&p, &mut plain, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(full.status, "done");
+    let full = load(&run_dir(&p, &full.id)).unwrap();
+    for n in 1..=plain.n {
+        let dir = tempdir().unwrap();
+        let q = project(dir.path());
+        let mut fx = Mock::new();
+        fx.checks.insert("cut-1/cut".into(), weak());
+        fx.stop_at = Some(n);
+        let first = start(&q, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+        assert_eq!(first.status, "stopped", "stop at call {n}: {:?}", fx.all.last());
+        let last = resume(&q, &mut fx, &first.id).unwrap();
+        assert_eq!(last.status, "done", "stop at call {n}: {:?}", last.error);
+        assert_eq!(fx.done, plain.done, "stop at call {n} ({:?})", fx.all[n - 1]);
+        let (a, b) = (shape(&last), shape(&full));
+        for (k, v) in a.as_object().unwrap() {
+            assert_eq!(v, &b[k], "stop at call {n}: {k}");
+        }
+    }
+}
+
+#[test]
+fn a_run_saved_before_the_gate_existed_loads_and_runs_without_it() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "done");
+    let mut v = serde_json::to_value(&st).unwrap();
+    v.as_object_mut().unwrap().remove("think_gate");
+    let sp = v["spec"].as_object_mut().unwrap();
+    sp.remove("think_gate");
+    sp.remove("think_gate_n");
+    let old: AutoState = serde_json::from_value(v).unwrap();
+    assert!(old.think_gate.is_none() && old.spec.think_gate && old.spec.think_gate_n == 2);
+    assert!(!old.steps.iter().any(|s| s.id == "think_gate"), "an old run has no gate step, so none runs");
+    // a stopped run of that kind goes on without it
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut a = Mock::new();
+    a.stop_at = Some(4);
+    let first = start(&p2, &mut a, spec(21.1)).unwrap();
+    let mut v2 = serde_json::to_value(&first).unwrap();
+    v2.as_object_mut().unwrap().remove("think_gate");
+    v2["spec"].as_object_mut().unwrap().remove("think_gate");
+    std::fs::write(run_dir(&p2, &first.id).join("auto.json"), serde_json::to_vec(&v2).unwrap()).unwrap();
+    let last = resume(&p2, &mut a, &first.id).unwrap();
+    assert_eq!(last.status, "done", "{:?}", last.error);
+    assert!(!a.done.iter().any(|d| d.contains("skip")) && last.think_gate.is_none());
+}
+
+#[test]
+fn the_number_of_cuts_the_gate_checks_is_validated() {
+    assert!(AutoSpec { think_gate_n: 0, ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { think_gate_n: 4, ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { think_gate_n: 3, ..gspec(21.1) }.validate().is_ok());
+}
+
+#[test]
+fn the_report_has_the_table_before_healing_and_the_guardrail_warnings() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("cut-1/cut".into(), weak());
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    let dir = run_dir(&p, &st.id);
+    let r: Value = serde_json::from_slice(&std::fs::read(dir.join("auto_report.json")).unwrap()).unwrap();
+    assert_eq!(r["think_gate"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(r["guardrails"].as_array().unwrap().len(), 0, "a cut inside the rules has no warning");
+    let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
+    assert!(md.contains("## Before healing") && md.contains("| Cut | Loss | Finishes reasoning | Loops | Right answers | Chosen |") && md.contains("| yes |"), "{md}");
+    // a run that was allowed to remove many blocks: the warning names the numbers
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut big = Mock::new();
+    let st2 = start(&p2, &mut big, AutoSpec { stages: 1, allow_many_blocks: true, ..gspec(15.0) }).unwrap();
+    let r2: Value = serde_json::from_slice(&std::fs::read(run_dir(&p2, &st2.id).join("auto_report.json")).unwrap()).unwrap();
+    let g = r2["guardrails"].as_array().unwrap();
+    assert!(g.iter().any(|x| x.as_str().unwrap().contains("whole blocks are removed")), "{r2}");
+    assert!(g.iter().any(|x| x.as_str().unwrap().contains("Before healing this cut finished its reasoning in")), "{g:?}");
 }

@@ -82,7 +82,27 @@ pub fn build(st: &AutoState) -> Value {
         "disk": plan.and_then(|p| p.disk.as_ref()).map(|d| json!({"peak_gb": d.peak_gb, "peak_step": d.peak_step, "final_gb": d.final_gb, "keep_intermediate": d.keep_intermediate, "measured": false})),
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
+        "think_gate": st.think_gate, "guardrails": guardrails(st),
     })
+}
+
+/// The ways the chosen cut goes beyond what Auto-cut does by itself (with the numbers of its check before healing when there are any): empty for a cut inside the rules.
+fn guardrails(st: &AutoState) -> Vec<String> {
+    let (Some(ins), Some(c)) = (st.inspect.as_ref(), st.chosen.as_ref()) else { return Vec::new() };
+    let mut out = super::auto_plan::beyond_guardrails(ins, c.blocks, c.intermediate);
+    if out.is_empty() {
+        return out;
+    }
+    let win = st.think_gate.as_ref().and_then(|g| g["rows"].as_array().and_then(|r| r.iter().find(|x| x["row"] == g["winner"]).cloned()));
+    if let Some(m) = win.as_ref().map(|w| &w["check"]["main"]).filter(|m| m.is_object()) {
+        out.push(format!("Before healing this cut finished its reasoning in {} of its answers, looped in {} (the original: {}).",
+                         pct(&m["closed_rate"]), pct(&m["loop_rate"]), st.baseline.as_ref().map(|b| pct(&b["main"]["closed_rate"])).unwrap_or_else(|| "-".into())));
+    }
+    out
+}
+
+fn pct(v: &Value) -> String {
+    v.as_f64().map(|x| format!("{:.0} %", x * 100.0)).unwrap_or_else(|| "-".into())
 }
 
 fn cell(v: &Value, key: &str) -> String {
@@ -136,6 +156,20 @@ pub fn markdown(r: &Value) -> String {
     for st in r["stages"].as_array().cloned().unwrap_or_default() {
         if let Some(l) = st["cut_loss"].as_f64() {
             s.push_str(&format!("\nStage {}: the cut's text-prediction error {l:.3} was measured in Try first (the new model was not loaded again to measure it).\n", st["index"]));
+        }
+    }
+    if let Some(rows) = r["think_gate"]["rows"].as_array().filter(|a| !a.is_empty()) {
+        s.push_str("\n## Before healing\n\nThe best cuts of Try first, checked for thinking before anything was healed (the check is an estimate of a model that has not been healed).\n\n| Cut | Loss | Finishes reasoning | Loops | Right answers | Chosen |\n|---|---|---|---|---|---|\n");
+        for x in rows {
+            let m = &x["check"]["main"];
+            s.push_str(&format!("| {} blocks, MLP {} ({} B) | {} | {} | {} | {} | {} |\n", x["blocks"], x["intermediate"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unchanged".into()), num(&x["params_b"], 2), num(&x["loss"], 3),
+                                 pct(&m["closed_rate"]), pct(&m["loop_rate"]), pct(&m["accuracy"]), if x["row"] == r["think_gate"]["winner"] { "yes" } else { "" }));
+        }
+    }
+    if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
+        s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");
+        for x in g.iter().filter_map(|x| x.as_str()) {
+            s.push_str(&format!("- {x}\n"));
         }
     }
     s.push_str("\n## Thinking check\n\n| Model | Verdict |");
