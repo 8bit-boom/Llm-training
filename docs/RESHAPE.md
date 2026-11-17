@@ -136,6 +136,14 @@ projection set to zero), atol 1e-4 in float32. The same check was made once by h
 transformers, so it is cut by weight size (`||down[:, i]|| * ||up[i, :]||` per neuron, `||o_proj columns||` per head) and the result says it was **not measured or healed**.
 bf16 tensors are cut as raw `uint16` with numpy: bit-exact, no bf16 type needed.
 
+### The guardrails
+
+Auto-cut's rules (`auto_plan.rs`): the MLP is never thinned below 61.7 % of its width (`WIDTH_FIRST_KEEP`: 10,752 of 17,408 for the 27 B) and at most 4 whole blocks are removed without the owner's
+confirmation (`MAX_BLOCKS_FREE`). A cut made by hand on the Slim page can go beyond them (a real run cut the MLP to 10,240, 58.8 %, with three blocks, and the model lost half of its ability to
+finish its reasoning). For a model that thinks the page warns when a cut goes beyond the rules (`plan::warnings`, the same sentences as the report), says how long the thinking check takes (about
+10 minutes in Quick per 17 B plus writing the cut) and reminds that a lower error is not a thinking test. The result card of a made cut that is beyond the rules shows a warning with the cut's own
+thinking numbers once it has been checked, otherwise a pointer to "Check the cut model"; the heal checklist has a yellow light until the cut has had a thinking check (never red).
+
 ### The multi-token (MTP) head in a cut model
 
 - **A cut that thins the MLP or the attention heads removes the head.** The sliced head was never measured or healed, speculative decoding with it only wastes compute (the main model checks every token), it kept about 0.3-0.4 B parameters on disk and in memory, and it made the export offer `--nextn` matrix work for nothing. The `mtp.*` tensors are not written, `mtp_num_hidden_layers` (and `num_nextn_predict_layers` where present) is set to 0, and the result says so in its notes and in `width.mtp` ("removed (no longer fits)"); `ndforge_reshape.json` gets `mtp_removed: true` and `mtp_params_removed`.

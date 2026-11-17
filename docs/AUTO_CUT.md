@@ -20,10 +20,10 @@ than **61.7 % of the original** (a cut of at most 38 %: 17,408 -> 10,752 for the
 blocks, then nearer. More than 4 blocks need the owner's confirmation (`needs_confirmation`); without it the planner stops with a plain sentence. The first three on target are what *Try
 first* is asked about. A model that cannot be thinned (not Qwen3.5 / 3.8) is cut by blocks only.
 
-For the 27B: 21.1 B is the MLP alone (10,752, exactly 21.13 B); 18 B is blocks plus the thinnest MLP; 14 B needs more than 4 blocks and waits for the confirmation; 3 B is refused.
+For the 27B: 21.1 B is the MLP alone (11,008, exactly 21.07 B; a width cut removes the multi-token head, so every width size is about 0.3-0.4 B lower than it was when the head was kept); 18 B is blocks plus the thinnest MLP; 14 B needs more than 4 blocks and waits for the confirmation; 3 B is refused.
 
 **Stages** (`split_stages`): two by default. Blocks and a thinner MLP: the blocks in stage A, the width in stage B. Width only: stage A takes the half-way stop (17,408 -> 14,080 ->
-10,752), stage B the rest. Blocks only: half of them in each stage. A cut that cannot be divided (one block, one MLP stop) is one stage, with a note. The teacher is always the original.
+11,008), stage B the rest. Blocks only: half of them in each stage. A cut that cannot be divided (one block, one MLP stop) is one stage, with a note. The teacher is always the original.
 
 **Healing per stage**: the thinking recipe's numbers (`runs::heal_choice` with `recipe: thinking`: sequence 8192 or 4096 by the card, batch 1, rank 64) and **40 million tokens** for stage A;
 the last stage 40 or **80 million** (`plan::thinking_tokens_m`, 80 when the cut is over 30 %). Without *keep thinking* the plain defaults (20 million from 15 B). The estimate of the card
@@ -32,10 +32,39 @@ the last stage 40 or **80 million** (`plan::thinking_tokens_m`, 80 when the cut 
 **Disk** (`disk_plan`): a timeline. The original stays; every stage adds its unhealed cut, the teacher's saved answers (196 bytes per token) and its healed model; the export adds a 16-bit GGUF
 and the chosen sizes. Without *keep the intermediate files* the cut and the answers of a stage go once the stage passed its checks, the healed model of the stage before once the next one
 passed, and the 16-bit GGUF after the export. The plan shows the peak (and at which step), what is left at the end, and refuses to start when the free space is under the peak plus 5 %.
-For the 27B to 21.1 B in two stages (stage A 24.46 B at MLP 14,080, stage B 21.14 B at 10,752, 40 million tokens each) the peak is **196.8 GB** with the clean-up (while stage B's healed model is
-written) and **308.7 GB** without it (at the export); 110.7 GB are left at the end with the clean-up. They are sums of file sizes, not measured.
+For the 27B to 21.1 B in two stages (stage A 24.09 B at MLP 14,080, stage B 21.07 B at 11,008, 40 million tokens each) the peak is **195.8 GB** with the clean-up (while stage B's healed model is
+written) and **306.7 GB** without it (at the export); 110.5 GB are left at the end with the clean-up. They are sums of file sizes, not measured.
 
 **Backing off** (`back_off`): the step Auto-cut takes back after a stage failed twice: one block less while there are blocks, else 1,024 more of the MLP (four stops).
+
+## The thinking check before healing (`think_gate`)
+
+**Why.** A real run (docs/REAL_RUN_17B.md) cut a 27 B model to about 17 B. The cut with the lowest text-prediction error finished its reasoning in only half of the answers (the original: 97 %),
+and the error was even *lower* than the original's. Try first measures how well a cut predicts text, not whether the model can still think, so Auto-cut checks the thinking of its best cuts
+before it spends hours healing one.
+
+**What it does** (step `think_gate`, after `try`, only with *keep thinking* and *think the best N cuts before healing* on; N is 2 by default, 1 to 3):
+
+1. The N cuts of Try first with the lowest loss are made one after the other as the FINAL cut (the same job as a stage, `skip_check`: Try first measured them already).
+2. The original is checked once (from the folder of the first cut), then each cut. The checked numbers are the same 16 or 32 questions as everywhere (docs/THINKING_CHECK.md).
+3. Only the best cut so far stays on the disk. The ranking is `thinkcheck::rank_thinking`: the score is *finishes its reasoning* minus *loops* minus *garbage*; the highest score wins, and scores within
+   0.125 of the best are a tie that the lower loss decides (the check asks few questions, so a smaller difference is noise). A cut without a score only counts when no cut has one.
+4. When the winner is not the cut Try first chose, the stages are planned again for it, and the notes say so with the numbers: "Try first's lowest loss was 1.267 (3 blocks, MLP 10240), but it kept
+   less of its thinking (closed 50 %, loops 50 %); 2 blocks, MLP 12032 was chosen (closed 97 %, loops 0 %)."
+5. With **one stage** the winner's cut and its check are the stage's own (`s1.cut` and `s1.check_cut` are skipped: "made and checked in the thinking gate") and its loss is Try first's. With
+   **two stages** the checked cuts are deleted (stage 1 makes its own, half-way cut) unless *keep the intermediate files* is on.
+6. **It never halts a run.** If even the best cut finished its reasoning in under 0.6 of the original's rate, a warning with the numbers is added ("Even the best cut has lost much of its
+   ability to finish its reasoning before healing (closed 50 % against 97 %). Healing may bring some back; the healed model's check decides."). The healed model's own check still gates the run.
+
+Stop and Continue repeat nothing: every checked cut, the cut that was being checked and the original's numbers are in the state (`think_gate`, `baseline`), and a run saved before the gate existed has no
+gate step and loads and runs as before.
+
+**Time and disk.** The plan shows `think_gate_minutes`: for each cut writing it (about 500 MB per second) plus the check (15 minutes for Full, 10 for Quick, per 17 B of the model, at least once),
+plus one check of the original. It is an estimate. On the disk the gate keeps one final cut at a time (two with one stage: the best so far and the next one); the plan has a line for it and uses it as the
+peak when it is the largest. `step_try` also notes when the best cut's loss is below the original's (measure both the same way).
+
+**The report** (`auto_report.json` key `think_gate`, markdown "Before healing") has the table of the checked cuts (loss, finishes reasoning, loops, right answers, chosen) and, when the chosen cut
+goes beyond the guardrails (`beyond_guardrails`: the MLP kept below 61.7 % or more than 4 blocks, as with *allow many blocks*), a warning with those numbers and the cut's own thinking numbers.
 
 ## The orchestrator (`reshape/auto.rs`, effects in `reshape/auto_fx.rs`)
 
@@ -55,6 +84,7 @@ a time on one card, with the Stop button on the same flag). Worker events are fo
 | `measure` | `reshape_measure` of the original on the reasoning-aware text (docs/RESHAPE.md, "Measuring on reasoning"): 256 samples, loaded the way the card allows |
 | `try` | Try first for the (up to three) candidates: first the widths and the best run of every block count, then the combined cut (those blocks and that width). The cheapest wins; when the two halves of the text name different winners, everything is asked again with 256 samples. The blocks of the winner are cut as Try first found them (explicit layers) |
 | `sN.cut` | `reshape` of the stage (the input is the original, or the healed model of the stage before; a width is measured on THAT model, on the reasoning-aware text) |
+| `think_gate` | the thinking check before healing (the section above): the best cuts of `try` are made and checked, the best thinker is chosen, the stages are planned again when it is not Try first's choice |
 | `sN.cut` (skip_check) | when stage 1 makes exactly the cut Try first measured (one stage, or the plan's last cut with its saved blocks), the job is told `skip_check`: the new model is not loaded again to measure its loss (and, for blocks only, nor is the original). The stage keeps Try first's loss as `cut_loss`, and the report says "measured in Try first". A later stage's cut is measured on the healed model as before |
 | `sN.check_cut` | thinking check of the cut (information only). The first one also checks the original, once, from the folder of the first cut (that is where its record of the original is) |
 | `sN.heal` | the Heal card's job with the thinking recipe and the stage's tokens; **the teacher is always the original model** (`heal_from_source` with the original as the teacher, also for stage 2) |

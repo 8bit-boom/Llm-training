@@ -4,6 +4,14 @@ Before a new model folder (tens of GB) is written, the page can tell what a cut 
 project's own calibration text is run through it; the text-prediction error ("loss") is the same number as the `loss_before` / `loss_after` of a made model. Nothing is
 written except one small file, `reshape_try.json`.
 
+## Loss is not a thinking test
+
+Try first measures how well a cut predicts text. For a model that thinks (Qwen3.5 / 3.8) that is NOT the same as still being able to think: in a real run (docs/REAL_RUN_17B.md) the cut with the
+lowest error finished its reasoning in half of the answers, against 97 % for the original. The verdict therefore always says so and what to do: make the cut, then run "Check the cut model" in the
+Thinking check before healing. A choice whose error is *lower than the original's* is flagged: a cut that predicts text better than the model it came from is a reason to check that both were
+measured the same way (a 4-bit or offloaded load against a 16-bit one, calibration text that suits the cut). Auto-cut does the thinking check for its best cuts by itself (docs/AUTO_CUT.md, "The
+thinking check before healing").
+
 ## What it answers (owner decisions = the defaults)
 
 1. **Baseline:** the loss of the original on the calibration batches (same data, samples and load mode as measuring: 4-bit for models that do not fit in 16-bit).

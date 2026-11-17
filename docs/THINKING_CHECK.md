@@ -33,6 +33,10 @@ Thinking ON (`enable_thinking=True`, the prompt ends with `<think>\n`), sampled 
 At most **3072** new tokens per question (Quick: **2048**; control questions: 512). Because the prompt already opens the reasoning block, the generated text starts inside it;
 `thinkcheck.split_output` cuts it at `</think>`.
 
+**The sampling is deliberate.** A greedy check (always the most likely token) did not show the failure of a real run (docs/REAL_RUN_17B.md): the same cuts that looked fine greedy looped or ran
+into the limit when sampled, which is how the model is really used. `thinkcheck_hf` therefore always calls `generate` with `do_sample=True` (a test asserts it), and llama-server is asked with the same
+settings.
+
 ## What is measured
 
 All rates are shares of the questions asked (0 to 1).
