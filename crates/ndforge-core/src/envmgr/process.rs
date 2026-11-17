@@ -1,5 +1,5 @@
 //! Run a command, hand its output to a callback line by line, and stop it when asked.
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -38,6 +38,25 @@ fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     }
 }
 
+/// Reads lines from a pipe until it closes. Bytes that are not valid UTF-8 (a Windows console in cp1252, a binary tool) become U+FFFD instead of ending the
+/// reading, which used to leave the rest of the output unread and the program stuck on a full pipe.
+fn pump(src: impl Read, stream: Stream, tx: mpsc::Sender<(Stream, String)>) {
+    let mut reader = BufReader::new(src);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf);
+                if tx.send((stream, text.trim_end_matches(['\r', '\n']).to_string())).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Runs `cmd` to the end (or until `cancel` is set, which kills it). Both output streams arrive in `on_line`.
 pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(Stream, &str)) -> Result<ExitStatus> {
     quiet(&mut cmd);
@@ -47,35 +66,23 @@ pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
-                if tx.send((Stream::Out, line)).is_err() {
-                    break;
-                }
-            }
-        }));
+        readers.push(std::thread::spawn(move || pump(out, Stream::Out, tx)));
     }
     if let Some(err) = child.stderr.take() {
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
-                if tx.send((Stream::Err, line)).is_err() {
-                    break;
-                }
-            }
-        }));
+        readers.push(std::thread::spawn(move || pump(err, Stream::Err, tx)));
     }
     drop(tx);
     loop {
+        // A chatty program never lets the receive time out, so look at the stop request on every turn.
+        if cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::new("Cancelled."));
+        }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok((stream, line)) => on_line(stream, &line),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if cancel.load(Ordering::SeqCst) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(Error::new("Cancelled."));
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
