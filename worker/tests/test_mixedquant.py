@@ -91,7 +91,7 @@ def first_rule(name, rules):
 def test_there_is_one_table_with_three_recipes_labelled_as_our_own():
     assert [p["id"] for p in mixedquant.PRESETS] == ["mixed_4", "mixed_3", "mixed_2"] and mixedquant.PRESET_IDS == ("mixed_4", "mixed_3", "mixed_2")
     assert [p["label"] for p in mixedquant.PRESETS] == ["Mixed 4-bit (balanced)", "Mixed 3-bit (small)", "Mixed 2-bit (smallest: short answers only)"]
-    assert mixedquant.LABEL == "Mixed precision (our own recipe)" and mixedquant.FIT_LABEL == "Mixed: fit to a size (experimental)" and mixedquant.MIXED_IDS == ("mixed_4", "mixed_3", "mixed_2", "mixed_fit")
+    assert mixedquant.LABEL == "Mixed precision (our own recipe)" and mixedquant.FIT_LABEL == "Mixed: fit to a size (experimental)" and mixedquant.MIXED_IDS == ("mixed_4", "mixed_3", "mixed_2", "mixed_fit", "mixed_measured")
     for p in mixedquant.PRESETS:
         assert p["base"] in mixedquant.PLAIN_BPW and p["embd"] in mixedquant.LEVELS + ("Q8_0",) and p["output"] in mixedquant.LEVELS and p["edge"] >= 1
         assert set(p["types"]) == set(mixedquant.ROLES)
@@ -510,6 +510,8 @@ def test_the_rust_table_of_sizes_and_this_one_say_the_same_things():
     for p in mixedquant.PRESETS:
         assert f'("{p["id"]}", "{p["label"]}' in text, p["id"]
     assert f'("{mixedquant.FIT_ID}", "{mixedquant.FIT_LABEL}' in text and mixedquant.LABEL in text
+    from ndforge_worker import quantfit
+    assert f'("{quantfit.ID}", "{quantfit.LABEL} · {quantfit.DESCRIPTION}")' in text
 
 
 # ------------------------------------------------------------------------------------------------------------------ the export

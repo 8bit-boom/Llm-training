@@ -7,5 +7,6 @@ pub mod imatrix_adapt;
 pub mod imatrix_lib;
 pub mod mixed;
 pub mod quantcheck;
+pub mod quantfit;
 pub mod runs;
 pub mod studio;

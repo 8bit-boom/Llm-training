@@ -145,6 +145,21 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error("quantcheck_failed", _explain(exc))
             return 1
+    if kind in ("quantfit", "quantfit_estimate"):
+        from . import imatrix, quantfit, quantmeasure
+        try:
+            return {"quantfit": quantfit.run, "quantfit_estimate": quantfit.run_estimate}[kind](job)
+        except (imatrix.Stopped, quantmeasure.Stopped):   # the Stop button (the STOP file): the same word as a killed worker
+            protocol.error("quantfit_stopped", "Cancelled.")
+            return 1
+        except quantfit.QuantFitError as exc:   # a plain-language failure: no traceback text (llama.cpp missing carries its own code)
+            protocol.error(_code(exc, "quantfit_failed"), str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error(_code(exc, "quantfit_failed"), str(exc) if _code(exc, "") else _explain(exc))
+            return 1
     if kind == "mixed_plan":
         from . import mixedquant
         try:

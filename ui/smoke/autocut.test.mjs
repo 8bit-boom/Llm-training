@@ -151,3 +151,26 @@ test("the thinking gate has a checkbox that is on with keep thinking, shows its 
   assert.equal(b.run("acSpec().think_gate"), false, "without keep thinking there is no gate");
   assert.doesNotMatch(card(b), /id="ac-gate"/);
 });
+
+test("an optional target size makes a measured file and compares it: the field, the words, the spec and what the plan adds", async () => {
+  const b = browser({ auto_plan: { plan: plan({ measured_minutes: [8, 13] }) }, auto_start: null });
+  open(b, {}, `ac.plan = ${JSON.stringify(plan({ measured_minutes: [8, 13] }))}`);
+  let html = card(b);
+  assert.match(html, /Also make a file of about <input type="text" id="ac-gb" value="" placeholder="10.6"[^>]*> GB \(measured mixed precision\) and compare it with the plain sizes/);
+  assert.doesNotMatch(html, /id="ac-gbnote"/); assert.doesNotMatch(html, /id="ac-gbon" checked/);
+  assert.equal(b.run("acSpec().target_gb"), undefined, "no target without the tick");
+  b.run(`ac.gbOn = true`);
+  html = card(b);
+  assert.match(html, /id="ac-gbon" checked/); assert.match(html, /id="ac-gbwhy">Give the size in GB\./);
+  assert.match(html, /Compare quants<\/strong> \(KL divergence\) checks the file against the plain sizes[^]*published only when it is clearly better/);
+  assert.match(html, /About 8 min to measure and 13 min to compare \(guesses\)\. The 16-bit file is kept until the comparison is done/);
+  assert.doesNotMatch(html, /Dynamic|UD-/i);
+  b.run("wireAuto()"); b.els["ac-gb"].value = " 10.6 "; b.els["ac-gb"].onchange();
+  assert.equal(b.run("acSpec().target_gb"), 10.6); assert.doesNotMatch(card(b), /id="ac-gbwhy"/);
+  b.run("acRefresh()"); await tick();
+  assert.equal(plain(b.calls.filter((x) => x[0] === "auto_plan").at(-1)[1].spec).target_gb, 10.6);
+  b.run("wireAuto()"); b.els["ac-go"].onclick(); await tick();
+  assert.equal(b.calls.find((x) => x[0] === "auto_start")[1].spec.target_gb, 10.6);
+  b.els["ac-gbon"].checked = false; b.run("ac.running = false"); b.run("wireAuto()"); b.els["ac-gbon"].onchange();
+  assert.equal(b.run("acSpec().target_gb"), undefined);
+});

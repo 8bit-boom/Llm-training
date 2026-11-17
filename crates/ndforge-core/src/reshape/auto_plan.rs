@@ -75,11 +75,14 @@ pub struct AutoSpec {
     /// how many of the cuts Try first liked best are checked (1 to `TRY_TOP`; default 2)
     #[serde(default = "two")]
     pub think_gate_n: u32,
+    /// also make a file of about this many GB with "Mixed: measured fit to a size" (docs/AUTO_CUT.md, "A target size"), and compare it with the plain sizes next to it; None = not
+    #[serde(default)]
+    pub target_gb: Option<f64>,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
-        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2 }
+        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -91,6 +94,11 @@ impl AutoSpec {
         }
         if !(1..=TRY_TOP as u32).contains(&self.think_gate_n) {
             return Err(Error::new(format!("The thinking check before healing looks at 1 to {TRY_TOP} cuts.")));
+        }
+        if let Some(t) = self.target_gb {
+            if !t.is_finite() || t <= 0.0 {
+                return Err(Error::new("The size of the measured file must be a number of GB above 0."));
+            }
         }
         if let Some(q) = self.quants.iter().find(|q| !crate::export::runs::QUANTS.iter().any(|(id, _)| id == q)) {
             return Err(Error::new(format!("Unknown size for the export: {q}.")));
@@ -104,6 +112,24 @@ impl AutoSpec {
         for q in &self.quants {
             if !out.contains(q) {
                 out.push(q.clone());
+            }
+        }
+        out
+    }
+
+    /// The sizes the export makes when the cut model has `final_params` parameters. Without `target_gb` this is `export_quants()`. With it: Q4_K_M, the chosen ones, the plain sizes just below and
+    /// just above the target (the comparison needs a plain file of about the same size and one above it), "mixed_measured" and "f16" (the reference of the comparison, deleted after it
+    /// unless `keep_intermediate`).
+    pub fn export_quants_for(&self, final_params: u64) -> Vec<String> {
+        let mut out = self.export_quants();
+        let Some(t) = self.target_gb else { return out };
+        let mut sizes: Vec<(f64, &str)> = ["q4_k_m", "q5_k_m", "q6_k", "q8_0"].iter().map(|q| (final_params as f64 * quant_bytes_per_param(q) / 1e9, *q)).collect();
+        sizes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let below = sizes.iter().rev().find(|(g, _)| *g <= t).map(|(_, q)| q.to_string());
+        let above = sizes.iter().find(|(g, _)| *g > t).map(|(_, q)| q.to_string());
+        for q in below.into_iter().chain(above).chain(["mixed_measured".to_string(), "f16".to_string()]) {
+            if !out.contains(&q) {
+                out.push(q);
             }
         }
         out
@@ -415,7 +441,7 @@ pub fn stage_plans(ins: &Inspect, spec: &AutoSpec, steps: &[Step], vram_gb: Opti
 }
 
 /// Bytes per parameter of a GGUF size (llama.cpp's own figures, rounded up).
-fn quant_bytes_per_param(id: &str) -> f64 {
+pub fn quant_bytes_per_param(id: &str) -> f64 {
     match id {
         "q4_k_m" => 0.61,
         "q5_k_m" => 0.71,
@@ -425,6 +451,9 @@ fn quant_bytes_per_param(id: &str) -> f64 {
         _ => 0.8,
     }
 }
+
+/// The sample file the measured fit writes next to the 16-bit GGUF (about 1 % of the weights, written once more by llama-quantize): a safe round number.
+pub const MEASURED_SAMPLE_GB: f64 = 2.0;
 
 /// One line of the disk timeline: what is on the disk after the step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -480,12 +509,19 @@ pub fn disk_plan(ins: &Inspect, stages: &[StagePlan], quants: &[String], keep_in
     let f16 = model(final_params) / bpp * 2.0;
     live += f16;
     note("export: the 16-bit GGUF".into(), live, &mut steps, &mut peak);
-    let q: f64 = quants.iter().map(|id| final_params as f64 * quant_bytes_per_param(id) / 1e9).sum();
+    // with a measured file the 16-bit GGUF stays as the reference of the comparison, and the measuring writes a small sample file
+    let measured = quants.iter().any(|q| q == "mixed_measured");
+    let q: f64 = quants.iter().filter(|id| !(measured && id.as_str() == "f16")).map(|id| final_params as f64 * quant_bytes_per_param(id) / 1e9).sum();
+    if measured {
+        live += MEASURED_SAMPLE_GB;
+        note("export: the sample file of the measured fit".into(), live, &mut steps, &mut peak);
+        live -= MEASURED_SAMPLE_GB;
+    }
     live += q;
     note("export: the sizes".into(), live, &mut steps, &mut peak);
     if !keep_intermediate {
         live -= f16;
-        note("export: the 16-bit GGUF deleted".into(), live, &mut steps, &mut peak);
+        note(if measured { "the comparison: the 16-bit GGUF deleted" } else { "export: the 16-bit GGUF deleted" }.into(), live, &mut steps, &mut peak);
     }
     let download = if ins.local { 0.0 } else if ins.source_bytes > 0 { ins.source_bytes as f64 / 1e9 } else { model(ins.total_params) };
     let (peak_gb, peak_step) = (peak.0 + download, peak.1);
@@ -532,6 +568,9 @@ pub struct AutoPlan {
     /// about how many minutes the thinking check before healing adds (None: it is off); an estimate
     #[serde(default)]
     pub think_gate_minutes: Option<f64>,
+    /// with a target size: about how many minutes measuring the fit takes and how many the comparison takes; (None: no target). Guesses.
+    #[serde(default)]
+    pub measured_minutes: Option<(f64, f64)>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -539,7 +578,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);
@@ -592,7 +631,18 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
         }
     }
     out.heal_hours = out.stages.iter().fold((0.0, 0.0), |a, s| (a.0 + s.hours.0, a.1 + s.hours.1));
-    let mut disk = disk_plan(ins, &out.stages, &spec.export_quants(), spec.keep_intermediate, free_gb);
+    let final_params = out.stages.last().map(|s| s.params).unwrap_or(ins.total_params);
+    let export = spec.export_quants_for(final_params);
+    let mut disk = disk_plan(ins, &out.stages, &export, spec.keep_intermediate, free_gb);
+    if let Some(t) = spec.target_gb {
+        let (final_b, files) = (final_params as f64 / 1e9, export.iter().filter(|q| q.as_str() != "f16").count() as f64);
+        let min_gb = final_params as f64 * 0.30 / 1e9;
+        if t < min_gb {
+            out.blockers.push(format!("{t:.1} GB is smaller than the cut model can be made at all (about {min_gb:.1} GB with 3-bit weights). Ask for more."));
+        }
+        // guesses, like the other times shown here: measuring about 0.25 minutes per billion parameters plus 2, the comparison 4 minutes plus 3 per file
+        out.measured_minutes = Some((((2.0 + 0.25 * final_b) * 10.0).round() / 10.0, 4.0 + 3.0 * files));
+    }
     if spec.keep_thinking && spec.think_gate && !out.try_list.is_empty() {
         let n = (spec.think_gate_n as usize).min(out.try_list.len());
         let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.quick)).sum();

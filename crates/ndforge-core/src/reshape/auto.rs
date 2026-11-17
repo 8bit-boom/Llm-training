@@ -5,7 +5,7 @@
 //! (`auto_fx::RealEffects`) calls the existing jobs (`reshape_inspect`, `reshape_measure`, `reshape_try`, `reshape`, the heal jobs, `think_check`, export); the tests use a
 //! stand-in that only records, so the state machine is tested on every system without a worker.
 //!
-//! Steps: plan, measure, try, then per stage cut / check_cut / heal / check_heal, then export, check_gguf, studio_publish (and, when the run ends, the report: `auto_report`).
+//! Steps: plan, measure, try, then per stage cut / check_cut / heal / check_heal, then export, check_gguf, compare_quants (only with a target size), studio_publish (and, when the run ends, the report: `auto_report`).
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +113,16 @@ pub trait Effects {
     }
     /// The GGUF files of the healed model: `{"dir", "ggufs": [{"quant", "path"}]}`.
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>>;
+    /// `export` for a run with a target size: the same, and "mixed_measured" in `quants` is made with the size `target_gb`. The default ignores the target (an effects object
+    /// that does not know it still gets "mixed_measured" in `quants`).
+    fn export_measured(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, _target_gb: f64) -> Result<Out<Value>> {
+        self.export(run, healed, family, quants, keep_thinking)
+    }
+    /// Compares the GGUF files `picks` (`[{"path", "label", "group", "matrix", "mixed"}]`) with the 16-bit file `reference` (Compare quants) and returns its results (`rows`, `promotion`,
+    /// `verdict`). The default does nothing and says so.
+    fn compare_quants(&mut self, _reference: &str, _picks: &[Value]) -> Result<Out<Value>> {
+        Ok(Out::Done(json!({"skipped": "This run cannot compare files."})))
+    }
     /// Puts the GGUF files into Unsloth Studio's share (docs/UNSLOTH_API_CONTRACT.md); `{"published": false, "why": ...}` when Studio is not set up.
     fn publish(&mut self, export: &Value, model_name: &str) -> Result<Out<Value>>;
 }
@@ -204,6 +214,9 @@ pub struct AutoState {
     /// the thinking check before healing (docs/AUTO_CUT.md): `{"order", "rows", "pending", "winner", "lost_much"}`; None for a run without it (and for one saved before it existed)
     #[serde(default)]
     pub think_gate: Option<Value>,
+    /// the comparison of the measured file with the plain sizes (a run with a target size): `{"promoted": bool, "promotion", "verdict", "rows", "skipped"}`; None for a run without it
+    #[serde(default)]
+    pub compare: Option<Value>,
 }
 
 impl AutoState {
@@ -211,7 +224,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None,
         }
     }
 
@@ -309,6 +322,9 @@ fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec
     v.push(StepRec::new("export", "Make the GGUF files"));
     if spec.keep_thinking {
         v.push(StepRec::new("check_gguf", "Thinking check of the GGUF"));
+    }
+    if spec.target_gb.is_some() {
+        v.push(StepRec::new("compare_quants", "Compare the measured file with the plain sizes"));
     }
     if spec.studio_publish {
         v.push(StepRec::new("studio_publish", "Put the files into Unsloth Studio"));
@@ -512,6 +528,7 @@ fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> 
         "think_gate" => step_think_gate(st, fx),
         "export" => step_export(st, fx),
         "check_gguf" => step_check_gguf(st, fx),
+        "compare_quants" => step_compare_quants(st, fx),
         "studio_publish" => step_publish(st, fx),
         _ => {
             let (stage, what) = id.split_once('.').ok_or_else(|| Error::new(format!("Unknown step {id}.")))?;
@@ -1054,10 +1071,75 @@ fn step_export(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     }
     let h = final_heal(st)?;
     let family = st.original.as_ref().map(|o| o.family.clone()).unwrap_or_else(|| "generic".into());
-    let quants = st.spec.export_quants();
-    let r = out!(fx.export(&st.id.clone(), &h, &family, &quants, st.keep_thinking())?);
+    let final_params = st.stages.last().map(|s| s.plan.params).unwrap_or(0);
+    let quants = st.spec.export_quants_for(final_params);
+    let run = st.id.clone();
+    let r = match st.spec.target_gb {
+        Some(t) => out!(fx.export_measured(&run, &h, &family, &quants, st.keep_thinking(), t)?),
+        None => out!(fx.export(&run, &h, &family, &quants, st.keep_thinking())?),
+    };
+    // the 16-bit GGUF a target size asked for is only the reference of the comparison: it is deleted after it (unless the person chose it or keeps the intermediate files)
+    if st.spec.target_gb.is_some() && !st.spec.quants.iter().any(|q| q == "f16") {
+        if let Some(name) = r["ggufs"].as_array().and_then(|a| a.iter().find(|g| g["quant"] == "f16")).and_then(|g| g["export"].as_str()) {
+            st.made.push(Made { kind: "export".into(), name: name.to_string(), model_id: None, stage: 0, removed: false });
+        }
+    }
     st.export = Some(r);
     Ok(Flow::Done(None))
+}
+
+/// The 16-bit file of an export, the reference of the comparison.
+fn f16_of(export: &Value) -> Option<String> {
+    export["ggufs"].as_array()?.iter().find(|g| g["quant"] == "f16").and_then(|g| g["path"].as_str()).map(String::from)
+}
+
+/// The label, group and matrix words of a file of the export, as Compare quants shows them.
+fn pick_of(g: &Value, matrix: bool) -> Value {
+    let q = g["quant"].as_str().unwrap_or("");
+    if q == "mixed_measured" {
+        return json!({"path": g["path"], "label": "Mixed: measured fit to a size", "group": "Mixed: measured fit to a size", "matrix": matrix, "mixed": "mixed_measured"});
+    }
+    let name = q.to_uppercase();
+    json!({"path": g["path"], "label": if matrix { format!("{name}, with matrix") } else { name.clone() }, "group": name, "matrix": if matches!(q, "q8_0" | "f16") { Value::Null } else { json!(matrix) }, "mixed": null})
+}
+
+/// Did the measured file beat the plain file of its size beyond the noise? (the promotion of Compare quants, read from its results)
+fn promoted_of(result: &Value) -> bool {
+    let rows = result["rows"].as_array().cloned().unwrap_or_default();
+    result["promotion"].as_array().map(|a| a.iter().any(|p| p["promoted"] == true && rows.iter().any(|r| r["id"] == p["id"] && r["mixed"] == "mixed_measured"))).unwrap_or(false)
+}
+
+fn step_compare_quants(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    if st.compare.is_some() {
+        return Ok(Flow::Skipped("already compared".into()));
+    }
+    let export = st.export.clone().ok_or_else(|| Error::new("There is nothing to compare: the export is missing."))?;
+    let reference = f16_of(&export).ok_or_else(|| Error::new("The export made no 16-bit file to compare with."))?;
+    let picks: Vec<Value> = export["ggufs"].as_array().map(|a| a.iter().filter(|g| g["quant"] != "f16").map(|g| pick_of(g, true)).collect()).unwrap_or_default();
+    // a comparison that cannot be done must not lose the files that were made: it is noted, the run goes on, and the measured file is not published
+    let res = match fx.compare_quants(&reference, &picks) {
+        Ok(Out::Done(v)) => v,
+        Ok(Out::Stopped) => return Ok(Flow::Stopped),
+        Err(e) if e.is_cancelled() => return Ok(Flow::Stopped),
+        Err(e) => json!({"skipped": format!("The comparison could not be made ({}). The measured file was made but is not published; the 16-bit file is kept so that Compare quants can be run by hand.", e.0)}),
+    };
+    let skipped = res["skipped"].as_str().map(String::from);
+    let promoted = skipped.is_none() && promoted_of(&res);
+    let verdict = res["verdict"].clone();
+    st.compare = Some(json!({"promoted": promoted, "promotion": res["promotion"], "verdict": verdict, "rows": res["rows"], "skipped": skipped, "comparison": res["entry"]["id"]}));
+    // the reference is not needed any more
+    if skipped.is_none() && !st.spec.keep_intermediate {
+        let victims: Vec<String> = st.made.iter().filter(|m| m.kind == "export" && !m.removed).map(|m| m.name.clone()).collect();
+        for n in victims {
+            remove_made(st, &n, fx)?;
+        }
+    }
+    let note = match (&skipped, promoted) {
+        (Some(s), _) => Some(s.clone()),
+        (None, true) => Some("the measured file is better than the plain file of its size: it is published".to_string()),
+        (None, false) => Some("the measured file is not better than the plain file of its size beyond the noise: it is kept but not published".to_string()),
+    };
+    Ok(Flow::Done(note))
 }
 
 /// The Q4_K_M file (or the first one) of an export.
@@ -1086,6 +1168,17 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     // the folder is named after the model and the size it was cut to, so it is never taken for the original
     let size = st.stages.last().map(|s| s.plan.params_b).unwrap_or(st.spec.target_b);
     let name = format!("{} cut to {size:.1}B", st.original.as_ref().map(|o| o.name.clone()).unwrap_or_default());
+    // the files: not the 16-bit reference of a target-size run (unless the person asked for it), and the measured file only when the comparison promoted it
+    let export = {
+        let mut e = export;
+        let (keep_f16, measured_ok) = (st.spec.quants.iter().any(|q| q == "f16"), st.compare.as_ref().is_some_and(|c| c["promoted"] == true));
+        if st.spec.target_gb.is_some() {
+            if let Some(a) = e["ggufs"].as_array_mut() {
+                a.retain(|g| (keep_f16 || g["quant"] != "f16") && (measured_ok || g["quant"] != "mixed_measured"));
+            }
+        }
+        e
+    };
     let r = out!(fx.publish(&export, &name)?);
     let note = if r["published"] == true { None } else { r["why"].as_str().map(String::from) };
     st.publish = Some(r);

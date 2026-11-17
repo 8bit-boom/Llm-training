@@ -46,7 +46,8 @@ PRESET_IDS = tuple(p["id"] for p in PRESETS)
 FIT_ID = "mixed_fit"
 FIT_LABEL = "Mixed: fit to a size (experimental)"
 FIT_BASE, FIT_EMBD, FIT_OUTPUT = "Q2_K", "Q4_K", "Q6_K"
-MIXED_IDS = PRESET_IDS + (FIT_ID,)
+MEASURED_ID = "mixed_measured"          # "Mixed: measured fit to a size" (quantfit.py)
+MIXED_IDS = PRESET_IDS + (FIT_ID, MEASURED_ID)
 # the plain sizes, as llama.cpp's own table gives them (tools/quantize/README.md, Llama-3.1-8B, bits per weight); other models differ a little
 PLAIN_BPW = {"Q2_K": 3.1593, "Q3_K_M": 3.9960, "Q4_K_M": 4.8944, "Q5_K_M": 5.7036, "Q6_K": 6.5633, "Q8_0": 8.5008}
 BASE_TYPE = {"Q2_K": "Q2_K", "Q3_K_M": "Q3_K", "Q4_K_M": "Q4_K"}      # the type a base ftype gives to a tensor no rule names (its own mixture adds some higher types)
@@ -242,16 +243,18 @@ def read_importance(path) -> dict:
 
 # ------------------------------------------------------------------------------------------------------------------ fit to a size (experimental)
 
-def _compress(assign: dict) -> list:
+def _compress(assign: dict, order=None) -> list:
     """Per-tensor assignment {name: type} -> the shortest honest rule list: one rule per (tensor role, type) naming the layers, `blk\\.(?:3|7|12)\\.attn_k\\.weight$=Q5_K`; a tensor
-    outside the blocks gets a rule of its own. Deterministic: sorted by role, then the highest type first."""
+    outside the blocks gets a rule of its own. Deterministic: sorted by role, then the highest type first. `order`: the types lowest first (default `LEVELS`; the measured fit
+    passes a longer one with Q8_0 and the legacy types, which `LEVELS.index` would not know)."""
+    order = order or LEVELS
     groups: dict = {}
     for name, t in assign.items():
         m = re.match(r"blk\.(\d+)\.(.+)$", name)
         key = (m.group(2) if m else None, name if not m else None, t)
         groups.setdefault(key, []).append(int(m.group(1)) if m else name)
     rules = []
-    for (suffix, whole, t), items in sorted(groups.items(), key=lambda kv: (kv[0][0] or "~" + (kv[0][1] or ""), -LEVELS.index(kv[0][2]))):
+    for (suffix, whole, t), items in sorted(groups.items(), key=lambda kv: (kv[0][0] or "~" + (kv[0][1] or ""), -order.index(kv[0][2]))):
         if suffix is not None:
             rules.append((r"blk\." + _alt(sorted(items)) + r"\." + suffix.replace(".", r"\.") + "$", t))
         else:

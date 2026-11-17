@@ -1,7 +1,9 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
 Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
-mixed_fit (optional {"target_gb", "matrix": a matrix file}: the target of the size "mixed_fit", see mixedquant.py), keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
+mixed_fit (optional {"target_gb", "matrix": a matrix file}: the target of the size "mixed_fit", see mixedquant.py),
+mixed_measured (optional {"target_gb", "matrix": a matrix file | null (then the export's own matrix), "floor", "ceiling", "sample_rows", "engine": "auto" | "llama" | "reference", "cache_dir"}: the target
+of the size "mixed_measured", see quantfit.py; the entry of `mixed` in the result gains `measured` {"engine", "sample_rows", "predicted", "simulated", "fits", "measure_key"}), keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
 imatrix (optional: the importance matrix for the sizes below q8_0, see imatrix.py. It is measured with llama.cpp's llama-imatrix; the GGUF is then made by Unsloth (its
 save_pretrained_gguf(imatrix_file=...)) when the installed build can apply a matrix, else the llama.cpp way. Result: `imatrix` with made / reused / applied / not_applied / notes / file / nextn / via;
 and `via` ("unsloth" | "llama.cpp") for the GGUF step of every export)."""
@@ -174,12 +176,34 @@ def merge_hf(cfg, merged: Path):
     patch_template_dir(merged, cfg["base"]["family"], thinking_default_of(cfg))
 
 
+def _measured_info(cfg, quantize, f16: Path, final: Path, own_matrix, im):
+    """The plan of the size "mixed_measured" (quantfit.for_export). When the measured fit cannot be done (no readable matrix of this model, an unreadable file, no target) the guessed fit
+    "mixed_fit" is used instead (it falls back to a preset itself), and a note says so: an export never stops after the merge for this."""
+    from . import ggufrows, quantfit, quantmeasure
+    mc = cfg.get("mixed_measured") or {}
+    try:
+        return quantfit.for_export(f16, own_matrix, mc, quantize, im, final.parent)
+    except (quantfit.QuantFitError, quantmeasure.MeasureError, ggufrows.SourceError, quantfit.PlanError) as exc:
+        protocol.log(f"The measured fit could not be done: {exc}")
+        info = mixedquant.for_export(mixedquant.FIT_ID, f16, {"target_gb": mc.get("target_gb")}, mc.get("matrix") or own_matrix)
+        info = dict(info)
+        info["notes"] = [f"The measured fit to a size could not be done ({exc}) The guessed fit was used instead, or a preset when that was not possible either."] + list(info["notes"])
+        return info
+
+
 def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, report, im, mixed_report: dict):
     """One mixed-precision size ("Mixed precision (our own recipe)", mixedquant.py): llama-quantize with the preset's base type, `--output-tensor-type`, `--token-embedding-type`
     and its ordered `--tensor-type REGEX=TYPE` rules, with the importance matrix when there is one (and once more without it when llama-quantize refuses it, as for the other sizes)."""
     fit_cfg = cfg.get("mixed_fit") or {}
+    report = report if report is not None else new_report()          # without an importance-matrix block there is no report: a throw-away one keeps the code below simple
+    own = str(matrix) if matrix is not None else None
     try:
-        info = mixedquant.for_export(quant, f16, fit_cfg, fit_cfg.get("matrix") or (str(matrix) if matrix is not None else None))
+        if quant == mixedquant.MEASURED_ID:
+            info = _measured_info(cfg, quantize, f16, final, own, im)
+            if matrix is None and info.get("matrix"):
+                matrix = info["matrix"]          # a saved matrix chosen for the measurement is also given to llama-quantize
+        else:
+            info = mixedquant.for_export(quant, f16, fit_cfg, fit_cfg.get("matrix") or own)
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"The 16-bit GGUF could not be read to plan the mixed-precision size ({exc}).")
     for n in info["notes"]:
@@ -201,6 +225,8 @@ def _make_mixed(cfg, quantize, f16: Path, final: Path, quant: str, matrix, repor
     mixed_report[quant] = {"id": info["id"], "requested": quant, "label": info["label"], "recipe": mixedquant.LABEL, "base": info["base"], "embd": info["embd"], "output": info["output"], "rules": info["rules"],
                            "estimate": {k: info["estimate"][k] for k in ("bytes", "gb", "bpw", "unmatched", "dead_rules")}, "notes": info["notes"], "fit": info.get("fit"), "matrix_used": used,
                            "actual_bytes": final.stat().st_size if final.is_file() else None}
+    if info.get("measured"):
+        mixed_report[quant]["measured"] = info["measured"]
 
 
 def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = None, mixed_report: dict = None) -> dict:

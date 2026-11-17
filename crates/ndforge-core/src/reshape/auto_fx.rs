@@ -11,7 +11,7 @@ use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{self, HealSpec, TrySpec};
 use super::thinkcheck::{self, ThinkSpec};
 use crate::error::{Error, Result};
-use crate::export::runs::ImatrixOptions;
+use crate::export::runs::{ImatrixOptions, MixedMeasured, MixedOptions};
 use crate::project::Project;
 use crate::train::catalog;
 
@@ -30,6 +30,30 @@ pub struct RealEffects<'a> {
 impl<'a> RealEffects<'a> {
     pub fn new(p: &'a Project, stop: Arc<AtomicBool>, vram_gb: Option<f64>, on_event: &'a mut dyn FnMut(Value)) -> Self {
         RealEffects { p, stop, vram_gb, on_event, step: "plan".into() }
+    }
+
+    /// The export of the healed model with the options of the mixed sizes.
+    #[allow(clippy::too_many_arguments)]
+    fn export_with(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, mixed: &MixedOptions) -> Result<Out<Value>> {
+        let stop = self.stop.clone();
+        let mut events = Vec::new();
+        let dir = std::path::PathBuf::from(&healed.dir);
+        // the matrix for the small sizes is measured on the finished model, on text that looks like what it will be asked: with thinking when it keeps thinking (docs/IMATRIX.md)
+        let imatrix = ImatrixOptions { enabled: true, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
+        let r = crate::export::runs::execute_model_folder_full(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, mixed, &stop, &mut |e| events.push(e));
+        for e in events {
+            self.forward(e);
+        }
+        if self.stop.load(Ordering::SeqCst) && r.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
+            return Ok(Out::Stopped);
+        }
+        let metas = r?;
+        let exports = crate::export::runs::exports_dir(self.p);
+        let ggufs: Vec<Value> = metas.iter().filter_map(|m| {
+            let (q, f, n) = (m["quant"].as_str()?, m["gguf_file"].as_str()?, m["name"].as_str()?);
+            Some(json!({"quant": q, "path": exports.join(n).join(f), "export": n, "size_gb": std::fs::metadata(exports.join(n).join(f)).map(|x| (x.len() as f64 / 1e8).round() / 10.0).ok()}))
+        }).collect();
+        Ok(Out::Done(json!({"dir": exports, "hf_dir": healed.dir, "ggufs": ggufs, "exports": metas.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()})))
     }
 
     /// A worker event as the window gets it: the same events as on the Slim page, tagged with the step of the run.
@@ -173,6 +197,18 @@ impl Effects for RealEffects<'_> {
         match what.kind.as_str() {
             "cut" => runs::remove_cut(self.p, &what.name),
             "healed" => runs::remove_keeping_teacher_cache(self.p, &what.name),
+            // the 16-bit GGUF kept as the reference of a comparison: its export folder (only ever one this run made, only under exports/)
+            "export" => {
+                let n = what.name.as_str();
+                if n.is_empty() || n.contains(['/', '\\']) || n.contains("..") {
+                    return Err(Error::new("That is not the name of an export."));
+                }
+                let dir = crate::export::runs::exports_dir(self.p).join(n);
+                if dir.is_dir() {
+                    std::fs::remove_dir_all(&dir)?;
+                }
+                Ok(())
+            }
             other => Err(Error::new(format!("Auto-cut did not make a {other}."))),
         }
     }
@@ -183,25 +219,32 @@ impl Effects for RealEffects<'_> {
     }
 
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {
+        self.export_with(run, healed, family, quants, keep_thinking, &MixedOptions::default())
+    }
+
+    fn export_measured(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, target_gb: f64) -> Result<Out<Value>> {
+        // the matrix of the export (measured on the healed model, with its thinking text) decides; no saved one is chosen
+        let mixed = MixedOptions { measured: Some(MixedMeasured { target_gb, ..Default::default() }), ..Default::default() };
+        self.export_with(run, healed, family, quants, keep_thinking, &mixed)
+    }
+
+    fn compare_quants(&mut self, reference: &str, picks: &[Value]) -> Result<Out<Value>> {
+        use crate::export::quantcheck::{self, CompareSpec, QuantPick, ReferenceSpec, TextSpec};
+        // the model the files were made from names the chat template (its folder is the `base_repo` in the meta of the 16-bit export next to the reference file)
+        let meta = std::path::Path::new(reference).parent().map(|d| d.join("meta.json")).and_then(|f| crate::export::runs::read_json(&f)).unwrap_or(Value::Null);
+        let tokenizer = meta["base_repo"].as_str().map(String::from);
+        // the text: the saved data of the project when there is any, else general text with the fixed seed (docs/QUANT_COMPARE.md)
+        let kind = if self.has_training_data() { "data" } else { "general" };
+        let text = TextSpec { kind: kind.into(), tokenizer, ..Default::default() };
+        let quants: Vec<QuantPick> = picks.iter().filter_map(|p| serde_json::from_value(p.clone()).ok()).collect();
+        let spec = CompareSpec { reference: ReferenceSpec { kind: "file".into(), file: Some(reference.to_string()), source: None }, quants, text, ..Default::default() };
         let stop = self.stop.clone();
         let mut events = Vec::new();
-        let dir = std::path::PathBuf::from(&healed.dir);
-        // the matrix for the small sizes is measured on the finished model, on text that looks like what it will be asked: with thinking when it keeps thinking (docs/IMATRIX.md)
-        let imatrix = ImatrixOptions { enabled: true, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
-        let r = crate::export::runs::execute_model_folder(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, &stop, &mut |e| events.push(e));
+        let r = quantcheck::compare(self.p, &spec, &stop, &mut |e| events.push(e));
         for e in events {
             self.forward(e);
         }
-        if self.stop.load(Ordering::SeqCst) && r.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
-            return Ok(Out::Stopped);
-        }
-        let metas = r?;
-        let exports = crate::export::runs::exports_dir(self.p);
-        let ggufs: Vec<Value> = metas.iter().filter_map(|m| {
-            let (q, f, n) = (m["quant"].as_str()?, m["gguf_file"].as_str()?, m["name"].as_str()?);
-            Some(json!({"quant": q, "path": exports.join(n).join(f), "export": n, "size_gb": std::fs::metadata(exports.join(n).join(f)).map(|x| (x.len() as f64 / 1e8).round() / 10.0).ok()}))
-        }).collect();
-        Ok(Out::Done(json!({"dir": exports, "hf_dir": healed.dir, "ggufs": ggufs, "exports": metas.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()})))
+        done(r, Ok)
     }
 
     fn publish(&mut self, export: &Value, model_name: &str) -> Result<Out<Value>> {

@@ -29,7 +29,8 @@ def type_name(t: int) -> str:
 
 
 def read(path) -> dict:
-    """{"version", "meta": {key: value}, "tensors": [{"name", "dims", "type", "offset"}], "data_start": int}. An array value is None and its length is under
+    """{"version", "meta": {key: value}, "tensors": [{"name", "dims", "type", "offset"}], "data_start": int, "kv_end": int (where the key-value section ends: the bytes
+    [24:kv_end] are the section), "alignment": int}. An array value is None and its length is under
     `<key>#len`; an array of strings with at most 64 entries (an importance matrix's `imatrix.datasets`) also has them under `<key>#items`. `offset` is relative to `data_start`. Raises ValueError when the file is not a readable GGUF (not one, version below 2, truncated, absurd sizes)."""
     try:
         with open(path, "rb") as fh:
@@ -85,6 +86,7 @@ def read(path) -> dict:
                         meta[key + "#items"] = v[2]
                     v = None
                 meta[key] = v
+            kv_end = fh.tell()
             tensors = []
             for _ in range(n_tensors):
                 name = string()
@@ -97,7 +99,7 @@ def read(path) -> dict:
             align = meta.get("general.alignment")
             align = align if isinstance(align, int) and align > 0 else 32
             pos = fh.tell()
-            return {"version": version, "meta": meta, "tensors": tensors, "data_start": (pos + align - 1) // align * align}
+            return {"version": version, "meta": meta, "tensors": tensors, "data_start": (pos + align - 1) // align * align, "kv_end": kv_end, "alignment": align}
     except struct.error as exc:
         raise ValueError(str(exc))
 
