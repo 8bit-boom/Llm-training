@@ -10,7 +10,7 @@ use crate::settings::Settings;
 use crate::train::runs::list_runs;
 
 fn tidy(text: &str) -> String {
-    let text = crate::unsloth::client::scrub(text);
+    let text = crate::secrets::redact(text);
     let text = text.as_str();
     match dirs::home_dir().map(|h| h.to_string_lossy().to_string()).filter(|h| h.len() > 1) {
         Some(h) => text.replace(&h, "~"),

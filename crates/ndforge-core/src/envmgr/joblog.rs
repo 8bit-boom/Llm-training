@@ -28,7 +28,7 @@ pub struct JobLog {
 }
 
 fn clean(text: &str) -> String {
-    crate::unsloth::client::scrub(text)
+    crate::secrets::redact(text)
 }
 
 impl JobLog {
