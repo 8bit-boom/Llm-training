@@ -79,13 +79,13 @@ fn remove_world(s: State<App>, slug: String) -> Out<Value> {
     Ok(m.state())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_bundle(s: State<App>, path: String) -> Out<Value> {
     lock(&s).check_bundle(&path).map_err(|e| e.to_string())
 }
 
 /// Returns {"changes": text, "state": ...}
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_bundle(s: State<App>, path: String) -> Out<Value> {
     let mut m = lock(&s);
     let changes = m.apply_bundle(&path).map_err(|e| e.to_string())?;
@@ -99,19 +99,24 @@ fn set_setting(s: State<App>, key: String, value: bool) -> Out<Value> {
     Ok(m.state())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dataset_state(s: State<App>) -> Out<Value> {
     lock(&s).dataset_state().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dataset_generate(s: State<App>, recipe: Value) -> Out<Value> {
     lock(&s).dataset_generate(recipe).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn problem_report(s: State<App>) -> String {
-    lock(&s).problem_report()
+#[tauri::command(async)]
+fn problem_report(s: State<App>) -> Out<String> {
+    // the report asks the machine (nvidia-smi ...): the model is not locked meanwhile
+    let (project, settings) = {
+        let m = lock(&s);
+        (m.project.clone(), m.settings.clone())
+    };
+    Ok(ndforge_core::diagnose::report(project.as_ref(), &settings))
 }
 
 /// Looks a Hugging Face model up (a network call, so off the window's thread).
@@ -126,7 +131,7 @@ async fn model_add(input: String) -> Out<String> {
     tauri::async_runtime::spawn_blocking(move || AppModel::custom_model_add(&input).map_err(|e| e.to_string())).await.map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn model_remove(id: String) -> Out<()> {
     AppModel::custom_model_remove(&id).map_err(|e| e.to_string())
 }
@@ -175,12 +180,12 @@ fn hf_token_clear(s: State<App>) -> Out<Value> {
     lock(&s).hf_token_clear().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn test_state(s: State<App>) -> Out<Value> {
     lock(&s).test_state().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn test_result(s: State<App>, run: String) -> Out<Value> {
     lock(&s).test_result(&run).map_err(|e| e.to_string())
 }
@@ -249,7 +254,7 @@ fn teacher_clear(s: State<App>, kind: Option<String>, forget_cache: bool) -> Out
     lock(&s).teacher_clear(kind.as_deref(), forget_cache).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dataset_examples(s: State<App>, filter: Value, offset: usize, limit: usize) -> Out<Value> {
     lock(&s).dataset_examples(&filter, offset, limit).map_err(|e| e.to_string())
 }
@@ -270,14 +275,14 @@ fn dataset_edit(s: State<App>, id: String, text: String) -> Out<()> {
 }
 
 /// Writes a saved data version as JSONL files for Unsloth Studio's Train page into `dest` (default: the project's exports folder). Returns the summary.
-#[tauri::command]
+#[tauri::command(async)]
 fn studio_export(s: State<App>, version: Option<u32>, dest: Option<String>, world_book: bool) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     let dest = dest.map(std::path::PathBuf::from).unwrap_or_else(|| ndforge_core::export::studio::default_dest(&project));
     ndforge_core::export::studio::export(&project, version, &dest, world_book).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dataset_save(s: State<App>) -> Out<Value> {
     lock(&s).dataset_save().map_err(|e| e.to_string())
 }
@@ -313,18 +318,18 @@ fn bench_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model:
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn bench_last(s: State<App>, model: String, method: String) -> Out<Value> {
     let (method, _) = parse_choice(&method, "quick")?;
     lock(&s).bench_last(&model, method).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn train_state(s: State<App>, server: Option<String>) -> Out<Value> {
     lock(&s).train_state(server.as_deref()).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn train_plan(s: State<App>, model: String, method: String, preset: String, server: Option<String>, stages: Option<String>) -> Out<Value> {
     let (method, preset) = parse_choice(&method, &preset)?;
     lock(&s).train_plan(&model, method, preset, server.as_deref(), stages.as_deref()).map_err(|e| e.to_string())
@@ -407,12 +412,12 @@ fn train_stop(tasks: State<Tasks>) {
     tasks.cancel.store(true, Ordering::SeqCst);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn train_metrics(s: State<App>, run: String) -> Out<Value> {
     lock(&s).train_metrics(&run).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_state(s: State<App>) -> Out<Value> {
     lock(&s).export_state().map_err(|e| e.to_string())
 }
@@ -431,7 +436,7 @@ fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: 
 
 /// The mixed-precision plan (docs/MIXED_QUANTS.md): every recipe's rules and estimated size from the tensor shapes of `gguf` (any GGUF of the model), and the "Fit to a size"
 /// proposal when `target_gb` and a saved matrix (`matrix`, a library id) are given.
-#[tauri::command]
+#[tauri::command(async)]
 fn mixed_plan(s: State<App>, gguf: String, target_gb: Option<f64>, matrix: Option<String>) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::mixed::plan(&project, &gguf, target_gb, matrix.as_deref()).map_err(|e| e.to_string())
@@ -440,7 +445,7 @@ fn mixed_plan(s: State<App>, gguf: String, target_gb: Option<f64>, matrix: Optio
 // ------------------------------------------------------------------------------------------------ the matrix library (docs/IMATRIX.md)
 
 /// What the "Importance matrices" card shows: the library, the choices for a new matrix, time guesses, the general-text chooser.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_list(s: State<App>) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     Ok(ndforge_core::export::imatrix_lib::state(&project))
@@ -460,7 +465,7 @@ fn imatrix_stop(tasks: State<Tasks>) {
 }
 
 /// Adds a matrix file from this computer (`file`: .gguf or .dat) or the matrix saved next to an earlier export (`export`) to the library. Returns {"added": entry, "state": ...}.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_import(s: State<App>, file: Option<String>, export: Option<String>, label: Option<String>) -> Out<Value> {
     use ndforge_core::export::imatrix_lib as lib;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
@@ -474,7 +479,7 @@ fn imatrix_import(s: State<App>, file: Option<String>, export: Option<String>, l
 }
 
 /// "Save a copy...": the files of an entry in a new numbered folder inside `dest`. Returns the new folder.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_save_copy(s: State<App>, id: String, dest: String) -> Out<String> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::imatrix_lib::save_copy(&project, &id, std::path::Path::new(dest.trim()), &ndforge_core::export::imatrix_lib::free_bytes).map(|p| p.display().to_string()).map_err(|e| e.to_string())
@@ -495,7 +500,7 @@ fn imatrix_make_dat(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, i
 }
 
 /// Deletes an entry (refused while a job uses it). Returns the new state of the card.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_delete(s: State<App>, id: String) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::imatrix_lib::delete(&project, &id).map_err(|e| e.to_string())?;
@@ -512,7 +517,7 @@ fn imatrix_merge(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec
 }
 
 /// Looks up Unsloth's published matrix for a base model on the Hub (its repo, file and size; nothing is downloaded).
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_published(s: State<App>, base: String) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::imatrix_lib::published_info(&project, &base).map_err(|e| e.to_string())
@@ -520,7 +525,7 @@ fn imatrix_published(s: State<App>, base: String) -> Out<Value> {
 
 /// "Adapt to my cut model": the numbers before anything is made (layers kept, ffn_down before and after, the size), or the plain reason this model / matrix cannot be used.
 /// `spec` is {"source": {"kind": "library"|"file"|"published", "id"|"file"|"base"}, "model": a made model's name, "weight", "label", "kept_layers", "source_size"}.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_adapt_preview(s: State<App>, spec: Value) -> Out<Value> {
     let spec: ndforge_core::export::imatrix_adapt::AdaptSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
@@ -536,7 +541,7 @@ fn imatrix_adapt(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec
 }
 
 /// The light check before an export: does this matrix seem to fit the model of `run`? {"warnings": [...], ...}; never a refusal.
-#[tauri::command]
+#[tauri::command(async)]
 fn imatrix_check(s: State<App>, id: String, run: Option<String>) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::imatrix_lib::check(&project, &id, run.as_deref()).map_err(|e| e.to_string())
@@ -545,14 +550,14 @@ fn imatrix_check(s: State<App>, id: String, run: Option<String>) -> Out<Value> {
 // ------------------------------------------------------------------------------------------------ compare quants (docs/QUANT_COMPARE.md)
 
 /// What the "Compare quants" card shows: the saved comparisons, the files of the exports, the runs and models, the disk.
-#[tauri::command]
+#[tauri::command(async)]
 fn quantcheck_state(s: State<App>) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     Ok(ndforge_core::export::quantcheck::state(&project))
 }
 
 /// The disk need of the 16-bit model's answers for every amount of text, before anything runs (the worker reads the vocabulary from the reference).
-#[tauri::command]
+#[tauri::command(async)]
 fn quantcheck_plan(s: State<App>, reference: Option<String>) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::quantcheck::plan(&project, reference.as_deref()).map_err(|e| e.to_string())
@@ -572,14 +577,14 @@ fn quantcheck_stop(tasks: State<Tasks>) {
 }
 
 /// One saved comparison (the table, the line, the words).
-#[tauri::command]
+#[tauri::command(async)]
 fn quantcheck_get(s: State<App>, id: String) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::quantcheck::get(&project, &id).map(|(_, r)| r).map_err(|e| e.to_string())
 }
 
 /// Deletes a comparison (refused while it runs). Returns the new state of the card.
-#[tauri::command]
+#[tauri::command(async)]
 fn quantcheck_delete(s: State<App>, id: String) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::quantcheck::delete(&project, &id).map_err(|e| e.to_string())?;
@@ -587,7 +592,7 @@ fn quantcheck_delete(s: State<App>, id: String) -> Out<Value> {
 }
 
 /// Deletes only the big file of the 16-bit model's answers of a comparison. Returns the new state of the card.
-#[tauri::command]
+#[tauri::command(async)]
 fn quantcheck_delete_logits(s: State<App>, id: String) -> Out<Value> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::quantcheck::delete_logits(&project, &id).map_err(|e| e.to_string())?;
@@ -595,7 +600,7 @@ fn quantcheck_delete_logits(s: State<App>, id: String) -> Out<Value> {
 }
 
 /// Copies a run's LoRA add-on (with a README on how to load and merge it) into a folder the user chose. Returns the new folder.
-#[tauri::command]
+#[tauri::command(async)]
 fn copy_adapter(s: State<App>, run: String, dest: String) -> Out<String> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::export::runs::copy_adapter(&project, &run, std::path::Path::new(&dest)).map(|p| p.display().to_string()).map_err(|e| e.to_string())
@@ -649,7 +654,7 @@ fn ollama_server_remove(s: State<App>, url: String) -> Out<Value> {
     m.export_state().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn retrain_info(s: State<App>) -> Out<Value> {
     lock(&s).retrain_info().map_err(|e| e.to_string())
 }
@@ -796,19 +801,19 @@ fn help(key: String) -> String {
     help_html(&key)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn env_status() -> Value {
     ndforge_core::envmgr::tasks::status()
 }
 
 /// The memory of this computer's first graphics card in GB (None when there is none or it cannot be read).
 fn card_vram_gb() -> Option<f64> {
-    ndforge_core::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb()))
+    ndforge_core::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb()))
 }
 
 // ------------------------------------------------------------------------------------------------ slim or grow a model
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reshape_state(s: State<App>) -> Out<Value> {
     lock(&s).reshape_state().map_err(|e| e.to_string())
 }
@@ -823,7 +828,7 @@ async fn reshape_options(s: State<'_, App>, model: String, mode: String, shape: 
 }
 
 /// What an earlier measurement of a model on the saved data looks like (is there one to reuse?).
-#[tauri::command]
+#[tauri::command(async)]
 fn reshape_measurement(s: State<App>, model: String, samples: u32, len: u32, load: String) -> Out<Value> {
     let m = ndforge_core::train::catalog::find(&model).ok_or("That model is not in the list any more.")?;
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
@@ -863,7 +868,7 @@ async fn reshape_try_plan(s: State<'_, App>, spec: Value) -> Out<Value> {
 }
 
 /// The answers kept by earlier tries of this model on the saved data with these settings.
-#[tauri::command]
+#[tauri::command(async)]
 fn reshape_try_results(s: State<App>, model: String, samples: u32, len: u32, load: String) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::reshape::runs::try_results(&p, &model, samples, len, &load).map_err(|e| e.to_string())
@@ -895,7 +900,7 @@ fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
 }
 
 /// The thinking check (docs/THINKING_CHECK.md): what the result page shows for a made model (saved numbers of every model checked, the gates, the GGUF files of the exports).
-#[tauri::command]
+#[tauri::command(async)]
 fn think_check_results(s: State<App>, name: String) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::reshape::thinkcheck::results(&p, &name).map_err(|e| e.to_string())
@@ -942,7 +947,7 @@ fn think_check_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
 // ------------------------------------------------------------------------------------------------ Auto-cut (docs/AUTO_CUT.md)
 
 /// The plan of an Auto-cut for the model the Slim page shows (`inspect` is its `reshape_options` answer's `inspect`): sizes, stages, card, disk, blockers. Runs no job.
-#[tauri::command]
+#[tauri::command(async)]
 fn auto_plan(s: State<App>, spec: Value, inspect: Value) -> Out<Value> {
     let spec: ndforge_core::reshape::auto_plan::AutoSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let ins: ndforge_core::reshape::plan::Inspect = serde_json::from_value(inspect).map_err(|e| format!("The model's description is not valid: {e}"))?;
@@ -996,7 +1001,7 @@ fn auto_stop(tasks: State<Tasks>) {
 }
 
 /// The newest run (its whole state: steps, stages, checks) and whether a job is running. A run that was still "running" when the program closed is marked stopped first.
-#[tauri::command]
+#[tauri::command(async)]
 fn auto_status(s: State<App>, tasks: State<Tasks>) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     let running = tasks.busy.load(Ordering::SeqCst);
@@ -1008,14 +1013,14 @@ fn auto_status(s: State<App>, tasks: State<Tasks>) -> Out<Value> {
 }
 
 /// The report of a run (the newest when `run` is null): data and Markdown.
-#[tauri::command]
+#[tauri::command(async)]
 fn auto_report(s: State<App>, run: Option<String>) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::reshape::auto::report_of(&p, run.as_deref()).map_err(|e| e.to_string())
 }
 
 /// Saves the Studio share (where Auto-cut puts the GGUF files). Nothing here is a secret.
-#[tauri::command]
+#[tauri::command(async)]
 fn studio_share_set(s: State<App>, share: Value) -> Out<Value> {
     let sh: ndforge_core::settings::StudioShare = serde_json::from_value(share).map_err(|e| format!("The choice is not valid: {e}"))?;
     let mut m = lock(&s);
@@ -1048,14 +1053,14 @@ async fn studio_share_check(s: State<'_, App>, share: Value) -> Out<Value> {
 }
 
 /// What the Heal card shows: how healing would run on this card, the budgets and where it stands.
-#[tauri::command]
+#[tauri::command(async)]
 fn heal_options(s: State<App>, name: String) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::reshape::runs::heal_options(&p, &name, card_vram_gb()).map_err(|e| e.to_string())
 }
 
 /// The live memory estimate of the Heal card for the settings chosen so far.
-#[tauri::command]
+#[tauri::command(async)]
 fn heal_estimate(s: State<App>, name: String, spec: Value) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
@@ -1106,7 +1111,7 @@ fn heal_teacher_of(v: Value) -> Result<Option<ndforge_core::reshape::heal_source
 }
 
 /// What the pickers of the Heal section offer: the made models, the model list's folders and Hugging Face ids, and the earlier heals of other models.
-#[tauri::command]
+#[tauri::command(async)]
 fn heal_candidates(s: State<App>) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     Ok(ndforge_core::reshape::heal_source::heal_candidates(&p))
@@ -1242,7 +1247,7 @@ fn reshape_test(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name:
 }
 
 /// Deletes a made model (refused while a run was trained on it). Returns the page state.
-#[tauri::command]
+#[tauri::command(async)]
 fn reshape_remove(s: State<App>, name: String) -> Out<Value> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
     ndforge_core::reshape::runs::remove(&p, &name).map_err(|e| e.to_string())?;      // deleting tens of GB: not while the lock is held
@@ -1289,13 +1294,13 @@ fn env_cancel(tasks: State<Tasks>) {
 
 // ------------------------------------------------------------------------------------------------------------------ llama.cpp (docs/LLAMA_CPP_INSTALL.md)
 
-#[tauri::command]
+#[tauri::command(async)]
 fn llamacpp_status() -> Value {
     ndforge_core::envmgr::llamacpp::status(&ndforge_core::envmgr::llamacpp::Config::from_env())
 }
 
 /// What an install would download (backend, files, size), for the confirmation: nothing is downloaded or changed.
-#[tauri::command]
+#[tauri::command(async)]
 fn llamacpp_plan(backend: Option<String>, tag: Option<String>) -> Out<Value> {
     use ndforge_core::envmgr::llamacpp as lc;
     let opts = lc::Options { want: lc::choose::Want::parse(backend.as_deref().unwrap_or("auto")), tag: tag.filter(|t| !t.trim().is_empty()) };
@@ -1330,7 +1335,7 @@ fn llamacpp_remove(tasks: State<Tasks>) -> Out<Value> {
 }
 
 /// A hint only: is there a newer llama.cpp release than the installed one? Installs nothing.
-#[tauri::command]
+#[tauri::command(async)]
 fn llamacpp_check_update() -> Out<Value> {
     ndforge_core::envmgr::llamacpp::check_update(&ndforge_core::envmgr::llamacpp::Config::from_env()).map_err(|f| f.message)
 }

@@ -309,3 +309,14 @@ fn setup_without_unsloth_installs_only_the_standard_libraries_and_never_fails_on
     assert_eq!(env_engine(&plan3.env_dir).as_deref(), Some("unsloth"));
     assert_eq!(env_engine(&d.path().join("nowhere")), None);
 }
+
+#[test]
+fn the_graphics_card_is_asked_once_a_minute_not_once_per_page() {
+    use ndforge_core::envmgr::gpu::detect_gpus_cached;
+    let first = detect_gpus_cached();
+    let t0 = std::time::Instant::now();
+    for _ in 0..200 {
+        assert_eq!(detect_gpus_cached(), first, "the remembered answer is the same one");
+    }
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "no program is started for the remembered answer");
+}

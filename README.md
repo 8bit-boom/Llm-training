@@ -181,6 +181,8 @@ An export first works out the disk it needs at one moment (the merged 16-bit mod
 
 Training and healing check a checkpoint before they continue from it (`worker/ndforge_worker/ckpt.py`): the state file must parse and the weights and optimizer files must not be empty. A checkpoint cut short by a crash is renamed `checkpoint-<step>.broken` (kept, never used) and the run continues from the one before it, or from the start when there is none.
 
+The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
+
 ## Job logs
 
 Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).

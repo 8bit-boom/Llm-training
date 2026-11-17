@@ -237,7 +237,7 @@ impl AppModel {
     /// Everything the Train page shows: the six models with fit marks for this card, the newest saved data version, the runs.
     pub fn train_state(&self, server: Option<&str>) -> Result<Value> {
         let p = self.project_ref()?;
-        let gpus = crate::envmgr::gpu::detect_gpus();
+        let gpus = crate::envmgr::gpu::detect_gpus_cached();
         let gpu = gpus.as_ref().ok().and_then(|g| g.first().cloned());
         // the card the plan is for: this PC's, or the chosen server's as last reported
         let server_gpu = server.and_then(|u| self.remote_status.get(u)).and_then(|st| st["gpu"].as_object().cloned());
@@ -330,7 +330,7 @@ impl AppModel {
         let m = find(model_id).ok_or_else(|| Error::new("Unknown model."))?;
         let vram = match server {
             Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
-            None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+            None => crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
         };
         let stats = runs::latest_version(p).map(|(_, mf)| runs::data_stats(&mf)).unwrap_or_default();
         let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
@@ -383,11 +383,11 @@ impl AppModel {
             let try_anyway = overrides["try_anyway"] == true;
             let bf16 = match server {
                 Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["precision"].as_str()).map(|p| p == "bf16"),
-                None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.precision() == crate::envmgr::gpu::Precision::Bf16)),
+                None => crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.precision() == crate::envmgr::gpu::Precision::Bf16)),
             };
             let vram_for_check = match server {
                 Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
-                None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+                None => crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
             };
             let mut why = full_blockers(&m, vram_for_check, bf16, server.is_some());
             if try_anyway {
@@ -404,7 +404,7 @@ impl AppModel {
         }
         let vram = match server {
             Some(u) => self.remote_status.get(u).and_then(|st| st["gpu"]["vram_gb"].as_f64()),
-            None => crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
+            None => crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())),
         };
         let measured = if server.is_some() { None } else { runs::load_measured(&m.id, method) };
         let pl = plan(&m, method, preset, vram, runs::data_stats(&manifest), measured);
@@ -428,7 +428,7 @@ impl AppModel {
     /// Everything the Slim or grow page shows before a model is chosen: the model list, what was made, and what this PC has.
     pub fn reshape_state(&self) -> Result<Value> {
         let p = self.project_ref()?;
-        let gpu = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().cloned());
+        let gpu = crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().cloned());
         Ok(json!({
             "models": models().iter().map(|m| json!({"id": m.id, "name": m.name, "family": m.family, "params_b": m.params_b, "custom": m.custom, "reshape": m.reshape, "derived_from": m.derived_from})).collect::<Vec<_>>(),
             "made": crate::reshape::runs::list(p),
@@ -470,7 +470,7 @@ impl AppModel {
             "both" => plan::Shape::Both,
             other => return Err(Error::new(format!("Unknown way of slimming: {other}"))),
         };
-        let gpu = crate::envmgr::gpu::detect_gpus().ok().and_then(|g| g.first().cloned());
+        let gpu = crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().cloned());
         let vram = gpu.as_ref().map(|g| g.vram_gb());
         let ins = rruns::inspect(&m, &AtomicBool::new(false), &mut |_| {})?;
         let options = plan::options(&ins, mode, vram);
