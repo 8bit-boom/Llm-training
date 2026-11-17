@@ -30,9 +30,9 @@ test("the text names the clock times of the range, or one time when there is no 
   const b = makeBrowser();
   const at = new Date(2026, 0, 1, 12, 0, 0).getTime();
   const text = (steps, eta) => b.ctx.acEtaText(run(steps), eta, at);
-  assert.equal(text([step("export", "pending")]), "done around 12:30");
-  assert.equal(text([step("s1.heal", "pending"), step("export", "pending")]), "done around 14:30–16:30");
-  assert.equal(text([step("s1.heal", "running")], { s: 3600, step: "s1.heal", at }), "done around 13:00");
+  assert.equal(text([step("export", "pending")]), "about 30 min left (done around 12:30)");
+  assert.equal(text([step("s1.heal", "pending"), step("export", "pending")]), "about 2 h 30 min to 4 h 30 min left (done around 14:30–16:30)");
+  assert.equal(text([step("s1.heal", "running")], { s: 3600, step: "s1.heal", at }), "about 1 h left (done around 13:00)");
   assert.equal(text([]), "");
 });
 
@@ -41,18 +41,31 @@ test("a finish time on another calendar day says so (local dates, not 24 hours)"
   const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const text = (now, lo, hi) => b.ctx.acEtaText({ status: "running", steps: [step("s1.heal", "pending")], plan: { stages: [{ hours: [lo, hi] }] } }, null, now);
   const noon = new Date(2026, 0, 1, 12, 0, 0).getTime();
-  assert.equal(text(noon, 1, 3), "done around 13:00–15:00", "same day: unchanged");
+  assert.equal(text(noon, 1, 3), "about 1 h to 3 h left (done around 13:00–15:00)", "same day: no day word");
   const evening = new Date(2026, 0, 1, 18, 49, 0).getTime();
-  assert.equal(text(evening, 0, 20), "done around 18:49–tomorrow 14:49", "the case the owner saw: no longer reads as an earlier time");
-  assert.equal(text(noon, 12.5, 14.5), "done around tomorrow 00:30–02:30", "both ends tomorrow: the day word once");
+  assert.equal(text(evening, 3 + 1 / 3, 20), "about 3 h 20 min to 20 h left (done around 22:09–tomorrow 14:49)", "the owner's case: the day is named");
+  assert.equal(text(noon, 12.5, 14.5), "about 12 h 30 min to 14 h 30 min left (done around tomorrow 00:30–02:30)", "both ends tomorrow: the day word once");
   const late = new Date(2026, 0, 1, 23, 30, 0).getTime();
-  assert.equal(text(late, 1.5, 1.5), "done around tomorrow 01:00", "a short wait that crosses midnight");
+  assert.equal(text(late, 1.5, 1.5), "about 1 h 30 min left (done around tomorrow 01:00)", "a single value that crosses midnight");
   const far = new Date(noon + 50 * 3600e3);                 // two days on
-  assert.equal(text(noon, 4, 50), `done around 16:00–${DAYS[far.getDay()]} 14:00`);
-  // the low end is never shown as later than the high end
-  const lo = new Date(noon + 20 * 3600e3), hi = new Date(noon + 30 * 3600e3);
-  assert.equal(text(noon, 20, 30), "done around tomorrow 08:00–18:00");
-  assert.ok(lo < hi);
+  assert.equal(text(noon, 4, 50), `about 4 h to 50 h left (done around 16:00–${DAYS[far.getDay()]} 14:00)`);
+  assert.equal(text(noon, 20, 30), "about 20 h to 30 h left (done around tomorrow 08:00–18:00)");
+});
+
+test("the time left is told in hours and minutes without false precision", () => {
+  const b = makeBrowser();
+  const noon = new Date(2026, 0, 1, 12, 0, 0).getTime();
+  const left = (h) => b.ctx.acEtaText({ status: "running", steps: [step("s1.heal", "pending")], plan: { stages: [{ hours: [h, h] }] } }, null, noon).replace(/ \(done.*$/, "");
+  assert.equal(left(0.75), "about 45 min left");
+  assert.equal(left(0.02), "about 5 min left", "never claims less than 5 minutes");
+  assert.equal(left(1), "about 1 h left");
+  assert.equal(left(2 + 5 / 60), "about 2 h 05 min left");
+  assert.equal(left(2 + 7 / 60), "about 2 h 05 min left", "rounded to 5 minutes");
+  assert.equal(left(10 + 10 / 60), "about 10 h left", "from 10 hours on to 30 minutes");
+  assert.equal(left(10.3), "about 10 h 30 min left");
+  assert.equal(left(20), "about 20 h left");
+  // nothing for a finished run
+  assert.equal(b.ctx.acEtaText({ status: "done", steps: [] }, null, noon), "");
 });
 
 test("an Auto-cut event with a time left is remembered for the estimate", () => {

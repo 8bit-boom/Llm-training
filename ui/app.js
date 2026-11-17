@@ -2558,14 +2558,21 @@ const acDay = (ms, nowMs) => {
   return days <= 0 ? "" : days === 1 ? "tomorrow" : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
 };
 const acClock = (ms, nowMs) => { const day = nowMs == null ? "" : acDay(ms, nowMs); return (day ? day + " " : "") + acHM(new Date(ms)); };
+// a duration in words without false precision: to the nearest 5 minutes below 10 hours, to the nearest 30 minutes from 10 hours up ("45 min", "1 h", "2 h 05 min", "20 h")
+function acDuration(hours) {
+  const step = hours >= 10 ? 30 : 5;
+  const m = Math.max(5, Math.round(hours * 60 / step) * step), h = Math.floor(m / 60), r = m % 60;
+  return h === 0 ? `${r} min` : r === 0 ? `${h} h` : `${h} h ${String(r).padStart(2, "0")} min`;
+}
 function acEtaText(run, eta, nowMs) {
   const r = acEtaRange(run, eta, nowMs);
   if (!r) return "";
-  const now = nowMs || Date.now(), lo = now + r.lo * 3600e3, hi = now + Math.max(r.lo, r.hi) * 3600e3;
-  const a = acClock(lo, now), b = acClock(hi, now);
-  if (a === b) return `done around ${a}`;
-  const da = acDay(lo, now), db = acDay(hi, now);
-  return da === db ? `done around ${a}–${acHM(new Date(hi))}` : `done around ${a}–${b}`;      // one day word for both ends when they share it
+  const now = nowMs || Date.now(), hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
+  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
+  const dl = acDuration(r.lo), dh = acDuration(hiH);
+  const left = dl === dh ? dl : `${dl} to ${dh}`;
+  const when = a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}`;      // one day word for both ends when they share it
+  return `about ${left} left (done around ${when})`;
 }
 
 function onAutoEvent(p) {
