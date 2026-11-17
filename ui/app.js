@@ -2420,6 +2420,14 @@ function sideBySide(m) {
     <p class="dim small">${th ? esc(th.verdict.headline) : "The healed model has not been tested yet."}</p>`;
 }
 
+// what became of the vision part and the multi-token head (the worker's `width.mtp` says what a width cut did to the head; a depth-only cut leaves it as it was)
+function mtpText(wd) {
+  const m = wd && wd.mtp ? String(wd.mtp) : "";
+  if (m.startsWith("removed")) return "The vision part was copied unchanged. The multi-token head (speculative decoding) was removed: it no longer fits the thinner layers.";
+  if (m.includes("sliced")) return "The vision part was copied unchanged. The multi-token head was cut to fit but was not measured or healed; do not use it for speculative decoding.";
+  return "The vision part and the multi-token head were copied unchanged.";
+}
+
 function madeCard(m) {
   const sm = m.summary;
   if (!sm) return `<div class="card wide"><h2>${esc(m.name)}</h2><p class="${m.status === "failed" ? "err" : "dim"}">${esc(m.status)}${m.error ? ": " + esc(m.error) : ""}</p></div>`;
@@ -2447,7 +2455,7 @@ function madeCard(m) {
     ${loss ? `<p>${esc(loss)}</p>` : ""}${stab}
     ${slim && sm.stable === false && !wide ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
     ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
-    <p class="dim small">The vision part and the multi-token head were copied unchanged. ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
+    <p class="dim small">${mtpText(wd)} ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
     <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>

@@ -521,7 +521,7 @@ pub fn resolve_width(d: &WidthDims, w: &Width) -> WidthSizes {
 }
 
 /// Exact parameter count of a Qwen3.5-style model with `n_lin` linear-attention and `n_full` full-attention layers at the given widths (layers +
-/// embeddings + output layer + final norm + multi-token head + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
+/// embeddings + output layer + final norm + multi-token head (not counted when the cut thins the MLP or the attention heads) + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
 /// `worker/tests/data/width_params.json` is read by both test suites.
 pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> u64 {
     let (h, hd, kv) = (d.hidden as u64, d.head_dim as u64, d.kv_heads as u64);
@@ -533,7 +533,8 @@ pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes,
     let gdn = h * conv + h * nv * dv + 2 * h * nv + conv * d.conv_kernel as u64 + 2 * nv + dv + nv * dv * h;
     let att = h * nh * hd * 2 + 2 * h * kv * hd + nh * hd * h + 2 * hd;
     let layers = n_lin * (gdn + mlp + norms) + n_full * (att + mlp + norms);
-    let mtp = d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h);
+    // a cut that thins the MLP or the attention heads removes the multi-token head (the mirror of `mtp_removed` in the worker)
+    let mtp = if w.intermediate != d.intermediate || w.heads != d.heads { 0 } else { d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h) };
     let head = if d.tied { 0 } else { d.vocab as u64 * h };
     layers + d.vocab as u64 * h + head + h + mtp + vision + other
 }

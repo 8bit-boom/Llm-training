@@ -136,6 +136,15 @@ projection set to zero), atol 1e-4 in float32. The same check was made once by h
 transformers, so it is cut by weight size (`||down[:, i]|| * ||up[i, :]||` per neuron, `||o_proj columns||` per head) and the result says it was **not measured or healed**.
 bf16 tensors are cut as raw `uint16` with numpy: bit-exact, no bf16 type needed.
 
+### The multi-token (MTP) head in a cut model
+
+- **A cut that thins the MLP or the attention heads removes the head.** The sliced head was never measured or healed, speculative decoding with it only wastes compute (the main model checks every token), it kept about 0.3-0.4 B parameters on disk and in memory, and it made the export offer `--nextn` matrix work for nothing. The `mtp.*` tensors are not written, `mtp_num_hidden_layers` (and `num_nextn_predict_layers` where present) is set to 0, and the result says so in its notes and in `width.mtp` ("removed (no longer fits)"); `ndforge_reshape.json` gets `mtp_removed: true` and `mtp_params_removed`.
+- The parameter estimates of the Slim page and Auto-cut (`reshape_width.params_for` and `plan.rs width_params_dims`, kept in step by `worker/tests/data/width_params.json`) no longer count the head for such a cut, so width sizes are about 0.3-0.4 B lower than before (a 27 B model at MLP 10,752 is 20.81 B, not 21.14 B).
+- A cut that only thins the linear-attention value heads still fits the head, which is then left as it was.
+- **A depth-only cut keeps the head unchanged** (its shapes still fit) with the note that it was not healed, so speculative decoding accepts fewer tokens.
+- The job key `keep_mtp: true` restores the old slicing by weight size.
+- Not verified here: that llama.cpp's converter accepts a config with `mtp_num_hidden_layers = 0` (export a width-cut model to GGUF and load it).
+
 ### Sizes (exact, before anything is measured)
 
 Qwen3.5 / Qwen3.8 27B (64 layers, MLP 17,408, 48 value heads, 24 heads; the formula reproduces the Hugging Face total 27,781,427,952 exactly, checked in `worker/tests/test_reshape_width.py`):

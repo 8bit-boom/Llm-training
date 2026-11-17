@@ -81,7 +81,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 23691981552
+  "params": 23330196720
  },
  {
   "name": "27B I 10752",
@@ -109,7 +109,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 21136077552
+  "params": 20813614320
  },
  {
   "name": "27B I 12288 + 32 value heads",
@@ -137,7 +137,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 21151411440
+  "params": 20805355248
  },
  {
   "name": "27B I 13312 + 32 value heads + 16 heads",
@@ -165,7 +165,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 21638999280
+  "params": 21308671728
  },
  {
   "name": "27B 60 layers + I 12288",
@@ -193,7 +193,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 21462117968
+  "params": 21116061776
  },
  {
   "name": "27B 56 layers + I 13312",
@@ -221,7 +221,7 @@
   },
   "vision": 460730096,
   "other": 0,
-  "params": 21151148464
+  "params": 20789363632
  },
  {
   "name": "9B I 9216",
@@ -249,7 +249,7 @@
   },
   "vision": 456010480,
   "other": 0,
-  "params": 8407396080
+  "params": 8201854192
  },
  {
   "name": "9B I 9216 + 16 value heads",
@@ -277,7 +277,7 @@
   },
   "vision": 456010480,
   "other": 0,
-  "params": 7800073200
+  "params": 7594531312
  },
  {
   "name": "tiny",
@@ -333,7 +333,7 @@
   },
   "vision": 5,
   "other": 0,
-  "params": 8317
+  "params": 7245
  },
  {
   "name": "tiny tied",

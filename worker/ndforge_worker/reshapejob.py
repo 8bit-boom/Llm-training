@@ -596,6 +596,9 @@ def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
     return keep, (sum(ov) / len(ov) if ov else 1.0)
 
 
+MTP_REMOVED = "removed (no longer fits)"
+
+
 def _mtp_keep(tensors: dict, dims: dict, width: dict):
     """What stays in the multi-token head (never run, so chosen by weight size), or None when there is none."""
     if not any(k.startswith("mtp.layers.") for k in tensors):
@@ -876,6 +879,7 @@ def run(cfg: dict) -> int:
     nb = reshape.block_count(n_layers, period)
     protocol.progress("inspect", 1.0, f"{n_layers} layers in blocks of {period}")
     width = dims = keep = mtp_keep = sc = None
+    mtp_drop = False                    # a width cut that thins the MLP or the heads removes the multi-token head (job key keep_mtp: true keeps the old slicing)
     overlap = None
     if width_req:
         why = reshape_width.width_supported(config)
@@ -923,7 +927,8 @@ def run(cfg: dict) -> int:
                 load_used, tokens = sc["meta"].get("load", load_used), sc["meta"].get("tokens")
                 loss_before = sc["meta"].get("loss_before")
             keep, overlap = _keep_sets(sc, src, types, dims, width)
-            mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] else None
+            mtp_drop = bool(groups["mtp"]) and not cfg.get("keep_mtp") and reshape_width.mtp_removed(dims, width)
+            mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] and not mtp_drop else None
             protocol.emit("width_scores", **_width_event(sc, keep, src, overlap))
             protocol.log(f"Thinning every layer: MLP {dims['intermediate']:,} to {width['intermediate']:,}"
                          + (f", linear-attention value heads {dims['lin_v_heads']} to {width['lin_v_heads']}" if width["lin_v_heads"] != dims["lin_v_heads"] else "")
@@ -945,9 +950,18 @@ def run(cfg: dict) -> int:
     if width:
         new_cfg = reshape_width.fix_config_width(new_cfg, dims, width)
         plan = reshape_width.plan_width(plan, src, types, dims, width, keep, mtp_keep)
-        if groups["mtp"]:
+        if mtp_drop:
+            plan = [t for t in plan if not t.name.startswith("mtp.")]
+            tc_new = reshape.text_config(new_cfg)
+            for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+                if key in tc_new:
+                    tc_new[key] = 0
+            notes.append("The speculative-decoding (multi-token) head was removed: it no longer fits the thinner layers and was never measured or healed.")
+        elif groups["mtp"]:
             notes.append("The multi-token head was cut to fit but was not measured or healed; do not use it for speculative decoding." if mtp_keep
                          else "The multi-token head was left as it was.")
+    elif groups["mtp"] and mode == "prune":
+        notes.append("The multi-token head was kept unchanged; it was not healed, so speculative decoding accepts fewer tokens.")
     new_groups = reshape.group_params({t.name: (t.dtype, t.shape) for t in plan}, len(src)) if width else None
     need = sum(t.nbytes for t in plan)
     free = fsutil.free_bytes(out.parent)
@@ -988,7 +1002,7 @@ def run(cfg: dict) -> int:
         if width:
             wmeta = {"intermediate_size": [dims["intermediate"], width["intermediate"]], "linear_num_value_heads": [dims["lin_v_heads"], width["lin_v_heads"]],
                      "num_attention_heads": [dims["heads"], width["heads"]], "kept": "width_kept.npz", "scores_key": Path(cfg.get("scores_dir") or "").name or None,
-                     "stable_overlap": round(overlap, 4), "mtp": ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
+                     "stable_overlap": round(overlap, 4), "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
             _save_kept(out / "width_kept.npz", src, keep, mtp_keep)
         shape_word = ("both" if chosen else "width") if width else ("depth" if mode == "prune" else None)
         meta = {"format": 2 if width else 1, "tool": "ND Lore Forge", "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -999,7 +1013,10 @@ def run(cfg: dict) -> int:
                                  **({"reasoning": reasoning_key(calibration)} if reasoning_key(calibration) else {}), "tokens": tokens} if (scores or sc) else None),
                 "loss_before": loss_before, "loss_after": loss_after, "stable": stable,
                 "vision": "unchanged (copied from the original)" if groups["vision"] else "none",
-                "mtp": ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if width and groups["mtp"] else "copied unchanged" if groups["mtp"] else "none"}
+                "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if width and groups["mtp"] else "copied unchanged" if groups["mtp"] else "none"}
+        if mtp_drop:
+            meta["mtp_removed"] = True
+            meta["mtp_params_removed"] = int(groups["mtp"])
         if width:
             meta["shape"] = shape_word
             meta["width"] = wmeta

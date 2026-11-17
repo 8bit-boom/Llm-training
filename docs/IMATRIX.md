@@ -93,6 +93,8 @@ Per export folder (`exports/<run>-<size>/`), next to the GGUFs, in **every** exp
 
 ## The speculative-decoding (MTP) head (`--nextn`)
 
+A model cut in width has no head any more (the cut removes it: `docs/RESHAPE.md`), so none is offered for it; a depth-only cut keeps its head.
+
 llama.cpp's `tools/imatrix` README: `--nextn` "collects data for MTP/NextN layers if present. Needs a single sequence per batch (i.e. set `--batch-size` <= `--ctx-size`). Cannot be used on models where NextN layers share the trunk's KV cache." (`--model-draft FNAME` supplies an external draft file, only for a model without NextN layers; **not used**.)
 
 Owner decisions (defaults) as built:

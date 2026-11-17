@@ -442,6 +442,11 @@ fn a_model_folder_is_checked_for_a_speculative_decoding_head() {
     let idx = f("index");
     std::fs::write(idx.join("model.safetensors.index.json"), json!({"weight_map": {"mtp.fc.weight": "a.safetensors"}}).to_string()).unwrap();
     assert_eq!(exports::mtp_head_in(&idx), Some(true));
+    // a width-cut model: the head was removed (count 0 in the text config, no mtp tensors), so no --nextn work is offered
+    let cut = f("width_cut");
+    std::fs::write(cut.join("config.json"), json!({"text_config": {"mtp_num_hidden_layers": 0, "intermediate_size": 11008}}).to_string()).unwrap();
+    st_file(&cut.join("model.safetensors"), &["model.language_model.layers.0.mlp.gate_proj.weight", "lm_head.weight"]);
+    assert_eq!(exports::mtp_head_in(&cut), Some(false));
 }
 
 #[test]

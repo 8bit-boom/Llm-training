@@ -269,7 +269,7 @@ fn an_uninterrupted_run_goes_through_every_step_in_order() {
     assert_eq!(fx.done, vec![
         "inspect",
         "measure qwen3.8-27b 256 4bit reasoning=true",
-        "try samples=128 runs=[1, 2] widths=[10752] choices=0",
+        "try samples=128 runs=[1, 2] widths=[11008] choices=0",
         "try samples=128 runs=[] widths=[] choices=2",
         "cut cut-1 from qwen3.8-27b blocks=0 drop=None width=Some(14080) reasoning=true",
         "check cut-1 original quick=false gguf=false",
@@ -277,7 +277,7 @@ fn an_uninterrupted_run_goes_through_every_step_in_order() {
         "heal cut-1 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")",
         "check cut-1 healed quick=false gguf=false",
         "remove cut cut-1",
-        "cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(10752) reasoning=true",
+        "cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(11008) reasoning=true",
         "check cut-2 cut quick=false gguf=false",
         "heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")",
         "check cut-2 healed quick=false gguf=false",
@@ -314,7 +314,7 @@ fn what_is_removed_is_only_what_the_run_made_and_only_after_the_next_step_worked
     assert_eq!(removed, vec![("cut", "cut-1"), ("healed", "cut-1"), ("cut", "cut-2")], "the final healed model stays");
     let pos = |what: &str| fx.done.iter().position(|d| d == what).unwrap();
     // the cut of a stage goes after the check of its healed model, the healed model of stage 1 after the check of stage 2's
-    assert!(pos("remove cut cut-1") > pos("check cut-1 healed quick=false gguf=false") && pos("remove cut cut-1") < pos("cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(10752) reasoning=true"));
+    assert!(pos("remove cut cut-1") > pos("check cut-1 healed quick=false gguf=false") && pos("remove cut cut-1") < pos("cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(11008) reasoning=true"));
     assert!(pos("remove healed cut-1") > pos("check cut-2 healed quick=false gguf=false") && pos("remove cut cut-2") > pos("check cut-2 healed quick=false gguf=false"));
     assert!(st.made.iter().filter(|m| m.removed).count() == 3 && st.made.iter().any(|m| m.kind == "healed" && m.name == "cut-2" && !m.removed));
     // keeping the intermediate files: nothing is removed
@@ -435,9 +435,9 @@ fn the_preflight_refuses_before_any_job_starts() {
     let mut small = Mock::new();
     small.free_gb = Some(120.0);
     let e = start(&p, &mut small, spec(21.1)).unwrap_err();
-    assert!(e.0.contains("up to 197 GB of disk") && e.0.contains("120 GB are free"), "{}", e.0);
+    assert!(e.0.contains("up to 196 GB of disk") && e.0.contains("120 GB are free"), "{}", e.0);
     let st = list(&p).into_iter().find(|s| s.status == "failed" && s.plan.is_some()).unwrap();
-    assert_eq!(st.plan.as_ref().unwrap().disk.as_ref().unwrap().peak_gb, 196.8);
+    assert_eq!(st.plan.as_ref().unwrap().disk.as_ref().unwrap().peak_gb, 195.8);
     assert!(small.done == vec!["inspect"], "{:?}", small.done);
     // a card that cannot heal the stage
     let mut card = Mock::new();
@@ -473,7 +473,7 @@ fn blocks_are_cut_as_try_first_found_them_and_the_cheapest_candidate_wins() {
     assert!(first["width"].is_null(), "stage 1: blocks only");
     assert!(fx.specs[1]["drop_layers"].is_null() && fx.specs[1]["width"]["intermediate"] == json!(chosen.intermediate.unwrap()), "stage 2: the width, measured on the healed model");
     assert_eq!(fx.specs[1]["source_model_id"], "id-cut-1-healed");
-    assert!(fx.done.iter().any(|d| d.contains("choices=2")), "the combined cut was asked: {:?}", fx.done);
+    assert!(fx.done.iter().any(|d| d.contains("choices=3")), "the combined cut was asked: {:?}", fx.done);
 }
 
 #[test]
@@ -602,10 +602,10 @@ fn a_single_stage_backed_off_gives_a_larger_model_than_asked() {
     fx.checks.insert("healed".into(), bad());
     let st = start(&p, &mut fx, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
     assert_eq!(st.status, "gates_failed");
-    // 10,752 backs off to 11,776: a larger model than asked
-    assert!(st.stages[0].plan.intermediate_after == Some(11_776), "{:?}", st.stages[0].plan);
+    // 11,008 backs off to 12,032: a larger model than asked (these sizes moved when the multi-token head stopped being counted in a width cut)
+    assert!(st.stages[0].plan.intermediate_after == Some(12_032), "{:?}", st.stages[0].plan);
     assert!(st.notes.iter().any(|n| n.contains("larger than asked")), "{:?}", st.notes);
-    assert_eq!(st.chosen.as_ref().unwrap().intermediate, Some(11_776));
+    assert_eq!(st.chosen.as_ref().unwrap().intermediate, Some(12_032));
 }
 
 #[test]

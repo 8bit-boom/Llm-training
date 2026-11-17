@@ -228,18 +228,18 @@ fn the_27b_gets_one_exact_stop_per_mlp_width() {
     assert_eq!(opts.len(), 35);
     assert_eq!((opts[0].intermediate, opts[34].intermediate), (Some(8704), Some(17408)), "ascending: the thinnest first");
     let at = |i: u32| opts.iter().find(|o| o.intermediate == Some(i)).unwrap();
-    assert_eq!((at(13312).params_b, at(10752).params_b), (23.69, 21.14));
+    assert_eq!((at(13312).params_b, at(10752).params_b), (23.33, 20.81));       // the multi-token head is removed by a width cut: about 0.3-0.4 B lower than before
     assert!(at(13312).exact && at(10752).layers == 64 && at(10752).blocks == 0);
-    assert!((at(10752).disk_gb - 42.3).abs() < 0.05, "{:?}", at(10752));
+    assert!((at(10752).disk_gb - 41.6).abs() < 0.05, "{:?}", at(10752));
     assert_eq!((at(10752).fits_lora, at(10752).fits_qlora), (Some(false), Some(true)));
-    // both: one block less (60 layers) and 12,288 = 21.46 B; two blocks less and 13,312 = 21.15 B
+    // both: one block less (60 layers) and 12,288 = 21.12 B; two blocks less and 13,312 = 20.79 B
     let both = width_options(&ins, 1, None, None, None);
     let b = both.iter().find(|o| o.intermediate == Some(12288)).unwrap();
-    assert_eq!((b.layers, b.blocks, b.params_b, b.fits_qlora), (60, 1, 21.46, None));
-    assert_eq!(width_options(&ins, 2, None, None, None).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.15);
+    assert_eq!((b.layers, b.blocks, b.params_b, b.fits_qlora), (60, 1, 21.12, None));
+    assert_eq!(width_options(&ins, 2, None, None, None).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 20.79);
     // the Expert axes change the size: 32 value heads and 16 attention heads
-    assert_eq!(width_options(&ins, 0, None, Some(32), Some(16)).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.64);
-    assert_eq!(width_options(&ins, 0, None, Some(32), None).iter().find(|o| o.intermediate == Some(12288)).unwrap().params_b, 21.15);
+    assert_eq!(width_options(&ins, 0, None, Some(32), Some(16)).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.31);
+    assert_eq!(width_options(&ins, 0, None, Some(32), None).iter().find(|o| o.intermediate == Some(12288)).unwrap().params_b, 20.81);
     // no options for a model that cannot be thinned
     let mut no = qwen27();
     no.width_supported = false;
