@@ -2414,3 +2414,60 @@ fn the_recipe_is_offered_for_qwen_models_only_and_refused_for_others() {
     assert!(e.0.contains("Qwen3.5 and Qwen3.8"), "{}", e.0);
     assert!(jobs_seen(d.path()).iter().all(|j| j["job"] != "distill_cache" && j["job"] != "distill"), "refused before anything ran");
 }
+
+// ---- reasoning-aware measuring (S10)
+
+#[test]
+fn the_reasoning_text_is_part_of_the_name_of_a_measurement() {
+    let r = ReasoningCalib::default();
+    assert!(r.validate().is_ok());
+    assert_eq!(r.json(), json!({"source": {"id": THINKING_GENERAL_ID}, "share": 0.5, "max_len": 2048}));
+    let key = rruns::scores_key_with("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto", Some(&r));
+    assert!(key.starts_with("unsloth-qwen3.5-4b-v1-128x512-auto-r50x2048-faunix-qwen3.8-2-"), "{key}");
+    assert_eq!(rruns::scores_key_with("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto", None), rruns::scores_key("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto"));
+    let other = ReasoningCalib { id: Some("a/b".into()), share: 0.3, ..Default::default() };
+    let file = ReasoningCalib { file: Some(std::path::Path::new("some").join("traces.jsonl").to_string_lossy().into_owned()), ..Default::default() };
+    let keys: Vec<String> = [&r, &other, &file].iter().map(|x| rruns::scores_key_with("m", Some(1), 128, 512, "auto", Some(x))).collect();
+    assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "{keys:?}");
+    assert!(keys.iter().all(|k| !k.contains(['/', '\\', ' ']) && !k.contains("..")), "{keys:?}");
+    assert_eq!(file.json()["source"], json!({"file": file.file.clone().unwrap()}));
+    for bad in [ReasoningCalib { share: 0.0, ..Default::default() }, ReasoningCalib { share: 0.95, ..Default::default() }, ReasoningCalib { max_len: 8, ..Default::default() },
+                ReasoningCalib { id: Some(" ".into()), ..Default::default() }] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_spec_without_reasoning_is_as_before_and_one_with_it_is_checked() {
+    let s = spec(Mode::Prune, 1);
+    assert!(s.reasoning.is_none());
+    let v: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "m", "mode": "prune", "blocks": 1, "reasoning": {}})).unwrap();
+    assert_eq!(v.reasoning, Some(ReasoningCalib::default()));
+    let t: rruns::TrySpec = serde_json::from_value(json!({"model_id": "qwen3.5-4b", "reasoning": {"share": 2.0}})).unwrap();
+    assert!(t.validate().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_reasoning_text_reaches_the_worker_and_gets_its_own_measurement() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let m = catalog::find("qwen3.5-4b").unwrap();
+    let r = ReasoningCalib { id: Some("a/b".into()), share: 0.4, max_len: 1024, ..Default::default() };
+    let plain = rruns::measurement_info(&p, &m, 256, 512, "auto");
+    let with = rruns::measurement_info_with(&p, &m, 256, 512, "auto", Some(&r));
+    assert!(plain["key"] != with["key"] && with["key"].as_str().unwrap().contains("-r40x1024-a-b-"), "{with}");
+    let res = rruns::measure_with(&p, "qwen3.5-4b", 256, 512, "auto", Some(&r), false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert_eq!(res["key"], with["key"]);
+    let job = &jobs_seen(d.path())[0];
+    assert_eq!(job["calibration"]["reasoning"], json!({"source": {"id": "a/b"}, "share": 0.4, "max_len": 1024}));
+    assert_eq!(job["out_dir"].as_str().unwrap(), rruns::scores_dir(&p, with["key"].as_str().unwrap()).to_string_lossy());
+    assert_eq!(rruns::measurement_info_with(&p, &m, 256, 512, "auto", Some(&r))["exists"], true);
+    assert_eq!(rruns::measurement_info(&p, &m, 256, 512, "auto")["exists"], false, "the plain measurement is another one");
+    assert!(rruns::measure_with(&p, "qwen3.5-4b", 256, 512, "auto", Some(&ReasoningCalib { share: 0.0, ..Default::default() }), false, Arc::new(AtomicBool::new(false)), &mut |_| {}).is_err());
+    // a plain measurement sends no reasoning at all
+    rruns::measure(&p, "qwen3.5-4b", 128, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert!(jobs_seen(d.path())[1]["calibration"].get("reasoning").is_none());
+}

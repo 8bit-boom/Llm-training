@@ -228,13 +228,14 @@ def weights_fingerprint(folder) -> str:
 
 def build_key(repo: str, weights: str | None, calib: dict, train_hash: str | None, load: str) -> dict:
     """Everything the answers depend on. The same key is the same question; another key is another set of answers."""
+    from . import reshapejob
     return {"format": TRY_FORMAT, "source": repo, "weights": weights, "data_version": calib.get("version"), "data_hash": train_hash, "samples": calib.get("samples"),
-            "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": load}
+            "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": load, "reasoning": reshapejob.reasoning_key(calib)}
 
 
 KEY_WORDS = {"format": "an older file format", "source": "another model", "weights": "other weights of the model", "data_version": "another version of the training data",
              "data_hash": "other training text", "samples": "another number of samples", "max_len": "another text length", "seed": "another seed",
-             "load": "another way of loading the model"}
+             "load": "another way of loading the model", "reasoning": "another reasoning text"}
 
 
 def key_diff(old, new: dict):
@@ -488,7 +489,7 @@ def run_try(cfg: dict) -> int:
     meas = None
     if dims and cfg.get("measure_dir"):
         meas = reshapejob._read_scores(cfg["measure_dir"], {"source": cfg["source"], "calibration": {"version": calib.get("version"), "samples": cfg.get("measure_samples"),
-                                                                                                    "max_len": calib.get("max_len")}}, n_layers, dims, types)
+                                                                                                    "max_len": calib.get("max_len"), "reasoning": calib.get("reasoning")}}, n_layers, dims, types)
     needs_measurement = wants_width and meas is None
     if needs_measurement and not plan_only:
         raise ReshapeError("Trying a width needs the measurement of the neurons. Measure the model first.")

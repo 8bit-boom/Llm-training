@@ -262,6 +262,20 @@ template"). A healed model's quality is checked with the **Thinking check** (doc
 Expect a longer and larger heal than the plain one: the teacher's saved answers are about 196 bytes per token (80 million tokens: about 15.7 GB), the rows are long, and healing a 27B to about 16 B with this
 much text is still far less than the tens of billions of tokens that published prune-and-heal work used (docs/THINKING_CHECK.md says what the check can and cannot show).
 
+### Measuring on reasoning (reasoning-aware calibration)
+
+The layers and the neurons of a cut are chosen by measuring the model on text. The project's own text (world books and practice conversations, written without thinking) hides what a block does for
+reasoning, and every removed block of a Qwen3.5 / 3.8 takes one of its 16 full-attention layers with it. A measurement (`reshape_measure`), a cut (`reshape`) and Try first (`reshape_try`) therefore take an
+optional `calibration.reasoning` = `{"source": {"id" | "file"}, "share": 0.5, "max_len": 2048}` (Rust: `ReasoningCalib`, in `ReshapeSpec.reasoning`, `TrySpec.reasoning`, `runs::measure_with`):
+
+- that share of the samples (default half) are conversations with thinking, rows of the default `faunix/Qwen3.8-27B-Distillation-40K` (or a dataset / file of your choice), written the way the model thinks
+  (`data.render_chat_full`, docs/GENERAL_TEXT.md "Thinking"), cut to their first `max_len` tokens (default 2048), in batches of their own after the project's batches (about as many tokens per batch);
+  conversations without a trace are passed over for a family that thinks; an unreadable dataset or one with no trace in its first rows stops the job with one plain sentence (nothing is measured on other text);
+- the other samples are the project's own rows as before; without `reasoning` nothing changes (no new key in any file);
+- the text is part of the key: the folder of a measurement gets the tag `-r50x2048-<dataset>-<hash>` (`ReasoningCalib::tag`), `scores.json` and `ndforge_reshape.json` (`calibration.reasoning`) keep
+  `reasoning_key`, Try first's key has a `reasoning` part ("another reasoning text" when it differs), and a measurement made on other text is measured again. Healing's before / after loss uses the
+  same text as the cut it heals. The Auto-cut pipeline (docs/AUTO_CUT.md) turns it on for models that think; the Slim page does not have a switch for it yet.
+
 ## Try before cutting (version 3)
 
 A "Try first" card on the page finds out what a cut will cost before any model folder is written (job `reshape_try`: the loss of the original, of every block skipped on its own, of every run of blocks, of every width, of a chosen combination, on the project's calibration text, with the cut imitated by hooks; kept in `reshape_try.json` next to the measurements). Everything about it, including the colour bands, the deviations and its own "not verified yet" list, is in `docs/TRY_FIRST.md`. The predicted loss equals the calibration loss of the folder the `reshape` job writes, on a tiny model (`worker/tests/test_reshape_try_torch.py`); nothing is known yet about how it relates to the quality after healing.
@@ -307,6 +321,10 @@ Not run on a real model, card or dataset: whether the recipe keeps the reasoning
 (is its thinking really inline as `<think>...</think>`? how many rows are longer than 2 x 4096 tokens and skipped?), the memory of 8192 (the estimate says about 21 GB for a 16 B student with QLoRA,
 checkpointing and batch 1; it has never been measured), the time of 40 to 80 million tokens of long rows, and the teacher cache of 15.7 GB. The pieces were tested alone: the rendering with the real Qwen3.5 chat template
 (jinja), the recipe's numbers and what reaches the worker with a fake worker, the merge job writing `healed.recipe`, the export flag, and the Heal card in a stand-in browser.
+
+Reasoning-aware measuring: not run on a real model either. What is tested: the keys (worker and Rust), the rows written from a stand-in dataset with the real Qwen3.5 template, the batches (CI only, they need torch),
+and what reaches the worker. Not known: whether blocks chosen on reasoning text keep the model's reasoning better than blocks chosen on the project's text (the hypothesis; Try first can show the loss on
+each text, the Thinking check shows the rest), how long 128 rows of 2048 tokens take on the 5090, and whether the measuring batches fit the card at 2048 tokens.
 
 ### Version 2 (thinner layers and healing): not verified yet
 

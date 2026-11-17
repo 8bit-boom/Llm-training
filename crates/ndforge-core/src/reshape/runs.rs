@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 
 use super::heal_source;
-use super::plan::{self, Inspect, Mode, ReshapeSpec, Width};
+use super::plan::{self, Inspect, Mode, ReasoningCalib, ReshapeSpec, Width};
 use crate::envmgr::jobs::{run_job, WorkerEvent};
 use crate::envmgr::{env_dir, python_path, worker_dir};
 use crate::error::{Error, Result};
@@ -92,7 +92,12 @@ pub fn name_for_shape(src: &ModelEntry, mode: Mode, layers_after: u32, width: Op
 
 /// The key of a measurement: model, data version, samples, length and the way it was loaded. The same key is the same measurement.
 pub fn scores_key(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str) -> String {
-    format!("{}-v{}-{samples}x{len}-{load}", slug(source_repo), version.unwrap_or(0))
+    scores_key_with(source_repo, version, samples, len, load, None)
+}
+
+/// `scores_key` for a measuring text with a reasoning part: the same key plus `ReasoningCalib::tag` (another reasoning text is another measurement).
+pub fn scores_key_with(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> String {
+    format!("{}-v{}-{samples}x{len}-{load}{}", slug(source_repo), version.unwrap_or(0), reasoning.map(|r| r.tag()).unwrap_or_default())
 }
 
 pub fn scores_dir(p: &Project, key: &str) -> PathBuf {
@@ -184,15 +189,24 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         "job": "reshape", "source": {"repo": m.repo, "family": m.family}, "mode": spec.mode, "blocks": spec.blocks, "strategy": spec.strategy,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "drop_layers": spec.drop_layers,
         "grow": {"layout": "solar", "init": spec.init},
-        "calibration": {"train": train, "samples": samples, "max_len": spec.calib_len, "seed": 3407, "version": version},
+        "calibration": calibration_json(train.as_deref(), samples, spec.calib_len, version, spec.reasoning.as_ref()),
         "load": spec.load, "check": true, "shard_gb": 5,
         "out": dir.join("model.partial"), "final": dir.join("model"),
     });
     if let Some(w) = &spec.width {
         job["width"] = json!({"intermediate_size": w.intermediate, "linear_num_value_heads": w.lin_v_heads, "num_attention_heads": w.heads});
-        job["scores_dir"] = json!(scores_dir(p, &scores_key(&m.repo, version, samples, spec.calib_len, &spec.load)));
+        job["scores_dir"] = json!(scores_dir(p, &scores_key_with(&m.repo, version, samples, spec.calib_len, &spec.load, spec.reasoning.as_ref())));
     }
     Ok(job)
+}
+
+/// The `calibration` of a worker job: the project's training file, how many samples of which length and, when asked, the reasoning part.
+fn calibration_json(train: Option<&Path>, samples: u32, len: u32, version: Option<u32>, reasoning: Option<&ReasoningCalib>) -> Value {
+    let mut c = json!({"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version});
+    if let Some(r) = reasoning {
+        c["reasoning"] = r.json();
+    }
+    c
 }
 
 fn active() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
@@ -854,7 +868,10 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         let _ = std::fs::remove_dir_all(&run_dir);
     }
     let cal = &o.calibration;
-    let calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
+    let mut calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
+    if cal["reasoning"].is_object() {
+        calibration["reasoning"] = cal["reasoning"].clone();         // the loss before and after is measured on the text the cut was measured on
+    }
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
     set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
@@ -959,8 +976,13 @@ pub fn heal_metrics(p: &Project, name: &str) -> Vec<Value> {
 
 /// What is kept of an earlier measurement of this model on this data with these settings (None when there is none yet).
 pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str) -> Value {
+    measurement_info_with(p, m, samples, len, load, None)
+}
+
+/// `measurement_info` for a measuring text with a reasoning part.
+pub fn measurement_info_with(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Value {
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
-    let key = scores_key(&m.repo, version, samples, len, load);
+    let key = scores_key_with(&m.repo, version, samples, len, load, reasoning);
     let meta = read_json(&scores_dir(p, &key).join("scores.json"));
     json!({"key": key, "exists": meta.is_some(), "tokens": meta.as_ref().map(|x| x["tokens"].clone()), "load": meta.as_ref().map(|x| x["load"].clone()),
            "created": meta.as_ref().map(|x| x["created"].clone()), "data_version": version})
@@ -969,6 +991,15 @@ pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, loa
 /// "Measure now" (Expert: also "measure again"): measures the model once and keeps the result for every later size choice on the same data. Making a
 /// thinner model measures by itself when nothing is kept, so this is optional. Returns the worker's result.
 pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, force: bool, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    measure_with(p, model_id, samples, len, load, None, force, stop, on_event)
+}
+
+/// `measure` with a reasoning part in the measuring text (half of the samples are conversations with thinking, written the way the model thinks).
+#[allow(clippy::too_many_arguments)]
+pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>, force: bool, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    if let Some(r) = reasoning {
+        r.validate()?;
+    }
     if !["auto", "16bit", "4bit", "offload"].contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
         return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
     }
@@ -979,12 +1010,12 @@ pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, 
         return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
     }
     let py = python()?;
-    let key = scores_key(&m.repo, Some(version), samples, len, load);
+    let key = scores_key_with(&m.repo, Some(version), samples, len, load, reasoning);
     let folder = scores_dir(p, &key);
     let _active = Active::begin(&folder)?;
     let job = json!({
         "job": "reshape_measure", "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
-        "calibration": {"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version},
+        "calibration": calibration_json(Some(&train), samples, len, Some(version), reasoning),
     });
     let stop_dir = models_dir(p).join("_scores");
     let mut result = crate::train::runs::drive(&py, &stop_dir, &job, stop, Duration::from_secs(60), &mut |e| on_event(event_json(e)))?;
@@ -1060,6 +1091,9 @@ pub struct TrySpec {
     /// the model's size in billions of parameters (for the first time estimate)
     #[serde(default)]
     pub params_b: Option<f64>,
+    /// a measuring text with a reasoning part (the answers and the measurement of the neurons are kept per reasoning text)
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCalib>,
 }
 
 /// The most cuts one request may ask for (a safety net; the page asks for far fewer).
@@ -1075,6 +1109,9 @@ impl TrySpec {
         }
         if !(8..=4096).contains(&self.samples) || !(8..=4096).contains(&self.measure_samples) || !(32..=8192).contains(&self.len) {
             return Err(Error::new("Try on 8 to 4096 samples of 32 to 8192 tokens."));
+        }
+        if let Some(r) = &self.reasoning {
+            r.validate()?;
         }
         if self.protect_first > 8 || self.protect_last > 8 {
             return Err(Error::new("Protect at most 8 blocks at each end."));
@@ -1099,7 +1136,7 @@ impl TrySpec {
 
 /// The folder where the answers for this model, data and settings are kept (the measurement's own folder when the samples are the same).
 pub fn try_dir(p: &Project, m: &ModelEntry, version: u32, spec: &TrySpec) -> PathBuf {
-    scores_dir(p, &scores_key(&m.repo, Some(version), spec.samples, spec.len, &spec.load))
+    scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.samples, spec.len, &spec.load, spec.reasoning.as_ref()))
 }
 
 /// The worker's job for a spec. `plan_only`: count the passes and estimate the time, run nothing.
@@ -1112,8 +1149,8 @@ pub fn try_job(p: &Project, m: &ModelEntry, spec: &TrySpec, plan_only: bool) -> 
     }
     Ok(json!({
         "job": "reshape_try", "source": {"repo": m.repo, "family": m.family}, "load": spec.load, "out_dir": try_dir(p, m, version, spec), "plan_only": plan_only, "force": spec.force,
-        "calibration": {"train": train, "samples": spec.samples, "max_len": spec.len, "seed": 3407, "version": version},
-        "measure_dir": scores_dir(p, &scores_key(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load)), "measure_samples": spec.measure_samples,
+        "calibration": calibration_json(Some(&train), spec.samples, spec.len, Some(version), spec.reasoning.as_ref()),
+        "measure_dir": scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load, spec.reasoning.as_ref())), "measure_samples": spec.measure_samples,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "strategy": spec.strategy, "want": spec.want(), "params_b": spec.params_b,
     }))
 }
@@ -1134,9 +1171,14 @@ pub fn try_plan(p: &Project, spec: &TrySpec, kill: &AtomicBool, on_event: &mut d
 
 /// The answers kept for this model, data and settings (`{"exists": false}` when there are none). Whether they still belong to the weights is checked by the worker.
 pub fn try_results(p: &Project, model_id: &str, samples: u32, len: u32, load: &str) -> Result<Value> {
+    try_results_with(p, model_id, samples, len, load, None)
+}
+
+/// `try_results` for a measuring text with a reasoning part.
+pub fn try_results_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Value> {
     let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let Some((version, _)) = crate::train::runs::latest_version(p) else { return Ok(json!({"exists": false})) };
-    let file = scores_dir(p, &scores_key(&m.repo, Some(version), samples, len, load)).join("reshape_try.json");
+    let file = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning)).join("reshape_try.json");
     let Some(v) = read_json(&file) else { return Ok(json!({"exists": false})) };
     if v["key"]["source"] != json!(m.repo) || v["key"]["data_version"] != json!(version) {
         return Ok(json!({"exists": false}));
