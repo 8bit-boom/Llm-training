@@ -150,6 +150,9 @@ pub struct StageState {
     /// more tokens for the next heal (40 million more for the second try)
     pub extra_tokens_m: u32,
     pub passed: bool,
+    /// the loss of this stage's cut as Try first measured it (the cut itself is not measured again): kept for the report
+    #[serde(default)]
+    pub cut_loss: Option<f64>,
     /// one line per healed model that was checked: {attempt, kind: heal | heal_again | back_off, model, tokens_m, verdict, failed, main}
     #[serde(default)]
     pub attempts: Vec<Value>,
@@ -160,7 +163,7 @@ pub struct StageState {
 
 impl StageState {
     pub fn new(plan: StagePlan) -> Self {
-        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, attempts: Vec::new(), retry_from: None }
+        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, cut_loss: None, attempts: Vec::new(), retry_from: None }
     }
 }
 
@@ -684,10 +687,32 @@ fn step_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow
             spec.drop_layers = Some(layers_of(b, period));
         }
     }
+    // a stage 1 that makes exactly the cut Try first measured does not measure it again (that would load the new model, and for blocks only the original too)
+    if idx == 0 {
+        if let Some(loss) = tried_loss(st, &plan) {
+            spec.skip_check = true;
+            st.stages[idx].cut_loss = Some(loss);
+        }
+    }
     let r = out!(fx.cut(&spec)?);
     made(st, "cut", &r.name, Some(r.model_id.clone()), idx as u32 + 1);
     st.stages[idx].cut = Some(r);
     Ok(Flow::Done(None))
+}
+
+/// The loss Try first measured for the cut this stage makes: only when the stage's cut IS the candidate that won (the same blocks and MLP width) and the run's cut
+/// uses the layers Try first found (a plain width cut, or blocks with their saved choice).
+fn tried_loss(st: &AutoState, plan: &StagePlan) -> Option<f64> {
+    let chosen = st.chosen.as_ref()?;
+    if plan.blocks_cut != chosen.blocks || plan.width != chosen.intermediate.filter(|i| Some(*i) != st.inspect.as_ref().and_then(|ins| auto_plan::full_width(ins))) {
+        return None;
+    }
+    if chosen.blocks > 0 && st.drop_blocks.as_ref().is_none_or(|b| b.len() as u32 != chosen.blocks) {
+        return None;
+    }
+    let tr = st.try_result.as_ref()?;
+    let w = tr["winner"].as_u64()? as usize;
+    tr["rows"].get(w)?["loss"].as_f64()
 }
 
 /// The numbers of a check without the long parts.

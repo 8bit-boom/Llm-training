@@ -188,6 +188,9 @@ pub struct ReshapeSpec {
     /// reasoning-aware measuring: part of the samples are conversations with thinking (None: the project's own text only, as before)
     #[serde(default)]
     pub reasoning: Option<ReasoningCalib>,
+    /// do not measure the new model's loss after the cut (its loss was measured already, for instance by Try first): saves loading it once more
+    #[serde(default)]
+    pub skip_check: bool,
 }
 
 fn r_share() -> f64 {

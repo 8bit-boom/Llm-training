@@ -44,7 +44,7 @@ fn stage_json(s: &StageState) -> Value {
         "index": p.index, "of": p.of, "params_b": p.params_b, "cut_pct": p.cut_pct, "blocks_cut": p.blocks_cut, "blocks_after": p.blocks_after,
         "mlp_width": p.intermediate_after, "tokens_m": s.heal.as_ref().map(|h| h.tokens_m).unwrap_or(p.tokens_m), "seq": p.seq, "rank": p.rank,
         "passed": s.passed, "attempts": s.attempts, "retries": s.attempts.len().saturating_sub(1), "backed_off": s.attempt >= 2,
-        "cut_check": s.cut_check, "heal_check": s.heal_check,
+        "cut_check": s.cut_check, "heal_check": s.heal_check, "cut_loss": s.cut_loss,
         // the healing curves: the teacher's loss and the student's before and after, and the KL at the start and the end
         "kl_first": summary["kd_first"], "kl_last": summary["kd_last"], "loss_before": summary["calib_loss_before"], "loss_after": summary["calib_loss_after"], "teacher_loss": summary["teacher_calib_loss"],
         "healed_model": s.heal.as_ref().map(|h| h.name.clone()),
@@ -132,6 +132,11 @@ pub fn markdown(r: &Value) -> String {
         let result = if st["passed"] == true { if st["backed_off"] == true { "passed after backing off" } else if st["retries"].as_u64().unwrap_or(0) > 0 { "passed on the second heal" } else { "passed" } } else { "not passed" };
         s.push_str(&format!("| {} of {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n", st["index"], st["of"], num(&st["params_b"], 2), num(&st["cut_pct"], 1), st["blocks_cut"], st["mlp_width"].as_u64().map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
                              st["tokens_m"], num(&st["kl_first"], 3), num(&st["kl_last"], 3), num(&st["loss_before"], 3), num(&st["loss_after"], 3), num(&st["teacher_loss"], 3), st["attempts"].as_array().map(|a| a.len()).unwrap_or(0), result));
+    }
+    for st in r["stages"].as_array().cloned().unwrap_or_default() {
+        if let Some(l) = st["cut_loss"].as_f64() {
+            s.push_str(&format!("\nStage {}: the cut's text-prediction error {l:.3} was measured in Try first (the new model was not loaded again to measure it).\n", st["index"]));
+        }
     }
     s.push_str("\n## Thinking check\n\n| Model | Verdict |");
     for (_, label) in METRICS {

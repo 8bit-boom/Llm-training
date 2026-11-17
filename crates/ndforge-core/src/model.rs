@@ -482,7 +482,7 @@ impl AppModel {
         let default_blocks = options.last().map(|o| o.blocks.min((ins.blocks / 4).max(1))).unwrap_or(0);
         let base_spec = |blocks: u32, width: Option<plan::Width>| plan::ReshapeSpec {
             source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512,
-            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None,
+            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None, skip_check: false,
         };
         // every size comes with the disk space it needs and what to know before choosing it
         let sized: Vec<Value> = options.iter().map(|o| {

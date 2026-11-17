@@ -184,7 +184,7 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "drop_layers": spec.drop_layers,
         "grow": {"layout": "solar", "init": spec.init},
         "calibration": calibration_json(train.as_deref(), samples, spec.calib_len, version, spec.reasoning.as_ref()),
-        "load": spec.load, "check": true, "shard_gb": 5,
+        "load": spec.load, "check": !spec.skip_check, "shard_gb": 5,
         "out": dir.join("model.partial"), "final": dir.join("model"),
     });
     if let Some(w) = &spec.width {

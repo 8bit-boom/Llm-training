@@ -755,3 +755,55 @@ fn a_run_and_a_heal_that_were_cut_off_are_found_for_going_on_by_themselves() {
     let again = resume(&p, &mut fx2, &st.id).unwrap();
     assert!(!again.interrupted);
 }
+
+#[test]
+fn a_cut_that_try_first_measured_is_not_measured_again() {
+    // one stage: the cut is exactly the candidate Try first measured, so the new model is not loaded once more
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut one = Mock::new();
+    let st = start(&p, &mut one, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(one.specs[0]["skip_check"], json!(true), "{}", one.specs[0]);
+    let loss = st.stages[0].cut_loss.expect("Try first's loss is kept for the report");
+    let winner = st.try_result.as_ref().unwrap()["winner"].as_u64().unwrap() as usize;
+    assert_eq!(Some(loss), st.try_result.as_ref().unwrap()["rows"][winner]["loss"].as_f64());
+    // two stages: stage 1 is half the cut (not what Try first measured) and stage 2 is measured on the healed model: both are checked
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut two = Mock::new();
+    let st2 = start(&p2, &mut two, spec(21.1)).unwrap();
+    assert_eq!(st2.status, "done", "{:?}", st2.error);
+    assert_eq!(two.specs.len(), 2);
+    assert_eq!((two.specs[0]["skip_check"].clone(), two.specs[1]["skip_check"].clone()), (json!(false), json!(false)));
+    assert!(st2.stages.iter().all(|s| s.cut_loss.is_none()));
+}
+
+#[test]
+fn a_run_saved_before_the_new_fields_still_loads() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let mut v = serde_json::to_value(&st).unwrap();
+    for s in v["stages"].as_array_mut().unwrap() {
+        s.as_object_mut().unwrap().remove("cut_loss");
+    }
+    let old: ndforge_core::reshape::auto::AutoState = serde_json::from_value(v).unwrap();
+    assert!(old.stages.iter().all(|s| s.cut_loss.is_none()));
+    assert!(!serde_json::from_value::<ndforge_core::reshape::plan::ReshapeSpec>(json!({"source_model_id": "m", "mode": "prune", "blocks": 1})).unwrap().skip_check, "an old spec has no skip_check");
+}
+
+#[test]
+fn the_report_says_when_the_loss_of_a_cut_was_measured_in_try_first() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
+    assert!(st.report.is_some(), "the report was written");
+    let dir = ndforge_core::reshape::auto::run_dir(&p, &st.id);
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto_report.json")).unwrap()).unwrap();
+    assert!(report["stages"][0]["cut_loss"].as_f64().is_some(), "{report}");
+    let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
+    assert!(md.contains("was measured in Try first"), "{md}");
+}
