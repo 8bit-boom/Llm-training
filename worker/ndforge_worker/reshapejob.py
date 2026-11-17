@@ -291,7 +291,7 @@ def _reasoning_rows(tokenizer, key: dict, fam_name: str, want: int, seed: int) -
     src = {k: key[k] for k in ("id", "file", "config", "split", "column") if key.get(k)}
     report: dict = {}
     src.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     rows, scanned = [], 0
     try:
         for text in generaltext.texts(src):
@@ -357,7 +357,7 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     enc, _ = data.encode_rows(tokenizer, texts[:want_t] + chats[:want_c], fam_name, max_len, seed)
     if not enc:
         raise ReshapeError("Nothing in the training data could be used for measuring. Save a training-data version in Step 2 first.")
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     bs = max(1, min(int(calib_cfg.get("batch", 4)), len(enc) // 2))
     batches = _pad_batches(enc, bs, pad)

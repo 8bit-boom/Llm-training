@@ -53,8 +53,8 @@ def _load(repo, four_bit=False):
 
 def _answers(model, tok, fam_name, questions, max_new, label, done, total):
     import torch
-    from .data import _inner, render_chat
-    inner = _inner(tok)
+    from .data import render_chat, text_tokenizer
+    inner = text_tokenizer(tok)
     model.eval()
     dev = next(model.parameters()).device
     out = {}
@@ -81,8 +81,10 @@ def run(cfg: dict) -> int:
     qs = cfg["questions"]
     total = len(qs) * len(which)
     tok = AutoTokenizer.from_pretrained(cfg["model"]["repo"])
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    from .data import text_tokenizer
+    inner = text_tokenizer(tok)         # a processor (a multimodal model) has no pad token of its own: set it on its text tokenizer
+    if inner.pad_token is None:
+        inner.pad_token = inner.eos_token
     max_new = int(cfg.get("max_new", 160))
     answers, done = {}, 0
     sides = plan_sides(cfg)

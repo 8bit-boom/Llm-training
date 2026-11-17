@@ -9,6 +9,7 @@ Batched generation of a model with linear-attention layers and left padding is n
 from __future__ import annotations
 
 from . import protocol
+from .data import text_tokenizer
 from .thinkcheck import ThinkCheckError
 
 DEFAULT_BATCH = 8
@@ -62,7 +63,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     from . import reshapejob, safetensors_io
     folder = reshapejob._resolve_source(str(job["model"]))
     tok = AutoTokenizer.from_pretrained(str(folder))
-    inner = getattr(tok, "tokenizer", tok)
+    inner = text_tokenizer(tok)
     inner.padding_side = "left"
     if inner.pad_token_id is None:
         inner.pad_token = inner.eos_token

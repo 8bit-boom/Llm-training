@@ -247,7 +247,7 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
             g["id"] = DEFAULT_GENERAL
         name = g.get("file") or g.get("id")
         stats["general_source"] = name
-        inner = data._inner(tokenizer)
+        inner = data.text_tokenizer(tokenizer)
         report: dict = {}
         g.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
@@ -666,7 +666,8 @@ def run_cache(cfg: dict) -> int:
     mode = reshapejob._choose_load(cfg["teacher"].get("load", "auto"), est)
     protocol.progress("cache", 0.0, f"Loading the original model ({mode})")
     model = reshapejob._load(teacher_dir, mode)
-    inner = getattr(tok, "tokenizer", tok)
+    from .data import text_tokenizer
+    inner = text_tokenizer(tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
     window_rows = max(WINDOW_ROWS, batch)
@@ -1053,7 +1054,7 @@ def run(cfg: dict) -> int:
     tokens_planned = sum(len(rows[i]["input_ids"]) for i in order)
     protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text).")
 
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
     cuda = torch.cuda.is_available()
     bf16 = cuda and torch.cuda.get_device_capability(0)[0] >= 8
