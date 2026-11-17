@@ -86,3 +86,30 @@ def not_found_text(what: str, need_convert: bool = False) -> str:
     conv = " and convert_hf_to_gguf.py" if need_convert else ""
     return (f"llama.cpp was not found, so {what}. Install it from https://github.com/ggml-org/llama.cpp (a build that has llama-imatrix{conv}), then tell this program where it is: "
             f"set the environment variable LLAMA_CPP_DIR to its folder. {SEARCH_ORDER} {CAN_INSTALL}")
+
+
+_HELP_CACHE: dict = {}
+
+
+def quantize_help(quantize) -> str:
+    """The text `llama-quantize --help` prints (both output streams: it prints its usage to stderr and exits with 1), cached per program path and modification time. "" when it cannot be run."""
+    import subprocess
+    from . import imatrix
+    p = Path(quantize)
+    try:
+        key = (str(p), p.stat().st_mtime_ns)
+    except OSError:
+        return ""
+    if key not in _HELP_CACHE:
+        try:
+            r = subprocess.run(imatrix.launcher(p) + ["--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", timeout=60)
+            _HELP_CACHE[key] = r.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            _HELP_CACHE[key] = ""
+    return _HELP_CACHE[key]
+
+
+def quantize_supports(quantize, flag: str) -> bool:
+    """Does this llama-quantize list `flag` (such as `--tensor-type-file`) in its help?"""
+    import re
+    return re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", quantize_help(quantize)) is not None

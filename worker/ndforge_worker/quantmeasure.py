@@ -28,10 +28,17 @@ from pathlib import Path
 
 import numpy as np
 
-from . import fsutil, ggufinfo, ggufrows, mixedquant, quantblocks
+from . import fsutil, ggufinfo, ggufrows, imatrix, llamacpp, mixedquant, protocol, quantblocks
 
 MEASURE_VERSION = 1
 RUNGS = ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0")
+# the types a rule may name, lowest bits first
+RULE_ORDER = ("Q2_K", "Q3_K", "Q4_0", "Q4_K", "Q5_0", "Q5_K", "Q5_1", "Q6_K", "Q8_0", "F16")
+# the ftype that makes llama-quantize use a rung as its base type
+FTYPE = {"Q2_K": "Q2_K", "Q3_K": "Q3_K_M", "Q4_K": "Q4_K_M", "Q5_K": "Q5_K_M", "Q6_K": "Q6_K", "Q8_0": "Q8_0"}
+SIMULATED = ("Q4_K_M", "Q5_K_M")
+SELF_CHECK_MIN = 0.999
+COMMAND_LIMIT = 30000          # characters: Windows refuses a command line above 32,767
 DEFAULT_SAMPLE_ROWS = 128
 CAVEATS = ("The error is measured with a diagonal approximation of the importance matrix (it ignores how input channels move together). Every tensor and layer is treated as equally harmful for the "
            "same output error; nothing runs the model. Only about 1 to 3 percent of the rows of each tensor were looked at. With the reference engine the rounding is not the rounding of an "
@@ -278,3 +285,217 @@ def speed_probe(types=("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"), weights: int = 1
             quantblocks.encode(x, t)
             _SPEED[t] = weights / max(time.perf_counter() - t0, 1e-6)
     return {t: _SPEED[t] for t in types}
+
+
+# ------------------------------------------------------------------------------------------------------------------ engine `llama`: the user's own llama-quantize on a small sample file
+
+class LlamaUnusable(Exception):
+    """The llama engine cannot be used here; the text says why and the measurement falls back to the numpy engine."""
+
+
+def _errors(rows, dec, a, pick) -> tuple:
+    """(weighted error, plain error) of decoded rows against the source rows, scaled from the sample to the whole tensor like tensor_record does."""
+    n = rows.shape[0]
+    scale = pick["rows_per_expert"] * pick["experts"] / n
+    arow = np.repeat(a, len(pick["rows"]), axis=0)
+    diff = rows.astype(np.float64) - dec.astype(np.float64)
+    sq = diff * diff
+    return float(scale * np.sum(arow * sq)), float(scale * np.sum(sq))
+
+
+def _read_output(out_path, sample: dict, picks: dict, imp: dict, rows_by_name: dict) -> dict:
+    """Reads what llama-quantize wrote: {tensor: {"eff": the type it ACTUALLY has, "err", "err_plain", "bytes", "raw": bytes}} for every sampled tensor. Raises LlamaUnusable when a sampled
+    tensor is missing, has another shape, or has a type this program cannot decode."""
+    try:
+        info = ggufinfo.read(out_path)
+    except (OSError, ValueError) as exc:
+        raise LlamaUnusable(f"the file llama-quantize wrote could not be read ({exc})")
+    by = {t["name"]: t for t in info["tensors"]}
+    got = {}
+    with open(out_path, "rb") as fh:
+        for name, pick in picks.items():
+            t = by.get(name)
+            if t is None or list(t["dims"]) != ggufrows.sample_dims(pick):
+                raise LlamaUnusable(f"llama-quantize wrote a different set of tensors than it was given ({name} is missing or has another shape)")
+            eff = ggufinfo.type_name(t["type"])
+            if eff not in quantblocks.BLOCK:
+                raise LlamaUnusable(f"llama-quantize gave {name} the type {eff}, which this program cannot read back")
+            n = len(ggufrows.flat_rows(pick))
+            fh.seek(info["data_start"] + t["offset"])
+            raw = fh.read(n * quantblocks.row_bytes(eff, pick["cols"]))
+            dec = quantblocks.decode(raw, eff, n, pick["cols"])
+            err, plain = _errors(rows_by_name[name], dec, imp[name], pick)
+            got[name] = {"eff": eff, "err": err, "err_plain": plain, "bytes": int(pick["cols"] * pick["rows_per_expert"] * pick["experts"] * ggufinfo.BPW[eff] / 8), "raw": raw}
+    return got
+
+
+def _command(quantize, flags: list, sample, out, ftype: str, cache_dir, tag: str, rules=None, use_file=False) -> list:
+    """launcher + flags + the rules (as a type file when the tool has `--tensor-type-file`, else as repeated `--tensor-type`) + the files and the ftype. LlamaUnusable above the command limit."""
+    cmd = imatrix.launcher(quantize) + list(flags)
+    if rules:
+        if use_file:
+            tf = Path(cache_dir) / f"{tag}.tensor-types.txt"
+            tf.write_text("".join(f"{rx}={t}\n" for rx, t in rules), encoding="utf-8")
+            cmd += ["--tensor-type-file", str(tf)]
+        else:
+            for rx, t in rules:
+                cmd += ["--tensor-type", f"{rx}={t}"]
+    cmd += [str(sample), str(out), ftype]
+    if len(" ".join(cmd)) >= COMMAND_LIMIT:
+        raise LlamaUnusable("the command is too long for this system and this llama-quantize has no --tensor-type-file: update llama.cpp (this plan needs --tensor-type-file)")
+    return cmd
+
+
+def measure_llama(src: dict, imp: dict, opts: dict, cache_dir, quantize, matrix=None, im=None, progress=lambda done, total, name: None) -> dict:
+    """The llama engine. Writes a small sample GGUF (ggufrows.write_sample), runs the user's llama-quantize on it once per rung (`--pure` so that every tensor gets the rung's type, with
+    `--imatrix` when there is a matrix: the rounding is then exactly the rounding of the real export, importance weighting included), then once each for the plain Q4_K_M and Q5_K_M (llama.cpp's
+    own mixture), reads every output back with quantblocks.decode and records the type each tensor ACTUALLY got. Before that a self-check runs `Q4_K_M --pure` WITHOUT the matrix and compares
+    the blocks with the numpy engine's: at least 99.9 percent must be identical (the rest can differ by compiler floating-point details), else LlamaUnusable. `im` is {"stop_file"}: the STOP file
+    kills the running tool and raises Stopped; what was measured is in the cache and a new run resumes at the next rung. Returns the measures like `measure`, plus "selfcheck" and "simulated"."""
+    rungs = tuple(opts.get("rungs") or RUNGS)
+    n_rows = int(opts.get("sample_rows") or DEFAULT_SAMPLE_ROWS)
+    seed = int(opts.get("seed") or 0)
+    key = opts["key"]
+    cache_dir = Path(cache_dir)
+    stop = (lambda: imatrix.stop_requested(im)) if im else (lambda: False)
+    if quantize is None or not Path(quantize).is_file():
+        raise LlamaUnusable("llama-quantize was not found")
+    picks = ggufrows.sample_plan(src, n_rows, seed)
+    data = _load_cache(cache_dir, key)
+    if data.get("engine") not in (None, "llama") and data["tensors"]:
+        data = {"version": MEASURE_VERSION, "key": key, "tensors": {}, "skipped": [], "notes": [], "done": False}
+    data.update({"engine": "llama", "sample_rows": n_rows, "seed": seed, "rungs": list(rungs), "done": False})
+    data.setdefault("llama_runs", {})
+    data.setdefault("simulated", {})
+    sample_path = cache_dir / "sample.gguf"
+    est = int(sum(len(ggufrows.flat_rows(pk)) * pk["cols"] for pk in picks.values()) * 2.2)
+    if not sample_path.is_file():
+        free = fsutil.free_bytes(cache_dir)
+        if free < est * 2.2:
+            raise LlamaUnusable(f"there is not enough free disk space for the sample file ({est * 2.2 / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free)")
+        with protocol.timed("measure_read", sampled_weights=est):
+            ggufrows.write_sample(src, sample_path, picks)
+    sample = ggufrows.open_source(sample_path)
+    sby = {t["name"]: t for t in sample["tensors"]}
+    rows_by_name = {n: ggufrows.read_rows(sample, sby[n], range(len(ggufrows.flat_rows(pk)))) for n, pk in picks.items()}
+    bad = [n for n, r in rows_by_name.items() if not np.isfinite(r).all()]
+    for n in bad:
+        data["skipped"].append(n)
+        data["notes"].append(f"{n} holds numbers that are not finite (NaN or infinity) in the sampled rows; it was left out of the measurement and is kept at a high type.")
+        picks.pop(n)
+        rows_by_name.pop(n)
+    use_file = llamacpp.quantize_supports(quantize, "--tensor-type-file")
+    mflags = ["--imatrix", str(matrix)] if matrix else []
+    total_runs = 1 + len(rungs) + len(SIMULATED)
+    done_runs = [0]
+
+    def run(tag, flags, ftype, rules=None):
+        if stop():
+            raise Stopped()
+        out = cache_dir / f"{tag}.gguf.partial"
+        out.unlink(missing_ok=True)
+        cmd = _command(quantize, flags, sample_path, out, ftype, cache_dir, tag, rules, use_file)
+        try:
+            with protocol.timed("measure_llama", run=tag):
+                rc, tail = imatrix.run_streaming(cmd, im or {}, 1, None)
+        except imatrix.Stopped:
+            out.unlink(missing_ok=True)
+            raise Stopped()
+        if rc != 0 or not out.is_file():
+            out.unlink(missing_ok=True)
+            raise LlamaUnusable(f"llama-quantize exited with code {rc} on the sample file" + (f" ({tail[-1][:200]})" if tail else ""))
+        try:
+            return _read_output(out, sample, picks, imp, rows_by_name)
+        finally:
+            out.unlink(missing_ok=True)
+
+    # the self-check: the numpy engine and llama-quantize make the same blocks without a matrix
+    if "selfcheck" not in data:
+        got = run("selfcheck", ["--pure"], "Q4_K_M")
+        same = blocks = 0
+        for n, g in got.items():
+            if g["eff"] != "Q4_K":
+                continue
+            ref = quantblocks.encode(rows_by_name[n], "Q4_K").reshape(-1, quantblocks.BLOCK["Q4_K"][1])
+            mine = np.frombuffer(g["raw"], dtype=np.uint8).reshape(-1, quantblocks.BLOCK["Q4_K"][1])
+            same += int((ref == mine).all(axis=1).sum())
+            blocks += ref.shape[0]
+        frac = same / blocks if blocks else 0.0
+        data["selfcheck"] = {"identical": round(frac, 6), "blocks": blocks, "passed": bool(blocks and frac >= SELF_CHECK_MIN)}
+        save_cache(cache_dir, data)
+    sc = data["selfcheck"]
+    if not sc["passed"]:
+        raise LlamaUnusable(f"the self-check failed: only {sc['identical'] * 100:.2f} percent of the blocks llama-quantize made without a matrix equal the numpy engine's (at least {SELF_CHECK_MIN * 100:.1f} percent are required)")
+    done_runs[0] += 1
+    progress(done_runs[0], total_runs, "selfcheck")
+    for rung in rungs:
+        if rung in data["llama_runs"]:
+            done_runs[0] += 1
+            continue
+        assign = {n: mixedquant.effective_type(rung, pk["cols"]) for n, pk in picks.items()}
+        odd = {n: t for n, t in assign.items() if t != rung}
+        rules = mixedquant._compress(odd, order=RULE_ORDER) if odd else []
+        rules.append((".*", rung))
+        got = run("rung-" + rung.lower(), ["--pure"] + mflags + ["--output-tensor-type", rung, "--token-embedding-type", rung], FTYPE[rung], rules)
+        data["llama_runs"][rung] = {n: {k: v for k, v in g.items() if k != "raw"} for n, g in got.items()}
+        wrong = sorted(n for n, g in got.items() if g["eff"] != assign[n])
+        if wrong:
+            data["notes"].append(f"llama-quantize gave {len(wrong)} tensor(s) another type than {rung} asked for at the {rung} rung (for example {wrong[0]}: {got[wrong[0]]['eff']}); the type it really gave was measured.")
+        save_cache(cache_dir, data)
+        done_runs[0] += 1
+        progress(done_runs[0], total_runs, rung)
+    for ft in SIMULATED:
+        if ft in data["simulated"]:
+            done_runs[0] += 1
+            continue
+        got = run("plain-" + ft.lower(), mflags, ft)
+        data["simulated"][ft] = {n: {k: v for k, v in g.items() if k != "raw"} for n, g in got.items()}
+        save_cache(cache_dir, data)
+        done_runs[0] += 1
+        progress(done_runs[0], total_runs, ft)
+    # compose the same records the numpy engine makes
+    tensors = {}
+    for name, pick in picks.items():
+        n = len(ggufrows.flat_rows(pick))
+        scale = pick["rows_per_expert"] * pick["experts"] / n
+        w = rows_by_name[name].astype(np.float64)
+        arow = np.repeat(imp[name], len(pick["rows"]), axis=0)
+        rec = {"rows": pick["rows_per_expert"] * pick["experts"], "cols": pick["cols"], "experts": pick["experts"], "sampled": n, "norm2_w": float(scale * np.sum(arow * w * w)), "types": {}}
+        for rung in rungs:
+            r = data["llama_runs"][rung][name]
+            rec["types"][rung] = {"eff": r["eff"], "bytes": r["bytes"], "err": r["err"], "err_plain": r["err_plain"]}
+        tensors[name] = rec
+    data["tensors"] = tensors
+    data["notes"] = sorted(set(data["notes"]))
+    data["done"] = True
+    save_cache(cache_dir, data)
+    sample_path.unlink(missing_ok=True)
+    return data
+
+
+def measure_any(src: dict, imp: dict, opts: dict, cache_dir, quantize=None, matrix=None, im=None, should_stop=None, progress=lambda done, total, name: None) -> dict:
+    """The measurement with the engine asked for in opts["engine"]: "reference" (numpy), "llama", or "auto" (llama when llama-quantize is given, else numpy). A cache that is complete is
+    returned as it is. When the llama engine cannot be used the numpy engine measures instead, with a note saying why; Stop raises Stopped either way."""
+    engine = opts.get("engine") or "auto"
+    stop = should_stop or ((lambda: imatrix.stop_requested(im)) if im else (lambda: False))
+    cached = _load_cache(Path(cache_dir), opts["key"])
+    if cached.get("done"):
+        return cached
+    note = None
+    if engine in ("auto", "llama"):
+        if quantize is None:
+            note = "llama-quantize was not found, so the numpy engine measured (its rounding is not the importance-matrix rounding of an export)."
+        else:
+            try:
+                return measure_llama(src, imp, opts, cache_dir, quantize, matrix, im, progress)
+            except LlamaUnusable as exc:
+                note = f"The llama engine could not be used ({exc}); the numpy engine measured instead (its rounding is not the importance-matrix rounding of an export)."
+        protocol.log(note)
+        stale = _load_cache(Path(cache_dir), opts["key"])
+        if stale.get("engine") == "llama":
+            save_cache(cache_dir, {"version": MEASURE_VERSION, "key": opts["key"], "tensors": {}, "skipped": [], "notes": [], "done": False})
+    out = measure(src, imp, opts, cache_dir, stop, progress)
+    if note:
+        out["notes"] = sorted(set(out["notes"]) | {note})
+        save_cache(cache_dir, out)
+    return out

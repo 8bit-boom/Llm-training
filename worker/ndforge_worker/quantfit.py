@@ -30,7 +30,7 @@ DESCRIPTION = "Mixed precision (our own recipe): each tensor's error measured on
 LADDER = quantmeasure.RUNGS
 DEFAULT_FLOOR, DEFAULT_CEILING = "Q3_K", "Q8_0"
 # the types a rule may name, lowest bits first (bits per weight: 2.625, 3.4375, 4.5, 4.5, 5.5, 5.5, 6.0, 6.5625, 8.5, 16); ties by this order
-ORDER = ("Q2_K", "Q3_K", "Q4_0", "Q4_K", "Q5_0", "Q5_K", "Q5_1", "Q6_K", "Q8_0", "F16")
+ORDER = quantmeasure.RULE_ORDER
 PLAIN_SIZES = ("Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0")
 MARGIN_BYTES = 64 << 10              # the budget keeps this and 32 bytes per tensor free for the header and the alignment of the output file
 
