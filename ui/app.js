@@ -336,7 +336,7 @@ function renderTrain() {
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
   const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
     ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
-    ${tr.error ? `<div class="err">${esc(tr.error)}</div>` : ""}${tr.notice ? `<div class="ok">${esc(tr.notice)}</div>` : ""}
+    ${tr.error ? errDiv(tr.error) : ""}${tr.notice ? `<div class="ok">${esc(tr.notice)}</div>` : ""}
     ${(() => { const m = tr.metrics.at(-1); return m ? `<div class="stats"><span>Step <strong>${m.step}/${m.total_steps}</strong></span><span>Loss <strong>${(+m.loss).toFixed(3)}</strong></span><span>Memory peak <strong>${m.vram_mb ? (m.vram_mb / 1024).toFixed(1) + " GB" : "–"}</strong></span>${m.tok_s ? `<span>Speed <strong>${m.tok_s.toLocaleString()} tokens/s</strong></span>` : ""}${m.pad_pct != null ? `<span title="Share of the computed tokens that are padding (wasted)">Padding <strong>${m.pad_pct} %</strong></span>` : ""}<span>GPU <strong>${m.gpu_temp != null ? m.gpu_temp + " °C" : "–"}</strong></span><span>Time left <strong>${fmtEta(m.eta_s)}</strong></span></div>` : ""; })()}
     ${speedHtml()}${lossChart(tr.metrics.filter((m) => m.kind === "metric" || m.type === "metric"))}${samplesHtml()}
     ${tr.log.length ? `<details><summary>Log</summary><pre class="log">${tr.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>` : "";
@@ -1611,6 +1611,39 @@ let lc = { status: null, planning: false, confirm: null, running: false, step: "
 const LLAMA_MARK = "[llama_cpp_missing]";                // the program ends the text of a worker error with this when llama.cpp (or a part of it) was not found
 const llamaMarked = (t) => typeof t === "string" && t.includes(LLAMA_MARK);
 const stripLlamaMark = (t) => (typeof t === "string" ? t.split(LLAMA_MARK).join("").trim() : t);
+
+// ------------------------------------------------------------------------------------------------------------ worker errors -> fix-it buttons
+// The program ends a worker error with ` [fix:<code>]` for some codes (envmgr/jobs.rs FIX_CODES, and missing_module for a missing Python library). fixActions() takes the marks out of
+// the text for display and gives the buttons for them; fixDo() does what a button says. Codes without a button here (distill_unstable, reshape_refused, bad_job) only lose the mark.
+const FIX_RE = /\s*\[fix:([a-z_]+)\]/g;
+const FIX_BUTTONS = { disk_full: [["open", "Open the project folder"]], distill_oom: [["safer", "Use safer settings"]], missing_module: [["repair", "Repair the training software"]] };
+function fixActions(text) {
+  if (typeof text !== "string") return { text, html: "" };
+  const codes = [];
+  const shown = text.replace(FIX_RE, (_, c) => { codes.push(c); return ""; }).trim();
+  const btns = [...new Set(codes)].flatMap((c) => FIX_BUTTONS[c] || []).map(([act, label]) => `<button class="secondary" data-fix="${act}">${esc(label)}</button>`).join(" ");
+  return { text: shown, html: btns ? `<div class="row fix-row">${btns}</div>` : "" };
+}
+// `<div class="err">…</div>` for a worker error, with its buttons (tag: "div" or "p")
+function errDiv(text, tag) {
+  const f = fixActions(text);
+  return `<${tag || "div"} class="err">${esc(f.text)}</${tag || "div"}>${f.html}`;
+}
+function healUseSafer() {
+  const s = rs.hl && rs.hl.opts && rs.hl.opts.safer, hs = rs.hlSpec;
+  if (!s || !hs) return false;
+  hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null;
+  return true;
+}
+async function fixDo(act) {
+  try {
+    if (act === "open") await invoke("imatrix_open_folder", { path: (state && state.project && state.project.folder) || "" });
+    else if (act === "safer") {
+      if (rs.hl && rs.hl.name) await rsLoadHeal(rs.hl.name);
+      if (healUseSafer()) { render(); rsHealEstimate(); } else render();
+    } else if (act === "repair") { await go("setup"); startEnv("env_install", { unsloth: !env.noUnsloth }); }
+  } catch (e) { alert(String(e)); }
+}
 const LC_WHY = { all: "It is needed to make GGUF files with llama.cpp (the importance matrix, the mixed sizes).", imatrix: "It is needed to measure an importance matrix.", perplexity: "Compare quants needs its llama-perplexity program.", merge: "Merging matrices needs its llama-imatrix program." };
 
 // is a part that the page needs missing? (null status = not known yet: say nothing)
@@ -1731,7 +1764,7 @@ function llamaNotice(need, force) {
 // an error box; a worker error that ends with the mark gets the install button under it
 function errBox(text, need) {
   if (!text) return "";
-  const body = `<div class="err">${esc(stripLlamaMark(text))}</div>`;
+  const body = errDiv(stripLlamaMark(text));
   return llamaMarked(text) ? body + llamaNotice(need || "all", true) : body;
 }
 
@@ -2287,7 +2320,7 @@ function healSection() {
     : `<label>Original model (the teacher) <select id="hs-teacher" ${dis}>${tOpts}</select></label>${tMore}${guessNote}`;
   const checking = h.checking ? `<p class="dim" id="hs-checking">Checking the two models (their files are read; nothing is loaded or downloaded)…</p>` : "";
   const list = h.check && h.checkKey === hsKey() ? hsChecks(h.check) : "";
-  const err = h.err ? `<div class="err">${esc(h.err)}</div>` : "";
+  const err = h.err ? errDiv(h.err) : "";
   let body = "";
   if (hsCardMode() && st0 && made.some((m) => m.name === st0.name)) body = `<p class="dim small" id="hs-cardnote">The settings, the estimate and the Start button for this model are in its result card below (<strong>Heal it</strong>). Pick another original above to teach it from a different model.</p>`;
   else if (rs.hl && rs.hl.pair && rs.hl.opts) {
@@ -2436,7 +2469,7 @@ function autoCard() {
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
     ${live ? `<div class="stepline" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
-    ${ac.err ? `<div class="err">${esc(ac.err)}</div>` : ""}${status}${steps}${rep}</div>`;
+    ${ac.err ? errDiv(ac.err) : ""}${status}${steps}${rep}</div>`;
 }
 
 function onAutoEvent(p) {
@@ -2511,7 +2544,7 @@ function thinkCard(m) {
     ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
     ${tk.run && tk.run.name === m.name ? `<div class="stepline">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
-    ${tk.err ? `<p class="err">${esc(tk.err)}</p>` : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
+    ${tk.err ? errDiv(tk.err, "p") : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
 }
 
 async function tkLoad(name) {
@@ -2822,7 +2855,7 @@ function renderReshape() {
     <p><strong>Grow</strong> copies a stretch of layers in. It starts out answering exactly like the original, and is then trained. <strong>Honest expectation:</strong> from one world's text the gain is usually small or none, and it needs about 40 % more memory, disk space and time. It pays off with much more training text than a world has.</p>
     <p><strong>Thinner layers</strong> (Qwen3.5 and 3.8 only) keep every layer but make each one narrower: the neurons that matter least, measured on your own text, are taken out of the MLP of every layer. This usually keeps more quality than removing whole layers for the same size, but it is slower to run, and it needs <strong>healing</strong>: the original model teaches the thinner one to answer like it did, which takes hours.</p>
     <p>Always test the new model, and usually train it in Step 3 afterwards.</p></div>`;
-  const msg = (rs.error ? `<div class="err">${esc(rs.error)}</div>` : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
+  const msg = (rs.error ? errDiv(rs.error) : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
   const modelOpts = st.models.map((m) => `<option value="${esc(m.id)}" ${m.id === rs.model ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("");
   const op = rs.options, ins = op && op.inspect;
   let info = "";
@@ -3089,7 +3122,7 @@ function wireReshape() {
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
   on("hl-reset", () => { Object.assign(hs, HEAL_AUTO); render(); rsHealEstimate(); });
-  on("hl-safer", () => { const s = rs.hl.opts.safer; if (!s) return; hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null; render(); rsHealEstimate(); });
+  on("hl-safer", () => { if (!healUseSafer()) return; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
   hv("hl-mode", (e) => { hs.mode = e.value; });
   on("hl-go", async () => {
@@ -3159,6 +3192,7 @@ function wire() {
     if (dir) openProject(dir);
   });
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
+  document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   on("choose", async () => {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });
     if (f) checkFile(f);

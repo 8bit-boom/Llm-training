@@ -14,6 +14,21 @@ use crate::error::{Error, Result};
 pub const LLAMA_CPP_MISSING: &str = "llama_cpp_missing";
 pub const LLAMA_CPP_MISSING_MARK: &str = "[llama_cpp_missing]";
 
+/// Worker error codes the window can offer a button for. The error text then ends with ` [fix:<code>]` (after the `(details: ...)` part, before nothing else): the window
+/// strips the mark for display and shows the buttons (`fixActions` in ui/app.js). `[llama_cpp_missing]` is the older mark of the same kind and stays as it was.
+pub const FIX_CODES: [&str; 5] = ["disk_full", "distill_oom", "distill_unstable", "reshape_refused", "bad_job"];
+/// The mark for a text whose worker said a Python library is missing (any job: the worker explains it the same way everywhere).
+pub const FIX_MISSING_MODULE: &str = "[fix:missing_module]";
+
+/// The ` [fix:...]` mark for a worker error, or None.
+pub fn fix_mark(code: &str, text: &str) -> Option<String> {
+    let low = text.to_lowercase();
+    if FIX_CODES.contains(&code) {
+        return Some(format!("[fix:{code}]"));
+    }
+    ["no module named", "training library is missing", "training software is incomplete"].iter().any(|m| low.contains(m)).then(|| FIX_MISSING_MODULE.to_string())
+}
+
 /// What the worker reports while it runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerEvent {
@@ -135,6 +150,8 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
             }
             if failure_code == LLAMA_CPP_MISSING {
                 text = format!("{text} {LLAMA_CPP_MISSING_MARK}");
+            } else if let Some(mark) = fix_mark(&failure_code, &text).filter(|_| failure.is_some()) {
+                text = format!("{text} {mark}");
             }
             Err(Error::new(text))
         }

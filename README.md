@@ -190,6 +190,13 @@ Above the Start button of Auto-cut, healing, export, the thinking check, Compare
 from the model and sizes, healing's answers, Auto-cut's plan), the card's memory estimate, a saved training-data version, a Windows folder name with accents (llama.cpp), another program using the same settings folder
 and the Unsloth Studio folder. A red light disables Start and says what to do; yellow lights only warn. The list is asked for again after 15 seconds, when the page's facts change and when the install or llama.cpp finishes.
 
+## Fix-it buttons
+
+A worker error with one of the codes `disk_full`, `distill_oom`, `distill_unstable`, `reshape_refused`, `bad_job`, or a message about a missing Python library, ends with a mark (`[fix:<code>]`, `[fix:missing_module]`)
+after the `(details: logs/jobs/...)` part (`envmgr::jobs::fix_mark`); `[llama_cpp_missing]` is the older mark and stays last. The window (`fixActions` in `ui/app.js`) removes the marks from the text and
+shows a button under it: disk full opens the project folder, an out-of-memory heal offers the next safer setting (`heal_options`, the same one as "Try again with safer settings"), a missing library starts
+"Install the training software" again, llama.cpp offers its installer. The other codes only lose their mark. Marks are added to worker errors only, never to "Cancelled." or to a worker that died silently.
+
 ## One program at a time
 
 The program takes an exclusive lock on `<settings folder>/instance.lock` as it starts (`ndforge_core::instance`) and keeps it until it ends; the system lets go of it when the program dies, however it dies. A second
