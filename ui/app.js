@@ -55,7 +55,10 @@ function renderWelcome() {
     ${msgHtml()}
     <div class="row"><button class="secondary" id="openp">Open an existing project…</button></div>
     ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}
-    ${state.project ? `<div class="row"><label class="opt" title="An Auto-cut or a healing that was cut off by closing the program (or a crash) is put in the queue and goes on where it stopped, when the project is opened."><input type="checkbox" id="auto-continue" ${state.settings.auto_continue_interrupted ? "checked" : ""}> Go on by itself with what was cut off when I open the project</label></div>` : ""}`;
+    ${state.project ? `<div class="row"><label class="opt" title="An Auto-cut or a healing that was cut off by closing the program (or a crash) is put in the queue and goes on where it stopped, when the project is opened."><input type="checkbox" id="auto-continue" ${state.settings.auto_continue_interrupted ? "checked" : ""}> Go on by itself with what was cut off when I open the project</label></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="notify-on" ${state.settings.notifications !== false ? "checked" : ""}> Tell me when a job or the queue has finished (a message from the system)</label></div>
+    <div class="row"><label>Web address that gets one line when a job ends (optional, for example an ntfy topic) <input type="text" id="webhook-url" value="${esc(state.settings.webhook_url || "")}" placeholder="https://ntfy.sh/my-topic" style="min-width:280px"></label><button class="secondary" id="webhook-save">Save</button></div>
+    <p class="dim small">The line says only what kind of job it was and how it ended, never a name or a folder.</p>` : ""}`;
 }
 
 function bundleCard() {
@@ -333,7 +336,7 @@ function renderTrain() {
     <button class="secondary" id="tr-stop" title="Finishes the current step, saves a checkpoint and stops. The run can be continued later, even after closing the program." ${tr.running && !tr.stopping ? "" : "disabled"}>${tr.stopping ? "Stopping…" : "Stop and save"}</button>
     ${canResume ? `<button class="secondary" id="tr-resume" data-run="${esc(last.name)}">Continue the last run (${esc(last.model)}${last.step ? `, from step ${last.step}${last.total_steps ? " of " + last.total_steps : ""}` : ""})</button>` : ""}</div>
     <div class="row power"><label class="opt" title="Stops the computer from going to sleep while a training runs (the screen may still turn off). Applies from the next start."><input type="checkbox" id="tr-awake" ${state.settings.keep_awake ? "checked" : ""} ${tr.running ? "disabled" : ""}> Keep this computer awake during training</label>
-      <label class="opt" title="When a training has finished normally, the computer is switched off after a 60-second warning that you can cancel. Not after a stop or an error. Switches itself off again after use."><input type="checkbox" id="tr-shutdown" ${tr.shutdownAfter ? "checked" : ""}> Shut down this computer when training has finished</label></div>`;
+      <label class="opt" title="When a job has finished normally and the queue has nothing more to do, the computer is switched off after a 60-second warning that you can cancel. Not after a stop or an error. Switches itself off again after use."><input type="checkbox" id="tr-shutdown" ${tr.shutdownAfter ? "checked" : ""}> Shut down this computer when the training and the queue have finished</label></div>`;
   const env = !st.env_ready ? `<div class="err">The training software is not installed yet. Open "⚙ Training setup" first.</div>` : "";
   const live = (tr.running || tr.metrics.length || tr.error || tr.notice) ? `<div class="card wide"><h2>${tr.running ? "Training…" : "Last run"}</h2>
     ${tr.stepText ? `<div class="stepline">${esc(tr.stepText)}</div>` : ""}${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}
@@ -412,7 +415,7 @@ function onPowerEvent(p) {
   if (p.kind === "failed") { gone(); tr.error = p.text; if (page === "train") render(); return; }
   if (!bar) { bar = document.createElement("div"); bar.id = "powerbar"; document.body.appendChild(bar); }
   if (p.kind === "shutting_down") { bar.textContent = "Shutting down now…"; return; }
-  bar.innerHTML = `<span>Training finished. This computer shuts down in <strong>${p.left}</strong> s.</span> <button id="pw-cancel">Cancel shutdown</button>`;
+  bar.innerHTML = `<span>Everything has finished. This computer shuts down in <strong>${p.left}</strong> s.</span> <button id="pw-cancel">Cancel shutdown</button>`;
   document.getElementById("pw-cancel").onclick = () => invoke("cancel_shutdown");
 }
 
@@ -3249,6 +3252,8 @@ function wire() {
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   wireQueue();
+  const nf = $("notify-on"); if (nf) nf.onchange = async () => { try { setState(await invoke("set_setting", { key: "notifications", value: nf.checked })); } catch (e) { alert(String(e)); } };
+  const wh = $("webhook-save"); if (wh) wh.onclick = async () => { try { setState(await invoke("webhook_set", { url: ($("webhook-url") || {}).value || "" })); } catch (e) { alert(String(e)); } };
   const ac2 = $("auto-continue"); if (ac2) ac2.onchange = async () => { try { setState(await invoke("set_setting", { key: "auto_continue_interrupted", value: ac2.checked })); } catch (e) { alert(String(e)); } };
   on("choose", async () => {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });

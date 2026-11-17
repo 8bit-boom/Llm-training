@@ -14,6 +14,7 @@ pub mod general;
 pub mod help;
 pub mod instance;
 pub mod model;
+pub mod notify;
 pub mod paths;
 pub mod power;
 pub mod preflight;

@@ -193,6 +193,13 @@ the checklist is skipped with the reason, a failed one is marked and the queue g
 Setting `auto_continue_interrupted` (default off; the checkbox on the Home page): when a project is opened, an Auto-cut run or a heal that was cut off by closing the program or a crash (`interrupted: true`
 in `auto.json` / `heal.json`, set when it is marked stopped) is put in the queue and the queue runs. A stop by the person is left alone, and a heal that belongs to the interrupted Auto-cut goes on with the run.
 
+## Notifications and shutdown
+
+When a job or the queue ends the program shows a system notification ("Healing finished", or "Healing failed" with the first sentence of the error; `tauri-plugin-notification`, isolated in the `Notifier` trait in
+`src-tauri/src/lib.rs`; setting `notifications`, default on) and, when the queue has run out, how many entries ended each way. An optional web address (`webhook_url`, an ntfy-style topic, default empty) gets one plain-text
+POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
+computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
+
 ## Before you start
 
 Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the

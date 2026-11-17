@@ -66,3 +66,14 @@ test("a refusal from the program is shown, not lost", async () => {
   await b.run(`quAdd("export", null)`);
   assert.equal(b.run("qu.note"), "Open a project first.");
 });
+
+test("the Home page has the notification and webhook settings once a project is open", () => {
+  const b = browser();
+  b.run(`state = ${JSON.stringify({ project: { name: "P", folder: "/p" }, recent: [], settings: { notifications: true, webhook_url: "https://ntfy.sh/t" } })}`);
+  const html = b.run("renderWelcome()");
+  assert.match(html, /id="notify-on" checked/);
+  assert.match(html, /id="webhook-url" value="https:\/\/ntfy\.sh\/t"/);
+  assert.match(html, /never a name or a folder/);
+  b.run(`state.project = null`);
+  assert.doesNotMatch(b.run("renderWelcome()"), /webhook-url/);
+});

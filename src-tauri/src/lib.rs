@@ -433,7 +433,7 @@ fn export_state(s: State<App>) -> Out<Value> {
 #[tauri::command]
 fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: String, quant: String, num_ctx: u32, what: Option<String>, quants: Option<Vec<String>>, imatrix: Option<ndforge_core::export::runs::ImatrixOptions>, mixed: Option<ndforge_core::export::runs::MixedOptions>) -> Out<()> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "export-event", move |cancel, emit| {
+    spawn_task_as(app, &tasks, "export-event", "export", move |cancel, emit| {
         let list = quants.filter(|q| !q.is_empty()).unwrap_or_else(|| vec![quant]);
         let mut metas = ndforge_core::export::runs::execute_many_full(&project, &run, &list, num_ctx, what.as_deref().unwrap_or("gguf"), &imatrix.unwrap_or_default(), &mixed.unwrap_or_default(), cancel, emit).map_err(|e| e.to_string())?;
         // one size: its export; several: a summary naming them all
@@ -463,7 +463,7 @@ fn imatrix_list(s: State<App>) -> Out<Value> {
 fn imatrix_create(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::export::imatrix_lib::MakeSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::create(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+    spawn_task_as(app, &tasks, "imatrix-event", "imatrix_make", move |cancel, emit| ndforge_core::export::imatrix_lib::create(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -503,7 +503,7 @@ fn imatrix_open_folder(s: State<App>, id: Option<String>, path: Option<String>) 
 #[tauri::command]
 fn imatrix_make_dat(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, id: String) -> Out<()> {
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::make_dat(&project, &id, cancel, emit).map_err(|e| e.to_string()))
+    spawn_task_as(app, &tasks, "imatrix-event", "imatrix_make", move |cancel, emit| ndforge_core::export::imatrix_lib::make_dat(&project, &id, cancel, emit).map_err(|e| e.to_string()))
 }
 
 /// Deletes an entry (refused while a job uses it). Returns the new state of the card.
@@ -520,7 +520,7 @@ fn imatrix_delete(s: State<App>, id: String) -> Out<Value> {
 fn imatrix_merge(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::export::imatrix_lib::MergeSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_lib::merge(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+    spawn_task_as(app, &tasks, "imatrix-event", "imatrix_make", move |cancel, emit| ndforge_core::export::imatrix_lib::merge(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
 }
 
 /// Looks up Unsloth's published matrix for a base model on the Hub (its repo, file and size; nothing is downloaded).
@@ -544,7 +544,7 @@ fn imatrix_adapt_preview(s: State<App>, spec: Value) -> Out<Value> {
 fn imatrix_adapt(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::export::imatrix_adapt::AdaptSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "imatrix-event", move |cancel, emit| ndforge_core::export::imatrix_adapt::adapt(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+    spawn_task_as(app, &tasks, "imatrix-event", "imatrix_make", move |cancel, emit| ndforge_core::export::imatrix_adapt::adapt(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
 }
 
 /// The light check before an export: does this matrix seem to fit the model of `run`? {"warnings": [...], ...}; never a refusal.
@@ -575,7 +575,7 @@ fn quantcheck_plan(s: State<App>, reference: Option<String>) -> Out<Value> {
 fn quantcheck_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::export::quantcheck::CompareSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_task(app, &tasks, "quantcheck-event", move |cancel, emit| ndforge_core::export::quantcheck::compare(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
+    spawn_task_as(app, &tasks, "quantcheck-event", "quantcheck", move |cancel, emit| ndforge_core::export::quantcheck::compare(&project, &spec, cancel, emit).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -808,6 +808,19 @@ fn preflight(s: State<App>, kind: String, spec: Value) -> Out<Value> {
     let project = lock(&s).project.clone();
     let checks = ndforge_core::preflight::check(project.as_ref(), &kind, &spec);
     Ok(serde_json::json!({"checks": checks, "can_start": ndforge_core::preflight::can_start(&checks)}))
+}
+
+/// The optional webhook (an ntfy-style address that gets one line when a job ends: its kind and how it ended). An empty text turns it off.
+#[tauri::command(async)]
+fn webhook_set(s: State<App>, url: String) -> Out<Value> {
+    let url = url.trim().to_string();
+    if !url.is_empty() && !ndforge_core::notify::valid_webhook(&url) {
+        return Err("The address must start with http:// or https:// and have no spaces.".into());
+    }
+    let mut m = lock(&s);
+    m.settings.webhook_url = url;
+    m.settings.save();
+    Ok(m.state())
 }
 
 /// The memory of this computer's first graphics card in GB (None when there is none or it cannot be read).
@@ -1209,6 +1222,49 @@ fn queue_kick(app: &tauri::AppHandle) {
     }
 }
 
+/// Nothing runs and nothing waits in the queue.
+fn queue_idle(app: &tauri::AppHandle) -> bool {
+    !app.state::<Tasks>().busy.load(Ordering::SeqCst) && queue_edit(app, |q| q.running().is_none() && !q.items.iter().any(|i| i.status == "queued"))
+}
+
+/// Shows a message to the person outside the window. The plugin call lives here only: a build or a platform without it changes this one function.
+trait Notifier {
+    fn show(&self, title: &str, body: &str);
+}
+struct Toast(tauri::AppHandle);
+impl Notifier for Toast {
+    fn show(&self, title: &str, body: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = self.0.notification().builder().title(title).body(body).show();
+    }
+}
+
+/// The notifications and the webhook for a job that ended (settings: `notifications`, `webhook_url`).
+fn tell_about(app: &tauri::AppHandle, kind: &str, r: &Result<Value, String>, queue_finished: Option<(usize, usize, usize, usize)>) {
+    let (on, hook) = {
+        let st = app.state::<App>();
+        let m = st.0.lock().unwrap_or_else(|e| e.into_inner());
+        (m.settings.notifications, m.settings.webhook_url.clone())
+    };
+    if kind == "task" {
+        return;                         // an install or a check of the setup page: the window shows it
+    }
+    let status = ndforge_core::notify::status_of(r);
+    if on {
+        let toast = Toast(app.clone());
+        let (t, b) = ndforge_core::notify::toast(kind, r);
+        toast.show(&t, &b);
+        if let Some((d, f, s, x)) = queue_finished {
+            let (t, b) = ndforge_core::notify::queue_toast(d, f, s, x);
+            toast.show(&t, &b);
+        }
+    }
+    if ndforge_core::notify::valid_webhook(&hook) {
+        let kind = kind.to_string();
+        std::thread::spawn(move || { ndforge_core::notify::send_webhook(&hook, &kind, status); });
+    }
+}
+
 /// A job has ended (its end event is sent and the busy flag is free): the queue item that was running gets its result, and the next one starts.
 fn job_ended(app: &tauri::AppHandle, _kind: &str, r: &Result<Value, String>) {
     let stopped = match r {
@@ -1236,6 +1292,12 @@ fn job_ended(app: &tauri::AppHandle, _kind: &str, r: &Result<Value, String>) {
         queue_changed(app);
     }
     queue_kick(app);
+    // the queue has run out: say how it went
+    let finished = had.then(|| queue_edit(app, |q| {
+        let n = |s: &str| q.items.iter().filter(|i| i.status == s).count();
+        (q.running().is_none() && n("queued") == 0 && !q.paused).then(|| (n("done"), n("failed"), n("skipped"), n("stopped")))
+    })).flatten();
+    tell_about(app, _kind, r, finished);
 }
 
 #[tauri::command(async)]
@@ -1352,7 +1414,8 @@ fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnO
         }
         let _ = app.emit(channel, end);
         job_ended(&app, opts.kind, &r);
-        if opts.shutdown_after && finished && shutdown_after.swap(false, Ordering::SeqCst) {
+        // "shut down when it has finished" covers the whole queue: only when nothing runs and nothing waits any more
+        if (opts.shutdown_after || opts.kind != "task") && finished && queue_idle(&app) && shutdown_after.swap(false, Ordering::SeqCst) {
             shutdown_with_warning(&app, &shutdown_cancel, std::time::Duration::from_secs(1), 60);
         }
     });
@@ -1361,7 +1424,12 @@ fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnO
 
 /// Runs `job` on a thread; its progress goes to the window as events on `channel`, the end as {"kind": "done"|"error"}.
 fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
-    spawn_job(app, tasks, JobOpts::new(channel), move |cancel, emit| job(&cancel, emit))
+    spawn_task_as(app, tasks, channel, "task", job)
+}
+
+/// `spawn_task` for a job the person wants to hear about (and the queue can hold): `kind` names it.
+fn spawn_task_as(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, kind: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
+    spawn_job(app, tasks, JobOpts { kind, ..JobOpts::new(channel) }, move |cancel, emit| job(&cancel, emit))
 }
 
 #[tauri::command]
@@ -1435,6 +1503,7 @@ pub fn run() {
     let instance = ndforge_core::instance::acquire(&ndforge_core::paths::config_dir());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
             // closing the window while something runs (training above all): stop it and let it save first, so training can be continued later
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1480,7 +1549,7 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
