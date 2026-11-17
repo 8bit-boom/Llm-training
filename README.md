@@ -183,6 +183,12 @@ Training and healing check a checkpoint before they continue from it (`worker/nd
 
 The window's commands that read folders, ask the graphics card or start a program (`state`, `plan`, `options`, `estimate`, `status`, `check` and the delete/copy ones) are `#[tauri::command(async)]`, so they run off the window's own thread and the window keeps answering while they work; the card is asked once a minute (`gpu::detect_gpus_cached`), not once per page. `problem_report` no longer holds the model's lock while it asks the machine.
 
+## One program at a time
+
+The program takes an exclusive lock on `<settings folder>/instance.lock` as it starts (`ndforge_core::instance`) and keeps it until it ends; the system lets go of it when the program dies, however it dies. A second
+program with the same settings folder shows "ND Lore Forge is already open" and closes (a copy with its own `NDFORGE_CONFIG_DIR` runs next to it). `instance.pid` names the holder for the message only. If the
+settings folder cannot be used for the lock, the program starts without it. The dialog and the closing were not tried in a real window here.
+
 ## Job logs
 
 Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).

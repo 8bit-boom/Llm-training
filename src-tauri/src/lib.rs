@@ -48,6 +48,10 @@ fn stop_and_wait(busy: &AtomicBool, cancel: &AtomicBool, max: std::time::Duratio
 
 type Out<T> = Result<T, String>;
 
+/// The lock that keeps a second program out of the settings folder (instance.rs); it lives as long as the program.
+#[allow(dead_code)]
+struct InstanceHold(Mutex<Option<ndforge_core::instance::Instance>>);
+
 fn lock<'a>(s: &'a State<'a, App>) -> std::sync::MutexGuard<'a, AppModel> {
     s.0.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1341,6 +1345,8 @@ fn llamacpp_check_update() -> Out<Value> {
 }
 
 pub fn run() {
+    // taken first, before anything reads or writes the settings folder
+    let instance = ndforge_core::instance::acquire(&ndforge_core::paths::config_dir());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
@@ -1359,6 +1365,26 @@ pub fn run() {
                     }
                 }
             }
+        })
+        .setup(move |app| {
+            // one program per settings folder: two would write the same settings, projects and logs (README, "One program at a time")
+            use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+            match instance {
+                Ok(hold) => {
+                    app.manage(InstanceHold(Mutex::new(Some(hold))));
+                }
+                Err(ndforge_core::instance::Refused::Held(pid)) => {
+                    for (_, w) in app.webview_windows() {
+                        let _ = w.hide();
+                    }
+                    let handle = app.handle().clone();
+                    let who = pid.map(|p| format!(" (process {p})")).unwrap_or_default();
+                    app.dialog().message(format!("ND Lore Forge is already open{who}. Use that window; two at once would damage each other's settings and projects.")).kind(MessageDialogKind::Error)
+                        .title("ND Lore Forge is already open").show(move |_| handle.exit(0));
+                }
+                Err(ndforge_core::instance::Refused::Unusable(_)) => {}     // the settings folder cannot be used: the program starts anyway and says so where it fails
+            }
+            Ok(())
         })
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
