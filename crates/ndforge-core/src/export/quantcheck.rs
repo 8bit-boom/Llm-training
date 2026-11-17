@@ -57,13 +57,16 @@ pub struct ReferenceSpec {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TextSpec {
-    /// "data" (the held-out part of the saved data version, else a sample of it) | "file" (a text file of the person's own)
+    /// "data" (the held-out part of the saved data version, else a sample of it) | "file" (a text file of the person's own) | "general" (general text, seed 1234: for a model
+    /// folder that has no data of its own of this project, as in Auto-cut)
     pub kind: String,
     pub file: Option<String>,
     /// data: the run whose model the files were made from (its chat template writes the conversations)
     pub run: Option<String>,
     /// data: a model folder or Hugging Face id instead of a run
     pub tokenizer: Option<String>,
+    /// general: where the text comes from; None = the program's default general text
+    pub general: Option<crate::general::GeneralSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -344,7 +347,12 @@ pub fn build_job(p: &Project, spec: &CompareSpec, id: &str, stop_file: &Path) ->
             json!({"kind": "data", "train": vdir.join("train.jsonl"), "test": if has_test { json!(vdir.join("test.jsonl")) } else { Value::Null }, "family": family, "tokenizer": tokenizer,
                    "seed": 1234, "data_version": version})
         }
-        _ => return Err(Error::new("Choose the test text: the held-out part of your saved data, or a text file of your own.")),
+        "general" => {
+            let (tokenizer, family) = tokenizer_for(p, &spec.text)?;
+            let source = crate::general::job_block(&crate::general::resolve(spec.text.general.as_ref(), true)?, 1.0);
+            json!({"kind": "general", "source": source, "family": family, "tokenizer": tokenizer, "seed": 1234})
+        }
+        _ => return Err(Error::new("Choose the test text: the held-out part of your saved data, a general text, or a text file of your own.")),
     };
     Ok(json!({"job": "quantcheck", "root": dir(p), "id": id, "resume": spec.resume.is_some(), "stop_file": stop_file, "chunks": spec.chunks, "ctx": CTX, "ngl": 99,
               "keep_logits": spec.keep_logits, "reference": reference, "quants": quants, "text": text}))

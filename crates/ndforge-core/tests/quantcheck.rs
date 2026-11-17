@@ -408,3 +408,25 @@ echo '{"type":"result","data":{"vocab":248320,"default_chunks":16,"options":[{"c
     let sent: Value = serde_json::from_slice(&std::fs::read(qc::dir(&p).join("plan-job.json")).unwrap()).unwrap();
     assert!(sent["reference"].is_null(), "an empty reference means the vocabulary is assumed");
 }
+
+#[test]
+fn the_general_text_job_has_the_source_the_tokenizer_the_family_and_the_fixed_seed() {
+    let d = tempdir().unwrap();
+    let p = plain_project(d.path());                        // no saved data version: the general text does not need one
+    let ok = spec_with(d.path());
+    let text_file = d.path().join("general.txt");
+    std::fs::write(&text_file, "some general text").unwrap();
+    let general = ndforge_core::general::GeneralSource { file: Some(text_file.display().to_string()), ..Default::default() };
+    let mk = |t: qc::TextSpec| qc::build_job(&p, &qc::CompareSpec { text: t, ..ok.clone() }, "x", Path::new("S"));
+    let t = mk(qc::TextSpec { kind: "general".into(), tokenizer: Some("Qwen/Qwen3.5-4B".into()), general: Some(general.clone()), ..Default::default() }).unwrap()["text"].clone();
+    assert_eq!((t["kind"].as_str(), t["seed"].as_u64(), t["family"].as_str()), (Some("general"), Some(1234), Some("generic")));
+    assert_eq!(t["tokenizer"], json!(["Qwen/Qwen3.5-4B"]));
+    assert_eq!(t["source"]["file"], json!(text_file.display().to_string()));
+    // a model that needs naming for its chat template; and both a dataset and a file is refused
+    assert!(mk(qc::TextSpec { kind: "general".into(), general: Some(general.clone()), ..Default::default() }).unwrap_err().0.contains("Say which model"));
+    let both = ndforge_core::general::GeneralSource { id: Some("a/b".into()), ..general };
+    assert!(mk(qc::TextSpec { kind: "general".into(), tokenizer: Some("m".into()), general: Some(both), ..Default::default() }).unwrap_err().0.contains("either a Hugging Face dataset or a file"));
+    // old specs have no `general`
+    let t: qc::TextSpec = serde_json::from_value(json!({"kind": "data", "run": "r"})).unwrap();
+    assert!(t.general.is_none());
+}

@@ -15,6 +15,7 @@ Job {"job": "quantcheck", "root": folder of all comparisons, "id": folder name, 
 and {"job": "quantcheck_plan", "reference": path | None, "ctx": 512, "root": folder}."""
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -140,6 +141,8 @@ def build_text(spec: dict, ctx: int, chunks: int, notes: list):
         if len(text.strip()) < 2 * ctx:
             raise QuantCheckError(f"The text file {f.name} is too short: the comparison needs at least {2 * ctx} tokens (about {4 * 2 * ctx} letters) and a few thousand words are better.")
         return text, f"the text file {f.name} (used as it is)", None, chunks
+    if spec.get("kind") == "general":
+        return _general_text(spec, ctx, chunks, notes)
     if spec.get("kind") != "data":
         raise QuantCheckError("Choose the test text: the held-out part of your saved data, or a text file of your own.")
     rows = read_rows(spec.get("test"))
@@ -174,6 +177,28 @@ def build_text(spec: dict, ctx: int, chunks: int, notes: list):
     if possible < chunks:
         notes.append(f"The test text is short ({got:,} tokens): {possible} chunks of {ctx} tokens were used instead of {chunks}.")
     return "\n".join(out), f"{'the held-out questions' if source == 'held-out' else 'a sample of the training data'} of the saved data version, as the model sees them ({len(out)} texts)", len(out), min(chunks, possible)
+
+
+def _general_text(spec: dict, ctx: int, chunks: int, notes: list):
+    """The test text of kind "general": general text (the source of the calibration's general share: a Hugging Face dataset or a file) with seed 1234, for a project that has no data of its own
+    (Auto-cut of a model folder). It may overlap the matrix calibration's general sample a little, which makes every file look slightly better, about equally."""
+    try:
+        tokenizer = imatrix.load_tokenizer([s for s in spec.get("tokenizer") or [] if s])
+    except Exception as exc:    # noqa: BLE001
+        raise QuantCheckError("The chat template (the tokenizer) of the model could not be read, so the general text cannot be prepared. "
+                              f"({type(exc).__name__}: {str(exc)[:160]}) Tell the page which model the files were made from, or choose a text file of your own.")
+    want = int(ctx * chunks * SLACK) + 1
+    texts, note = imatrix.fetch_general(spec.get("source") or {}, tokenizer, want, ctx, seed=int(spec.get("seed", SEED)), fam_name=spec.get("family") or None)
+    if not texts:
+        raise QuantCheckError((note or "The general text had nothing to read.") + " Choose a text file of your own instead.")
+    got = sum(imatrix.count_tokens(tokenizer, t) for t in texts)
+    possible = got // ctx
+    if possible < MIN_CHUNKS:
+        raise QuantCheckError(f"There is too little general text: {got:,} tokens, the comparison needs at least {MIN_CHUNKS * ctx:,}. Use a text file of your own (a few thousand words).")
+    if possible < chunks:
+        notes.append(f"The general text is short ({got:,} tokens): {possible} chunks of {ctx} tokens were used instead of {chunks}.")
+    notes.append("The test text is general text, not your world's: it may overlap the general text the importance matrix was measured on a little, which makes every file look slightly better, about equally.")
+    return "\n".join(texts), f"general text (seed {int(spec.get('seed', SEED))}; {len(texts)} texts)", len(texts), min(chunks, possible)
 
 
 # ------------------------------------------------------------------------------------------------------------------ reading llama-perplexity's output
@@ -261,6 +286,43 @@ def _better(a, b) -> int:
     return round((b - a) / b * 100) if b else 0
 
 
+def promotion(rows: list) -> list:
+    """For every finished mixed file M: is it worth keeping over the plain file of about its size? [{"id", "against", "promoted", "reason", "delta_pct", "noise"}]. P is the largest plain file
+    with size <= 1.01 x M's (else the smallest plain one). M is promoted iff `M.mean_kld + sqrt(uM^2 + uP^2) < P.mean_kld`, with u the +- figures llama-perplexity printed (0 when absent,
+    said in `noise`); a smaller difference is "a tie within measurement noise" and is not promoted. The reason also says how M compares with the next bigger plain file. Pure."""
+    done = [r for r in rows if r.get("status") == "done" and r.get("mean_kld") is not None]
+    plain = sorted((r for r in done if not r.get("mixed")), key=lambda r: (r["size"], r["id"]))
+    out = []
+    for m in (r for r in done if r.get("mixed")):
+        if not plain:
+            continue
+        le = [r for r in plain if r["size"] <= 1.01 * m["size"]]
+        p = le[-1] if le else plain[0]
+        um, up = m.get("kld_unc"), p.get("kld_unc")
+        noise = math.sqrt((um or 0.0) ** 2 + (up or 0.0) ** 2)
+        missing = um is None or up is None
+        promoted = m["mean_kld"] + noise < p["mean_kld"]
+        pct = round((p["mean_kld"] - m["mean_kld"]) / p["mean_kld"] * 100, 1) if p["mean_kld"] else 0.0
+        d = (m["size"] - p["size"]) / 1e9
+        size = f"{abs(d):.2f} GB {'larger' if d > 0 else 'smaller'}" if abs(d) >= 0.005 else "the same size"
+        if promoted:
+            reason = f"{m['label']} ({size} than {p['label']}) is {abs(pct)} % closer to the 16-bit model, more than the measurement noise: it is worth keeping."
+        elif m["mean_kld"] <= p["mean_kld"] + noise and abs(m["mean_kld"] - p["mean_kld"]) <= noise:
+            reason = f"{m['label']} and {p['label']} are a tie within measurement noise (mean KLD {m['mean_kld']:.4f} against {p['mean_kld']:.4f}): the plain file is as good, so the mixed one is not promoted."
+        else:
+            reason = f"{m['label']} is {abs(pct)} % further from the 16-bit model than {p['label']} (mean KLD {m['mean_kld']:.4f} against {p['mean_kld']:.4f}): the plain file is better, so the mixed one is not promoted."
+        if missing:
+            reason += " (llama-perplexity gave no plus-minus figure for one of them, so the noise was taken as 0.)"
+        bigger = [r for r in plain if r["size"] > 1.01 * m["size"] and r is not p]
+        if bigger:
+            n = bigger[0]
+            dn = (n["size"] - m["size"]) / 1e9
+            pn = _better(n["mean_kld"], m["mean_kld"])
+            reason += f" {n['label']} is {dn:.2f} GB larger and {abs(pn)} % {'closer to' if pn >= 0 else 'further from'} the 16-bit model than {m['label']}."
+        out.append({"id": m["id"], "against": p["id"], "promoted": bool(promoted), "reason": reason, "delta_pct": pct, "noise": round(noise, 6) if not missing else None})
+    return out
+
+
 def verdict(rows: list) -> list:
     """Plain sentences about the table (a list of strings). KLD is only a proxy, and the last sentence says so."""
     done = [r for r in rows if r.get("status") == "done" and r.get("mean_kld") is not None]
@@ -304,6 +366,7 @@ def verdict(rows: list) -> list:
         d = (m["size"] - near["size"]) / 1e9
         pct = _better(m["mean_kld"], near["mean_kld"])
         out.append(f"{m['label']} is {abs(d):.2f} GB {'larger' if d > 0 else 'smaller'} than {near['label']} and {abs(pct)} % {'closer to' if pct >= 0 else 'further from'} the 16-bit model (mean KLD {m['mean_kld']:.4f} against {near['mean_kld']:.4f}).")
+    out += [p["reason"] for p in promotion(rows)]
     out.append("KL divergence is a proxy: it says how much the answers' probabilities moved on this text, which is also what Unsloth reports for its quants. It does not replace trying the "
                "model on your own questions (Step 4 · Test).")
     return out
@@ -385,6 +448,7 @@ def start_rows(job_quants: list, old: list) -> list:
 def _summary(res: dict) -> dict:
     res["pareto"] = pareto(res["rows"])
     res["verdict"] = verdict(res["rows"])
+    res["promotion"] = promotion(res["rows"])
     res["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return res
 
