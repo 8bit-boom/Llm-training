@@ -139,6 +139,7 @@ impl AppModel {
             "show_help_panel" => self.settings.show_help_panel = value,
             "welcome_seen" => self.settings.welcome_seen = value,
             "keep_awake" => self.settings.keep_awake = value,
+            "auto_continue_interrupted" => self.settings.auto_continue_interrupted = value,
             other => return Err(Error::new(format!("Unknown setting: {other}"))),
         }
         self.settings.save();

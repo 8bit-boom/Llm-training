@@ -72,10 +72,35 @@ fn create_project(s: State<App>, name: String) -> Out<Value> {
 }
 
 #[tauri::command]
-fn open_project(s: State<App>, folder: String) -> Out<Value> {
-    let mut m = lock(&s);
-    m.open_project(&folder).map_err(|e| e.to_string())?;
-    Ok(m.state())
+fn open_project(app: tauri::AppHandle, s: State<App>, folder: String) -> Out<Value> {
+    let state = {
+        let mut m = lock(&s);
+        m.open_project(&folder).map_err(|e| e.to_string())?;
+        m.state()
+    };
+    auto_continue(&app);
+    Ok(state)
+}
+
+/// With the setting `auto_continue_interrupted` on: an Auto-cut or a heal that was cut off by closing the program goes into the queue and the queue runs.
+fn auto_continue(app: &tauri::AppHandle) {
+    let st = app.state::<App>();
+    let (enabled, project) = { let m = st.0.lock().unwrap_or_else(|e| e.into_inner()); (m.settings.auto_continue_interrupted, m.project.clone()) };
+    let Some(p) = project.filter(|_| enabled) else { return };
+    if app.state::<Tasks>().busy.load(Ordering::SeqCst) {
+        return;
+    }
+    ndforge_core::reshape::auto::mark_interrupted(&p);
+    let folder = p.folder.to_string_lossy().to_string();
+    let added = ndforge_core::queue::interrupted_work(&p).into_iter().filter(|(kind, args)| queue_edit(app, |q| {
+        if q.items.iter().any(|i| i.status == "queued" && &i.kind == kind && &i.spec == args) { return false; }
+        q.enqueue(&folder, kind, args.clone()).is_ok()
+    })).count();
+    if added > 0 {
+        queue_edit(app, |q| q.paused = false);
+        queue_changed(app);
+        queue_kick(app);
+    }
 }
 
 /// Takes a world out of a project that holds several. Returns the new state.

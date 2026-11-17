@@ -74,6 +74,8 @@ pub struct Settings {
     pub theme: String,
     /// keep the computer awake while training (default on: a computer that falls asleep stops the training)
     pub keep_awake: bool,
+    /// when a project is opened, go on by itself with an Auto-cut or a healing that was cut off by closing the program (default off)
+    pub auto_continue_interrupted: bool,
     pub ollama_servers: Vec<OllamaServer>,
     pub train_servers: Vec<TrainServer>,
     /// Unsloth Desktop as a place to train (one connection)
@@ -89,7 +91,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true,
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true, auto_continue_interrupted: false,
             ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), recent_projects: Vec::new(), load_note: None }
     }
 }

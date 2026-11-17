@@ -190,6 +190,9 @@ The Home page lists the queue: move a waiting entry, remove it, pause or run the
 the checklist is skipped with the reason, a failed one is marked and the queue goes on, a job that was stopped pauses the queue. After a restart what was running is "stopped" and the queue waits until
 "Run the queue" is pressed. Entries of another project than the open one are skipped. Commands: `queue_list`, `queue_add`, `queue_remove`, `queue_move`, `queue_pause`, `queue_clear_finished`; the window hears `queue-event`.
 
+Setting `auto_continue_interrupted` (default off; the checkbox on the Home page): when a project is opened, an Auto-cut run or a heal that was cut off by closing the program or a crash (`interrupted: true`
+in `auto.json` / `heal.json`, set when it is marked stopped) is put in the queue and the queue runs. A stop by the person is left alone, and a heal that belongs to the interrupted Auto-cut goes on with the run.
+
 ## Before you start
 
 Above the Start button of Auto-cut, healing, export, the thinking check, Compare quants, the importance matrix, cutting a model and training the window shows a short checklist (`ndforge_core::preflight`, the

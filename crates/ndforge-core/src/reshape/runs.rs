@@ -633,7 +633,7 @@ pub fn mark_interrupted(p: &Project) -> usize {
         // healing that was cut off can be continued: its checkpoints and the teacher's answers are kept
         if !live && read_json(&dir.join("heal.json")).is_some_and(|h| h["status"] == "running") {
             let _ = std::fs::remove_dir_all(dir.join("healed.partial"));
-            set_heal(&dir, json!({"status": "stopped", "error": "The program was closed while this model was being healed. Continue to go on where it stopped."}));
+            set_heal(&dir, json!({"status": "stopped", "interrupted": true, "error": "The program was closed while this model was being healed. Continue to go on where it stopped."}));
             n += 1;
         }
         if st["status"] == "running" && !live {
@@ -1007,7 +1007,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
-    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
+    set_heal(&dir, json!({"status": "running", "interrupted": false, "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
     let stopped = |step: &str| {
         set_heal(&dir, json!({"status": "stopped", "step": step}));
         json!({"stopped": true, "name": name})

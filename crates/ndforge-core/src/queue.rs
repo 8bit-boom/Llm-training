@@ -197,3 +197,24 @@ pub fn preflight_spec(kind: &str, a: &Value) -> Value {
         _ => json!({}),
     }
 }
+
+/// What was cut off by closing the program and can go on: the newest Auto-cut run that was marked interrupted (its id), and every heal that was (its name and settings).
+/// As (kind, arguments of the start command) pairs, ready for `enqueue`. Marks nothing itself: `reshape::auto::mark_interrupted` and `reshape::runs::mark_interrupted` do that first.
+pub fn interrupted_work(p: &crate::project::Project) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let mut by_auto: Vec<String> = Vec::new();
+    if let Some(st) = crate::reshape::auto::list(p).into_iter().next().filter(|st| st.interrupted && st.status == "stopped") {
+        by_auto = st.made.iter().map(|m| m.name.clone()).collect();         // its own heals go on with the run, not on their own
+        out.push(("auto".to_string(), json!({"spec": null, "resume": st.id})));
+    }
+    if let Ok(rd) = std::fs::read_dir(crate::reshape::runs::models_dir(p)) {
+        let mut heals: Vec<(String, Value)> = rd.flatten().filter_map(|e| {
+            let h: Value = serde_json::from_slice(&std::fs::read(e.path().join("heal.json")).ok()?).ok()?;
+            let name = e.file_name().to_string_lossy().to_string();
+            (h["status"] == "stopped" && h["interrupted"] == true && h["spec"].is_object() && !by_auto.contains(&name)).then(|| (name, h["spec"].clone()))
+        }).collect();
+        heals.sort_by(|a, b| a.0.cmp(&b.0));
+        out.extend(heals.into_iter().map(|(name, spec)| ("heal".to_string(), json!({"name": name, "spec": spec}))));
+    }
+    out
+}

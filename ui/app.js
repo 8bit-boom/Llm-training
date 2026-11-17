@@ -54,7 +54,8 @@ function renderWelcome() {
       <button class="primary" id="create">Create a new project</button></div>
     ${msgHtml()}
     <div class="row"><button class="secondary" id="openp">Open an existing project…</button></div>
-    ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}`;
+    ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}
+    ${state.project ? `<div class="row"><label class="opt" title="An Auto-cut or a healing that was cut off by closing the program (or a crash) is put in the queue and goes on where it stopped, when the project is opened."><input type="checkbox" id="auto-continue" ${state.settings.auto_continue_interrupted ? "checked" : ""}> Go on by itself with what was cut off when I open the project</label></div>` : ""}`;
 }
 
 function bundleCard() {
@@ -3248,6 +3249,7 @@ function wire() {
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   wireQueue();
+  const ac2 = $("auto-continue"); if (ac2) ac2.onchange = async () => { try { setState(await invoke("set_setting", { key: "auto_continue_interrupted", value: ac2.checked })); } catch (e) { alert(String(e)); } };
   on("choose", async () => {
     const f = await tauri.dialog.open({ multiple: false, title: "Choose a training file", filters: [{ name: "Training bundle", extensions: ["ndtrain"] }, { name: "All files", extensions: ["*"] }] });
     if (f) checkFile(f);
