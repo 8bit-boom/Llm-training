@@ -1,0 +1,36 @@
+# Known-vulnerability scans, weekly and by hand. They never block anything: the result is in the job summary and the run is marked successful.
+name: Audit
+on:
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: |
+          set +e
+          cargo audit 2>&1 | tee audit.txt
+          { echo "## cargo audit"; echo '```'; tail -80 audit.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+  python:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install pip-audit
+      - name: pip-audit
+        run: |
+          set +e
+          pip-audit -r worker/requirements-ci.txt 2>&1 | tee audit.txt
+          { echo "## pip-audit"; echo '```'; tail -80 audit.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
