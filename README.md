@@ -202,6 +202,14 @@ When a job or the queue ends the program shows a system notification ("Healing f
 POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
 computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
 
+## The end-to-end test
+
+`crates/ndforge-core/tests/e2e.rs` (ignored by default) runs the program's own steps on a tiny random Qwen3.5-shaped model with the real worker on a CPU: inspect, measure, try, cut (thinner layers), heal
+(the teacher's answers into the shared cache, the student learns, the LoRA is merged; `HealSpec.tokens_exact` = 20,000 tokens, never sent by the window) and the thinking check of the original, the cut and the healed
+model (`ThinkSpec.max_new` = 8). Run it with `NDFORGE_E2E_PYTHON=<venv>/bin/python cargo test -p ndforge-core --test e2e -- --ignored --nocapture`. CI job `e2e-cpu`: on pushes to main, nightly, by hand, and on a
+push whose commit message contains `[e2e]`; never on pull requests. It does not make GGUF files (llama.cpp is not installed there) and it does not drive the Auto-cut state machine itself (its target size starts at 1
+billion parameters, a tiny model is far below it): the steps are the ones Auto-cut calls.
+
 ## The worker's contract
 
 `worker/ndforge_worker/contract.json` lists the job types, event types and error codes of the worker, with the protocol number; names are only ever added (docs/WORKER_CONTRACT.md). Tests in both languages check it, and the

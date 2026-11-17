@@ -90,11 +90,13 @@ pub struct ThinkSpec {
     pub load: Option<String>,
     /// how many questions are asked at once (the transformers way); 1 = one at a time
     pub batch: Option<u32>,
+    /// the most new tokens per answer (the worker's own limit when None); only the end-to-end test on a tiny model sets it
+    pub max_new: Option<u32>,
 }
 
 impl Default for ThinkSpec {
     fn default() -> Self {
-        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None }
+        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None }
     }
 }
 
@@ -145,6 +147,9 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
                          "stop_file": dir.join("STOP"), "cache_file": dir.join(file_name(&spec.target, spec.quick))});
     if let Some(b) = spec.batch.filter(|b| (1..=64).contains(b)) {
         job["batch"] = json!(b);
+    }
+    if let Some(n) = spec.max_new.filter(|n| (1..=65536).contains(n)) {
+        job["max_new"] = json!(n);
     }
     Ok(job)
 }
