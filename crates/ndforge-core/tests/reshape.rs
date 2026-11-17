@@ -2305,3 +2305,14 @@ fn another_teacher_can_be_chosen_for_a_made_model_and_the_default_leaves_the_fol
     // it is still registered the way a made model is
     assert_eq!(catalog::find("custom-local-slim-9b-healed").unwrap().derived_from.as_deref(), Some("acme/Better"));
 }
+
+#[test]
+fn the_sequence_length_can_be_8192_for_long_reasoning_rows_and_nothing_else_outside_the_list() {
+    let ok = |seq: u32| serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 20, "seq": seq})).unwrap().validate();
+    for seq in [512, 1024, 2048, 4096, 8192] {
+        assert!(ok(seq).is_ok(), "{seq}");
+    }
+    for seq in [0, 256, 3000, 16384] {
+        assert!(ok(seq).unwrap_err().0.contains("512, 1024, 2048, 4096 or 8192"), "{seq}");
+    }
+}

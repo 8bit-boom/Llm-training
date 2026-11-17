@@ -176,3 +176,46 @@ def test_rows_are_saved_next_to_the_cache_and_come_back_unchanged(tmp_path):
     assert dj.load_rows(tmp_path) == rows and dj.data_hash(dj.load_rows(tmp_path)) == dj.data_hash(rows)
     with pytest.raises(ReshapeError, match="made again"):
         dj.load_rows(tmp_path / "nothing")
+
+
+class ChatCharTok(CharTok):
+    eos_token = "<e>"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kw):
+        return "".join(f"{m['content']}\n" for m in messages) + ("" if not add_generation_prompt else "")
+
+
+def chat_row(user_chars, answer_chars):
+    return {"messages": [{"role": "user", "content": "q" * user_chars}, {"role": "assistant", "content": "a" * answer_chars}]}
+
+
+def test_a_chat_conversation_is_one_row_cut_at_the_length_and_a_very_long_one_is_skipped(tmp_path):
+    # plain text of the same length is windowed (below); a conversation is "q"*u + "\n" + "a"*a characters = one token each
+    f = jsonl(tmp_path / "c.jsonl", [chat_row(10, 39), chat_row(10, 20), chat_row(30, 40), chat_row(5, 6), chat_row(100, 100)])
+    stats: dict = {}
+    rows, tokens = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
+    lens = [len(r["input_ids"]) for r in rows]
+    # 50 chars -> cut to 32 (no second window); 31 chars -> 31; 71 chars is more than twice 32 -> skipped; 12 chars -> too short; 201 -> skipped
+    assert lens == [32, 31] and tokens == 63 and stats == {"cut_rows": 1, "skipped_long": 2}
+    assert all(r["kind"] == "general" and r["completion_mask"] == [1] * len(r["input_ids"]) for r in rows)
+
+
+def test_plain_text_is_still_windowed_and_a_text_column_of_turns_counts_as_text(tmp_path):
+    f = jsonl(tmp_path / "t.jsonl", [{"text": "a" * 100}])
+    stats: dict = {}
+    rows, _ = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
+    assert [len(r["input_ids"]) for r in rows] == [32, 32, 32] and stats == {"cut_rows": 0, "skipped_long": 0}
+
+
+def test_the_conversation_rule_does_not_need_a_stats_dict_or_a_report(tmp_path):
+    f = jsonl(tmp_path / "c.jsonl", [chat_row(10, 39)])
+    rows, _ = dj.general_rows({"file": f}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000)
+    assert [len(r["input_ids"]) for r in rows] == [32]                                        # the report is filled by the reader itself, so the rule holds without one
+
+
+def test_build_rows_counts_the_long_conversations_and_says_so(tmp_path, monkeypatch):
+    patch_project(monkeypatch)
+    g = jsonl(tmp_path / "g.jsonl", [chat_row(10, 39), chat_row(100, 100), chat_row(10, 20)] * 4)
+    rows, st = dj.build_rows(ChatCharTok(), {"train": "x", "tokens": 400, "general": {"share": 0.5, "file": g}}, "generic", 32)
+    assert st["general_cut_rows"] >= 1 and st["general_skipped_long"] >= 1 and st["general_error"] is None
+    assert all(len(r["input_ids"]) <= 32 for r in rows)

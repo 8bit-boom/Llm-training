@@ -78,6 +78,11 @@ so saved matrices stay valid).
 model trained thinking-off). The export job takes the key `thinking_default`: `"off"` (the default, nothing changes for old callers such as nd-world) or `"keep"` (the template stays as the
 model ships it). The app sends `"keep"` when the base model's `ndforge_reshape.json` says `healed.recipe == "thinking"` (the recipe is written by a later step; until then it is always `"off"`).
 
+**Long rows.** A plain-text source is cut into windows of the sequence length (a long text gives several rows). A **chat-shaped** source (messages, conversations, prompt + answer) gives **one row per
+conversation: its first `max_seq` tokens**, because a later window would have neither the question nor the chat frame; a conversation longer than **twice** the sequence length is **skipped**. The cut and
+skipped counts are in the cache job's `stats` (`general_cut_rows`, `general_skipped_long`) and in the log ("Long conversations: ..."). For reasoning sets such as faunix (about 5,750 tokens a row) use
+4096, or 8192 when the memory allows it (Heal settings).
+
 **Local files**, read the same way: `.jsonl`/`.ndjson` (one JSON per line), `.json` (a list, an object holding a list, or JSON lines), `.txt`/`.md` (blocks separated by blank lines are the
 documents), `.csv`/`.tsv` (header row), `.parquet` (only when `pyarrow` is installed in the training software; otherwise a plain message). A file is read line by line where the format allows.
 

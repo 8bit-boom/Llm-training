@@ -600,7 +600,7 @@ pub struct HealSpec {
     #[serde(default)]
     pub backend: Option<String>,
     // Healing settings (Expert, docs/HEAL_SETTINGS.md): None = the automatic value for this student and card (`plan::heal_defaults`). Older windows send none of them.
-    /// sequence length: 512 | 1024 | 2048 | 4096
+    /// sequence length: 512 | 1024 | 2048 | 4096 | 8192
     #[serde(default)]
     pub seq: Option<u32>,
     /// sequences per step on the card: 1 | 2 | 4
@@ -647,8 +647,8 @@ impl HealSpec {
             return Err(Error::new("Unknown way of healing."));
         }
         let bad = |what: &str| Err(Error::new(format!("Healing settings out of range: {what}.")));
-        if self.seq.is_some_and(|s| ![512, 1024, 2048, 4096].contains(&s)) {
-            return bad("sequence length 512, 1024, 2048 or 4096");
+        if self.seq.is_some_and(|s| ![512, 1024, 2048, 4096, 8192].contains(&s)) {
+            return bad("sequence length 512, 1024, 2048, 4096 or 8192");
         }
         if self.batch.is_some_and(|b| ![1, 2, 4].contains(&b)) {
             return bad("batch per step 1, 2 or 4");

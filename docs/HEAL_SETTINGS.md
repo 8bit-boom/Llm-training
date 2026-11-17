@@ -23,7 +23,7 @@ Healing (distillation, `worker/ndforge_worker/distilljob.py`) ran out of graphic
 
 | Setting | What it does | Default |
 |---|---|---|
-| Sequence length 512/1024/2048/4096 | tokens per training text. Memory grows with it. Changing it makes the original answer again (the cache is for one length) and restarts the learning. | 1024 from 15 B, else 2048 |
+| Sequence length 512/1024/2048/4096/8192 | tokens per training text. Memory grows with it. 8192 is for long reasoning rows (the faunix set averages about 5,750 tokens); the estimate of a 16 B student with QLoRA, checkpointing and batch 1 is about 18.5 GB at 4096 and 20.6 GB at 8192 (shared cases in `worker/tests/data/heal_cases.json`, estimates not measurements). Changing it makes the original answer again (the cache is for one length) and restarts the learning. | 1024 from 15 B, else 2048 |
 | Batch per step 1/2/4 | texts on the card at once. | 2 from 15 B (1 from 25 B), else 4 |
 | Sequences per update | batch x accumulation; the accumulation is computed and shown. Keeps the learning the same whatever the batch. | 32 |
 | Gradient checkpointing Auto/On/Off | makes layer activations again in the backward pass: much less memory, about a third slower. Auto: on from 8 B; below that on when the activations would take more than 60 % of the memory left after the weights; card unknown: on. | Auto |

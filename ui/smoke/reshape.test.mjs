@@ -566,6 +566,7 @@ test("Healing settings: only in Expert mode, with the automatic values shown, th
   let html = b.run("renderReshape()");
   assert.match(html, /<summary>Healing settings<\/summary>/);
   assert.match(html, /<option value="1024" selected>1024<\/option>/);
+  assert.match(html, /<option value="8192" >8192 \(long reasoning rows; needs a lot of memory\)<\/option>/);
   assert.match(html, /<option value="2" selected>2<\/option>/);
   assert.match(html, /id="hl-perupdate" value="32"/);
   assert.match(html, /= 2 × 16 steps added up/);

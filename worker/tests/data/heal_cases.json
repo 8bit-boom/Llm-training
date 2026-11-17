@@ -350,6 +350,36 @@
    "qlora": true,
    "upcast": true,
    "gb": 4.23
+  },
+  {
+   "name": "16 B student, QLoRA, checkpointing, batch 1, sequence 4096",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 4096,
+   "batch": 1,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "gb": 18.53
+  },
+  {
+   "name": "16 B student, QLoRA, checkpointing, batch 1, sequence 8192",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 8192,
+   "batch": 1,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "gb": 20.64
   }
  ]
 }
