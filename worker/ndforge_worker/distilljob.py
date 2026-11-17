@@ -594,11 +594,19 @@ def _teacher_answers(model, batch_rows: list, k: int, chunk: int, pad_id: int):
         weight = model.get_output_embeddings().weight
         for i, r in enumerate(batch_rows):
             h = hidden[i, :len(r["input_ids"])]
-            parts = []
-            for a in range(0, h.shape[0], chunk):
-                parts.append([t.cpu() for t in topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k)])
-            out.append(tuple(torch.cat([p[j] for p in parts]).numpy() for j in range(3)))
+            # the chunks stay on the card (the logits of one chunk at a time bound the memory), and the row comes back to the host in one go
+            parts = [topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+            out.append(tuple(torch.cat([p[j] for p in parts]).cpu().numpy() for j in range(3)))
     return out
+
+
+WINDOW_ROWS = 64            # rows answered together in length order before they are written in their own order
+SPEED_LOG_EVERY = 60.0      # seconds between the "cache_speed" lines
+
+
+def length_order(window: list) -> list:
+    """The positions of `window` from the longest row to the shortest (equal lengths keep their order): the order the teacher answers them in."""
+    return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
 
 
 def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int) -> dict:
@@ -661,6 +669,9 @@ def run_cache(cfg: dict) -> int:
     inner = getattr(tok, "tokenizer", tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
+    window_rows = max(WINDOW_ROWS, batch)
+    t0 = last_log = time.monotonic()
+    seen_tokens = 0
     try:
         i = writer.done_rows
         if i:
@@ -669,25 +680,52 @@ def run_cache(cfg: dict) -> int:
             if stop_file.exists():
                 result["stopped"] = True
                 break
-            part = rows[i:i + batch]
-            try:
-                answers = _teacher_answers(model, part, k, chunk, pad_id)
-            except RuntimeError as exc:
-                if not reshapejob._is_oom(exc) or len(part) == 1:
-                    raise
-                protocol.log("Out of memory; the original model answers one text at a time.")
-                reshapejob._free()
-                batch = 1
-                continue
-            for a in answers:
-                writer.add_row(*a)
-            i += len(part)
-            protocol.progress("cache", i / len(rows), f"The original model answers your texts: {i} of {len(rows)}")
+            # a window of rows is answered longest first (batches of similar length waste little on padding) and written in the order of the rows
+            window = rows[i:i + window_rows]
+            answers: dict = {}
+            order = length_order(window)
+            pos, cut_short = 0, False
+            while pos < len(order):
+                if stop_file.exists():
+                    cut_short = True
+                    break
+                idx = order[pos:pos + batch]
+                try:
+                    got = _teacher_answers(model, [window[j] for j in idx], k, chunk, pad_id)
+                except RuntimeError as exc:
+                    if not reshapejob._is_oom(exc) or len(idx) == 1:
+                        raise
+                    protocol.log("Out of memory; the original model answers one text at a time.")
+                    reshapejob._free()
+                    batch = 1
+                    continue
+                for j, a in zip(idx, got):
+                    answers[j] = a
+                    seen_tokens += len(window[j]["input_ids"])
+                pos += len(idx)
+                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}")
+                if time.monotonic() - last_log >= SPEED_LOG_EVERY:
+                    last_log = time.monotonic()
+                    protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far)")
+            # the rows that were answered, from the first one on without a gap, go to the cache in their own order
+            written = 0
+            while written < len(window) and written in answers:
+                writer.add_row(*answers[written])
+                written += 1
+                if stop_file.exists():                  # the Stop button was pressed while the cache was written (a part was saved just now)
+                    break
+            i += written
+            if cut_short:
+                result["stopped"] = True
+                break
     finally:
         writer.close()
         del model
         reshapejob._free()
-    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows)
+    tps = seen_tokens / max(time.monotonic() - t0, 1e-9)
+    if seen_tokens:
+        protocol.log(f"cache_speed: {tps:,.0f} tokens/s ({seen_tokens:,} tokens answered in {time.monotonic() - t0:,.0f} s)")
+    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows, tokens_per_s=round(tps, 1))
     protocol.result(result)
     return 0
 

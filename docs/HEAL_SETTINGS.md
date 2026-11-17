@@ -146,3 +146,11 @@ The model's own `distill/cache/` keeps `index.json` (the parts its rows need, `s
 decision work as before. A cache an older version made in the model's own folder is still read; a partly made one is continued as before. The shared folder goes when no model points at it any more
 (a model was deleted) and, for Auto-cut, at the end of the run (docs/AUTO_CUT.md). The disk check before a heal still counts the whole cache (it does not know what is already there).
 
+## How fast the teacher answers
+
+The teacher pass (`distilljob._teacher_answers`, `run_cache`) answers a window of 64 rows longest first, so a batch holds rows of similar length and wastes little on padding, and writes the rows to
+the cache in their own order. Inside a row the top-k work is done chunk by chunk as before (the logits of one chunk bound the memory); the three result arrays of a row come back to the host
+once, not once per chunk. The arrays are identical to the old ones (a test compares them). The log has a `cache_speed` line (tokens per second) about every minute and at the end, and the job
+result has `tokens_per_s`. A Stop that comes while a window is being answered keeps the rows that were finished from the first one on without a gap; the others are answered again on Continue.
+The speed-up on a 27B is not measured here.
+

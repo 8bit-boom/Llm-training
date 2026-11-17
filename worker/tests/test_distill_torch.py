@@ -417,3 +417,51 @@ def test_a_bigger_shared_cache_run_only_asks_the_teacher_for_the_new_rows(tmp_pa
     cfg_c = {**cfg_a, "out": str(tmp_path / "c" / "cache")}
     code, ev = run_in_process(monkeypatch, dj.run_cache, cfg_c)
     assert code == 0 and ev[-1]["data"]["reused"] is True
+
+
+def _answers_before_the_speed_up(model, batch_rows, k, chunk, pad_id):
+    """the teacher pass as it was: every chunk of every row came back to the host on its own"""
+    n = max(len(r["input_ids"]) for r in batch_rows)
+    dev = next(model.parameters()).device
+    ids = torch.full((len(batch_rows), n), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(batch_rows), n), dtype=torch.long)
+    for i, r in enumerate(batch_rows):
+        ids[i, :len(r["input_ids"])] = torch.tensor(r["input_ids"])
+        mask[i, :len(r["input_ids"])] = 1
+    out = []
+    with torch.no_grad():
+        hidden, _ = dj.forward_hidden(model, ids.to(dev), mask.to(dev))
+        weight = model.get_output_embeddings().weight
+        for i, r in enumerate(batch_rows):
+            h = hidden[i, :len(r["input_ids"])]
+            parts = []
+            for a in range(0, h.shape[0], chunk):
+                parts.append([t.cpu() for t in dj.topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k)])
+            out.append(tuple(torch.cat([p[j] for p in parts]).numpy() for j in range(3)))
+    return out
+
+
+def test_the_faster_teacher_pass_gives_exactly_the_same_arrays(base):
+    model = load(base)
+    rows = [{"input_ids": [(7 * i + j) % 50 + 1 for j in range(n)]} for i, n in enumerate((37, 5, 21, 40))]
+    now = dj._teacher_answers(model, rows, 8, 16, 0)
+    before = _answers_before_the_speed_up(model, rows, 8, 16, 0)
+    assert len(now) == len(before) == 4
+    for a, b in zip(now, before):
+        for x, y in zip(a, b):
+            assert x.dtype == y.dtype and x.shape == y.shape and np.array_equal(x, y)
+
+
+def test_every_row_of_the_cache_is_the_answer_for_that_row_whatever_the_order_it_was_made_in(tmp_path, base, monkeypatch):
+    cfg = cache_cfg(tmp_path, base, batch=3)
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg)
+    assert code == 0 and ev[-1]["data"]["tokens_per_s"] > 0
+    folder = tmp_path / "distill" / "cache"
+    rows = dj.load_rows(folder)
+    assert len({len(r["input_ids"]) for r in rows}) > 1, "the rows differ in length, so a mix-up would show"
+    reader = dj.CacheReader(folder)
+    model = load(base)
+    for i, r in enumerate(rows):
+        ids, lp, rs = reader.get(i)
+        ref_ids, ref_lp, ref_rs = _answers_before_the_speed_up(model, [r], 8, 16, 0)[0]
+        assert ids.shape[0] == len(r["input_ids"]) and np.allclose(lp.astype(np.float32), ref_lp, atol=2e-2) and np.allclose(rs, ref_rs, atol=2e-2), i

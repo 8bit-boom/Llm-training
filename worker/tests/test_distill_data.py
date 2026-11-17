@@ -364,3 +364,11 @@ def test_the_store_id_follows_everything_but_the_budget(tmp_path):
     (teacher / "config.json").write_text('{"a": 2}')
     assert sid() != base, "another teacher config"
     assert len(base) == 20
+
+
+def test_rows_are_answered_longest_first_and_every_row_once():
+    window = [{"input_ids": [0] * n} for n in (5, 9, 5, 2, 9, 7)]
+    order = dj.length_order(window)
+    assert [len(window[j]["input_ids"]) for j in order] == [9, 9, 7, 5, 5, 2]
+    assert order == [1, 4, 5, 0, 2, 3], "equal lengths keep their order"
+    assert sorted(order) == list(range(6)) and dj.length_order([]) == []
