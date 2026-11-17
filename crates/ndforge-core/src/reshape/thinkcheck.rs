@@ -68,6 +68,46 @@ pub fn gates(original: &Value, candidate: &Value) -> Value {
     json!({"verdict": verdict, "checks": checks, "failed": failed, "warned": warned})
 }
 
+// ------------------------------------------------------------------------------------------------------------------ choosing by thinking
+
+/// Two thinking scores this close are a tie: the check asks few questions (16 in the quick suite) and is noisy, so the lower loss decides.
+pub const THINK_TIE: f64 = 0.125;
+
+/// One number for "how well does it still think": the share of answers that finish their reasoning, minus the share that loop, minus the share of garbage. None when the
+/// row has no numbers.
+pub fn think_score(main: &Value) -> Option<f64> {
+    let get = |k: &str| main[k].as_f64();
+    let closed = get("closed_rate")?;
+    Some(closed - get("loop_rate").unwrap_or(0.0) - get("garbage_rate").unwrap_or(0.0))
+}
+
+/// The best candidate of `(loss, thinking score)` rows, or None for no rows. The highest score wins; scores within `THINK_TIE` of it are decided by the lower loss; a row
+/// without a score only competes when no row has one (then the lowest loss wins). A row without a loss loses every tie.
+pub fn rank_thinking(rows: &[(Option<f64>, Option<f64>)]) -> Option<usize> {
+    let by_loss = |idx: Vec<usize>| -> Option<usize> {
+        idx.into_iter().min_by(|a, b| {
+            let (la, lb) = (rows[*a].0.unwrap_or(f64::INFINITY), rows[*b].0.unwrap_or(f64::INFINITY));
+            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b))
+        })
+    };
+    let top = rows.iter().filter_map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+    if top.is_finite() {
+        by_loss((0..rows.len()).filter(|i| rows[*i].1.is_some_and(|s| s >= top - THINK_TIE - 1e-12)).collect())
+    } else if rows.iter().any(|r| r.0.is_some()) {
+        by_loss((0..rows.len()).collect())
+    } else {
+        None
+    }
+}
+
+/// Did the candidate lose much of its ability to finish its reasoning: its `closed_rate` is below 0.6 times the original's.
+pub fn lost_much(original_main: &Value, cand_main: &Value) -> bool {
+    match (original_main["closed_rate"].as_f64(), cand_main["closed_rate"].as_f64()) {
+        (Some(o), Some(c)) => o > 0.0 && c < 0.6 * o,
+        _ => false,
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------ what is checked
 
 fn default_target() -> String {

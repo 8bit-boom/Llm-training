@@ -253,3 +253,30 @@ fn the_spec_has_the_owner_defaults_and_refuses_nonsense() {
         assert!(s.validate().is_err(), "{s:?}");
     }
 }
+
+#[test]
+fn the_owners_first_cut_is_beyond_the_guardrails_and_the_checks_take_an_estimated_time() {
+    use ndforge_core::reshape::auto_plan::{beyond_guardrails, think_gate_minutes};
+    let ins = qwen27();
+    // cut A of a real run: three blocks and the MLP at 10,240 of 17,408 (58.8 % kept; the floor is 10,752)
+    let a = beyond_guardrails(&ins, 3, Some(10240));
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert!(a[0].contains("10240 of 17408") && a[0].contains("58.8 %") && a[0].contains("10752"), "{a:?}");
+    // the floor itself, and a few blocks, are inside
+    assert!(beyond_guardrails(&ins, 4, Some(10752)).is_empty());
+    assert!(beyond_guardrails(&ins, 0, Some(17408)).is_empty());
+    let both = beyond_guardrails(&ins, 5, Some(10240));
+    assert_eq!(both.len(), 2, "{both:?}");
+    assert!(both[1].contains("5 whole blocks"));
+    // a model that cannot be thinned has no width rule
+    let mut plain = qwen27();
+    plain.width_supported = false;
+    assert!(beyond_guardrails(&plain, 1, None).is_empty());
+    // the estimate: write at 500 MB/s plus 15 (full) or 10 (quick) minutes per 17 B, at least once
+    let cands = candidates(&ins, 17.4);
+    let c = &cands[0];
+    let (full, quick) = (think_gate_minutes(&ins, c, false), think_gate_minutes(&ins, c, true));
+    assert!(quick < full && full > 15.0 && full < 25.0, "{full} {quick}");
+    let small = Candidate { params: 5_000_000_000, ..c.clone() };
+    assert!(think_gate_minutes(&ins, &small, true) >= 10.0, "never less than one unit of the check");
+}
