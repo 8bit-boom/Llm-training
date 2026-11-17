@@ -37,6 +37,14 @@ pub struct State {
     pub break_at: Option<u32>,
     pub broken: bool,
     pub total_steps: u32,
+    /// false: `/api/models/scan-folders` answers 404 (a Studio without the list of custom folders)
+    pub scan_folders: bool,
+    /// a text: POST scan-folders answers 400 with it (a folder Studio cannot read)
+    pub scan_reject: Option<String>,
+    /// the paths POSTed to scan-folders
+    pub scan_posts: Vec<Value>,
+    /// the run folders `/api/models/checkpoints` lists: false = an empty list
+    pub list_runs: bool,
     /// where the adapter lives on "Desktop's" disk (a folder of the test)
     pub outputs_dir: String,
     // what happened
@@ -52,7 +60,7 @@ pub struct State {
 
 impl State {
     fn new(outputs_dir: &str) -> State {
-        State { key: KEY.into(), desktop: true, not_unsloth: false, fine_tuning: true, chat_only: false, queue_polls: 0, hold: false, fail: None, forget_jobs: false, break_at: None, broken: false, total_steps: 4,
+        State { key: KEY.into(), desktop: true, not_unsloth: false, fine_tuning: true, chat_only: false, queue_polls: 0, hold: false, fail: None, forget_jobs: false, break_at: None, broken: false, total_steps: 4, scan_folders: true, scan_reject: None, scan_posts: vec![], list_runs: true,
                 outputs_dir: outputs_dir.into(), files: vec![], job_bodies: vec![], requests: vec![], authorization: vec![], job_id: None, polls: 0, cancelled: false }
     }
 
@@ -212,7 +220,27 @@ fn handle(state: &Arc<Mutex<State>>, mut req: tiny_http::Request) {
     }
     if path == "/api/models/checkpoints" {
         let text = fixture("checkpoints.json").to_string().replace("@OUTPUTS@", &s.outputs_dir.replace('\\', "\\\\"));
-        return reply(req, 200, serde_json::from_str(&text).unwrap());
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        if !s.list_runs {
+            v["models"] = json!([]);
+        }
+        return reply(req, 200, v);
+    }
+    if path == "/api/models/scan-folders" {
+        if !s.scan_folders {
+            return error(req, 404, "Not Found");
+        }
+        if method == "GET" {
+            return reply(req, 200, fixture("scan_folders.json"));
+        }
+        if method == "POST" {
+            let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            if let Some(why) = s.scan_reject.clone() {
+                return error(req, 400, &why);
+            }
+            s.scan_posts.push(b);
+            return reply(req, 201, fixture("scan_folder_added.json"));
+        }
     }
     if path.starts_with("/v1/") && !s.fine_tuning && path != "/v1/models" {
         return error(req, 404, "Not Found");

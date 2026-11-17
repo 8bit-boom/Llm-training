@@ -280,7 +280,7 @@ def test_no_usable_column_is_its_own_note(monkeypatch):
 def test_general_key_follows_every_part_of_the_dataset():
     base = {"id": "a/b", "config": "c", "split": "train", "column": None}
     k = gt.general_key(base, 0.5, 3407)
-    assert k == {"used": True, "id": "a/b", "file": None, "config": "c", "split": "train", "column": None, "share": 0.5, "seed": 3407}
+    assert k == {"used": True, "id": "a/b", "file": None, "config": "c", "split": "train", "column": None, "share": 0.5, "seed": 3407, "render": 2}
     for change in ({"id": "a/c"}, {"config": "d"}, {"split": "test"}, {"column": "text"}, {"file": "x.jsonl"}):
         assert gt.general_key({**base, **change}, 0.5, 3407) != k
     assert gt.general_key(base, 0.4, 3407) != k and gt.general_key(base, 0.5, 1) != k

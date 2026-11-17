@@ -190,14 +190,32 @@ def _general_texts(source: dict):
     yield from generaltext.texts(source)
 
 
-def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407):
-    """General text cut into rows of at most max_seq tokens (windows of long texts), about `budget` tokens in all. tok_fn(text) -> list of token ids.
+def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407, stats: dict | None = None):
+    """General text cut into rows of at most max_seq tokens, about `budget` tokens in all. tok_fn(text) -> list of token ids.
+    A plain-text source is windowed: a long text gives several rows. A chat-shaped source (messages, conversations, prompt + answer) gives ONE row per conversation, its first
+    max_seq tokens (a later window would have neither the question nor the chat frame); a conversation longer than twice max_seq is skipped. `stats` (a dict, optional)
+    receives {"cut_rows": conversations cut to max_seq, "skipped_long": conversations skipped as too long}.
     The order is the dataset's own, or mixed by source["seed"] when it has one (the same seed gives the same sample); returns (rows, tokens). Raises whatever the source raises (the caller explains it)."""
+    stats = stats if stats is not None else {}
+    stats.setdefault("cut_rows", 0)
+    stats.setdefault("skipped_long", 0)
+    report = source.get("report")
+    if not isinstance(report, dict):
+        report = {}
+        source = {**source, "report": report}                 # the reader fills it: what kind of rows these are is known after the first one
     rows, tokens = [], 0
     for text in _general_texts(source):
         ids = tok_fn(text)
-        for a in range(0, len(ids), max_seq):
-            w = ids[a:a + max_seq]
+        if (report.get("detected") or {}).get("kind", "text") != "text":
+            if len(ids) > 2 * max_seq:
+                stats["skipped_long"] += 1
+                continue
+            if len(ids) > max_seq:
+                stats["cut_rows"] += 1
+            windows = [ids[:max_seq]]
+        else:
+            windows = [ids[a:a + max_seq] for a in range(0, len(ids), max_seq)]
+        for w in windows:
             if len(w) < MIN_GENERAL_ROW:
                 continue
             rows.append({"input_ids": w, "completion_mask": [1] * len(w), "kind": "general", "source": "general"})
@@ -218,7 +236,7 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
     for r in proj:
         r["source"] = "project"
     stats = {"project_rows": len(proj), "project_tokens": pstats["tokens"], "general_rows": 0, "general_tokens": 0, "general_error": None, "general_error_code": None,
-             "general_source": None, "general_detected": None, "general_texts_skipped": 0}
+             "general_source": None, "general_detected": None, "general_texts_skipped": 0, "general_cut_rows": 0, "general_skipped_long": 0}
     g = data_cfg.get("general")
     rows = list(proj)
     if g and float(g.get("share", 0)) > 0:
@@ -231,20 +249,24 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
         stats["general_source"] = name
         inner = data._inner(tokenizer)
         report: dict = {}
-        g.update(seed=seed, report=report, render=lambda msgs: data.render_chat(tokenizer, msgs, fam_name)[1])
+        g.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
+        long_rows: dict = {}
         try:
-            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed)
+            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed, long_rows)
         except Exception as exc:      # noqa: BLE001 - offline, gated, wrong id or column: all end the same plain way
             grows, gtok = [], 0
             stats["general_error"], stats["general_error_code"] = generaltext.failure_note(
                 exc, g, "downloaded", "Healing goes on with your world's text only; try again later or choose another dataset.", DEFAULT_GENERAL)
             protocol.log(stats["general_error"])
-        stats.update(general_detected=report.get("detected"), general_texts_skipped=report.get("skipped", 0))
+        stats.update(general_detected=report.get("detected"), general_texts_skipped=report.get("skipped", 0), general_cut_rows=long_rows.get("cut_rows", 0),
+                     general_skipped_long=long_rows.get("skipped_long", 0))
         rows += grows
         stats.update(general_rows=len(grows), general_tokens=gtok)
         if grows:
             protocol.log(f"General text used: {name} ({len(grows)} rows, {gtok:,} tokens).")
+            if stats["general_cut_rows"] or stats["general_skipped_long"]:
+                protocol.log(f"Long conversations: {stats['general_cut_rows']} were cut to {max_seq} tokens, {stats['general_skipped_long']} were longer than {2 * max_seq} tokens and left out.")
         protocol.progress("data", 1.0, "")
     return rows, stats
 
@@ -1004,6 +1026,8 @@ def merge(cfg: dict) -> int:
                           "from": cfg.get("student_label") or (base.name if base.name != "model" else base.parent.name), "merged_weights": res["merged"],
                           "lora_rank": res["rank"], "lora_scaling": res["scaling"], **{k: s.get(k) for k in (
                               "mode", "general", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
+        if cfg.get("recipe"):
+            meta["healed"]["recipe"] = str(cfg["recipe"])         # "thinking": the export keeps the model's own chat template (exportjob thinking_default)
         (out / "ndforge_reshape.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         label = cfg.get("student_label") or base.parent.name
         teacher = (meta.get("origin") or {}).get("repo")

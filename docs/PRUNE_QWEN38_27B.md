@@ -69,6 +69,8 @@ Every layer keeps its shape except the MLP, which loses neurons (multiples of 25
    **Heal card** does this: the original answers first and saves its answers to disk (about 4 GB for 20 million tokens), then the thinner model learns; the result is a new base model, *healed*.
 7. **Heal with more than your world.** One world teaches the world, not the general ability the cut took away. Keep the *general chat* share of the training data higher than usual (Step 2) when training a slimmed model, and
    if the model should keep thinking before it answers, keep **at least 75 % reasoning-style examples** (Unsloth's advice for Qwen3.8; in nd-world's export this is the *Reasoning share* option).
+   Reasoning rows of the general text are now written the way the model thinks (`<think>` + trace + `</think>` + answer, once; see GENERAL_TEXT.md "Thinking"), and a model healed
+   with the thinking recipe is **exported with the model's own chat template** (it thinks unless the client switches thinking off); any other model still answers without thinking by default.
 8. **Do not stack changes.** Slim first, test, heal, test again. Do not grow the same model, change the training data and change the settings at once: you will not know what helped.
 9. **Keep the original.** The program never changes it; do not delete it until the slim model has passed your own test.
 
@@ -86,10 +88,10 @@ Every layer keeps its shape except the MLP, which loses neurons (multiples of 25
 2. **🧬 Slim or grow a model**: choose *Qwen3.8 27B*, **Slim it**, **Make every layer thinner**. The slider starts on **MLP 13,312 (23.7 B)**. Check the disk line (about 47 GB) and the training line.
 3. **Make the model.** It measures your own text once (the page says when an earlier measurement is reused), cuts, and shows the per-layer chart and the text-prediction error *before healing*. Read that number:
    it is the honest starting point.
-4. **Heal it.** On the result card: general text on (it is downloaded from Hugging Face; offline it falls back to your text only), **20 million tokens**, press *Start healing*. The original answers first
+4. **Heal it.** On the result card: leave **Keep thinking** ticked if the model should still think before it answers (it uses the reasoning traces of Qwen3.8-27B as the general text, 40 or 80 million tokens, longer texts, more memory; docs/RESHAPE.md), general text on (it is downloaded from Hugging Face; offline it falls back to your text only), **20 million tokens** (40 or 80 with Keep thinking), press *Start healing*. The original answers first
    (a few hours on a 5090, about 4 GB of answers saved to disk), then the thinner model learns (several hours). You can **Stop** and **Continue** at any time. Watch the two curves: the KL and the error on your data
    should fall towards the original's.
-5. **Test the healed model** (button on the card). The table shows original · thinner · healed. A good outcome is a healed model whose general numbers are close to the original's.
+5. **Test the healed model** (button on the card) and run the **Thinking check** (original, cut, healed; docs/THINKING_CHECK.md). The table shows original · thinner · healed. A good outcome is a healed model whose general numbers are close to the original's.
 6. **Train it on your world (Step 3)** with the healed model (QLoRA, the *Normal* preset, a higher general share, 75 % reasoning-style examples if it should keep thinking), then **test again** and export (Step 5).
 7. **Not good enough?** Go back to step 2 with a milder cut (MLP 14,336), or heal for longer (40 or 80 million tokens). **Too slow when it runs?** Try layers instead, or *Both*.
 8. **Delete the extras when you are done**: deleting the thinned model also deletes its healed version and the teacher's saved answers.

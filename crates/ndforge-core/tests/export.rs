@@ -365,7 +365,7 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!((o.enabled, o.chunks, o.reuse), (false, 128, true));
     // the page sends only what it has: missing fields are the defaults
     let sent: exports::ImatrixOptions = serde_json::from_value(json!({"enabled": true})).unwrap();
-    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true, use_saved: None });
+    assert_eq!(sent, exports::ImatrixOptions { enabled: true, chunks: 128, reuse: true, general: None, nextn: true, use_saved: None, reasoning: None });
     assert_eq!(serde_json::from_value::<exports::ImatrixOptions>(json!({})).unwrap(), o);
     // the speculative-decoding head: on by default (the worker uses it only when there is one and llama-imatrix knows --nextn); an old spec without the field loads as on
     assert!(o.nextn && sent.nextn);
@@ -388,6 +388,12 @@ fn the_importance_matrix_is_off_by_default_and_its_choices_are_checked() {
     assert_eq!(b["stop_file"], json!(out.join("STOP")));
     assert_eq!(b["nextn"], json!(true));
     assert_eq!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { nextn: false, ..on() }, &out).unwrap().unwrap()["nextn"], json!(false));
+    // conversations with thinking in the calibration text: none unless asked, then the worker's own request shape (the same one the measuring uses)
+    assert!(b["reasoning"].is_null());
+    let r = exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { reasoning: Some(ndforge_core::reshape::plan::ReasoningCalib::default()), ..on() }, &out).unwrap().unwrap()["reasoning"].clone();
+    assert_eq!((r["source"]["id"].clone(), r["share"].clone(), r["max_len"].clone()), (json!(ndforge_core::reshape::plan::THINKING_GENERAL_ID), json!(0.5), json!(2048)));
+    let bad = ndforge_core::reshape::plan::ReasoningCalib { share: 0.95, ..Default::default() };
+    assert!(exports::imatrix_block(&p, "run1", &cfg, &exports::ImatrixOptions { reasoning: Some(bad), ..on() }, &out).is_err());
     // the general text: the open default, with its split; another dataset is passed on as chosen; an acknowledgement is needed where the preset says so
     assert_eq!((b["general"]["id"].clone(), b["general"]["split"].clone(), b["general"]["share"].clone(), b["seed"].clone()), (json!("mlabonne/open-perfectblend"), json!("train"), json!(0.2), json!(3407)));
     let own = exports::ImatrixOptions { general: Some(ndforge_core::general::GeneralSource { file: Some("notes.jsonl".into()), ..Default::default() }), ..on() };
@@ -596,4 +602,39 @@ exit 1"#);
     });
     assert_eq!(r.unwrap_err().0, "Cancelled.");
     assert!(t0.elapsed().as_secs() < 15 && !p.folder.join("exports/run1-q4_k_m/STOP").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_export_keeps_thinking_only_for_a_base_healed_with_the_thinking_recipe() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"cp "$5" "$out/job.json"
+printf 'GGUF' > "$out/model-$quant.gguf"
+echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    store::generate_draft(&p, &Recipe::default()).unwrap();
+    store::save_version(&p).unwrap();
+    fake_done_run(&p, "run1", 1);
+    let sent = || serde_json::from_str::<Value>(&std::fs::read_to_string(p.folder.join("exports/run1-q4_k_m/job.json")).unwrap()).unwrap()["thinking_default"].clone();
+    // a base from the model list: no record of a healing, the template answers without thinking as before
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("off"));
+    // a base folder healed with the thinking recipe, and one healed without it
+    let base = d.path().join("healed");
+    std::fs::create_dir_all(&base).unwrap();
+    let point_at = |dir: &std::path::Path| {
+        let f = truns::runs_dir(&p).join("run1/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        cfg["model"]["repo"] = json!(dir.to_string_lossy());
+        std::fs::write(&f, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    };
+    point_at(&base);
+    std::fs::write(base.join("ndforge_reshape.json"), json!({"healed": {"recipe": "thinking"}}).to_string()).unwrap();
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("keep"));
+    std::fs::write(base.join("ndforge_reshape.json"), json!({"healed": {"lora_rank": 32}}).to_string()).unwrap();
+    exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(sent(), json!("off"));
+    assert_eq!(exports::thinking_default(&d.path().join("nowhere")), "off");
 }

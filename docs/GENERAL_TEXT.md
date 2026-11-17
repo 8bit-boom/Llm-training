@@ -64,10 +64,24 @@ column the shape of the cell decides (a list of {role, content} is chat even whe
 answer and the family's end marker). A conversation is cut so that it ends with the assistant's answer and has a user turn before it; one that is not like that, or that the template
 refuses (strict alternation ...), is skipped and counted. If nothing is left the message is "no usable column ... (the model's chat template refused the conversations)".
 
-**Thinking.** Thinking that is already inline in the assistant text (`<think>...</think>`, as the faunix card suggests) is left alone. A separate `reasoning_content` field (r0b0tlab) is put
-into `<think>\n...\n</think>\n\n` before the answer **once** (never double-wrapped: nothing is added when the text already has a `<think>`). Messages with `tool_calls`, a `tool_call_id` or a
-`tool` role make the whole row **skipped** (the simpler, robust choice: no tool turns in general text); `trainable`, `tools`, `sampling_weight`, `domain` and the other fields are ignored.
-The Qwen template of this program is non-thinking by default (`families.py`); the traces teach the original's way of thinking only where their rows contain it.
+**Thinking.** A conversation whose last assistant turn has thinking is rendered the way the model writes it with thinking ON (`data.render_chat_full`): the model's own
+template over the whole conversation with `enable_thinking=True`, the trace passed as `reasoning_content`, which gives
+`...<|im_start|>assistant\n<think>\n{trace}\n</think>\n\n{answer}<|im_end|>\n` (the prefix `assistant\n<think>\n` is what the model sees when it is asked to think). Thinking is found
+inline (`<think>...</think>`, as the faunix card suggests) or in a separate `reasoning_content` field (r0b0tlab; `normalize_messages` puts it inline once, never double-wrapped). Before this
+change such rows went through the thinking-OFF rendering and got an empty block in front of the real one (`...</think>\n\n<think>\n...`): healing learned a text that never occurs. A row
+WITHOUT thinking (or with an empty block) keeps the thinking-off rendering (`<think>\n\n</think>\n\n` before the answer), so the model keeps both modes. Messages with `tool_calls`, a
+`tool_call_id` or a `tool` role make the whole row **skipped** (the simpler, robust choice: no tool turns in general text); `trainable`, `tools`, `sampling_weight`, `domain` and the other
+fields are ignored. Only families that think (`families.py`, `"thinks"`: Qwen3.5) are rendered this way; the importance matrix still renders thinking-off (its key does not carry the rendering,
+so saved matrices stay valid).
+
+**The exported template.** Until now every Qwen3.5 export had its chat template rewritten so the model answers WITHOUT thinking unless the client asks for it (`families.default_non_thinking`; right for a
+model trained thinking-off). The export job takes the key `thinking_default`: `"off"` (the default, nothing changes for old callers such as nd-world) or `"keep"` (the template stays as the
+model ships it). The app sends `"keep"` when the base model's `ndforge_reshape.json` says `healed.recipe == "thinking"` (the recipe is the Heal card's "Keep thinking", docs/RESHAPE.md; the worker's merge job writes it as `healed.recipe`).
+
+**Long rows.** A plain-text source is cut into windows of the sequence length (a long text gives several rows). A **chat-shaped** source (messages, conversations, prompt + answer) gives **one row per
+conversation: its first `max_seq` tokens**, because a later window would have neither the question nor the chat frame; a conversation longer than **twice** the sequence length is **skipped**. The cut and
+skipped counts are in the cache job's `stats` (`general_cut_rows`, `general_skipped_long`) and in the log ("Long conversations: ..."). For reasoning sets such as faunix (about 5,750 tokens a row) use
+4096, or 8192 when the memory allows it (Heal settings).
 
 **Local files**, read the same way: `.jsonl`/`.ndjson` (one JSON per line), `.json` (a list, an object holding a list, or JSON lines), `.txt`/`.md` (blocks separated by blank lines are the
 documents), `.csv`/`.tsv` (header row), `.parquet` (only when `pyarrow` is installed in the training software; otherwise a plain message). A file is read line by line where the format allows.
@@ -106,11 +120,10 @@ report: `scrub` (Rust, also used by the problem report) and `protocol.scrub` (wo
 ## Cache keys
 
 - **Teacher cache** (`distill/cache/index.json`): `general_key` and `general_rows` are compared together with teacher, k, rows, `data_hash`, tokenizer and length
-  (`distilljob.cache_matches`). `general_key` = `{used, id, file, config, split, column, share, seed}` (`generaltext.general_key`; Rust builds the identical value, `general::key`, and a test
-  pins the literal). Another dataset, config, split, column, share or seed -> the cache is "other data": the worker discards the old parts and the app runs the cache job again
+  (`distilljob.cache_matches`). `general_key` = `{used, id, file, config, split, column, share, seed, render}` (`render` = 2: thinking rows rendered with the thinking-ON template; a cache made before has no `render` and is other data, so it is made again) (`generaltext.general_key`; Rust builds the identical value, `general::key`, and both sides are tested against the shared cases in `worker/tests/data/general_key_cases.json`). Another dataset, config, split, column, share or seed -> the cache is "other data": the worker discards the old parts and the app runs the cache job again
   (`cache_complete` compares the key too). An **older cache has no key and counts as other data** (also an old one without general text: the key is always stored). When the key changed
   after a stopped heal, the old training checkpoints (`distill/run`) are removed so they are not continued with other data. The `distill` job refuses a cache with another key.
-- **Saved importance matrix** (`imatrix.json`): `settings_key` gains `general` (the same key, with the matrix's share 0.2 and seed); `find_saved` needs equality, so another dataset never reuses
+- **Saved importance matrix** (`imatrix.json`): `settings_key` gains `general` (the same key without `render`, with the matrix's share 0.2 and seed); `find_saved` needs equality, so another dataset never reuses
   a matrix, and a matrix saved before this key counts as made from other data. The number of general texts follows from `chunks x ctx x share`, which are in the key as well.
 - The heal job's *row count* is `rows`/`general_rows` in the cache index.
 
@@ -166,6 +179,6 @@ Nothing here was run against the real Hub, a real model or a GPU (the datasets-s
 - The Hub's real error texts for gated, not found and offline (the classification looks at exception names and phrases such as "gated dataset", "ask for access", 401/403, "doesn't exist";
   the user's own report of the gated message is the only real sample) and that a saved token is accepted by a dataset the account has access to.
 - The licence texts of the datasets (read the dataset pages), and the licence line the Hub API returns for "Check it".
-- The thinking handling on a real Qwen3.x template (`<think>` before the answer); the interaction with the non-thinking default template.
+- The thinking rendering was tested with the real Qwen3.5 template through jinja (`worker/tests/test_thinking_render.py`), not with the real tokenizer or the real faunix rows: whether their inline thinking has exactly the `<think>...</think>` shape is still unverified.
 - A heal or an export on the owner's PC with the new default; the memory and time of long rows (about 5,750 tokens) at sequence length 4096; `.parquet` with a real `pyarrow`.
 - The Tauri commands (`general_*`, `hf_token_*`) and the window itself: `src-tauri` was not built here (disk), only `ndforge-core` and the page in a stand-in browser.

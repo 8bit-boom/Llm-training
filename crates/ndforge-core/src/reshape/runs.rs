@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 
 use super::heal_source;
-use super::plan::{self, Inspect, Mode, ReshapeSpec, Width};
+use super::plan::{self, Inspect, Mode, ReasoningCalib, ReshapeSpec, Width};
 use crate::envmgr::jobs::{run_job, WorkerEvent};
 use crate::envmgr::{env_dir, python_path, worker_dir};
 use crate::error::{Error, Result};
@@ -92,7 +92,12 @@ pub fn name_for_shape(src: &ModelEntry, mode: Mode, layers_after: u32, width: Op
 
 /// The key of a measurement: model, data version, samples, length and the way it was loaded. The same key is the same measurement.
 pub fn scores_key(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str) -> String {
-    format!("{}-v{}-{samples}x{len}-{load}", slug(source_repo), version.unwrap_or(0))
+    scores_key_with(source_repo, version, samples, len, load, None)
+}
+
+/// `scores_key` for a measuring text with a reasoning part: the same key plus `ReasoningCalib::tag` (another reasoning text is another measurement).
+pub fn scores_key_with(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> String {
+    format!("{}-v{}-{samples}x{len}-{load}{}", slug(source_repo), version.unwrap_or(0), reasoning.map(|r| r.tag()).unwrap_or_default())
 }
 
 pub fn scores_dir(p: &Project, key: &str) -> PathBuf {
@@ -184,15 +189,24 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         "job": "reshape", "source": {"repo": m.repo, "family": m.family}, "mode": spec.mode, "blocks": spec.blocks, "strategy": spec.strategy,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "drop_layers": spec.drop_layers,
         "grow": {"layout": "solar", "init": spec.init},
-        "calibration": {"train": train, "samples": samples, "max_len": spec.calib_len, "seed": 3407, "version": version},
+        "calibration": calibration_json(train.as_deref(), samples, spec.calib_len, version, spec.reasoning.as_ref()),
         "load": spec.load, "check": true, "shard_gb": 5,
         "out": dir.join("model.partial"), "final": dir.join("model"),
     });
     if let Some(w) = &spec.width {
         job["width"] = json!({"intermediate_size": w.intermediate, "linear_num_value_heads": w.lin_v_heads, "num_attention_heads": w.heads});
-        job["scores_dir"] = json!(scores_dir(p, &scores_key(&m.repo, version, samples, spec.calib_len, &spec.load)));
+        job["scores_dir"] = json!(scores_dir(p, &scores_key_with(&m.repo, version, samples, spec.calib_len, &spec.load, spec.reasoning.as_ref())));
     }
     Ok(job)
+}
+
+/// The `calibration` of a worker job: the project's training file, how many samples of which length and, when asked, the reasoning part.
+fn calibration_json(train: Option<&Path>, samples: u32, len: u32, version: Option<u32>, reasoning: Option<&ReasoningCalib>) -> Value {
+    let mut c = json!({"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version});
+    if let Some(r) = reasoning {
+        c["reasoning"] = r.json();
+    }
+    c
 }
 
 fn active() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
@@ -299,6 +313,31 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
             Err(e)
         }
     }
+}
+
+/// Auto-cut's clean-up of a made model whose heal has passed its check: the unhealed model (`model/`, and its entry in the model list) and the teacher's saved answers go;
+/// the folder, its records, the thinking checks and a healed model stay. Refused while the model is being made.
+pub fn remove_cut(p: &Project, name: &str) -> Result<()> {
+    valid_name(name)?;
+    let dir = models_dir(p).join(name);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    if active().lock().map(|a| a.contains(&dir)).unwrap_or(false) {
+        return Err(Error::new("This model is being made right now. Stop it first."));
+    }
+    let model = dir.join("model");
+    let repo = model.canonicalize().unwrap_or(model.clone()).to_string_lossy().to_string();
+    if let Some(id) = catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.id) {
+        catalog::remove_custom(&id)?;
+    }
+    for sub in [model, dir.join("distill").join("cache")] {
+        if sub.is_dir() {
+            std::fs::remove_dir_all(sub)?;
+        }
+    }
+    set_state(&dir, json!({"model_removed": true}));
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------------------------------- the list
@@ -600,7 +639,7 @@ pub struct HealSpec {
     #[serde(default)]
     pub backend: Option<String>,
     // Healing settings (Expert, docs/HEAL_SETTINGS.md): None = the automatic value for this student and card (`plan::heal_defaults`). Older windows send none of them.
-    /// sequence length: 512 | 1024 | 2048 | 4096
+    /// sequence length: 512 | 1024 | 2048 | 4096 | 8192
     #[serde(default)]
     pub seq: Option<u32>,
     /// sequences per step on the card: 1 | 2 | 4
@@ -633,9 +672,18 @@ pub struct HealSpec {
     /// the numerics of the frozen tables: the training key and the teacher's cache key do not include it (docs/HEAL_SETTINGS.md).
     #[serde(default)]
     pub kbit_upcast: Option<bool>,
+    /// "thinking": heal so that the model keeps thinking (`plan::THINKING_RECIPE`). The window sends the recipe's numbers (`heal_options` says them: tokens, general share);
+    /// what it leaves empty is filled here: the general text (the reasoning traces of Qwen3.8-27B), the sequence length, the batch and the LoRA size. Written to `heal.json`
+    /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
+    #[serde(default)]
+    pub recipe: Option<String>,
 }
 
 impl HealSpec {
+    pub fn thinking(&self) -> bool {
+        self.recipe.as_deref() == Some(plan::THINKING_RECIPE)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !plan::HEAL_TOKENS_M.contains(&self.tokens_m) {
             return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens."));
@@ -646,9 +694,12 @@ impl HealSpec {
         if self.mode.as_deref().is_some_and(|m| !["cache", "online"].contains(&m)) {
             return Err(Error::new("Unknown way of healing."));
         }
+        if self.recipe.as_deref().is_some_and(|r| r != plan::THINKING_RECIPE) {
+            return Err(Error::new("Unknown healing recipe. The only one is \"thinking\"."));
+        }
         let bad = |what: &str| Err(Error::new(format!("Healing settings out of range: {what}.")));
-        if self.seq.is_some_and(|s| ![512, 1024, 2048, 4096].contains(&s)) {
-            return bad("sequence length 512, 1024, 2048 or 4096");
+        if self.seq.is_some_and(|s| ![512, 1024, 2048, 4096, 8192].contains(&s)) {
+            return bad("sequence length 512, 1024, 2048, 4096 or 8192");
         }
         if self.batch.is_some_and(|b| ![1, 2, 4].contains(&b)) {
             return bad("batch per step 1, 2 or 4");
@@ -680,7 +731,8 @@ impl HealSpec {
             return Ok(None);
         }
         let legacy = self.general_dataset.as_ref().filter(|d| !d.trim().is_empty()).map(|d| crate::general::GeneralSource { id: Some(d.clone()), column: self.general_column.clone(), ..Default::default() });
-        crate::general::resolve(self.general.as_ref().or(legacy.as_ref()), true).map(Some)
+        let recipe = self.thinking().then(|| crate::general::GeneralSource::hub(plan::THINKING_GENERAL_ID));
+        crate::general::resolve(self.general.as_ref().or(legacy.as_ref()).or(recipe.as_ref()), true).map(Some)
     }
 }
 
@@ -697,10 +749,12 @@ pub struct HealChoice {
 
 pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &plan::HealDims) -> HealChoice {
     let def = plan::heal_defaults(student_b, vram_gb, d);
-    let batch = spec.batch.unwrap_or(def.batch);
+    // the thinking recipe changes what the automatic values are; what the person chose still wins
+    let (rseq, rbatch, rrank) = if spec.thinking() { plan::thinking_knobs(student_b, vram_gb, d) } else { (def.seq, def.batch, def.rank) };
+    let batch = spec.batch.unwrap_or(rbatch);
     let per_update = spec.per_update.unwrap_or(def.batch * def.grad_accum).max(batch);
     let mut knobs = plan::HealKnobs {
-        seq: spec.seq.unwrap_or(def.seq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(def.rank),
+        seq: spec.seq.unwrap_or(rseq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(rrank),
         kl_chunk: spec.kl_chunk.unwrap_or(def.kl_chunk), qlora: match spec.method.as_deref() { Some("qlora") => true, Some("lora") => false, _ => def.qlora }, upcast: false,
     };
     knobs.upcast = knobs.qlora && spec.kbit_upcast.unwrap_or(false);      // 16-bit LoRA has no such copy
@@ -801,6 +855,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let o = heal_source::read_origin(&dir)?;
     let (origin, family) = (o.teacher.clone(), o.family.clone());
+    if spec.thinking() && family != "qwen3_5" {
+        return Err(Error::new("The thinking recipe is for Qwen3.5 and Qwen3.8 models (their chat template writes the reasoning). Untick \"Keep thinking\" for this model."));
+    }
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: healing uses your world's text."))?;
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
     if !train.is_file() {
@@ -836,10 +893,13 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         let _ = std::fs::remove_dir_all(&run_dir);
     }
     let cal = &o.calibration;
-    let calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
+    let mut calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
+    if cal["reasoning"].is_object() {
+        calibration["reasoning"] = cal["reasoning"].clone();         // the loss before and after is measured on the text the cut was measured on
+    }
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
-    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": []}));
+    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
     let stopped = |step: &str| {
         set_heal(&dir, json!({"status": "stopped", "step": step}));
         json!({"stopped": true, "name": name})
@@ -901,6 +961,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         summary = r;
     }
     let mut job = json!({"job": "distill_merge", "base": model, "adapter": run_dir.join("adapter"), "out": dir.join("healed.partial"), "final": dir.join("healed"), "summary": summary, "stop_file": stop_file});
+    if let Some(r) = &spec.recipe {
+        job["recipe"] = json!(r);          // the merged model's ndforge_reshape.json says how it was healed (healed.recipe): the export keeps its thinking template for "thinking"
+    }
     if o.external || o.teacher_chosen {
         // a model the Slim page did not make has no recorded original: the merged folder records the teacher (and the student's name) for Step 3 and Step 5
         job["origin"] = json!({"repo": origin, "family": family, "params": (teacher_b * 1e9).round()});
@@ -938,8 +1001,13 @@ pub fn heal_metrics(p: &Project, name: &str) -> Vec<Value> {
 
 /// What is kept of an earlier measurement of this model on this data with these settings (None when there is none yet).
 pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str) -> Value {
+    measurement_info_with(p, m, samples, len, load, None)
+}
+
+/// `measurement_info` for a measuring text with a reasoning part.
+pub fn measurement_info_with(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Value {
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
-    let key = scores_key(&m.repo, version, samples, len, load);
+    let key = scores_key_with(&m.repo, version, samples, len, load, reasoning);
     let meta = read_json(&scores_dir(p, &key).join("scores.json"));
     json!({"key": key, "exists": meta.is_some(), "tokens": meta.as_ref().map(|x| x["tokens"].clone()), "load": meta.as_ref().map(|x| x["load"].clone()),
            "created": meta.as_ref().map(|x| x["created"].clone()), "data_version": version})
@@ -948,6 +1016,15 @@ pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, loa
 /// "Measure now" (Expert: also "measure again"): measures the model once and keeps the result for every later size choice on the same data. Making a
 /// thinner model measures by itself when nothing is kept, so this is optional. Returns the worker's result.
 pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, force: bool, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    measure_with(p, model_id, samples, len, load, None, force, stop, on_event)
+}
+
+/// `measure` with a reasoning part in the measuring text (half of the samples are conversations with thinking, written the way the model thinks).
+#[allow(clippy::too_many_arguments)]
+pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>, force: bool, stop: Arc<AtomicBool>, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    if let Some(r) = reasoning {
+        r.validate()?;
+    }
     if !["auto", "16bit", "4bit", "offload"].contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
         return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
     }
@@ -958,12 +1035,12 @@ pub fn measure(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, 
         return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
     }
     let py = python()?;
-    let key = scores_key(&m.repo, Some(version), samples, len, load);
+    let key = scores_key_with(&m.repo, Some(version), samples, len, load, reasoning);
     let folder = scores_dir(p, &key);
     let _active = Active::begin(&folder)?;
     let job = json!({
         "job": "reshape_measure", "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
-        "calibration": {"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version},
+        "calibration": calibration_json(Some(&train), samples, len, Some(version), reasoning),
     });
     let stop_dir = models_dir(p).join("_scores");
     let mut result = crate::train::runs::drive(&py, &stop_dir, &job, stop, Duration::from_secs(60), &mut |e| on_event(event_json(e)))?;
@@ -1039,6 +1116,9 @@ pub struct TrySpec {
     /// the model's size in billions of parameters (for the first time estimate)
     #[serde(default)]
     pub params_b: Option<f64>,
+    /// a measuring text with a reasoning part (the answers and the measurement of the neurons are kept per reasoning text)
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCalib>,
 }
 
 /// The most cuts one request may ask for (a safety net; the page asks for far fewer).
@@ -1054,6 +1134,9 @@ impl TrySpec {
         }
         if !(8..=4096).contains(&self.samples) || !(8..=4096).contains(&self.measure_samples) || !(32..=8192).contains(&self.len) {
             return Err(Error::new("Try on 8 to 4096 samples of 32 to 8192 tokens."));
+        }
+        if let Some(r) = &self.reasoning {
+            r.validate()?;
         }
         if self.protect_first > 8 || self.protect_last > 8 {
             return Err(Error::new("Protect at most 8 blocks at each end."));
@@ -1078,7 +1161,7 @@ impl TrySpec {
 
 /// The folder where the answers for this model, data and settings are kept (the measurement's own folder when the samples are the same).
 pub fn try_dir(p: &Project, m: &ModelEntry, version: u32, spec: &TrySpec) -> PathBuf {
-    scores_dir(p, &scores_key(&m.repo, Some(version), spec.samples, spec.len, &spec.load))
+    scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.samples, spec.len, &spec.load, spec.reasoning.as_ref()))
 }
 
 /// The worker's job for a spec. `plan_only`: count the passes and estimate the time, run nothing.
@@ -1091,8 +1174,8 @@ pub fn try_job(p: &Project, m: &ModelEntry, spec: &TrySpec, plan_only: bool) -> 
     }
     Ok(json!({
         "job": "reshape_try", "source": {"repo": m.repo, "family": m.family}, "load": spec.load, "out_dir": try_dir(p, m, version, spec), "plan_only": plan_only, "force": spec.force,
-        "calibration": {"train": train, "samples": spec.samples, "max_len": spec.len, "seed": 3407, "version": version},
-        "measure_dir": scores_dir(p, &scores_key(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load)), "measure_samples": spec.measure_samples,
+        "calibration": calibration_json(Some(&train), spec.samples, spec.len, Some(version), spec.reasoning.as_ref()),
+        "measure_dir": scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load, spec.reasoning.as_ref())), "measure_samples": spec.measure_samples,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "strategy": spec.strategy, "want": spec.want(), "params_b": spec.params_b,
     }))
 }
@@ -1113,9 +1196,14 @@ pub fn try_plan(p: &Project, spec: &TrySpec, kill: &AtomicBool, on_event: &mut d
 
 /// The answers kept for this model, data and settings (`{"exists": false}` when there are none). Whether they still belong to the weights is checked by the worker.
 pub fn try_results(p: &Project, model_id: &str, samples: u32, len: u32, load: &str) -> Result<Value> {
+    try_results_with(p, model_id, samples, len, load, None)
+}
+
+/// `try_results` for a measuring text with a reasoning part.
+pub fn try_results_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Value> {
     let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let Some((version, _)) = crate::train::runs::latest_version(p) else { return Ok(json!({"exists": false})) };
-    let file = scores_dir(p, &scores_key(&m.repo, Some(version), samples, len, load)).join("reshape_try.json");
+    let file = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning)).join("reshape_try.json");
     let Some(v) = read_json(&file) else { return Ok(json!({"exists": false})) };
     if v["key"]["source"] != json!(m.repo) || v["key"]["data_version"] != json!(version) {
         return Ok(json!({"exists": false}));
@@ -1161,8 +1249,19 @@ pub fn heal_options_with(p: &Project, dir: Option<(&str, &Path)>, o: &heal_sourc
         "teacher": o.teacher, "external": o.external, "teacher_chosen": o.teacher_chosen, "student_label": o.student_label, "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
         "healed": dir.is_some_and(|(_, d)| d.join("healed").join("config.json").is_file()), "heal": heal, "metrics": dir.map(|(n, _)| heal_metrics(p, n)).unwrap_or_default(), "vram_gb": vram_gb,
         "free_disk_gb": crate::envmgr::health::free_disk_gb(&free_in).map(|g| (g * 10.0).round() / 10.0),
-        "calibration": o.calibration, "loss": {"original": o.loss_before, "thinned": o.loss_after},
+        "calibration": o.calibration, "loss": {"original": o.loss_before, "thinned": o.loss_after}, "recipe": thinking_recipe_json(o, &dims, vram_gb),
     })
+}
+
+/// What the Heal card needs for "Keep thinking": the recipe's numbers for this student and card, and whether it is on by default (Qwen3.5 / Qwen3.8 students). Null for other models.
+fn thinking_recipe_json(o: &heal_source::Origin, dims: &plan::HealDims, vram_gb: Option<f64>) -> Value {
+    if o.family != "qwen3_5" {
+        return Value::Null;
+    }
+    let (seq, batch, rank) = plan::thinking_knobs(o.student_b, vram_gb, dims);
+    let cut = if o.teacher_b > 0.0 { (1.0 - o.student_b / o.teacher_b).max(0.0) } else { 0.0 };
+    json!({"id": plan::THINKING_RECIPE, "tokens_m": plan::thinking_tokens_m(o.student_b, o.teacher_b), "general_share": plan::THINKING_SHARE, "general": plan::THINKING_GENERAL_ID, "seq": seq, "batch": batch,
+           "rank": rank, "cut_share": (cut * 1000.0).round() / 1000.0, "default_on": true})
 }
 
 /// The Heal card's live estimate: the plan (memory in plain words, the breakdown, the way that fits) for the settings the person has chosen so far, and the

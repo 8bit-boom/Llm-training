@@ -39,6 +39,72 @@ def render_chat(tokenizer, messages: list, fam_name: str):
     return prompt, prompt + messages[-1]["content"] + end
 
 
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+
+
+def split_thinking(content: str):
+    """(trace, answer) of an assistant text that starts with a reasoning block, as the Qwen template reads it: the text before the first </think> (after the last
+    <think> in it), and what follows. (None, content) when there is no closed block."""
+    if THINK_CLOSE not in content:
+        return None, content
+    head, _, answer = content.partition(THINK_CLOSE)
+    trace = head.split(THINK_OPEN)[-1].strip()
+    return trace, answer.lstrip("\n")
+
+
+def has_thinking(messages: list) -> bool:
+    """True when the last assistant turn carries a reasoning trace that is not empty: inline (<think>...</think>) or in the separate field `reasoning_content`."""
+    if not messages or messages[-1].get("role") != "assistant":
+        return False
+    last = messages[-1]
+    r = last.get("reasoning_content")
+    if isinstance(r, str) and r.strip():
+        return True
+    c = last.get("content")
+    if isinstance(c, str):
+        trace, _ = split_thinking(c)
+        return bool(trace)
+    return False
+
+
+def render_chat_full(tokenizer, messages: list, fam_name: str, thinking=None):
+    """(prompt text, full text) like render_chat, but a conversation whose last assistant turn has thinking is rendered the way the model writes it with thinking ON:
+
+        ...<|im_start|>assistant\n<think>\n{trace}\n</think>\n\n{answer}<|im_end|>\n      prompt = everything up to and including "assistant\n<think>\n"
+
+    (the model's own template over the whole conversation, enable_thinking=True, the trace passed as reasoning_content). render_chat would put its empty thinking-off
+    block in front of such an answer, which then holds a second block. Without thinking the result is render_chat's. `thinking`: None = decide with has_thinking."""
+    fam = family(fam_name)
+    on = has_thinking(messages) if thinking is None else bool(thinking)
+    if not (on and fam.get("thinks")) or not messages or messages[-1]["role"] != "assistant":
+        return render_chat(tokenizer, _without_empty_block(messages, fam) if fam.get("thinks") else messages, fam_name)
+    tok = _inner(tokenizer)
+    last = messages[-1]
+    trace, answer = split_thinking(last["content"]) if isinstance(last.get("content"), str) else (None, "")
+    if not trace:
+        r = last.get("reasoning_content")
+        trace, answer = (r.strip() if isinstance(r, str) else ""), (last.get("content") or "")
+    if not trace:
+        return render_chat(tokenizer, messages, fam_name)
+    turn = {"role": "assistant", "content": answer.strip(), "reasoning_content": trace}
+    full = tok.apply_chat_template(messages[:-1] + [turn], tokenize=False, add_generation_prompt=False, enable_thinking=True)
+    prompt = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True, enable_thinking=True)
+    if not full.startswith(prompt):
+        raise ValueError("the chat template did not write the reasoning block where the prompt ends")
+    return prompt, full
+
+
+def _without_empty_block(messages: list, fam: dict) -> list:
+    """The last assistant turn without a leading EMPTY reasoning block ("<think>\n\n</think>\n\n"): the thinking-off prompt already ends with one."""
+    if not messages or messages[-1].get("role") != "assistant" or not isinstance(messages[-1].get("content"), str):
+        return messages
+    c = messages[-1]["content"]
+    trace, answer = split_thinking(c)
+    if trace == "" and c.lstrip().startswith(THINK_OPEN):
+        return messages[:-1] + [{**messages[-1], "content": answer}]
+    return messages
+
+
 def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 3407):
     """[{input_ids, completion_mask, kind: "text"|"chat"}] and counts. Rows whose prompt alone does not fit are skipped; longer rows are cut at max_len."""
     tok = _inner(tokenizer)

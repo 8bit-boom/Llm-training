@@ -34,7 +34,9 @@ Unsloth Desktop is an app that starts the same Studio backend and talks to it ov
 | Events | `GET B/v1/fine_tuning/jobs/{id}/events?limit=100` | `{"data":[...],"has_more"}` **newest first**; `after=<id>` pages toward OLDER events; ids are stable (`ftevent_<run>_step<N>`); `type:"metrics"` events carry `{step,total_steps,train_loss,learning_rate,grad_norm,valid_loss,epoch}` [V]. Fixture `events.json` |
 | Stop | `POST B/v1/fine_tuning/jobs/{id}/cancel` | 200 job `cancelled`; 400 "already ..."; 409 "not running" [V] |
 | Pause / resume | `POST .../pause`, `.../resume` | **always 400** "Pausing and resuming fine-tuning jobs is not supported; use cancel." [V]. Never call them |
-| Run folders | `GET B/api/models/checkpoints` | `{"outputs_dir","models":[{"name":"<run folder>","checkpoints":[{"display_name","path","loss"}],"base_model","peft_type","lora_rank","is_quantized"}]}`; the host paths are visible to API-key callers (Unsloth's own MCP code relies on it) [V]. Fixture `checkpoints.json` (`@OUTPUTS@` stands for the outputs folder) |
+| Run folders (and Studio's own outputs folder) | `GET B/api/models/checkpoints` | `{"outputs_dir","models":[{"name":"<run folder>","checkpoints":[{"display_name","path","loss"}],"base_model","peft_type","lora_rank","is_quantized"}]}`; the host paths are visible to API-key callers (Unsloth's own MCP code relies on it) [V]. Fixture `checkpoints.json` (`@OUTPUTS@` stands for the outputs folder) |
+| Custom folders: is it there? | `GET B/api/models/scan-folders` | 200 `{"folders":[{"id","path","created_at","recursive","status"}]}`; 404 / 405 = this Studio has no such list [V route and model]. Under an API key the `path` values are opaque `ref:<32 hex>` handles, not paths [V: `host_paths.py`], so the list cannot be compared with a path: do not try. Fixture `scan_folders.json` |
+| Custom folders: add | `POST B/api/models/scan-folders {"path": "<folder as Studio sees it>", "recursive": true}` | **201** `{"id","path","created_at","recursive","status"}`, also for a folder that was registered before (nothing is inserted twice) [V]; **400** `{"detail": "<reason>"}` when the folder does not exist or cannot be read for Studio [V]. Fixture `scan_folder_added.json` |
 | Export (not used by v1) | `POST B/api/export/load-checkpoint {checkpoint_path,max_seq_length,op_id}`, then `POST B/api/export/export/{lora,merged,gguf} {save_directory,expected_checkpoint,op_id,quantization_method?}`, status `GET B/api/export/status` | one export at a time [V]. Lore Forge does not call these yet (optional step LF6) |
 
 ## The job body
@@ -55,6 +57,33 @@ Unsloth Desktop is an app that starts the same Studio backend and talks to it ov
 - **`load_in_4bit` defaults to `true` in Unsloth** [V]: always send it, `false` for LoRA, `true` for QLoRA.
 - Full fine-tuning (`training_type: "Full Finetuning"`) has no adapter and Lore Forge's two-stage training (world book first) cannot be expressed: both are refused for Unsloth.
 - A busy Unsloth queues the job in memory; a queued job does not survive an Unsloth restart [V]: its id then answers 404.
+
+## Publish (Auto-cut puts GGUF files into Studio's share)
+
+Added with Auto-cut (docs/AUTO_CUT.md). **nd-world: copy this section, the two new rows above and the fixtures `scan_folders.json` and `scan_folder_added.json` (the stand-in
+server needs the two routes and the `list_runs` / `scan_folders` / `scan_reject` switches of `crates/ndforge-core/tests/common/fake_unsloth.rs`).** The code is `unsloth/publish.rs`.
+
+Studio runs in Docker (on a NAS) and keeps its files in a folder that the container sees under another path than the computer that runs Lore Forge. Two settings say which:
+**Studio share** (the folder as this computer sees it, e.g. `Y:\unsloth\studio`) and **Path inside the container** (the same folder in the container, e.g. `/workspace`). Nothing of Studio is read
+from disk: not its database, not its secrets.
+
+1. **Container path.** With an API key: `GET /api/models/checkpoints` gives `outputs_dir` (a path inside the container, e.g. `/workspace/outputs`) [V]; the folder above it is Studio's root.
+   A path typed in the settings wins over the detected one. The share is **confirmed** by the run folders the same listing names: at least one must exist under `<share>/outputs`. When Studio lists runs and
+   none is in the share, nothing is copied ("not Studio's folder"); when it lists none, the copy goes ahead with a note.
+2. **Copy.** The free space of the share is checked first (files + 2 % + 0.25 GB; unknown = go ahead). The files are written into `<share>/exports/<name>.partial/` in 8 MB chunks, every size is checked,
+   then the folder is renamed to `<share>/exports/<name>/` (an older export of the same name is moved aside and deleted only after the rename). A stop or an error removes the `.partial` folder and leaves the
+   older export whole. `<name>` is `<model name> cut to <size>B` made safe (letters, digits, `.`, `_`, `-`). A `README.md` goes along.
+3. **Where it is inside Studio**: `<container root>/exports/<name>/<file>`; shown in the report and the window with a Copy button.
+4. **Registration (feature-probed).** If `GET /api/models/scan-folders` is 200 and the container path is known, `POST /api/models/scan-folders {"path": "<container root>/exports", "recursive": true}` is sent once per
+   publish (Studio answers 201 whether it knew the folder or not). 400 = Studio could not read the folder: a note ("check Path inside the container"), the files stay. 404 / 405 = not offered: a note. Switched off by
+   the setting `register_scan_folder`. Whether Studio then lists a GGUF with a non-standard depth is **not verified** [GPU/Desktop].
+5. **Fine-tune handoff** (setting `finetune_handoff`, **off by default**): also copies the healed Hugging Face folder to `<share>/exports/<name>-hf/` and returns its container path as `finetune_model`
+   (the `model` of a fine-tuning job in Studio). Only the path is prepared: Lore Forge does not start that job from Auto-cut. It is only useful when the NAS has a graphics card [A].
+
+The result (stored in the Auto-cut state and report): `{"published": true, "name", "host_path", "container_path", "files": [{"file","host_path","container_path"}], "size_gb", "hf", "finetune_model",
+"scan_folder": {"status": "registered|skipped|not_offered|rejected|failed", "note"}, "detected": {...}, "notes": []}`, or `{"published": false, "why": "<plain sentence>"}` (not set up, drive not there, not Studio's folder).
+
+Cannot be automated (said in the window): creating the API key and LAN access, Docker volume mappings, Studio's chat **Think** toggle, and whether Studio loads a cut GGUF of a non-standard depth.
 
 ## Failure messages (each product words them in its own UI)
 
@@ -83,6 +112,7 @@ The unknown-parameter 400 is the canary for a changed schema; the stand-in serve
 | Unsloth | Source | Lore Forge | nd-world |
 |---|---|---|---|
 | backend commit `1bbf9c3f` (read, not run) | source reading, 2026-11-13 | stand-in server only | stand-in server only |
+| scan-folders and `outputs_dir` (Publish) | source reading of the same backend, 2026-11-17 | stand-in server only | not yet |
 | first real Desktop | - | not yet (GPU checklist in `docs/UNSLOTH_DESKTOP.md`) | not yet |
 
 ## Security

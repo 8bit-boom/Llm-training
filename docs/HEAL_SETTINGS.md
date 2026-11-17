@@ -23,7 +23,7 @@ Healing (distillation, `worker/ndforge_worker/distilljob.py`) ran out of graphic
 
 | Setting | What it does | Default |
 |---|---|---|
-| Sequence length 512/1024/2048/4096 | tokens per training text. Memory grows with it. Changing it makes the original answer again (the cache is for one length) and restarts the learning. | 1024 from 15 B, else 2048 |
+| Sequence length 512/1024/2048/4096/8192 | tokens per training text. Memory grows with it. 8192 is for long reasoning rows (the faunix set averages about 5,750 tokens); the estimate of a 16 B student with QLoRA, checkpointing and batch 1 is about 18.5 GB at 4096 and 20.6 GB at 8192 (shared cases in `worker/tests/data/heal_cases.json`, estimates not measurements). Changing it makes the original answer again (the cache is for one length) and restarts the learning. | 1024 from 15 B, else 2048 |
 | Batch per step 1/2/4 | texts on the card at once. | 2 from 15 B (1 from 25 B), else 4 |
 | Sequences per update | batch x accumulation; the accumulation is computed and shown. Keeps the learning the same whatever the batch. | 32 |
 | Gradient checkpointing Auto/On/Off | makes layer activations again in the backward pass: much less memory, about a third slower. Auto: on from 8 B; below that on when the activations would take more than 60 % of the memory left after the weights; card unknown: on. | Auto |
@@ -54,6 +54,12 @@ Example, 16 B student (40 layers, hidden 4096, vocab 248,320), QLoRA, rank 32: d
 (2048 tokens, batch 4, no checkpointing, 32-bit copy) = about 73 GB at rank 64 (the activations alone are 45 GB), "will probably run out of memory". Words on the page: *fits* (up to 85 % of the card),
 *tight* (up to 100 %), *will probably run out of memory* (more); healing is refused only for the last one. The teacher's step is estimated as before (4-bit, 0.6 bytes per parameter + 2 GB) and
 the heavier of the two steps counts (both together when they fit: "online").
+
+## The thinking recipe and these settings
+
+With **Keep thinking** ticked (Qwen3.5 / 3.8 students) the automatic values change: sequence length 8192 when the estimate fits (else 4096, 2048, 1024), batch 1, LoRA size 64; 40 or 80 million tokens
+(`plan::thinking_knobs`, `thinking_tokens_m`; docs/RESHAPE.md has the table). What is chosen in Expert mode wins, and a sequence length or LoRA size that differs from the stopped run's still makes the
+old checkpoints go (`train_key`). The out-of-memory ladder below never changes the sequence length or the rank, so a recipe run that is too big ends with the plain message and the choice to pick 4096 or 2048.
 
 ## Out-of-memory recovery
 

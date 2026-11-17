@@ -1,0 +1,443 @@
+{
+ "gates": [
+  "closed_rate",
+  "accuracy",
+  "loop_rate",
+  "garbage_rate",
+  "median_think_tokens"
+ ],
+ "cases": [
+  {
+   "name": "the same as the original passes",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "pass",
+    "failed": [],
+    "warned": []
+   }
+  },
+  {
+   "name": "a healed model that does better passes",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.9,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 600
+   },
+   "expect": {
+    "verdict": "pass",
+    "failed": [],
+    "warned": []
+   }
+  },
+  {
+   "name": "closed rate just above the limit warns",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.9375,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "closed_rate"
+    ]
+   }
+  },
+  {
+   "name": "closed rate below 0.9x the original fails",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.875,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "closed_rate"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "accuracy below 0.8x the original fails",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.5,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "accuracy"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "accuracy exactly at the limit warns",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.6,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "accuracy"
+    ]
+   }
+  },
+  {
+   "name": "loops above the original plus 0.10 fail",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.125,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "loop_rate"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "loops within 5 percent of the limit warn",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0969,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "loop_rate"
+    ]
+   }
+  },
+  {
+   "name": "garbage above 0.05 fails",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0625,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "garbage_rate"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "garbage within 5 percent of 0.05 warns",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.049,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "garbage_rate"
+    ]
+   }
+  },
+  {
+   "name": "a median trace over 2.5x the original's fails",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 2100
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "median_think_tokens"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "a median trace near the limit warns",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 1950
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "median_think_tokens"
+    ]
+   }
+  },
+  {
+   "name": "a weak original still needs 0.75 closed",
+   "original": {
+    "closed_rate": 0.5,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.7,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "closed_rate"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "a weak original: 0.75 closed is allowed but close",
+   "original": {
+    "closed_rate": 0.5,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.75,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "warn",
+    "failed": [],
+    "warned": [
+     "closed_rate"
+    ]
+   }
+  },
+  {
+   "name": "an original that never thinks: any trace over 2.5 tokens fails",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 0
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 3
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "median_think_tokens"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "an original that gets nothing right: accuracy cannot fail",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.0,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 1.0,
+    "accuracy": 0.0,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "pass",
+    "failed": [],
+    "warned": []
+   }
+  },
+  {
+   "name": "several misses are all named, in order",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.5,
+    "accuracy": 0.1,
+    "loop_rate": 0.5,
+    "garbage_rate": 0.5,
+    "median_think_tokens": 9000
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "closed_rate",
+     "accuracy",
+     "loop_rate",
+     "garbage_rate",
+     "median_think_tokens"
+    ],
+    "warned": []
+   }
+  },
+  {
+   "name": "a fail beats a warn",
+   "original": {
+    "closed_rate": 1.0,
+    "accuracy": 0.75,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "candidate": {
+    "closed_rate": 0.9375,
+    "accuracy": 0.5,
+    "loop_rate": 0.0,
+    "garbage_rate": 0.0,
+    "median_think_tokens": 800
+   },
+   "expect": {
+    "verdict": "fail",
+    "failed": [
+     "accuracy"
+    ],
+    "warned": [
+     "closed_rate"
+    ]
+   }
+  }
+ ]
+}

@@ -1901,7 +1901,9 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
-  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null };
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
+  // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
+  tk: { name: null, data: null, quick: null, gguf: "", run: null, err: null, ok: null } };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
 // labelled experimental, and stays switched off until the measurements on a real graphics card (docs/RESHAPE.md, "Not verified yet") are done:
@@ -2065,7 +2067,7 @@ function healSettings(sp, kn, plan, busy, upcastGb) {
   return `<details id="hl-settings" open><summary>Healing settings</summary>
     <p class="dim small">The safe settings for this model and card are already chosen. If healing runs out of memory, the program tries again by itself with safer ones.</p>
     <div class="grid">
-    <label>Sequence length<br>${sel("hl-seq", v(sp.seq, kn.seq), [[512, "512"], [1024, "1024"], [2048, "2048"], [4096, "4096"]])}</label>
+    <label>Sequence length<br>${sel("hl-seq", v(sp.seq, kn.seq), [[512, "512"], [1024, "1024"], [2048, "2048"], [4096, "4096"], [8192, "8192 (long reasoning rows; needs a lot of memory)"]])}</label>
     <label>Batch per step<br>${sel("hl-batch", bt, [[1, "1"], [2, "2"], [4, "4"]])}</label>
     <label>Sequences per update<br><input type="text" id="hl-perupdate" value="${pu}" ${d}> <span class="dim small" id="hl-accum">= ${bt} × ${Math.ceil(pu / bt)} steps added up</span></label>
     <label>Gradient checkpointing<br>${sel("hl-ckpt", sp.checkpointing || "auto", [["auto", "Auto" + (kn.checkpointing != null ? " (" + (kn.checkpointing ? "on" : "off") + ")" : "")], ["on", "On (less memory, about a third slower)"], ["off", "Off"]])}</label>
@@ -2096,11 +2098,16 @@ function healCard(m, pair) {
     <div class="row">${m.healed_model_id ? `<button class="primary" data-rstrain="${esc(m.healed_model_id)}">Train the healed model on your world (Step 3)</button>` : ""}</div></div>`;
   if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
   if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
-  const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, st = (h.heal && h.heal.status) || null;
+  const sp = rs.hlSpec, st = (h.heal && h.heal.status) || null;
+  const recipeOn = hlRecipeOn(h), tk = sp.tokens_m || (recipeOn ? h.recipe.tokens_m : h.default_tokens_m);
   const est = rs.hlEst && rs.hlEst.name === m.name ? rs.hlEst.est : null, plan = (est && est.plan) || h.plan || {}, kn = (est && est.knobs) || h.defaults || plan.knobs || {};
   const t = (h.tokens || []).find((x) => x.tokens_m === tk) || {};
   const expert = state.settings.expert_mode;
   gcUse(h.general);
+  if (h.recipe && sp.recipe == null && gc.state && !rs.hlSeed[m.name]) {            // the recipe is on by default: its reasoning text is chosen once, unless the person already chose a text for healing
+    rs.hlSeed[m.name] = true;
+    if (!(gc.state.choice || {}).heal) { const sc = gcScope("heal"); sc.sel = h.recipe.general; sc.project = state && state.project ? state.project.folder : ""; sc.check = null; }
+  }
   const blocked = sp.general ? gcBlocked("heal") : "";
   const verdictP = plan.verdict_text ? `<p class="${plan.verdict === "over" ? "err" : plan.verdict === "tight" ? "warn" : "dim"} small" id="hl-verdict">${esc(plan.verdict_text)}${plan.breakdown ? ` <span class="dim">Weights ${plan.breakdown.weights_gb} GB, LoRA and optimizer ${plan.breakdown.lora_gb} GB, activations ${plan.breakdown.activations_gb} GB, loss ${plan.breakdown.kl_gb} GB, the rest ${(plan.breakdown.overhead_gb + (plan.breakdown.total_gb - plan.breakdown.weights_gb - plan.breakdown.lora_gb - plan.breakdown.activations_gb - plan.breakdown.kl_gb - plan.breakdown.overhead_gb)).toFixed(1)} GB.</span>` : ""}</p>` : "";
   const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>${verdictP}`
@@ -2122,6 +2129,7 @@ function healCard(m, pair) {
   return `<div class="card-in">${head}
     ${pair ? `<p>The original model teaches the model you chose to answer like it does, on your world's text and on general text. This brings back what cutting the model down took away. Your world's facts are still taught afterwards, in Step 3. The healed copy is a new folder inside this project; the model you chose is only read, never changed.</p>${h.name == null && rs.hs.check && rs.hs.check.download_gb ? `<p class="warn small">Starting downloads about ${rs.hs.check.download_gb} GB from Hugging Face first (into the Hugging Face cache on this computer).</p>` : ""}`
       : `<p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>`}
+    ${h.recipe ? `<label class="opt"><input type="checkbox" id="hl-recipe" ${recipeOn ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Keep thinking</strong> (recommended for reasoning models). ${recipeOn ? `The healing text is ${Math.round(h.recipe.general_share * 100)} % reasoning traces that Qwen3.8-27B itself wrote (${esc(h.recipe.general)}, downloaded from Hugging Face) and the rest your world's text; texts up to ${h.recipe.seq} tokens long, LoRA size ${h.recipe.rank}, ${h.recipe.tokens_m} million tokens${h.recipe.tokens_m > 40 ? " (more, because more than 30 % was cut)" : ""}. It takes longer and needs more memory than the plain recipe. Without this the model learns to answer without thinking, and the exported file's chat template then answers without thinking too.` : `Off: the model is healed on answers without thinking, and the exported file answers without thinking unless asked.`}</label>` : ""}
     <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
     ${sp.general ? gcHtml("heal") : ""}
     <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
@@ -2312,7 +2320,203 @@ function madeCard(m) {
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
+}
+
+
+// ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
+// The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
+// program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
+let ac = { target: null, thinking: null, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
+  run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
+const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
+const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
+
+function acIns() { return rs.options && rs.options.inspect && rs.options.inspect.supported ? rs.options.inspect : null; }
+function acDefaults() {
+  const ins = acIns(); if (!ins) return;
+  const total = ins.total_params / 1e9;
+  if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
+  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
+}
+function acSpec() {
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
+}
+async function acLoad() {
+  try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
+  if (page === "reshape") render();
+}
+// keeps the plan in step with the choices; asks the program only when the request changed
+function acRefresh() {
+  if (page !== "reshape" || !rs.state) return;
+  if (!ac.loaded) { ac.loaded = true; acLoad(); }
+  const ins = acIns(); acDefaults();
+  if (!ins || ac.target == null) return;
+  const sig = JSON.stringify([acSpec(), rs.state.dataset_version]);
+  if (sig === ac.planFor) return;
+  ac.planFor = sig; ac.plan = null; ac.planErr = null;
+  const token = ++ac.planTok;
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
+    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+}
+
+function autoCard() {
+  const ins = acIns();
+  if (!rs.state) return "";
+  acDefaults();
+  const run = ac.run, live = ac.running || (run && run.status === "running");
+  const total = ins ? ins.total_params / 1e9 : 0;
+  const pl = ac.plan;
+  const canThink = !!ins && ins.model_type === "qwen3_5";
+  const lock = live ? "disabled" : "";
+  const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
+    ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
+  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") : "";
+  const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
+  const status = run ? `<p><strong id="ac-status">${esc(AC_STATUS[run.status] || run.status)}</strong>${run.error ? `: ${esc(run.error)}` : ""} <span class="dim small">${esc(run.id)}</span></p>` : "";
+  const ended = run && ["done", "gates_failed", "failed"].includes(run.status);
+  const sh = ac.share || {};
+  const studio = `<label class="opt"><input type="checkbox" id="ac-publish" ${ac.publish ? "checked" : ""} ${lock}> Put the GGUF files into Unsloth Studio's share when done</label>
+    ${ac.publish || ac.shareOpen ? `<div class="grid" id="ac-share">
+      <label>Studio share (the folder as this computer sees it)<input type="text" id="ac-sh-host" value="${esc(sh.host_path || "")}" placeholder="Y:\\unsloth\\studio"></label>
+      <label>Path inside the container<input type="text" id="ac-sh-cont" value="${esc(sh.container_path || "")}" placeholder="/workspace (empty: found out from Studio)"></label>
+      <label><input type="checkbox" id="ac-sh-reg" ${sh.register_scan_folder ? "checked" : ""}> Tell Studio about the exports folder</label>
+      <label><input type="checkbox" id="ac-sh-hf" ${sh.finetune_handoff ? "checked" : ""}> Also copy the healed model for fine-tuning in Studio (large)</label>
+      <div class="row"><button class="secondary" id="ac-sh-save">Save</button><button class="secondary" id="ac-sh-check">Check</button></div>
+      ${ac.shareNote ? `<p class="dim small" id="ac-sh-note">${esc(ac.shareNote)}</p>` : ""}</div>` : ""}`;
+  const rep = ac.report ? `<details open id="ac-report"><summary>Report</summary><pre class="log">${esc(ac.report)}</pre></details>` : "";
+  return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
+    <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
+    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “1 · Start from”.</p>` : `
+    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
+    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
+    <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
+    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
+      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
+    <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
+    ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
+    ${studio}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
+    <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready ? "disabled" : ""}>Start Auto-cut</button>
+      ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
+      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
+      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
+    ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
+    ${live ? `<div class="stepline" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
+    ${ac.err ? `<div class="err">${esc(ac.err)}</div>` : ""}${status}${steps}${rep}</div>`;
+}
+
+function onAutoEvent(p) {
+  if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
+  if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
+  else if (p.kind === "error") { ac.running = false; ac.err = p.text; ac.progress = null; acLoad(); return; }
+  else if (p.kind === "done") { ac.running = false; ac.progress = null; ac.text = ""; if (p.data) ac.run = p.data; acLoad(); return; }
+  if (page === "reshape") render();
+}
+
+function wireAuto() {
+  const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
+  set("ac-target", (e) => { ac.target = +e.value; });
+  const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
+  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
+  set("ac-publish", (e) => { ac.publish = e.checked; });
+  document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
+  document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
+  const share = () => ({ host_path: ($("ac-sh-host") || {}).value || "", container_path: ($("ac-sh-cont") || {}).value || "", register_scan_folder: !!($("ac-sh-reg") || {}).checked, finetune_handoff: !!($("ac-sh-hf") || {}).checked });
+  const sv = $("ac-sh-save"); if (sv) sv.onclick = async () => { ac.share = share(); try { setState(await invoke("studio_share_set", { share: ac.share })); ac.shareNote = "Saved."; } catch (e) { ac.shareNote = String(e); } render(); };
+  const ck = $("ac-sh-check"); if (ck) ck.onclick = async () => { ac.share = share(); ac.shareNote = "Checking…"; render(); try { const r = await invoke("studio_share_check", { share: ac.share }); ac.shareNote = r.note; } catch (e) { ac.shareNote = String(e); } render(); };
+  const go = $("ac-go");
+  if (go) go.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Starting…"; ac.progress = null; render();
+    try { await invoke("auto_start", { spec: acSpec(), resume: null }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+  const co = $("ac-continue");
+  if (co) co.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing…"; render();
+    try { await invoke("auto_start", { spec: null, resume: ac.run.id }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+  const st = $("ac-stop"); if (st) st.onclick = () => { ac.text = "Stopping…"; invoke("auto_stop"); render(); };
+  const rp = $("ac-report-btn");
+  if (rp) rp.onclick = async () => { try { const r = await invoke("auto_report", { run: ac.run ? ac.run.id : null }); ac.report = r.markdown; } catch (e) { ac.err = String(e); } render(); };
+  acRefresh();
+}
+
+// ------------------------------------------------------------------------------------------------------------ the thinking check
+// Does the model still think before it answers, after it was cut and healed? A small suite is asked with thinking on (worker job think_check, docs/THINKING_CHECK.md);
+// the table sets the numbers of the original, the cut, the healed model and a GGUF file side by side, and the gates say pass, warn or fail for each.
+const TK_TARGETS = [["original", "Original"], ["cut", "Cut model"], ["healed", "Healed"], ["gguf", "GGUF file"]];
+const TK_NUMBERS = [["think_rate", "Writes a reasoning trace", "rate"], ["closed_rate", "Finishes its reasoning and answers", "rate"], ["accuracy", "Right answers", "rate"], ["loop_rate", "Loops (lower is better)", "rate"],
+  ["garbage_rate", "Garbled text (lower is better)", "rate"], ["truncated_rate", "Cut off by the length limit", "rate"], ["median_think_tokens", "Typical length of the reasoning (tokens)", "n"]];
+const TK_GATE_WORD = { closed_rate: "finishing its reasoning", accuracy: "right answers", loop_rate: "loops", garbage_rate: "garbled text", median_think_tokens: "length of the reasoning" };
+
+function tkQuick(m) {
+  if (rs.tk.quick != null) return rs.tk.quick;
+  const b = m && m.summary ? (m.summary.params_after || 0) / 1e9 : 0;
+  return b >= 15;
+}
+const tkCell = (v, kind) => v == null ? "–" : kind === "rate" ? Math.round(v * 100) + " %" : thou(Math.round(v));
+
+function thinkCard(m) {
+  const sm = m.summary;
+  if (!sm || m.status !== "done") return "";
+  const tk = rs.tk, d = tk.name === m.name ? tk.data : null;
+  const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
+  const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
+  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
+  const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>`;
+  const cols = TK_TARGETS.filter(([t]) => rows[t]);
+  const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
+      ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
+      <tr><td>Thinking off (control): right answers</td>${cols.map(([t]) => `<td>${tkCell(rows[t].control && rows[t].control.n ? rows[t].control.accuracy : null, "rate")}</td>`).join("")}</tr>
+      <tr><td><strong>Compared with the original</strong></td>${cols.map(([t]) => { const g = gates[t]; return `<td>${t === "original" ? "–" : g ? `<strong class="${g.verdict === "pass" ? "ok" : g.verdict === "warn" ? "warn" : "err"}" data-tkverdict="${t}">${g.verdict === "pass" ? "Pass" : g.verdict === "warn" ? "Close to the limit" : "Fail"}</strong>${g.failed.length ? `<br><span class="dim small">too weak: ${g.failed.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : g.warned.length ? `<br><span class="dim small">near the limit: ${g.warned.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : ""}` : "<span class=\"dim small\">check the original first</span>"}</td>`; }).join("")}</tr></table>
+      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
+  const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
+  const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
+  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>
+    <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
+    <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
+    <div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
+    ${tk.run && tk.run.name === m.name ? `<div class="stepline">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
+    ${tk.err ? `<p class="err">${esc(tk.err)}</p>` : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
+}
+
+async function tkLoad(name) {
+  rs.tk.name = name;
+  try { rs.tk.data = await invoke("think_check_results", { name }); } catch (e) { rs.tk.data = null; rs.tk.err = String(e); }
+  if (page === "reshape") render();
+}
+
+function tkStart(m, target) {
+  const tk = rs.tk;
+  tk.run = { name: m.name, target, text: "Starting…", progress: null, done: 0 }; tk.err = null; tk.ok = null; render();
+  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
+}
+
+function onThinkEvent(p) {
+  const tk = rs.tk;
+  if (p.kind === "progress") { if (tk.run) { tk.run.text = p.step === "load" ? (p.text || "Loading the model…") : (p.text || p.step); tk.run.progress = p.value; } }
+  else if (p.kind === "think_item") { if (tk.run) tk.run.done++; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "error") { tk.run = null; tk.err = p.text; }
+  else if (p.kind === "done") {
+    const name = tk.run && tk.run.name;
+    tk.run = null;
+    tk.ok = p.data && p.data.stopped ? "Stopped. Nothing was saved from this check." : p.data && p.data.cached ? "Done (the saved numbers of this model were used)." : "Done. The numbers are in the table.";
+    if (name) { tkLoad(name); return; }
+  }
+  if (page === "reshape") render();
+}
+
+function wireThink() {
+  const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
+  const tk = rs.tk;
+  document.querySelectorAll("input[name=tk-mode]").forEach((r) => r.onchange = () => { tk.quick = r.value === "quick"; render(); });
+  document.querySelectorAll("[data-tkgo]").forEach((b) => b.onclick = () => { if (m) tkStart(m, b.dataset.tkgo); });
+  const pick = $("tk-gguf-pick"); if (pick) pick.onchange = () => { tk.gguf = pick.value; render(); };
+  const gf = $("tk-gguf"); if (gf) gf.onchange = () => { tk.gguf = gf.value.trim(); render(); };
+  const st = $("tk-stop"); if (st) st.onclick = () => { if (tk.run) tk.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
 
 // ------------------------------------------------------------------------------------------------------- try before cutting
@@ -2636,7 +2840,7 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + pick + size + tryCard() + make + healSection() + result + list;
+  return head + msg + intro + autoCard() + pick + size + tryCard() + make + healSection() + result + list;
 }
 
 async function rsRefresh(stale) {
@@ -2690,6 +2894,8 @@ async function rsMeasInfo() {
 // the person's Heal card needs the options of the model that is shown
 function rsAfterState() {
   const st = rs.state; if (!st) return;
+  const done = st.made.filter((m) => m.status === "done" && m.summary), on = done.find((m) => m.name === rs.view) || done[0];
+  if (on && (rs.tk.name !== on.name || !rs.tk.data) && !rs.tk.run) tkLoad(on.name);                // the thinking check card shows the saved numbers of the shown model
   if (rs.hl && rs.hl.pair) { if (rs.hl.stale) hsReloadPair(); return; }          // a pair chosen in the Heal section: it is reloaded as a pair
   const made = st.made.filter((m) => m.status === "done" && m.summary);
   const shown = made.find((m) => m.name === rs.view) || made[0];
@@ -2719,6 +2925,8 @@ function onHealEvent(p) {
 }
 
 function onReshapeEvent(p) {
+  if (p.phase === "auto") return onAutoEvent(p);
+  if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "try") return onTryEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
@@ -2754,10 +2962,14 @@ function rsSpec() {
   return spec;
 }
 
+// "Keep thinking": the recipe is offered for Qwen3.5 / 3.8 models (`opts.recipe`) and is on unless the person unticked it
+function hlRecipeOn(o) { return !!(o && o.recipe) && (rs.hlSpec.recipe == null ? !!o.recipe.default_on : !!rs.hlSpec.recipe); }
+
 // what the Heal card sends
 function rsHealSpec() {
-  const sp = rs.hlSpec, o = rs.hl && rs.hl.opts;
-  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
+  const sp = rs.hlSpec, o = rs.hl && rs.hl.opts, rc = hlRecipeOn(o) ? o.recipe : null;
+  return { tokens_m: sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, general_share: sp.general ? +(rc && !sp.shareSet ? rc.general_share : sp.share) : 0, recipe: rc ? rc.id : null,
+    general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
     kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null };
 }
@@ -2831,8 +3043,13 @@ function wireReshape() {
   document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
   // healing
   const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); rsHealEstimate(); }; };
-  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); 
-  hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; });
+  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
+  hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again
+    hs.recipe = e.checked; hs.tokens_m = null; hs.shareSet = false;
+    const o = rs.hl && rs.hl.opts, sc = gcScope("heal");
+    if (gc.state && o && o.recipe) { sc.sel = e.checked ? o.recipe.general : gc.state.default; sc.check = null; sc.project = state && state.project ? state.project.folder : ""; gcPersist("heal"); }
+  });
+  hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; hs.shareSet = true; });
   hv("hl-alpha", (e) => { const v = parseFloat(e.value); hs.alpha = Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; });
   const hnum = (id, key, lo, hi) => hv(id, (e) => { const v = parseInt(e.value, 10); hs[key] = Number.isFinite(v) && v >= lo && v <= hi ? v : null; });
   hnum("hl-rank", "rank", 8, 128); hnum("hl-klchunk", "kl_chunk", 64, 512); hnum("hl-k", "k", 8, 128); hnum("hl-warmup", "warmup", 0, 1000); hnum("hl-perupdate", "per_update", 1, 256);
@@ -2855,6 +3072,8 @@ function wireReshape() {
   on("hl-stop", () => { if (rs.hlRun) rs.hlRun.text = "Stopping…"; invoke("heal_stop"); render(); });
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
   wireHealSection();
+  wireThink();
+  wireAuto();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {

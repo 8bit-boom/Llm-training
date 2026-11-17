@@ -477,3 +477,106 @@ def test_the_whole_export_job_returns_the_imatrix_report(world, monkeypatch):
     world.events.clear()
     assert exportjob.run(cfg2) == 0 and [e for e in world.events if e["type"] == "result"][0]["data"]["imatrix"] is None
     assert len(world.calls("imatrix")) == 1
+
+
+# ------------------------------------------------------------------------------------------------------------------ reasoning text in the calibration (thinking models)
+
+class ThinkTok(StubTok):
+    """a chat template that writes the reasoning block the way a thinking model's does: with thinking on, `<think>\\n{trace}\\n</think>\\n\\n{answer}`"""
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kw):
+        out = ""
+        for m in messages:
+            c = m["content"]
+            if m.get("reasoning_content") and kw.get("enable_thinking"):
+                c = f"<think>\n{m['reasoning_content']}\n</think>\n\n{c}"
+            out += f"<|im_start|>{m['role']}\n{c}<|im_end|>\n"
+        if add_generation_prompt:
+            out += "<|im_start|>assistant\n" + ("<think>\n" if kw.get("enable_thinking") else "<think>\n\n</think>\n\n")
+        return out
+
+
+def reasoning_file(tmp_path, n=20, words=50, plain_every=0):
+    rows = []
+    for i in range(n):
+        reply = {"role": "assistant", "content": f"answer{i}"}
+        if not (plain_every and i % plain_every == 0):
+            reply["reasoning_content"] = " ".join(f"trace{i}_{j}" for j in range(words))
+        rows.append({"messages": [{"role": "user", "content": f"question{i}"}, reply]})
+    return write_rows(tmp_path / "reasoning.jsonl", rows)
+
+
+def asked(tmp_path, **over):  # 150 conversations: more than the half of the text that is asked for
+    return {"source": {"file": reasoning_file(tmp_path, n=150)}, "share": 0.5, "max_len": 200, **over}
+
+
+def test_conversations_with_thinking_are_written_the_way_the_model_thinks_and_mixed_into_the_file(world, monkeypatch):
+    monkeypatch.setattr(imatrix, "load_tokenizer", lambda sources: ThinkTok())
+    files, rep, out = world.export(["q4_k_m"], reasoning=asked(world.root))
+    (im,) = world.calls("imatrix")
+    text = im["calibration"]
+    import re
+    assert re.search(r"<\|im_start\|>assistant\n<think>\ntrace(\d+)_0 trace\1_1 ", text) and re.search(r"</think>\n\nanswer\d+<\|im_end\|>", text)
+    assert "<think>\n\n</think>\n\n<think>" not in text, "no empty block in front of a trace"
+    assert "fact0_0" in text and "gen0_" in text, "the project's text and the general text are still there"
+    meta = json.loads((out / "imatrix.json").read_text(encoding="utf-8"))
+    assert meta["reasoning_used"] is True and meta["reasoning_tokens"] > 0 and meta["project_tokens"] > 0 and meta["general_tokens"] > 0
+    assert meta["reasoning"]["share"] == 0.5 and meta["reasoning"]["max_len"] == 200 and meta["reasoning"]["file"].endswith("reasoning.jsonl")
+    assert any(e["type"] == "log" and "conversations with thinking" in e["text"] for e in world.events)
+    # about half of the tokens are reasoning text (the rest is shared by the project's text and the general text)
+    total = meta["project_tokens"] + meta["general_tokens"] + meta["reasoning_tokens"]
+    assert 0.35 < meta["reasoning_tokens"] / total < 0.65, (meta["reasoning_tokens"], total)
+
+
+def test_a_conversation_is_cut_at_max_len_and_conversations_without_a_trace_are_passed_over(world, tmp_path):
+    tok = ThinkTok()
+    key = imatrix.reasoning_key({"reasoning": {"source": {"file": reasoning_file(tmp_path, n=12, words=80, plain_every=2)}, "share": 0.5, "max_len": 30}})
+    texts, note = imatrix.fetch_reasoning(key, tok, 10_000, fam_name="qwen3_5")
+    assert note == "" and len(texts) == 6, "every second conversation has no trace"
+    assert all("<think>\ntrace" in t and len(t.split()) <= 30 + 2 for t in texts), [len(t.split()) for t in texts]
+    texts, _ = imatrix.fetch_reasoning(key, tok, 40, fam_name="qwen3_5")                          # the budget ends the reading
+    assert len(texts) == 2
+    # a source with no thinking at all says so, plainly
+    none = imatrix.reasoning_key({"reasoning": {"source": {"file": reasoning_file(tmp_path, n=4, plain_every=1)}, "share": 0.5, "max_len": 30}})
+    assert imatrix.fetch_reasoning(none, tok, 1000, fam_name="qwen3_5") == ([], "The reasoning text (" + none["file"] + ") had no conversation with a thinking trace. The matrix is made without it.")
+
+
+def test_a_reasoning_text_that_cannot_be_read_is_a_note_and_the_matrix_is_made_without_it(world, monkeypatch):
+    monkeypatch.setattr(imatrix, "load_tokenizer", lambda sources: ThinkTok())
+    files, rep, out = world.export(["q4_k_m"], reasoning={"source": {"file": str(world.root / "missing.jsonl")}, "share": 0.5, "max_len": 200})
+    (im,) = world.calls("imatrix")
+    assert rep["made"] and rep["info"]["reasoning_used"] is False and rep["info"]["reasoning_tokens"] == 0
+    assert any("without the reasoning text" in n for n in rep["notes"]), rep["notes"]
+    assert "<think>\ntrace" not in im["calibration"] and "fact" in im["calibration"]
+
+
+def test_the_reasoning_text_is_part_of_what_a_saved_matrix_was_made_from(world, monkeypatch):
+    monkeypatch.setattr(imatrix, "load_tokenizer", lambda sources: ThinkTok())
+    n = lambda: len(world.calls("imatrix"))                                                       # noqa: E731
+    _, plain, out_plain = world.export(["q4_k_m"])
+    assert plain["info"]["reasoning"] is None and plain["info"]["reasoning_used"] is False
+    _, rsn, out_rsn = world.export(["q4_k_m"], out=world.root / "o_r", reuse_dirs=[str(out_plain)], reasoning=asked(world.root))
+    assert rsn["made"] and not rsn["reused"] and n() == 2, "a matrix without reasoning text is not used when it is wanted"
+    _, again, _ = world.export(["q4_k_m"], out=world.root / "o_r2", reuse_dirs=[str(out_plain), str(out_rsn)], reasoning=asked(world.root))
+    assert again["reused"] and n() == 2
+    world.export(["q4_k_m"], out=world.root / "o_r3", reuse_dirs=[str(out_rsn)], reasoning=asked(world.root, share=0.3))
+    world.export(["q4_k_m"], out=world.root / "o_r4", reuse_dirs=[str(out_rsn)], reasoning=asked(world.root, max_len=100))
+    assert n() == 4, "another share or row length is another matrix"
+    # one that fell back (the text was not there) is not reused when the text is wanted now
+    bad = {"source": {"file": str(world.root / "missing.jsonl")}, "share": 0.5, "max_len": 200}
+    _, fell, out_fell = world.export(["q4_k_m"], out=world.root / "o_f", reasoning=bad)
+    assert fell["info"]["reasoning_used"] is False
+    _, _, _ = world.export(["q4_k_m"], out=world.root / "o_f2", reuse_dirs=[str(out_fell)], reasoning=bad)
+    assert n() == 6, "asked for, not there: measured again (the fallback may succeed now)"
+
+
+def test_without_a_reasoning_request_the_calibration_is_what_it_was(world):
+    _, rep, out = world.export(["q4_k_m"])
+    (im,) = world.calls("imatrix")
+    meta = json.loads((out / "imatrix.json").read_text(encoding="utf-8"))
+    assert meta["reasoning"] is None and meta["reasoning_used"] is False and meta["reasoning_tokens"] == 0
+    assert "<think>\ntrace" not in im["calibration"]
+    # the job's request shape: 0 share = nothing
+    assert imatrix.reasoning_key({"reasoning": {"share": 0}}) is None and imatrix.reasoning_key({}) is None
+    from ndforge_worker import generaltext
+    assert imatrix.reasoning_key({"reasoning": {}})["render"] == generaltext.RENDER_VERSION

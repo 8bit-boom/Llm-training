@@ -89,3 +89,8 @@ Everything above is tested against a stand-in server written from Unsloth's docu
 Desktop open; key created; Training setup: Find, paste the key, Test (expect the card and "training API: yes"); Save; Step 3: Where to train = Unsloth Desktop, Quick preset, a small model; watch the charts;
 let it finish; check `runs/<name>/adapter/` holds `adapter_config.json` and `adapter_model.safetensors`; Step 4 Test on that run; then repeat with Stop, with Desktop closed mid-run, and with Desktop busy chatting.
 Write the Desktop version, port and anything that differed into the tested-version table of the contract document.
+
+## Putting an Auto-cut model into Studio
+
+Auto-cut (docs/AUTO_CUT.md) can copy its GGUF files into the share of a Studio that runs in Docker: settings "Studio share" and "Path inside the container", the calls in
+docs/UNSLOTH_API_CONTRACT.md ("Publish"). Verified only against a stand-in server; on a real Studio the GPU checklist adds: the container path matches, the exports folder shows in Studio's custom folders, the cut GGUF loads.

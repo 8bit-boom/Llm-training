@@ -31,6 +31,15 @@ pub struct Probe {
     pub cpu_training: bool,
 }
 
+/// What Unsloth said to a scan-folder registration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanFolder {
+    Added(Value),
+    /// 400: the text is Unsloth's reason (the path is not a folder it can read)
+    Rejected(String),
+    NotOffered,
+}
+
 pub struct UnslothClient {
     base: String,
     key: String,
@@ -251,6 +260,26 @@ impl UnslothClient {
 
     pub fn cancel(&self, id: &str) -> Result<Value> {
         self.json(self.req("POST", &format!("/v1/fine_tuning/jobs/{}/cancel", safe_id(id)?), true).send_string(""))
+    }
+
+    /// Does this Unsloth have the list of custom model folders (`GET /api/models/scan-folders` answers 200)? Probed every time: `/api/*` routes can move.
+    pub fn scan_folders_available(&self) -> Result<bool> {
+        Ok(self.status_of("/api/models/scan-folders", true)? == 200)
+    }
+
+    /// `POST /api/models/scan-folders {"path", "recursive"}`: Unsloth lists the models under that folder (a path as Unsloth sees it, inside its container). 201 with the folder
+    /// (also when it was registered before); 400 with a text when the folder is not there or not readable for Unsloth; 404 / 405 when the route does not exist.
+    pub fn add_scan_folder(&self, path: &str, recursive: bool) -> Result<ScanFolder> {
+        match self.req("POST", "/api/models/scan-folders", true).send_json(serde_json::json!({"path": path, "recursive": recursive})) {
+            Ok(r) => Ok(ScanFolder::Added(r.into_json().unwrap_or(Value::Null))),
+            Err(ureq::Error::Status(400, resp)) => {
+                let text = detail(&resp.into_string().unwrap_or_default());
+                // an older Unsloth may answer 400 for a folder it knows already
+                Ok(if text.to_ascii_lowercase().contains("already") { ScanFolder::Added(Value::Null) } else { ScanFolder::Rejected(text) })
+            }
+            Err(ureq::Error::Status(404 | 405, _)) => Ok(ScanFolder::NotOffered),
+            Err(e) => Err(failure(&self.base, e)),
+        }
     }
 
     /// `GET /api/models/checkpoints`: every run folder with its checkpoints and host paths. The only `/api/*` route the run needs.

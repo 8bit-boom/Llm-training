@@ -27,6 +27,27 @@ pub struct UnslothSettings {
     pub url: String,
 }
 
+/// The folder Unsloth Studio (in Docker, on a NAS) keeps its files in, as this computer sees it, and the same folder as Studio sees it inside its container. Auto-cut puts
+/// the GGUF files into `<share>/exports/<model>` (docs/UNSLOTH_API_CONTRACT.md, "Publish").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StudioShare {
+    /// e.g. `Y:\unsloth\studio` or `\\truenas\apps\studio`
+    pub host_path: String,
+    /// the same folder inside Studio's container, e.g. `/workspace`; empty: found out from Studio's outputs folder when an API key is set
+    pub container_path: String,
+    /// tell Studio about the exports folder (`POST /api/models/scan-folders`) when it offers that
+    pub register_scan_folder: bool,
+    /// also copy the healed model (Hugging Face format) next to the GGUF files and give its container path, so it can be fine-tuned in Studio (off: big)
+    pub finetune_handoff: bool,
+}
+
+impl Default for StudioShare {
+    fn default() -> Self {
+        StudioShare { host_path: String::new(), container_path: String::new(), register_scan_folder: true, finetune_handoff: false }
+    }
+}
+
 /// The model that writes extra training examples (any OpenAI-compatible server; Ollama works). Its access key, if any, is in `secrets` under "teacher".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -57,6 +78,8 @@ pub struct Settings {
     pub train_servers: Vec<TrainServer>,
     /// Unsloth Desktop as a place to train (one connection)
     pub unsloth: Option<UnslothSettings>,
+    /// Unsloth Studio's share, where Auto-cut puts its GGUF files
+    pub studio_share: Option<StudioShare>,
     pub teacher: TeacherSettings,
     pub recent_projects: Vec<String>,
 }
@@ -64,7 +87,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true,
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, teacher: TeacherSettings::default(), recent_projects: Vec::new() }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), recent_projects: Vec::new() }
     }
 }
 

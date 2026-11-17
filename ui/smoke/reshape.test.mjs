@@ -510,7 +510,7 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; renderReshape(); wireReshape();`);
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
-  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, recipe: null, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
     optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
@@ -566,6 +566,7 @@ test("Healing settings: only in Expert mode, with the automatic values shown, th
   let html = b.run("renderReshape()");
   assert.match(html, /<summary>Healing settings<\/summary>/);
   assert.match(html, /<option value="1024" selected>1024<\/option>/);
+  assert.match(html, /<option value="8192" >8192 \(long reasoning rows; needs a lot of memory\)<\/option>/);
   assert.match(html, /<option value="2" selected>2<\/option>/);
   assert.match(html, /id="hl-perupdate" value="32"/);
   assert.match(html, /= 2 × 16 steps added up/);
@@ -868,4 +869,56 @@ test("a failing Check shows the error plainly", async () => {
   await b.run("hsCheck(true)");
   assert.match(b.run("renderReshape()"), /<div class="err">The training software is not installed yet/);
   assert.match(b.run("renderReshape()"), /id="hs-check" >Check/);
+});
+
+// ---- "Keep thinking": the thinking recipe of the Heal card
+const recipeOpts = (over = {}) => healOpts({ recipe: { id: "thinking", tokens_m: 40, general_share: 0.8, general: "faunix/Qwen3.8-27B-Distillation-40K", seq: 8192, batch: 1, rank: 64, cut_share: 0.24, default_on: true }, ...over });
+
+test("Keep thinking: on by default for a Qwen model, its numbers and reasoning text are what the job gets, and unticking goes back to the plain recipe", async () => {
+  const sent = [];
+  const m = thinModel();
+  const b = browser({ heal_start: (a) => { sent.push(JSON.parse(JSON.stringify(a))); return null; }, heal_estimate: () => null });
+  open(b, pageState({ made: [m] }));
+  const gcState = { default: "mlabonne/open-perfectblend", presets: [{ key: "mlabonne/open-perfectblend", id: "mlabonne/open-perfectblend", name: "Open PerfectBlend", kind: "chat", license: "Apache-2.0" },
+    { key: "faunix/Qwen3.8-27B-Distillation-40K", id: "faunix/Qwen3.8-27B-Distillation-40K", name: "Qwen3.8-27B reasoning traces (40K)", kind: "chat", license: "Apache-2.0" }], custom: [], acknowledged: [], choice: {}, has_token: false };
+  const opts = recipeOpts({ general: gcState });
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(opts)} }`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /<input type="checkbox" id="hl-recipe" checked[^>]*> <strong>Keep thinking<\/strong>/);
+  assert.match(html, /80 % reasoning traces that Qwen3.8-27B itself wrote \(faunix\/Qwen3.8-27B-Distillation-40K/);
+  assert.match(html, /texts up to 8192 tokens long, LoRA size 64, 40 million tokens\./);
+  assert.match(html, /<option value="40" selected>40 million tokens<\/option>/);
+  assert.equal(b.run(`gcSel("heal")`), "faunix/Qwen3.8-27B-Distillation-40K");              // the reasoning text is chosen for the person
+  b.run("wireReshape()");
+  await b.els["hl-go"].onclick();
+  const on = sent[0].spec;
+  assert.deepEqual([on.recipe, on.tokens_m, on.general_share, on.general.id, on.rank, on.seq], ["thinking", 40, 0.8, "faunix/Qwen3.8-27B-Distillation-40K", null, null]);   // the program fills seq, batch and rank
+  // untick: the plain recipe and the program's default text
+  b.run(`rs.hlRun = null; renderReshape(); wireReshape()`);
+  b.els["hl-recipe"].checked = false;
+  await b.els["hl-recipe"].onchange();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run(`gcSel("heal")`), "mlabonne/open-perfectblend");
+  html = b.run("renderReshape()");
+  assert.doesNotMatch(html, /id="hl-recipe" checked/); assert.match(html, /Off: the model is healed on answers without thinking/); assert.match(html, /<option value="20" selected>20 million tokens<\/option>/);
+  b.run("wireReshape()");
+  await b.els["hl-go"].onclick();
+  const off = sent[1].spec;
+  assert.deepEqual([off.recipe, off.tokens_m, off.general_share, off.general.id], [null, 20, 0.5, "mlabonne/open-perfectblend"]);
+});
+
+test("Keep thinking: a model that is not a Qwen has no such box, a share typed in Expert mode wins, and the 80 million tokens of a deep cut are said", async () => {
+  const m = thinModel();
+  const b = browser({ heal_estimate: () => null });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ recipe: null }))} }`);
+  assert.doesNotMatch(b.run("renderReshape()"), /Keep thinking/);
+  assert.equal(b.run("rsHealSpec().recipe"), null);
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(recipeOpts({ recipe: { id: "thinking", tokens_m: 80, general_share: 0.8, general: "faunix/Qwen3.8-27B-Distillation-40K", seq: 4096, batch: 1, rank: 64, cut_share: 0.42, default_on: true } }))} }`);
+  assert.match(b.run("renderReshape()"), /80 million tokens \(more, because more than 30 % was cut\)/);
+  assert.equal(b.run("rsHealSpec().tokens_m"), 80);
+  b.run(`rs.hlSpec.share = 0.6; rs.hlSpec.shareSet = true`);
+  assert.equal(b.run("rsHealSpec().general_share"), 0.6);
+  b.run(`rs.hlSpec.recipe = false`);
+  assert.equal(b.run("rsHealSpec().recipe"), null);
 });

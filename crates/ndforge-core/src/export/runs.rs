@@ -76,6 +76,10 @@ pub struct ImatrixOptions {
     /// the id of a matrix of the library (`export::imatrix_lib`) to use as it is: nothing is measured. Old specs have none.
     #[serde(default)]
     pub use_saved: Option<String>,
+    /// conversations with thinking (written the way a thinking model writes them) in the calibration text: that share of its tokens. None = the project's text and the
+    /// general text only. The matrix of a model that thinks is then measured on text that looks like what it will be asked (docs/IMATRIX.md, "Thinking models").
+    #[serde(default)]
+    pub reasoning: Option<crate::reshape::plan::ReasoningCalib>,
 }
 
 fn default_nextn() -> bool {
@@ -84,7 +88,7 @@ fn default_nextn() -> bool {
 
 impl Default for ImatrixOptions {
     fn default() -> Self {
-        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true, use_saved: None }
+        ImatrixOptions { enabled: false, chunks: IMATRIX_DEFAULT_CHUNKS, reuse: true, general: None, nextn: true, use_saved: None, reasoning: None }
     }
 }
 
@@ -228,12 +232,19 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
     let version = cfg["dataset"]["version"].as_u64().unwrap_or(0);
     let train = cfg["dataset"]["train"].as_str().map(PathBuf::from).unwrap_or_else(|| p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl"));
     let general = crate::general::job_block(&crate::general::resolve(opts.general.as_ref(), true)?, IMATRIX_GENERAL_SHARE);
+    let reasoning = match &opts.reasoning {
+        Some(r) => {
+            r.validate()?;
+            r.json()
+        }
+        None => Value::Null,
+    };
     // a saved matrix of the library: nothing is measured, the worker copies the file into the export folder and gives it to llama-quantize / Unsloth as a fresh one
     let (use_file, use_id) = match opts.use_saved.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => { let (id, f) = super::imatrix_lib::for_export(p, id)?; (json!(f), json!(id)) }
         None => (Value::Null, Value::Null),
     };
-    Ok(Some(json!({"use_file": use_file, "use_id": use_id, "enabled": true, "general": general, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
+    Ok(Some(json!({"use_file": use_file, "use_id": use_id, "enabled": true, "general": general, "reasoning": reasoning, "seed": crate::general::SEED, "model": run, "data_version": version, "train": train, "chunks": opts.chunks, "ctx": IMATRIX_CTX, "general_share": IMATRIX_GENERAL_SHARE,
                    "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
@@ -297,6 +308,16 @@ pub fn list_exports(p: &Project) -> Vec<Value> {
     }).collect()).unwrap_or_default();
     out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
     out
+}
+
+/// What the exported chat template does about thinking (the worker's job key `thinking_default`): "keep" when the base model was healed with the thinking recipe
+/// (`healed.recipe == "thinking"` in its `ndforge_reshape.json`: it was taught to think, so the template stays as the model ships it), else "off" (answers without
+/// thinking unless asked, what a model trained thinking-off expects).
+pub fn thinking_default(base: &std::path::Path) -> &'static str {
+    match read_json(&base.join("ndforge_reshape.json")) {
+        Some(m) if m["healed"]["recipe"].as_str() == Some("thinking") => "keep",
+        _ => "off",
+    }
 }
 
 /// Makes the GGUF of a run in the worker and writes the Modelfile and the model card next to it.
@@ -369,7 +390,7 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     // a base made by "Slim or grow a model" keeps the original's vision part: its vision file comes from the original model
     let origin = read_json(&std::path::Path::new(&repo).join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
     let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": out, "quant": list[0], "quants": list, "backend": "auto", "gguf": want_gguf, "keep_merged": keep_merged,
-                     "max_seq": cfg["hyper"]["max_seq"]});
+                     "max_seq": cfg["hyper"]["max_seq"], "thinking_default": thinking_default(std::path::Path::new(&repo))});
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
@@ -485,6 +506,95 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     if many {
         let _ = std::fs::remove_dir_all(&out);
     }
+    Ok(metas)
+}
+
+/// The GGUF files of a model folder that is not a training run (the healed model of Auto-cut): the whole model is converted once and shrunk to every size, then each size
+/// becomes an export (`exports/<name>-<size>/` with its Modelfile and meta.json, which names the folder as its base). `thinking`: the exported chat template keeps the
+/// model's own thinking (a model healed with the thinking recipe), else it answers without thinking unless asked (`thinking_default`). Returns the metas.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path, family: &str, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+        return Err(Error::new("That is not a name for an export."));
+    }
+    if !model_dir.join("config.json").is_file() {
+        return Err(Error::new("The model to export is missing."));
+    }
+    let mut list: Vec<String> = Vec::new();
+    for q in quants {
+        if !QUANTS.iter().any(|(id, _)| id == q) {
+            return Err(Error::new(format!("Unknown file size: {q}")));
+        }
+        if !list.contains(q) {
+            list.push(q.clone());
+        }
+    }
+    if list.is_empty() {
+        return Err(Error::new("Choose at least one file size."));
+    }
+    let py = python_path(&env_dir());
+    if !py.is_file() {
+        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+    }
+    let work = exports_dir(p).join(format!("{name}-gguf-work"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let repo = model_dir.to_string_lossy().to_string();
+    let origin = read_json(&model_dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
+    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": work, "quant": list[0], "quants": list, "backend": "auto", "gguf": true, "keep_merged": false,
+                         "max_seq": 4096, "thinking_default": if thinking { "keep" } else { "off" }, "full_model": model_dir});
+    if let Some(o) = &origin {
+        job["base"]["vision_repo"] = json!(o);
+    }
+    let matrix = if imatrix.enabled {
+        let (version, train) = match crate::train::runs::latest_version(p) {
+            Some((v, _)) => (v, p.folder.join("datasets").join(format!("v{v}")).join("train.jsonl")),
+            None => return Err(Error::new("Save a training-data version in Step 2 first: the importance matrix is measured on your world's text too.")),
+        };
+        imatrix_block(p, name, &json!({"dataset": {"version": version, "train": train}}), imatrix, &work)?
+    } else {
+        None
+    };
+    if let Some(m) = &matrix {
+        job["imatrix"] = m.clone();
+    }
+    let result = run_export_job(&py, &job, &work, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
+        WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
+        WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
+        WorkerEvent::Other(v) => v,
+    }))?;
+    if result["stopped"].as_bool().unwrap_or(false) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Ok(Vec::new());
+    }
+    let oname = ollama_name(&p.model_label(), "");
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut metas = Vec::new();
+    for (i, quant) in list.iter().enumerate() {
+        let gguf = result["ggufs"][quant.as_str()].as_str().or_else(|| if list.len() == 1 { result["gguf"].as_str() } else { None }).map(PathBuf::from)
+            .ok_or_else(|| Error::new(format!("No GGUF file was made for {quant}.")))?;
+        let dir = exports_dir(p).join(format!("{name}-{quant}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
+        std::fs::rename(&gguf, dir.join(&gguf_file))?;
+        let mmproj_file = match result["mmproj"].as_str().map(PathBuf::from).filter(|m| m.is_file()) {
+            Some(m) => {
+                let file = m.file_name().and_then(|n| n.to_str()).unwrap_or("mmproj-F16.gguf").to_string();
+                if i == list.len() - 1 { std::fs::rename(&m, dir.join(&file))?; } else { std::fs::copy(&m, dir.join(&file))?; }
+                Some(file)
+            }
+            None => None,
+        };
+        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(family, num_ctx)))?;
+        let mut meta = json!({"name": format!("{name}-{quant}"), "run": name, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file,
+                              "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": null, "ollama_name": oname, "num_ctx": num_ctx,
+                              "created": created, "world": p.display_name(), "installed": [], "via": result["via"], "auto_cut": true});
+        meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, None);
+        write_json(&dir.join("meta.json"), &meta)?;
+        metas.push(meta);
+    }
+    let _ = std::fs::remove_dir_all(&work);
     Ok(metas)
 }
 

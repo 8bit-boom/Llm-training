@@ -1150,7 +1150,7 @@ if kind == "distill_cache":
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
     os.makedirs(job["out"], exist_ok=True)
     g = job["data"].get("general")
-    key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"]}}
+    key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"], "render": 2}}
     json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key, "k": job["k"], "max_len": job["max_seq"]}}, open(os.path.join(job["out"], "index.json"), "w"))
     out(type="progress", step="cache", value=0.5, text="The original model answers your texts")
     out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."]}})
@@ -2304,4 +2304,170 @@ fn another_teacher_can_be_chosen_for_a_made_model_and_the_default_leaves_the_fol
     assert_eq!(meta["origin"]["repo"], "unsloth/Qwen3.5-4B", "the made model's own record is not changed");
     // it is still registered the way a made model is
     assert_eq!(catalog::find("custom-local-slim-9b-healed").unwrap().derived_from.as_deref(), Some("acme/Better"));
+}
+
+#[test]
+fn the_sequence_length_can_be_8192_for_long_reasoning_rows_and_nothing_else_outside_the_list() {
+    let ok = |seq: u32| serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 20, "seq": seq})).unwrap().validate();
+    for seq in [512, 1024, 2048, 4096, 8192] {
+        assert!(ok(seq).is_ok(), "{seq}");
+    }
+    for seq in [0, 256, 3000, 16384] {
+        assert!(ok(seq).unwrap_err().0.contains("512, 1024, 2048, 4096 or 8192"), "{seq}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------- the thinking recipe
+
+#[test]
+fn the_thinking_recipe_numbers_follow_the_size_of_the_cut_and_the_card() {
+    // 40 million tokens; 80 when more than 30 % of the parameters were cut
+    assert_eq!((thinking_tokens_m(21.1, 27.8), thinking_tokens_m(16.0, 27.8), thinking_tokens_m(19.5, 27.8), thinking_tokens_m(8.0, 0.0)), (40, 80, 40, 40));
+    assert_eq!((THINKING_SHARE, THINKING_RANK, THINKING_GENERAL_ID), (0.8, 64, "faunix/Qwen3.8-27B-Distillation-40K"));
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    // a 16 B student, QLoRA, checkpointing, batch 1: about 18.5 GB at 4096 and 20.6 GB at 8192 (shared cases), 85 % of a 32 GB card is 27.2 GB
+    assert_eq!(thinking_knobs(16.0, Some(32.0), &d), (8192, 1, 64));
+    assert_eq!(thinking_knobs(16.0, Some(24.0), &d).0, 4096, "8192 only when the estimate says it fits, 4096 is tight but not over");
+    assert_eq!(thinking_knobs(16.0, None, &d).0, 4096, "an unknown card: 4096");
+    assert!(thinking_knobs(16.0, Some(16.0), &d).0 <= 2048, "over the card at 4096: shorter");
+}
+
+fn spec_of(v: serde_json::Value) -> rruns::HealSpec {
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn the_recipe_changes_the_automatic_settings_and_what_the_person_chose_still_wins() {
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    let plain = rruns::heal_choice(&spec_of(json!({"tokens_m": 20})), 16.0, Some(32.0), &d);
+    assert_eq!((plain.knobs.seq, plain.knobs.rank, plain.knobs.batch, plain.knobs.grad_accum), (1024, 32, 2, 16));
+    let rec = rruns::heal_choice(&spec_of(json!({"tokens_m": 40, "recipe": "thinking"})), 16.0, Some(32.0), &d);
+    assert_eq!((rec.knobs.seq, rec.knobs.rank, rec.knobs.batch, rec.knobs.grad_accum), (8192, 64, 1, 32), "32 sequences per update as always");
+    let own = rruns::heal_choice(&spec_of(json!({"tokens_m": 40, "recipe": "thinking", "seq": 2048, "rank": 16, "batch": 2})), 16.0, Some(32.0), &d);
+    assert_eq!((own.knobs.seq, own.knobs.rank, own.knobs.batch, own.knobs.grad_accum), (2048, 16, 2, 16));
+    // the recipe's text is the reasoning traces unless another general text was chosen
+    let g = spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general_share": 0.8})).general_source().unwrap().unwrap();
+    assert_eq!((g.id.as_deref(), g.split.as_deref()), (Some("faunix/Qwen3.8-27B-Distillation-40K"), Some("train")));
+    let other = spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general": {"id": "HuggingFaceH4/ultrachat_200k"}})).general_source().unwrap().unwrap();
+    assert_eq!(other.id.as_deref(), Some("HuggingFaceH4/ultrachat_200k"));
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general_share": 0})).general_source().unwrap().is_none(), "no general text: the project's own only");
+    assert_eq!(spec_of(json!({"tokens_m": 20})).general_source().unwrap().unwrap().id.as_deref(), Some("mlabonne/open-perfectblend"));
+    // validation
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "thinking"})).validate().is_ok() && spec_of(json!({"tokens_m": 40})).validate().is_ok());
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "fast"})).validate().unwrap_err().0.contains("Unknown healing recipe"));
+}
+
+#[cfg(unix)]
+#[test]
+fn healing_with_the_thinking_recipe_sends_its_numbers_and_records_it() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim-a");
+    thin_27b(&p, "slim-b");
+    let run = |name: &str, spec: &rruns::HealSpec| rruns::heal(&p, name, spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    let rec = spec_of(json!({"tokens_m": 80, "recipe": "thinking", "general_share": 0.8}));
+    run("slim-a", &rec);
+    run("slim-b", &spec_of(json!({"tokens_m": 80, "general_share": 0.8})));
+    let jobs = jobs_seen(d.path());
+    let (cache_a, train_a, merge_a) = (&jobs[0], &jobs[1], &jobs[2]);
+    let (cache_b, train_b, merge_b) = (&jobs[3], &jobs[4], &jobs[5]);
+    let dims = HealDims::from_config(&json!({"num_hidden_layers": 24}), 21.1);
+    let (seq, batch, rank) = thinking_knobs(21.1, Some(32.0), &dims);
+    assert_eq!((cache_a["max_seq"].clone(), train_a["hyper"]["max_seq"].clone(), train_a["hyper"]["rank"].clone(), train_a["hyper"]["batch"].clone()), (json!(seq), json!(seq), json!(rank), json!(batch)));
+    assert!(seq >= 4096 && rank == 64 && batch == 1);
+    assert_eq!((cache_a["data"]["general"]["id"].clone(), cache_a["data"]["general"]["share"].clone(), cache_a["data"]["tokens"].clone()), (json!("faunix/Qwen3.8-27B-Distillation-40K"), json!(0.8), json!(80_000_000)));
+    assert_eq!((merge_a["recipe"].clone(), merge_b.get("recipe").cloned()), (json!("thinking"), None));
+    assert_eq!((cache_b["max_seq"].clone(), train_b["hyper"]["rank"].clone(), cache_b["data"]["general"]["id"].clone()), (json!(1024), json!(32), json!("mlabonne/open-perfectblend")));
+    // heal.json keeps the recipe, and the training key differs (another sequence length and rank), so a stopped run of the other kind is not continued
+    let ha: serde_json::Value = serde_json::from_slice(&std::fs::read(p.folder.join("models/slim-a/heal.json")).unwrap()).unwrap();
+    let hb: serde_json::Value = serde_json::from_slice(&std::fs::read(p.folder.join("models/slim-b/heal.json")).unwrap()).unwrap();
+    assert_eq!((ha["recipe"].clone(), hb["recipe"].clone(), ha["spec"]["recipe"].clone()), (json!("thinking"), json!(null), json!("thinking")));
+    assert_ne!(ha["train_key"], hb["train_key"]);
+    assert_eq!((ha["train_key"]["seq"].clone(), ha["train_key"]["rank"].clone(), hb["train_key"]["seq"].clone()), (json!(seq), json!(64), json!(1024)));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_recipe_is_offered_for_qwen_models_only_and_refused_for_others() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim-q");
+    let o = rruns::heal_options(&p, "slim-q", Some(32.0)).unwrap();
+    let r = &o["recipe"];
+    assert_eq!((r["id"].clone(), r["general_share"].clone(), r["general"].clone(), r["rank"].clone(), r["batch"].clone(), r["default_on"].clone()), (json!("thinking"), json!(0.8), json!("faunix/Qwen3.8-27B-Distillation-40K"), json!(64), json!(1), json!(true)));
+    assert_eq!(r["tokens_m"], 40, "27.8 B to 21.1 B is a cut of 24 %");
+    assert!(r["seq"].as_u64().unwrap() >= 4096 && r["cut_share"].as_f64().unwrap() > 0.2 && r["cut_share"].as_f64().unwrap() < 0.3, "{r}");
+    // a model whose original is not a Qwen3.5 / 3.8 gets no recipe
+    thin_27b(&p, "slim-g");
+    let f = p.folder.join("models/slim-g/model/ndforge_reshape.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+    meta["origin"]["family"] = json!("generic");
+    std::fs::write(&f, meta.to_string()).unwrap();
+    assert!(rruns::heal_options(&p, "slim-g", Some(32.0)).unwrap()["recipe"].is_null());
+    let e = rruns::heal(&p, "slim-g", &spec_of(json!({"tokens_m": 40, "recipe": "thinking"})), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap_err();
+    assert!(e.0.contains("Qwen3.5 and Qwen3.8"), "{}", e.0);
+    assert!(jobs_seen(d.path()).iter().all(|j| j["job"] != "distill_cache" && j["job"] != "distill"), "refused before anything ran");
+}
+
+// ---- reasoning-aware measuring (S10)
+
+#[test]
+fn the_reasoning_text_is_part_of_the_name_of_a_measurement() {
+    let r = ReasoningCalib::default();
+    assert!(r.validate().is_ok());
+    assert_eq!(r.json(), json!({"source": {"id": THINKING_GENERAL_ID}, "share": 0.5, "max_len": 2048}));
+    let key = rruns::scores_key_with("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto", Some(&r));
+    assert!(key.starts_with("unsloth-qwen3.5-4b-v1-128x512-auto-r50x2048-faunix-qwen3.8-2-"), "{key}");
+    assert_eq!(rruns::scores_key_with("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto", None), rruns::scores_key("unsloth/Qwen3.5-4B", Some(1), 128, 512, "auto"));
+    let other = ReasoningCalib { id: Some("a/b".into()), share: 0.3, ..Default::default() };
+    let file = ReasoningCalib { file: Some(std::path::Path::new("some").join("traces.jsonl").to_string_lossy().into_owned()), ..Default::default() };
+    let keys: Vec<String> = [&r, &other, &file].iter().map(|x| rruns::scores_key_with("m", Some(1), 128, 512, "auto", Some(x))).collect();
+    assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "{keys:?}");
+    assert!(keys.iter().all(|k| !k.contains(['/', '\\', ' ']) && !k.contains("..")), "{keys:?}");
+    assert_eq!(file.json()["source"], json!({"file": file.file.clone().unwrap()}));
+    for bad in [ReasoningCalib { share: 0.0, ..Default::default() }, ReasoningCalib { share: 0.95, ..Default::default() }, ReasoningCalib { max_len: 8, ..Default::default() },
+                ReasoningCalib { id: Some(" ".into()), ..Default::default() }] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_spec_without_reasoning_is_as_before_and_one_with_it_is_checked() {
+    let s = spec(Mode::Prune, 1);
+    assert!(s.reasoning.is_none());
+    let v: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "m", "mode": "prune", "blocks": 1, "reasoning": {}})).unwrap();
+    assert_eq!(v.reasoning, Some(ReasoningCalib::default()));
+    let t: rruns::TrySpec = serde_json::from_value(json!({"model_id": "qwen3.5-4b", "reasoning": {"share": 2.0}})).unwrap();
+    assert!(t.validate().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_reasoning_text_reaches_the_worker_and_gets_its_own_measurement() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    let m = catalog::find("qwen3.5-4b").unwrap();
+    let r = ReasoningCalib { id: Some("a/b".into()), share: 0.4, max_len: 1024, ..Default::default() };
+    let plain = rruns::measurement_info(&p, &m, 256, 512, "auto");
+    let with = rruns::measurement_info_with(&p, &m, 256, 512, "auto", Some(&r));
+    assert!(plain["key"] != with["key"] && with["key"].as_str().unwrap().contains("-r40x1024-a-b-"), "{with}");
+    let res = rruns::measure_with(&p, "qwen3.5-4b", 256, 512, "auto", Some(&r), false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert_eq!(res["key"], with["key"]);
+    let job = &jobs_seen(d.path())[0];
+    assert_eq!(job["calibration"]["reasoning"], json!({"source": {"id": "a/b"}, "share": 0.4, "max_len": 1024}));
+    assert_eq!(job["out_dir"].as_str().unwrap(), rruns::scores_dir(&p, with["key"].as_str().unwrap()).to_string_lossy());
+    assert_eq!(rruns::measurement_info_with(&p, &m, 256, 512, "auto", Some(&r))["exists"], true);
+    assert_eq!(rruns::measurement_info(&p, &m, 256, 512, "auto")["exists"], false, "the plain measurement is another one");
+    assert!(rruns::measure_with(&p, "qwen3.5-4b", 256, 512, "auto", Some(&ReasoningCalib { share: 0.0, ..Default::default() }), false, Arc::new(AtomicBool::new(false)), &mut |_| {}).is_err());
+    // a plain measurement sends no reasoning at all
+    rruns::measure(&p, "qwen3.5-4b", 128, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert!(jobs_seen(d.path())[1]["calibration"].get("reasoning").is_none());
 }

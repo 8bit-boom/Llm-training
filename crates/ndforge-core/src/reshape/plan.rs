@@ -3,7 +3,10 @@
 //! The worker (`reshape_inspect`) reports what a model is made of; everything the page shows before the job starts is computed here from that.
 //! Layers are cut / copied only in whole blocks of one pattern period (Qwen3.5: 3 linear-attention + 1 full-attention layer = 4 layers). The rules
 //! for `limits` are the same as `reshape.limits` in the Python worker; `worker/tests/data/reshape_limits.json` is read by both test suites.
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::train::hub::estimate_vram;
@@ -32,7 +35,7 @@ impl Mode {
 }
 
 /// What the worker's `reshape_inspect` job found out about a model (extra keys it sends are ignored).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Inspect {
     #[serde(default)]
     pub model_type: String,
@@ -182,6 +185,75 @@ pub struct ReshapeSpec {
     /// measuring samples when width is on (the measurement is kept per model, data version, samples and length)
     #[serde(default = "s256")]
     pub width_samples: u32,
+    /// reasoning-aware measuring: part of the samples are conversations with thinking (None: the project's own text only, as before)
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCalib>,
+}
+
+fn r_share() -> f64 {
+    REASONING_SHARE
+}
+fn r_len() -> u32 {
+    REASONING_LEN
+}
+
+/// The reasoning part of a measuring text: a dataset of conversations with thinking, the share of the samples it takes and the length of a row.
+/// Part of the folder name of a measurement (`tag`) and of the worker's keys (`reasoning_key` in reshapejob.py names the same parts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningCalib {
+    /// a Hugging Face dataset id (default: the teacher's own traces)
+    #[serde(default)]
+    pub id: Option<String>,
+    /// a local file instead of a dataset
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default = "r_share")]
+    pub share: f64,
+    #[serde(default = "r_len")]
+    pub max_len: u32,
+}
+
+/// Half of the samples, rows of 2048 tokens.
+pub const REASONING_SHARE: f64 = 0.5;
+pub const REASONING_LEN: u32 = 2048;
+
+impl Default for ReasoningCalib {
+    fn default() -> Self {
+        ReasoningCalib { id: None, file: None, share: REASONING_SHARE, max_len: REASONING_LEN }
+    }
+}
+
+impl ReasoningCalib {
+    pub fn validate(&self) -> Result<()> {
+        if !(self.share > 0.0 && self.share <= 0.9) || !(64..=8192).contains(&self.max_len) {
+            return Err(Error::new("The reasoning text takes up to 90 % of the samples, in rows of 64 to 8192 tokens."));
+        }
+        if self.id.as_deref().is_some_and(|i| i.trim().is_empty()) || self.file.as_deref().is_some_and(|f| f.trim().is_empty()) {
+            return Err(Error::new("The reasoning text needs a dataset id or a file."));
+        }
+        Ok(())
+    }
+
+    /// The `reasoning` of the worker's calibration.
+    pub fn json(&self) -> Value {
+        let mut source = serde_json::Map::new();
+        if let Some(f) = self.file.as_ref().filter(|f| !f.is_empty()) {
+            source.insert("file".into(), json!(f));
+        } else {
+            source.insert("id".into(), json!(self.id.clone().filter(|i| !i.is_empty()).unwrap_or_else(|| THINKING_GENERAL_ID.to_string())));
+        }
+        json!({"source": source, "share": self.share, "max_len": self.max_len})
+    }
+
+    /// What goes after the measurement's key so that another reasoning text is another folder: `-r50x2048-<dataset>` (share in percent, row length, a short name).
+    pub fn tag(&self) -> String {
+        let name = self.file.as_deref().filter(|f| !f.is_empty()).map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .or_else(|| self.id.clone().filter(|i| !i.is_empty())).unwrap_or_else(|| THINKING_GENERAL_ID.to_string());
+        let slug: String = name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect();
+        let slug = slug.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+        let hash = format!("{:08x}", name.bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193)));
+        format!("-r{}x{}-{}-{hash}", (self.share * 100.0).round() as u32, self.max_len, slug.chars().take(16).collect::<String>().trim_matches('-'))
+    }
 }
 
 /// Depth, width or both, from what the spec asks for.
@@ -332,6 +404,9 @@ pub fn validate(spec: &ReshapeSpec, ins: &Inspect) -> Result<()> {
     }
     if spec.calib_samples < 8 || spec.calib_samples > 4096 || spec.calib_len < 32 || spec.calib_len > 8192 || spec.width_samples < 8 || spec.width_samples > 4096 {
         return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
+    }
+    if let Some(r) = &spec.reasoning {
+        r.validate()?;
     }
     if let Some(w) = &spec.width {
         validate_width(spec, ins, w)?;
@@ -563,6 +638,36 @@ pub const HEAL_TOKENS_M: [u32; 4] = [10, 20, 40, 80];
 /// Default budget: 20 M tokens for students of 15 B or more, 40 M below (owner decision).
 pub fn default_heal_tokens_m(student_b: f64) -> u32 {
     if student_b >= 15.0 { 20 } else { 40 }
+}
+
+// ---- the thinking recipe (docs/THINKING_CHECK.md, docs/RESHAPE.md): heal a cut model so that it keeps thinking
+
+/// The name of the recipe in `HealSpec.recipe`, `heal.json` and `ndforge_reshape.json` (`healed.recipe`).
+pub const THINKING_RECIPE: &str = "thinking";
+/// The general text of the recipe: 40,000 reasoning traces written by Qwen3.8-27B (the original's own way of thinking), Apache-2.0.
+pub const THINKING_GENERAL_ID: &str = "faunix/Qwen3.8-27B-Distillation-40K";
+/// The share of the healing text that is general (reasoning) text; the project's own text is the rest.
+pub const THINKING_SHARE: f64 = 0.8;
+pub const THINKING_RANK: u32 = 64;
+/// More than this share of the parameters cut: 80 million tokens instead of 40.
+pub const THINKING_CUT_FOR_80M: f64 = 0.30;
+
+/// 40 million tokens; 80 million when the cut took out more than 30 % of the parameters.
+pub fn thinking_tokens_m(student_b: f64, teacher_b: f64) -> u32 {
+    if teacher_b > 0.0 && 1.0 - student_b / teacher_b > THINKING_CUT_FOR_80M { 80 } else { 40 }
+}
+
+/// (sequence length, batch, LoRA rank) of the recipe: sequence 8192 when the estimate says it FITS the card (up to 85 % of it), else 4096 while that is not over the card,
+/// else 2048 or 1024; 4096 when the card is not known. Batch 1 (32 sequences per update as always), gradient checkpointing on.
+pub fn thinking_knobs(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> (u32, u32, u32) {
+    let def = heal_defaults(student_b, vram_gb, d);
+    let est = |seq: u32| heal_memory_gb(student_b, d, &HealKnobs { seq, batch: 1, grad_accum: 32, checkpointing: true, rank: THINKING_RANK, ..def.clone() });
+    let seq = match vram_gb {
+        None => 4096,
+        Some(v) if heal_verdict(est(8192), Some(v)) == "fits" => 8192,
+        Some(v) => [4096, 2048, 1024].into_iter().find(|&s| est(s) <= v).unwrap_or(1024),
+    };
+    (seq, 1, THINKING_RANK)
 }
 
 // ---- the memory of healing (the student's training step)

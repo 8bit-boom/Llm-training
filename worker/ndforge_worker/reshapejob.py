@@ -12,7 +12,8 @@ import shutil
 import time
 from pathlib import Path
 
-from . import protocol, reshape, reshape_width, safetensors_io, slice_io, vision
+from . import generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, vision
+from .families import family
 from .reshape import ReshapeError
 
 # copied byte for byte from the source folder when present (the weights and the index are written, never copied)
@@ -259,15 +260,88 @@ def _find_layers(model, n: int):
     return found[0][1]
 
 
+REASONING_ID = "faunix/Qwen3.8-27B-Distillation-40K"     # the default reasoning text: the teacher's own thinking traces (the app's preset list names the same)
+REASONING_SHARE, REASONING_LEN = 0.5, 2048
+REASONING_SCAN = 40                                         # rows read per row wanted, at most (a source with few traces ends the scan)
+
+
+def reasoning_key(calib_cfg: dict):
+    """What makes the reasoning part of a calibration another one (None when there is none): the dataset, its config / split / column, the share of the samples
+    and the length of a row. Part of the keys of a measurement and of the Try-first answers; the app's Rust code names the same parts in the folder of a
+    measurement (crates/ndforge-core/src/reshape/plan.rs `ReasoningCalib::tag`)."""
+    r = (calib_cfg or {}).get("reasoning")
+    if not isinstance(r, dict):
+        return None
+    share = float(r.get("share", REASONING_SHARE) or 0)
+    if not share > 0:
+        return None
+    src = r.get("source") or {}
+    key = {"id": src.get("id") or (None if src.get("file") else REASONING_ID), "file": src.get("file") or None, "config": src.get("config") or None,
+           "split": src.get("split") or None, "column": src.get("column") or None, "share": round(min(share, 0.9), 4), "max_len": int(r.get("max_len", REASONING_LEN)),
+           "render": generaltext.RENDER_VERSION}
+    return key
+
+
+def _reasoning_rows(tokenizer, key: dict, fam_name: str, want: int, seed: int) -> list:
+    """`want` rows of thinking conversations of the reasoning source, written the way the model thinks (data.render_chat_full) and cut to key["max_len"] tokens
+    (the first window only: a later one would have neither the question nor the chat frame). Conversations without a trace are passed over when the model
+    family thinks. Raises ReshapeError (plain words) when the source cannot be read or has no traces."""
+    from . import data
+    fam = family(fam_name)
+    src = {k: key[k] for k in ("id", "file", "config", "split", "column") if key.get(k)}
+    report: dict = {}
+    src.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
+    inner = data._inner(tokenizer)
+    rows, scanned = [], 0
+    try:
+        for text in generaltext.texts(src):
+            scanned += 1
+            if fam.get("thinks") and "</think>" not in text.replace("<think>\n\n</think>", ""):
+                if scanned >= want * REASONING_SCAN:
+                    break
+                continue
+            ids = inner(text, add_special_tokens=False)["input_ids"][: key["max_len"]]
+            if len(ids) >= 16:
+                rows.append({"input_ids": ids, "completion_mask": [1] * len(ids), "kind": "reasoning"})
+            if len(rows) >= want or scanned >= want * REASONING_SCAN:
+                break
+    except Exception as exc:        # noqa: BLE001 - offline, gated, wrong id: one plain sentence, the measurement does not go on with other text
+        note, _ = generaltext.failure_note(exc, src, "read for measuring", "Choose another reasoning text or switch the reasoning text off.", REASONING_ID)
+        raise ReshapeError(note) from None
+    if not rows:
+        raise ReshapeError(f"The reasoning text ({generaltext.source_name(src)}) has no conversations with a thinking trace in its first {scanned} rows. Choose another dataset.")
+    protocol.log(f"Reasoning text for measuring: {len(rows)} conversations with thinking from {generaltext.source_name(src)} (cut to {key['max_len']} tokens).")
+    return rows
+
+
+def _pad_batches(enc: list, bs: int, pad: int) -> list:
+    import torch
+    batches = []
+    for i in range(0, len(enc), bs):
+        part = [e["input_ids"] for e in enc[i:i + bs]]
+        width = max(len(x) for x in part)
+        ids = torch.full((len(part), width), pad, dtype=torch.long)
+        mask = torch.zeros((len(part), width), dtype=torch.long)
+        for k, x in enumerate(part):
+            ids[k, :len(x)] = torch.tensor(x)
+            mask[k, :len(x)] = 1
+        batches.append({"input_ids": ids, "attention_mask": mask})
+    return batches
+
+
 def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     """Deterministic batches [{"input_ids": LongTensor[b,t], "attention_mask": LongTensor[b,t]}]: half world-book text, half practice conversations
-    (whatever the training file has), right-padded. Without a training file a few built-in sentences are used (enough for the exact-copy self-check)."""
+    (whatever the training file has), right-padded. Without a training file a few built-in sentences are used (enough for the exact-copy self-check).
+    With calib_cfg["reasoning"] ({"source": {"id" | "file", ...}, "share": 0.5, "max_len": 2048}) that share of the samples are conversations with thinking,
+    written the way the model thinks (data.render_chat_full), measured in batches of their own after the project's batches; the others are the project's rows."""
     import random
-    import torch
     from . import data
     samples = max(2, int(calib_cfg.get("samples", 128)))
     max_len = int(calib_cfg.get("max_len", 512))
     seed = int(calib_cfg.get("seed", 3407))
+    rkey = reasoning_key(calib_cfg)
+    n_reason = max(1, min(samples - 1, round(samples * rkey["share"]))) if rkey else 0
+    samples -= n_reason
     path = calib_cfg.get("train")
     rows = data.read_jsonl(path) if path and Path(path).is_file() else []
     if not rows:
@@ -286,16 +360,11 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     inner = data._inner(tokenizer)
     pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     bs = max(1, min(int(calib_cfg.get("batch", 4)), len(enc) // 2))
-    batches = []
-    for i in range(0, len(enc), bs):
-        part = [e["input_ids"] for e in enc[i:i + bs]]
-        width = max(len(x) for x in part)
-        ids = torch.full((len(part), width), pad, dtype=torch.long)
-        mask = torch.zeros((len(part), width), dtype=torch.long)
-        for k, x in enumerate(part):
-            ids[k, :len(x)] = torch.tensor(x)
-            mask[k, :len(x)] = 1
-        batches.append({"input_ids": ids, "attention_mask": mask})
+    batches = _pad_batches(enc, bs, pad)
+    if rkey:
+        reasoning = _reasoning_rows(tokenizer, rkey, fam_name, n_reason, seed)
+        rbs = max(1, min(bs, bs * max_len // max(1, rkey["max_len"])))        # long rows go in smaller batches: about as many tokens per batch as the project's
+        batches += _pad_batches(reasoning, rbs, pad)
     return batches
 
 
@@ -451,6 +520,9 @@ def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
         return None
     if (cal.get("samples") is not None and meta.get("samples") != cal.get("samples")) or (cal.get("max_len") is not None and meta.get("max_len") != cal.get("max_len")):
         protocol.log("The earlier measurement used another number of samples or length; measuring again.")
+        return None
+    if meta.get("reasoning") != reasoning_key(cal):
+        protocol.log("The earlier measurement used another reasoning text; measuring again.")
         return None
     n_full = sum(1 for t in types if t == "full_attention")
     want = {"mlp": (n_layers, dims["intermediate"]), "attn": (n_full, dims["heads"]), "gdn": (n_layers - n_full, dims["lin_v_heads"])}
@@ -667,7 +739,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
         _free()
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
-            "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
+            "reasoning": reasoning_key(calib), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
             "loss_before": loss, "seconds_per_pass": round(time.monotonic() - timer, 1), "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     if cfg.get("scores_dir"):
         _write_scores(Path(cfg["scores_dir"]), meta, scores)
@@ -896,7 +968,7 @@ def run(cfg: dict) -> int:
                 "mode": mode, "period": period, "layers": len(src), "params": info["params_after"], "src_layers": src, "dropped": info["dropped"],
                 "duplicated": info["duplicated"], "zero_init": zero_init, "strategy": strategy if mode == "prune" else cfg.get("grow", {}).get("layout", "solar"),
                 "calibration": ({"version": calibration.get("version"), "samples": calibration.get("samples"), "max_len": calibration.get("max_len"),
-                                 "tokens": tokens} if (scores or sc) else None),
+                                 **({"reasoning": reasoning_key(calibration)} if reasoning_key(calibration) else {}), "tokens": tokens} if (scores or sc) else None),
                 "loss_before": loss_before, "loss_after": loss_after, "stable": stable,
                 "vision": "unchanged (copied from the original)" if groups["vision"] else "none",
                 "mtp": ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if width and groups["mtp"] else "copied unchanged" if groups["mtp"] else "none"}
