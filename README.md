@@ -179,6 +179,8 @@ Stop (and closing the program) ends the worker and every program it started: its
 
 Every job of the training software (export, healing, checks ...) saves its log to `logs/jobs/<date>-<time>-<job>.log` in the settings folder: the job (without secrets), every line the worker wrote with the seconds since the start, and how it ended. Tokens and keys are replaced by `[token]` / `[key]`. The newest 60 files are kept, at most 300 MB. When a job fails, its message ends with `(details: logs/jobs/<file>)`. `ndforge_core::envmgr::joblog::latest(n)` lists the newest files (for the problem report).
 
+A job that writes nothing for 20 minutes (60 for the teacher's answers, an export and a matrix; job key `stall_minutes` changes it) makes the program send a `stall` event, again after each further period; the window shows "No sign of progress for N minutes. The job may be stuck; Stop is safe." It only warns, nothing is stopped.
+
 ## Saved files
 
 Settings, the access keys (`secrets.json`), run states and the other small files are written to `<name>.tmp` first and renamed, so a crash or a full disk leaves the old file, never half a file (`crates/ndforge-core/src/fsx.rs`; on Windows a rename that is refused for a moment is tried again). A settings or keys file that cannot be read is kept as `settings.json.broken-<time>` (or `secrets.json.broken-<time>`), the standard settings are used, and the window says so once at the start.

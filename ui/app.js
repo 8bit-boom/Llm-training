@@ -3259,6 +3259,22 @@ async function go(key) {
   $("help").scrollTop = 0;
 }
 
+// A job that has written nothing for a long time (the program sends {kind: "stall", minutes} on the job's own channel): one banner for every page. It only warns.
+const STALL_CHANNELS = ["train-event", "reshape-event", "env-event", "export-event", "imatrix-event", "quantcheck-event", "unsloth-event", "server-event", "test-event", "teacher-event", "bench-event"];
+function onStallEvent(ev) {
+  const box = $("stall");
+  if (!box || !ev || typeof ev !== "object") return;
+  const kind = ev.kind || ev.type;
+  if (kind === "stall") {
+    const n = Math.max(1, Math.round(Number(ev.minutes) || 0));
+    box.textContent = `No sign of progress for ${n} minute${n === 1 ? "" : "s"}. The job may be stuck; Stop is safe.`;
+    box.hidden = false;
+  } else if (!box.hidden) {
+    box.hidden = true;                  // any other event: it is moving again (or it ended)
+    box.textContent = "";
+  }
+}
+
 async function init() {
   setState(await invoke("get_state"));
   // a damaged settings file was set aside (core: settings.rs); say so once
@@ -3287,6 +3303,7 @@ async function init() {
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
+  for (const ch of STALL_CHANNELS) { try { await tauri.event.listen(ch, (e) => onStallEvent(e.payload)); } catch (_) { /* previews */ } }
   go("welcome");
 }
 init();

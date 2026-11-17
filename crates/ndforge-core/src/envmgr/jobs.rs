@@ -3,10 +3,11 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use serde_json::Value;
 
-use super::process::{run_lines, Stream};
+use super::process::{run_watched, Item, Stream};
 use crate::error::{Error, Result};
 
 /// The worker's error code when llama.cpp (or a part of it) is not there, and the mark the error text then ends with.
@@ -39,6 +40,18 @@ pub fn job_env(job: &Value) -> Vec<(String, String)> {
     crate::secrets::get(crate::general::TOKEN_SECRET).map(|t| vec![("HF_TOKEN".to_string(), t)]).unwrap_or_default()
 }
 
+/// How many minutes without any output make the program say "no sign of progress": the job key `stall_minutes`, else 60 for the jobs that are quiet for long
+/// stretches (the teacher's answers, an export, a matrix) and 20 for the others. The job is only warned about, never stopped.
+pub fn stall_minutes(job: &Value) -> f64 {
+    if let Some(m) = job["stall_minutes"].as_f64().filter(|m| *m > 0.0) {
+        return m;
+    }
+    match job["job"].as_str() {
+        Some("distill_cache") | Some("export") | Some("imatrix_make") => 60.0,
+        _ => 20.0,
+    }
+}
+
 /// Runs `job` and returns the worker's result data. A worker error becomes `Err` with the worker's plain-language message.
 pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
     let dir = std::env::temp_dir().join(format!("ndforge-job-{}-{}", std::process::id(), chrono::Utc::now().timestamp_micros()));
@@ -60,7 +73,17 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
     let mut result: Option<Value> = None;
     let mut failure: Option<String> = None;
     let mut failure_code = String::new();
-    let status = run_lines(cmd, cancel, &mut |stream: Stream, line: &str| {
+    let stall = stall_minutes(job);
+    let status = run_watched(cmd, cancel, Some(Duration::from_secs_f64(stall * 60.0)), &mut |item: Item| {
+        let (stream, line) = match item {
+            Item::Line(stream, line) => (stream, line),
+            Item::Stall { periods } => {
+                let minutes = stall * periods as f64;
+                log.line("stall", &format!("no output for {minutes} minutes"));
+                on_event(WorkerEvent::Other(serde_json::json!({"type": "stall", "kind": "stall", "minutes": if minutes.fract() == 0.0 { serde_json::json!(minutes as u64) } else { serde_json::json!(minutes) }})));
+                return;
+            }
+        };
         log.line(if stream == Stream::Err { "err" } else { "out" }, line);
         if stream == Stream::Err {
             on_event(WorkerEvent::Log(scrub(line)));

@@ -143,3 +143,6 @@ p.hs-warn { color: #8a5a00; }
 .stepper .ac-failed span:first-child { color: var(--err, #c33); }
 .stepper .ac-running { font-weight: 600; }
 .stepper .ac-pending, .stepper .ac-skipped { opacity: .6; }
+
+.stall { margin: 0; padding: 8px 16px; border-width: 0 0 1px 0; }
+.stall[hidden] { display: none; }

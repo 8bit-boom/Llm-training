@@ -128,8 +128,25 @@ fn pump(src: impl Read, stream: Stream, tx: mpsc::Sender<(Stream, String)>) {
     }
 }
 
-/// Runs `cmd` to the end (or until `cancel` is set, which kills it). Both output streams arrive in `on_line`.
-pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(Stream, &str)) -> Result<ExitStatus> {
+/// What a watched run reports: a line of output, or "no output for a while".
+pub enum Item<'a> {
+    Line(Stream, &'a str),
+    /// The program has said nothing for `periods` times the stall period (1 = the first warning, 2 = the same silence twice as long ...). It only warns; nothing is stopped.
+    Stall { periods: u32 },
+}
+
+/// Runs `cmd` to the end (or until `cancel` is set, which kills it and what it started). Both output streams arrive in `on_line`.
+pub fn run_lines(cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(Stream, &str)) -> Result<ExitStatus> {
+    run_watched(cmd, cancel, None, &mut |item| {
+        if let Item::Line(stream, line) = item {
+            on_line(stream, line)
+        }
+    })
+}
+
+/// Like `run_lines`, and with `stall` set it also reports `Item::Stall` when the program has written nothing (on either stream) for that long, again after each
+/// further period of silence.
+pub fn run_watched(mut cmd: Command, cancel: &AtomicBool, stall: Option<Duration>, on_item: &mut dyn FnMut(Item)) -> Result<ExitStatus> {
     quiet(&mut cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
@@ -150,6 +167,7 @@ pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(
         readers.push(std::thread::spawn(move || pump(err, Stream::Err, tx)));
     }
     drop(tx);
+    let (mut last, mut periods) = (std::time::Instant::now(), 0u32);
     loop {
         // A chatty program never lets the receive time out, so look at the stop request on every turn.
         if cancel.load(Ordering::SeqCst) {
@@ -157,8 +175,18 @@ pub fn run_lines(mut cmd: Command, cancel: &AtomicBool, on_line: &mut dyn FnMut(
             return Err(Error::cancelled());
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok((stream, line)) => on_line(stream, &line),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok((stream, line)) => {
+                (last, periods) = (std::time::Instant::now(), 0);
+                on_item(Item::Line(stream, &line))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(period) = stall {
+                    if last.elapsed() >= period * (periods + 1) {
+                        periods += 1;
+                        on_item(Item::Stall { periods });
+                    }
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
