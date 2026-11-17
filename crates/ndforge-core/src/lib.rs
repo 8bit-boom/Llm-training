@@ -26,6 +26,7 @@ pub mod reshape;
 pub mod train;
 pub mod sample;
 pub mod teacher;
+pub mod timing;
 pub mod unsloth;
 pub mod settings;
 

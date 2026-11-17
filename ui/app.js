@@ -1887,6 +1887,26 @@ function wireLlama() {
 
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
+// "Where the time went": the timing lines of the latest job logs, summed (crates/ndforge-core/src/timing.rs). Loaded on a click: it reads the saved logs.
+const tm = { data: null, loading: false, err: null };
+async function tmLoad() {
+  tm.loading = true; tm.err = null; render();
+  try { tm.data = await invoke("timing_report"); } catch (e) { tm.data = null; tm.err = String(e); }
+  tm.loading = false; render();
+}
+function tmSecs(s) { return s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : Math.round(s) + " s"; }
+function renderTimeCard() {
+  const d = tm.data, sum = d && d.summary;
+  const stages = sum && sum.stages ? Object.entries(sum.stages).sort((a, b) => b[1].seconds - a[1].seconds).slice(0, 12) : [];
+  const body = tm.err ? `<p class="err">${esc(tm.err)}</p>` : !d ? `<p class="dim">The program writes down how long every part of a job took (loading a model, measuring, the teacher's answers, healing, saving, converting). Press the button to add up the latest ${30} jobs.</p>`
+    : !stages.length ? `<p class="dim">No timing lines in the latest ${sum.logs} job logs yet: they come with the next job.</p>`
+    : `<p class="dim small">${sum.logs} job logs, ${tmSecs(sum.job_seconds)} in all.</p>
+      <table class="tbl" id="tm-table"><tr><th>Stage</th><th>Time</th><th>Times</th><th>Share</th></tr>${stages.map(([n, v]) => `<tr><td>${esc(n)}</td><td>${tmSecs(v.seconds)}</td><td>${v.count}</td><td>${Math.round(v.share * 100)} %</td></tr>`).join("")}</table>
+      ${(d.advice || []).map((a) => `<p class="${a.worth ? "warn" : "dim"} small" data-tm-advice="${esc(a.id)}">${a.worth ? "<strong>Worth doing:</strong> " : ""}${esc(a.text)}</p>`).join("")}`;
+  return `<div class="card wide" id="tm-card"><h2>Where the time went</h2>${body}
+    <div class="row"><button class="secondary" id="tm-load" ${tm.loading ? "disabled" : ""}>${d ? "Look again" : "Show where the time went"}</button></div></div>`;
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -1908,6 +1928,7 @@ function renderSetup() {
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderTimeCard()}
     ${renderLlamaSection()}
     ${renderUnsloth()}`;
 }
@@ -3360,6 +3381,7 @@ function wire() {
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
   on("selftest", () => startEnv("env_selftest"));
+  on("tm-load", () => tmLoad());
   on("kernels", () => startEnv("env_install_kernels"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);

@@ -109,3 +109,19 @@ test("the setup page offers the fast-kernels button only when that light is not 
   assert.doesNotMatch(page([]), /id="kernels"/, "no light, no button");
   assert.doesNotMatch(page([k("warn")], false), /id="kernels"/, "nothing to add to before the install");
 });
+
+test("the setup page has a card that adds up where the time of the jobs went", async () => {
+  const report = { summary: { logs: 4, job_seconds: 7300, stages: { teacher_pass: { seconds: 5000, count: 2, share: 0.68 }, write: { seconds: 120, count: 1, share: 0.02 } } },
+    advice: [{ id: "merge_bound", worth: true, text: "Saving the healed model is bound by the disk." }, { id: "fast_kernels", worth: false, text: "No slow-kernel warning was recorded in these jobs." }] };
+  const b = makeBrowser({ answers: { timing_report: report }, state: () => ({ project: { name: "P", folder: "/p" }, steps: [], bundle: { world: "W" }, settings: { theme: "light" }, worlds: [], recent: [] }) });
+  b.run(`state = {project: {name: "P", folder: "/p"}, steps: [], bundle: {world: "W"}, settings: {theme: "light", expert_mode: false}, worlds: [], recent: []}; page = "setup"; env.status = {checks: [], can_install: true, env_installed: true}; lc.status = null;`);
+  let html = b.run("renderSetup()");
+  assert.match(html, /<h2>Where the time went<\/h2>/); assert.match(html, /Show where the time went/); assert.doesNotMatch(html, /tm-table/);
+  await b.run("tmLoad()");
+  html = b.run("renderSetup()");
+  assert.match(html, /4 job logs, 2\.0 h in all/);
+  assert.match(html, /<tr><td>teacher_pass<\/td><td>1.4 h<\/td><td>2<\/td><td>68 %<\/td><\/tr>/);
+  assert.match(html, /<strong>Worth doing:<\/strong> Saving the healed model is bound by the disk\./);
+  assert.match(html, /data-tm-advice="fast_kernels"/); assert.doesNotMatch(html, /Worth doing:<\/strong> No slow-kernel/);
+  assert.match(html, /Look again/);
+});

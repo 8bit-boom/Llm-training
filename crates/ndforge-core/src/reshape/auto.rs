@@ -1109,6 +1109,7 @@ pub fn report_of(p: &Project, id: Option<&str>) -> Result<Value> {
         None => latest(p),
     }
     .ok_or_else(|| Error::new("There is no Auto-cut run yet."))?;
-    let r = auto_report::build(&st);
+    let mut r = auto_report::build(&st);
+    auto_report::add_timings(&mut r, &st);
     Ok(json!({"run": st.id, "report": r, "markdown": auto_report::markdown(&r)}))
 }

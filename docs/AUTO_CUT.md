@@ -165,3 +165,24 @@ Nothing here ran on a real model, card or Studio (the publish ran against a stan
 is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs, including `publish`, which reads the global settings) has only been compiled and read, not run against a worker; the page was only run in a stand-in browser, never in the window.
 
 The Auto-cut card says how long the rest takes and when it will be done: "about 3 h 20 min to 20 h left (done around 22:09–tomorrow 14:49)". Durations are rounded to 5 minutes below 10 hours and to 30 minutes from 10 hours up, so they do not claim false precision. An end of the range that falls on another calendar day names it ("tomorrow", or a short weekday name two or more days on), so the high end never reads as earlier than the low end. A finished run shows nothing.
+
+## Where the time went (`timing.rs`)
+
+Every worker job records how long its parts took (`protocol.timing`): loading a model (and in which mode), measuring, one Try pass, writing the model, the thinking check of a cut, the teacher's
+answers (tokens per second and the mean row length), training, the merge split into reading / arithmetic / total, the 16-bit conversion, the quantisation, the importance matrix and the thinking
+check's generation (tokens per second, the kernels that ran). They are ordinary log lines (`timing: {json}`) in the saved job logs and the `timings` key of a job's result.
+
+`timing.rs` reads those lines back (`parse_log`), adds them up per kind of job and stage with shares (`summarize`) and says what is worth changing (`advice`; each rule answers worth or not worth when its
+numbers are there):
+
+| Advice | Worth it when |
+| --- | --- |
+| a saved 4-bit copy of the original (teacher) | loading it as 4-bit took more than 10 % of the time of these jobs |
+| reusing the 16-bit GGUF and the merged folder between exports | the conversion took more than 10 % of the export time and the same model was exported at least twice |
+| the merge is bound by the processor or by the disk | always one of the two: arithmetic more than twice the rest = processor, else disk ("put the models on the fastest drive") |
+| install the fast kernels | a thinking check or a model load ran on the slow kernels |
+| long rows dominate the teacher's answers | the speed in the last fifth is below 0.6 of the median |
+
+It appears in the diagnostics bundle (`timings.json`), in the Auto-cut report (the jobs whose logs started while the run lasted; the section "Where the time went") and on the setup page ("Where the
+time went", a button that adds up the latest 30 logs). The numbers decide whether the two things the advice mentions are worth building (a saved 4-bit teacher, reusing the 16-bit GGUF): send the
+diagnostics bundle after the next real run.

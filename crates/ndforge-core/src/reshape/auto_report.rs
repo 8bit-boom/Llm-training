@@ -51,6 +51,20 @@ fn stage_json(s: &StageState) -> Value {
     })
 }
 
+/// Adds `timings` (where the time of the jobs went, from the job logs that started while this run lasted) to a report. A run whose logs are gone has none.
+pub fn add_timings(r: &mut Value, st: &AutoState) {
+    let files = crate::timing::logs_between(&crate::envmgr::joblog::dir(), &st.created, &st.updated);
+    if files.is_empty() {
+        return;
+    }
+    let summary = crate::timing::summarize(&files);
+    if summary["job_seconds"].as_f64().unwrap_or(0.0) <= 0.0 {
+        return;
+    }
+    let advice = crate::timing::advice(&summary);
+    r["timings"] = json!({"summary": summary, "advice": advice});
+}
+
 /// The report of a run as data.
 pub fn build(st: &AutoState) -> Value {
     let plan = st.plan.as_ref();
@@ -218,6 +232,17 @@ pub fn markdown(r: &Value) -> String {
             s.push_str(&format!("\nUnsloth Studio: not published ({}).\n", p["why"].as_str().unwrap_or("")));
         }
     }
+    if let Some(stages) = r["timings"]["summary"]["stages"].as_object().filter(|m| !m.is_empty()) {
+        s.push_str("\n## Where the time went\n\nFrom the timing lines of the job logs; the share is of the time of all the jobs of this run.\n\n| Stage | Seconds | Times | Share |\n|---|---|---|---|\n");
+        let mut rows: Vec<(&String, &Value)> = stages.iter().collect();
+        rows.sort_by(|a, b| b.1["seconds"].as_f64().partial_cmp(&a.1["seconds"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, v) in rows {
+            s.push_str(&format!("| {name} | {} | {} | {} |\n", num(&v["seconds"], 0), v["count"], pct(&v["share"])));
+        }
+        for a in r["timings"]["advice"].as_array().cloned().unwrap_or_default() {
+            s.push_str(&format!("\n- {}{}\n", if a["worth"] == true { "Worth doing: " } else { "" }, a["text"].as_str().unwrap_or("")));
+        }
+    }
     if let Some(n) = r["notes"].as_array().filter(|n| !n.is_empty()) {
         s.push_str("\n## Notes\n\n");
         for x in n.iter().filter_map(|x| x.as_str()) {
@@ -234,7 +259,8 @@ pub fn markdown(r: &Value) -> String {
 
 /// Writes `auto_report.json` and `auto_report.md` into the run's folder and returns the small pointer the state keeps (`{"json", "md"}`: file names, no times).
 pub fn write(dir: &Path, st: &AutoState) -> Result<Value> {
-    let r = build(st);
+    let mut r = build(st);
+    add_timings(&mut r, st);
     write_json(&dir.join(JSON_FILE), &r)?;
     let md = dir.join(MD_FILE);
     let tmp = md.with_extension("tmp");

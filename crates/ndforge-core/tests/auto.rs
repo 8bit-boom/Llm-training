@@ -989,3 +989,39 @@ fn the_report_has_the_table_before_healing_and_the_guardrail_warnings() {
     assert!(g.iter().any(|x| x.as_str().unwrap().contains("whole blocks are removed")), "{r2}");
     assert!(g.iter().any(|x| x.as_str().unwrap().contains("Before healing this cut finished its reasoning in")), "{g:?}");
 }
+
+#[test]
+fn the_report_says_where_the_time_went_from_the_job_logs_of_the_run() {
+    use ndforge_core::reshape::auto_report::{add_timings, markdown};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let mut st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let cfg = d.path().join("cfg");
+    let jobs = cfg.join("logs").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    let line = |t: f64, rec: Value| format!("[{t:>8.1}s out] {}\n", json!({"type": "log", "text": format!("timing: {rec}")}));
+    let log = |job: &str, recs: &[Value]| format!("# job: {}\n{}", json!({"job": job}), recs.iter().enumerate().map(|(i, r)| line(i as f64, r.clone())).collect::<String>());
+    // the logs are from 2020 and the run's times are set to match, so no other test's run can see them
+    std::fs::write(jobs.join("20200101-100000-reshape.log"), log("reshape", &[json!({"stage": "write", "seconds": 60.0}), json!({"stage": "job", "seconds": 100.0})])).unwrap();
+    std::fs::write(jobs.join("20200101-110000-export.log"), log("export", &[json!({"stage": "convert_f16", "seconds": 30.0}), json!({"stage": "job", "seconds": 100.0})])).unwrap();
+    std::fs::write(jobs.join("20190101-100000-export.log"), log("export", &[json!({"stage": "quantize", "seconds": 999.0})])).unwrap();       // before the run
+    st.created = "2020-01-01T09:00:00Z".into();
+    st.updated = "2020-01-01T12:00:00Z".into();
+    std::env::set_var("NDFORGE_CONFIG_DIR", &cfg);
+    let mut r = ndforge_core::reshape::auto_report::build(&st);
+    add_timings(&mut r, &st);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+    assert_eq!(r["timings"]["summary"]["logs"], 2);
+    assert_eq!(r["timings"]["summary"]["stages"]["write"]["seconds"], 60.0);
+    assert!(r["timings"]["summary"]["stages"].get("quantize").is_none(), "a log from before the run is not counted");
+    let md = markdown(&r);
+    assert!(md.contains("## Where the time went") && md.contains("| write | 60 | 1 | 0.30 |") || md.contains("| write | 60 | 1 |"), "{md}");
+    // no logs: no section
+    let mut none = ndforge_core::reshape::auto_report::build(&st);
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("empty"));
+    add_timings(&mut none, &st);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+    assert!(none.get("timings").is_none() || none["timings"].is_null());
+    assert!(!markdown(&none).contains("Where the time went"));
+}
