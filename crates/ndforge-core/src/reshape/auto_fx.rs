@@ -160,7 +160,11 @@ impl Effects for RealEffects<'_> {
             self.forward(e);
         }
         done(r, |v| match (v["name"].as_str(), v["model_id"].as_str(), v["healed_dir"].as_str()) {
-            (Some(name), Some(id), Some(dir)) => Ok(HealRef { name: name.into(), model_id: id.into(), dir: dir.into(), tokens_m: spec.tokens_m }),
+            (Some(name), Some(id), Some(dir)) => {
+                let keys = ["kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss", "tokens_seen", "steps"];
+                let summary: serde_json::Map<String, Value> = keys.iter().filter(|k| !v[**k].is_null()).map(|k| (k.to_string(), v[*k].clone())).collect();
+                Ok(HealRef { name: name.into(), model_id: id.into(), dir: dir.into(), tokens_m: spec.tokens_m, summary: Some(Value::Object(summary)) })
+            }
             _ => Err(Error::new("The heal did not give a model.")),
         })
     }

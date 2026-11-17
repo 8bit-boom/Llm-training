@@ -5,7 +5,7 @@
 //! (`auto_fx::RealEffects`) calls the existing jobs (`reshape_inspect`, `reshape_measure`, `reshape_try`, `reshape`, the heal jobs, `think_check`, export); the tests use a
 //! stand-in that only records, so the state machine is tested on every system without a worker.
 //!
-//! Steps: plan, measure, try, then per stage cut / check_cut / heal / check_heal, then export, check_gguf, studio_publish (and, in `auto_gates`, the report).
+//! Steps: plan, measure, try, then per stage cut / check_cut / heal / check_heal, then export, check_gguf, studio_publish (and, when the run ends, the report: `auto_report`).
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use super::auto_plan::{self, AutoPlan, AutoSpec, Candidate, StagePlan};
 use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
+use super::auto_report;
 use super::thinkcheck;
 use crate::error::{Error, Result};
 use crate::project::Project;
@@ -23,6 +24,8 @@ pub const FORMAT: u32 = 1;
 const CALIB_SAMPLES: u32 = 128;
 const WIDTH_SAMPLES: u32 = 256;
 const TRY_RECHECK_SAMPLES: u32 = 256;
+/// The tokens the second heal of a stage adds (the retry after a failed check).
+pub const RETRY_TOKENS_M: u32 = 40;
 
 // ------------------------------------------------------------------------------------------------------------------ what the steps do
 
@@ -68,6 +71,9 @@ pub struct HealRef {
     /// `models/<name>/healed`
     pub dir: String,
     pub tokens_m: u32,
+    /// the numbers the heal ended with (kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss) for the report
+    #[serde(default)]
+    pub summary: Option<Value>,
 }
 
 /// What a heal learns from.
@@ -135,16 +141,22 @@ pub struct StageState {
     /// {"verdict", "gates", "main"} of the thinking check of the cut / the healed model
     pub cut_check: Option<Value>,
     pub heal_check: Option<Value>,
-    /// 0: the first heal, 1: healed again on top of the first (`auto_gates`), 2: the cut was backed off
+    /// 0: the first heal, 1: healed again on top of the first, 2: the cut was backed off one step and the stage made again
     pub attempt: u32,
-    /// more tokens for the next heal (`auto_gates`: 40 million more for the second try)
+    /// more tokens for the next heal (40 million more for the second try)
     pub extra_tokens_m: u32,
     pub passed: bool,
+    /// one line per healed model that was checked: {attempt, kind: heal | heal_again | back_off, model, tokens_m, verdict, failed, main}
+    #[serde(default)]
+    pub attempts: Vec<Value>,
+    /// the healed model of the first try, healed again on top (attempt 1)
+    #[serde(default)]
+    pub retry_from: Option<HealRef>,
 }
 
 impl StageState {
     pub fn new(plan: StagePlan) -> Self {
-        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false }
+        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, attempts: Vec::new(), retry_from: None }
     }
 }
 
@@ -306,6 +318,8 @@ enum Flow {
     Stopped,
     /// the run ends here with this status (`gates_failed`)
     Halt(String),
+    /// the step stays open and the steps the retry needs were set to pending: the loop goes on with the first one that is not done
+    Retry(String),
 }
 
 fn mark(st: &mut AutoState, id: &str, status: &str, note: Option<String>) {
@@ -352,7 +366,7 @@ pub fn resume(p: &Project, fx: &mut dyn Effects, id: &str) -> Result<AutoState> 
         "stopped" | "failed" => {}
         "running" => return Err(Error::new("This Auto-cut run is running (or was cut off by closing the program: use Continue after the program has marked it stopped).")),
         "done" => return Ok(st),
-        "gates_failed" => return Err(Error::new("This run ended because the checks failed twice. Start a new one with another size.")),
+        "gates_failed" => return Err(Error::new("This run ended because the thinking checks failed after the retries (healing again, then a smaller cut). Start a new one with another size.")),
         other => return Err(Error::new(format!("This run cannot be continued ({other})."))),
     }
     st.status = "running".into();
@@ -395,7 +409,7 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
         let Some(id) = st.next_step() else {
             st.status = "done".into();
             st.step = "done".into();
-            save(dir, &mut st)?;
+            finish(dir, &mut st);
             fx.emit(event(&st, "done", "done", None));
             return Ok(st);
         };
@@ -421,11 +435,16 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
                 fx.emit(event(&st, &id, "stopped", None));
                 return Ok(st);
             }
+            Ok(Flow::Retry(note)) => {
+                fx.emit(event(&st, &id, "retry", Some(&note)));
+                mark(&mut st, &id, "pending", Some(note));
+                save(dir, &mut st)?;
+            }
             Ok(Flow::Halt(status)) => {
                 let why = st.error.clone();
                 mark(&mut st, &id, "failed", why);
                 st.status = status;
-                save(dir, &mut st)?;
+                finish(dir, &mut st);
                 fx.emit(event(&st, &id, "failed", st.error.clone().as_deref()));
                 return Ok(st);
             }
@@ -433,10 +452,26 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
                 st.error = Some(e.0.clone());
                 st.status = "failed".into();
                 mark(&mut st, &id, "failed", Some(e.0.clone()));
-                save(dir, &mut st)?;
+                finish(dir, &mut st);
                 fx.emit(event(&st, &id, "failed", Some(&e.0)));
                 return Err(e);
             }
+        }
+    }
+}
+
+/// The run has ended (done, gates_failed or failed): the report is written next to the state, then the state is saved. A report that cannot be written is not a failure of the run.
+fn finish(dir: &Path, st: &mut AutoState) {
+    st.report = auto_report::write(dir, st).ok();
+    let _ = save(dir, st);
+}
+
+/// Sets steps back to pending (a retry runs them again).
+fn reopen(st: &mut AutoState, ids: &[String]) {
+    for id in ids {
+        if let Some(s) = st.step_mut(id) {
+            s.status = "pending".into();
+            s.finished = None;
         }
     }
 }
@@ -675,14 +710,22 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
     if st.stages[idx].heal.is_some() {
         return Ok(Flow::Skipped("already healed".into()));
     }
-    let cut = st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?;
     let teacher = st.original.as_ref().map(|o| o.repo.clone()).ok_or_else(|| Error::new("The original model is missing."))?;
+    // the second try heals the healed model of the first one again; the teacher stays the original
+    let student = match st.stages[idx].retry_from.clone() {
+        Some(prev) => Student::Folder(prev.dir),
+        None => Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name),
+    };
     let mut spec = st.stages[idx].plan.heal_spec(st.keep_thinking());
     spec.tokens_m += st.stages[idx].extra_tokens_m;
-    let h = out!(fx.heal(&Student::Made(cut.name.clone()), &teacher, &spec)?);
+    let h = out!(fx.heal(&student, &teacher, &spec)?);
     made(st, "healed", &h.name, Some(h.model_id.clone()), idx as u32 + 1);
     st.stages[idx].heal = Some(h);
     Ok(Flow::Done(None))
+}
+
+fn failed_names(chk: &Value) -> Vec<String> {
+    chk["gates"]["failed"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
 fn step_check_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow> {
@@ -690,25 +733,118 @@ fn step_check_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Resu
     let r = out!(fx.think_check(&h.name, "healed", st.spec.quick, None)?);
     let chk = check_json(&r, st.baseline.as_ref());
     let verdict = chk["verdict"].as_str().unwrap_or("pass").to_string();
-    st.stages[idx].heal_check = Some(chk);
+    let attempt = st.stages[idx].attempt;
+    let kind = ["heal", "heal_again", "back_off"].get(attempt as usize).copied().unwrap_or("back_off");
+    st.stages[idx].attempts.push(json!({"attempt": attempt, "kind": kind, "model": h.name, "tokens_m": h.tokens_m, "verdict": verdict, "failed": failed_names(&chk), "main": chk["main"]}));
+    st.stages[idx].heal_check = Some(chk.clone());
     if verdict == "fail" {
-        let failed = st.stages[idx].heal_check.as_ref().map(|c| c["gates"]["failed"].clone()).unwrap_or(Value::Null);
-        st.error = Some(format!("The thinking check of the healed model of stage {} failed ({}).", idx + 1, failed.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()));
-        return Ok(Flow::Halt("gates_failed".into()));
+        return gate_failed(st, idx, &failed_names(&chk), fx);
     }
     st.stages[idx].passed = true;
     cleanup_after(st, idx, fx)?;
     Ok(Flow::Done(Some(verdict)))
 }
 
-/// Without `keep_intermediate`: once stage `idx` has passed its check, its unhealed cut goes, and the healed model of the stage before (the next stage's input has been made).
-/// Only what Auto-cut made is ever removed, and never the healed model of the last stage.
+/// The healed model of a stage missed a gate. Once: heal it again (the healed model is the student, the original still the teacher) with `RETRY_TOKENS_M` million more tokens.
+/// Twice: back the cut off one step (`auto_plan::back_off`) and make the stage again. A third time: the run ends with `gates_failed` and its report. Nothing is deleted on the way:
+/// what a failed try made is cleaned up when the stage has passed (and never with `keep_intermediate`).
+fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn Effects) -> Result<Flow> {
+    let n = idx + 1;
+    let names = failed.join(", ");
+    let ids = |what: &[&str]| -> Vec<String> { what.iter().map(|w| format!("s{n}.{w}")).collect() };
+    match st.stages[idx].attempt {
+        0 => {
+            let sg = &mut st.stages[idx];
+            sg.retry_from = sg.heal.take();
+            sg.extra_tokens_m = RETRY_TOKENS_M;
+            sg.attempt = 1;
+            let note = format!("Stage {n} missed its thinking check ({names}): it is healed again on the healed model with {RETRY_TOKENS_M} million more tokens.");
+            st.notes.push(note.clone());
+            reopen(st, &ids(&["heal", "check_heal"]));
+            return Ok(Flow::Retry(note));
+        }
+        1 => match back_off_stage(st, idx, fx.vram_gb()) {
+            Ok(note) => {
+                st.notes.push(note.clone());
+                let all: Vec<&str> = if st.keep_thinking() { vec!["cut", "check_cut", "heal", "check_heal"] } else { vec!["cut", "heal"] };
+                reopen(st, &ids(&all));
+                return Ok(Flow::Retry(note));
+            }
+            Err(why) => st.notes.push(why),
+        },
+        _ => {}
+    }
+    st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}) after {} tries; the run stops here. The report says what was tried.", st.stages[idx].attempts.len()));
+    Ok(Flow::Halt("gates_failed".into()))
+}
+
+/// Backs the cut of stage `idx` off by one step and makes a fresh stage of it (the stages after it are planned again from the new stop). Err(why) when nothing is left to give back,
+/// or the card cannot heal the larger model.
+fn back_off_stage(st: &mut AutoState, idx: usize, vram_gb: Option<f64>) -> std::result::Result<String, String> {
+    let ins = st.inspect.clone().ok_or_else(|| "The model's description is missing, so the cut cannot be backed off.".to_string())?;
+    let cur = st.stages[idx].plan.clone();
+    let prev = match idx.checked_sub(1) {
+        None => auto_plan::Step { blocks: 0, intermediate: auto_plan::full_width(&ins) },
+        Some(i) => auto_plan::Step { blocks: st.stages[i].plan.blocks_after, intermediate: st.stages[i].plan.intermediate_after },
+    };
+    // a stage that cuts blocks gives a block back; a stage that only thins the MLP gives MLP width back (the blocks of the stages before stay cut)
+    let (b, i) = if cur.blocks_cut > 0 {
+        auto_plan::back_off(&ins, cur.blocks_after, cur.intermediate_after)
+    } else {
+        auto_plan::back_off(&ins, 0, cur.intermediate_after).map(|(_, i)| (cur.blocks_after, i))
+    }.ok_or_else(|| format!("Stage {} cannot be backed off any further.", idx + 1))?;
+    let i = match (i, prev.intermediate) {
+        (Some(a), Some(p)) if a > p => Some(p),
+        _ => i,
+    };
+    let new = auto_plan::Step { blocks: b, intermediate: i };
+    if new == prev {
+        return Err(format!("Backing off stage {} would leave nothing to cut in it.", idx + 1));
+    }
+    let mut steps: Vec<auto_plan::Step> = st.stages.iter().map(|s| auto_plan::Step { blocks: s.plan.blocks_after, intermediate: s.plan.intermediate_after }).collect();
+    steps[idx] = new;
+    let plans = auto_plan::stage_plans(&ins, &st.spec, &steps, vram_gb);
+    if plans[idx].verdict == "over" {
+        return Err(format!("Backing off stage {} makes a model ({:.1} B) the card cannot heal (about {:.0} GB needed).", idx + 1, plans[idx].params_b, plans[idx].heal_gb));
+    }
+    let attempts = std::mem::take(&mut st.stages[idx].attempts);
+    for j in idx..st.stages.len() {
+        st.stages[j] = StageState::new(plans[j].clone());
+        if let Some(pl) = st.plan.as_mut() {
+            if let Some(slot) = pl.stages.get_mut(j) {
+                *slot = plans[j].clone();
+            }
+        }
+    }
+    st.stages[idx].attempts = attempts;
+    st.stages[idx].attempt = 2;
+    let last = idx + 1 == st.stages.len();
+    if last {
+        if let Some(c) = st.chosen.as_mut() {
+            c.blocks = b;
+            c.intermediate = i;
+            c.params = plans[idx].params;
+            c.params_b = plans[idx].params_b;
+            c.layers = plans[idx].layers_after;
+        }
+    }
+    let (from, to) = (cur.params_b, plans[idx].params_b);
+    Ok(format!("Stage {} missed its thinking check twice: the cut is backed off one step ({} blocks, MLP {}), so stage {} makes a {:.1} B model instead of {:.1} B.{}",
+               idx + 1, b, i.map(|x| x.to_string()).unwrap_or_else(|| "unchanged".into()), idx + 1, to, from, if last { " The final size is larger than asked." } else { "" }))
+}
+
+/// Without `keep_intermediate`: once stage `idx` has passed its check, what its tries made goes (the unhealed cut, a healed model that was healed again or whose stage was made
+/// again), and the healed model of the stage before (the next stage's input has been made). Only what Auto-cut made is ever removed, and never the healed model of the
+/// last stage nor the one that passed.
 fn cleanup_after(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<()> {
     if st.spec.keep_intermediate {
         return Ok(());
     }
     let stage = idx as u32 + 1;
-    let victims: Vec<usize> = st.made.iter().enumerate().filter(|(_, m)| !m.removed && ((m.kind == "cut" && m.stage == stage) || (m.kind == "healed" && m.stage + 1 == stage))).map(|(i, _)| i).collect();
+    let keep = st.stages[idx].heal.as_ref().map(|h| h.name.clone());
+    let victims: Vec<usize> = st.made.iter().enumerate().filter(|(_, m)| !m.removed && (
+        (m.kind == "cut" && m.stage == stage) || (m.kind == "healed" && m.stage == stage && Some(&m.name) != keep.as_ref()) || (m.kind == "healed" && m.stage + 1 == stage)
+    )).map(|(i, _)| i).collect();
     for i in victims {
         let m = st.made[i].clone();
         fx.remove(&m)?;
@@ -743,8 +879,15 @@ fn step_check_gguf(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let h = final_heal(st)?;
     let file = st.export.as_ref().and_then(gguf_of).ok_or_else(|| Error::new("The export made no GGUF file to check."))?;
     let r = out!(fx.think_check(&h.name, "gguf", st.spec.quick, Some(&file))?);
-    st.gguf_check = Some(check_json(&r, st.baseline.as_ref()));
-    Ok(Flow::Done(None))
+    let chk = check_json(&r, st.baseline.as_ref());
+    let verdict = chk["verdict"].as_str().unwrap_or("pass").to_string();
+    let failed = failed_names(&chk);
+    st.gguf_check = Some(chk);
+    if verdict == "fail" {
+        st.error = Some(format!("The thinking check of the GGUF file failed ({}) although the healed model passed: the export or the quantisation lost it. The files are kept, nothing was published.", failed.join(", ")));
+        return Ok(Flow::Halt("gates_failed".into()));
+    }
+    Ok(Flow::Done(Some(verdict)))
 }
 
 fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {

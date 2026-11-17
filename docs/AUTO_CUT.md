@@ -4,7 +4,7 @@ Auto-cut chains the steps of the Slim page that a person would do by hand: look 
 files into Unsloth Studio's share. It reuses the existing jobs (`reshape_inspect`, `reshape_measure`, `reshape_try`, `reshape`, the heal jobs, `think_check`, export, imatrix adapt); it
 adds a planner, a state machine that can be stopped and continued, gates after every stage, and a report. Nothing in it has run on a real model yet ("Not verified yet" at the end).
 
-This file is written in steps: the planner, the orchestrator (state machine, then gates, retry and report), the Studio publish and the page.
+This file is written in steps: the planner, the orchestrator (state machine, gates, retry and report), the Studio publish and the page.
 
 ## The planner (`crates/ndforge-core/src/reshape/auto_plan.rs`)
 
@@ -57,7 +57,7 @@ a time on one card, with the Stop button on the same flag). Worker events are fo
 | `sN.cut` | `reshape` of the stage (the input is the original, or the healed model of the stage before; a width is measured on THAT model, on the reasoning-aware text) |
 | `sN.check_cut` | thinking check of the cut (information only). The first one also checks the original, once, from the folder of the first cut (that is where its record of the original is) |
 | `sN.heal` | the Heal card's job with the thinking recipe and the stage's tokens; **the teacher is always the original model** (`heal_from_source` with the original as the teacher, also for stage 2) |
-| `sN.check_heal` | thinking check of the healed model against the original's numbers (the gates of docs/THINKING_CHECK.md). A failure ends the run with `gates_failed` for now |
+| `sN.check_heal` | thinking check of the healed model against the original's numbers (the gates of docs/THINKING_CHECK.md). A failure is retried, backed off, or ends the run ("Gates, retry and back-off" below) |
 | `export` | the GGUF sizes (Q4_K_M and the chosen ones) of the last healed model, its chat template keeping thinking (`thinking_default: "keep"`) |
 | `check_gguf` | thinking check of the Q4_K_M GGUF through llama-server (covers the template and the quantisation) |
 | `studio_publish` | only when asked (docs/UNSLOTH_API_CONTRACT.md, "Publish") |
@@ -72,6 +72,32 @@ original model, and nothing from a stage that did not pass. The test records eve
 before the first step (the worker finds the original through the cut's record: `think_check` target `original`); the export measures its importance matrix on the finished model instead of adapting a
 matrix of the original (`imatrix_adapt` needs a saved matrix of the original, which a run does not have; docs/IMATRIX.md); stage A heals with 40 million tokens (the plan said 20 in one place and 40 per
 stage in another).
+
+## Gates, retry and back-off (`reshape/auto.rs`, `gate_failed`)
+
+The healed model of every stage is checked against the original's numbers (the gates of docs/THINKING_CHECK.md). `warn` passes, `fail` (any gate missed) goes through three tries per stage:
+
+1. **Heal again**: the healed model is the student and the original is still the teacher; the stage's tokens plus **40 million** (`RETRY_TOKENS_M`). The new healed model is its own folder (`heal-...`).
+2. **Back off one step** (`auto_plan::back_off`): one block less in a stage that cuts blocks, else 1,024 more of the MLP width (never wider than the stage before). The stage is made again from the same input
+   (cut, check of the cut, heal, check), the stages after it are planned again from the new stop. When the last stage is backed off the final model is larger than asked; the report and a note say so.
+   Backing off is refused when nothing is left to give back or the card cannot heal the larger model.
+3. **Give up**: status `gates_failed`, `error` names the stage and the gates, the report is written. A run in that status is not continued (start a new one with another size).
+
+The GGUF check is a gate too: a Q4_K_M file that fails although the healed model passed ends the run with `gates_failed` before anything is published (the files stay).
+
+Every try is a line of `stage.attempts` (`heal`, `heal_again`, `back_off`: model, tokens, verdict, failed gates, numbers). The steps of a retry are set back to pending in the saved state, so a stop at any call and a
+continue gives the same run here as well (a test stops at every call of a run with both retries).
+
+**Clean-up and retries**: what a failed try made (its unhealed cut, a healed model that was healed again, the first stage's failed attempt) is deleted only when the stage has passed (never with *keep the
+intermediate files*, never for a run that gave up). Only what the run made is removed, never the original, never the healed model that passed. The back-off therefore needs room for the failed try next to the
+new one; the plan's peak does not include that.
+
+## The report (`reshape/auto_report.rs`)
+
+When a run ends (`done`, `gates_failed`, `failed`) `models/_auto/<run>/auto_report.json` and `auto_report.md` are written (the state keeps only their names in `report`). A report is a function of the saved state, so it can be
+made again at any time, also for a stopped run. It holds: the model, the size asked and reached, blocks removed, MLP width, the time (the steps' own seconds added up), the planned disk (not measured), per stage the size, cut,
+tokens, KL at the start and the end of the heal, the loss before and after and the teacher's loss, the tries and their verdicts; the thinking-check table (original, every cut, every healed model, the GGUF) with
+the gates that were missed; the exported files; where Studio has them; the notes (retries, back-offs, the halves of Try first that disagreed); every step with its status and seconds.
 
 ## Not verified yet
 

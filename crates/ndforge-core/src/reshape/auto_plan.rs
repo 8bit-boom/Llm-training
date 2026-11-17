@@ -139,7 +139,7 @@ fn block_list(ins: &Inspect, n: u32) -> Vec<u32> {
     (end.saturating_sub(n)..end).collect()
 }
 
-fn full_width(ins: &Inspect) -> Option<u32> {
+pub fn full_width(ins: &Inspect) -> Option<u32> {
     ins.width_dims.as_ref().map(|d| d.intermediate).filter(|i| *i > 0 && ins.width_supported)
 }
 
