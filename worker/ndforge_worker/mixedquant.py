@@ -46,7 +46,8 @@ PRESET_IDS = tuple(p["id"] for p in PRESETS)
 FIT_ID = "mixed_fit"
 FIT_LABEL = "Mixed: fit to a size (experimental)"
 FIT_BASE, FIT_EMBD, FIT_OUTPUT = "Q2_K", "Q4_K", "Q6_K"
-MIXED_IDS = PRESET_IDS + (FIT_ID,)
+MEASURED_ID = "mixed_measured"          # "Mixed: measured fit to a size" (quantfit.py)
+MIXED_IDS = PRESET_IDS + (FIT_ID, MEASURED_ID)
 # the plain sizes, as llama.cpp's own table gives them (tools/quantize/README.md, Llama-3.1-8B, bits per weight); other models differ a little
 PLAIN_BPW = {"Q2_K": 3.1593, "Q3_K_M": 3.9960, "Q4_K_M": 4.8944, "Q5_K_M": 5.7036, "Q6_K": 6.5633, "Q8_0": 8.5008}
 BASE_TYPE = {"Q2_K": "Q2_K", "Q3_K_M": "Q3_K", "Q4_K_M": "Q4_K"}      # the type a base ftype gives to a tensor no rule names (its own mixture adds some higher types)

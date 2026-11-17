@@ -24,11 +24,12 @@ pub const QUANTS: [(&str, &str); 5] = [
 
 /// The mixed-precision sizes ("Mixed precision (our own recipe)", docs/MIXED_QUANTS.md): the recipes are in ONE table in the worker (`worker/ndforge_worker/mixedquant.py`); the ids and
 /// the labels here must say the same (a worker test reads this file and checks). Made through llama.cpp only (per-tensor types); never called anything else.
-pub const MIXED_QUANTS: [(&str, &str); 4] = [
+pub const MIXED_QUANTS: [(&str, &str); 5] = [
     ("mixed_4", "Mixed 4-bit (balanced) · Mixed precision (our own recipe): about 5 bits per weight"),
     ("mixed_3", "Mixed 3-bit (small) · Mixed precision (our own recipe): about 4 bits per weight"),
     ("mixed_2", "Mixed 2-bit (smallest: short answers only) · Mixed precision (our own recipe): about 3 bits per weight"),
     ("mixed_fit", "Mixed: fit to a size (experimental) · Mixed precision (our own recipe): made to fit the size you give, from a saved matrix"),
+    ("mixed_measured", "Mixed: measured fit to a size · Mixed precision (our own recipe): each tensor's error measured on your weights, weighted by the importance matrix"),
 ];
 /// What the recipes are called wherever they are shown.
 pub const MIXED_RECIPE: &str = "Mixed precision (our own recipe)";
@@ -50,11 +51,89 @@ pub struct MixedFit {
     pub matrix: Option<String>,
 }
 
+/// "Mixed: measured fit to a size" (docs/MIXED_QUANTS.md, "Fit to a size (measured)"): the size asked for, the saved matrix (a library id) whose statistics weight the error (without one the
+/// export's own matrix), the lowest and highest type the plan may use (`Q2_K`..`Q8_0`; default Q3_K and Q8_0), how many rows of every tensor are looked at (0 = 128) and the engine
+/// (`auto`, `llama` or `reference`; default auto).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MixedMeasured {
+    pub target_gb: f64,
+    pub matrix: Option<String>,
+    pub floor: Option<String>,
+    pub ceiling: Option<String>,
+    pub sample_rows: u32,
+    pub engine: Option<String>,
+}
+
+/// The types of the ladder of the measured fit, lowest first.
+pub const MEASURED_LADDER: [&str; 6] = ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"];
+pub const MEASURED_ENGINES: [&str; 3] = ["auto", "llama", "reference"];
+
+impl MixedMeasured {
+    /// Plain-language refusal of an unusable setting, else Ok. The size must be a number above 0.
+    pub fn check(&self) -> Result<()> {
+        if !(self.target_gb.is_finite() && self.target_gb > 0.0) {
+            return Err(Error::new("Give the size in GB that \"Mixed: measured fit to a size\" should aim for (a number above 0)."));
+        }
+        let pos = |t: &Option<String>, default: usize| -> Result<usize> {
+            match t.as_deref().filter(|s| !s.is_empty()) {
+                None => Ok(default),
+                Some(x) => MEASURED_LADDER.iter().position(|l| *l == x).ok_or_else(|| Error::new(format!("{x} is not one of the types the measured fit can use ({}).", MEASURED_LADDER.join(", ")))),
+            }
+        };
+        if pos(&self.floor, 1)? > pos(&self.ceiling, 5)? {
+            return Err(Error::new("The lowest type is above the highest one. Choose a lowest type that is not above the highest."));
+        }
+        if let Some(e) = self.engine.as_deref().filter(|e| !e.is_empty()) {
+            if !MEASURED_ENGINES.contains(&e) {
+                return Err(Error::new(format!("Unknown way of measuring: {e} (use auto, llama or reference).")));
+            }
+        }
+        if self.sample_rows != 0 && !(8..=4096).contains(&self.sample_rows) {
+            return Err(Error::new("The number of rows looked at in every tensor must be between 8 and 4096 (the usual choice is 128)."));
+        }
+        Ok(())
+    }
+
+    /// The `mixed_measured` block of an export job. `matrix_file` is the saved matrix's file when one was chosen; `cache_dir` is where the measures are kept between runs.
+    pub fn job_block(&self, matrix_file: Option<String>, cache_dir: &std::path::Path) -> Value {
+        json!({"target_gb": self.target_gb, "matrix": matrix_file, "floor": self.floor.as_deref().filter(|s| !s.is_empty()).unwrap_or("Q3_K"),
+               "ceiling": self.ceiling.as_deref().filter(|s| !s.is_empty()).unwrap_or("Q8_0"), "sample_rows": if self.sample_rows == 0 { 128 } else { self.sample_rows },
+               "engine": self.engine.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), "cache_dir": cache_dir})
+    }
+}
+
 /// Options of the mixed-precision sizes. Old specs have none.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MixedOptions {
     pub fit: Option<MixedFit>,
+    pub measured: Option<MixedMeasured>,
+}
+
+/// Where the measures of "Mixed: measured fit to a size" are kept between runs (`<project>/quantfit/<key>/`).
+pub fn quantfit_cache_dir(p: &Project) -> PathBuf {
+    p.folder.join("quantfit")
+}
+
+/// The `mixed_fit` and `mixed_measured` blocks of an export job, when those sizes are in `list`; a plain refusal when their target is missing.
+fn add_mixed_blocks(p: &Project, list: &[String], mixed: &MixedOptions, job: &mut Value) -> Result<()> {
+    let file_of = |m: Option<&str>| -> Result<Option<String>> {
+        match m.filter(|m| !m.is_empty()) {
+            Some(id) => Ok(Some(super::imatrix_lib::for_export(p, id)?.1.to_string_lossy().to_string())),
+            None => Ok(None),
+        }
+    };
+    if list.iter().any(|q| q == "mixed_fit") {
+        let fit = mixed.fit.as_ref().filter(|f| f.target_gb.is_finite() && f.target_gb > 0.0).ok_or_else(|| Error::new("Give the size in GB that \"Mixed: fit to a size\" should aim for (a number above 0)."))?;
+        job["mixed_fit"] = json!({"target_gb": fit.target_gb, "matrix": file_of(fit.matrix.as_deref())?});
+    }
+    if list.iter().any(|q| q == "mixed_measured") {
+        let m = mixed.measured.as_ref().ok_or_else(|| Error::new("Give the size in GB that \"Mixed: measured fit to a size\" should aim for (a number above 0)."))?;
+        m.check()?;
+        job["mixed_measured"] = m.job_block(file_of(m.matrix.as_deref())?, &quantfit_cache_dir(p));
+    }
+    Ok(())
 }
 
 /// The optional importance matrix of a GGUF export (docs/IMATRIX.md): off by default. llama.cpp measures on calibration text which weights matter most and
@@ -123,7 +202,9 @@ pub fn export_need_gb(params_b: f64, has_adapter: bool, quants: &[String], keep_
     }
     let f16 = 2.0 * params_b;
     let sizes: f64 = quants.iter().filter(|q| q.as_str() != "f16").map(|q| params_b * bits_per_weight(q) / 8.0).sum();
-    (merged + f16).max(if keep_merged { merged } else { 0.0 } + f16 + sizes)
+    // the measured fit keeps a small sample file of the weights next to the 16-bit file while it measures
+    let sample = if quants.iter().any(|q| q == "mixed_measured") { 2.0 } else { 0.0 };
+    (merged + f16).max(if keep_merged { merged } else { 0.0 } + f16 + sizes) + sample
 }
 
 /// Refuses an export that would run the disk full, in plain words with both numbers. `free_gb` None (not known) never refuses.
@@ -421,13 +502,8 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
         job["base"]["vision_repo"] = json!(o);
     }
     let matrix = if want_gguf { imatrix_block(p, run, &cfg, imatrix, &out)? } else { None };
-    if want_gguf && list.iter().any(|q| q == "mixed_fit") {
-        let fit = mixed.fit.as_ref().filter(|f| f.target_gb.is_finite() && f.target_gb > 0.0).ok_or_else(|| Error::new("Give the size in GB that \"Mixed: fit to a size\" should aim for (a number above 0)."))?;
-        let file = match fit.matrix.as_deref().filter(|m| !m.is_empty()) {
-            Some(id) => Some(super::imatrix_lib::for_export(p, id)?.1),
-            None => None,
-        };
-        job["mixed_fit"] = json!({"target_gb": fit.target_gb, "matrix": file});
+    if want_gguf {
+        add_mixed_blocks(p, &list, mixed, &mut job)?;
     }
     if let Some(m) = &matrix {
         job["imatrix"] = m.clone();
@@ -541,6 +617,12 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
 /// model's own thinking (a model healed with the thinking recipe), else it answers without thinking unless asked (`thinking_default`). Returns the metas.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path, family: &str, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    execute_model_folder_full(p, name, model_dir, family, quants, num_ctx, thinking, imatrix, &MixedOptions::default(), kill, on_event)
+}
+
+/// `execute_model_folder` that also makes the mixed-precision sizes (the plain ones and `mixed_4` .. `mixed_measured`), with their options.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path::Path, family: &str, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, mixed: &MixedOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
     if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
         return Err(Error::new("That is not a name for an export."));
     }
@@ -549,7 +631,7 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     }
     let mut list: Vec<String> = Vec::new();
     for q in quants {
-        if !QUANTS.iter().any(|(id, _)| id == q) {
+        if !QUANTS.iter().chain(MIXED_QUANTS.iter()).any(|(id, _)| id == q) {
             return Err(Error::new(format!("Unknown file size: {q}")));
         }
         if !list.contains(q) {
@@ -576,6 +658,7 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     if let Some(o) = &origin {
         job["base"]["vision_repo"] = json!(o);
     }
+    add_mixed_blocks(p, &list, mixed, &mut job)?;
     let matrix = if imatrix.enabled {
         let (version, train) = match crate::train::runs::latest_version(p) {
             Some((v, _)) => (v, p.folder.join("datasets").join(format!("v{v}")).join("train.jsonl")),
@@ -622,6 +705,14 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
                               "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": null, "ollama_name": oname, "num_ctx": num_ctx,
                               "created": created, "world": p.display_name(), "installed": [], "via": result["via"], "auto_cut": true});
         meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, None);
+        if is_mixed(quant) {
+            let mut m = result["mixed"][quant.as_str()].clone();
+            if !m.is_object() {
+                m = json!({"id": quant, "label": MIXED_QUANTS.iter().find(|(id, _)| id == quant).map(|(id, n)| quant_label(id, n)), "recipe": MIXED_RECIPE});
+            }
+            m["note"] = json!(result["mixed_notes"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default());
+            meta["mixed"] = m;
+        }
         write_json(&dir.join("meta.json"), &meta)?;
         metas.push(meta);
     }

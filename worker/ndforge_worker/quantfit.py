@@ -653,3 +653,43 @@ def run(job: dict) -> int:
     protocol.reserve_stdout()
     protocol.result(run_job(job))
     return 0
+
+
+def for_export(f16, matrix_file, cfg: dict, quantize, im=None, out_dir=None, quant: str = ID) -> dict:
+    """What llama-quantize needs for the size `mixed_measured` of an export made from the 16-bit file `f16`, like mixedquant.for_export: {"id", "label", "recipe", "base", "embd", "output", "flags",
+    "rules": ["regex=TYPE"], "estimate", "notes", "fit", "matrix" (the file the plan was weighted by), "measured"}. `cfg` = {"target_gb", "floor", "ceiling", "sample_rows", "engine", "cache_dir",
+    "matrix"}; `matrix_file` is the export's own matrix, used when `cfg` names none. The rules go to `<out_dir>/<quant>.tensor-types.txt` when this llama-quantize has `--tensor-type-file`.
+    A target below the smallest size is NOT refused here (an export never stops after the merge): the smallest plan is made and `fit["fits"]` is False with a loud note.
+    Raises QuantFitError and the measurement's own errors (the caller falls back to the guessed fit); imatrix.Stopped on Stop."""
+    from . import ggufrows, imatrix, llamacpp
+    matrix = (cfg or {}).get("matrix") or matrix_file
+    notes: list = []
+    try:
+        r = measure_and_plan(f16, matrix, cfg or {}, quantize, im, notes)
+    except quantmeasure.Stopped:
+        raise imatrix.Stopped()
+    plan, rs, src = r["plan"], r["rules"], r["src"]
+    use_file = bool(quantize and llamacpp.quantize_supports(quantize, "--tensor-type-file"))
+    type_file = Path(out_dir or Path(f16).parent) / f"{quant}.tensor-types.txt" if use_file else None
+    if type_file is not None:
+        type_file.parent.mkdir(parents=True, exist_ok=True)
+        type_file.write_text(type_file_text(rs), encoding="utf-8")
+    fl = flags(plan, rs, type_file)
+    if type_file is None and len(" ".join(fl)) >= quantmeasure.COMMAND_LIMIT:
+        raise QuantFitError(f"The plan has {len(rs)} rules, too many for the command line of this system, and this llama-quantize has no --tensor-type-file: update llama.cpp (this plan needs --tensor-type-file).")
+    avg = plan.total * 8 / max(_params(src), 1)
+    est = mixedquant.estimate(src, rs, preset_p(plan, avg))
+    target = float((cfg or {}).get("target_gb") or 0) * 1e9
+    if not plan.fits:
+        notes.append(f"The size asked for ({target / 1e9:.2f} GB) is smaller than the smallest this model can be with {(cfg or {}).get('floor') or DEFAULT_FLOOR} as the lowest type ({plan.min_bytes / 1e9:.2f} GB). "
+                     "The smallest plan was made instead; lower the lowest type (Q2_K) or ask for a bigger size.")
+    notes += [n for n in plan.notes if n not in notes]
+    rep = r["report"]
+    simulated = {row["id"]: {"gb": row["gb"], "error": row["error"]} for row in rep["rows"] if row["id"].startswith("plain_")}
+    plan_row = next(row for row in rep["rows"] if row["id"] == "plan")
+    return {"id": ID, "label": LABEL, "recipe": mixedquant.LABEL, "base": base_ftype(avg), "embd": plan.pins["embd"], "output": plan.pins["output"], "summary": DESCRIPTION,
+            "rules": [f"{rx}={t}" for rx, t in rs], "flags": fl, "estimate": est, "notes": notes, "matrix": matrix,
+            "fit": {"fits": plan.fits, "target_bytes": int(target), "min_bytes": plan.min_bytes, "max_bytes": plan.max_bytes, "bytes": plan.total, "gb": round(plan.total / 1e9, 2),
+                    "bpw": round(avg, 3), "types": rep["types"]},
+            "measured": {"engine": r["engine"], "sample_rows": int((cfg or {}).get("sample_rows") or quantmeasure.DEFAULT_SAMPLE_ROWS), "predicted": {"error": plan_row["error"], "gb": plan_row["gb"]},
+                         "simulated": simulated, "fits": plan.fits, "measure_key": r["key"], "tensor_type_file": str(type_file) if type_file else None}}
