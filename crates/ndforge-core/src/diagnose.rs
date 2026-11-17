@@ -121,6 +121,7 @@ pub fn bundle(project: Option<&Project>, settings: &Settings, dest: &std::path::
             if let Some(t) = read(&f) { add("export.json", format!("// export folder: {name}\n{t}")); }
         }
     }
+    add("timings.json", serde_json::to_string_pretty(&crate::timing::report_of_latest(10)).unwrap_or_default());
     add("graphics_card.txt", match crate::envmgr::gpu::detect_gpus() { Ok(g) => format!("{g:#?}"), Err(e) => e });
     let mut w = zip::ZipWriter::new(std::fs::File::create(&file)?);
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);

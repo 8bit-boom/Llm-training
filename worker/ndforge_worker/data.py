@@ -23,9 +23,14 @@ def read_jsonl(path: str) -> list:
     return rows
 
 
-def _inner(tokenizer):
-    """Multimodal models hand back a processor; plain tokenization and the chat template live on its tokenizer."""
+def text_tokenizer(tokenizer):
+    """The text tokenizer inside what a loader handed back. A multimodal model (and Unsloth's wrapper) returns a processor whose `__call__` and
+    `apply_chat_template` look for images and fail on plain text; tokenization, the chat template and the pad / eos ids live on its `.tokenizer`.
+    A plain tokenizer is returned as it is. Everything that renders or tokenizes text goes through this."""
     return getattr(tokenizer, "tokenizer", tokenizer)
+
+
+_inner = text_tokenizer         # the old name, kept
 
 
 def render_chat(tokenizer, messages: list, fam_name: str):

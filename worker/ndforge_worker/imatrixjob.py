@@ -57,10 +57,7 @@ def plain(exc: BaseException) -> str:
 
 def free_bytes(path) -> int:
     """Free space on the disk that holds `path` (the nearest folder that exists)."""
-    p = Path(path)
-    while not p.exists() and p.parent != p:
-        p = p.parent
-    return shutil.disk_usage(p).free
+    return fsutil.free_bytes(path)
 
 
 def folder_bytes(folder, pattern="*.safetensors") -> int:
@@ -351,7 +348,8 @@ def make(job: dict) -> dict:
             parse_special = bool(re.search(r"<\|[^|\n]{1,40}\|>", own)) or bool(re.search(r"<(start|end)_of_turn>|\[INST\]", own))
             what = f"the text file {calib.name} (used as it is)"
         partial = out / "imatrix.partial.gguf"
-        rc, used_nextn, left_out = imatrix.make_matrix(tool, f16, calib, partial, im, chunks, ctx, want_nextn, nnote, int(job.get("ngl", 99)), parse_special, span=(0.2, 0.95))
+        with protocol.timed("imatrix", chunks=chunks, ctx=ctx):
+            rc, used_nextn, left_out = imatrix.make_matrix(tool, f16, calib, partial, im, chunks, ctx, want_nextn, nnote, int(job.get("ngl", 99)), parse_special, span=(0.2, 0.95))
         if left_out:
             notes.append(f"The MTP head was left out: {left_out}.")
         if rc != 0 or not partial.is_file():

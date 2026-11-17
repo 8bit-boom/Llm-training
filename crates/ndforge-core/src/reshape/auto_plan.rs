@@ -69,11 +69,17 @@ pub struct AutoSpec {
     /// put the GGUF files into Unsloth Studio's share when it is set up (docs/UNSLOTH_API_CONTRACT.md, "Publish")
     #[serde(default)]
     pub studio_publish: bool,
+    /// before healing, check the thinking of the best `think_gate_n` cuts (by loss) and choose among them by how they think (only with `keep_thinking`; default on)
+    #[serde(default = "yes")]
+    pub think_gate: bool,
+    /// how many of the cuts Try first liked best are checked (1 to `TRY_TOP`; default 2)
+    #[serde(default = "two")]
+    pub think_gate_n: u32,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
-        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false }
+        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2 }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -82,6 +88,9 @@ impl AutoSpec {
         }
         if !(1..=2).contains(&self.stages) {
             return Err(Error::new("Auto-cut works in one or two stages."));
+        }
+        if !(1..=TRY_TOP as u32).contains(&self.think_gate_n) {
+            return Err(Error::new(format!("The thinking check before healing looks at 1 to {TRY_TOP} cuts.")));
         }
         if let Some(q) = self.quants.iter().find(|q| !crate::export::runs::QUANTS.iter().any(|(id, _)| id == q)) {
             return Err(Error::new(format!("Unknown size for the export: {q}.")));
@@ -169,6 +178,40 @@ pub fn width_floor(ins: &Inspect) -> Option<u32> {
     let full = full_width(ins)?;
     let want = full as f64 * WIDTH_FIRST_KEEP;
     widths(ins).into_iter().find(|w| *w as f64 >= want)
+}
+
+/// The sentences for a cut that goes beyond what the program does by itself: the MLP kept below the floor (`full` is the original's width, `floor` the thinnest width
+/// the rule allows) and more than `MAX_BLOCKS_FREE` blocks removed. Empty when the cut stays inside.
+pub fn guardrail_messages(blocks: u32, intermediate: Option<u32>, full: Option<u32>, floor: Option<u32>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let (Some(i), Some(full), Some(floor)) = (intermediate, full, floor) {
+        if i < floor {
+            out.push(format!("The MLP is thinned to {i} of {full} ({:.1} % kept); Auto-cut does not go below {floor} ({:.1} % kept).", i as f64 / full as f64 * 100.0, floor as f64 / full as f64 * 100.0));
+        }
+    }
+    if blocks > MAX_BLOCKS_FREE {
+        out.push(format!("{blocks} whole blocks are removed; Auto-cut does not remove more than {MAX_BLOCKS_FREE} without asking."));
+    }
+    out
+}
+
+/// The ways a cut goes beyond what the program does by itself (the width-first rule keeps at least `WIDTH_FIRST_KEEP` of the MLP and removes at most `MAX_BLOCKS_FREE` blocks
+/// without asking), as plain sentences; empty when it stays inside. Used to warn about a cut made by hand and to explain a chosen one.
+pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) -> Vec<String> {
+    guardrail_messages(blocks, intermediate, full_width(ins), width_floor(ins))
+}
+
+/// About how many minutes the thinking check of one cut before healing takes: writing the cut (about 500 MB per second) plus the check (15 minutes for the full suite, 10 for the
+/// quick one, per 17 B of the model, at least once). An estimate: the real time depends on the computer.
+pub fn think_check_minutes(ins: &Inspect, blocks: u32, intermediate: Option<u32>, quick: bool) -> f64 {
+    let params = size_of(ins, blocks, intermediate) as f64;
+    let write = params * ins.bytes_per_param.max(1.0) / 500e6 / 60.0;
+    let check = (if quick { 10.0 } else { 15.0 }) * (params / 1e9 / 17.0).max(1.0);
+    ((write + check) * 10.0).round() / 10.0
+}
+
+pub fn think_gate_minutes(ins: &Inspect, cand: &Candidate, quick: bool) -> f64 {
+    think_check_minutes(ins, cand.blocks, cand.intermediate, quick)
 }
 
 /// The most blocks the model allows (never the first or last block, at most half).
@@ -451,6 +494,22 @@ pub fn disk_plan(ins: &Inspect, stages: &[StagePlan], quants: &[String], keep_in
     }
 }
 
+/// The thinking check before healing keeps one final cut on the disk while the next one is made (two at most; with more than one stage the best one is deleted at the end):
+/// a line after the original in the timeline, and a new peak when it is the largest.
+fn add_think_gate_disk(ins: &Inspect, disk: &mut DiskPlan, chosen: &Candidate, single_stage: bool) {
+    let bpp = if ins.bytes_per_param > 0.0 { ins.bytes_per_param } else { 2.0 };
+    let cut = chosen.params as f64 * bpp / 1e9;
+    let base = disk.steps.first().map(|s| s.in_use_gb).unwrap_or(0.0);
+    let in_use = gb(base + cut * if single_stage { 2.0 } else { 1.0 });
+    let label = if single_stage { "the thinking check: the best cut so far and the next one" } else { "the thinking check: one final cut at a time" };
+    disk.steps.insert(1, DiskStep { step: label.into(), in_use_gb: in_use });
+    if in_use > disk.peak_gb {
+        disk.peak_gb = in_use;
+        disk.peak_step = label.into();
+        disk.enough = disk.free_gb.map(|f| f >= in_use * 1.05);
+    }
+}
+
 /// What Auto-cut says before it starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoPlan {
@@ -470,6 +529,9 @@ pub struct AutoPlan {
     pub measure_load: String,
     /// the healing time of all stages (low, high) in hours; the other steps are not counted
     pub heal_hours: (f64, f64),
+    /// about how many minutes the thinking check before healing adds (None: it is off); an estimate
+    #[serde(default)]
+    pub think_gate_minutes: Option<f64>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -477,7 +539,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0),
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);
@@ -530,7 +592,14 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
         }
     }
     out.heal_hours = out.stages.iter().fold((0.0, 0.0), |a, s| (a.0 + s.hours.0, a.1 + s.hours.1));
-    let disk = disk_plan(ins, &out.stages, &spec.export_quants(), spec.keep_intermediate, free_gb);
+    let mut disk = disk_plan(ins, &out.stages, &spec.export_quants(), spec.keep_intermediate, free_gb);
+    if spec.keep_thinking && spec.think_gate && !out.try_list.is_empty() {
+        let n = (spec.think_gate_n as usize).min(out.try_list.len());
+        let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.quick)).sum();
+        let baseline = (if spec.quick { 10.0 } else { 15.0 }) * (ins.total_params as f64 / 1e9 / 17.0).max(1.0);
+        out.think_gate_minutes = Some(((per + baseline) * 10.0).round() / 10.0);
+        add_think_gate_disk(ins, &mut disk, &chosen, out.stages.len() == 1);
+    }
     if disk.enough == Some(false) {
         out.blockers.push(format!("The run needs up to {:.0} GB of disk ({}); {:.0} GB are free. Free some space{}.", disk.peak_gb, disk.peak_step, disk.free_gb.unwrap_or(0.0),
                                   if spec.keep_intermediate { " or switch \"keep the intermediate files\" off" } else { "" }));

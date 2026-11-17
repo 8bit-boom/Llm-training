@@ -224,3 +224,53 @@ fn a_check_runs_the_job_and_its_numbers_show_up_in_the_results() {
     let plan_ = plan(&ThinkSpec { target: "gguf".into(), quick: true, ..Default::default() }, &AtomicBool::new(false)).unwrap();
     assert_eq!((plan_["items"].clone(), plan_["backend"].clone()), (json!(16), json!("llama")));
 }
+
+#[test]
+fn a_cut_is_chosen_by_how_it_thinks_and_by_loss_only_when_the_thinking_ties() {
+    use ndforge_core::reshape::thinkcheck::{lost_much, rank_thinking, think_score, THINK_TIE};
+    let main = |closed: f64, lp: f64, garbage: f64| json!({"closed_rate": closed, "loop_rate": lp, "garbage_rate": garbage});
+    // the numbers of a real run: cut A (loss 1.267, closed 0.50, loops 0.50) against cut B (1.30, closed 0.44, loops 0.59)
+    let a = think_score(&main(0.50, 0.50, 0.0));
+    let b = think_score(&main(0.44, 0.59, 0.0));
+    assert_eq!((a, b), (Some(0.0), Some(0.44 - 0.59)));
+    assert_eq!(rank_thinking(&[(Some(1.267), a), (Some(1.30), b)]), Some(0));
+    // the lower loss does not win when the other thinks clearly better
+    assert_eq!(rank_thinking(&[(Some(1.20), think_score(&main(0.3, 0.6, 0.0))), (Some(1.40), think_score(&main(0.9, 0.05, 0.0)))]), Some(1));
+    // within the tie the lower loss decides, in either order
+    let close = [(Some(1.40), Some(0.50)), (Some(1.30), Some(0.50 - THINK_TIE + 0.01))];
+    assert_eq!(rank_thinking(&close), Some(1));
+    assert_eq!(rank_thinking(&[close[1], close[0]]), Some(0));
+    // just outside the tie the better thinker wins
+    assert_eq!(rank_thinking(&[(Some(1.40), Some(0.50)), (Some(1.30), Some(0.50 - THINK_TIE - 0.01))]), Some(0));
+    // no scores: the lowest loss; some scores: a row without one does not compete; nothing: None
+    assert_eq!(rank_thinking(&[(Some(1.4), None), (Some(1.3), None)]), Some(1));
+    assert_eq!(rank_thinking(&[(Some(1.0), None), (Some(1.5), Some(0.2))]), Some(1));
+    assert_eq!(rank_thinking(&[(None, None)]), None);
+    assert_eq!(rank_thinking(&[]), None);
+    assert_eq!(think_score(&json!({})), None);
+    assert_eq!(think_score(&json!({"closed_rate": 0.9})), Some(0.9));
+    // "lost much": finishes its reasoning in under 60 % of the original's rate
+    assert!(lost_much(&main(0.97, 0.0, 0.0), &main(0.50, 0.5, 0.0)));
+    assert!(!lost_much(&main(0.97, 0.0, 0.0), &main(0.60, 0.1, 0.0)));
+    assert!(!lost_much(&json!({}), &main(0.1, 0.0, 0.0)));
+}
+
+#[test]
+fn the_results_page_names_how_a_cut_goes_beyond_the_guardrails() {
+    use ndforge_core::reshape::thinkcheck::cut_guardrails;
+    let d = tempdir().unwrap();
+    let dir = d.path().join("m");
+    std::fs::create_dir_all(dir.join("model")).unwrap();
+    assert!(cut_guardrails(&dir).is_empty(), "no record, no guess");
+    let meta = |dropped: usize, after: u32| json!({"mode": "prune", "period": 4, "dropped": (0..dropped).collect::<Vec<_>>(), "width": {"intermediate_size": [17408, after]}});
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(12, 10240).to_string()).unwrap();      // cut A: three blocks, 58.8 % of the MLP
+    let g = cut_guardrails(&dir);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert!(g[0].contains("10240 of 17408") && g[0].contains("58.8 %"), "{g:?}");
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(20, 10240).to_string()).unwrap();
+    assert_eq!(cut_guardrails(&dir).len(), 2);
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), meta(8, 12288).to_string()).unwrap();
+    assert!(cut_guardrails(&dir).is_empty(), "inside the rules");
+    std::fs::write(dir.join("model").join("ndforge_reshape.json"), json!({"mode": "grow", "period": 4, "dropped": []}).to_string()).unwrap();
+    assert!(cut_guardrails(&dir).is_empty());
+}

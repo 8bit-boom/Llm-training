@@ -161,6 +161,12 @@ fn diagnostics_save(s: State<App>, dest: String) -> Out<String> {
     ndforge_core::diagnose::bundle(project.as_ref(), &settings, std::path::Path::new(&dest)).map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
+/// Where the time of the latest jobs went (the timing lines of the saved job logs, summed per kind of job and stage) and what is worth changing: `{"summary", "advice"}`.
+#[tauri::command(async)]
+fn timing_report() -> Value {
+    ndforge_core::timing::report_of_latest(30)
+}
+
 /// Looks a Hugging Face model up (a network call, so off the window's thread).
 #[tauri::command]
 async fn model_lookup(input: String) -> Out<Value> {
@@ -866,7 +872,7 @@ fn reshape_measurement(s: State<App>, model: String, samples: u32, len: u32, loa
 #[tauri::command]
 fn reshape_measure(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, model: String, samples: u32, len: u32, load: String, force: Option<bool>) -> Out<()> {
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_job(app, &tasks, JobOpts { phase: Some("measure"), kind: "measure", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+    spawn_job(app, &tasks, JobOpts { phase: Some("measure"), awake: awake_if_set(), kind: "measure", ..JobOpts::new("reshape-event") }, move |stop, emit| {
         ndforge_core::reshape::runs::measure(&p, &model, samples, len, &load, force.unwrap_or(false), stop, emit).map_err(|e| e.to_string())
     })
 }
@@ -893,7 +899,7 @@ fn reshape_try_results(s: State<App>, model: String, samples: u32, len: u32, loa
 fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
     let spec: ndforge_core::reshape::runs::TrySpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
     let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
-    spawn_job(app, &tasks, JobOpts { phase: Some("try"), tag_events: true, kind: "try", ..JobOpts::new("reshape-event") }, move |stop, emit| {
+    spawn_job(app, &tasks, JobOpts { phase: Some("try"), tag_events: true, awake: awake_if_set(), kind: "try", ..JobOpts::new("reshape-event") }, move |stop, emit| {
         ndforge_core::reshape::runs::try_run(&p, &spec, stop, emit).map_err(|e| e.to_string())
     })
 }
@@ -1369,6 +1375,11 @@ enum Awake {
     Noted,
 }
 
+/// `Quiet` when the setting "Keep this computer awake" is on, else `Off`.
+fn awake_if_set() -> Awake {
+    if ndforge_core::settings::Settings::load().keep_awake { Awake::Quiet } else { Awake::Off }
+}
+
 /// How a job is started: where its events go and what its end carries.
 #[derive(Clone, Copy)]
 struct JobOpts {
@@ -1407,7 +1418,7 @@ fn spawn_job(app: tauri::AppHandle, tasks: &Tasks, opts: JobOpts, body: impl FnO
             }
             let _ = emitter.emit(channel, v);
         };
-        let awake = if opts.awake == Awake::Off { ndforge_core::power::KeepAwake::off() } else { ndforge_core::power::KeepAwake::start() };
+        let awake = if opts.awake == Awake::Off { ndforge_core::power::KeepAwake::off() } else { ndforge_core::power::KeepAwake::start_with(ndforge_core::settings::Settings::load().keep_display_on) };
         if opts.awake == Awake::Noted && !awake.note.is_empty() {
             emit(serde_json::json!({"kind": "log", "text": awake.note}));
         }
@@ -1439,7 +1450,9 @@ fn spawn_task(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, job: 
 
 /// `spawn_task` for a job the person wants to hear about (and the queue can hold): `kind` names it.
 fn spawn_task_as(app: tauri::AppHandle, tasks: &Tasks, channel: &'static str, kind: &'static str, job: impl FnOnce(&AtomicBool, &mut dyn FnMut(Value)) -> Result<Value, String> + Send + 'static) -> Out<()> {
-    spawn_job(app, tasks, JobOpts { kind, ..JobOpts::new(channel) }, move |cancel, emit| job(&cancel, emit))
+    // an export, a matrix or a quant check runs for a long time: the computer is kept awake like for the other long jobs (setting "Keep this computer awake")
+    let awake = if kind == "task" { Awake::Off } else { awake_if_set() };
+    spawn_job(app, tasks, JobOpts { kind, awake, ..JobOpts::new(channel) }, move |cancel, emit| job(&cancel, emit))
 }
 
 #[tauri::command]
@@ -1448,6 +1461,12 @@ fn env_install(app: tauri::AppHandle, tasks: State<Tasks>, unsloth: Option<bool>
     spawn_task(app, &tasks, "env-event", move |cancel, emit| {
         ndforge_core::envmgr::tasks::install(unsloth, cancel, emit).map(|_| Value::Null).map_err(|e| e.to_string())
     })
+}
+
+/// Only the fast kernels (flash-linear-attention, causal-conv1d, and on Windows triton-windows): the button on the setup page when the kernels light is yellow.
+#[tauri::command]
+fn env_install_kernels(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
+    spawn_task(app, &tasks, "env-event", |cancel, emit| ndforge_core::envmgr::tasks::install_kernels(cancel, emit).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -1559,7 +1578,7 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -150,6 +150,9 @@ pub struct StageState {
     /// more tokens for the next heal (40 million more for the second try)
     pub extra_tokens_m: u32,
     pub passed: bool,
+    /// the loss of this stage's cut as Try first measured it (the cut itself is not measured again): kept for the report
+    #[serde(default)]
+    pub cut_loss: Option<f64>,
     /// one line per healed model that was checked: {attempt, kind: heal | heal_again | back_off, model, tokens_m, verdict, failed, main}
     #[serde(default)]
     pub attempts: Vec<Value>,
@@ -160,7 +163,7 @@ pub struct StageState {
 
 impl StageState {
     pub fn new(plan: StagePlan) -> Self {
-        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, attempts: Vec::new(), retry_from: None }
+        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, cut_loss: None, attempts: Vec::new(), retry_from: None }
     }
 }
 
@@ -198,6 +201,9 @@ pub struct AutoState {
     pub report: Option<Value>,
     /// notes for the report: what was backed off, retried, skipped
     pub notes: Vec<String>,
+    /// the thinking check before healing (docs/AUTO_CUT.md): `{"order", "rows", "pending", "winner", "lost_much"}`; None for a run without it (and for one saved before it existed)
+    #[serde(default)]
+    pub think_gate: Option<Value>,
 }
 
 impl AutoState {
@@ -205,7 +211,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(),
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None,
         }
     }
 
@@ -293,6 +299,9 @@ fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec
     let mut v = vec![StepRec::new("measure", "Measure the model")];
     if with_try {
         v.push(StepRec::new("try", "Try the cuts"));
+        if spec.keep_thinking && spec.think_gate {
+            v.push(StepRec::new("think_gate", "Check the thinking of the best cuts before healing"));
+        }
     }
     for n in 1..=stages {
         v.extend(stage_steps(n, stages, spec.keep_thinking));
@@ -309,7 +318,7 @@ fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec
 
 /// Replaces the stage steps (after Try first changed the number of stages); everything before them is kept as it is.
 fn rebuild_stage_steps(st: &mut AutoState) {
-    let keep: Vec<StepRec> = st.steps.iter().filter(|s| s.id == "plan" || s.id == "measure" || s.id == "try").cloned().collect();
+    let keep: Vec<StepRec> = st.steps.iter().filter(|s| s.id == "plan" || s.id == "measure" || s.id == "try" || s.id == "think_gate").cloned().collect();
     let mut steps = keep;
     let after = steps_after_plan(&st.spec, st.stages.len() as u32, false);
     steps.extend(after.into_iter().filter(|s| s.id != "measure"));
@@ -500,6 +509,7 @@ fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> 
         "plan" => step_plan(st, fx),
         "measure" => step_measure(st, fx),
         "try" => step_try(st, fx),
+        "think_gate" => step_think_gate(st, fx),
         "export" => step_export(st, fx),
         "check_gguf" => step_check_gguf(st, fx),
         "studio_publish" => step_publish(st, fx),
@@ -644,18 +654,28 @@ fn step_try(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     };
     let chosen = cands[w].clone();
     st.drop_blocks = (chosen.blocks > 0 && !rows[w].blocks.is_empty()).then(|| rows[w].blocks.clone());
-    if st.chosen.as_ref() != Some(&chosen) {
-        let steps = auto_plan::split_stages(&ins, &chosen, st.spec.stages);
-        let stages = auto_plan::stage_plans(&ins, &st.spec, &steps, fx.vram_gb());
-        st.stages = stages.iter().cloned().map(StageState::new).collect();
-        if let Some(pl) = st.plan.as_mut() {
-            pl.chosen = Some(chosen.clone());
-            pl.stages = stages;
-        }
-        st.chosen = Some(chosen.clone());
-        rebuild_stage_steps(st);
+    choose(st, &ins, &chosen, fx.vram_gb());
+    let lower = st.measure.as_ref().and_then(|m| m["loss"].as_f64()).zip(losses[w]);
+    if let Some((orig, cut)) = lower.filter(|(o, c)| *c < *o * 0.98) {
+        st.notes.push(format!("The best cut's text-prediction error ({cut:.3}) is lower than the original's ({orig:.3}): check that both were measured the same way. A lower error does not mean the model can still think."));
     }
     Ok(Flow::Done(Some(format!("{} blocks, MLP {}: loss {:.3}", chosen.blocks, chosen.intermediate.map(|i| i.to_string()).unwrap_or_else(|| "unchanged".into()), losses[w].unwrap_or(0.0)))))
+}
+
+/// Makes `chosen` the cut of the run: when it is not the planner's own choice, the stages are planned again for it and the stage steps rebuilt.
+fn choose(st: &mut AutoState, ins: &Inspect, chosen: &Candidate, vram_gb: Option<f64>) {
+    if st.chosen.as_ref() == Some(chosen) {
+        return;
+    }
+    let steps = auto_plan::split_stages(ins, chosen, st.spec.stages);
+    let stages = auto_plan::stage_plans(ins, &st.spec, &steps, vram_gb);
+    st.stages = stages.iter().cloned().map(StageState::new).collect();
+    if let Some(pl) = st.plan.as_mut() {
+        pl.chosen = Some(chosen.clone());
+        pl.stages = stages;
+    }
+    st.chosen = Some(chosen.clone());
+    rebuild_stage_steps(st);
 }
 
 /// The layers of whole blocks (every block is `period` layers).
@@ -667,6 +687,141 @@ fn made(st: &mut AutoState, kind: &str, name: &str, model_id: Option<String>, st
     if !st.made.iter().any(|m| m.kind == kind && m.name == name) {
         st.made.push(Made { kind: kind.into(), name: name.into(), model_id, stage, removed: false });
     }
+}
+
+/// The thinking check before healing. The cuts Try first liked best (the `think_gate_n` lowest losses) are made one after the other as the FINAL cut, each checked for thinking
+/// (the original once, from the first cut's folder) and deleted unless it is the best so far; the cut with the best thinking is chosen (`thinkcheck::rank_thinking`: the
+/// thinking decides, the loss breaks a tie). When it is not the cut Try first chose, the stages are planned again for it. With one stage the winner's cut and its check are the
+/// stage's own (the steps `s1.cut` and `s1.check_cut` are skipped); with two the winner's cut is deleted too. The gate NEVER halts a run: a cut that lost much of its thinking only
+/// adds a warning (the healed model's check decides). Every call is looked at the state first, so Stop and Continue repeat nothing.
+fn step_think_gate(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    let ins = st.inspect.clone().ok_or_else(|| Error::new("The model's description is missing."))?;
+    let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
+    let cands = plan.try_list.clone();
+    let Some(tr) = st.try_result.clone() else { return Ok(Flow::Skipped("Try first gave no answer".into())) };
+    let try_rows = tr["rows"].as_array().cloned().unwrap_or_default();
+    let period = ins.period.max(1);
+    let mut gate = st.think_gate.clone().unwrap_or_else(|| json!({"rows": [], "pending": null}));
+    if gate.get("order").is_none() {
+        let mut order: Vec<usize> = (0..cands.len().min(try_rows.len())).filter(|i| try_rows[*i]["loss"].as_f64().is_some()
+            && (cands[*i].blocks == 0 || blocks_of(&try_rows[*i]["cut_blocks"]).len() as u32 == cands[*i].blocks)).collect();
+        order.sort_by(|a, b| try_rows[*a]["loss"].as_f64().partial_cmp(&try_rows[*b]["loss"].as_f64()).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+        order.truncate(st.spec.think_gate_n as usize);
+        if order.is_empty() {
+            return Ok(Flow::Skipped("Try first measured no cut that can be checked".into()));
+        }
+        gate["order"] = json!(order);
+    }
+    let order: Vec<usize> = gate["order"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect()).unwrap_or_default();
+    let rank = |gate: &Value| -> Option<usize> {
+        let rows = gate["rows"].as_array().cloned().unwrap_or_default();
+        let pairs: Vec<(Option<f64>, Option<f64>)> = rows.iter().map(|r| (r["loss"].as_f64(), r["score"].as_f64())).collect();
+        thinkcheck::rank_thinking(&pairs)
+    };
+    for &i in &order {
+        if gate["rows"].as_array().is_some_and(|a| a.iter().any(|r| r["row"] == json!(i))) {
+            continue;
+        }
+        let cand = cands[i].clone();
+        // 1. the final cut (the gate's own cut is never measured again: Try first measured it)
+        let cut: CutRef = match serde_json::from_value::<CutRef>(gate["pending"]["cut"].clone()).ok().filter(|_| gate["pending"]["row"] == json!(i)) {
+            Some(c) => c,
+            None => {
+                let steps = auto_plan::split_stages(&ins, &cand, 1);
+                let stage = auto_plan::stage_plans(&ins, &st.spec, &steps, fx.vram_gb()).into_iter().next().ok_or_else(|| Error::new("The cut to check could not be planned."))?;
+                let input = st.original.as_ref().map(|o| o.id.clone()).ok_or_else(|| Error::new("The model of this run is missing."))?;
+                let mut spec = stage.reshape_spec(&input, st.reasoning(), CALIB_SAMPLES, WIDTH_SAMPLES);
+                spec.load = st.plan.as_ref().map(|p| p.measure_load.clone()).unwrap_or_else(|| "auto".into());
+                if cand.blocks > 0 {
+                    spec.drop_layers = Some(layers_of(&blocks_of(&try_rows[i]["cut_blocks"]), period));
+                }
+                spec.skip_check = true;
+                st.think_gate = Some(gate.clone());
+                let r = out!(fx.cut(&spec)?);
+                made(st, "cut", &r.name, Some(r.model_id.clone()), 0);
+                gate["pending"] = json!({"row": i, "cut": r});
+                st.think_gate = Some(gate.clone());
+                r
+            }
+        };
+        // 2. the original once, then this cut
+        st.think_gate = Some(gate.clone());
+        if st.baseline.is_none() {
+            let r = out!(fx.think_check(&cut.name, "original", st.spec.quick, None)?);
+            st.baseline = Some(r);
+        }
+        let r = out!(fx.think_check(&cut.name, "cut", st.spec.quick, None)?);
+        let chk = check_json(&r, st.baseline.as_ref());
+        let row = json!({"row": i, "blocks": cand.blocks, "intermediate": cand.intermediate, "params_b": cand.params_b, "loss": try_rows[i]["loss"], "cut": cut.name, "model_id": cut.model_id,
+                         "cut_blocks": try_rows[i]["cut_blocks"], "score": thinkcheck::think_score(&chk["main"]), "check": chk, "removed": false});
+        gate["rows"].as_array_mut().map(|a| a.push(row));
+        gate["pending"] = Value::Null;
+        st.think_gate = Some(gate.clone());
+        // 3. only the best so far stays on the disk
+        if !st.spec.keep_intermediate {
+            let best = rank(&gate);
+            let rows = gate["rows"].as_array().cloned().unwrap_or_default();
+            for (k, r) in rows.iter().enumerate() {
+                if Some(k) != best && r["removed"] != json!(true) {
+                    remove_made(st, r["cut"].as_str().unwrap_or(""), fx)?;
+                    gate["rows"][k]["removed"] = json!(true);
+                    st.think_gate = Some(gate.clone());
+                }
+            }
+        }
+    }
+    // 4. the choice
+    let rows = gate["rows"].as_array().cloned().unwrap_or_default();
+    let w = rank(&gate).ok_or_else(|| Error::new("The thinking check gave no answer."))?;
+    let (win, ci) = (rows[w].clone(), rows[w]["row"].as_u64().unwrap_or(0) as usize);
+    let chosen = cands[ci].clone();
+    let try_winner = tr["winner"].as_u64().map(|n| n as usize);
+    let fmt = |r: &Value| format!("closed {:.0} %, loops {:.0} %", r["check"]["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0, r["check"]["main"]["loop_rate"].as_f64().unwrap_or(0.0) * 100.0);
+    let name_of = |c: &Candidate| format!("{} blocks, MLP {}", c.blocks, c.intermediate.map(|x| x.to_string()).unwrap_or_else(|| "unchanged".into()));
+    gate["winner"] = json!(ci);
+    if try_winner.is_some_and(|tw| tw != ci) {
+        let tw = try_winner.unwrap_or(0);
+        let tw_row = rows.iter().find(|r| r["row"] == json!(tw));
+        st.notes.push(format!("Try first's lowest loss was {} ({}), but it kept less of its thinking ({}); {} was chosen ({}).",
+                              try_rows[tw]["loss"].as_f64().map(|l| format!("{l:.3}")).unwrap_or_else(|| "?".into()), name_of(&cands[tw]), tw_row.map(&fmt).unwrap_or_else(|| "not checked".into()), name_of(&chosen), fmt(&win)));
+    }
+    if let Some(base) = st.baseline.as_ref().filter(|b| thinkcheck::lost_much(&b["main"], &win["check"]["main"])) {
+        gate["lost_much"] = json!(true);
+        st.notes.push(format!("Even the best cut has lost much of its ability to finish its reasoning before healing (closed {:.0} % against {:.0} %). Healing may bring some back; the healed model's check decides.",
+                              win["check"]["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0, base["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0));
+    }
+    st.drop_blocks = (chosen.blocks > 0).then(|| blocks_of(&win["cut_blocks"])).filter(|b| !b.is_empty());
+    choose(st, &ins, &chosen, fx.vram_gb());
+    let kept = win["removed"] != json!(true);
+    if st.stages.len() == 1 && kept {
+        // the stage's own cut and check: its steps are skipped
+        let cut = CutRef { name: win["cut"].as_str().unwrap_or("").into(), model_id: win["model_id"].as_str().unwrap_or("").into() };
+        if let Some(m) = st.made.iter_mut().find(|m| m.kind == "cut" && m.name == cut.name) {
+            m.stage = 1;
+        }
+        st.stages[0].cut = Some(cut);
+        st.stages[0].cut_check = Some(win["check"].clone());
+        st.stages[0].cut_loss = win["loss"].as_f64();
+        for id in ["s1.cut", "s1.check_cut"] {
+            mark(st, id, "skipped", Some("made and checked in the thinking gate".into()));
+        }
+    } else if kept && !st.spec.keep_intermediate {
+        // two stages: the final cut was only checked; stage 1 makes its own (half) cut
+        remove_made(st, win["cut"].as_str().unwrap_or(""), fx)?;
+        gate["rows"][w]["removed"] = json!(true);
+    }
+    st.think_gate = Some(gate);
+    Ok(Flow::Done(Some(format!("{}: {}", name_of(&chosen), fmt(&win)))))
+}
+
+/// Deletes a model Auto-cut made (by its folder name) and marks it removed in the state.
+fn remove_made(st: &mut AutoState, name: &str, fx: &mut dyn Effects) -> Result<()> {
+    if let Some(i) = st.made.iter().position(|m| m.name == name && !m.removed) {
+        let m = st.made[i].clone();
+        fx.remove(&m)?;
+        st.made[i].removed = true;
+    }
+    Ok(())
 }
 
 fn step_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow> {
@@ -684,10 +839,32 @@ fn step_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow
             spec.drop_layers = Some(layers_of(b, period));
         }
     }
+    // a stage 1 that makes exactly the cut Try first measured does not measure it again (that would load the new model, and for blocks only the original too)
+    if idx == 0 {
+        if let Some(loss) = tried_loss(st, &plan) {
+            spec.skip_check = true;
+            st.stages[idx].cut_loss = Some(loss);
+        }
+    }
     let r = out!(fx.cut(&spec)?);
     made(st, "cut", &r.name, Some(r.model_id.clone()), idx as u32 + 1);
     st.stages[idx].cut = Some(r);
     Ok(Flow::Done(None))
+}
+
+/// The loss Try first measured for the cut this stage makes: only when the stage's cut IS the candidate that won (the same blocks and MLP width) and the run's cut
+/// uses the layers Try first found (a plain width cut, or blocks with their saved choice).
+fn tried_loss(st: &AutoState, plan: &StagePlan) -> Option<f64> {
+    let chosen = st.chosen.as_ref()?;
+    if plan.blocks_cut != chosen.blocks || plan.width != chosen.intermediate.filter(|i| Some(*i) != st.inspect.as_ref().and_then(|ins| auto_plan::full_width(ins))) {
+        return None;
+    }
+    if chosen.blocks > 0 && st.drop_blocks.as_ref().is_none_or(|b| b.len() as u32 != chosen.blocks) {
+        return None;
+    }
+    let tr = st.try_result.as_ref()?;
+    let w = tr["winner"].as_u64()? as usize;
+    tr["rows"].get(w)?["loss"].as_f64()
 }
 
 /// The numbers of a check without the long parts.
@@ -932,6 +1109,7 @@ pub fn report_of(p: &Project, id: Option<&str>) -> Result<Value> {
         None => latest(p),
     }
     .ok_or_else(|| Error::new("There is no Auto-cut run yet."))?;
-    let r = auto_report::build(&st);
+    let mut r = auto_report::build(&st);
+    auto_report::add_timings(&mut r, &st);
     Ok(json!({"run": st.id, "report": r, "markdown": auto_report::markdown(&r)}))
 }

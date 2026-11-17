@@ -160,6 +160,14 @@ def _header_bytes(shard: list[OutTensor]) -> bytes:
     return raw + b" " * (-len(raw) % 8)
 
 
+def _as_bytes_view(blob) -> memoryview:
+    """A flat byte view of whatever a producer returned (bytes, bytearray, memoryview, numpy array), without copying it when it is contiguous."""
+    view = blob if isinstance(blob, memoryview) else memoryview(blob)
+    if view.ndim != 1 or view.itemsize != 1:
+        view = view.cast("B")
+    return view
+
+
 def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30, chunk: int = 64 * 2**20,
                  on_progress=None, should_stop=None) -> dict:
     """Writes model-00001-of-0000N.safetensors (+ model.safetensors.index.json when N > 1, always with metadata.total_size)
@@ -174,7 +182,7 @@ def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30
     for t in tensors:
         if t.slice is not None and t.source is None:
             raise ValueError(f"tensor {t.name!r}: a slice needs a source")
-        if t.data is not None and (t.source is not None or (not callable(t.data) and len(t.data) != t.nbytes)):
+        if t.data is not None and (t.source is not None or (not callable(t.data) and _as_bytes_view(t.data).nbytes != t.nbytes)):
             raise ValueError(f"tensor {t.name!r}: data must have exactly {t.nbytes} bytes and no source")
         if t.source is not None and t.slice is None and t.source.nbytes != t.nbytes:
             raise ValueError(f"tensor {t.name!r}: source has {t.source.nbytes} bytes, expected {t.nbytes}")
@@ -200,17 +208,18 @@ def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30
                             blob = slice_io.sliced_bytes(t.source, t.slice[0], t.slice[1])
                         else:
                             blob = t.data() if callable(t.data) else t.data
-                        if len(blob) != t.nbytes:
-                            raise ValueError(f"tensor {t.name!r}: produced {len(blob)} bytes, expected {t.nbytes}")
-                        for pos in range(0, len(blob), chunk):
+                        view = _as_bytes_view(blob)                 # bytes, bytearray, a memoryview or a numpy array: the pieces are slices of one view, never copies
+                        if view.nbytes != t.nbytes:
+                            raise ValueError(f"tensor {t.name!r}: produced {view.nbytes} bytes, expected {t.nbytes}")
+                        for pos in range(0, view.nbytes, chunk):
                             if should_stop and should_stop():
                                 raise Cancelled()
-                            piece = blob[pos:pos + chunk]
+                            piece = view[pos:pos + chunk]
                             dst.write(piece)
                             done += len(piece)
                             if on_progress:
                                 on_progress(done, total)
-                        del blob
+                        del view, blob
                     elif t.source is None:
                         while left > 0:
                             if should_stop and should_stop():

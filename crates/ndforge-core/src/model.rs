@@ -67,7 +67,7 @@ impl AppModel {
             "steps": steps,
             "bundle": bundle,
             "recent": recent,
-            "settings": {"keep_awake": self.settings.keep_awake, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth,
+            "settings": {"keep_awake": self.settings.keep_awake, "keep_display_on": self.settings.keep_display_on, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth,
                          "auto_continue_interrupted": self.settings.auto_continue_interrupted, "notifications": self.settings.notifications, "webhook_url": self.settings.webhook_url},
             "projects_dir": default_projects_dir(),
         })
@@ -140,6 +140,7 @@ impl AppModel {
             "show_help_panel" => self.settings.show_help_panel = value,
             "welcome_seen" => self.settings.welcome_seen = value,
             "keep_awake" => self.settings.keep_awake = value,
+            "keep_display_on" => self.settings.keep_display_on = value,
             "auto_continue_interrupted" => self.settings.auto_continue_interrupted = value,
             "notifications" => self.settings.notifications = value,
             other => return Err(Error::new(format!("Unknown setting: {other}"))),
@@ -481,7 +482,7 @@ impl AppModel {
         let default_blocks = options.last().map(|o| o.blocks.min((ins.blocks / 4).max(1))).unwrap_or(0);
         let base_spec = |blocks: u32, width: Option<plan::Width>| plan::ReshapeSpec {
             source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512,
-            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None,
+            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None, skip_check: false,
         };
         // every size comes with the disk space it needs and what to know before choosing it
         let sized: Vec<Value> = options.iter().map(|o| {

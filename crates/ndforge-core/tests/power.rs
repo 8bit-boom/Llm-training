@@ -100,3 +100,27 @@ fn keep_awake_is_a_remembered_setting_that_defaults_to_on() {
     std::fs::write(d.path().join("cfg/settings.json"), r#"{"expert_mode": true}"#).unwrap();
     assert_eq!(AppModel::load().state()["settings"]["keep_awake"], true);
 }
+
+#[test]
+fn the_worker_is_told_not_to_keep_the_computer_awake_only_when_the_setting_is_off() {
+    use ndforge_core::envmgr::jobs::power_env;
+    assert!(power_env(true, false).is_empty());
+    assert_eq!(power_env(false, false), vec![("NDFORGE_KEEP_AWAKE".to_string(), "0".to_string())]);
+    assert_eq!(power_env(true, true), vec![("NDFORGE_KEEP_DISPLAY".to_string(), "1".to_string())]);
+    assert_eq!(power_env(false, true).len(), 1, "off stays off");
+}
+
+#[test]
+fn keep_display_on_is_a_remembered_setting_that_defaults_to_off() {
+    use ndforge_core::model::AppModel;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    std::env::set_var("NDFORGE_PROJECTS_DIR", d.path().join("projects"));
+    let mut m = AppModel::load();
+    assert_eq!(m.state()["settings"]["keep_display_on"], false);
+    m.set_setting("keep_display_on", true).unwrap();
+    assert_eq!(AppModel::load().state()["settings"]["keep_display_on"], true);
+    std::fs::write(d.path().join("cfg/settings.json"), r#"{"expert_mode": true}"#).unwrap();
+    assert_eq!(AppModel::load().state()["settings"]["keep_display_on"], false);
+}

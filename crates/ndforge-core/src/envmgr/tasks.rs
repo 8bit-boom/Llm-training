@@ -46,6 +46,22 @@ pub fn install(unsloth: bool, cancel: &AtomicBool, on_event: &mut dyn FnMut(Valu
     }))
 }
 
+/// Only the fast-kernel packages (the "Install the fast kernels" button); the environment must exist.
+pub fn install_kernels(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let facts = gather();
+    let gpu = facts.gpus.as_ref().ok().and_then(|g| g.first().cloned()).ok_or_else(|| Error::new("No graphics card found."))?;
+    let wheel = cuda_wheel_for(&gpu).map_err(Error::new)?;
+    let plan = SetupPlan {
+        env_dir: env_dir(), uv: find_uv().ok_or_else(|| Error::new("uv was not found."))?, worker_dir: worker_dir(),
+        wheel: wheel.to_string(), python_version: "3.13".to_string(), unsloth: false,
+    };
+    let done = super::setup::run_kernels_only(&plan, cancel, &mut |e| on_event(match e {
+        Event::Step { index, total, text } => json!({"kind": "step", "index": index, "total": total, "text": text}),
+        Event::Log(l) => json!({"kind": "log", "text": l}),
+    }))?;
+    Ok(json!({"installed": done}))
+}
+
 /// Runs the GPU self-test in the worker and remembers a pass (`selftest.json`), which turns the last light green.
 pub fn selftest(cancel: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
     let env = env_dir();

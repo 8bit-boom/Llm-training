@@ -21,6 +21,9 @@ pub struct Check {
     pub detail: String,
     /// what to do about it (empty when green)
     pub fix: String,
+    /// a button the window can offer next to the fix (`"keep_awake_on"`: switch the setting on); absent when there is none
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
 }
 
 /// Everything the checks look at, gathered once (so the rules can be tested without a real machine).
@@ -37,6 +40,8 @@ pub struct Facts {
     pub env_cuda_unchecked: bool,
     /// the requirements version the installed environment was made with (`ENV_REQUIREMENTS_VERSION` of its setup); None: an older setup that did not write one
     pub env_requirements: Option<u32>,
+    /// flash-linear-attention is installed in the environment (its package folder is there); None: no environment to look in. Qwen3.5's linear-attention layers are several times slower without it.
+    pub fast_kernels: Option<bool>,
 }
 
 /// The version of what the setup installs (the upper bounds in `worker/constraints.txt`, the order of the steps). Raise it when a program version needs another environment: the setup page then
@@ -49,7 +54,7 @@ const DISK_WARN_GB: f64 = 40.0;
 const VRAM_MIN_GB: f64 = 5.5;
 
 fn check(id: &'static str, label: &'static str, light: Light, detail: impl Into<String>, fix: impl Into<String>) -> Check {
-    Check { id, label, light, detail: detail.into(), fix: fix.into() }
+    Check { id, label, light, detail: detail.into(), fix: fix.into(), action: None }
 }
 
 pub fn evaluate(f: &Facts) -> Vec<Check> {
@@ -104,6 +109,13 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
     } else {
         check("selftest", "Graphics card test", Light::Warn, "Not run yet.", "After the install, press \"Test the graphics card\" (about 30 seconds).")
     });
+    match f.fast_kernels {
+        Some(true) => out.push(check("kernels", "Fast kernels for Qwen3.5 linear attention", Light::Ok, "flash-linear-attention is installed.", "")),
+        Some(false) => out.push(check("kernels", "Fast kernels for Qwen3.5 linear attention", Light::Warn,
+            "flash-linear-attention is not installed: Qwen3.5's linear-attention layers run on a much slower PyTorch version when measuring, healing and checking.",
+            "Press \"Install the fast kernels\" (a small download; if there is no ready-made package for this system nothing is changed).")),
+        None => {}
+    }
     out
 }
 
@@ -147,6 +159,23 @@ pub fn env_requirements(env: &Path) -> Option<u32> {
     v["requirements"].as_u64().map(|n| n as u32)
 }
 
+/// Is flash-linear-attention installed in this environment? Looks for its `flash_linear_attention-*.dist-info` folder in the site-packages
+/// (Windows `Lib/site-packages`, Unix `lib/python3*/site-packages`); nothing is imported. None when there is no environment.
+pub fn env_fast_kernels(env: &Path) -> Option<bool> {
+    if !env_installed(env) {
+        return None;
+    }
+    let mut sites = vec![env.join("Lib").join("site-packages")];
+    if let Ok(rd) = std::fs::read_dir(env.join("lib")) {
+        sites.extend(rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("python")).map(|e| e.path().join("site-packages")));
+    }
+    let found = sites.iter().filter_map(|s| std::fs::read_dir(s).ok()).flatten().flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        n.starts_with("flash_linear_attention-") && n.ends_with(".dist-info")
+    });
+    Some(found)
+}
+
 pub fn selftest_passed(env: &Path) -> bool {
     env.join("selftest.json").is_file()
 }
@@ -161,5 +190,6 @@ pub fn gather() -> Facts {
         selftest_passed: selftest_passed(&env),
         env_cuda_unchecked: env_cuda_unchecked(&env),
         env_requirements: env_requirements(&env),
+        fast_kernels: env_fast_kernels(&env),
     }
 }

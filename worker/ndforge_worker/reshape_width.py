@@ -123,9 +123,15 @@ def check_width(dims: dict, width: dict, divisor: int = FFN_DIVISOR) -> dict:
     return out
 
 
-def params_for(dims: dict, layer_types: list[str], width: dict, vision: int, other: int = 0) -> int:
+def mtp_removed(dims: dict, width: dict) -> bool:
+    """A width cut that thins the MLP or the attention heads removes the multi-token head (it no longer fits and is never measured or healed)."""
+    return width["intermediate"] != dims["intermediate"] or width["heads"] != dims["heads"]
+
+
+def params_for(dims: dict, layer_types: list[str], width: dict, vision: int, other: int = 0, keep_mtp: bool = False) -> int:
     """Exact parameter count of a Qwen3.5 model with the given layer types and widths (layers + embeddings + output layer + final norm + multi-token head
-    + `vision` + `other`). Reproduces the Hugging Face totals of Qwen3.5-27B and -9B."""
+    + `vision` + `other`). The multi-token head is not counted when the cut thins the MLP or the attention heads (`mtp_removed`), unless `keep_mtp`.
+    Reproduces the Hugging Face totals of Qwen3.5-27B and -9B for the uncut model."""
     H, hd, kv = dims["hidden"], dims["head_dim"], dims["kv_heads"]
     I, nh = width["intermediate"], width["heads"]
     nk, nv, dk, dv = dims["lin_k_heads"], width["lin_v_heads"], dims["lin_k_dim"], dims["lin_v_dim"]
@@ -137,7 +143,7 @@ def params_for(dims: dict, layer_types: list[str], width: dict, vision: int, oth
     n_full = sum(1 for t in layer_types if t == "full_attention")
     n_lin = len(layer_types) - n_full
     layers = n_lin * (gdn + mlp + norms) + n_full * (att + mlp + norms)
-    mtp = dims["mtp_layers"] * (2 * H * H + att + mlp + norms + 3 * H)
+    mtp = 0 if (mtp_removed(dims, width) and not keep_mtp) else dims["mtp_layers"] * (2 * H * H + att + mlp + norms + 3 * H)
     head = 0 if dims["tied"] else dims["vocab"] * H
     return layers + dims["vocab"] * H + head + H + mtp + vision + other
 

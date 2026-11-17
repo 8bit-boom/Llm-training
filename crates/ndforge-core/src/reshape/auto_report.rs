@@ -44,11 +44,25 @@ fn stage_json(s: &StageState) -> Value {
         "index": p.index, "of": p.of, "params_b": p.params_b, "cut_pct": p.cut_pct, "blocks_cut": p.blocks_cut, "blocks_after": p.blocks_after,
         "mlp_width": p.intermediate_after, "tokens_m": s.heal.as_ref().map(|h| h.tokens_m).unwrap_or(p.tokens_m), "seq": p.seq, "rank": p.rank,
         "passed": s.passed, "attempts": s.attempts, "retries": s.attempts.len().saturating_sub(1), "backed_off": s.attempt >= 2,
-        "cut_check": s.cut_check, "heal_check": s.heal_check,
+        "cut_check": s.cut_check, "heal_check": s.heal_check, "cut_loss": s.cut_loss,
         // the healing curves: the teacher's loss and the student's before and after, and the KL at the start and the end
         "kl_first": summary["kd_first"], "kl_last": summary["kd_last"], "loss_before": summary["calib_loss_before"], "loss_after": summary["calib_loss_after"], "teacher_loss": summary["teacher_calib_loss"],
         "healed_model": s.heal.as_ref().map(|h| h.name.clone()),
     })
+}
+
+/// Adds `timings` (where the time of the jobs went, from the job logs that started while this run lasted) to a report. A run whose logs are gone has none.
+pub fn add_timings(r: &mut Value, st: &AutoState) {
+    let files = crate::timing::logs_between(&crate::envmgr::joblog::dir(), &st.created, &st.updated);
+    if files.is_empty() {
+        return;
+    }
+    let summary = crate::timing::summarize(&files);
+    if summary["job_seconds"].as_f64().unwrap_or(0.0) <= 0.0 {
+        return;
+    }
+    let advice = crate::timing::advice(&summary);
+    r["timings"] = json!({"summary": summary, "advice": advice});
 }
 
 /// The report of a run as data.
@@ -82,7 +96,27 @@ pub fn build(st: &AutoState) -> Value {
         "disk": plan.and_then(|p| p.disk.as_ref()).map(|d| json!({"peak_gb": d.peak_gb, "peak_step": d.peak_step, "final_gb": d.final_gb, "keep_intermediate": d.keep_intermediate, "measured": false})),
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
+        "think_gate": st.think_gate, "guardrails": guardrails(st),
     })
+}
+
+/// The ways the chosen cut goes beyond what Auto-cut does by itself (with the numbers of its check before healing when there are any): empty for a cut inside the rules.
+fn guardrails(st: &AutoState) -> Vec<String> {
+    let (Some(ins), Some(c)) = (st.inspect.as_ref(), st.chosen.as_ref()) else { return Vec::new() };
+    let mut out = super::auto_plan::beyond_guardrails(ins, c.blocks, c.intermediate);
+    if out.is_empty() {
+        return out;
+    }
+    let win = st.think_gate.as_ref().and_then(|g| g["rows"].as_array().and_then(|r| r.iter().find(|x| x["row"] == g["winner"]).cloned()));
+    if let Some(m) = win.as_ref().map(|w| &w["check"]["main"]).filter(|m| m.is_object()) {
+        out.push(format!("Before healing this cut finished its reasoning in {} of its answers, looped in {} (the original: {}).",
+                         pct(&m["closed_rate"]), pct(&m["loop_rate"]), st.baseline.as_ref().map(|b| pct(&b["main"]["closed_rate"])).unwrap_or_else(|| "-".into())));
+    }
+    out
+}
+
+fn pct(v: &Value) -> String {
+    v.as_f64().map(|x| format!("{:.0} %", x * 100.0)).unwrap_or_else(|| "-".into())
 }
 
 fn cell(v: &Value, key: &str) -> String {
@@ -133,6 +167,25 @@ pub fn markdown(r: &Value) -> String {
         s.push_str(&format!("| {} of {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n", st["index"], st["of"], num(&st["params_b"], 2), num(&st["cut_pct"], 1), st["blocks_cut"], st["mlp_width"].as_u64().map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
                              st["tokens_m"], num(&st["kl_first"], 3), num(&st["kl_last"], 3), num(&st["loss_before"], 3), num(&st["loss_after"], 3), num(&st["teacher_loss"], 3), st["attempts"].as_array().map(|a| a.len()).unwrap_or(0), result));
     }
+    for st in r["stages"].as_array().cloned().unwrap_or_default() {
+        if let Some(l) = st["cut_loss"].as_f64() {
+            s.push_str(&format!("\nStage {}: the cut's text-prediction error {l:.3} was measured in Try first (the new model was not loaded again to measure it).\n", st["index"]));
+        }
+    }
+    if let Some(rows) = r["think_gate"]["rows"].as_array().filter(|a| !a.is_empty()) {
+        s.push_str("\n## Before healing\n\nThe best cuts of Try first, checked for thinking before anything was healed (the check is an estimate of a model that has not been healed).\n\n| Cut | Loss | Finishes reasoning | Loops | Right answers | Chosen |\n|---|---|---|---|---|---|\n");
+        for x in rows {
+            let m = &x["check"]["main"];
+            s.push_str(&format!("| {} blocks, MLP {} ({} B) | {} | {} | {} | {} | {} |\n", x["blocks"], x["intermediate"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unchanged".into()), num(&x["params_b"], 2), num(&x["loss"], 3),
+                                 pct(&m["closed_rate"]), pct(&m["loop_rate"]), pct(&m["accuracy"]), if x["row"] == r["think_gate"]["winner"] { "yes" } else { "" }));
+        }
+    }
+    if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
+        s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");
+        for x in g.iter().filter_map(|x| x.as_str()) {
+            s.push_str(&format!("- {x}\n"));
+        }
+    }
     s.push_str("\n## Thinking check\n\n| Model | Verdict |");
     for (_, label) in METRICS {
         s.push_str(&format!(" {label} |"));
@@ -179,6 +232,17 @@ pub fn markdown(r: &Value) -> String {
             s.push_str(&format!("\nUnsloth Studio: not published ({}).\n", p["why"].as_str().unwrap_or("")));
         }
     }
+    if let Some(stages) = r["timings"]["summary"]["stages"].as_object().filter(|m| !m.is_empty()) {
+        s.push_str("\n## Where the time went\n\nFrom the timing lines of the job logs; the share is of the time of all the jobs of this run.\n\n| Stage | Seconds | Times | Share |\n|---|---|---|---|\n");
+        let mut rows: Vec<(&String, &Value)> = stages.iter().collect();
+        rows.sort_by(|a, b| b.1["seconds"].as_f64().partial_cmp(&a.1["seconds"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, v) in rows {
+            s.push_str(&format!("| {name} | {} | {} | {} |\n", num(&v["seconds"], 0), v["count"], pct(&v["share"])));
+        }
+        for a in r["timings"]["advice"].as_array().cloned().unwrap_or_default() {
+            s.push_str(&format!("\n- {}{}\n", if a["worth"] == true { "Worth doing: " } else { "" }, a["text"].as_str().unwrap_or("")));
+        }
+    }
     if let Some(n) = r["notes"].as_array().filter(|n| !n.is_empty()) {
         s.push_str("\n## Notes\n\n");
         for x in n.iter().filter_map(|x| x.as_str()) {
@@ -195,7 +259,8 @@ pub fn markdown(r: &Value) -> String {
 
 /// Writes `auto_report.json` and `auto_report.md` into the run's folder and returns the small pointer the state keeps (`{"json", "md"}`: file names, no times).
 pub fn write(dir: &Path, st: &AutoState) -> Result<Value> {
-    let r = build(st);
+    let mut r = build(st);
+    add_timings(&mut r, st);
     write_json(&dir.join(JSON_FILE), &r)?;
     let md = dir.join(MD_FILE);
     let tmp = md.with_extension("tmp");

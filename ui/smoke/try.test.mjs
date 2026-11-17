@@ -221,3 +221,20 @@ test("kept answers are shown when the page opens", async () => {
   assert.equal(b.run("rs.tr.analysis.passes"), 26); assert.equal(b.run("rs.tr.sps"), 12);
   assert.match(b.run("tryCard()"), /Skipping one block at a time/);
 });
+
+test("a model that thinks is told that a lower error is not a thinking test, and a lower-than-original choice is flagged", () => {
+  const b = browser();
+  open(b, pageState());
+  b.run(`rs.tr.analysis = ${JSON.stringify(analysis())}; rs.tr.sel = [5, 6, 7, 8]`);
+  let html = b.run("tryCard()");
+  assert.match(html, /id="tr-think-note"/);
+  assert.match(html, /A lower text-prediction error does not mean the model can still think\. Make the cut, then run “Check the cut model” in the Thinking check before healing\./);
+  assert.doesNotMatch(html, /lower than the original's/, "this choice is worse than the original");
+  // a choice that predicts the text better than the original: the measurement is doubted
+  b.run(`rs.tr.analysis = ${JSON.stringify(analysis({ windows: undefined }))}; rs.tr.analysis.runs["4"].windows[4].loss = 1.8; rs.tr.analysis.runs["4"].windows[4].rel = -0.1; rs.tr.sel = [5, 6, 7, 8]`);
+  html = b.run("tryCard()");
+  assert.match(html, /This choice's error is lower than the original's: check that both were measured the same way/);
+  // a model that does not think has no such note
+  b.run(`rs.options.inspect.model_type = "llama"`);
+  assert.doesNotMatch(b.run("tryCard()"), /id="tr-think-note"/);
+});

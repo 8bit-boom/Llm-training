@@ -369,7 +369,7 @@ def nextn_refused(tail) -> str:
 # ------------------------------------------------------------------------------------------------------------------ the calibration text
 
 def count_tokens(tokenizer, text: str) -> int:
-    return len(data._inner(tokenizer)(text, add_special_tokens=False)["input_ids"])
+    return len(data.text_tokenizer(tokenizer)(text, add_special_tokens=False)["input_ids"])
 
 
 def render_rows(tokenizer, rows: list, fam_name: str):

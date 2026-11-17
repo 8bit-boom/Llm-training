@@ -228,18 +228,18 @@ fn the_27b_gets_one_exact_stop_per_mlp_width() {
     assert_eq!(opts.len(), 35);
     assert_eq!((opts[0].intermediate, opts[34].intermediate), (Some(8704), Some(17408)), "ascending: the thinnest first");
     let at = |i: u32| opts.iter().find(|o| o.intermediate == Some(i)).unwrap();
-    assert_eq!((at(13312).params_b, at(10752).params_b), (23.69, 21.14));
+    assert_eq!((at(13312).params_b, at(10752).params_b), (23.33, 20.81));       // the multi-token head is removed by a width cut: about 0.3-0.4 B lower than before
     assert!(at(13312).exact && at(10752).layers == 64 && at(10752).blocks == 0);
-    assert!((at(10752).disk_gb - 42.3).abs() < 0.05, "{:?}", at(10752));
+    assert!((at(10752).disk_gb - 41.6).abs() < 0.05, "{:?}", at(10752));
     assert_eq!((at(10752).fits_lora, at(10752).fits_qlora), (Some(false), Some(true)));
-    // both: one block less (60 layers) and 12,288 = 21.46 B; two blocks less and 13,312 = 21.15 B
+    // both: one block less (60 layers) and 12,288 = 21.12 B; two blocks less and 13,312 = 20.79 B
     let both = width_options(&ins, 1, None, None, None);
     let b = both.iter().find(|o| o.intermediate == Some(12288)).unwrap();
-    assert_eq!((b.layers, b.blocks, b.params_b, b.fits_qlora), (60, 1, 21.46, None));
-    assert_eq!(width_options(&ins, 2, None, None, None).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.15);
+    assert_eq!((b.layers, b.blocks, b.params_b, b.fits_qlora), (60, 1, 21.12, None));
+    assert_eq!(width_options(&ins, 2, None, None, None).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 20.79);
     // the Expert axes change the size: 32 value heads and 16 attention heads
-    assert_eq!(width_options(&ins, 0, None, Some(32), Some(16)).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.64);
-    assert_eq!(width_options(&ins, 0, None, Some(32), None).iter().find(|o| o.intermediate == Some(12288)).unwrap().params_b, 21.15);
+    assert_eq!(width_options(&ins, 0, None, Some(32), Some(16)).iter().find(|o| o.intermediate == Some(13312)).unwrap().params_b, 21.31);
+    assert_eq!(width_options(&ins, 0, None, Some(32), None).iter().find(|o| o.intermediate == Some(12288)).unwrap().params_b, 20.81);
     // no options for a model that cannot be thinned
     let mut no = qwen27();
     no.width_supported = false;
@@ -2584,4 +2584,24 @@ fn the_reasoning_text_reaches_the_worker_and_gets_its_own_measurement() {
     // a plain measurement sends no reasoning at all
     rruns::measure(&p, "qwen3.5-4b", 128, 512, "auto", false, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
     assert!(jobs_seen(d.path())[1]["calibration"].get("reasoning").is_none());
+}
+
+#[test]
+fn the_manual_slim_page_warns_about_the_guardrails_and_the_thinking_of_a_model_that_thinks() {
+    let ins = qwen27();
+    // cut A of a real run, made by hand: three blocks and the MLP at 10,240 (58.8 % kept; Auto-cut stops at 10,752)
+    let w = warnings(&wspec(3, 10240), &ins, Some(32.0));
+    assert!(w.iter().any(|x| x.contains("10240 of 17408") && x.contains("58.8 %") && x.contains("10752")), "{w:?}");
+    assert!(w.iter().any(|x| x.contains("Check its thinking before healing") && x.contains("minutes in Quick") && x.contains("does not mean it can still think")), "{w:?}");
+    // inside the rules: no guardrail sentence, but the thinking is still mentioned
+    let ok = warnings(&wspec(1, 12288), &ins, Some(32.0));
+    assert!(!ok.iter().any(|x| x.contains("Auto-cut does not")), "{ok:?}");
+    assert!(ok.iter().any(|x| x.contains("Check its thinking before healing")));
+    // more than four blocks
+    assert!(warnings(&wspec(5, 17408), &ins, None).iter().any(|x| x.contains("5 whole blocks are removed")));
+    // a model that does not think (or a growing model) has none of it
+    let mut plain = qwen27();
+    plain.model_type = "llama".into();
+    assert!(!warnings(&wspec(3, 10240), &plain, None).iter().any(|x| x.contains("Check its thinking")));
+    assert!(!warnings(&spec(Mode::Grow, 2), &ins, None).iter().any(|x| x.contains("Check its thinking")));
 }

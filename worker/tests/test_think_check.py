@@ -315,3 +315,18 @@ def test_fingerprints(tmp_path):
     d = tmp_path / "d"
     d.mkdir()
     assert tc.fingerprint(str(d)).startswith("dir:")
+
+
+def test_the_check_always_samples_it_is_never_greedy():
+    """Greedy decoding hid the failure of a real run (docs/REAL_RUN_17B.md): the thinking check asks sampled answers, with the settings Qwen recommends for thinking."""
+    import ast
+    from pathlib import Path
+
+    from ndforge_worker import thinkcheck_hf
+    tree = ast.parse(Path(thinkcheck_hf.__file__).read_text(encoding="utf-8"))
+    gens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "generate"]
+    assert gens, "the check generates with model.generate"
+    for call in gens:
+        kw = {k.arg: k.value for k in call.keywords if k.arg}
+        assert isinstance(kw.get("do_sample"), ast.Constant) and kw["do_sample"].value is True, "do_sample=True"
+        assert {"temperature", "top_p", "top_k"} <= set(kw)

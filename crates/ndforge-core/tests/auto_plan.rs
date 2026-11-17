@@ -39,8 +39,8 @@ fn spec(target: f64) -> AutoSpec {
 fn the_exact_sizes_of_the_27b() {
     let ins = qwen27();
     assert_eq!(size_of(&ins, 0, Some(17408)), 27_781_427_952, "the original, from the formula");
-    assert_eq!(size_of(&ins, 0, Some(10752)) / 10_000_000, 2113, "21.13 B: the thinnest MLP the width-first rule allows (the Slim page shows 21.14)");
-    assert_eq!(size_of(&ins, 1, Some(12288)) / 10_000_000, 2146);
+    assert_eq!(size_of(&ins, 0, Some(10752)) / 10_000_000, 2081, "20.81 B: the thinnest MLP the width-first rule allows (the multi-token head is removed by a width cut, so 0.32 B less than before)");
+    assert_eq!(size_of(&ins, 1, Some(12288)) / 10_000_000, 2111);
     assert_eq!(width_floor(&ins), Some(10752), "17,408 x 0.617 = 10,741 -> the stop 10,752");
 }
 
@@ -49,13 +49,13 @@ fn twenty_one_billion_is_the_mlp_alone() {
     let ins = qwen27();
     let c = candidates(&ins, 21.1);
     let best = &c[0];
-    assert_eq!((best.blocks, best.intermediate, best.params_b, best.on_target, best.needs_confirmation), (0, Some(10752), 21.14, true, false), "{best:?}");
+    assert_eq!((best.blocks, best.intermediate, best.params_b, best.on_target, best.needs_confirmation), (0, Some(11008), 21.07, true, false), "{best:?}");
     assert_eq!(best.layers, 64);
-    assert!((best.width_cut - 0.382).abs() < 1e-9 && best.error_pct == 0.2, "{best:?}");
+    assert!((best.width_cut - 0.368).abs() < 1e-9 && best.error_pct == -0.2, "{best:?}");
     // width first: blocks come only when the MLP alone cannot reach the size
     let p = plan(&ins, &spec(21.1), Some(32.0), Some(900.0));
     assert!(p.ok, "{:?}", p.blockers);
-    assert_eq!(p.chosen.as_ref().map(|c| (c.blocks, c.intermediate)), Some((0, Some(10752))));
+    assert_eq!(p.chosen.as_ref().map(|c| (c.blocks, c.intermediate)), Some((0, Some(11008))));
     assert_eq!(p.try_list[0], *p.chosen.as_ref().unwrap());
     assert!(p.try_list.len() <= TRY_TOP);
 }
@@ -118,10 +118,10 @@ fn two_stages_cut_half_of_the_width_first_and_the_depth_before_the_width() {
     let p = plan(&ins, &spec(21.1), Some(32.0), Some(900.0));
     assert_eq!(p.stages.len(), 2);
     let (a, b) = (&p.stages[0], &p.stages[1]);
-    // 17,408 -> 14,080 (nearest stop to the middle of 17,408 and 10,752: 14,080) -> 10,752
+    // 17,408 -> 14,080 (nearest stop to the middle of 17,408 and 11,008: 14,080) -> 11,008
     assert_eq!((a.intermediate_before, a.intermediate_after, a.width, a.blocks_cut, a.index, a.of), (Some(17408), Some(14080), Some(14080), 0, 1, 2), "{a:?}");
-    assert_eq!((b.intermediate_before, b.intermediate_after, b.width, b.blocks_cut), (Some(14080), Some(10752), Some(10752), 0), "{b:?}");
-    assert!(a.params > b.params && b.params_b == 21.14);
+    assert_eq!((b.intermediate_before, b.intermediate_after, b.width, b.blocks_cut), (Some(14080), Some(11008), Some(11008), 0), "{b:?}");
+    assert!(a.params > b.params && b.params_b == 21.07);
     // blocks and width: the blocks go in stage A, the width in stage B
     let c = Candidate { blocks: 2, intermediate: Some(12288), ..p.chosen.clone().unwrap() };
     let steps = split_stages(&ins, &c, 2);
@@ -134,7 +134,7 @@ fn two_stages_cut_half_of_the_width_first_and_the_depth_before_the_width() {
     // one stage on request
     let one = plan(&ins, &AutoSpec { stages: 1, ..spec(21.1) }, Some(32.0), Some(900.0));
     assert_eq!(one.stages.len(), 1);
-    assert_eq!((one.stages[0].blocks_cut, one.stages[0].width), (0, Some(10752)));
+    assert_eq!((one.stages[0].blocks_cut, one.stages[0].width), (0, Some(11008)));
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn the_stage_cuts_and_heals_are_specs_the_existing_jobs_take() {
     let ins = qwen27();
     let p = plan(&ins, &spec(21.1), Some(32.0), Some(900.0));
     let s = p.stages[1].reshape_spec("stage-a-model", Some(ReasoningCalib::default()), 128, 256);
-    assert_eq!((s.source_model_id.as_str(), s.blocks, s.width.clone().map(|w| w.intermediate), s.width_samples), ("stage-a-model", 0, Some(10752), 256));
+    assert_eq!((s.source_model_id.as_str(), s.blocks, s.width.clone().map(|w| w.intermediate), s.width_samples), ("stage-a-model", 0, Some(11008), 256));
     assert_eq!(s.reasoning, Some(ReasoningCalib::default()));
     let h = p.stages[0].heal_spec(true);
     assert_eq!((h.tokens_m, h.recipe.as_deref()), (40, Some("thinking")));
@@ -192,14 +192,14 @@ fn the_disk_timeline_and_the_peak() {
     let b = p.stages[1].params as f64 * 2.0 / 1e9;
     let expect_peak = 55.6 + a + b + p.stages[1].cache_gb + b - 0.0;
     assert!(d.peak_gb >= 55.6 + a + 2.0 * b && (d.peak_gb - expect_peak).abs() < 3.0, "{d:?} {expect_peak}");
-    assert_eq!((d.peak_gb, d.final_gb), (196.8, 110.7));
-    assert_eq!((p.stages[0].params_b, p.stages[0].cut_pct, p.stages[1].params_b, p.stages[1].cut_pct), (24.46, 12.0, 21.14, 23.9));
+    assert_eq!((d.peak_gb, d.final_gb), (195.8, 110.5));
+    assert_eq!((p.stages[0].params_b, p.stages[0].cut_pct, p.stages[1].params_b, p.stages[1].cut_pct), (24.09, 13.3, 21.07, 24.2));
     assert_eq!(d.peak_step, "stage 2: the healed model");
     assert_eq!(d.enough, Some(true));
     // keeping everything needs more than cleaning up
     let keep = plan(&ins, &AutoSpec { keep_intermediate: true, ..spec(21.1) }, Some(32.0), Some(900.0)).disk.unwrap();
     assert!(keep.peak_gb > d.peak_gb && keep.final_gb > d.final_gb, "{keep:?} {d:?}");
-    assert_eq!((keep.peak_gb, keep.peak_step.as_str()), (308.7, "export: the sizes"));
+    assert_eq!((keep.peak_gb, keep.peak_step.as_str()), (306.7, "export: the sizes"));
     // the original and the final model stay in both cases
     assert!(d.final_gb >= 55.6 + b, "{d:?}");
     // a small disk blocks the run and says what to do
@@ -252,4 +252,31 @@ fn the_spec_has_the_owner_defaults_and_refuses_nonsense() {
         let s: AutoSpec = serde_json::from_value(v).unwrap();
         assert!(s.validate().is_err(), "{s:?}");
     }
+}
+
+#[test]
+fn the_owners_first_cut_is_beyond_the_guardrails_and_the_checks_take_an_estimated_time() {
+    use ndforge_core::reshape::auto_plan::{beyond_guardrails, think_gate_minutes};
+    let ins = qwen27();
+    // cut A of a real run: three blocks and the MLP at 10,240 of 17,408 (58.8 % kept; the floor is 10,752)
+    let a = beyond_guardrails(&ins, 3, Some(10240));
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert!(a[0].contains("10240 of 17408") && a[0].contains("58.8 %") && a[0].contains("10752"), "{a:?}");
+    // the floor itself, and a few blocks, are inside
+    assert!(beyond_guardrails(&ins, 4, Some(10752)).is_empty());
+    assert!(beyond_guardrails(&ins, 0, Some(17408)).is_empty());
+    let both = beyond_guardrails(&ins, 5, Some(10240));
+    assert_eq!(both.len(), 2, "{both:?}");
+    assert!(both[1].contains("5 whole blocks"));
+    // a model that cannot be thinned has no width rule
+    let mut plain = qwen27();
+    plain.width_supported = false;
+    assert!(beyond_guardrails(&plain, 1, None).is_empty());
+    // the estimate: write at 500 MB/s plus 15 (full) or 10 (quick) minutes per 17 B, at least once
+    let cands = candidates(&ins, 17.4);
+    let c = &cands[0];
+    let (full, quick) = (think_gate_minutes(&ins, c, false), think_gate_minutes(&ins, c, true));
+    assert!(quick < full && full > 15.0 && full < 25.0, "{full} {quick}");
+    let small = Candidate { params: 5_000_000_000, ..c.clone() };
+    assert!(think_gate_minutes(&ins, &small, true) >= 10.0, "never less than one unit of the check");
 }

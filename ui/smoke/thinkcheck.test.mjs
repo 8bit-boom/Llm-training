@@ -119,3 +119,22 @@ test("a start that the program refuses shows its message and frees the buttons",
   assert.equal(b.run("rs.tk.run"), null);
   assert.match(card(b), /Another job is still running/);
 });
+
+test("a cut beyond the guardrails gets a warning with its thinking numbers, or a pointer to the Check button", () => {
+  const b = browser();
+  const guard = ["The MLP is thinned to 10240 of 17408 (58.8 % kept); Auto-cut does not go below 10741 (61.7 % kept).", "5 whole blocks are removed; Auto-cut does not remove more than 4 without asking."];
+  // not checked yet
+  open(b, [model()], results({ guardrails: guard }));
+  let html = card(b);
+  assert.match(html, /<p class="warn" id="tk-guard">The MLP is thinned to 10240 of 17408 \(58\.8 % kept\)/);
+  assert.match(html, /5 whole blocks are removed/);
+  assert.match(html, /It has not been checked for thinking yet: press “Check the cut model” below\./);
+  // checked: the numbers of the cut and of the original
+  const modes = { quick: { rows: { original: row(main(0.97, 0.97, 0, 121)), cut: row(main(0.5, 0.28, 0.5, 519)) }, gates: {} }, full: { rows: {}, gates: {} } };
+  open(b, [model()], results({ guardrails: guard, modes }));
+  html = card(b);
+  assert.match(html, /Checked before healing: it finished its reasoning in 50 % of the answers and looped in 50 % \(the original: 97 %\)\./);
+  // inside the rules: nothing
+  open(b, [model()], results({ guardrails: [] }));
+  assert.doesNotMatch(card(b), /tk-guard/);
+});

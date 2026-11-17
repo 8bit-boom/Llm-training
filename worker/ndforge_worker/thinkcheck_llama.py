@@ -150,18 +150,26 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     protocol.progress("load", 0.0, "Starting llama-server")
     server = Server(exe, gguf, job)
     pool = None
+    counted = {"tokens": 0}
+    t_gen = [None]
     try:
         server.wait_ready(float(job.get("start_timeout") or DEFAULT_START_TIMEOUT), should_stop)
         if should_stop():
             return
         protocol.progress("load", 1.0, "")
+        t_gen[0] = time.monotonic()
         pool = ThreadPoolExecutor(max_workers=int(job.get("parallel") or DEFAULT_PARALLEL))
         pending = {pool.submit(ask, server.url, r, settings) for r in requests}
         while pending and not should_stop():                    # looks at the Stop file twice a second while the questions run
             done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
             for f in done:
-                on_result(f.result())
+                res = f.result()
+                counted["tokens"] += int((res or {}).get("gen_tokens") or 0)
+                on_result(res)
     finally:
+        if t_gen[0] is not None:
+            spent = time.monotonic() - t_gen[0]
+            protocol.timing("think_generate", spent, backend="llama", generated_tokens=counted["tokens"], tokens_per_s=round(counted["tokens"] / spent, 1) if spent > 0 and counted["tokens"] else None)
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
         server.stop()

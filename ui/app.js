@@ -56,6 +56,7 @@ function renderWelcome() {
     <div class="row"><button class="secondary" id="openp">Open an existing project…</button></div>
     ${recent ? `<h2>Recent projects</h2><ul class="recent">${recent}</ul>` : ""}${quCard()}
     ${state.project ? `<div class="row"><label class="opt" title="An Auto-cut or a healing that was cut off by closing the program (or a crash) is put in the queue and goes on where it stopped, when the project is opened."><input type="checkbox" id="auto-continue" ${state.settings.auto_continue_interrupted ? "checked" : ""}> Go on by itself with what was cut off when I open the project</label></div>
+    <div class="row"><label class="opt" title="Also keeps the screen on while a long job runs. On a computer with Modern Standby this may be the only way to stop it from sleeping. Needs Keep this computer awake."><input type="checkbox" id="keep-display" ${state.settings.keep_display_on ? "checked" : ""}> Keep the screen on too while a long job runs</label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="notify-on" ${state.settings.notifications !== false ? "checked" : ""}> Tell me when a job or the queue has finished (a message from the system)</label></div>
     <div class="row"><label>Web address that gets one line when a job ends (optional, for example an ntfy topic) <input type="text" id="webhook-url" value="${esc(state.settings.webhook_url || "")}" placeholder="https://ntfy.sh/my-topic" style="min-width:280px"></label><button class="secondary" id="webhook-save">Save</button></div>
     <p class="dim small">The line says only what kind of job it was and how it ended, never a name or a folder.</p>` : ""}`;
@@ -1658,9 +1659,17 @@ function pfBox(kind, spec) {
   if (!e.checks || !e.checks.length) return "";
   const bad = e.checks.some((c) => c.light === "fail");
   const mark = { ok: "✓", warn: "!", fail: "✕" };
-  const rows = e.checks.map((c) => `<li class="pf-${esc(c.light)}"><span class="pf-dot" aria-hidden="true">${mark[c.light] || "·"}</span> <strong>${esc(c.label)}</strong> ${esc(c.detail)}${c.fix && c.light !== "ok" ? ` <span class="dim">${esc(c.fix)}</span>` : ""}</li>`).join("");
+  const rows = e.checks.map((c) => `<li class="pf-${esc(c.light)}"><span class="pf-dot" aria-hidden="true">${mark[c.light] || "·"}</span> <strong>${esc(c.label)}</strong> ${esc(c.detail)}${c.fix && c.light !== "ok" ? ` <span class="dim">${esc(c.fix)}</span>` : ""}${c.action === "keep_awake_on" && c.light !== "ok" ? ` <button class="secondary" data-pf-action="keep_awake_on">Keep the computer awake</button>` : ""}</li>`).join("");
   return `<div class="pf ${bad ? "pf-bad" : ""}" role="status" aria-live="polite" data-pf="${esc(kind)}"><div class="small dim">Before you start</div><ul>${rows}</ul></div>`;
 }
+// a button next to a light (the program names it in the check's `action`): "keep_awake_on" switches the setting on, then the list is asked again
+async function pfAction(act) {
+  if (act !== "keep_awake_on") return;
+  try { setState(await invoke("set_setting", { key: "keep_awake", value: true })); } catch (_) { /* the list stays as it was */ }
+  pfReset();
+  try { render(); } catch (_) { /* a preview without a window */ }
+}
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-pf-action]"); if (t) pfAction(t.dataset.pfAction); }); } catch (_) { /* a preview without a window */ }
 const pfBlocked = (kind) => { const e = pf[kind]; return !!(e && e.checks && e.can_start === false); };
 
 // ------------------------------------------------------------------------------------------------------------ llama.cpp: the installer (docs/LLAMA_CPP_INSTALL.md)
@@ -1878,6 +1887,26 @@ function wireLlama() {
 
 const LIGHT = { ok: "🟢", warn: "🟡", fail: "🔴" };
 
+// "Where the time went": the timing lines of the latest job logs, summed (crates/ndforge-core/src/timing.rs). Loaded on a click: it reads the saved logs.
+const tm = { data: null, loading: false, err: null };
+async function tmLoad() {
+  tm.loading = true; tm.err = null; render();
+  try { tm.data = await invoke("timing_report"); } catch (e) { tm.data = null; tm.err = String(e); }
+  tm.loading = false; render();
+}
+function tmSecs(s) { return s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? Math.round(s / 60) + " min" : Math.round(s) + " s"; }
+function renderTimeCard() {
+  const d = tm.data, sum = d && d.summary;
+  const stages = sum && sum.stages ? Object.entries(sum.stages).sort((a, b) => b[1].seconds - a[1].seconds).slice(0, 12) : [];
+  const body = tm.err ? `<p class="err">${esc(tm.err)}</p>` : !d ? `<p class="dim">The program writes down how long every part of a job took (loading a model, measuring, the teacher's answers, healing, saving, converting). Press the button to add up the latest ${30} jobs.</p>`
+    : !stages.length ? `<p class="dim">No timing lines in the latest ${sum.logs} job logs yet: they come with the next job.</p>`
+    : `<p class="dim small">${sum.logs} job logs, ${tmSecs(sum.job_seconds)} in all.</p>
+      <table class="tbl" id="tm-table"><tr><th>Stage</th><th>Time</th><th>Times</th><th>Share</th></tr>${stages.map(([n, v]) => `<tr><td>${esc(n)}</td><td>${tmSecs(v.seconds)}</td><td>${v.count}</td><td>${Math.round(v.share * 100)} %</td></tr>`).join("")}</table>
+      ${(d.advice || []).map((a) => `<p class="${a.worth ? "warn" : "dim"} small" data-tm-advice="${esc(a.id)}">${a.worth ? "<strong>Worth doing:</strong> " : ""}${esc(a.text)}</p>`).join("")}`;
+  return `<div class="card wide" id="tm-card"><h2>Where the time went</h2>${body}
+    <div class="row"><button class="secondary" id="tm-load" ${tm.loading ? "disabled" : ""}>${d ? "Look again" : "Show where the time went"}</button></div></div>`;
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -1892,12 +1921,14 @@ function renderSetup() {
       <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
       <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
       <button class="primary" id="selftest" ${busy || !st || !st.env_installed ? "disabled" : ""}>Test the graphics card</button>
+      ${st && st.env_installed && (st.checks || []).some((c) => c.id === "kernels" && c.light !== "ok") ? `<button class="secondary" id="kernels" ${busy ? "disabled" : ""} title="Installs flash-linear-attention (and causal-conv1d where a ready-made package exists) so that Qwen3.5's linear-attention layers run fast. Nothing else is changed.">Install the fast kernels</button>` : ""}
       <button class="secondary" id="cancelenv" ${busy ? "" : "disabled"}>Cancel</button>
     </div>
     ${env.step ? `<div class="stepline" aria-live="polite">${esc(env.step)}</div>` : ""}
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderTimeCard()}
     ${renderLlamaSection()}
     ${renderUnsloth()}`;
 }
@@ -2262,7 +2293,7 @@ function healCard(m, pair) {
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
-    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text })}
+    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
     <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
@@ -2410,6 +2441,14 @@ function sideBySide(m) {
     <p class="dim small">${th ? esc(th.verdict.headline) : "The healed model has not been tested yet."}</p>`;
 }
 
+// what became of the vision part and the multi-token head (the worker's `width.mtp` says what a width cut did to the head; a depth-only cut leaves it as it was)
+function mtpText(wd) {
+  const m = wd && wd.mtp ? String(wd.mtp) : "";
+  if (m.startsWith("removed")) return "The vision part was copied unchanged. The multi-token head (speculative decoding) was removed: it no longer fits the thinner layers.";
+  if (m.includes("sliced")) return "The vision part was copied unchanged. The multi-token head was cut to fit but was not measured or healed; do not use it for speculative decoding.";
+  return "The vision part and the multi-token head were copied unchanged.";
+}
+
 function madeCard(m) {
   const sm = m.summary;
   if (!sm) return `<div class="card wide"><h2>${esc(m.name)}</h2><p class="${m.status === "failed" ? "err" : "dim"}">${esc(m.status)}${m.error ? ": " + esc(m.error) : ""}</p></div>`;
@@ -2437,7 +2476,7 @@ function madeCard(m) {
     ${loss ? `<p>${esc(loss)}</p>` : ""}${stab}
     ${slim && sm.stable === false && !wide ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
     ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
-    <p class="dim small">The vision part and the multi-token head were copied unchanged. ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
+    <p class="dim small">${mtpText(wd)} ${sm.load ? "Measured with the model loaded as " + esc(sm.load) + "." : ""} It is in the model list of Step 3 as “${esc((rs.state.models.find((x) => x.id === m.model_id) || {}).name || m.model_id || "")}”.</p>
     <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
@@ -2449,7 +2488,7 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
+let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, plan: null, planFor: "", planErr: null, planTok: 0,
   run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
 const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
@@ -2463,7 +2502,7 @@ function acDefaults() {
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
 function acSpec() {
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2514,6 +2553,7 @@ function autoCard() {
     <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
+    ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
     <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
       <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
@@ -2550,12 +2590,29 @@ function acEtaRange(run, eta, nowMs) {
   }
   return lo || hi ? { lo, hi } : null;
 }
-const acClock = (ms) => { const d = new Date(ms); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+const acHM = (d) => String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+// the clock time of `ms`; a time on another calendar day (local date, not 24 hours) says which: "tomorrow 14:49", or "Thu 14:49" two or more days on
+const acDay = (ms, nowMs) => {
+  const d = new Date(ms), n = new Date(nowMs);
+  const days = Math.round((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(n.getFullYear(), n.getMonth(), n.getDate())) / 864e5);
+  return days <= 0 ? "" : days === 1 ? "tomorrow" : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
+};
+const acClock = (ms, nowMs) => { const day = nowMs == null ? "" : acDay(ms, nowMs); return (day ? day + " " : "") + acHM(new Date(ms)); };
+// a duration in words without false precision: to the nearest 5 minutes below 10 hours, to the nearest 30 minutes from 10 hours up ("45 min", "1 h", "2 h 05 min", "20 h")
+function acDuration(hours) {
+  const step = hours >= 10 ? 30 : 5;
+  const m = Math.max(5, Math.round(hours * 60 / step) * step), h = Math.floor(m / 60), r = m % 60;
+  return h === 0 ? `${r} min` : r === 0 ? `${h} h` : `${h} h ${String(r).padStart(2, "0")} min`;
+}
 function acEtaText(run, eta, nowMs) {
   const r = acEtaRange(run, eta, nowMs);
   if (!r) return "";
-  const now = nowMs || Date.now(), a = acClock(now + r.lo * 3600e3), b = acClock(now + r.hi * 3600e3);
-  return a === b ? `done around ${a}` : `done around ${a}–${b}`;
+  const now = nowMs || Date.now(), hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
+  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
+  const dl = acDuration(r.lo), dh = acDuration(hiH);
+  const left = dl === dh ? dl : `${dl} to ${dh}`;
+  const when = a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}`;      // one day word for both ends when they share it
+  return `about ${left} left (done around ${when})`;
 }
 
 function onAutoEvent(p) {
@@ -2571,7 +2628,7 @@ function wireAuto() {
   const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
   set("ac-target", (e) => { ac.target = +e.value; });
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
-  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
+  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
@@ -2625,7 +2682,14 @@ function thinkCard(m) {
       <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
   const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
   const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
-  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>
+  // a cut that goes beyond what Auto-cut does by itself (the program names how): the thinking numbers of the cut when it was checked, else a pointer to the button
+  const guard = d && d.guardrails && d.guardrails.length ? (() => {
+    const cm = rows.cut ? rows.cut.main : null;
+    const nums = cm ? `Checked before healing: it finished its reasoning in ${Math.round((cm.closed_rate || 0) * 100)} % of the answers and looped in ${Math.round((cm.loop_rate || 0) * 100)} %${rows.original ? ` (the original: ${Math.round((rows.original.main.closed_rate || 0) * 100)} %)` : ""}.`
+      : `It has not been checked for thinking yet: press “Check the cut model” below.`;
+    return `<p class="warn" id="tk-guard">${d.guardrails.map(esc).join(" ")} ${esc(nums)}</p>`;
+  })() : "";
+  return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>${guard}
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
     ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
@@ -2834,6 +2898,13 @@ function tryVerdict(a, r, what) {
 
 const TRY_HONEST = (a) => `<p class="dim small">This is the error <strong>before</strong> healing: healing usually wins back part of it. A cheap cut now is not a guarantee that it heals well, and an expensive one can still heal into a usable model; nobody has measured how the two relate for your model yet. The colours are rules of thumb (under +${Math.round(a.bands.edges[0] * 100)} %, +${Math.round(a.bands.edges[0] * 100)} to +${Math.round(a.bands.edges[1] * 100)} %, over +${Math.round(a.bands.edges[1] * 100)} % of the original's error), not promises. Removing two blocks costs more than the two single costs added up; the "My choice" pass is the honest number. Small differences between two options are noise: the two halves of your text are compared below the chart.</p>`;
 
+// For a model that thinks (Qwen3.5 / 3.8): the error before healing is not a thinking test. When the choice has a LOWER error than the original, both may have been measured differently.
+function tryThinkNote(ins, a, hit) {
+  if (!ins || ins.model_type !== "qwen3_5") return "";
+  const lower = hit && hit.loss != null && a && a.base && a.base.loss != null && hit.loss < a.base.loss;
+  return `<p class="warn small" id="tr-think-note">A lower text-prediction error does not mean the model can still think. Make the cut, then run “Check the cut model” in the Thinking check before healing.${lower ? " This choice's error is lower than the original's: check that both were measured the same way (a cut that predicts text better than the model it came from is a reason to doubt the measurement)." : ""}</p>`;
+}
+
 function tryCard() {
   const op = rs.options, ins = op && op.inspect, st = rs.state, tr = rs.tr;
   if (!ins || !ins.supported || rs.mode !== "prune" || !(op.options.length > 0 || tryWidthOnShape())) return "";
@@ -2861,7 +2932,7 @@ function tryCard() {
     const ch = tryChoice(), hit = tryLookup(a, ch);
     const label = (ch.blocks.length ? `blocks ${ranges(ch.blocks)}` : "") + (ch.blocks.length && ch.width != null ? " and " : "") + (ch.width != null ? `MLP ${thou(ch.width)}` : "");
     const verdict = hit ? tryVerdict(a, hit, "Your choice (" + label + ")") : (ch.blocks.length || ch.width != null) ? `<p class="dim">Your choice (${esc(label)}) has not been tried yet: choose “My choice” above and press Try.</p>` : "";
-    parts.push(`<h4>Verdict</h4>${verdict}<p>Original: error ${a.base.loss.toFixed(3)}, perplexity ${a.base.ppl}.</p>${TRY_HONEST(a)}
+    parts.push(`<h4>Verdict</h4>${verdict}<p>Original: error ${a.base.loss.toFixed(3)}, perplexity ${a.base.ppl}.</p>${TRY_HONEST(a)}${tryThinkNote(ins, a, hit)}
       <div class="row"><button class="primary" id="tr-use" ${hit && !run && !rs.running ? "" : "disabled"}>Use this choice</button><span class="dim small">${hit ? "fills the Make form below so the model is cut exactly as it was tried" : "try the choice first, then it can be used"}</span></div>`);
     body = parts.join("");
   }
@@ -3287,6 +3358,7 @@ function wire() {
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   wireQueue();
+  const kd = $("keep-display"); if (kd) kd.onchange = async () => { try { setState(await invoke("set_setting", { key: "keep_display_on", value: kd.checked })); } catch (e) { alert(String(e)); } };
   const nf = $("notify-on"); if (nf) nf.onchange = async () => { try { setState(await invoke("set_setting", { key: "notifications", value: nf.checked })); } catch (e) { alert(String(e)); } };
   const wh = $("webhook-save"); if (wh) wh.onclick = async () => { try { setState(await invoke("webhook_set", { url: ($("webhook-url") || {}).value || "" })); } catch (e) { alert(String(e)); } };
   const ac2 = $("auto-continue"); if (ac2) ac2.onchange = async () => { try { setState(await invoke("set_setting", { key: "auto_continue_interrupted", value: ac2.checked })); } catch (e) { alert(String(e)); } };
@@ -3309,6 +3381,8 @@ function wire() {
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
   on("selftest", () => startEnv("env_selftest"));
+  on("tm-load", () => tmLoad());
+  on("kernels", () => startEnv("env_install_kernels"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
   document.querySelectorAll(".rmworld").forEach((b) => b.onclick = async () => {

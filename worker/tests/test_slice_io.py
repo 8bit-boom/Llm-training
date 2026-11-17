@@ -95,3 +95,36 @@ def test_numpy_is_not_imported_by_the_depth_modules():
     p = subprocess.run([sys.executable, "-c", code], cwd=worker, capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stderr
     assert p.stdout.strip() == "False"
+
+
+def _old_f32_to_bf16(f32):
+    """the version before the in-place rewrite (uint64 temporaries), kept as the reference"""
+    f = np.ascontiguousarray(f32, dtype=np.float32)
+    u = f.view(np.uint32).astype(np.uint64)
+    rounded = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    nan = np.isnan(f)
+    if nan.any():
+        rounded = np.where(nan, ((u >> 16) | 0x40).astype(np.uint16), rounded)
+    return rounded
+
+
+def test_the_in_place_f32_to_bf16_is_bit_identical_to_the_old_one():
+    highs = np.arange(65536, dtype=np.uint32) << 16
+    lows = np.array([0, 0x7FFF, 0x8000, 0x8001, 0xFFFF], dtype=np.uint32)
+    bits = (highs[:, None] | lows[None, :]).reshape(-1).astype(np.uint32)
+    special = np.array([0x7F800000, 0xFF800000, 0x00000000, 0x80000000, 0x7FC00000, 0xFFC00000, 0x7F800001, 0xFFFFFFFF, 0x7FFFFFFF], dtype=np.uint32)
+    rng = np.random.default_rng(7)
+    rand = rng.integers(0, 2**32, size=1_000_000, dtype=np.uint64).astype(np.uint32)
+    for arr in (bits, special, rand):
+        f = arr.view(np.float32)
+        with np.errstate(all="ignore"):
+            assert np.array_equal(slice_io.f32_to_bf16(f), _old_f32_to_bf16(f))
+    assert slice_io.f32_to_bf16(np.array([np.inf, -np.inf, 0.0, -0.0], dtype=np.float32)).tolist() == [0x7F80, 0xFF80, 0x0000, 0x8000]
+
+
+def test_the_new_bf16_to_f32_matches_the_plain_shift_and_does_not_touch_its_input():
+    u = np.arange(65536, dtype="<u2")
+    keep = u.copy()
+    want = (u.astype(np.uint32) << 16).view(np.float32)
+    assert np.array_equal(slice_io.bf16_to_f32(u).view(np.uint32), want.view(np.uint32))
+    assert np.array_equal(u, keep)

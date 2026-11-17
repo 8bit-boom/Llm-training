@@ -68,6 +68,46 @@ pub fn gates(original: &Value, candidate: &Value) -> Value {
     json!({"verdict": verdict, "checks": checks, "failed": failed, "warned": warned})
 }
 
+// ------------------------------------------------------------------------------------------------------------------ choosing by thinking
+
+/// Two thinking scores this close are a tie: the check asks few questions (16 in the quick suite) and is noisy, so the lower loss decides.
+pub const THINK_TIE: f64 = 0.125;
+
+/// One number for "how well does it still think": the share of answers that finish their reasoning, minus the share that loop, minus the share of garbage. None when the
+/// row has no numbers.
+pub fn think_score(main: &Value) -> Option<f64> {
+    let get = |k: &str| main[k].as_f64();
+    let closed = get("closed_rate")?;
+    Some(closed - get("loop_rate").unwrap_or(0.0) - get("garbage_rate").unwrap_or(0.0))
+}
+
+/// The best candidate of `(loss, thinking score)` rows, or None for no rows. The highest score wins; scores within `THINK_TIE` of it are decided by the lower loss; a row
+/// without a score only competes when no row has one (then the lowest loss wins). A row without a loss loses every tie.
+pub fn rank_thinking(rows: &[(Option<f64>, Option<f64>)]) -> Option<usize> {
+    let by_loss = |idx: Vec<usize>| -> Option<usize> {
+        idx.into_iter().min_by(|a, b| {
+            let (la, lb) = (rows[*a].0.unwrap_or(f64::INFINITY), rows[*b].0.unwrap_or(f64::INFINITY));
+            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b))
+        })
+    };
+    let top = rows.iter().filter_map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+    if top.is_finite() {
+        by_loss((0..rows.len()).filter(|i| rows[*i].1.is_some_and(|s| s >= top - THINK_TIE - 1e-12)).collect())
+    } else if rows.iter().any(|r| r.0.is_some()) {
+        by_loss((0..rows.len()).collect())
+    } else {
+        None
+    }
+}
+
+/// Did the candidate lose much of its ability to finish its reasoning: its `closed_rate` is below 0.6 times the original's.
+pub fn lost_much(original_main: &Value, cand_main: &Value) -> bool {
+    match (original_main["closed_rate"].as_f64(), cand_main["closed_rate"].as_f64()) {
+        (Some(o), Some(c)) => o > 0.0 && c < 0.6 * o,
+        _ => false,
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------ what is checked
 
 fn default_target() -> String {
@@ -102,6 +142,11 @@ impl Default for ThinkSpec {
 
 pub fn think_dir(p: &Project, name: &str) -> PathBuf {
     models_dir(p).join(name).join("think_check")
+}
+
+/// Has the cut of the made model `name` had a thinking check of either size (saved by the worker)?
+pub fn cut_checked(p: &Project, name: &str) -> bool {
+    valid_name(name).is_ok() && [true, false].iter().any(|q| think_dir(p, name).join(file_name("cut", *q)).is_file())
 }
 
 fn file_name(target: &str, quick: bool) -> String {
@@ -205,6 +250,20 @@ fn saved(dir: &Path, target: &str, quick: bool) -> Option<Value> {
     (r.is_object() && r["suite_version"] == json!(SUITE_VERSION) && r["main"].is_object()).then_some(r)
 }
 
+/// The ways a made cut goes beyond what Auto-cut does by itself (see `auto_plan::guardrail_messages`), read from the cut's own record (`ndforge_reshape.json`): the MLP kept
+/// below `WIDTH_FIRST_KEEP` of the original's, more than `MAX_BLOCKS_FREE` blocks removed. Empty for a cut inside the rules or a record that cannot be read.
+pub fn cut_guardrails(dir: &Path) -> Vec<String> {
+    let Some(meta) = read_json(&dir.join("model").join("ndforge_reshape.json")) else { return Vec::new() };
+    if meta["mode"] != json!("prune") {
+        return Vec::new();
+    }
+    let blocks = (meta["dropped"].as_array().map(|d| d.len()).unwrap_or(0) as u32) / meta["period"].as_u64().unwrap_or(4).max(1) as u32;
+    let w = &meta["width"]["intermediate_size"];
+    let (full, after) = (w[0].as_u64().map(|x| x as u32), w[1].as_u64().map(|x| x as u32));
+    let floor = full.map(|f| (f as f64 * super::auto_plan::WIDTH_FIRST_KEEP).ceil() as u32);
+    super::auto_plan::guardrail_messages(blocks, after, full, floor)
+}
+
 /// What the result page shows: `{"suite_version", "modes": {"full": {"rows": {target: result}, "gates": {target: gates}}, "quick": {...}}, "targets": {"cut": bool, ...}, "ggufs": [...]}`.
 /// The gates are there for every row once the original of the same mode has been checked. A result of another suite version is not shown.
 pub fn results(p: &Project, name: &str) -> Result<Value> {
@@ -234,7 +293,7 @@ pub fn results(p: &Project, name: &str) -> Result<Value> {
             let path = Path::new(m["dir"].as_str()?).join(m["gguf_file"].as_str()?);
             Some(json!({"name": m["name"], "path": path}))
         }).collect();
-    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "ggufs": ggufs,
+    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "ggufs": ggufs, "guardrails": cut_guardrails(&dir),
               "targets": {"original": heal_source::read_origin(&dir).is_ok(), "cut": dir.join("model").join("config.json").is_file() || heal_source::student_folder(&dir).ok().flatten().is_some(),
                           "healed": dir.join("healed").join("config.json").is_file()}}))
 }

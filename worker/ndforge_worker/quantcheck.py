@@ -22,7 +22,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import data, ggufinfo, imatrix, llamacpp, protocol
+from . import data, fsutil, ggufinfo, imatrix, llamacpp, protocol
 
 FORMAT = 1
 CTX = 512
@@ -61,10 +61,7 @@ def find_perplexity():
 
 def free_bytes(path) -> int:
     """Free space on the disk that holds `path` (the nearest folder that exists). Tests replace this function."""
-    p = Path(path)
-    while not p.exists() and p.parent != p:
-        p = p.parent
-    return shutil.disk_usage(p).free
+    return fsutil.free_bytes(path)
 
 
 def kld_file_bytes(ctx: int, chunks: int, vocab: int) -> int:
@@ -109,7 +106,7 @@ SPECIAL = [re.compile(p) for p in (r"<\|[^|\n]{1,40}\|>", r"<(?:start|end)_of_tu
 def strip_specials(text: str, tokenizer=None) -> str:
     """llama-perplexity cannot parse special tokens (it has no --parse-special; perplexity.cpp tokenises with special parsing off), so the markers of the chat template
     (`<|im_start|>`, `<end_of_turn>`, ...) would be read as ordinary characters. They are taken out here and the role names and line breaks stay: a plain conversation."""
-    inner = data._inner(tokenizer) if tokenizer is not None else None
+    inner = data.text_tokenizer(tokenizer) if tokenizer is not None else None
     for tok in sorted(set(getattr(inner, "all_special_tokens", None) or []), key=len, reverse=True):
         if isinstance(tok, str) and tok:
             text = text.replace(tok, "\n")

@@ -23,6 +23,7 @@ Start with the root [README](../README.md). The documents below describe what is
 | [THINKING_CHECK.md](THINKING_CHECK.md) | The thinking check, and how Stop ends everything a job started |
 | [IMATRIX.md](IMATRIX.md), [MIXED_QUANTS.md](MIXED_QUANTS.md), [QUANT_COMPARE.md](QUANT_COMPARE.md) | The GGUF export: importance matrix, mixed sizes, comparing sizes |
 | [PRUNE_QWEN38_27B.md](PRUNE_QWEN38_27B.md) | A worked example with the 27B model |
+| [REAL_RUN_17B.md](REAL_RUN_17B.md) | A real run cutting a 27 B model to about 17 B: the numbers, what went wrong, and the rules that came out of it |
 
 ## Contracts with nd-world
 | Document | What it is about |

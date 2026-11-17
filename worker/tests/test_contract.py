@@ -28,9 +28,8 @@ def strs(node):
 
 def found_jobs():
     tree = ast.parse((ROOT / "__main__.py").read_text(encoding="utf-8"))
-    main = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main")
     out = set()
-    for n in ast.walk(main):
+    for n in (m for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name in ("main", "_run") for m in ast.walk(f)):       # `main` reads the job; `_run` dispatches it
         if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "kind":
             for c in n.comparators:
                 out.update(strs(c))

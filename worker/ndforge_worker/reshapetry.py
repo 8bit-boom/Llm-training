@@ -20,7 +20,7 @@ import os
 import time
 from pathlib import Path
 
-from . import protocol, reshape, reshape_width
+from . import protocol, reshape, reshape_width, speed
 from .reshape import ReshapeError
 
 TRY_FORMAT = 1
@@ -540,13 +540,15 @@ def run_try(cfg: dict) -> int:
     stop = stop_file.exists
     from transformers import AutoTokenizer
     protocol.progress("calibrate", 0.0, "Preparing the text")
-    batches = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), calib, cfg["source"].get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), calib, cfg["source"].get("family", "generic"))
     data["tokens"] = sum(int(b["attention_mask"].sum()) for b in batches)
     data["load_used"] = mode
     protocol.log(f"Trying {len(todo)} cuts on {len(batches)} batches ({data['tokens']:,} tokens), model loaded as {mode}.")
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("try", 0.0, f"Loading the model ({mode})")
     model = reshapejob._load(src_dir, mode)
+    speed.report_kernels(model)
     layers = reshapejob._find_layers(model, n_layers)
     mlp = meas["mlp"] if meas else None
     size = dims["intermediate"] if dims else 0
@@ -574,6 +576,7 @@ def run_try(cfg: dict) -> int:
                 if reshapejob._is_oom(exc):
                     raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
                 raise
+            protocol.timing("try_pass", res["seconds"], key=k, tokens=data["tokens"])
             merge_pass(data, k, res)
             data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
             write_results(folder, data)

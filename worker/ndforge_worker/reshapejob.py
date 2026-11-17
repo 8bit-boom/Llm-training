@@ -12,7 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, vision
+from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, speed, vision
 from .families import family
 from .reshape import ReshapeError
 
@@ -213,8 +213,21 @@ def _choose_load(requested: str, est_bytes: int) -> str:
     return "offload"
 
 
-def _load(folder, mode: str):
-    """The text model of a folder (AutoModelForCausalLM: vision tower and the multi-token head are left out), ready for measuring."""
+def _folder_bytes(folder) -> int:
+    try:
+        return sum(f.stat().st_size for f in Path(folder).glob("*.safetensors") if f.is_file())
+    except OSError:
+        return 0
+
+
+def _load(folder, mode: str, stage: str = "load_model"):
+    """The text model of a folder (AutoModelForCausalLM: vision tower and the multi-token head are left out), ready for measuring.
+    The time it takes is recorded as `stage` (load_model, load_teacher, load_student) with the load mode and the bytes."""
+    with protocol.timed(stage, load=mode, bytes=_folder_bytes(folder)):
+        return _load_model(folder, mode)
+
+
+def _load_model(folder, mode: str):
     import torch
     from transformers import AutoModelForCausalLM
     kw: dict = {}
@@ -291,7 +304,7 @@ def _reasoning_rows(tokenizer, key: dict, fam_name: str, want: int, seed: int) -
     src = {k: key[k] for k in ("id", "file", "config", "split", "column") if key.get(k)}
     report: dict = {}
     src.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     rows, scanned = [], 0
     try:
         for text in generaltext.texts(src):
@@ -357,7 +370,7 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     enc, _ = data.encode_rows(tokenizer, texts[:want_t] + chats[:want_c], fam_name, max_len, seed)
     if not enc:
         raise ReshapeError("Nothing in the training data could be used for measuring. Save a training-data version in Step 2 first.")
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     bs = max(1, min(int(calib_cfg.get("batch", 4)), len(enc) // 2))
     batches = _pad_batches(enc, bs, pad)
@@ -462,12 +475,15 @@ def _score(src_dir: Path, cfg: dict, period: int):
     mode = _choose_load(cfg.get("load", "auto"), est)
     protocol.progress("calibrate", 0.0, "Preparing the measuring text")
     tok = AutoTokenizer.from_pretrained(str(src_dir))
-    batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
     protocol.log(f"Measuring on {len(batches)} batches ({sum(int(b['attention_mask'].sum()) for b in batches):,} tokens), model loaded as {mode}.")
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
+    speed.report_kernels(model)
     layers = _find_layers(model, n_layers)
+    t_score = time.monotonic()
     try:
         try:
             D, D1, D2, loss, tokens = _measure(model, layers, period, batches, mode)
@@ -485,6 +501,7 @@ def _score(src_dir: Path, cfg: dict, period: int):
         del layers
         del model
         _free()
+    protocol.timing("score", time.monotonic() - t_score, tokens=tokens, load=mode)
     return D, D1, D2, loss, {"load": mode, "tokens": tokens}
 
 
@@ -577,6 +594,9 @@ def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
             keep["gdn"][s] = g(sc["gdn"])
             ov.append(reshape_width.overlap(g(sc["gdn_h1"]), g(sc["gdn_h2"])))
     return keep, (sum(ov) / len(ov) if ov else 1.0)
+
+
+MTP_REMOVED = "removed (no longer fits)"
 
 
 def _mtp_keep(tensors: dict, dims: dict, width: dict):
@@ -712,12 +732,14 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     mode = _choose_load(cfg.get("load", "auto"), est)
     protocol.progress("calibrate", 0.0, "Preparing the measuring text")
     tok = AutoTokenizer.from_pretrained(str(src_dir))
-    batches = _calibration(tok, calib, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, calib, (cfg.get("source") or {}).get("family", "generic"))
     n_tokens = sum(int(b["attention_mask"].sum()) for b in batches)
     protocol.log(f"Measuring on {len(batches)} batches ({n_tokens:,} tokens), model loaded as {mode}.")
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
+    speed.report_kernels(model)
     layers = _find_layers(model, n_layers)
     timer = time.monotonic()
     try:
@@ -737,6 +759,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
         del layers
         del model
         _free()
+    protocol.timing("score", time.monotonic() - timer, tokens=tokens, load=mode)
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
             "reasoning": reasoning_key(calib), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
@@ -754,17 +777,21 @@ def _loss(folder, cfg: dict, mode: str):
     est = sum(r.nbytes for r in safetensors_io.list_tensors(folder).values())
     mode = _choose_load(mode, est)
     tok = AutoTokenizer.from_pretrained(str(folder))
-    batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
     model = _load(folder, mode)
+    speed.report_kernels(model)
     try:
         dev = next(model.parameters()).device
         total, count = 0.0, 0
+        t_score = time.monotonic()
         with torch.no_grad():
             for b in batches:
                 ids, mask = b["input_ids"].to(dev), b["attention_mask"].to(dev)
                 ls, ln = _token_losses(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, ids, mask)
                 total += ls
                 count += ln
+        protocol.timing("check", time.monotonic() - t_score, tokens=count, load=mode)
     finally:
         del model
         _free()
@@ -852,6 +879,7 @@ def run(cfg: dict) -> int:
     nb = reshape.block_count(n_layers, period)
     protocol.progress("inspect", 1.0, f"{n_layers} layers in blocks of {period}")
     width = dims = keep = mtp_keep = sc = None
+    mtp_drop = False                    # a width cut that thins the MLP or the heads removes the multi-token head (job key keep_mtp: true keeps the old slicing)
     overlap = None
     if width_req:
         why = reshape_width.width_supported(config)
@@ -899,7 +927,8 @@ def run(cfg: dict) -> int:
                 load_used, tokens = sc["meta"].get("load", load_used), sc["meta"].get("tokens")
                 loss_before = sc["meta"].get("loss_before")
             keep, overlap = _keep_sets(sc, src, types, dims, width)
-            mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] else None
+            mtp_drop = bool(groups["mtp"]) and not cfg.get("keep_mtp") and reshape_width.mtp_removed(dims, width)
+            mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] and not mtp_drop else None
             protocol.emit("width_scores", **_width_event(sc, keep, src, overlap))
             protocol.log(f"Thinning every layer: MLP {dims['intermediate']:,} to {width['intermediate']:,}"
                          + (f", linear-attention value heads {dims['lin_v_heads']} to {width['lin_v_heads']}" if width["lin_v_heads"] != dims["lin_v_heads"] else "")
@@ -921,18 +950,29 @@ def run(cfg: dict) -> int:
     if width:
         new_cfg = reshape_width.fix_config_width(new_cfg, dims, width)
         plan = reshape_width.plan_width(plan, src, types, dims, width, keep, mtp_keep)
-        if groups["mtp"]:
+        if mtp_drop:
+            plan = [t for t in plan if not t.name.startswith("mtp.")]
+            tc_new = reshape.text_config(new_cfg)
+            for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+                if key in tc_new:
+                    tc_new[key] = 0
+            notes.append("The speculative-decoding (multi-token) head was removed: it no longer fits the thinner layers and was never measured or healed.")
+        elif groups["mtp"]:
             notes.append("The multi-token head was cut to fit but was not measured or healed; do not use it for speculative decoding." if mtp_keep
                          else "The multi-token head was left as it was.")
+    elif groups["mtp"] and mode == "prune":
+        notes.append("The multi-token head was kept unchanged; it was not healed, so speculative decoding accepts fewer tokens.")
     new_groups = reshape.group_params({t.name: (t.dtype, t.shape) for t in plan}, len(src)) if width else None
     need = sum(t.nbytes for t in plan)
-    free = shutil.disk_usage(out.parent)[2]
+    free = fsutil.free_bytes(out.parent)
     if free < need * 1.1:
         protocol.error("disk_full", f"There is not enough free space: {need * 1.1 / 1e9:.1f} GB needed in {out.parent}, {free / 1e9:.1f} GB free.")
         return 1
 
     if out.exists():
         shutil.rmtree(out)
+    fsutil.ensure_parent(out)
+    fsutil.ensure_parent(final)
     out.mkdir(parents=True)
     last = [-1.0]
 
@@ -942,11 +982,13 @@ def run(cfg: dict) -> int:
             protocol.progress("write", done / total, f"Writing the new model: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
 
     try:
-        safetensors_io.write_shards(plan, out, shard_bytes=int(float(cfg.get("shard_gb", 5)) * 2**30), on_progress=on_progress,
-                                    should_stop=lambda: stop_file.exists())
+        with protocol.timed("write", bytes=need):
+            safetensors_io.write_shards(plan, out, shard_bytes=int(float(cfg.get("shard_gb", 5)) * 2**30), on_progress=on_progress,
+                                        should_stop=lambda: stop_file.exists())
         (out / "config.json").write_text(json.dumps(new_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         _copy_side_files(src_dir, out)
-        loss_before, loss_after, load_used = _check(cfg, mode, src_dir, out, zero, loss_before, load_used, notes)
+        with protocol.timed("check"):
+            loss_before, loss_after, load_used = _check(cfg, mode, src_dir, out, zero, loss_before, load_used, notes)
         if loss_after == "failed":
             shutil.rmtree(out, ignore_errors=True)
             protocol.error("grow_check_failed", "The new model does not give the same answers as the original although it should; nothing was saved. "
@@ -960,7 +1002,7 @@ def run(cfg: dict) -> int:
         if width:
             wmeta = {"intermediate_size": [dims["intermediate"], width["intermediate"]], "linear_num_value_heads": [dims["lin_v_heads"], width["lin_v_heads"]],
                      "num_attention_heads": [dims["heads"], width["heads"]], "kept": "width_kept.npz", "scores_key": Path(cfg.get("scores_dir") or "").name or None,
-                     "stable_overlap": round(overlap, 4), "mtp": ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
+                     "stable_overlap": round(overlap, 4), "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
             _save_kept(out / "width_kept.npz", src, keep, mtp_keep)
         shape_word = ("both" if chosen else "width") if width else ("depth" if mode == "prune" else None)
         meta = {"format": 2 if width else 1, "tool": "ND Lore Forge", "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -971,7 +1013,10 @@ def run(cfg: dict) -> int:
                                  **({"reasoning": reasoning_key(calibration)} if reasoning_key(calibration) else {}), "tokens": tokens} if (scores or sc) else None),
                 "loss_before": loss_before, "loss_after": loss_after, "stable": stable,
                 "vision": "unchanged (copied from the original)" if groups["vision"] else "none",
-                "mtp": ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if width and groups["mtp"] else "copied unchanged" if groups["mtp"] else "none"}
+                "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if width and groups["mtp"] else "copied unchanged" if groups["mtp"] else "none"}
+        if mtp_drop:
+            meta["mtp_removed"] = True
+            meta["mtp_params_removed"] = int(groups["mtp"])
         if width:
             meta["shape"] = shape_word
             meta["width"] = wmeta

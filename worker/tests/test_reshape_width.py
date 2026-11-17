@@ -111,8 +111,9 @@ def test_the_parity_table_with_the_rust_side():
 
 def test_the_sizes_named_in_the_owner_decisions():
     by = {c["name"]: c["params"] / 1e9 for c in table()}
-    assert round(by["27B mild (I 13312)"], 2) == 23.69 and round(by["27B I 10752"], 2) == 21.14
-    assert round(by["27B 60 layers + I 12288"], 2) == 21.46 and round(by["27B 56 layers + I 13312"], 2) == 21.15
+    # the multi-token head is removed by a cut that thins the MLP or the heads: every width size is about 0.3-0.4 B lower than when the head was sliced and kept
+    assert round(by["27B mild (I 13312)"], 2) == 23.33 and round(by["27B I 10752"], 2) == 20.81
+    assert round(by["27B 60 layers + I 12288"], 2) == 21.12 and round(by["27B 56 layers + I 13312"], 2) == 20.79
 
 
 # ----------------------------------------------------------------------------------------------------- 3: choices
@@ -339,7 +340,7 @@ def test_plan_width_slices_exactly_what_the_table_says(tmp_path, width, drop):
     # the output is a loadable folder whose parameter count equals the formula
     g = rs.group_params({k: (r.dtype, r.shape) for k, r in st.list_tensors(out).items()}, len(src_layers))
     d = dict(dims)
-    assert rw.params_for(d, [types[s] for s in src_layers], width, g["vision"], g["other"] - d["hidden"]) == g["total"]
+    assert rw.params_for(d, [types[s] for s in src_layers], width, g["vision"], g["other"] - d["hidden"], keep_mtp=True) == g["total"]       # plan_width alone slices the head
 
 
 def test_plan_width_leaves_the_multi_token_head_alone_when_asked(tmp_path):
@@ -461,7 +462,7 @@ def test_width_only_job_from_a_cached_measurement(tmp_path):
     np = pytest.importorskip("numpy")
     src = fake_qwen_width(tmp_path)
     arrays = write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
-    j = wjob(tmp_path, src, {"intermediate_size": 20, "linear_num_value_heads": None, "num_attention_heads": 4})
+    j = wjob(tmp_path, src, {"intermediate_size": 20, "linear_num_value_heads": None, "num_attention_heads": 4}, keep_mtp=True)        # keep_mtp: the head is sliced as before
     code, ev = run_job(tmp_path, j)
     assert code == 0 and ev[-1]["type"] == "result", ev[-1]
     r = ev[-1]["data"]
@@ -483,7 +484,7 @@ def test_width_only_job_from_a_cached_measurement(tmp_path):
     refs = st.list_tensors(final)
     g = rs.group_params({k: (x.dtype, x.shape) for k, x in refs.items()}, 8)
     d = fake_dims()
-    assert g["total"] == r["params_after"] == rw.params_for(d, fake_types(), {"intermediate": 20, "lin_v_heads": 4, "heads": 4}, g["vision"], g["other"] - d["hidden"])
+    assert g["total"] == r["params_after"] == rw.params_for(d, fake_types(), {"intermediate": 20, "lin_v_heads": 4, "heads": 4}, g["vision"], g["other"] - d["hidden"], keep_mtp=True)
     assert refs["model.language_model.layers.0.mlp.gate_proj.weight"].shape == (20, 8) and refs["model.language_model.layers.3.self_attn.q_proj.weight"].shape == (32, 8)
     assert refs["mtp.layers.0.mlp.down_proj.weight"].shape == (8, 20) and refs["mtp.layers.0.self_attn.o_proj.weight"].shape == (8, 16)
     # the kept neurons are the ones with the highest scores, and they are recorded
@@ -601,5 +602,56 @@ def test_a_stop_file_cancels_a_width_job(tmp_path):
     j = wjob(tmp_path, src, {"intermediate_size": 20})
     (Path(j["out"]).parent / "STOP").write_text("")
     code, ev = run_job(tmp_path, j)
-    assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None}
+    assert code == 0 and {k: v for k, v in ev[-1]["data"].items() if k != "timings"} == {"stopped": True, "model_dir": None}
     assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
+
+
+def test_a_width_cut_removes_the_multi_token_head_and_says_so(tmp_path):
+    pytest.importorskip("numpy")
+    from ndforge_worker import imatrix
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
+    j = wjob(tmp_path, src, {"intermediate_size": 20, "linear_num_value_heads": None, "num_attention_heads": 4})
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    final = Path(j["final"])
+    refs = st.list_tensors(final)
+    assert not [k for k in refs if k.startswith("mtp.")], "no multi-token tensor is written"
+    cfg = json.loads((final / "config.json").read_text())["text_config"]
+    assert cfg["mtp_num_hidden_layers"] == 0
+    assert r["width"]["mtp"] == "removed (no longer fits)" and any("head was removed" in n for n in r["notes"])
+    meta = json.loads((final / "ndforge_reshape.json").read_text())
+    removed = sum(x.numel for k, x in st.list_tensors(src).items() if k.startswith("mtp."))
+    assert meta["mtp_removed"] is True and meta["mtp_params_removed"] == removed > 0 and meta["mtp"] == "removed (no longer fits)" and meta["width"]["mtp"] == "removed (no longer fits)"
+    g = rs.group_params({k: (x.dtype, x.shape) for k, x in refs.items()}, 8)
+    d = fake_dims()
+    assert g["mtp"] == 0 and g["total"] == r["params_after"] == rw.params_for(d, fake_types(), {"intermediate": 20, "lin_v_heads": 4, "heads": 4}, g["vision"], g["other"] - d["hidden"])
+    assert imatrix.folder_has_mtp(final) is False
+
+
+def test_a_depth_only_cut_keeps_the_head_with_a_note(tmp_path):
+    from fakemodel import fake_model
+    from ndforge_worker import imatrix
+    src = fake_model(tmp_path, 8)
+    j = {"job": "reshape", "source": {"repo": str(src), "family": "qwen3_5"}, "mode": "prune", "blocks": 1, "strategy": "contiguous", "protect": {"first": 0, "last": 0},
+         "drop_layers": [4, 5, 6, 7], "load": "auto", "check": False, "shard_gb": 5, "out": str(tmp_path / "models" / "m1" / "model.partial"), "final": str(tmp_path / "models" / "m1" / "model")}
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    final = Path(j["final"])
+    assert any(k.startswith("mtp.") for k in st.list_tensors(final))
+    assert any("kept unchanged" in n and "speculative decoding accepts fewer tokens" in n for n in ev[-1]["data"]["notes"])
+    assert imatrix.folder_has_mtp(final) is True
+
+
+def test_keep_mtp_restores_the_old_slicing(tmp_path):
+    pytest.importorskip("numpy")
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src))
+    j = wjob(tmp_path, src, {"intermediate_size": 20, "linear_num_value_heads": None, "num_attention_heads": 4}, keep_mtp=True)
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    refs = st.list_tensors(Path(j["final"]))
+    assert refs["mtp.layers.0.mlp.down_proj.weight"].shape == (8, 20)
+    meta = json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())
+    assert "mtp_removed" not in meta and "weight size" in meta["mtp"]

@@ -49,7 +49,7 @@ fn the_bundle_has_the_records_and_neither_a_stored_secret_nor_the_home_folder() 
     assert!(out.starts_with(d.path().join("save")) && out.extension().unwrap() == "zip");
     let entries = read_zip(&out);
     let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    for want in ["report.txt", "settings.json", "ndforge_env.json", "worker_hello.json", "heal.json", "export.json", "graphics_card.txt"] {
+    for want in ["report.txt", "settings.json", "ndforge_env.json", "worker_hello.json", "heal.json", "export.json", "graphics_card.txt", "timings.json"] {
         assert!(names.contains(&want), "{want} in {names:?}");
     }
     assert_eq!(names.iter().filter(|n| n.starts_with("logs/jobs/")).count(), 10, "the last ten job logs");
@@ -68,4 +68,11 @@ fn the_bundle_has_the_records_and_neither_a_stored_secret_nor_the_home_folder() 
     assert!(!read_zip(&direct).iter().any(|(n, _)| n == "heal.json"));
     std::env::remove_var("NDFORGE_CONFIG_DIR");
     std::env::remove_var("NDFORGE_ENV_DIR");
+}
+
+#[test]
+fn the_bundle_has_the_timings_of_the_latest_logs_as_data() {
+    let r = ndforge_core::timing::report_of_latest(10);
+    assert!(r["summary"].is_object() && r["advice"].is_array());
+    assert!(r["summary"]["logs"].is_u64());
 }

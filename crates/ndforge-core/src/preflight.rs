@@ -43,10 +43,16 @@ pub struct Inputs {
     pub other_instance: bool,
     /// when the files go to Unsloth Studio: is the share's folder there? None: not publishing
     pub share_reachable: Option<bool>,
+    /// what the power plan does when the computer is idle (Windows; None where it cannot be read)
+    pub sleep: Option<crate::power::SleepFacts>,
+    /// the setting "Keep this computer awake" is on
+    pub keep_awake: bool,
+    /// a heal of a model that thinks whose cut has had no thinking check yet: `Some(about minutes of the check, 0 when not known)`; None: checked, or not asked
+    pub think_cut_missing: Option<f64>,
 }
 
 fn c(id: &'static str, label: &'static str, light: Light, detail: impl Into<String>, fix: impl Into<String>) -> Check {
-    Check { id, label, light, detail: detail.into(), fix: fix.into() }
+    Check { id, label, light, detail: detail.into(), fix: fix.into(), action: None }
 }
 
 /// The checks for these inputs, in the order the list shows them.
@@ -110,10 +116,56 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             c("share", "Unsloth Studio folder", Light::Warn, "The Studio share folder cannot be reached; the files will stay in the exports folder.", "Check the folder in the Auto-cut card (\"Check the folder\"), or untick publishing.")
         });
     }
+    if let Some(m) = i.think_cut_missing {
+        let when = if m > 0.0 { format!(" (about {m:.0} min)") } else { String::new() };
+        out.push(c("think_cut", "Thinking check of the cut", Light::Warn, format!("The cut has not had a thinking check yet{when}. Lower loss does not mean it can still think."),
+                   "Run \"Check the cut model\" in the Thinking check of this model before healing: a cut that has lost its thinking is better cut again than healed."));
+    }
+    if let Some(s) = i.sleep {
+        out.push(sleep_check(&s, i.keep_awake));
+    }
     for b in &i.blockers {
         out.push(c("plan", "The plan", Light::Fail, b.clone(), ""));
     }
     out
+}
+
+const SLEEP_LABEL: &str = "Sleep while the job runs";
+
+fn minutes(s: u32) -> String {
+    if s % 60 == 0 { format!("{} min", s / 60) } else { format!("{s} s") }
+}
+
+/// The sleep light: never red (a job can be started and watched), a warning when the computer may go to sleep and stop it.
+fn sleep_check(s: &crate::power::SleepFacts, keep_awake: bool) -> Check {
+    let timers = [s.ac_standby_s, s.ac_hibernate_s].into_iter().flatten().filter(|t| *t > 0).min();
+    let unattended = s.ac_unattend_s.is_some_and(|t| t > 0);
+    let modern = s.modern_standby == Some(true);
+    let commands = "In a command window: powercfg -setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0, then the same with HIBERNATEIDLE 0 and UNATTENDSLEEP 0, then powercfg -setactive SCHEME_CURRENT.";
+    if !keep_awake && timers.is_some() {
+        let mut ch = c("sleep", SLEEP_LABEL, Light::Warn,
+                       format!("\"Keep this computer awake\" is off and Windows puts this computer to sleep after {} of no use while it is plugged in. A long job stops when that happens.", minutes(timers.unwrap_or(0))),
+                       format!("Tick \"Keep this computer awake\", or change the power plan. {commands}"));
+        ch.action = Some("keep_awake_on");
+        return ch;
+    }
+    if modern || unattended {
+        let what = match (modern, unattended) {
+            (true, true) => "Modern Standby and unattended sleep",
+            (true, false) => "Modern Standby",
+            _ => "unattended sleep",
+        };
+        let mut fix = format!("Keep the screen on as well (the setting \"Keep the screen on too\"), or switch sleep off in the power plan. {commands}");
+        if !keep_awake {
+            fix = format!("Tick \"Keep this computer awake\". {fix}");
+        }
+        let mut ch = c("sleep", SLEEP_LABEL, Light::Warn, format!("Windows can still put this computer to sleep ({what}); that stops the job."), fix);
+        if !keep_awake {
+            ch.action = Some("keep_awake_on");
+        }
+        return ch;
+    }
+    c("sleep", SLEEP_LABEL, Light::Ok, if keep_awake { "The computer is kept awake while the job runs." } else { "Sleep is switched off in the power plan." }, "")
 }
 
 /// True when nothing is red.
@@ -188,6 +240,10 @@ pub fn gather(p: Option<&Project>, kind: &str, spec: &Value) -> Inputs {
         verdict: spec["verdict"].as_str().map(|v| (v.to_string(), spec["verdict_text"].as_str().unwrap_or("").to_string())),
         blockers: strs(&spec["blockers"]),
         other_instance: crate::instance::other_running(&crate::paths::config_dir()),
+        sleep: crate::power::sleep_facts(),
+        think_cut_missing: (kind == "heal" && spec["thinks"].as_bool() == Some(true) && spec["name"].as_str().is_some_and(|n| p.is_some_and(|p| !crate::reshape::thinkcheck::cut_checked(p, n))))
+            .then(|| spec["think_minutes"].as_f64().unwrap_or(0.0)),
+        keep_awake: crate::settings::Settings::load().keep_awake,
         share_reachable: publishing.then(|| crate::settings::Settings::load().studio_share.is_some_and(|s| !s.host_path.trim().is_empty() && std::path::Path::new(s.host_path.trim()).is_dir())),
     }
 }

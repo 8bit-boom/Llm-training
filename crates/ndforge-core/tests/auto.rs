@@ -233,8 +233,19 @@ fn project(root: &std::path::Path) -> Project {
     Project::create(&root.join("projects"), "Ashfall Reach").unwrap()
 }
 
+/// the spec of most tests: without the thinking check before healing (its own tests below switch it on), so that the calls of the other steps stay easy to read
 fn spec(target: f64) -> AutoSpec {
+    AutoSpec { think_gate: false, ..AutoSpec::new("qwen3.8-27b", target) }
+}
+
+/// the same with the thinking check before healing
+fn gspec(target: f64) -> AutoSpec {
     AutoSpec::new("qwen3.8-27b", target)
+}
+
+/// the metrics of a cut that lost much of its thinking
+fn weak() -> Value {
+    json!({"closed_rate": 0.5, "accuracy": 0.28, "loop_rate": 0.5, "garbage_rate": 0.0, "median_think_tokens": 800})
 }
 
 /// what two runs must have in common: the state without ids and times
@@ -269,7 +280,7 @@ fn an_uninterrupted_run_goes_through_every_step_in_order() {
     assert_eq!(fx.done, vec![
         "inspect",
         "measure qwen3.8-27b 256 4bit reasoning=true",
-        "try samples=128 runs=[1, 2] widths=[10752] choices=0",
+        "try samples=128 runs=[1, 2] widths=[11008] choices=0",
         "try samples=128 runs=[] widths=[] choices=2",
         "cut cut-1 from qwen3.8-27b blocks=0 drop=None width=Some(14080) reasoning=true",
         "check cut-1 original quick=false gguf=false",
@@ -277,7 +288,7 @@ fn an_uninterrupted_run_goes_through_every_step_in_order() {
         "heal cut-1 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")",
         "check cut-1 healed quick=false gguf=false",
         "remove cut cut-1",
-        "cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(10752) reasoning=true",
+        "cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(11008) reasoning=true",
         "check cut-2 cut quick=false gguf=false",
         "heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")",
         "check cut-2 healed quick=false gguf=false",
@@ -314,7 +325,7 @@ fn what_is_removed_is_only_what_the_run_made_and_only_after_the_next_step_worked
     assert_eq!(removed, vec![("cut", "cut-1"), ("healed", "cut-1"), ("cut", "cut-2")], "the final healed model stays");
     let pos = |what: &str| fx.done.iter().position(|d| d == what).unwrap();
     // the cut of a stage goes after the check of its healed model, the healed model of stage 1 after the check of stage 2's
-    assert!(pos("remove cut cut-1") > pos("check cut-1 healed quick=false gguf=false") && pos("remove cut cut-1") < pos("cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(10752) reasoning=true"));
+    assert!(pos("remove cut cut-1") > pos("check cut-1 healed quick=false gguf=false") && pos("remove cut cut-1") < pos("cut cut-2 from id-cut-1-healed blocks=0 drop=None width=Some(11008) reasoning=true"));
     assert!(pos("remove healed cut-1") > pos("check cut-2 healed quick=false gguf=false") && pos("remove cut cut-2") > pos("check cut-2 healed quick=false gguf=false"));
     assert!(st.made.iter().filter(|m| m.removed).count() == 3 && st.made.iter().any(|m| m.kind == "healed" && m.name == "cut-2" && !m.removed));
     // keeping the intermediate files: nothing is removed
@@ -435,9 +446,9 @@ fn the_preflight_refuses_before_any_job_starts() {
     let mut small = Mock::new();
     small.free_gb = Some(120.0);
     let e = start(&p, &mut small, spec(21.1)).unwrap_err();
-    assert!(e.0.contains("up to 197 GB of disk") && e.0.contains("120 GB are free"), "{}", e.0);
+    assert!(e.0.contains("up to 196 GB of disk") && e.0.contains("120 GB are free"), "{}", e.0);
     let st = list(&p).into_iter().find(|s| s.status == "failed" && s.plan.is_some()).unwrap();
-    assert_eq!(st.plan.as_ref().unwrap().disk.as_ref().unwrap().peak_gb, 196.8);
+    assert_eq!(st.plan.as_ref().unwrap().disk.as_ref().unwrap().peak_gb, 195.8);
     assert!(small.done == vec!["inspect"], "{:?}", small.done);
     // a card that cannot heal the stage
     let mut card = Mock::new();
@@ -473,7 +484,7 @@ fn blocks_are_cut_as_try_first_found_them_and_the_cheapest_candidate_wins() {
     assert!(first["width"].is_null(), "stage 1: blocks only");
     assert!(fx.specs[1]["drop_layers"].is_null() && fx.specs[1]["width"]["intermediate"] == json!(chosen.intermediate.unwrap()), "stage 2: the width, measured on the healed model");
     assert_eq!(fx.specs[1]["source_model_id"], "id-cut-1-healed");
-    assert!(fx.done.iter().any(|d| d.contains("choices=2")), "the combined cut was asked: {:?}", fx.done);
+    assert!(fx.done.iter().any(|d| d.contains("choices=3")), "the combined cut was asked: {:?}", fx.done);
 }
 
 #[test]
@@ -602,10 +613,10 @@ fn a_single_stage_backed_off_gives_a_larger_model_than_asked() {
     fx.checks.insert("healed".into(), bad());
     let st = start(&p, &mut fx, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
     assert_eq!(st.status, "gates_failed");
-    // 10,752 backs off to 11,776: a larger model than asked
-    assert!(st.stages[0].plan.intermediate_after == Some(11_776), "{:?}", st.stages[0].plan);
+    // 11,008 backs off to 12,032: a larger model than asked (these sizes moved when the multi-token head stopped being counted in a width cut)
+    assert!(st.stages[0].plan.intermediate_after == Some(12_032), "{:?}", st.stages[0].plan);
     assert!(st.notes.iter().any(|n| n.contains("larger than asked")), "{:?}", st.notes);
-    assert_eq!(st.chosen.as_ref().unwrap().intermediate, Some(11_776));
+    assert_eq!(st.chosen.as_ref().unwrap().intermediate, Some(12_032));
 }
 
 #[test]
@@ -754,4 +765,263 @@ fn a_run_and_a_heal_that_were_cut_off_are_found_for_going_on_by_themselves() {
     let mut fx2 = Mock::new();
     let again = resume(&p, &mut fx2, &st.id).unwrap();
     assert!(!again.interrupted);
+}
+
+#[test]
+fn a_cut_that_try_first_measured_is_not_measured_again() {
+    // one stage: the cut is exactly the candidate Try first measured, so the new model is not loaded once more
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut one = Mock::new();
+    let st = start(&p, &mut one, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(one.specs[0]["skip_check"], json!(true), "{}", one.specs[0]);
+    let loss = st.stages[0].cut_loss.expect("Try first's loss is kept for the report");
+    let winner = st.try_result.as_ref().unwrap()["winner"].as_u64().unwrap() as usize;
+    assert_eq!(Some(loss), st.try_result.as_ref().unwrap()["rows"][winner]["loss"].as_f64());
+    // two stages: stage 1 is half the cut (not what Try first measured) and stage 2 is measured on the healed model: both are checked
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut two = Mock::new();
+    let st2 = start(&p2, &mut two, spec(21.1)).unwrap();
+    assert_eq!(st2.status, "done", "{:?}", st2.error);
+    assert_eq!(two.specs.len(), 2);
+    assert_eq!((two.specs[0]["skip_check"].clone(), two.specs[1]["skip_check"].clone()), (json!(false), json!(false)));
+    assert!(st2.stages.iter().all(|s| s.cut_loss.is_none()));
+}
+
+#[test]
+fn a_run_saved_before_the_new_fields_still_loads() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let mut v = serde_json::to_value(&st).unwrap();
+    for s in v["stages"].as_array_mut().unwrap() {
+        s.as_object_mut().unwrap().remove("cut_loss");
+    }
+    let old: ndforge_core::reshape::auto::AutoState = serde_json::from_value(v).unwrap();
+    assert!(old.stages.iter().all(|s| s.cut_loss.is_none()));
+    assert!(!serde_json::from_value::<ndforge_core::reshape::plan::ReshapeSpec>(json!({"source_model_id": "m", "mode": "prune", "blocks": 1})).unwrap().skip_check, "an old spec has no skip_check");
+}
+
+#[test]
+fn the_report_says_when_the_loss_of_a_cut_was_measured_in_try_first() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..spec(21.1) }).unwrap();
+    assert!(st.report.is_some(), "the report was written");
+    let dir = ndforge_core::reshape::auto::run_dir(&p, &st.id);
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto_report.json")).unwrap()).unwrap();
+    assert!(report["stages"][0]["cut_loss"].as_f64().is_some(), "{report}");
+    let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
+    assert!(md.contains("was measured in Try first"), "{md}");
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------ the thinking check before healing
+
+#[test]
+fn the_thinking_gate_chooses_by_how_the_cuts_think_and_plans_the_stages_again() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    // Try first likes the width-only cut best (cut-1) but it lost its thinking; the cut with a block removed (cut-2) still thinks
+    fx.checks.insert("cut-1/cut".into(), weak());
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let ids: Vec<&str> = st.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(&ids[..4], ["plan", "measure", "try", "think_gate"]);
+    let gate = st.think_gate.as_ref().unwrap();
+    assert_eq!(gate["rows"].as_array().unwrap().len(), 2);
+    assert_ne!(gate["rows"][0]["row"], gate["rows"][1]["row"]);
+    assert_eq!(st.chosen.as_ref().unwrap().blocks, 1, "{:?}", st.chosen);
+    assert!(st.notes.iter().any(|n| n.starts_with("Try first's lowest loss was") && n.contains("kept less of its thinking") && n.contains("closed 50 %")), "{:?}", st.notes);
+    // the gate's cuts are final cuts that Try first measured: their loss is not measured again
+    assert_eq!(fx.specs.len(), 2);
+    assert!(fx.specs.iter().all(|s| s["skip_check"] == json!(true)));
+    // one stage: the winner's cut and check are the stage's own; no other cut is made
+    assert_eq!(fx.cuts, 2);
+    let sta = |id: &str| st.steps.iter().find(|s| s.id == id).map(|s| (s.status.clone(), s.note.clone())).unwrap();
+    assert_eq!(sta("s1.cut"), ("skipped".into(), Some("made and checked in the thinking gate".into())));
+    assert_eq!(sta("s1.check_cut").0, "skipped");
+    assert!(st.stages[0].cut_loss.is_some());
+    // the loser went at once, the winner after its stage passed
+    let pos = |what: &str| fx.done.iter().position(|d| d == what).unwrap_or_else(|| panic!("{what} in {:?}", fx.done));
+    assert!(pos("remove cut cut-1") < pos("heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")"));
+    assert!(fx.done.iter().any(|d| d == "heal cut-2 teacher=org/Qwen3.8-27B tokens=40 recipe=Some(\"thinking\")"));
+    assert!(!fx.done.iter().any(|d| d.starts_with("heal cut-1")));
+    assert!(fx.removed.iter().any(|m| m.name == "cut-2"), "removed after its stage passed: {:?}", fx.removed);
+    // the original was checked once
+    assert_eq!(fx.asked.get("cut-1/original"), Some(&1));
+    assert_eq!(fx.asked.iter().filter(|(k, _)| k.ends_with("/original")).count(), 1);
+}
+
+#[test]
+fn a_tie_in_thinking_is_decided_by_the_loss_and_a_cut_that_lost_much_is_only_a_warning() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done");
+    assert_eq!(st.chosen.as_ref().unwrap().blocks, 0, "equal thinking: Try first's lowest loss stays");
+    assert!(!st.notes.iter().any(|n| n.starts_with("Try first's lowest loss was")));
+    // every cut lost much of its thinking: the run goes on, with the numbers in a warning
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    fx2.checks.insert("cut-1/cut".into(), weak());
+    fx2.checks.insert("cut-2/cut".into(), weak());
+    let st2 = start(&p2, &mut fx2, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(st2.status, "done", "the gate never halts: {:?}", st2.error);
+    assert!(st2.notes.iter().any(|n| n.starts_with("Even the best cut has lost much of its ability to finish its reasoning before healing (closed 50 % against 100 %)")), "{:?}", st2.notes);
+    assert_eq!(st2.think_gate.as_ref().unwrap()["lost_much"], json!(true));
+}
+
+#[test]
+fn with_two_stages_the_checked_cuts_are_deleted_and_stage_one_makes_its_own() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, gspec(21.1)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(st.stages.len(), 2);
+    // two gate cuts (final cuts, skip_check) and then the two stages' own cuts (measured as before)
+    assert_eq!(fx.cuts, 4);
+    assert_eq!(fx.specs.iter().map(|s| s["skip_check"].clone()).collect::<Vec<_>>(), vec![json!(true), json!(true), json!(false), json!(false)]);
+    assert!(fx.done.iter().any(|d| d == "remove cut cut-1") && fx.done.iter().any(|d| d == "remove cut cut-2"), "{:?}", fx.done);
+    let sta = |id: &str| st.steps.iter().find(|s| s.id == id).map(|s| s.status.clone()).unwrap();
+    assert_eq!((sta("s1.cut"), sta("s1.check_cut"), sta("think_gate")), ("done".into(), "done".into(), "done".into()));
+    // keep_intermediate keeps every checked cut
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut keep = Mock::new();
+    let st2 = start(&p2, &mut keep, AutoSpec { keep_intermediate: true, ..gspec(21.1) }).unwrap();
+    assert_eq!(st2.status, "done");
+    assert!(keep.removed.is_empty(), "{:?}", keep.removed);
+}
+
+#[test]
+fn a_stop_at_every_call_of_a_run_with_the_gate_repeats_nothing() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut plain = Mock::new();
+    plain.checks.insert("cut-1/cut".into(), weak());
+    let full = start(&p, &mut plain, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    assert_eq!(full.status, "done");
+    let full = load(&run_dir(&p, &full.id)).unwrap();
+    for n in 1..=plain.n {
+        let dir = tempdir().unwrap();
+        let q = project(dir.path());
+        let mut fx = Mock::new();
+        fx.checks.insert("cut-1/cut".into(), weak());
+        fx.stop_at = Some(n);
+        let first = start(&q, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+        assert_eq!(first.status, "stopped", "stop at call {n}: {:?}", fx.all.last());
+        let last = resume(&q, &mut fx, &first.id).unwrap();
+        assert_eq!(last.status, "done", "stop at call {n}: {:?}", last.error);
+        assert_eq!(fx.done, plain.done, "stop at call {n} ({:?})", fx.all[n - 1]);
+        let (a, b) = (shape(&last), shape(&full));
+        for (k, v) in a.as_object().unwrap() {
+            assert_eq!(v, &b[k], "stop at call {n}: {k}");
+        }
+    }
+}
+
+#[test]
+fn a_run_saved_before_the_gate_existed_loads_and_runs_without_it() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "done");
+    let mut v = serde_json::to_value(&st).unwrap();
+    v.as_object_mut().unwrap().remove("think_gate");
+    let sp = v["spec"].as_object_mut().unwrap();
+    sp.remove("think_gate");
+    sp.remove("think_gate_n");
+    let old: AutoState = serde_json::from_value(v).unwrap();
+    assert!(old.think_gate.is_none() && old.spec.think_gate && old.spec.think_gate_n == 2);
+    assert!(!old.steps.iter().any(|s| s.id == "think_gate"), "an old run has no gate step, so none runs");
+    // a stopped run of that kind goes on without it
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut a = Mock::new();
+    a.stop_at = Some(4);
+    let first = start(&p2, &mut a, spec(21.1)).unwrap();
+    let mut v2 = serde_json::to_value(&first).unwrap();
+    v2.as_object_mut().unwrap().remove("think_gate");
+    v2["spec"].as_object_mut().unwrap().remove("think_gate");
+    std::fs::write(run_dir(&p2, &first.id).join("auto.json"), serde_json::to_vec(&v2).unwrap()).unwrap();
+    let last = resume(&p2, &mut a, &first.id).unwrap();
+    assert_eq!(last.status, "done", "{:?}", last.error);
+    assert!(!a.done.iter().any(|d| d.contains("skip")) && last.think_gate.is_none());
+}
+
+#[test]
+fn the_number_of_cuts_the_gate_checks_is_validated() {
+    assert!(AutoSpec { think_gate_n: 0, ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { think_gate_n: 4, ..gspec(21.1) }.validate().is_err());
+    assert!(AutoSpec { think_gate_n: 3, ..gspec(21.1) }.validate().is_ok());
+}
+
+#[test]
+fn the_report_has_the_table_before_healing_and_the_guardrail_warnings() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("cut-1/cut".into(), weak());
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, ..gspec(21.1) }).unwrap();
+    let dir = run_dir(&p, &st.id);
+    let r: Value = serde_json::from_slice(&std::fs::read(dir.join("auto_report.json")).unwrap()).unwrap();
+    assert_eq!(r["think_gate"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(r["guardrails"].as_array().unwrap().len(), 0, "a cut inside the rules has no warning");
+    let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
+    assert!(md.contains("## Before healing") && md.contains("| Cut | Loss | Finishes reasoning | Loops | Right answers | Chosen |") && md.contains("| yes |"), "{md}");
+    // a run that was allowed to remove many blocks: the warning names the numbers
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut big = Mock::new();
+    let st2 = start(&p2, &mut big, AutoSpec { stages: 1, allow_many_blocks: true, ..gspec(15.0) }).unwrap();
+    let r2: Value = serde_json::from_slice(&std::fs::read(run_dir(&p2, &st2.id).join("auto_report.json")).unwrap()).unwrap();
+    let g = r2["guardrails"].as_array().unwrap();
+    assert!(g.iter().any(|x| x.as_str().unwrap().contains("whole blocks are removed")), "{r2}");
+    assert!(g.iter().any(|x| x.as_str().unwrap().contains("Before healing this cut finished its reasoning in")), "{g:?}");
+}
+
+#[test]
+fn the_report_says_where_the_time_went_from_the_job_logs_of_the_run() {
+    use ndforge_core::reshape::auto_report::{add_timings, markdown};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let mut st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let cfg = d.path().join("cfg");
+    let jobs = cfg.join("logs").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    let line = |t: f64, rec: Value| format!("[{t:>8.1}s out] {}\n", json!({"type": "log", "text": format!("timing: {rec}")}));
+    let log = |job: &str, recs: &[Value]| format!("# job: {}\n{}", json!({"job": job}), recs.iter().enumerate().map(|(i, r)| line(i as f64, r.clone())).collect::<String>());
+    // the logs are from 2020 and the run's times are set to match, so no other test's run can see them
+    std::fs::write(jobs.join("20200101-100000-reshape.log"), log("reshape", &[json!({"stage": "write", "seconds": 60.0}), json!({"stage": "job", "seconds": 100.0})])).unwrap();
+    std::fs::write(jobs.join("20200101-110000-export.log"), log("export", &[json!({"stage": "convert_f16", "seconds": 30.0}), json!({"stage": "job", "seconds": 100.0})])).unwrap();
+    std::fs::write(jobs.join("20190101-100000-export.log"), log("export", &[json!({"stage": "quantize", "seconds": 999.0})])).unwrap();       // before the run
+    st.created = "2020-01-01T09:00:00Z".into();
+    st.updated = "2020-01-01T12:00:00Z".into();
+    std::env::set_var("NDFORGE_CONFIG_DIR", &cfg);
+    let mut r = ndforge_core::reshape::auto_report::build(&st);
+    add_timings(&mut r, &st);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+    assert_eq!(r["timings"]["summary"]["logs"], 2);
+    assert_eq!(r["timings"]["summary"]["stages"]["write"]["seconds"], 60.0);
+    assert!(r["timings"]["summary"]["stages"].get("quantize").is_none(), "a log from before the run is not counted");
+    let md = markdown(&r);
+    assert!(md.contains("## Where the time went") && md.contains("| write | 60 | 1 | 0.30 |") || md.contains("| write | 60 | 1 |"), "{md}");
+    // no logs: no section
+    let mut none = ndforge_core::reshape::auto_report::build(&st);
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("empty"));
+    add_timings(&mut none, &st);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+    assert!(none.get("timings").is_none() || none["timings"].is_null());
+    assert!(!markdown(&none).contains("Where the time went"));
 }

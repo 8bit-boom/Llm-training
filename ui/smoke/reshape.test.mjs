@@ -397,6 +397,7 @@ test("the result card of a thinner model: the neurons chart, the stability and t
   assert.match(html, /The choice of neurons was stable \(93 % the same/);
   assert.match(html, /hold 81 % of the total score/);
   assert.match(html, /do not use it for speculative decoding/);
+  assert.match(html, /The vision part was copied unchanged\. The multi-token head was cut to fit/);
   assert.match(html, /Layers<\/th>/);
   assert.match(html, /MLP 17,408 → 10,752/);
   b.run(`rs.state.made[0].summary.width.stable_overlap = 0.6`);
@@ -902,4 +903,12 @@ test("Keep thinking: a model that is not a Qwen has no such box, a share typed i
   assert.equal(b.run("rsHealSpec().general_share"), 0.6);
   b.run(`rs.hlSpec.recipe = false`);
   assert.equal(b.run("rsHealSpec().recipe"), null);
+});
+
+test("the result card says what became of the multi-token head", () => {
+  const b = browser();
+  const removed = thinModel({ summary: { ...thinModel().summary, notes: [], width: { ...thinModel().summary.width, mtp: "removed (no longer fits)" } } });
+  open(b, pageState({ made: [removed] }));
+  assert.match(b.run("renderReshape()"), /The multi-token head \(speculative decoding\) was removed: it no longer fits the thinner layers\./);
+  assert.equal(b.run(`mtpText(null)`), "The vision part and the multi-token head were copied unchanged.");
 });

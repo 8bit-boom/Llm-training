@@ -247,7 +247,7 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
             g["id"] = DEFAULT_GENERAL
         name = g.get("file") or g.get("id")
         stats["general_source"] = name
-        inner = data._inner(tokenizer)
+        inner = data.text_tokenizer(tokenizer)
         report: dict = {}
         g.update(seed=seed, report=report, render=lambda msgs: data.render_chat_full(tokenizer, msgs, fam_name)[1])
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
@@ -665,13 +665,17 @@ def run_cache(cfg: dict) -> int:
     est = sum(r.nbytes for r in safetensors_io.list_tensors(teacher_dir).values())
     mode = reshapejob._choose_load(cfg["teacher"].get("load", "auto"), est)
     protocol.progress("cache", 0.0, f"Loading the original model ({mode})")
-    model = reshapejob._load(teacher_dir, mode)
-    inner = getattr(tok, "tokenizer", tok)
+    model = reshapejob._load(teacher_dir, mode, "load_teacher")
+    from . import speed
+    speed.report_kernels(model)
+    from .data import text_tokenizer
+    inner = text_tokenizer(tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
     window_rows = max(WINDOW_ROWS, batch)
     t0 = last_log = time.monotonic()
     seen_tokens = 0
+    rows_before = writer.done_rows
     try:
         i = writer.done_rows
         if i:
@@ -706,7 +710,7 @@ def run_cache(cfg: dict) -> int:
                 protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}")
                 if time.monotonic() - last_log >= SPEED_LOG_EVERY:
                     last_log = time.monotonic()
-                    protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far)")
+                    protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far; this row: {len(window[idx[0]]['input_ids']):,} tokens)")
             # the rows that were answered, from the first one on without a gap, go to the cache in their own order
             written = 0
             while written < len(window) and written in answers:
@@ -725,6 +729,8 @@ def run_cache(cfg: dict) -> int:
     tps = seen_tokens / max(time.monotonic() - t0, 1e-9)
     if seen_tokens:
         protocol.log(f"cache_speed: {tps:,.0f} tokens/s ({seen_tokens:,} tokens answered in {time.monotonic() - t0:,.0f} s)")
+        answered = max(1, writer.done_rows - rows_before)
+        protocol.timing("teacher_pass", time.monotonic() - t0, tokens=seen_tokens, tokens_per_s=round(tps, 1), mean_row_tokens=round(seen_tokens / answered, 1), rows=answered)
     result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows, tokens_per_s=round(tps, 1))
     protocol.result(result)
     return 0
@@ -1030,7 +1036,10 @@ def run(cfg: dict) -> int:
     method = cfg["method"]
     upcast = method == "qlora" and bool(d.get("kbit_upcast", False))     # the old 32-bit copy of the embeddings and the output layer (QLoRA only); off for healing
     lcfg = {"model": cfg["model"], "method": method, "hyper": h, "kbit_upcast": upcast}
-    model, tokenizer, _ = backends.load(lcfg, "hf")
+    with protocol.timed("load_student", method=method):
+        model, tokenizer, _ = backends.load(lcfg, "hf")
+    from . import speed
+    speed.report_kernels(model)
     if mode == "online":
         dcfg = {"train": cfg["dataset"]["train"], "tokens": int(h["tokens"]), "general": (cfg["dataset"] or {}).get("general")}
         rows, stats = build_rows(tokenizer, dcfg, cfg["model"].get("family", "generic"), int(h["max_seq"]), int(h["seed"]))
@@ -1039,7 +1048,7 @@ def run(cfg: dict) -> int:
         t_dir = reshapejob._resolve_source(d["teacher"]["repo"])
         _require_same_ids(t_dir, student_dir)
         est = sum(r.nbytes for r in safetensors_io.list_tensors(t_dir).values())
-        teacher = reshapejob._load(t_dir, reshapejob._choose_load(d["teacher"].get("load", "auto"), est))
+        teacher = reshapejob._load(t_dir, reshapejob._choose_load(d["teacher"].get("load", "auto"), est), "load_teacher")
         for p in teacher.parameters():
             p.requires_grad_(False)
     elif not any(r.get("source") == "general" for r in rows):
@@ -1053,7 +1062,7 @@ def run(cfg: dict) -> int:
     tokens_planned = sum(len(rows[i]["input_ids"]) for i in order)
     protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text).")
 
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
     cuda = torch.cuda.is_available()
     bf16 = cuda and torch.cuda.get_device_capability(0)[0] >= 8
@@ -1087,7 +1096,8 @@ def run(cfg: dict) -> int:
     def attempt(s: dict, n: int):
         if n > 0:                                            # a retry: a fresh model and trainer, from the last checkpoint
             lcfg["kbit_upcast"] = bool(s.get("upcast"))      # the ladder's first step turns the 32-bit embedding copy off
-            holder["model"] = backends.load(lcfg, "hf")[0]
+            with protocol.timed("load_student", method=method, retry=True):
+                holder["model"] = backends.load(lcfg, "hf")[0]
         mdl = holder["model"]
         _apply_checkpointing(mdl, bool(s["checkpointing"]))
         kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(s["batch"]), gradient_accumulation_steps=int(s["grad_accum"]), learning_rate=float(h["lr"]),
@@ -1114,7 +1124,8 @@ def run(cfg: dict) -> int:
         trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"])}
         live.distill = trainer.distill
         if done["before"] is None and eval_fn is not None:
-            done["before"] = eval_fn()
+            with protocol.timed("eval", when="before"):
+                done["before"] = eval_fn()
             if done["before"] is not None:
                 protocol.emit("distill_eval", step=0, calib_loss=done["before"])
         ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
@@ -1129,10 +1140,16 @@ def run(cfg: dict) -> int:
         if cuda:
             torch.cuda.reset_peak_memory_stats()
         try:
+            t_train = time.monotonic()
+            tokens_before = trainer.distill["tokens"]
             trainer.train(resume_from_checkpoint=str(ckpts[-1]) if resume else None)
+            spent = time.monotonic() - t_train
+            seen = trainer.distill["tokens"] - tokens_before
+            protocol.timing("train", spent, steps=trainer.state.global_step, tokens=seen, tokens_per_s=round(seen / spent, 1) if spent > 0 and seen > 0 else None)
             after = None
             if eval_fn is not None and not live.stopped:
-                after = eval_fn()
+                with protocol.timed("eval", when="after"):
+                    after = eval_fn()
                 if after is not None:
                     protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
             target = out / "adapter"
@@ -1181,12 +1198,14 @@ def merge(cfg: dict) -> int:
         raise ReshapeError(f"{final} already exists.")
     tensors = safetensors_io.list_tensors(base)
     need = sum(t.nbytes for t in tensors.values())
-    free = shutil.disk_usage(out.parent)[2]
+    free = fsutil.free_bytes(out.parent)
     if free < need * 1.1:
         protocol.error("disk_full", f"There is not enough free space: {need * 1.1 / 1e9:.1f} GB needed in {out.parent}, {free / 1e9:.1f} GB free.")
         return 1
     if out.exists():
         shutil.rmtree(out)
+    fsutil.ensure_parent(out)
+    fsutil.ensure_parent(final)
     out.mkdir(parents=True)
     last = [-1.0]
 
@@ -1196,7 +1215,12 @@ def merge(cfg: dict) -> int:
             protocol.progress("merge", done / total, f"Saving the healed model: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
 
     try:
-        res = slice_io.merge_lora(tensors, adapter, out, on_progress=on_progress, should_stop=lambda: stop_file.exists())
+        clock: dict = {}
+        t_merge = time.monotonic()
+        res = slice_io.merge_lora(tensors, adapter, out, on_progress=on_progress, should_stop=lambda: stop_file.exists(), clock=clock)
+        protocol.timing("merge_read", clock.get("read", 0.0), tensors=res["merged"])
+        protocol.timing("merge_compute", clock.get("compute", 0.0), tensors=res["merged"])
+        protocol.timing("merge_total", time.monotonic() - t_merge, bytes=need)
         shutil.copy2(base / "config.json", out / "config.json")
         reshapejob._copy_side_files(base, out)
         if (base / "width_kept.npz").is_file():

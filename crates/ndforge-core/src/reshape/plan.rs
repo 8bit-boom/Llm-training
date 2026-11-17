@@ -188,6 +188,9 @@ pub struct ReshapeSpec {
     /// reasoning-aware measuring: part of the samples are conversations with thinking (None: the project's own text only, as before)
     #[serde(default)]
     pub reasoning: Option<ReasoningCalib>,
+    /// do not measure the new model's loss after the cut (its loss was measured already, for instance by Try first): saves loading it once more
+    #[serde(default)]
+    pub skip_check: bool,
 }
 
 fn r_share() -> f64 {
@@ -469,6 +472,13 @@ pub fn warnings(spec: &ReshapeSpec, ins: &Inspect, vram_gb: Option<f64>) -> Vec<
             out.push("Thinning the attention layers is experimental: nobody has published how well it works for this kind of model.".to_string());
         }
     }
+    if spec.mode == Mode::Prune && ins.model_type == "qwen3_5" {
+        // a model that thinks: the error before healing does not say whether it can still think
+        let inter = spec.width.as_ref().map(|w| w.intermediate);
+        out.extend(super::auto_plan::beyond_guardrails(ins, blocks, inter).into_iter().map(|g| format!("{g} Reasoning suffers first when a cut goes this far.")));
+        let mins = super::auto_plan::think_check_minutes(ins, blocks, inter, true);
+        out.push(format!("Check its thinking before healing (Thinking check, \"Check the cut model\": about {mins:.0} minutes in Quick): a lower text-prediction error does not mean it can still think."));
+    }
     match spec.mode {
         Mode::Prune => {
             if blocks * 4 > ins.blocks {
@@ -521,7 +531,7 @@ pub fn resolve_width(d: &WidthDims, w: &Width) -> WidthSizes {
 }
 
 /// Exact parameter count of a Qwen3.5-style model with `n_lin` linear-attention and `n_full` full-attention layers at the given widths (layers +
-/// embeddings + output layer + final norm + multi-token head + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
+/// embeddings + output layer + final norm + multi-token head (not counted when the cut thins the MLP or the attention heads) + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
 /// `worker/tests/data/width_params.json` is read by both test suites.
 pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> u64 {
     let (h, hd, kv) = (d.hidden as u64, d.head_dim as u64, d.kv_heads as u64);
@@ -533,7 +543,8 @@ pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes,
     let gdn = h * conv + h * nv * dv + 2 * h * nv + conv * d.conv_kernel as u64 + 2 * nv + dv + nv * dv * h;
     let att = h * nh * hd * 2 + 2 * h * kv * hd + nh * hd * h + 2 * hd;
     let layers = n_lin * (gdn + mlp + norms) + n_full * (att + mlp + norms);
-    let mtp = d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h);
+    // a cut that thins the MLP or the attention heads removes the multi-token head (the mirror of `mtp_removed` in the worker)
+    let mtp = if w.intermediate != d.intermediate || w.heads != d.heads { 0 } else { d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h) };
     let head = if d.tied { 0 } else { d.vocab as u64 * h };
     layers + d.vocab as u64 * h + head + h + mtp + vision + other
 }

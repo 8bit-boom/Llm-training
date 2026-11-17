@@ -66,12 +66,12 @@ def _decide_checkpointing(model, rows, batch, pad_id, bf16):
 
 def _make_answer_fn(model, tokenizer, fam_name, backend, loader, max_new):
     import torch
-    from .data import _inner, render_chat
+    from .data import render_chat, text_tokenizer
 
     def answer(q):
         msgs = [{"role": "system", "content": q["system"]}, {"role": "user", "content": q["question"]}, {"role": "assistant", "content": ""}]
         prompt, _ = render_chat(tokenizer, msgs, fam_name)
-        tok = _inner(tokenizer)
+        tok = text_tokenizer(tokenizer)
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
         dev = next(model.parameters()).device
         backends.to_inference(backend, loader, model)
@@ -125,7 +125,7 @@ def run(cfg: dict) -> int:
     protocol.log(f"Backend: {backend}; method: {cfg['method']}; precision: {backends.precision_name()}")
     model, tokenizer, loader = backends.load(cfg, backend)
     rows, stats = data.load_training_rows(tokenizer, cfg["dataset"]["train"], cfg["model"]["family"], h["max_seq"], h["seed"])
-    inner = data._inner(tokenizer)
+    inner = data.text_tokenizer(tokenizer)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
     cuda = torch.cuda.is_available()
     bf16 = cuda and torch.cuda.get_device_capability(0)[0] >= 8
