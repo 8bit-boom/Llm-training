@@ -34,13 +34,20 @@ def _vision_source(cfg: dict) -> str:
     return cfg["base"].get("vision_repo") or cfg["base"]["repo"]
 
 
+_JOB = {"cfg": None}      # the export job being run: `_run` looks for its stop file here (the tools are started from many places)
+
+
+def _stop_info(cfg) -> dict:
+    """Where the Stop button's file is: the job key `stop_file`, else the one inside the importance-matrix block (older program versions)."""
+    cfg = cfg or {}
+    return {"stop_file": cfg.get("stop_file") or (cfg.get("imatrix") or {}).get("stop_file")}
+
+
 def _run(cmd, label):
-    protocol.log("$ " + " ".join(str(c) for c in cmd))
-    p = subprocess.run([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    for line in p.stdout.splitlines()[-40:]:
-        protocol.log(line)
-    if p.returncode != 0:
-        raise RuntimeError(f"{label} failed (exit code {p.returncode}). See the log.")
+    """Runs a tool of llama.cpp (converter, quantize). With a stop file in the job (`stop_file`) the Stop button ends the tool at once: raises imatrix.Stopped."""
+    rc, _tail = imatrix.run_streaming([str(c) for c in cmd], _stop_info(_JOB["cfg"]), 1, label=None, log_tail=True)
+    if rc != 0:
+        raise RuntimeError(f"{label} failed (exit code {rc}). See the log.")
 
 
 THINKING_DEFAULTS = ("off", "keep")
@@ -144,6 +151,7 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
     """Converts once to f16, then makes every wanted size from it. Returns {quant: file}. With cfg["imatrix"] and a `report` dict (see new_report) the
     importance matrix is made (or reused) after the conversion and given to every size below q8_0; the report says what happened. Raises imatrix.Stopped on Stop."""
     quants = [quants] if isinstance(quants, str) else list(quants)
+    _JOB["cfg"] = cfg
     conv, quantize = find_llama_cpp()
     if conv is None:
         raise ExportLlamaMissing("To make a GGUF file without Unsloth, llama.cpp is needed (convert_hf_to_gguf.py and llama-quantize). Install it from "
@@ -333,6 +341,7 @@ def find_gguf(dirs, quant: str, strict: bool = False):
 
 
 def run(cfg: dict) -> int:
+    _JOB["cfg"] = cfg
     protocol.reserve_stdout()
     out = Path(cfg["out"])
     out.mkdir(parents=True, exist_ok=True)

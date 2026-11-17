@@ -173,7 +173,7 @@ Training setup has **Install without Unsloth** (standard libraries only; the pro
 
 ## Stopping
 
-Stop (and closing the program) ends the worker and every program it started: its own process group on Linux and macOS, a Job Object on Windows. Details and what is not verified: `docs/THINKING_CHECK.md`, "Stopping". A line of worker output that is not valid UTF-8 (a Windows console in cp1252) is kept with the bad bytes replaced; it no longer stops the reading.
+Stop (and closing the program) ends the worker and every program it started: its own process group on Linux and macOS, a Job Object on Windows. Details and what is not verified: `docs/THINKING_CHECK.md`, "Stopping". A line of worker output that is not valid UTF-8 (a Windows console in cp1252) is kept with the bad bytes replaced; it no longer stops the reading. Stop during an export first writes a STOP file (the job key `stop_file`): the worker ends the converter or `llama-quantize` at once and exits cleanly; the program kills the worker only after a 20 s grace time.
 
 ## Saved files
 

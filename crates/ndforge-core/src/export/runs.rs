@@ -248,8 +248,8 @@ pub fn imatrix_block(p: &Project, run: &str, cfg: &Value, opts: &ImatrixOptions,
                    "reuse": opts.reuse, "nextn": opts.nextn, "reuse_dirs": saved_imatrices(p, run).into_iter().map(|(d, _)| d).collect::<Vec<_>>(), "stop_file": out.join("STOP")})))
 }
 
-/// Runs the export job. With the importance matrix the Stop button first writes a STOP file (the worker kills llama-imatrix and ends cleanly) and kills the
-/// worker only after IMATRIX_STOP_GRACE; without it the worker is killed at once, as before.
+/// Runs the export job. The Stop button first writes a STOP file (the worker kills llama-imatrix / the converter / llama-quantize and ends cleanly) and kills the
+/// worker only after IMATRIX_STOP_GRACE (`graceful: None` kills at once; the program always gives a grace time).
 pub(crate) fn run_export_job(py: &std::path::Path, job: &Value, out: &std::path::Path, graceful: Option<Duration>, kill: &AtomicBool, on_event: &mut dyn FnMut(WorkerEvent)) -> Result<Value> {
     let Some(grace) = graceful else { return run_job(py, &worker_dir(), job, kill, on_event) };
     let (inner, done, stop_file) = (AtomicBool::new(false), AtomicBool::new(false), out.join("STOP"));
@@ -411,7 +411,8 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     } else {
         job["adapter"] = json!(adapter);
     }
-    let result = run_export_job(&py, &job, &out, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
+    job["stop_file"] = json!(out.join("STOP"));
+    let result = run_export_job(&py, &job, &out, Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
@@ -557,7 +558,8 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
     if let Some(m) = &matrix {
         job["imatrix"] = m.clone();
     }
-    let result = run_export_job(&py, &job, &work, matrix.is_some().then_some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
+    job["stop_file"] = json!(work.join("STOP"));
+    let result = run_export_job(&py, &job, &work, Some(IMATRIX_STOP_GRACE), kill, &mut |e| on_event(match e {
         WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
         WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
         WorkerEvent::Other(v) => v,
