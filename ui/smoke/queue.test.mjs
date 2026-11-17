@@ -77,3 +77,11 @@ test("the Home page has the notification and webhook settings once a project is 
   b.run(`state.project = null`);
   assert.doesNotMatch(b.run("renderWelcome()"), /webhook-url/);
 });
+
+test("the Help page offers the diagnostics file and shows where it was saved", () => {
+  const b = browser();
+  b.run(`gd.html = "<p>x</p>"; gd.bundle = "/tmp/ndforge-diagnostics-1.zip"`);
+  const html = b.run("renderGuide()");
+  assert.match(html, /id="gd-bundle"/);
+  assert.match(html, /Saved: \/tmp\/ndforge-diagnostics-1\.zip/);
+});

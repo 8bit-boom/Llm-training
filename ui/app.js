@@ -3212,14 +3212,20 @@ function renderGuide() {
   if (gd.html == null) return `<h1>Guide</h1><p class="lead">Loading…</p>`;
   return `<div class="guide">${gd.html}</div>
     <div class="card wide"><h2>Something is wrong?</h2><p>The help panel on the right lists the usual problems. If it is not there, make a report and send it with your question. It contains no passwords or access keys.</p>
-      <div class="row"><button class="primary" id="gd-report">Make a problem report</button>${gd.report ? `<button class="secondary" id="gd-copy">${gd.copied ? "Copied" : "Copy to the clipboard"}</button>` : ""}</div>
-      ${gd.report ? `<textarea id="gd-text" rows="14" readonly>${esc(gd.report)}</textarea>` : ""}</div>`;
+      <div class="row"><button class="primary" id="gd-report">Make a problem report</button><button class="secondary" id="gd-bundle" title="One zip with the report, the last job logs, the settings (without keys), the versions of the training software and the newest Auto-cut, heal and export records: to attach to a message. Keys and your home folder name are taken out.">Save a diagnostics file…</button>${gd.report ? `<button class="secondary" id="gd-copy">${gd.copied ? "Copied" : "Copy to the clipboard"}</button>` : ""}</div>
+      ${gd.bundle ? `<p class="ok small" id="gd-bundle-ok">Saved: ${esc(gd.bundle)}</p>` : ""}${gd.bundleErr ? `<div class="err">${esc(gd.bundleErr)}</div>` : ""}${gd.report ? `<textarea id="gd-text" rows="14" readonly>${esc(gd.report)}</textarea>` : ""}</div>`;
 }
 async function gdLoad() { gd.html = await invoke("help", { key: "guide" }); if (page === "guide") render(); }
 function wireGuide() {
   if (page !== "guide") return;
   const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
   on("gd-report", async () => { gd.report = await invoke("problem_report"); gd.copied = false; render(); });
+  on("gd-bundle", async () => {
+    const dir = await tauri.dialog.open({ directory: true, title: "Choose where to save the diagnostics file" });
+    if (!dir) return;
+    try { gd.bundle = await invoke("diagnostics_save", { dest: dir }); gd.bundleErr = null; } catch (e) { gd.bundle = null; gd.bundleErr = String(e); }
+    render();
+  });
   on("gd-copy", async () => { try { await navigator.clipboard.writeText(gd.report); gd.copied = true; } catch (_) { $("gd-text").select(); } render(); });
 }
 

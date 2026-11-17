@@ -200,6 +200,12 @@ When a job or the queue ends the program shows a system notification ("Healing f
 POST per ended job: "ND Lore Forge: healing failed" (the kind and the result only, never a path or a name; `ndforge_core::notify`). "Shut down this computer when ... has finished" (Training page) now waits for the queue: the
 computer is switched off, after the 60-second warning, only when a job has finished normally and nothing runs or waits. The look of the toast on Windows was not checked here.
 
+## The diagnostics file
+
+Help > "Save a diagnostics file..." (`diagnostics_save`, `ndforge_core::diagnose::bundle`) writes one zip to a folder you choose: the problem report, the last 10 job logs, the settings (addresses and names, no keys: those are in `secrets.json`,
+which is never read for it; a webhook address is shown as "(set)"), the environment's marker, what the worker says about itself (`hello`), the llama.cpp install record, the newest Auto-cut run and its report, the newest heal and export
+records and the graphics card. Every text goes through `secrets::redact`, and the home folder name becomes `~`. The file is for the person to look at and attach; the program sends nothing anywhere.
+
 ## Versions of the training software
 
 The worker's `hello` job answers `{"worker", "protocol": 1, "packages": {torch, transformers, peft, trl, accelerate, bitsandbytes, unsloth, datasets}}` (versions from the installed metadata, nothing is imported).
