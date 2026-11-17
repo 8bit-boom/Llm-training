@@ -155,6 +155,20 @@ def test_the_merge_job_makes_the_missing_output_folders(tmp_path):
     assert (deep / "healed" / "config.json").is_file() and not (deep / "healed.partial").exists()
 
 
+def test_the_merge_job_reports_the_read_compute_and_total_time(tmp_path):
+    src = fake_qwen_width(tmp_path)
+    write_adapter(tmp_path / "adapter", MODULES)
+    code, ev = run_job(tmp_path, job_for(tmp_path, src))
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    by = {t["stage"]: t for t in ev[-1]["data"]["timings"]}
+    assert {"merge_read", "merge_compute", "merge_total", "job"} <= set(by)
+    assert by["merge_read"]["tensors"] == 3 and by["merge_total"]["bytes"] > 0
+    assert by["merge_read"]["seconds"] + by["merge_compute"]["seconds"] <= by["merge_total"]["seconds"] + 0.05
+    clock = {}
+    slice_io.merge_lora(st.list_tensors(src), tmp_path / "adapter", tmp_path / "again", shard_bytes=2000, clock=clock)
+    assert set(clock) == {"read", "compute"} and clock["read"] >= 0 and clock["compute"] >= 0
+
+
 def test_the_merge_job_records_the_recipe_the_model_was_healed_with(tmp_path):
     src = fake_qwen_width(tmp_path)
     write_adapter(tmp_path / "adapter", MODULES)

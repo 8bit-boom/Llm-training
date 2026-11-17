@@ -540,7 +540,8 @@ def run_try(cfg: dict) -> int:
     stop = stop_file.exists
     from transformers import AutoTokenizer
     protocol.progress("calibrate", 0.0, "Preparing the text")
-    batches = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), calib, cfg["source"].get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), calib, cfg["source"].get("family", "generic"))
     data["tokens"] = sum(int(b["attention_mask"].sum()) for b in batches)
     data["load_used"] = mode
     protocol.log(f"Trying {len(todo)} cuts on {len(batches)} batches ({data['tokens']:,} tokens), model loaded as {mode}.")
@@ -575,6 +576,7 @@ def run_try(cfg: dict) -> int:
                 if reshapejob._is_oom(exc):
                     raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
                 raise
+            protocol.timing("try_pass", res["seconds"], key=k, tokens=data["tokens"])
             merge_pass(data, k, res)
             data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
             write_results(folder, data)

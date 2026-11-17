@@ -6,10 +6,12 @@
     {"type": "error", "code": "short_code", "message": "plain-language text for the user"}
 
 Exit status: 0 after a result, 1 after an error."""
+import contextlib
 import json
 import os
 import re
 import sys
+import time
 
 # bumped when a line of the protocol changes shape (never for a new job, event or key: those are only added). The program reads it from the `hello` job.
 PROTOCOL_VERSION = 1
@@ -58,9 +60,47 @@ def add_extra(key: str, value) -> None:
     EXTRAS[key] = value
 
 
+# where the time went: `timing(stage, seconds, **fields)` logs one `timing: {...}` line (an ordinary log line: no new event type) and keeps the record;
+# `result` adds the records to a dict answer as `timings` (new key), with a last record `job` for the whole job.
+_TIMINGS: list = []
+_START = [None]
+
+
+def start_job() -> None:
+    """Called by the entry point when a job starts: forgets what an earlier job in this process collected."""
+    _TIMINGS.clear()
+    EXTRAS.clear()
+    _START[0] = time.monotonic()
+
+
+def timing(stage: str, seconds: float, **fields) -> dict:
+    rec = {"stage": stage, "seconds": round(float(seconds), 2), **{k: v for k, v in fields.items() if v is not None}}
+    _TIMINGS.append(rec)
+    log("timing: " + json.dumps(rec, ensure_ascii=False, sort_keys=True))
+    return rec
+
+
+def timings() -> list:
+    return list(_TIMINGS)
+
+
+@contextlib.contextmanager
+def timed(stage: str, **fields):
+    """Times the body and records it; the body may add fields to the yielded dict (`t["tokens"] = n`)."""
+    extra: dict = {}
+    t0 = time.monotonic()
+    try:
+        yield extra
+    finally:
+        timing(stage, time.monotonic() - t0, **{**fields, **extra})
+
+
 def result(data: dict) -> None:
-    if EXTRAS and isinstance(data, dict):
+    if isinstance(data, dict):
         data = {**data, **{k: v for k, v in EXTRAS.items() if k not in data}}
+        if _TIMINGS and "timings" not in data:
+            total = round(time.monotonic() - _START[0], 2) if _START[0] is not None else round(sum(t["seconds"] for t in _TIMINGS), 2)
+            data["timings"] = _TIMINGS + [{"stage": "job", "seconds": total}]
     emit("result", data=data)
 
 

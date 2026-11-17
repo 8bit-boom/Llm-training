@@ -601,5 +601,5 @@ def test_a_stop_file_cancels_a_width_job(tmp_path):
     j = wjob(tmp_path, src, {"intermediate_size": 20})
     (Path(j["out"]).parent / "STOP").write_text("")
     code, ev = run_job(tmp_path, j)
-    assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None}
+    assert code == 0 and {k: v for k, v in ev[-1]["data"].items() if k != "timings"} == {"stopped": True, "model_dir": None}
     assert not Path(j["out"]).exists() and not Path(j["final"]).exists()

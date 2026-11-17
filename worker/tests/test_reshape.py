@@ -470,7 +470,7 @@ def test_grow_with_identity_start(tmp_path):
     code, ev = run_job(tmp_path, j)
     assert code == 0 and ev[-1]["type"] == "result", ev[-1]
     r = ev[-1]["data"]
-    assert set(r) == RESULT_KEYS and r["stopped"] is False
+    assert set(r) - {"timings"} == RESULT_KEYS and r["stopped"] is False
     final = Path(j["final"])
     assert final.is_dir() and not Path(j["out"]).exists()
     cfg = json.loads((final / "config.json").read_text())
@@ -516,7 +516,7 @@ def test_prune_with_an_explicit_layer_list(tmp_path):
     code, ev = run_job(tmp_path, j)
     assert code == 0, ev[-1]
     r = ev[-1]["data"]
-    assert set(r) == RESULT_KEYS and r["layers_after"] == 8 and r["dropped"] == [4, 5, 6, 7] and r["chosen_blocks"] == [1] and r["src_layers"] == [0, 1, 2, 3, 8, 9, 10, 11]
+    assert set(r) - {"timings"} == RESULT_KEYS and r["layers_after"] == 8 and r["dropped"] == [4, 5, 6, 7] and r["chosen_blocks"] == [1] and r["src_layers"] == [0, 1, 2, 3, 8, 9, 10, 11]
     final = Path(j["final"])
     cfg = json.loads((final / "config.json").read_text())
     assert cfg["text_config"]["num_hidden_layers"] == 8 and cfg["text_config"]["layer_types"] == types(8)
@@ -569,6 +569,17 @@ def test_not_enough_disk_space_is_reported_before_anything_is_written(tmp_path, 
     assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
 
 
+def test_a_grow_job_reports_where_the_time_went(tmp_path):
+    src = fake_model(tmp_path, 8)
+    code, ev = run_job(tmp_path, job(tmp_path, src, "grow"))
+    assert code == 0 and ev[-1]["type"] == "result"
+    stages = [t["stage"] for t in ev[-1]["data"]["timings"]]
+    assert "write" in stages and stages[-1] == "job"
+    write = next(t for t in ev[-1]["data"]["timings"] if t["stage"] == "write")
+    assert write["bytes"] == ev[-1]["data"]["bytes_written"] and write["seconds"] >= 0
+    assert any(e["type"] == "log" and e["text"].startswith("timing: {") for e in ev), "the same records are log lines"
+
+
 def test_a_grow_job_makes_the_missing_output_folders(tmp_path):
     src = fake_model(tmp_path, 8)
     j = job(tmp_path, src, "grow")
@@ -584,7 +595,7 @@ def test_a_stop_file_cancels_and_cleans_up(tmp_path):
     j = job(tmp_path, src, "grow")
     (Path(j["out"]).parent / "STOP").write_text("")
     code, ev = run_job(tmp_path, j)
-    assert code == 0 and ev[-1]["data"] == {"stopped": True, "model_dir": None}
+    assert code == 0 and {k: v for k, v in ev[-1]["data"].items() if k != "timings"} == {"stopped": True, "model_dir": None}
     assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
 
 

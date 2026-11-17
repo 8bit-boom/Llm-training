@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import backends, fsutil, imatrix, llamacpp, mixedquant, protocol, vision
@@ -72,7 +73,8 @@ def convert_to(conv, source, final: Path, label="The GGUF conversion", extra=())
     part = fsutil.partial_of(final)
     part.unlink(missing_ok=True)
     try:
-        _run([sys.executable, conv, source, *extra, "--outfile", part, "--outtype", "f16"], label)
+        with protocol.timed("convert_f16"):
+            _run([sys.executable, conv, source, *extra, "--outfile", part, "--outtype", "f16"], label)
         if not part.is_file():
             raise RuntimeError(f"{label} finished but wrote no file. See the log.")
         fsutil.replace_retry(part, final)
@@ -92,11 +94,12 @@ def quantize_to(prefix, f16, final: Path, kind: str, flags=(), im=None, label="T
     part = fsutil.partial_of(final)
     part.unlink(missing_ok=True)
     try:
-        if im is None:
-            _run(list(prefix) + list(flags) + [f16, part, kind], label)
-            rc = 0
-        else:
-            rc, _ = imatrix.run_streaming(list(prefix) + list(flags) + [f16, part, kind], im, 1, None)
+        with protocol.timed("quantize", kind=str(kind), matrix=im is not None):
+            if im is None:
+                _run(list(prefix) + list(flags) + [f16, part, kind], label)
+                rc = 0
+            else:
+                rc, _ = imatrix.run_streaming(list(prefix) + list(flags) + [f16, part, kind], im, 1, None)
         if rc == 0 and part.is_file():
             fsutil.replace_retry(part, final)
             return rc, True
@@ -450,6 +453,7 @@ def run(cfg: dict) -> int:
             protocol.log(report["notes"][-1])
             report.update(applied=[], nextn=False)
             matrix_file = None
+        t_gguf = time.monotonic()
         try:
             if matrix_file is None:
                 model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=method)
@@ -466,6 +470,7 @@ def run(cfg: dict) -> int:
             matrix_file = None
             shutil.rmtree(tmp, ignore_errors=True)
             model.save_pretrained_gguf(str(tmp), tokenizer, quantization_method=method)
+        protocol.timing("unsloth_gguf", time.monotonic() - t_gguf, quants=len(quants), matrix=matrix_file is not None)
         if matrix_file is not None:
             for q in quants:
                 if q in imatrix.NO_IMATRIX:

@@ -8,6 +8,8 @@ Batched generation of a model with linear-attention layers and left padding is n
 """
 from __future__ import annotations
 
+import time
+
 from . import protocol
 from .data import text_tokenizer
 from .thinkcheck import ThinkCheckError
@@ -71,7 +73,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     mode = reshapejob._choose_load(job.get("load", "auto"), est)
     protocol.progress("load", 0.0, f"Loading the model ({mode})")
     model = reshapejob._load(folder, mode)
-    speed.report_kernels(model)
+    kernels = speed.report_kernels(model)
     model.config.use_cache = True
     protocol.progress("load", 1.0, "")
     stops = stop_ids(inner, model)
@@ -84,6 +86,14 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     prompts = {r["id"]: prompt_of(inner, r) for r in requests}
     order = sorted(requests, key=lambda r: (not r["thinking"], len(prompts[r["id"]])))
     seed, n_batch, i = int(settings["seed"]), 0, 0
+    counted = {"tokens": 0}
+    inner_result = on_result
+
+    def on_result(item):                                    # noqa: F811 - counts the generated tokens for the timing line
+        counted["tokens"] += int(item.get("gen_tokens") or 0)
+        inner_result(item)
+
+    t_gen = time.monotonic()
     try:
         while i < len(order):
             if should_stop():
@@ -111,5 +121,8 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
             i += len(part)
             n_batch += 1
     finally:
+        spent = time.monotonic() - t_gen
+        protocol.timing("think_generate", spent, generated_tokens=counted["tokens"], tokens_per_s=round(counted["tokens"] / spent, 1) if spent > 0 and counted["tokens"] else None,
+                        final_batch=batch, kernels=(kernels or {}).get("delta_rule") if kernels else None)
         del model
         reshapejob._free()

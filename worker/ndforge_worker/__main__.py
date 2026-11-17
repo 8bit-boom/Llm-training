@@ -80,6 +80,7 @@ def main(argv: list) -> int:
         protocol.error("bad_job", f"The job file could not be read: {exc}")
         return 1
     kind = job.get("job")
+    protocol.start_job()
     from . import power
     with power.keep_awake(kind, job):         # long jobs hold the computer awake; the short ones and the other systems are left alone
         return _run(kind, job)

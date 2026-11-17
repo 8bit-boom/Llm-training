@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 
 from .reshape import ReshapeError
 from .safetensors_io import TensorRef
@@ -156,11 +157,11 @@ def _from_f32(x, dtype: str) -> bytes:
     raise ReshapeError(f"Tensors of type {dtype} cannot be merged.")
 
 
-def merge_lora(base: dict, adapter_dir, out_dir, on_progress=None, should_stop=None, shard_bytes: int = 5 * 2**30) -> dict:
+def merge_lora(base: dict, adapter_dir, out_dir, on_progress=None, should_stop=None, shard_bytes: int = 5 * 2**30, clock: dict | None = None) -> dict:
     """Adds a plain LoRA into the base weights without loading the model: W' = W + (alpha / r) * B @ A for every adapted Linear weight (numpy, float32, one tensor
     at a time), rounded back to the tensor's own type (bf16: to nearest even). Everything else is copied as raw bytes. base: {name: TensorRef} of the base
     folder; adapter_dir: a PEFT adapter folder (adapter_model.safetensors + adapter_config.json). Writes the shards (and index) to out_dir.
-    Returns {"merged": number of weights changed, "scaling", "rank"}."""
+    Returns {"merged": number of weights changed, "scaling", "rank"}. `clock`, when given, is filled with the seconds spent reading ("read") and computing ("compute") the changed weights."""
     from pathlib import Path
 
     from . import safetensors_io as st
@@ -184,12 +185,18 @@ def merge_lora(base: dict, adapter_dir, out_dir, on_progress=None, should_stop=N
         def make():
             if should_stop and should_stop():
                 raise st.Cancelled()
+            t0 = time.monotonic()
             w = _to_f32(ref)
             a, b = _to_f32(adapter[ab["lora_A"]]), _to_f32(adapter[ab["lora_B"]])
+            t1 = time.monotonic()
             if a.shape[0] != r or b.shape[1] != r or b.shape[0] != w.shape[0] or a.shape[1] != w.shape[1]:
                 raise ReshapeError(MISMATCH)
             merged[0] += 1
-            return _from_f32(w + scaling * (b @ a), ref.dtype)
+            out = _from_f32(w + scaling * (b @ a), ref.dtype)
+            if clock is not None:
+                clock["read"] = clock.get("read", 0.0) + (t1 - t0)
+                clock["compute"] = clock.get("compute", 0.0) + (time.monotonic() - t1)
+            return out
         return make
 
     plan = []

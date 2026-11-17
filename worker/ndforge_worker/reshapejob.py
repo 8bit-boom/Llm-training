@@ -213,8 +213,21 @@ def _choose_load(requested: str, est_bytes: int) -> str:
     return "offload"
 
 
-def _load(folder, mode: str):
-    """The text model of a folder (AutoModelForCausalLM: vision tower and the multi-token head are left out), ready for measuring."""
+def _folder_bytes(folder) -> int:
+    try:
+        return sum(f.stat().st_size for f in Path(folder).glob("*.safetensors") if f.is_file())
+    except OSError:
+        return 0
+
+
+def _load(folder, mode: str, stage: str = "load_model"):
+    """The text model of a folder (AutoModelForCausalLM: vision tower and the multi-token head are left out), ready for measuring.
+    The time it takes is recorded as `stage` (load_model, load_teacher, load_student) with the load mode and the bytes."""
+    with protocol.timed(stage, load=mode, bytes=_folder_bytes(folder)):
+        return _load_model(folder, mode)
+
+
+def _load_model(folder, mode: str):
     import torch
     from transformers import AutoModelForCausalLM
     kw: dict = {}
@@ -462,13 +475,15 @@ def _score(src_dir: Path, cfg: dict, period: int):
     mode = _choose_load(cfg.get("load", "auto"), est)
     protocol.progress("calibrate", 0.0, "Preparing the measuring text")
     tok = AutoTokenizer.from_pretrained(str(src_dir))
-    batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
     protocol.log(f"Measuring on {len(batches)} batches ({sum(int(b['attention_mask'].sum()) for b in batches):,} tokens), model loaded as {mode}.")
     protocol.progress("calibrate", 1.0, "")
     protocol.progress("score", 0.0, f"Loading the model ({mode})")
     model = _load(src_dir, mode)
     speed.report_kernels(model)
     layers = _find_layers(model, n_layers)
+    t_score = time.monotonic()
     try:
         try:
             D, D1, D2, loss, tokens = _measure(model, layers, period, batches, mode)
@@ -486,6 +501,7 @@ def _score(src_dir: Path, cfg: dict, period: int):
         del layers
         del model
         _free()
+    protocol.timing("score", time.monotonic() - t_score, tokens=tokens, load=mode)
     return D, D1, D2, loss, {"load": mode, "tokens": tokens}
 
 
@@ -713,7 +729,8 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     mode = _choose_load(cfg.get("load", "auto"), est)
     protocol.progress("calibrate", 0.0, "Preparing the measuring text")
     tok = AutoTokenizer.from_pretrained(str(src_dir))
-    batches = _calibration(tok, calib, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, calib, (cfg.get("source") or {}).get("family", "generic"))
     n_tokens = sum(int(b["attention_mask"].sum()) for b in batches)
     protocol.log(f"Measuring on {len(batches)} batches ({n_tokens:,} tokens), model loaded as {mode}.")
     protocol.progress("calibrate", 1.0, "")
@@ -739,6 +756,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
         del layers
         del model
         _free()
+    protocol.timing("score", time.monotonic() - timer, tokens=tokens, load=mode)
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
             "reasoning": reasoning_key(calib), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
@@ -756,18 +774,21 @@ def _loss(folder, cfg: dict, mode: str):
     est = sum(r.nbytes for r in safetensors_io.list_tensors(folder).values())
     mode = _choose_load(mode, est)
     tok = AutoTokenizer.from_pretrained(str(folder))
-    batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
+    with protocol.timed("calibrate"):
+        batches = _calibration(tok, cfg.get("calibration") or {}, (cfg.get("source") or {}).get("family", "generic"))
     model = _load(folder, mode)
     speed.report_kernels(model)
     try:
         dev = next(model.parameters()).device
         total, count = 0.0, 0
+        t_score = time.monotonic()
         with torch.no_grad():
             for b in batches:
                 ids, mask = b["input_ids"].to(dev), b["attention_mask"].to(dev)
                 ls, ln = _token_losses(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, ids, mask)
                 total += ls
                 count += ln
+        protocol.timing("check", time.monotonic() - t_score, tokens=count, load=mode)
     finally:
         del model
         _free()
@@ -947,11 +968,13 @@ def run(cfg: dict) -> int:
             protocol.progress("write", done / total, f"Writing the new model: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
 
     try:
-        safetensors_io.write_shards(plan, out, shard_bytes=int(float(cfg.get("shard_gb", 5)) * 2**30), on_progress=on_progress,
-                                    should_stop=lambda: stop_file.exists())
+        with protocol.timed("write", bytes=need):
+            safetensors_io.write_shards(plan, out, shard_bytes=int(float(cfg.get("shard_gb", 5)) * 2**30), on_progress=on_progress,
+                                        should_stop=lambda: stop_file.exists())
         (out / "config.json").write_text(json.dumps(new_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         _copy_side_files(src_dir, out)
-        loss_before, loss_after, load_used = _check(cfg, mode, src_dir, out, zero, loss_before, load_used, notes)
+        with protocol.timed("check"):
+            loss_before, loss_after, load_used = _check(cfg, mode, src_dir, out, zero, loss_before, load_used, notes)
         if loss_after == "failed":
             shutil.rmtree(out, ignore_errors=True)
             protocol.error("grow_check_failed", "The new model does not give the same answers as the original although it should; nothing was saved. "
