@@ -926,13 +926,15 @@ def run(cfg: dict) -> int:
                          else "The multi-token head was left as it was.")
     new_groups = reshape.group_params({t.name: (t.dtype, t.shape) for t in plan}, len(src)) if width else None
     need = sum(t.nbytes for t in plan)
-    free = shutil.disk_usage(out.parent)[2]
+    free = fsutil.free_bytes(out.parent)
     if free < need * 1.1:
         protocol.error("disk_full", f"There is not enough free space: {need * 1.1 / 1e9:.1f} GB needed in {out.parent}, {free / 1e9:.1f} GB free.")
         return 1
 
     if out.exists():
         shutil.rmtree(out)
+    fsutil.ensure_parent(out)
+    fsutil.ensure_parent(final)
     out.mkdir(parents=True)
     last = [-1.0]
 

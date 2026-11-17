@@ -144,6 +144,17 @@ def test_the_merge_job_writes_a_self_contained_folder(tmp_path):
     assert set(st.list_tensors(final)) == set(st.list_tensors(src))
 
 
+def test_the_merge_job_makes_the_missing_output_folders(tmp_path):
+    src = fake_qwen_width(tmp_path)
+    write_adapter(tmp_path / "adapter", MODULES)
+    j = job_for(tmp_path, src)
+    deep = tmp_path / "x" / "y" / "z"
+    j["out"], j["final"] = str(deep / "healed.partial"), str(deep / "healed")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    assert (deep / "healed" / "config.json").is_file() and not (deep / "healed.partial").exists()
+
+
 def test_the_merge_job_records_the_recipe_the_model_was_healed_with(tmp_path):
     src = fake_qwen_width(tmp_path)
     write_adapter(tmp_path / "adapter", MODULES)

@@ -569,6 +569,16 @@ def test_not_enough_disk_space_is_reported_before_anything_is_written(tmp_path, 
     assert not Path(j["out"]).exists() and not Path(j["final"]).exists()
 
 
+def test_a_grow_job_makes_the_missing_output_folders(tmp_path):
+    src = fake_model(tmp_path, 8)
+    j = job(tmp_path, src, "grow")
+    deep = tmp_path / "a" / "b" / "c"
+    j["out"], j["final"] = str(deep / "model.partial"), str(deep / "model")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    assert (deep / "model" / "config.json").is_file() and not (deep / "model.partial").exists()
+
+
 def test_a_stop_file_cancels_and_cleans_up(tmp_path):
     src = fake_model(tmp_path, 8)
     j = job(tmp_path, src, "grow")

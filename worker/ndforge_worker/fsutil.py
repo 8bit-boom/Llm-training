@@ -3,6 +3,7 @@
 `replace_retry`: on Windows a rename or replace can fail for a moment (a virus scanner or the search indexer still holds the file or folder), so it is tried again a few times.
 A big output (a GGUF file, a model folder) is written under a `.partial` name and moved to its real name only when it is complete, so a half file is never taken for a finished one."""
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -19,6 +20,22 @@ def replace_retry(src, dst, tries: int = 10, pause: float = 0.2) -> None:
             if attempt + 1 >= tries:
                 raise
             time.sleep(pause)
+
+
+def free_bytes(path) -> int:
+    """Free space on the disk that holds `path`: the nearest folder that already exists (an output folder is often made only later,
+    and `shutil.disk_usage` on a missing path fails with WinError 3 on Windows)."""
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return shutil.disk_usage(p)[2]
+
+
+def ensure_parent(path) -> Path:
+    """Makes the folder that will hold `path` (and its parents) if it is missing. Returns `path` as a Path."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def partial_of(path) -> Path:

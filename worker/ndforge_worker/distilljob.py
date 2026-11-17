@@ -1181,12 +1181,14 @@ def merge(cfg: dict) -> int:
         raise ReshapeError(f"{final} already exists.")
     tensors = safetensors_io.list_tensors(base)
     need = sum(t.nbytes for t in tensors.values())
-    free = shutil.disk_usage(out.parent)[2]
+    free = fsutil.free_bytes(out.parent)
     if free < need * 1.1:
         protocol.error("disk_full", f"There is not enough free space: {need * 1.1 / 1e9:.1f} GB needed in {out.parent}, {free / 1e9:.1f} GB free.")
         return 1
     if out.exists():
         shutil.rmtree(out)
+    fsutil.ensure_parent(out)
+    fsutil.ensure_parent(final)
     out.mkdir(parents=True)
     last = [-1.0]
 

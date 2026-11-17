@@ -22,7 +22,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import data, ggufinfo, imatrix, llamacpp, protocol
+from . import data, fsutil, ggufinfo, imatrix, llamacpp, protocol
 
 FORMAT = 1
 CTX = 512
@@ -61,10 +61,7 @@ def find_perplexity():
 
 def free_bytes(path) -> int:
     """Free space on the disk that holds `path` (the nearest folder that exists). Tests replace this function."""
-    p = Path(path)
-    while not p.exists() and p.parent != p:
-        p = p.parent
-    return shutil.disk_usage(p).free
+    return fsutil.free_bytes(path)
 
 
 def kld_file_bytes(ctx: int, chunks: int, vocab: int) -> int:
