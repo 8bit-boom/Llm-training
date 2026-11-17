@@ -1901,7 +1901,7 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
-  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null,
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
   tk: { name: null, data: null, quick: null, gguf: "", run: null, err: null, ok: null } };
 
@@ -2098,11 +2098,16 @@ function healCard(m, pair) {
     <div class="row">${m.healed_model_id ? `<button class="primary" data-rstrain="${esc(m.healed_model_id)}">Train the healed model on your world (Step 3)</button>` : ""}</div></div>`;
   if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
   if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
-  const sp = rs.hlSpec, tk = sp.tokens_m || h.default_tokens_m, st = (h.heal && h.heal.status) || null;
+  const sp = rs.hlSpec, st = (h.heal && h.heal.status) || null;
+  const recipeOn = hlRecipeOn(h), tk = sp.tokens_m || (recipeOn ? h.recipe.tokens_m : h.default_tokens_m);
   const est = rs.hlEst && rs.hlEst.name === m.name ? rs.hlEst.est : null, plan = (est && est.plan) || h.plan || {}, kn = (est && est.knobs) || h.defaults || plan.knobs || {};
   const t = (h.tokens || []).find((x) => x.tokens_m === tk) || {};
   const expert = state.settings.expert_mode;
   gcUse(h.general);
+  if (h.recipe && sp.recipe == null && gc.state && !rs.hlSeed[m.name]) {            // the recipe is on by default: its reasoning text is chosen once, unless the person already chose a text for healing
+    rs.hlSeed[m.name] = true;
+    if (!(gc.state.choice || {}).heal) { const sc = gcScope("heal"); sc.sel = h.recipe.general; sc.project = state && state.project ? state.project.folder : ""; sc.check = null; }
+  }
   const blocked = sp.general ? gcBlocked("heal") : "";
   const verdictP = plan.verdict_text ? `<p class="${plan.verdict === "over" ? "err" : plan.verdict === "tight" ? "warn" : "dim"} small" id="hl-verdict">${esc(plan.verdict_text)}${plan.breakdown ? ` <span class="dim">Weights ${plan.breakdown.weights_gb} GB, LoRA and optimizer ${plan.breakdown.lora_gb} GB, activations ${plan.breakdown.activations_gb} GB, loss ${plan.breakdown.kl_gb} GB, the rest ${(plan.breakdown.overhead_gb + (plan.breakdown.total_gb - plan.breakdown.weights_gb - plan.breakdown.lora_gb - plan.breakdown.activations_gb - plan.breakdown.kl_gb - plan.breakdown.overhead_gb)).toFixed(1)} GB.</span>` : ""}</p>` : "";
   const mem = plan.fits === false ? `<div class="err">${esc(plan.why || "Healing does not fit this card.")}</div>${verdictP}`
@@ -2124,6 +2129,7 @@ function healCard(m, pair) {
   return `<div class="card-in">${head}
     ${pair ? `<p>The original model teaches the model you chose to answer like it does, on your world's text and on general text. This brings back what cutting the model down took away. Your world's facts are still taught afterwards, in Step 3. The healed copy is a new folder inside this project; the model you chose is only read, never changed.</p>${h.name == null && rs.hs.check && rs.hs.check.download_gb ? `<p class="warn small">Starting downloads about ${rs.hs.check.download_gb} GB from Hugging Face first (into the Hugging Face cache on this computer).</p>` : ""}`
       : `<p>The original model teaches the thinner one to answer like it did, on your world's text and on general text. This is what brings back most of what thinning took away. Your world's facts are still taught afterwards, in Step 3.</p>`}
+    ${h.recipe ? `<label class="opt"><input type="checkbox" id="hl-recipe" ${recipeOn ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Keep thinking</strong> (recommended for reasoning models). ${recipeOn ? `The healing text is ${Math.round(h.recipe.general_share * 100)} % reasoning traces that Qwen3.8-27B itself wrote (${esc(h.recipe.general)}, downloaded from Hugging Face) and the rest your world's text; texts up to ${h.recipe.seq} tokens long, LoRA size ${h.recipe.rank}, ${h.recipe.tokens_m} million tokens${h.recipe.tokens_m > 40 ? " (more, because more than 30 % was cut)" : ""}. It takes longer and needs more memory than the plain recipe. Without this the model learns to answer without thinking, and the exported file's chat template then answers without thinking too.` : `Off: the model is healed on answers without thinking, and the exported file answers without thinking unless asked.`}</label>` : ""}
     <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
     ${sp.general ? gcHtml("heal") : ""}
     <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
@@ -2837,10 +2843,14 @@ function rsSpec() {
   return spec;
 }
 
+// "Keep thinking": the recipe is offered for Qwen3.5 / 3.8 models (`opts.recipe`) and is on unless the person unticked it
+function hlRecipeOn(o) { return !!(o && o.recipe) && (rs.hlSpec.recipe == null ? !!o.recipe.default_on : !!rs.hlSpec.recipe); }
+
 // what the Heal card sends
 function rsHealSpec() {
-  const sp = rs.hlSpec, o = rs.hl && rs.hl.opts;
-  return { tokens_m: sp.tokens_m || (o && o.default_tokens_m) || 20, general_share: sp.general ? +sp.share : 0, general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
+  const sp = rs.hlSpec, o = rs.hl && rs.hl.opts, rc = hlRecipeOn(o) ? o.recipe : null;
+  return { tokens_m: sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, general_share: sp.general ? +(rc && !sp.shareSet ? rc.general_share : sp.share) : 0, recipe: rc ? rc.id : null,
+    general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
     kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null };
 }
@@ -2914,8 +2924,13 @@ function wireReshape() {
   document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
   // healing
   const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); rsHealEstimate(); }; };
-  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; }); 
-  hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; });
+  hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
+  hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again
+    hs.recipe = e.checked; hs.tokens_m = null; hs.shareSet = false;
+    const o = rs.hl && rs.hl.opts, sc = gcScope("heal");
+    if (gc.state && o && o.recipe) { sc.sel = e.checked ? o.recipe.general : gc.state.default; sc.check = null; sc.project = state && state.project ? state.project.folder : ""; gcPersist("heal"); }
+  });
+  hv("hl-share", (e) => { const v = parseFloat(e.value); hs.share = Number.isFinite(v) && v >= 0 && v <= 0.9 ? v : 0.5; hs.shareSet = true; });
   hv("hl-alpha", (e) => { const v = parseFloat(e.value); hs.alpha = Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; });
   const hnum = (id, key, lo, hi) => hv(id, (e) => { const v = parseInt(e.value, 10); hs[key] = Number.isFinite(v) && v >= lo && v <= hi ? v : null; });
   hnum("hl-rank", "rank", 8, 128); hnum("hl-klchunk", "kl_chunk", 64, 512); hnum("hl-k", "k", 8, 128); hnum("hl-warmup", "warmup", 0, 1000); hnum("hl-perupdate", "per_update", 1, 256);

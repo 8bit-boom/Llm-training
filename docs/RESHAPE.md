@@ -241,6 +241,27 @@ Healing no longer needs a model made on this page. The Heal a model section lets
 entry, a folder, a Hugging Face id) and checks the pair first (same tokenizer, supported family, full precision). A made model with its recorded original is healed
 from its result card as before. Everything is in docs/HEAL_ANY_MODEL.md, including what has not been verified.
 
+## Keep thinking: the thinking recipe of the Heal card
+
+A cut Qwen3.5 / 3.8 model that is healed on answers WITHOUT thinking forgets how to think (the exported template also answered without thinking, and a reasoning dataset used to be rendered with an
+empty thinking block in front of the real trace: docs/GENERAL_TEXT.md "Thinking"). The Heal card therefore has **Keep thinking (recommended for reasoning models)**, on by default for Qwen3.5 / 3.8
+(`HealSpec.recipe = "thinking"`, `plan::THINKING_*`, `heal_options.recipe`):
+
+| What | Recipe | Plain recipe |
+|---|---|---|
+| General text | `faunix/Qwen3.8-27B-Distillation-40K` (Apache-2.0; written by Qwen3.8-27B, the original's own way of thinking), **80 %** of the healing text; the project's own text is the rest | the chosen general text, 50 % |
+| Rows | one row per conversation, its first `seq` tokens; longer than 2 x `seq` skipped (docs/GENERAL_TEXT.md "Long rows") | the same |
+| Sequence length | **8192** when the memory estimate says it fits the card (up to 85 %), else 4096 while it is not over the card, else 2048 or 1024; 4096 when the card is not known | 1024 from 15 B |
+| Batch, LoRA size | batch 1 (32 sequences per update), rank 64 | batch 2 or 1, rank 32 |
+| Tokens | **40 million**; **80 million** when the cut took out more than 30 % of the parameters | 20 million from 15 B |
+| Loss | unchanged: KL on the original's top-32 answers (no hidden-state matching, no extra term) | |
+
+What the person chose in Expert mode still wins (sequence length, LoRA size, batch, tokens, general share, another general text). The recipe is written to `heal.json` (`recipe`) and, after the merge,
+to the healed model's `ndforge_reshape.json` (`healed.recipe`); an export of a run trained on that model keeps the model's own chat template (`thinking_default: "keep"`, docs/GENERAL_TEXT.md "The exported
+template"). A healed model's quality is checked with the **Thinking check** (docs/THINKING_CHECK.md). The recipe is refused for a model that is not Qwen3.5 / 3.8 (its chat template does not write the reasoning).
+Expect a longer and larger heal than the plain one: the teacher's saved answers are about 196 bytes per token (80 million tokens: about 15.7 GB), the rows are long, and healing a 27B to about 16 B with this
+much text is still far less than the tens of billions of tokens that published prune-and-heal work used (docs/THINKING_CHECK.md says what the check can and cannot show).
+
 ## Try before cutting (version 3)
 
 A "Try first" card on the page finds out what a cut will cost before any model folder is written (job `reshape_try`: the loss of the original, of every block skipped on its own, of every run of blocks, of every width, of a chosen combination, on the project's calibration text, with the cut imitated by hooks; kept in `reshape_try.json` next to the measurements). Everything about it, including the colour bands, the deviations and its own "not verified yet" list, is in `docs/TRY_FIRST.md`. The predicted loss equals the calibration loss of the folder the `reshape` job writes, on a tiny model (`worker/tests/test_reshape_try_torch.py`); nothing is known yet about how it relates to the quality after healing.
@@ -279,6 +300,13 @@ Everything below is **implemented as the plan says and has not been seen working
 Qwen3.5 engine accept 48 layers; 4-bit measuring ranks blocks like 16-bit; the quality after healing (QLoRA is fine for dense Qwen3.5, Unsloth's caution is for MoE; it still loses a little more than 16-bit); the
 estimated sizes (a 27B slimmed by 4 blocks is about 21.6 B; the 9B grown by 4 blocks about 13.1 B; the page computes them from the real tensor shapes, the
 plan's figures were estimates); measuring time and memory; whether a world's text gives any gain from growing (expected: no).
+
+### Thinking recipe and thinking check: not verified yet
+
+Not run on a real model, card or dataset: whether the recipe keeps the reasoning of a cut 27B (the point of the whole thing; the Thinking check was written to find out), the real rows of the faunix set
+(is its thinking really inline as `<think>...</think>`? how many rows are longer than 2 x 4096 tokens and skipped?), the memory of 8192 (the estimate says about 21 GB for a 16 B student with QLoRA,
+checkpointing and batch 1; it has never been measured), the time of 40 to 80 million tokens of long rows, and the teacher cache of 15.7 GB. The pieces were tested alone: the rendering with the real Qwen3.5 chat template
+(jinja), the recipe's numbers and what reaches the worker with a fake worker, the merge job writing `healed.recipe`, the export flag, and the Heal card in a stand-in browser.
 
 ### Version 2 (thinner layers and healing): not verified yet
 

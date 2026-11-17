@@ -565,6 +565,36 @@ pub fn default_heal_tokens_m(student_b: f64) -> u32 {
     if student_b >= 15.0 { 20 } else { 40 }
 }
 
+// ---- the thinking recipe (docs/THINKING_CHECK.md, docs/RESHAPE.md): heal a cut model so that it keeps thinking
+
+/// The name of the recipe in `HealSpec.recipe`, `heal.json` and `ndforge_reshape.json` (`healed.recipe`).
+pub const THINKING_RECIPE: &str = "thinking";
+/// The general text of the recipe: 40,000 reasoning traces written by Qwen3.8-27B (the original's own way of thinking), Apache-2.0.
+pub const THINKING_GENERAL_ID: &str = "faunix/Qwen3.8-27B-Distillation-40K";
+/// The share of the healing text that is general (reasoning) text; the project's own text is the rest.
+pub const THINKING_SHARE: f64 = 0.8;
+pub const THINKING_RANK: u32 = 64;
+/// More than this share of the parameters cut: 80 million tokens instead of 40.
+pub const THINKING_CUT_FOR_80M: f64 = 0.30;
+
+/// 40 million tokens; 80 million when the cut took out more than 30 % of the parameters.
+pub fn thinking_tokens_m(student_b: f64, teacher_b: f64) -> u32 {
+    if teacher_b > 0.0 && 1.0 - student_b / teacher_b > THINKING_CUT_FOR_80M { 80 } else { 40 }
+}
+
+/// (sequence length, batch, LoRA rank) of the recipe: sequence 8192 when the estimate says it FITS the card (up to 85 % of it), else 4096 while that is not over the card,
+/// else 2048 or 1024; 4096 when the card is not known. Batch 1 (32 sequences per update as always), gradient checkpointing on.
+pub fn thinking_knobs(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> (u32, u32, u32) {
+    let def = heal_defaults(student_b, vram_gb, d);
+    let est = |seq: u32| heal_memory_gb(student_b, d, &HealKnobs { seq, batch: 1, grad_accum: 32, checkpointing: true, rank: THINKING_RANK, ..def.clone() });
+    let seq = match vram_gb {
+        None => 4096,
+        Some(v) if heal_verdict(est(8192), Some(v)) == "fits" => 8192,
+        Some(v) => [4096, 2048, 1024].into_iter().find(|&s| est(s) <= v).unwrap_or(1024),
+    };
+    (seq, 1, THINKING_RANK)
+}
+
 // ---- the memory of healing (the student's training step)
 
 /// What the memory estimate needs to know about the student: the number of layers, the width and the vocabulary (the output layer is huge for Qwen3.5: 248,320 entries).

@@ -2316,3 +2316,101 @@ fn the_sequence_length_can_be_8192_for_long_reasoning_rows_and_nothing_else_outs
         assert!(ok(seq).unwrap_err().0.contains("512, 1024, 2048, 4096 or 8192"), "{seq}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------- the thinking recipe
+
+#[test]
+fn the_thinking_recipe_numbers_follow_the_size_of_the_cut_and_the_card() {
+    // 40 million tokens; 80 when more than 30 % of the parameters were cut
+    assert_eq!((thinking_tokens_m(21.1, 27.8), thinking_tokens_m(16.0, 27.8), thinking_tokens_m(19.5, 27.8), thinking_tokens_m(8.0, 0.0)), (40, 80, 40, 40));
+    assert_eq!((THINKING_SHARE, THINKING_RANK, THINKING_GENERAL_ID), (0.8, 64, "faunix/Qwen3.8-27B-Distillation-40K"));
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    // a 16 B student, QLoRA, checkpointing, batch 1: about 18.5 GB at 4096 and 20.6 GB at 8192 (shared cases), 85 % of a 32 GB card is 27.2 GB
+    assert_eq!(thinking_knobs(16.0, Some(32.0), &d), (8192, 1, 64));
+    assert_eq!(thinking_knobs(16.0, Some(24.0), &d).0, 4096, "8192 only when the estimate says it fits, 4096 is tight but not over");
+    assert_eq!(thinking_knobs(16.0, None, &d).0, 4096, "an unknown card: 4096");
+    assert!(thinking_knobs(16.0, Some(16.0), &d).0 <= 2048, "over the card at 4096: shorter");
+}
+
+fn spec_of(v: serde_json::Value) -> rruns::HealSpec {
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn the_recipe_changes_the_automatic_settings_and_what_the_person_chose_still_wins() {
+    let d = HealDims { layers: 40, hidden: 4096, vocab: 248_320 };
+    let plain = rruns::heal_choice(&spec_of(json!({"tokens_m": 20})), 16.0, Some(32.0), &d);
+    assert_eq!((plain.knobs.seq, plain.knobs.rank, plain.knobs.batch, plain.knobs.grad_accum), (1024, 32, 2, 16));
+    let rec = rruns::heal_choice(&spec_of(json!({"tokens_m": 40, "recipe": "thinking"})), 16.0, Some(32.0), &d);
+    assert_eq!((rec.knobs.seq, rec.knobs.rank, rec.knobs.batch, rec.knobs.grad_accum), (8192, 64, 1, 32), "32 sequences per update as always");
+    let own = rruns::heal_choice(&spec_of(json!({"tokens_m": 40, "recipe": "thinking", "seq": 2048, "rank": 16, "batch": 2})), 16.0, Some(32.0), &d);
+    assert_eq!((own.knobs.seq, own.knobs.rank, own.knobs.batch, own.knobs.grad_accum), (2048, 16, 2, 16));
+    // the recipe's text is the reasoning traces unless another general text was chosen
+    let g = spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general_share": 0.8})).general_source().unwrap().unwrap();
+    assert_eq!((g.id.as_deref(), g.split.as_deref()), (Some("faunix/Qwen3.8-27B-Distillation-40K"), Some("train")));
+    let other = spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general": {"id": "HuggingFaceH4/ultrachat_200k"}})).general_source().unwrap().unwrap();
+    assert_eq!(other.id.as_deref(), Some("HuggingFaceH4/ultrachat_200k"));
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "thinking", "general_share": 0})).general_source().unwrap().is_none(), "no general text: the project's own only");
+    assert_eq!(spec_of(json!({"tokens_m": 20})).general_source().unwrap().unwrap().id.as_deref(), Some("mlabonne/open-perfectblend"));
+    // validation
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "thinking"})).validate().is_ok() && spec_of(json!({"tokens_m": 40})).validate().is_ok());
+    assert!(spec_of(json!({"tokens_m": 40, "recipe": "fast"})).validate().unwrap_err().0.contains("Unknown healing recipe"));
+}
+
+#[cfg(unix)]
+#[test]
+fn healing_with_the_thinking_recipe_sends_its_numbers_and_records_it() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim-a");
+    thin_27b(&p, "slim-b");
+    let run = |name: &str, spec: &rruns::HealSpec| rruns::heal(&p, name, spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap();
+    let rec = spec_of(json!({"tokens_m": 80, "recipe": "thinking", "general_share": 0.8}));
+    run("slim-a", &rec);
+    run("slim-b", &spec_of(json!({"tokens_m": 80, "general_share": 0.8})));
+    let jobs = jobs_seen(d.path());
+    let (cache_a, train_a, merge_a) = (&jobs[0], &jobs[1], &jobs[2]);
+    let (cache_b, train_b, merge_b) = (&jobs[3], &jobs[4], &jobs[5]);
+    let dims = HealDims::from_config(&json!({"num_hidden_layers": 24}), 21.1);
+    let (seq, batch, rank) = thinking_knobs(21.1, Some(32.0), &dims);
+    assert_eq!((cache_a["max_seq"].clone(), train_a["hyper"]["max_seq"].clone(), train_a["hyper"]["rank"].clone(), train_a["hyper"]["batch"].clone()), (json!(seq), json!(seq), json!(rank), json!(batch)));
+    assert!(seq >= 4096 && rank == 64 && batch == 1);
+    assert_eq!((cache_a["data"]["general"]["id"].clone(), cache_a["data"]["general"]["share"].clone(), cache_a["data"]["tokens"].clone()), (json!("faunix/Qwen3.8-27B-Distillation-40K"), json!(0.8), json!(80_000_000)));
+    assert_eq!((merge_a["recipe"].clone(), merge_b.get("recipe").cloned()), (json!("thinking"), None));
+    assert_eq!((cache_b["max_seq"].clone(), train_b["hyper"]["rank"].clone(), cache_b["data"]["general"]["id"].clone()), (json!(1024), json!(32), json!("mlabonne/open-perfectblend")));
+    // heal.json keeps the recipe, and the training key differs (another sequence length and rank), so a stopped run of the other kind is not continued
+    let ha: serde_json::Value = serde_json::from_slice(&std::fs::read(p.folder.join("models/slim-a/heal.json")).unwrap()).unwrap();
+    let hb: serde_json::Value = serde_json::from_slice(&std::fs::read(p.folder.join("models/slim-b/heal.json")).unwrap()).unwrap();
+    assert_eq!((ha["recipe"].clone(), hb["recipe"].clone(), ha["spec"]["recipe"].clone()), (json!("thinking"), json!(null), json!("thinking")));
+    assert_ne!(ha["train_key"], hb["train_key"]);
+    assert_eq!((ha["train_key"]["seq"].clone(), ha["train_key"]["rank"].clone(), hb["train_key"]["seq"].clone()), (json!(seq), json!(64), json!(1024)));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_recipe_is_offered_for_qwen_models_only_and_refused_for_others() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim-q");
+    let o = rruns::heal_options(&p, "slim-q", Some(32.0)).unwrap();
+    let r = &o["recipe"];
+    assert_eq!((r["id"].clone(), r["general_share"].clone(), r["general"].clone(), r["rank"].clone(), r["batch"].clone(), r["default_on"].clone()), (json!("thinking"), json!(0.8), json!("faunix/Qwen3.8-27B-Distillation-40K"), json!(64), json!(1), json!(true)));
+    assert_eq!(r["tokens_m"], 40, "27.8 B to 21.1 B is a cut of 24 %");
+    assert!(r["seq"].as_u64().unwrap() >= 4096 && r["cut_share"].as_f64().unwrap() > 0.2 && r["cut_share"].as_f64().unwrap() < 0.3, "{r}");
+    // a model whose original is not a Qwen3.5 / 3.8 gets no recipe
+    thin_27b(&p, "slim-g");
+    let f = p.folder.join("models/slim-g/model/ndforge_reshape.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+    meta["origin"]["family"] = json!("generic");
+    std::fs::write(&f, meta.to_string()).unwrap();
+    assert!(rruns::heal_options(&p, "slim-g", Some(32.0)).unwrap()["recipe"].is_null());
+    let e = rruns::heal(&p, "slim-g", &spec_of(json!({"tokens_m": 40, "recipe": "thinking"})), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap_err();
+    assert!(e.0.contains("Qwen3.5 and Qwen3.8"), "{}", e.0);
+    assert!(jobs_seen(d.path()).iter().all(|j| j["job"] != "distill_cache" && j["job"] != "distill"), "refused before anything ran");
+}

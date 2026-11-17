@@ -55,6 +55,12 @@ Example, 16 B student (40 layers, hidden 4096, vocab 248,320), QLoRA, rank 32: d
 *tight* (up to 100 %), *will probably run out of memory* (more); healing is refused only for the last one. The teacher's step is estimated as before (4-bit, 0.6 bytes per parameter + 2 GB) and
 the heavier of the two steps counts (both together when they fit: "online").
 
+## The thinking recipe and these settings
+
+With **Keep thinking** ticked (Qwen3.5 / 3.8 students) the automatic values change: sequence length 8192 when the estimate fits (else 4096, 2048, 1024), batch 1, LoRA size 64; 40 or 80 million tokens
+(`plan::thinking_knobs`, `thinking_tokens_m`; docs/RESHAPE.md has the table). What is chosen in Expert mode wins, and a sequence length or LoRA size that differs from the stopped run's still makes the
+old checkpoints go (`train_key`). The out-of-memory ladder below never changes the sequence length or the rank, so a recipe run that is too big ends with the plain message and the choice to pick 4096 or 2048.
+
 ## Out-of-memory recovery
 
 In the worker (`healmem.run_with_oom_retry`): a torch `OutOfMemoryError`, or a `RuntimeError` / `AcceleratorError` whose text says "out of memory" (not Python's `MemoryError`) during the training step frees the model and

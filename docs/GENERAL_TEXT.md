@@ -76,7 +76,7 @@ so saved matrices stay valid).
 
 **The exported template.** Until now every Qwen3.5 export had its chat template rewritten so the model answers WITHOUT thinking unless the client asks for it (`families.default_non_thinking`; right for a
 model trained thinking-off). The export job takes the key `thinking_default`: `"off"` (the default, nothing changes for old callers such as nd-world) or `"keep"` (the template stays as the
-model ships it). The app sends `"keep"` when the base model's `ndforge_reshape.json` says `healed.recipe == "thinking"` (the recipe is written by a later step; until then it is always `"off"`).
+model ships it). The app sends `"keep"` when the base model's `ndforge_reshape.json` says `healed.recipe == "thinking"` (the recipe is the Heal card's "Keep thinking", docs/RESHAPE.md; the worker's merge job writes it as `healed.recipe`).
 
 **Long rows.** A plain-text source is cut into windows of the sequence length (a long text gives several rows). A **chat-shaped** source (messages, conversations, prompt + answer) gives **one row per
 conversation: its first `max_seq` tokens**, because a later window would have neither the question nor the chat frame; a conversation longer than **twice** the sequence length is **skipped**. The cut and

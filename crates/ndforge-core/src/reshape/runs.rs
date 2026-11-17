@@ -633,9 +633,18 @@ pub struct HealSpec {
     /// the numerics of the frozen tables: the training key and the teacher's cache key do not include it (docs/HEAL_SETTINGS.md).
     #[serde(default)]
     pub kbit_upcast: Option<bool>,
+    /// "thinking": heal so that the model keeps thinking (`plan::THINKING_RECIPE`). The window sends the recipe's numbers (`heal_options` says them: tokens, general share);
+    /// what it leaves empty is filled here: the general text (the reasoning traces of Qwen3.8-27B), the sequence length, the batch and the LoRA size. Written to `heal.json`
+    /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
+    #[serde(default)]
+    pub recipe: Option<String>,
 }
 
 impl HealSpec {
+    pub fn thinking(&self) -> bool {
+        self.recipe.as_deref() == Some(plan::THINKING_RECIPE)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !plan::HEAL_TOKENS_M.contains(&self.tokens_m) {
             return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens."));
@@ -645,6 +654,9 @@ impl HealSpec {
         }
         if self.mode.as_deref().is_some_and(|m| !["cache", "online"].contains(&m)) {
             return Err(Error::new("Unknown way of healing."));
+        }
+        if self.recipe.as_deref().is_some_and(|r| r != plan::THINKING_RECIPE) {
+            return Err(Error::new("Unknown healing recipe. The only one is \"thinking\"."));
         }
         let bad = |what: &str| Err(Error::new(format!("Healing settings out of range: {what}.")));
         if self.seq.is_some_and(|s| ![512, 1024, 2048, 4096, 8192].contains(&s)) {
@@ -680,7 +692,8 @@ impl HealSpec {
             return Ok(None);
         }
         let legacy = self.general_dataset.as_ref().filter(|d| !d.trim().is_empty()).map(|d| crate::general::GeneralSource { id: Some(d.clone()), column: self.general_column.clone(), ..Default::default() });
-        crate::general::resolve(self.general.as_ref().or(legacy.as_ref()), true).map(Some)
+        let recipe = self.thinking().then(|| crate::general::GeneralSource::hub(plan::THINKING_GENERAL_ID));
+        crate::general::resolve(self.general.as_ref().or(legacy.as_ref()).or(recipe.as_ref()), true).map(Some)
     }
 }
 
@@ -697,10 +710,12 @@ pub struct HealChoice {
 
 pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &plan::HealDims) -> HealChoice {
     let def = plan::heal_defaults(student_b, vram_gb, d);
-    let batch = spec.batch.unwrap_or(def.batch);
+    // the thinking recipe changes what the automatic values are; what the person chose still wins
+    let (rseq, rbatch, rrank) = if spec.thinking() { plan::thinking_knobs(student_b, vram_gb, d) } else { (def.seq, def.batch, def.rank) };
+    let batch = spec.batch.unwrap_or(rbatch);
     let per_update = spec.per_update.unwrap_or(def.batch * def.grad_accum).max(batch);
     let mut knobs = plan::HealKnobs {
-        seq: spec.seq.unwrap_or(def.seq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(def.rank),
+        seq: spec.seq.unwrap_or(rseq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(rrank),
         kl_chunk: spec.kl_chunk.unwrap_or(def.kl_chunk), qlora: match spec.method.as_deref() { Some("qlora") => true, Some("lora") => false, _ => def.qlora }, upcast: false,
     };
     knobs.upcast = knobs.qlora && spec.kbit_upcast.unwrap_or(false);      // 16-bit LoRA has no such copy
@@ -801,6 +816,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let o = heal_source::read_origin(&dir)?;
     let (origin, family) = (o.teacher.clone(), o.family.clone());
+    if spec.thinking() && family != "qwen3_5" {
+        return Err(Error::new("The thinking recipe is for Qwen3.5 and Qwen3.8 models (their chat template writes the reasoning). Untick \"Keep thinking\" for this model."));
+    }
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: healing uses your world's text."))?;
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
     if !train.is_file() {
@@ -839,7 +857,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
     let stop_file = dir.join("STOP");
     let started_at = read_json(&dir.join("heal.json")).and_then(|h| h["created"].as_str().map(String::from)).unwrap_or_else(now);
-    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": []}));
+    set_heal(&dir, json!({"status": "running", "step": "start", "spec": spec, "general": general, "general_key": general_key, "created": started_at, "error": null, "oom": false, "mode": mode, "plan": hp, "knobs": ch.knobs, "knobs_now": Value::Null, "train_key": train_key, "retries": [], "recipe": spec.recipe}));
     let stopped = |step: &str| {
         set_heal(&dir, json!({"status": "stopped", "step": step}));
         json!({"stopped": true, "name": name})
@@ -901,6 +919,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         summary = r;
     }
     let mut job = json!({"job": "distill_merge", "base": model, "adapter": run_dir.join("adapter"), "out": dir.join("healed.partial"), "final": dir.join("healed"), "summary": summary, "stop_file": stop_file});
+    if let Some(r) = &spec.recipe {
+        job["recipe"] = json!(r);          // the merged model's ndforge_reshape.json says how it was healed (healed.recipe): the export keeps its thinking template for "thinking"
+    }
     if o.external || o.teacher_chosen {
         // a model the Slim page did not make has no recorded original: the merged folder records the teacher (and the student's name) for Step 3 and Step 5
         job["origin"] = json!({"repo": origin, "family": family, "params": (teacher_b * 1e9).round()});
@@ -1161,8 +1182,19 @@ pub fn heal_options_with(p: &Project, dir: Option<(&str, &Path)>, o: &heal_sourc
         "teacher": o.teacher, "external": o.external, "teacher_chosen": o.teacher_chosen, "student_label": o.student_label, "general_dataset": DEFAULT_GENERAL_DATASET, "general": crate::general::state(Some(p)), "has_data": crate::train::runs::latest_version(p).is_some(),
         "healed": dir.is_some_and(|(_, d)| d.join("healed").join("config.json").is_file()), "heal": heal, "metrics": dir.map(|(n, _)| heal_metrics(p, n)).unwrap_or_default(), "vram_gb": vram_gb,
         "free_disk_gb": crate::envmgr::health::free_disk_gb(&free_in).map(|g| (g * 10.0).round() / 10.0),
-        "calibration": o.calibration, "loss": {"original": o.loss_before, "thinned": o.loss_after},
+        "calibration": o.calibration, "loss": {"original": o.loss_before, "thinned": o.loss_after}, "recipe": thinking_recipe_json(o, &dims, vram_gb),
     })
+}
+
+/// What the Heal card needs for "Keep thinking": the recipe's numbers for this student and card, and whether it is on by default (Qwen3.5 / Qwen3.8 students). Null for other models.
+fn thinking_recipe_json(o: &heal_source::Origin, dims: &plan::HealDims, vram_gb: Option<f64>) -> Value {
+    if o.family != "qwen3_5" {
+        return Value::Null;
+    }
+    let (seq, batch, rank) = plan::thinking_knobs(o.student_b, vram_gb, dims);
+    let cut = if o.teacher_b > 0.0 { (1.0 - o.student_b / o.teacher_b).max(0.0) } else { 0.0 };
+    json!({"id": plan::THINKING_RECIPE, "tokens_m": plan::thinking_tokens_m(o.student_b, o.teacher_b), "general_share": plan::THINKING_SHARE, "general": plan::THINKING_GENERAL_ID, "seq": seq, "batch": batch,
+           "rank": rank, "cut_share": (cut * 1000.0).round() / 1000.0, "default_on": true})
 }
 
 /// The Heal card's live estimate: the plan (memory in plain words, the breakdown, the way that fits) for the settings the person has chosen so far, and the

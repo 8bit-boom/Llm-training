@@ -1026,6 +1026,8 @@ def merge(cfg: dict) -> int:
                           "from": cfg.get("student_label") or (base.name if base.name != "model" else base.parent.name), "merged_weights": res["merged"],
                           "lora_rank": res["rank"], "lora_scaling": res["scaling"], **{k: s.get(k) for k in (
                               "mode", "general", "steps", "tokens_seen", "kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss") if k in s}}
+        if cfg.get("recipe"):
+            meta["healed"]["recipe"] = str(cfg["recipe"])         # "thinking": the export keeps the model's own chat template (exportjob thinking_default)
         (out / "ndforge_reshape.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         label = cfg.get("student_label") or base.parent.name
         teacher = (meta.get("origin") or {}).get("repo")

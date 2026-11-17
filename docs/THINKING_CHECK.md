@@ -4,6 +4,11 @@ A cut and healed model can look fine on the usual numbers (text-prediction error
 small suite of questions with thinking switched on and says whether the model still writes a reasoning trace, finishes it, reaches the right answer and stays free of loops and garbage,
 compared with the original model. It is a smoke test with 32 questions, not a benchmark: a difference of one or two questions is noise.
 
+## Where it fits
+
+Heal with **Keep thinking** (docs/RESHAPE.md), then check: the original, the cut model (before healing: how much thinking the cut alone took away) and the healed model, and a GGUF of the export (does
+the file llama.cpp runs still think; the exported template keeps thinking for a model healed with the recipe).
+
 ## The suite
 
 `worker/ndforge_worker/suites/think_suite.jsonl` (written for this program; `suite_version` 1; installed with the worker as package data):

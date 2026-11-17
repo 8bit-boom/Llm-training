@@ -144,6 +144,23 @@ def test_the_merge_job_writes_a_self_contained_folder(tmp_path):
     assert set(st.list_tensors(final)) == set(st.list_tensors(src))
 
 
+def test_the_merge_job_records_the_recipe_the_model_was_healed_with(tmp_path):
+    src = fake_qwen_width(tmp_path)
+    write_adapter(tmp_path / "adapter", MODULES)
+    j = {**job_for(tmp_path, src), "recipe": "thinking"}
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    assert json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())["healed"]["recipe"] == "thinking"
+
+
+def test_a_merge_without_a_recipe_records_none(tmp_path):
+    src = fake_qwen_width(tmp_path)
+    write_adapter(tmp_path / "adapter", MODULES)
+    j = job_for(tmp_path, src)
+    code, _ = run_job(tmp_path, j)
+    assert code == 0 and "recipe" not in json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())["healed"]
+
+
 def test_the_merge_job_says_plainly_when_the_adapter_does_not_fit(tmp_path):
     src = fake_qwen_width(tmp_path)
     write_adapter(tmp_path / "adapter", {"model.layers.0.mlp.gate_proj": (20, 8)})
