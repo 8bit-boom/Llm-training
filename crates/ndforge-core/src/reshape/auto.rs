@@ -21,6 +21,8 @@ use crate::project::Project;
 
 pub const FORMAT: u32 = 1;
 /// The samples of the cut's measuring, of the width's measuring and of a quick Try (the Slim page's own numbers).
+/// How many of the newest saved job logs the time estimate learns from.
+const HISTORY_LOGS: usize = 60;
 const CALIB_SAMPLES: u32 = 128;
 const WIDTH_SAMPLES: u32 = 256;
 const TRY_RECHECK_SAMPLES: u32 = 256;
@@ -96,6 +98,10 @@ pub trait Effects {
     fn vram_gb(&self) -> Option<f64>;
     /// free space on the disk the models are written to
     fn free_disk_gb(&self) -> Option<f64>;
+    /// what this computer's saved job logs say about its speed (the time estimate); nothing by default
+    fn history(&self) -> crate::timing::History {
+        crate::timing::History::default()
+    }
     fn inspect(&mut self, model: &ModelRef) -> Result<Out<Inspect>>;
     fn measure(&mut self, model_id: &str, samples: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Out<Value>>;
     /// Runs the cuts of a Try-first request and returns the saved analysis (`reshape_try.json`'s `analysis`).
@@ -553,6 +559,7 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     }
     let ins = out!(fx.inspect(&model)?);
     let plan = auto_plan::plan(&ins, &st.spec, fx.vram_gb(), fx.free_disk_gb());
+    let plan = auto_plan::with_history(plan, &ins, &st.spec, &fx.history());
     if !plan.ok {
         st.plan = Some(plan.clone());
         return Err(Error::new(plan.blockers.join(" ")));
@@ -1187,7 +1194,7 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 /// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
 pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
-    let mut plan = auto_plan::plan(ins, spec, vram_gb, free_gb);
+    let mut plan = auto_plan::with_history(auto_plan::plan(ins, spec, vram_gb, free_gb), ins, spec, &crate::timing::History::recent(HISTORY_LOGS));
     if !has_training_data {
         plan.ok = false;
         plan.blockers.push("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text.".into());

@@ -10,9 +10,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub use super::auto_time::{time_estimate, ExtraTime, StepPart, StepTime, TimeEstimate};
 use super::plan::{self, HealDims, HealPlan, Inspect, Mode, Width};
 use super::runs::{heal_choice, HealSpec};
 use crate::error::{Error, Result};
+use crate::timing::History;
 
 /// Whole blocks that may be removed without the owner's confirmation.
 pub const MAX_BLOCKS_FREE: u32 = 4;
@@ -232,8 +234,14 @@ pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) 
 pub fn think_check_minutes(ins: &Inspect, blocks: u32, intermediate: Option<u32>, quick: bool) -> f64 {
     let params = size_of(ins, blocks, intermediate) as f64;
     let write = params * ins.bytes_per_param.max(1.0) / 500e6 / 60.0;
-    let check = (if quick { 10.0 } else { 15.0 }) * (params / 1e9 / 17.0).max(1.0);
+    let check = think_check_only_minutes(params / 1e9, quick);
     ((write + check) * 10.0).round() / 10.0
+}
+
+/// The check alone (no writing of the cut): 15 minutes for the full suite, 10 for the quick one, per 17 B of the model, at least once. The one formula the time estimate
+/// (`auto_time`) and the plan's own thinking-check times share.
+pub fn think_check_only_minutes(params_b: f64, quick: bool) -> f64 {
+    (if quick { 10.0 } else { 15.0 }) * (params_b / 17.0).max(1.0)
 }
 
 pub fn think_gate_minutes(ins: &Inspect, cand: &Candidate, quick: bool) -> f64 {
@@ -571,6 +579,9 @@ pub struct AutoPlan {
     /// with a target size: about how many minutes measuring the fit takes and how many the comparison takes; (None: no target). Guesses.
     #[serde(default)]
     pub measured_minutes: Option<(f64, f64)>,
+    /// the time of the WHOLE run, step by step, before it starts (`auto_time`); None while the plan has blockers
+    #[serde(default)]
+    pub time: Option<TimeEstimate>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -578,7 +589,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);
@@ -656,5 +667,16 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     }
     out.disk = Some(disk);
     out.ok = out.blockers.is_empty();
+    if out.ok {
+        out.time = Some(time_estimate(ins, spec, &out, &History::default()));
+    }
     out
+}
+
+/// The plan with the time estimate made from this computer's own earlier jobs (`history`) where they say something: what the window shows and what a run saves.
+pub fn with_history(mut plan: AutoPlan, ins: &Inspect, spec: &AutoSpec, history: &History) -> AutoPlan {
+    if plan.ok {
+        plan.time = Some(time_estimate(ins, spec, &plan, history));
+    }
+    plan
 }

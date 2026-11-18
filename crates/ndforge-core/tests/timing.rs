@@ -137,3 +137,43 @@ fn logs_are_picked_by_the_time_in_their_names_and_the_report_of_the_newest_has_a
     assert_eq!(s["logs"], 1);
     assert_eq!(s["job_seconds"], 20.0);
 }
+
+#[test]
+fn the_history_takes_rates_out_of_the_logs_and_scales_them_by_size() {
+    // a teacher of 27 B (54 GB of 16-bit files) answers 1,000 tokens per second; its student of 20 B is merged in 40 s per GB (40 GB written) and trained at 800 tokens per second
+    let cache = log(json!({"job": "distill_cache"}), &[rec("load_teacher", 100.0, json!({"load": "4bit", "bytes": 54e9})), rec("teacher_pass", 5000.0, json!({"tokens": 5e6, "tokens_per_s": 1000.0}))], &[]);
+    let train = log(json!({"job": "distill"}), &[rec("load_student", 60.0, json!({"method": "qlora"})), rec("train", 6000.0, json!({"tokens": 4.8e6, "tokens_per_s": 800.0}))], &[]);
+    let merge = log(json!({"job": "distill_merge"}), &[rec("merge_total", 1600.0, json!({"bytes": 40e9}))], &[]);
+    let think = log(json!({"job": "think_check", "quick": true}), &[rec("load_model", 50.0, json!({"load": "16bit", "bytes": 40e9})), rec("think_generate", 800.0, json!({"generated_tokens": 5, "tokens_per_s": 5.0}))], &[]);
+    let llama = log(json!({"job": "think_check", "quick": false}), &[rec("think_generate", 800.0, json!({"backend": "llama"}))], &[]);
+    let h = History::from_texts(&[cache, train, merge, think, llama]);
+    let (t, n) = h.pick("teacher_tok_b_s", 27.0).unwrap();
+    assert_eq!(n, 1);
+    assert!((t - 27_000.0).abs() < 1.0, "1,000 tokens per second at 27 B: {t}");
+    assert!((h.pick("train_tok_b_s", 20.0).unwrap().0 - 16_000.0).abs() < 1.0, "the student's size comes from the merge that follows");
+    assert!((h.pick("merge_s_per_gb", 40.0).unwrap().0 - 40.0).abs() < 1e-9);
+    assert!((h.pick("think_s_per_b:quick", 20.0).unwrap().0 - 40.0).abs() < 1e-9, "800 s for 20 B");
+    assert!(h.pick("think_s_per_b:full", 20.0).is_none(), "a GGUF check has no size and is not used");
+    let load = h.pick("load_gb_s:4bit", 54.0).unwrap().0;
+    assert!((load - 0.54).abs() < 1e-9, "{load}");
+    // the same rate at a model of half the size is twice the tokens per second
+    assert!((h.pick("teacher_tok_b_s", 13.5).unwrap().0 / 13.5 - 2000.0).abs() < 1.0);
+    assert!(History::from_texts(&[]).is_empty());
+    assert!(History::from_texts(&["# job: {\"job\": \"export\"}\n".into()]).is_empty());
+}
+
+#[test]
+fn the_history_prefers_the_same_size_class_and_the_newest_samples() {
+    let mut h = History::default();
+    h.push("train_tok_b_s", 8.0, 100.0);
+    h.push("train_tok_b_s", 20.0, 300.0);
+    h.push("train_tok_b_s", 22.0, 500.0);
+    h.push("train_tok_b_s", 21.0, 400.0);
+    assert_eq!(h.pick("train_tok_b_s", 21.0), Some((400.0, 3)), "the 8 B sample is another size class; the median of 400, 500, 300");
+    assert_eq!(h.pick("train_tok_b_s", 50.0), Some((350.0, 4)), "nothing near: all of them, scaled by the size");
+    assert!(h.pick("merge_s_per_gb", 10.0).is_none());
+    for i in 0..9 {
+        h.push("k", 10.0, i as f64 + 1.0);
+    }
+    assert_eq!(h.pick("k", 10.0).unwrap().1, 5, "only the newest five");
+}

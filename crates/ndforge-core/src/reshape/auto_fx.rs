@@ -108,6 +108,9 @@ impl Effects for RealEffects<'_> {
         self.vram_gb
     }
 
+    fn history(&self) -> crate::timing::History {
+        crate::timing::History::recent(60)
+    }
     fn free_disk_gb(&self) -> Option<f64> {
         crate::envmgr::health::free_disk_gb(&runs::models_dir(self.p))
     }
