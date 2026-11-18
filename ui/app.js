@@ -2699,14 +2699,14 @@ function autoCard() {
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
     ${ac.gbOn ? `<p class="dim small" id="ac-gbnote">Each tensor gets the type that spends the bytes best (measured on the healed model's weights, weighted by its importance matrix), then <strong>Compare quants</strong> (KL divergence) checks the file against the plain sizes next to it. It is published only when it is clearly better than the plain file of its size.${pl && pl.measured_minutes ? ` About ${Math.round(pl.measured_minutes[0])} min to measure and ${Math.round(pl.measured_minutes[1])} min to compare (guesses). The 16-bit file is kept until the comparison is done, so this needs more disk.` : ""}${!(+ac.gb > 0) ? ` <span class="warn" id="ac-gbwhy">Give the size in GB.</span>` : ""}</p>` : ""}
     ${studio}
-    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}${live ? "" : acTimeBlock(pl)}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
-    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (an estimate; the checks and the export are counted at a fixed time)</p>` : ""}
+    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
     ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
     ${ac.err ? errDiv(ac.err) : ""}${status}${steps}${rep}</div>`;
 }
@@ -2716,14 +2716,33 @@ const AC_CHECK_H = 0.25, AC_EXPORT_H = 0.5;
 function acEtaRange(run, eta, nowMs) {
   if (!run || !run.steps || run.status === "done") return null;
   const stages = (run.plan && run.plan.stages) || [];
+  const time = run.plan && run.plan.time && run.plan.time.steps ? run.plan.time : null;
+  const now = nowMs || Date.now();
   let lo = 0, hi = 0;
   for (const x of run.steps) {
     if (x.status === "done" || x.status === "skipped") continue;
+    // the estimate made before the run: every step that is not done is left with its own range (a running step has the time it has used taken off)
+    const t = time ? time.steps.find((y) => y.id === x.id) : null;
+    if (t) {
+      let a = t.minutes[0] / 60, b = t.minutes[1] / 60;
+      if (x.status === "running") {
+        const left = eta && eta.step === x.id ? Math.max(0, eta.s - (now - eta.at) / 1000) / 3600 : null;
+        if (left != null) {
+          const merge = (t.parts || []).filter((q) => q.id === "merge").reduce((m, q) => [m[0] + q.minutes[0] / 60, m[1] + q.minutes[1] / 60], [0, 0]);   // the merge comes after the training
+          a = left + merge[0]; b = left + merge[1];
+        } else if (x.started && !Number.isNaN(Date.parse(x.started))) {
+          const used = Math.max(0, now - Date.parse(x.started)) / 3600e3;
+          a = Math.max(0.02, a - used); b = Math.max(a, b - used);
+        }
+      }
+      lo += a; hi += b;
+      continue;
+    }
     const m = /^s(\d+)\.(heal|check_cut|check_heal)$/.exec(x.id);
     if (x.id === "export") { lo += AC_EXPORT_H; hi += AC_EXPORT_H; }
     else if (x.id === "check_gguf" || (m && m[2] !== "heal")) { lo += AC_CHECK_H; hi += AC_CHECK_H; }
     else if (m) {
-      const left = eta && eta.step === x.id && x.status === "running" ? Math.max(0, eta.s - ((nowMs || Date.now()) - eta.at) / 1000) / 3600 : null;
+      const left = eta && eta.step === x.id && x.status === "running" ? Math.max(0, eta.s - (now - eta.at) / 1000) / 3600 : null;
       const g = stages[+m[1] - 1];
       if (left != null) { lo += left; hi += left; } else if (g && g.hours) { lo += g.hours[0]; hi += g.hours[1]; }
     }
@@ -2744,15 +2763,46 @@ function acDuration(hours) {
   const m = Math.max(5, Math.round(hours * 60 / step) * step), h = Math.floor(m / 60), r = m % 60;
   return h === 0 ? `${r} min` : r === 0 ? `${h} h` : `${h} h ${String(r).padStart(2, "0")} min`;
 }
+// a range of hours in words and the clock times it ends at: { left: "9 h 30 min to 14 h", when: "tomorrow 02:15–07:45" }
+function acSpan(r, now) {
+  const hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
+  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
+  const dl = acDuration(r.lo), dh = acDuration(hiH);
+  return { left: dl === dh ? dl : `${dl} to ${dh}`, when: a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}` };      // one day word for both ends when they share it
+}
 function acEtaText(run, eta, nowMs) {
   const r = acEtaRange(run, eta, nowMs);
   if (!r) return "";
-  const now = nowMs || Date.now(), hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
-  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
-  const dl = acDuration(r.lo), dh = acDuration(hiH);
-  const left = dl === dh ? dl : `${dl} to ${dh}`;
-  const when = a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}`;      // one day word for both ends when they share it
-  return `about ${left} left (done around ${when})`;
+  const s = acSpan(r, nowMs || Date.now());
+  return `about ${s.left} left (done around ${s.when})`;
+}
+
+// "How long this will take": the estimate of the whole run (plan.time, made by the program from your own earlier jobs where it has them, else from formulas)
+function acStepMin(lo, hi) {
+  const f = (m) => (m < 1 ? "<1" : String(Math.round(m)));
+  if (hi < 60) return lo < 1 && hi < 1 ? "under 1 min" : `${f(lo)}–${f(hi)} min`;
+  const a = acDuration(lo / 60), b = acDuration(hi / 60);
+  return a === b ? a : `${a} to ${b}`;
+}
+function acTimeBlock(pl, nowMs) {
+  const t = pl && pl.time;
+  if (!t || !t.steps || !t.steps.length) return "";
+  const now = nowMs || Date.now(), r = { lo: t.total_h[0], hi: t.total_h[1] }, sp = acSpan(r, now);
+  const tag = (b) => b === "your_history" ? `<span class="tag ac-hist">from your history</span>` : `<span class="tag ac-formula">formula</span>`;
+  const partsOf = (x) => {
+    const q = (x.parts || []).filter((y) => ["cache", "train", "merge"].includes(y.id));
+    return q.length ? `<div class="dim small">${q.map((y) => `${esc(y.label)}: ${acStepMin(y.minutes[0], y.minutes[1])}`).join("; ")}</div>` : "";
+  };
+  const rows = t.steps.map((x) => `<tr data-actime="${esc(x.id)}"><td>${esc(x.label)}${partsOf(x)}${x.note ? `<div class="dim small">${esc(x.note)}</div>` : ""}</td><td>${acStepMin(x.minutes[0], x.minutes[1])}</td><td>${tag(x.basis)}</td></tr>`).join("");
+  const lever = t.lever_h && t.lever_h[1] > 0.5 * r.hi ? `<p class="dim small" id="ac-time-lever">Most of the time is the teacher's answers and the heal: ${acStepMin(t.lever_h[0] * 60, t.lever_h[1] * 60)}. Fewer tokens or one stage shortens it.</p>` : "";
+  const extra = (t.extra || []).map((e) => `<p class="dim small" data-actime-extra="${esc(e.id)}">Possible extra, not counted above: ${esc(e.label)}: ${acStepMin(e.minutes[0], e.minutes[1])}.</p>`).join("");
+  return `<div class="ac-time" id="ac-time"><h3>How long this will take</h3>
+    <p class="ac-total" id="ac-time-total">All of it together takes about <strong>${esc(sp.left)}</strong></p>
+    <p id="ac-time-done">If you press Start now it should be done around ${esc(sp.when)}.</p>
+    <details id="ac-time-steps"><summary>Every step</summary><table class="tbl"><tr><th>Step</th><th>Estimate</th><th>Where from</th></tr>${rows}</table></details>
+    <p class="dim small" id="ac-time-basis">${esc(t.basis)}</p>
+    <p class="dim small" id="ac-time-caveat">${esc((t.notes && t.notes[0]) || "This is an estimate, not a promise.")}</p>
+    ${lever}${extra}${(t.notes || []).slice(1).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}</div>`;
 }
 
 function onAutoEvent(p) {

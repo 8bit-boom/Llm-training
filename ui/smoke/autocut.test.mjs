@@ -174,3 +174,70 @@ test("an optional target size makes a measured file and compares it: the field, 
   b.els["ac-gbon"].checked = false; b.run("ac.running = false"); b.run("wireAuto()"); b.els["ac-gbon"].onchange();
   assert.equal(b.run("acSpec().target_gb"), undefined);
 });
+
+// ---- how long it will take (plan.time: docs/AUTO_CUT.md, "How long it takes")
+const tstep = (id, label, lo, hi, basis = "formula", extra = {}) => ({ id, label, minutes: [lo, hi], basis, note: null, parts: [], ...extra });
+const timed = (over = {}) => ({
+  steps: [tstep("plan", "Check the model, the card and the disk", 0.2, 0.5), tstep("measure", "Measure the model", 11, 32), tstep("s1.heal", "Stage 1 of 2: heal", 1400, 2700, "your_history", { parts: [{ id: "cache", label: "the original writes its answers (40 M tokens)", minutes: [600, 1100], basis: "your_history" }, { id: "train", label: "the student learns (40 M tokens)", minutes: [500, 900], basis: "formula" }, { id: "merge", label: "add the learning into the model", minutes: [10, 40], basis: "formula" }] }),
+    tstep("export", "Make the GGUF files", 7.5, 18.5)],
+  total_h: [9.5, 14.25], history_steps: 1, step_count: 4, basis: "1 of 4 steps use your own earlier runs (from the saved job logs); the other 3 are formulas built on one real run on a 32 GB card.",
+  lever_h: [18.3, 33.3], notes: ["An estimate, not a promise: the teacher's answers and the training of the heal are most of it.", "Not in the total: waiting in the queue."],
+  extra: [{ id: "retry_heal", label: "If the last stage fails its thinking check: heal it again with 40 M more tokens", minutes: [60, 120], note: "" }], ...over });
+
+test("before Start the card says how long everything takes: the total as a range, the clock time, a table of the steps with where each number comes from, and the basis", () => {
+  const b = browser();
+  open(b, {}, `ac.plan = ${JSON.stringify(plan({ time: timed({ total_h: [9.5, 14.25], lever_h: [10, 12] }) }))}`);
+  const now = new Date(2026, 0, 1, 12, 0, 0).getTime();
+  const html = b.run(`acTimeBlock(ac.plan, ${now})`);
+  assert.match(html, /<h3>How long this will take<\/h3>/);
+  assert.match(html, /id="ac-time-total">All of it together takes about <strong>9 h 30 min to 14 h 30 min<\/strong>/, "the existing rounding: 5 minutes below 10 hours, 30 from 10 hours up");
+  assert.match(html, /id="ac-time-done">If you press Start now it should be done around 21:30–tomorrow 02:15\./);
+  assert.match(html, /<details id="ac-time-steps"><summary>Every step<\/summary>/);
+  assert.match(html, /<tr data-actime="measure"><td>Measure the model<\/td><td>11–32 min<\/td><td><span class="tag ac-formula">formula<\/span><\/td><\/tr>/);
+  assert.match(html, /<tr data-actime="plan"><td>[^<]*<\/td><td>under 1 min<\/td>/);
+  assert.match(html, /<tr data-actime="s1\.heal">[^]*the original writes its answers \(40 M tokens\): 10 h to 18 h 30 min[^]*<td>23 h 30 min to 45 h<\/td><td><span class="tag ac-hist">from your history<\/span>/);
+  assert.match(html, /id="ac-time-basis">1 of 4 steps use your own earlier runs/);
+  assert.match(html, /id="ac-time-caveat">An estimate, not a promise/);
+  assert.match(html, /id="ac-time-lever">Most of the time is the teacher's answers and the heal: 10 h to 12 h\. Fewer tokens or one stage shortens it\./);
+  assert.match(html, /data-actime-extra="retry_heal">Possible extra, not counted above: If the last stage fails[^<]*: 1 h to 2 h\./);
+  // it is in the card before the Start button; without a plan or without the estimate there is no block
+  assert.ok(card(b).indexOf('id="ac-time"') > 0 && card(b).indexOf('id="ac-time"') < card(b).indexOf('id="ac-go"'));
+  assert.equal(b.run("acTimeBlock(null)"), ""); assert.equal(b.run("acTimeBlock({ ok: true })"), "");
+  // a single value, no lever hint when the heal is not most of it
+  const one = b.run(`acTimeBlock(${JSON.stringify(plan({ time: timed({ total_h: [2, 2], lever_h: [0.5, 0.5], extra: [] }) }))}, ${now})`);
+  assert.match(one, /about <strong>2 h<\/strong>/); assert.match(one, /done around 14:00\./); assert.doesNotMatch(one, /ac-time-lever/); assert.doesNotMatch(one, /Possible extra/);
+});
+
+test("the estimate follows the choices: a changed size, stage count or Quick asks again and shows the new total; during a run the block is not shown", async () => {
+  const totals = [[9.5, 14.25], [40, 60]];
+  let n = 0;
+  const b = browser({ auto_plan: () => ({ plan: plan({ time: timed({ total_h: totals[n++ % 2] }) }) }), auto_start: null });
+  open(b);
+  b.run('page = "reshape"; acRefresh()'); await tick();
+  assert.match(card(b), /id="ac-time-total">[^]*9 h 30 min to 14 h 30 min/);
+  b.run('page = "reshape"; ac.stages = 1; acRefresh()'); await tick();
+  assert.equal(b.calls.filter((x) => x[0] === "auto_plan").length, 2, "the plan, and so the estimate, is asked again when the spec changes");
+  assert.match(card(b), /id="ac-time-total">[^]*40 h to 60 h/);
+  b.run(`ac.run = ${JSON.stringify(run("running"))}; ac.running = true`);
+  assert.doesNotMatch(card(b), /id="ac-time"/);
+});
+
+test("during a run the time left is the sum of the steps not done yet (a running step has its elapsed time taken off); an old run without the estimate keeps the old rule", () => {
+  const b = browser();
+  const now = new Date(2026, 0, 1, 12, 0, 0).getTime();
+  const st = (id, status, started = null) => ({ id, status, started });
+  const t = timed();
+  const left = (steps, eta) => JSON.parse(JSON.stringify(b.run(`acEtaRange(${JSON.stringify({ status: "running", steps, plan: { stages: [], time: t } })}, ${JSON.stringify(eta || null)}, ${now})`)));
+  assert.deepEqual(left([st("plan", "done"), st("measure", "done"), st("s1.heal", "pending"), st("export", "pending")]), { lo: (1400 + 7.5) / 60, hi: (2700 + 18.5) / 60 });
+  // the running measure started 10 minutes ago (1 minute of its 11 are left; never less than a minute)
+  const started = new Date(now - 10 * 60e3).toISOString();
+  const r = left([st("measure", "running", started), st("export", "pending")]);
+  assert.ok(Math.abs(r.lo - (0.02 + 7.5 / 60)) < 0.001 && Math.abs(r.hi - (22 / 60 + 18.5 / 60)) < 0.001, JSON.stringify(r));
+  // the running heal reports its own time left (1 h of training): that and its merge, then the export
+  const h = left([st("s1.heal", "running", started), st("export", "pending")], { s: 3600, step: "s1.heal", at: now });
+  assert.ok(Math.abs(h.lo - (1 + 10 / 60 + 7.5 / 60)) < 0.001 && Math.abs(h.hi - (1 + 40 / 60 + 18.5 / 60)) < 0.001, JSON.stringify(h));
+  // the text
+  assert.equal(b.run(`acEtaText(${JSON.stringify({ status: "running", steps: [st("export", "pending")], plan: { time: t } })}, null, ${now})`), "about 10 min to 20 min left (done around 12:07–12:18)");
+  // a step the estimate does not know falls back to the fixed allowance
+  assert.deepEqual(JSON.parse(JSON.stringify(b.run(`acEtaRange({ status: "running", steps: [{ id: "check_gguf", status: "pending" }], plan: { stages: [], time: ${JSON.stringify(t)} } }, null, ${now})`))), { lo: 0.25, hi: 0.25 });
+});

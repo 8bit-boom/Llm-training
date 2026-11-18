@@ -155,3 +155,11 @@ p.hs-warn { color: #8a5a00; }
 .pf-warn .pf-dot { color: var(--band-noticeable); }
 .pf-fail .pf-dot { color: var(--err); }
 .pf-bad { border-color: var(--err); }
+
+.ac-time { margin: 12px 0; padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.ac-time h3 { margin: 0 0 6px; font-size: 1em; }
+.ac-time .ac-total { font-size: 1.15em; margin: 4px 0; }
+.ac-time summary { cursor: pointer; margin: 6px 0; }
+.ac-time .tag.ac-hist { color: var(--ok); }
+.ac-time .tag.ac-formula { color: var(--dim); }
+@media (max-width: 640px) { .ac-time .tbl { font-size: 0.9em; } }
