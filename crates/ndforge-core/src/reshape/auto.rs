@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::auto_speed;
 use super::auto_plan::{self, AutoPlan, AutoSpec, Candidate, StagePlan};
 use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
@@ -21,11 +22,13 @@ use crate::project::Project;
 
 pub const FORMAT: u32 = 1;
 /// The samples of the cut's measuring, of the width's measuring and of a quick Try (the Slim page's own numbers).
+/// How many of the newest saved job logs the time estimate learns from.
+const HISTORY_LOGS: usize = 60;
 const CALIB_SAMPLES: u32 = 128;
 const WIDTH_SAMPLES: u32 = 256;
 const TRY_RECHECK_SAMPLES: u32 = 256;
 /// The tokens the second heal of a stage adds (the retry after a failed check).
-pub const RETRY_TOKENS_M: u32 = 40;
+pub use super::auto_plan::RETRY_TOKENS_M;
 
 // ------------------------------------------------------------------------------------------------------------------ what the steps do
 
@@ -96,6 +99,14 @@ pub trait Effects {
     fn vram_gb(&self) -> Option<f64>;
     /// free space on the disk the models are written to
     fn free_disk_gb(&self) -> Option<f64>;
+    /// what this computer's saved job logs say about its speed (the time estimate); nothing by default
+    /// The clock of the time limit (seconds since 1970); the stand-in of a test sets it.
+    fn now_secs(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+    fn history(&self) -> crate::timing::History {
+        crate::timing::History::default()
+    }
     fn inspect(&mut self, model: &ModelRef) -> Result<Out<Inspect>>;
     fn measure(&mut self, model_id: &str, samples: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Out<Value>>;
     /// Runs the cuts of a Try-first request and returns the saved analysis (`reshape_try.json`'s `analysis`).
@@ -112,6 +123,8 @@ pub trait Effects {
         Ok(())
     }
     /// The GGUF files of the healed model: `{"dir", "ggufs": [{"quant", "path"}]}`.
+    /// How the export is made, before it runs: `imatrix` = measure an importance matrix for the small sizes (the Fast setting leaves it out). The default keeps the old behaviour.
+    fn export_options(&mut self, _imatrix: bool) {}
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>>;
     /// `export` for a run with a target size: the same, and "mixed_measured" in `quants` is made with the size `target_gb`. The default ignores the target (an effects object
     /// that does not know it still gets "mixed_measured" in `quants`).
@@ -217,6 +230,9 @@ pub struct AutoState {
     /// the comparison of the measured file with the plain sizes (a run with a target size): `{"promoted": bool, "promotion", "verdict", "rows", "skipped"}`; None for a run without it
     #[serde(default)]
     pub compare: Option<Value>,
+    /// "I have at most N hours": what the time limit made the run give up (`auto_speed::fit_budget`); None for a run without a limit
+    #[serde(default)]
+    pub budget: Option<super::auto_speed::BudgetFit>,
 }
 
 impl AutoState {
@@ -224,7 +240,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None,
         }
     }
 
@@ -294,10 +310,10 @@ fn run_id(model: &ModelRef, target_b: f64) -> String {
 
 // ------------------------------------------------------------------------------------------------------------------ the list of steps
 
-fn stage_steps(n: u32, of: u32, thinking: bool) -> Vec<StepRec> {
+fn stage_steps(n: u32, of: u32, thinking: bool, check_cut: bool) -> Vec<StepRec> {
     let tag = if of > 1 { format!("Stage {n} of {of}: ") } else { String::new() };
     let mut v = vec![StepRec::new(&format!("s{n}.cut"), &format!("{tag}cut"))];
-    if thinking {
+    if thinking && check_cut {
         v.push(StepRec::new(&format!("s{n}.check_cut"), &format!("{tag}thinking check of the cut")));
     }
     v.push(StepRec::new(&format!("s{n}.heal"), &format!("{tag}heal")));
@@ -317,7 +333,7 @@ fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec
         }
     }
     for n in 1..=stages {
-        v.extend(stage_steps(n, stages, spec.keep_thinking));
+        v.extend(stage_steps(n, stages, spec.keep_thinking, spec.check_cut));
     }
     v.push(StepRec::new("export", "Make the GGUF files"));
     if spec.keep_thinking {
@@ -552,7 +568,20 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
         return Err(Error::new("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text."));
     }
     let ins = out!(fx.inspect(&model)?);
+    // "I have at most N hours": the least harmful settings are given up until the estimate fits, and every one of them is a note of the run and a line of the report
+    if let Some(h) = st.spec.max_hours {
+        let fit = auto_speed::fit_budget(&ins, &st.spec, fx.vram_gb(), &fx.history(), h);
+        st.budget = Some(fit.clone());
+        if !fit.fits {
+            return Err(Error::new(fit.message.clone().unwrap_or_else(|| "The run does not fit the time you have.".into())));
+        }
+        if !fit.dropped.is_empty() {
+            st.spec = fit.spec.clone();
+            st.notes.extend(auto_speed::budget_sentences(&fit));
+        }
+    }
     let plan = auto_plan::plan(&ins, &st.spec, fx.vram_gb(), fx.free_disk_gb());
+    let plan = auto_plan::with_speed(plan, &ins, &st.spec, fx.vram_gb(), &fx.history());
     if !plan.ok {
         st.plan = Some(plan.clone());
         return Err(Error::new(plan.blockers.join(" ")));
@@ -764,10 +793,10 @@ fn step_think_gate(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
         // 2. the original once, then this cut
         st.think_gate = Some(gate.clone());
         if st.baseline.is_none() {
-            let r = out!(fx.think_check(&cut.name, "original", st.spec.quick, None)?);
+            let r = out!(fx.think_check(&cut.name, "original", st.spec.think_quick(), None)?);
             st.baseline = Some(r);
         }
-        let r = out!(fx.think_check(&cut.name, "cut", st.spec.quick, None)?);
+        let r = out!(fx.think_check(&cut.name, "cut", st.spec.think_quick(), None)?);
         let chk = check_json(&r, st.baseline.as_ref());
         let row = json!({"row": i, "blocks": cand.blocks, "intermediate": cand.intermediate, "params_b": cand.params_b, "loss": try_rows[i]["loss"], "cut": cut.name, "model_id": cut.model_id,
                          "cut_blocks": try_rows[i]["cut_blocks"], "score": thinkcheck::think_score(&chk["main"]), "check": chk, "removed": false});
@@ -901,10 +930,10 @@ fn step_check_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Resul
     let cut = st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to check."))?;
     if st.baseline.is_none() {
         // the original is checked once, from the folder of the first cut (that is where its record of the original is)
-        let r = out!(fx.think_check(&cut.name, "original", st.spec.quick, None)?);
+        let r = out!(fx.think_check(&cut.name, "original", st.spec.think_quick(), None)?);
         st.baseline = Some(r);
     }
-    let r = out!(fx.think_check(&cut.name, "cut", st.spec.quick, None)?);
+    let r = out!(fx.think_check(&cut.name, "cut", st.spec.think_quick(), None)?);
     st.stages[idx].cut_check = Some(check_json(&r, st.baseline.as_ref()));
     Ok(Flow::Done(None))
 }
@@ -933,7 +962,12 @@ fn failed_names(chk: &Value) -> Vec<String> {
 
 fn step_check_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow> {
     let h = st.stages[idx].heal.clone().ok_or_else(|| Error::new("There is no healed model to check."))?;
-    let r = out!(fx.think_check(&h.name, "healed", st.spec.quick, None)?);
+    if st.baseline.is_none() {
+        // no check of the cut (and none before healing) came first: the original is checked here, once, so that the gates have something to compare with
+        let r = out!(fx.think_check(&h.name, "original", st.spec.think_quick(), None)?);
+        st.baseline = Some(r);
+    }
+    let r = out!(fx.think_check(&h.name, "healed", st.spec.think_quick(), None)?);
     let chk = check_json(&r, st.baseline.as_ref());
     let verdict = chk["verdict"].as_str().unwrap_or("pass").to_string();
     let attempt = st.stages[idx].attempt;
@@ -949,24 +983,39 @@ fn step_check_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Resu
 }
 
 /// The healed model of a stage missed a gate. Once: heal it again (the healed model is the student, the original still the teacher) with `RETRY_TOKENS_M` million more tokens.
-/// Twice: back the cut off one step (`auto_plan::back_off`) and make the stage again. A third time: the run ends with `gates_failed` and its report. Nothing is deleted on the way:
+/// (Without `retry_heal` the first failure goes straight to the back-off; without `back_off` the run ends.) Twice: back the cut off one step (`auto_plan::back_off`) and make the stage again. A third time: the run ends with `gates_failed` and its report. Nothing is deleted on the way:
 /// what a failed try made is cleaned up when the stage has passed (and never with `keep_intermediate`).
 fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn Effects) -> Result<Flow> {
     let n = idx + 1;
     let names = failed.join(", ");
     let ids = |what: &[&str]| -> Vec<String> { what.iter().map(|w| format!("s{n}.{w}")).collect() };
-    match st.stages[idx].attempt {
+    // with the retry switched off the first failure goes straight to backing the cut off
+    let attempt = match st.stages[idx].attempt {
+        0 if !st.spec.retry_heal => 1,
+        a => a,
+    };
+    // "I have at most N hours": a retry or a stage made again that would end after the limit is not started
+    if attempt <= 1 && (attempt == 0 || st.spec.back_off) {
+        if let Some(why) = too_late(st, idx, attempt == 0, fx.now_secs()) {
+            st.notes.push(why.clone());
+            st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}); {why} The run stops here with its report."));
+            return Ok(Flow::Halt("gates_failed".into()));
+        }
+    }
+    match attempt {
         0 => {
+            let stage_m = st.stages[idx].plan.tokens_m;
+            let total_m = auto_plan::retry_total_m(stage_m);
             let sg = &mut st.stages[idx];
             sg.retry_from = sg.heal.take();
-            sg.extra_tokens_m = RETRY_TOKENS_M;
+            sg.extra_tokens_m = total_m.saturating_sub(stage_m);
             sg.attempt = 1;
-            let note = format!("Stage {n} missed its thinking check ({names}): it is healed again on the healed model with {RETRY_TOKENS_M} million more tokens.");
+            let note = format!("Stage {n} missed its thinking check ({names}): it is healed again on the healed model, which learns on {total_m} million tokens in this second heal ({} million more of the original's answers).", total_m.saturating_sub(stage_m));
             st.notes.push(note.clone());
             reopen(st, &ids(&["heal", "check_heal"]));
             return Ok(Flow::Retry(note));
         }
-        1 => match back_off_stage(st, idx, fx.vram_gb()) {
+        1 if st.spec.back_off => match back_off_stage(st, idx, fx.vram_gb()) {
             Ok(note) => {
                 st.notes.push(note.clone());
                 let all: Vec<&str> = if st.keep_thinking() { vec!["cut", "check_cut", "heal", "check_heal"] } else { vec!["cut", "heal"] };
@@ -975,10 +1024,37 @@ fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn E
             }
             Err(why) => st.notes.push(why),
         },
+        1 => st.notes.push(format!("Stage {n} missed its thinking check ({names}) and \"cut one step less\" is switched off: the run ends here.")),
         _ => {}
     }
     st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}) after {} tries; the run stops here. The report says what was tried.", st.stages[idx].attempts.len()));
     Ok(Flow::Halt("gates_failed".into()))
+}
+
+/// With a time limit: would the next try of stage `idx` (the retry heal when `retry`, else the stage made again) end after it? The cost is the high end of the estimate of that try
+/// plus the steps that are still to run (the plan's estimate), the time left is the limit minus the time since the run was created. None when there is no limit or it is kept.
+fn too_late(st: &AutoState, idx: usize, retry: bool, now_secs: i64) -> Option<String> {
+    let max = st.spec.max_hours?;
+    let t = st.plan.as_ref()?.time.as_ref()?;
+    let started = chrono::NaiveDateTime::parse_from_str(&st.created, "%Y-%m-%dT%H:%M:%SZ").ok()?.and_utc().timestamp();
+    let left_h = max - (now_secs - started).max(0) as f64 / 3600.0;
+    let n = idx + 1;
+    let hi = |id: &str| t.steps.iter().find(|x| x.id == id).map(|x| x.minutes.1).unwrap_or(0.0);
+    let mine = |what: &str| format!("s{n}.{what}");
+    let cost = if retry {
+        // the last stage's retry has its own line in the estimate; another stage's is its heal at the retry's budget and its check
+        match t.extra.iter().find(|e| e.id == "retry_heal").filter(|_| idx + 1 == st.stages.len()) {
+            Some(e) => e.minutes.1,
+            None => hi(&mine("heal")) * auto_plan::retry_total_m(st.stages[idx].plan.tokens_m) as f64 / st.stages[idx].plan.tokens_m.max(1) as f64 + hi(&mine("check_heal")),
+        }
+    } else {
+        ["cut", "check_cut", "heal", "check_heal"].iter().map(|w| hi(&mine(w))).sum()
+    };
+    // what has not run yet and does not belong to this stage
+    let prefix = format!("s{n}.");
+    let rest: f64 = st.steps.iter().filter(|s| s.status != "done" && s.status != "skipped" && !s.id.starts_with(&prefix)).map(|s| hi(&s.id)).sum();
+    let need_h = (cost + rest) / 60.0;
+    (need_h > left_h).then(|| format!("{} would end after your time limit of {max:.0} hours (it needs about {need_h:.0} h more, {:.0} h are left).", if retry { "A retry heal" } else { "Making the stage again with a smaller cut" }, left_h.max(0.0)))
 }
 
 /// Backs the cut of stage `idx` off by one step and makes a fresh stage of it (the stages after it are planned again from the new stop). Err(why) when nothing is left to give back,
@@ -1074,6 +1150,7 @@ fn step_export(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let final_params = st.stages.last().map(|s| s.plan.params).unwrap_or(0);
     let quants = st.spec.export_quants_for(final_params);
     let run = st.id.clone();
+    fx.export_options(st.spec.imatrix);
     let r = match st.spec.target_gb {
         Some(t) => out!(fx.export_measured(&run, &h, &family, &quants, st.keep_thinking(), t)?),
         None => out!(fx.export(&run, &h, &family, &quants, st.keep_thinking())?),
@@ -1151,7 +1228,7 @@ fn gguf_of(export: &Value) -> Option<String> {
 fn step_check_gguf(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let h = final_heal(st)?;
     let file = st.export.as_ref().and_then(gguf_of).ok_or_else(|| Error::new("The export made no GGUF file to check."))?;
-    let r = out!(fx.think_check(&h.name, "gguf", st.spec.quick, Some(&file))?);
+    let r = out!(fx.think_check(&h.name, "gguf", st.spec.think_quick(), Some(&file))?);
     let chk = check_json(&r, st.baseline.as_ref());
     let verdict = chk["verdict"].as_str().unwrap_or("pass").to_string();
     let failed = failed_names(&chk);
@@ -1187,7 +1264,19 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 /// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
 pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
-    let mut plan = auto_plan::plan(ins, spec, vram_gb, free_gb);
+    let history = crate::timing::History::recent(HISTORY_LOGS);
+    // with a time limit the plan is the one of the settings the run will use (what start would do), with the list of what was given up
+    let fit = spec.max_hours.map(|h| auto_speed::fit_budget(ins, spec, vram_gb, &history, h));
+    let used = fit.as_ref().filter(|f| f.fits).map(|f| f.spec.clone()).unwrap_or_else(|| spec.clone());
+    let mut plan = auto_plan::with_speed(auto_plan::plan(ins, &used, vram_gb, free_gb), ins, &used, vram_gb, &history);
+    if let Some(f) = fit {
+        if !f.fits {
+            plan.ok = false;
+            plan.blockers.extend(f.message.clone());
+        }
+        plan.warnings.splice(0..0, auto_speed::budget_sentences(&f));
+        plan.budget = Some(f);
+    }
     if !has_training_data {
         plan.ok = false;
         plan.blockers.push("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text.".into());

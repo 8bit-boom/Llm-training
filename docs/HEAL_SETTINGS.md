@@ -154,3 +154,11 @@ once, not once per chunk. The arrays are identical to the old ones (a test compa
 result has `tokens_per_s`. A Stop that comes while a window is being answered keeps the rows that were finished from the first one on without a gap; the others are answered again on Continue.
 The speed-up on a 27B is not measured here.
 
+
+## The speed knobs of Auto-cut (`docs/AUTO_CUT.md`, "Speed settings")
+
+Auto-cut sets the heal's tokens per stage itself (`AutoSpec.stage_a_tokens_m`, `last_tokens_m`: 10 / 20 / 40 / 80 M; the recipe is 40 M for the first stage and 40 or 80 M for the last) and, with "same sequence length in
+both stages", sends the shortest sequence length of the stages to every heal (`HealSpec.seq`), because the original's saved answers are shared only between heals on the same sequence length and way of loading the
+original (`distilljob.shared_store_id`: `max_len` and `load` are in it). Then the second stage writes only the tokens it has more. A retry after a failed thinking check heals the healed model again on a budget the
+heal takes (the stage's tokens plus 40 M, rounded up to 10 / 20 / 40 / 80: 40 gives 80): the student learns on all of them, only the original's answers are extended. Not changed by any speed setting: the LoRA size, the
+batch and accumulation, gradient checkpointing, the top-k of the teacher's answers (it is in the key of the saved answers), the general-text share.

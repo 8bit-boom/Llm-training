@@ -74,13 +74,18 @@ struct Mock {
     compare_error: Option<String>,
     /// the export folders the run made (a 16-bit export may be removed)
     exports_made: BTreeSet<String>,
+    /// the heal specs as the heal got them, and the `imatrix` of every export_options call
+    heal_specs: Vec<Value>,
+    imatrix: Vec<bool>,
+    /// the clock of the time limit (seconds); None = the real one
+    clock: Option<i64>,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(),
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None,
         }
     }
 
@@ -109,6 +114,9 @@ impl Effects for Mock {
     }
     fn stopped(&self) -> bool {
         self.stop_flag
+    }
+    fn now_secs(&self) -> i64 {
+        self.clock.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
     }
     fn model(&self, id: &str) -> Result<ModelRef> {
         Ok(ModelRef { id: id.into(), repo: "org/Qwen3.8-27B".into(), name: "Qwen3.8 27B".into(), family: "qwen3_5".into() })
@@ -198,6 +206,7 @@ impl Effects for Mock {
             return Err(Error::new("The graphics card ran out of memory."));
         }
         self.heals += 1;
+        self.heal_specs.push(serde_json::to_value(spec).unwrap());
         let name = match student {
             Student::Made(n) => n.clone(),
             Student::Folder(_) => format!("heal-{}", self.heals),
@@ -217,6 +226,9 @@ impl Effects for Mock {
         assert!(models.iter().all(|m| self.made.contains(m)), "only models of this run: {models:?}");
         self.dropped.push(models.to_vec());
         Ok(())
+    }
+    fn export_options(&mut self, imatrix: bool) {
+        self.imatrix.push(imatrix);
     }
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {
         if self.stop_here(format!("export {}", healed.name)) {
@@ -567,6 +579,15 @@ fn a_healed_model_that_misses_a_gate_is_healed_again_with_40_million_more_tokens
     let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
     assert!(md.contains("passed on the second heal") && md.contains("healed again"), "{md}");
     assert_eq!(st.report, Some(json!({"json": "auto_report.json", "md": "auto_report.md"})));
+    // the estimate made before the run is kept next to what the steps took (additive keys; the old ones stay)
+    let est = &rep["estimate"];
+    assert!(est["total_h"][1].as_f64().unwrap() >= est["total_h"][0].as_f64().unwrap() && est["total_h"][0].as_f64().unwrap() > 0.0, "{est}");
+    assert!(est["actual_h"].is_number() && est["basis"].as_str().unwrap().contains("steps"), "{est}");
+    let rows = est["steps"].as_array().unwrap();
+    assert!(rows.iter().any(|x| x["id"] == "s1.heal" && x["estimated_minutes"].is_array() && x["actual_minutes"].is_number() && ["within", "faster", "slower"].contains(&x["result"].as_str().unwrap())), "{rows:?}");
+    let heal = rep["steps"].as_array().unwrap().iter().find(|x| x["id"] == "s1.heal").unwrap();
+    assert!(heal["estimated_minutes"].is_array() && heal["seconds"].is_number() && heal["status"] == "done" && heal["estimate_basis"] == "formula", "{heal}");
+    assert!(md.contains("## Estimated and actual time") && md.contains("| Stage 1 of 2: heal |"), "{md}");
 }
 
 #[test]
@@ -1211,4 +1232,262 @@ fn a_comparison_that_fails_does_not_lose_the_files_the_reference_stays_and_the_m
     assert!(c["skipped"].as_str().unwrap().contains("llama-perplexity was not found") && c["skipped"].as_str().unwrap().contains("not published"));
     assert!(!fx.done.iter().any(|d| d.starts_with("remove export")), "the 16-bit file is kept so that Compare quants can be run by hand");
     assert!(fx.done.iter().any(|d| d.ends_with("cut to 21.1B 2")));
+}
+
+#[test]
+fn a_worker_event_is_tagged_with_the_step_and_keeps_its_own_keys() {
+    let e = ndforge_core::reshape::auto_fx::tag(json!({"kind": "metric", "step": 12, "eta_s": 900}), "s1.heal");
+    assert_eq!(e["phase"], "auto");
+    assert_eq!(e["auto_step"], "s1.heal");
+    assert_eq!((e["kind"].as_str(), e["step"].as_i64(), e["eta_s"].as_i64()), (Some("metric"), Some(12), Some(900)));
+}
+
+// ---- the speed settings act (reshape::auto_speed): each knob changes what the run does, and a legacy spec runs as it always did
+
+fn checks_of(fx: &Mock, quick: bool) -> usize {
+    fx.done.iter().filter(|d| d.starts_with("check ") && d.contains(&format!("quick={quick}"))).count()
+}
+
+#[test]
+fn a_legacy_spec_and_the_thorough_preset_make_the_same_calls() {
+    let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+    let (p1, p2) = (project(d1.path()), project(d2.path()));
+    let (mut a, mut b) = (Mock::new(), Mock::new());
+    let s1 = start(&p1, &mut a, gspec(21.1)).unwrap();
+    let s2 = start(&p2, &mut b, gspec(21.1).with_preset("thorough").unwrap()).unwrap();
+    assert_eq!((s1.status.as_str(), s2.status.as_str()), ("done", "done"));
+    assert_eq!(a.done, b.done);
+    assert_eq!(a.heal_specs, b.heal_specs);
+    assert!(a.heal_specs.iter().all(|h| h["seq"].is_null()), "the sequence length is the program's own choice: {:?}", a.heal_specs);
+    assert_eq!(a.imatrix, vec![true]);
+    assert_eq!(checks_of(&a, true), 0, "the checks are the full ones");
+    assert_eq!(s1.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), s2.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn quick_thinking_checks_are_a_choice_of_their_own() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { think_quick: Some(true), ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(checks_of(&fx, true) >= 6 && checks_of(&fx, false) == 0, "{:?}", fx.done);
+    assert!(fx.done.iter().any(|d| d.starts_with("try samples=128")), "Try first still asks 128 samples: {:?}", fx.done);
+    // and the other way round: Quick Try first, full checks
+    let d2 = tempdir().unwrap();
+    let mut f2 = Mock::new();
+    let s2 = start(&project(d2.path()), &mut f2, AutoSpec { quick: true, think_quick: Some(false), ..gspec(21.1) }).unwrap();
+    assert_eq!(s2.status, "done");
+    assert!(checks_of(&f2, true) == 0 && checks_of(&f2, false) >= 6 && f2.done.iter().any(|d| d.starts_with("try samples=64")), "{:?}", f2.done);
+}
+
+#[test]
+fn without_the_check_of_the_cut_the_original_is_checked_after_the_first_heal() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { check_cut: false, ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(st.steps.iter().all(|s| !s.id.ends_with(".check_cut")), "{:?}", statuses(&st));
+    let originals = fx.done.iter().filter(|d| d.starts_with("check ") && d.contains(" original ")).count();
+    assert_eq!(originals, 1, "the original is the yardstick of the gates, checked once: {:?}", fx.done);
+    let first_heal = fx.done.iter().position(|d| d.starts_with("heal ")).unwrap();
+    let orig = fx.done.iter().position(|d| d.contains(" original ")).unwrap();
+    assert!(orig > first_heal, "after the first heal, not before it");
+    assert!(fx.done.iter().all(|d| !d.contains(" cut quick")), "no cut was checked: {:?}", fx.done);
+    assert!(st.stages.iter().all(|s| s.passed && s.heal_check.as_ref().is_some_and(|c| !c["verdict"].is_null())), "the gates had a baseline");
+}
+
+#[test]
+fn without_the_retry_a_failed_check_goes_straight_to_the_back_off() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    let st = start(&p, &mut fx, AutoSpec { retry_heal: false, ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    let kinds: Vec<&str> = st.stages[0].attempts.iter().map(|a| a["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["heal", "back_off"], "no heal on the healed model");
+    assert_eq!(fx.cuts, 2, "the first cut and the backed-off cut");
+    assert!(fx.heal_specs.len() == 2 && fx.done.iter().all(|d| !d.starts_with("heal heal-")), "{:?}", fx.done);
+}
+
+#[test]
+fn without_the_back_off_the_run_ends_after_the_retry() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    let st = start(&p, &mut fx, AutoSpec { back_off: false, ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    let kinds: Vec<&str> = st.stages[0].attempts.iter().map(|a| a["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["heal", "heal_again"]);
+    assert_eq!(fx.cuts, 1, "the cut is not backed off");
+    assert!(st.notes.iter().any(|n| n.contains("switched off")), "{:?}", st.notes);
+    // neither: the first failure ends the run
+    let d2 = tempdir().unwrap();
+    let mut f2 = Mock::new();
+    f2.checks.insert("healed".into(), bad());
+    let s2 = start(&project(d2.path()), &mut f2, AutoSpec { retry_heal: false, back_off: false, ..spec(21.1) }).unwrap();
+    assert_eq!(s2.status, "gates_failed");
+    assert_eq!(s2.stages[0].attempts.len(), 1);
+    assert_eq!(f2.heal_specs.len(), 1);
+}
+
+#[test]
+fn the_retry_learns_on_a_budget_the_heal_takes_and_the_notes_say_so() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    // stage 1 on 20 M: the retry learns on 80 M (20 + 40 is not a budget); the last stage keeps the recipe's 40 M and retries on 80 M
+    let st = start(&p, &mut fx, AutoSpec { stage_a_tokens_m: Some(20), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    let t: Vec<u64> = fx.heal_specs.iter().map(|h| h["tokens_m"].as_u64().unwrap()).collect();
+    assert_eq!(&t[..2], &[20, 80], "{t:?}");
+    assert!(st.notes.iter().any(|n| n.contains("learns on 80 million tokens") && n.contains("60 million more")), "{:?}", st.notes);
+    assert_eq!(retry_total_of(40), 80);
+    assert_eq!(retry_total_of(80), 80);
+    assert_eq!(retry_total_of(10), 80);
+}
+
+fn retry_total_of(m: u32) -> u32 {
+    ndforge_core::reshape::auto_plan::retry_total_m(m)
+}
+
+#[test]
+fn the_heal_tokens_of_a_stage_follow_the_choice() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, AutoSpec { stage_a_tokens_m: Some(10), last_tokens_m: Some(20), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let t: Vec<u64> = fx.heal_specs.iter().map(|h| h["tokens_m"].as_u64().unwrap()).collect();
+    assert_eq!(t, [10, 20]);
+    assert_eq!(st.stages.iter().map(|s| s.plan.tokens_m).collect::<Vec<_>>(), [10, 20]);
+}
+
+#[test]
+fn the_same_sequence_length_is_sent_to_every_heal_when_the_cache_is_shared() {
+    let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+    // on a 36 GB card the recipe's sequence is 4096 for the larger student and 8192 for the smaller one
+    let mut alone = Mock::new();
+    alone.vram = Some(36.0);
+    let s0 = start(&project(d1.path()), &mut alone, AutoSpec { allow_many_blocks: true, ..spec(17.4) }).unwrap();
+    assert_eq!(s0.status, "done", "{:?}", s0.error);
+    assert!(alone.heal_specs.iter().all(|h| h["seq"].is_null()));
+    let natural: Vec<u32> = s0.stages.iter().map(|s| s.plan.seq).collect();
+    assert!(natural.len() == 2 && natural[0] != natural[1], "the premise: the stages differ by themselves: {natural:?}");
+    let mut fx = Mock::new();
+    fx.vram = Some(36.0);
+    let st = start(&project(d2.path()), &mut fx, AutoSpec { allow_many_blocks: true, share_teacher_cache: true, ..spec(17.4) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let want = *natural.iter().min().unwrap();
+    assert_eq!(fx.heal_specs.iter().map(|h| h["seq"].as_u64().unwrap() as u32).collect::<Vec<_>>(), [want, want]);
+    assert_eq!(st.stages.iter().map(|s| s.plan.seq).collect::<Vec<_>>(), [want, want]);
+}
+
+#[test]
+fn the_importance_matrix_is_left_out_when_it_is_off() {
+    let (d1, d2) = (tempdir().unwrap(), tempdir().unwrap());
+    let mut fx = Mock::new();
+    start(&project(d1.path()), &mut fx, AutoSpec { imatrix: false, ..spec(21.1) }).unwrap();
+    assert_eq!(fx.imatrix, vec![false]);
+    let mut on = Mock::new();
+    start(&project(d2.path()), &mut on, spec(21.1)).unwrap();
+    assert_eq!(on.imatrix, vec![true]);
+}
+
+// ---- "I have at most N hours"
+
+#[test]
+fn a_time_limit_gives_up_the_least_harmful_settings_and_the_run_says_so() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    // the recipe of this cut takes about 50 to 100 hours; 60 needs a few settings given up
+    let st = start(&p, &mut fx, AutoSpec { max_hours: Some(60.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let b = st.budget.as_ref().unwrap();
+    assert!(b.fits && !b.dropped.is_empty(), "{b:?}");
+    assert_eq!(st.spec.preset.as_deref(), Some("custom"));
+    assert_eq!(st.spec.max_hours, Some(60.0), "the limit stays in the spec: the run watches the clock");
+    assert!(st.plan.as_ref().unwrap().time.as_ref().unwrap().total_h.1 <= 60.0);
+    assert!(st.notes.iter().any(|n| n.contains("To fit your 60 hours")) && b.dropped.iter().all(|d| st.notes.iter().any(|n| n.contains(&d.label) && n.contains(&d.risk))), "{:?}", st.notes);
+    // the report lists them
+    let rep = report_of(&p, Some(&st.id)).unwrap();
+    assert!(rep["markdown"].as_str().unwrap().contains("To fit your 60 hours"), "{}", rep["markdown"]);
+    assert_eq!(rep["report"]["budget"]["fits"], true);
+}
+
+#[test]
+fn a_time_limit_that_cannot_be_kept_ends_the_plan_in_plain_words_and_starts_nothing() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let e = start(&p, &mut fx, AutoSpec { max_hours: Some(2.0), ..spec(21.1) }).unwrap_err();
+    assert!(e.0.contains("Even the fastest settings take about") && e.0.contains("Choose more time or a larger size"), "{}", e.0);
+    assert!(fx.cuts == 0 && fx.heals == 0, "nothing was made");
+}
+
+#[test]
+fn a_retry_that_would_end_after_the_time_limit_is_not_started() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut late = Mock::new();
+    late.checks.insert("healed".into(), bad());
+    // the clock is a thousand hours ahead of the start of the run: no retry fits
+    late.clock = Some(late.now_secs() + 1000 * 3600);
+    let st = start(&p, &mut late, AutoSpec { max_hours: Some(336.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    assert!(st.error.as_deref().unwrap().contains("would end after your time limit of 336 hours"), "{:?}", st.error);
+    assert_eq!((st.stages[0].attempts.len(), late.heal_specs.len(), late.cuts), (1, 1, 1), "no second heal, no cut made again");
+    assert!(late.removed.is_empty());
+    // on time: the retry and the back-off run as always
+    let d2 = tempdir().unwrap();
+    let mut on_time = Mock::new();
+    on_time.checks.insert("healed".into(), bad());
+    let st = start(&project(d2.path()), &mut on_time, AutoSpec { max_hours: Some(336.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.stages[0].attempts.len(), 3);
+    assert!(st.error.as_deref().unwrap().contains("after 3 tries"));
+    // the guard is also for the stage made again (the retry is switched off, the clock is late)
+    let d3 = tempdir().unwrap();
+    let mut back = Mock::new();
+    back.checks.insert("healed".into(), bad());
+    back.clock = Some(back.now_secs() + 1000 * 3600);
+    let st = start(&project(d3.path()), &mut back, AutoSpec { max_hours: Some(336.0), retry_heal: false, ..spec(21.1) }).unwrap();
+    assert!(st.error.as_deref().unwrap().contains("Making the stage again with a smaller cut would end after your time limit"), "{:?}", st.error);
+    assert_eq!(back.cuts, 1);
+}
+
+#[test]
+fn the_report_lists_every_speed_setting_that_is_not_the_recipe_with_its_risk() {
+    let (d1, d2, d3) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+    // the recipe: nothing to list
+    let (p, mut fx) = (project(d1.path()), Mock::new());
+    let st = start(&p, &mut fx, gspec(21.1)).unwrap();
+    let md = report_of(&p, Some(&st.id)).unwrap()["markdown"].as_str().unwrap().to_string();
+    assert!(md.contains("## Speed settings") && md.contains("The recommended recipe: no setting was lowered to save time."), "{md}");
+    assert_eq!(report_of(&p, Some(&st.id)).unwrap()["report"]["speed"]["recipe"], true);
+    // Fast: every value is a row with its risk
+    let (p, mut fx) = (project(d2.path()), Mock::new());
+    let st = start(&p, &mut fx, gspec(21.1).with_preset("fast").unwrap()).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let r = report_of(&p, Some(&st.id)).unwrap();
+    let md = r["markdown"].as_str().unwrap();
+    assert!(md.contains("## Speed settings (setting: fast)"), "{md}");
+    for (label, used) in [("Heal tokens", "20 M tokens"), ("Stages", "one stage"), ("Try first", "Quick (64 texts)"), ("Thinking checks", "Quick (16 questions)"), ("Thinking check before healing", "the best 1 cut"),
+                          ("Check of each unhealed cut", "off"), ("Retry heal after a failed check", "off"), ("Cut one step less after a second failed check", "off"), ("Importance matrix for the export", "off")] {
+        assert!(md.lines().any(|l| l.starts_with(&format!("| {label} | {used} |"))), "{label}: {md}");
+    }
+    assert!(md.contains("very likely fail"), "{md}");
+    assert!(r["report"]["speed"]["deviations"].as_array().unwrap().len() >= 9);
+    // Balanced: its first stage and the shared length
+    let (p, mut fx) = (project(d3.path()), Mock::new());
+    fx.vram = Some(36.0);
+    let st = start(&p, &mut fx, AutoSpec { allow_many_blocks: true, ..gspec(17.4) }.with_preset("balanced").unwrap()).unwrap();
+    let md = report_of(&p, Some(&st.id)).unwrap()["markdown"].as_str().unwrap().to_string();
+    assert!(md.contains("| Heal tokens of the first stage | 20 M tokens | 40 M tokens |") && md.contains("| Sequence length of the stages | the same in both stages (4096) |"), "{md}");
+    // the plan's warnings and the notes said it before the run
+    assert!(st.notes.iter().any(|n| n.contains("first stage heals on 20 M tokens")), "{:?}", st.notes);
 }

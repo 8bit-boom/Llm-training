@@ -2626,8 +2626,16 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
+  sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
+// The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
+const AC_SPEED_PRESETS = [
+  {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
+  {"id": "balanced", "label": "Balanced", "blurb": "Two stages, a lighter first stage (20 M tokens), the same sequence length in both stages so the original writes its answers only once, quick thinking checks (16 questions) and a quick Try first. The last stage keeps the recipe's tokens.", "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.", "set": {"stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
+  {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false}},
+  {"id": "custom", "label": "Custom", "blurb": "Your own choice in the advanced speed settings below.", "risk": "Whatever you set below the recipe is listed in the plan and the report.", "set": {}},
+];
 const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
 const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
 
@@ -2637,10 +2645,43 @@ function acDefaults() {
   const total = ins.total_params / 1e9;
   if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
   if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (!ac.spInit) { ac.spInit = true; acApplyPreset(total >= 15 ? "balanced" : "thorough"); }      // a big model takes days: Balanced is chosen for it, the recommended recipe is one click away
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
+// the speed knobs as the program names them (the same fields as AC_SPEED_PRESETS[].set)
+function acKnobs() {
+  const sp = ac.sp;
+  return { stages: ac.stages, stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, share_teacher_cache: !!sp.share, quick: !!ac.quick, think_quick: sp.tq == null ? !!ac.quick : !!sp.tq, think_gate: !!ac.gate, think_gate_n: ac.gateN,
+    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix };
+}
+const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
+// the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
+function acPresetNow() {
+  const kn = acKnobs();
+  const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
+    if (!ac.thinking && AC_THINK_KNOBS.includes(k)) return true;
+    return kn[k] === (k === "think_quick" && v === null ? p.set.quick : v);
+  }));
+  return hit ? hit.id : "custom";
+}
+function acApplyPreset(id) {
+  const p = AC_SPEED_PRESETS.find((x) => x.id === id);
+  if (!p) return;
+  acApplySet(p.set);
+}
+// a choice of a knob (or a preset) sets these spec fields
+function acApplySet(set) {
+  for (const [k, v] of Object.entries(set)) {
+    if (k === "stages") ac.stages = v; else if (k === "quick") ac.quick = !!v; else if (k === "think_gate") ac.gate = !!v; else if (k === "think_gate_n") ac.gateN = v;
+    else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
+    else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
+  }
+}
 function acSpec() {
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish, ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}) };
+  const sp = ac.sp;
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
+    ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2658,6 +2699,46 @@ function acRefresh() {
   const token = ++ac.planTok;
   invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
     .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+}
+
+// a change of the total in hours: "−6 h to −11 h" (minutes in)
+function acDelta(d) {
+  if (!d) return "";
+  const [lo, hi] = [Math.min(d[0], d[1]), Math.max(d[0], d[1])];
+  if (Math.abs(lo) < 3 && Math.abs(hi) < 3) return "no change";
+  const sign = hi < 0 ? "−" : lo > 0 ? "+" : "±", a = acDuration(Math.abs(hi < 0 ? hi : lo) / 60), b = acDuration(Math.max(Math.abs(lo), Math.abs(hi)) / 60);
+  return a === b ? `${sign}${a}` : `${sign}${a} to ${sign}${b}`;
+}
+const acTotal = (t) => t ? `${acStepMin(t[0] * 60, t[1] * 60)}` : "";
+// the speed settings: the presets with their totals, the biggest levers with the change each choice makes, the rest under "More speed settings", and the time limit
+function acSpeedBlock(pl, live) {
+  const lock = live ? "disabled" : "", sp = pl && pl.speed, now = acPresetNow(), think = !!ac.thinking;
+  const row = (p) => {
+    const t = sp && sp.presets.find((x) => x.id === p.id), tt = p.id === "custom" ? sp && sp.total_h : t && t.total_h;
+    const risk = p.id === "fast" && think ? `<div class="err" data-acspeed-warn="fast">${esc(p.risk)} A model that thinks will very likely lose its reasoning with these settings.</div>` : `<div class="dim small">${esc(p.risk)}</div>`;
+    return `<label class="opt ac-preset" data-acpreset="${esc(p.id)}"><input type="radio" name="ac-preset" value="${esc(p.id)}" ${now === p.id ? "checked" : ""} ${lock}> <strong>${esc(p.label)}</strong>${tt ? ` <span class="ac-ptotal">about ${esc(acTotal(tt))}</span>` : ""}
+      <div class="dim small">${esc(p.blurb)}</div>${now === p.id || p.id === "fast" ? risk : ""}${t && t.retry_h && p.id !== "custom" ? `<div class="dim small">If a thinking check fails, a retry adds ${esc(acTotal(t.retry_h))} (not counted).</div>` : ""}</label>`;
+  };
+  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${o.current ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
+      <span class="dim small ac-delta">${o.current ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
+  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
+  const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
+  const bud = pl && pl.budget;
+  const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
+      <ul>${bud.dropped.map((d) => `<li data-acdropped="${esc(d.knob)}"><strong>${esc(d.label)}</strong>: ${esc(d.to)} instead of ${esc(d.from)} (saves ${esc(acTotal(d.saves_h))}). <span class="dim small">${esc(d.risk)}</span></li>`).join("")}</ul></div>` : `<p class="dim small" id="ac-budget-ok">Your settings already fit.</p>`) : "";
+  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast</h3>
+    <p class="dim small">Healing is most of the time. The recommended recipe is the safest; the others trade quality risk for hours, and every value that is not the recipe's is listed in the plan and in the report.</p>
+    ${AC_SPEED_PRESETS.map(row).join("")}
+    ${sp ? `<div class="ac-levers" id="ac-levers"><h4>What takes the time</h4><table class="tbl">${big.map(optRow).join("")}</table></div>` : ""}
+    ${rest.length ? `<details id="ac-adv" ${ac.advOpen ? "open" : ""}><summary>More speed settings</summary><table class="tbl">${rest.map(optRow).join("")}</table></details>` : ""}
+    <label class="opt"><input type="checkbox" id="ac-maxon" ${ac.maxOn ? "checked" : ""} ${lock}> I have at most <input type="text" id="ac-maxh" value="${esc(ac.maxH)}" placeholder="48" style="width:60px;flex:0" ${lock}> hours <span class="dim small">the least harmful settings are given up until it fits, or you are told it cannot</span></label>
+    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}</div>`;
+}
+
+// the change one choice of a knob makes, as a small note after its label (nothing while there is no plan or for the choice that is on)
+function acKnobDelta(pl, knob, labelStart) {
+  const k = pl && pl.speed && pl.speed.knobs.find((x) => x.knob === knob), o = k && k.options.find((x) => x.label.startsWith(labelStart));
+  return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
 function autoCard() {
@@ -2692,21 +2773,22 @@ function autoCard() {
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
     ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
-    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
-      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
+    ${acSpeedBlock(pl, live)}
+    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)${acKnobDelta(pl, "stages", "Two")}</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage${acKnobDelta(pl, "stages", "One")}</label>
+      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full${acKnobDelta(pl, "quick", "Full")}</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick${acKnobDelta(pl, "quick", "Quick")} <span class="dim small">(Try first)</span></label></div>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
     ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
     ${ac.gbOn ? `<p class="dim small" id="ac-gbnote">Each tensor gets the type that spends the bytes best (measured on the healed model's weights, weighted by its importance matrix), then <strong>Compare quants</strong> (KL divergence) checks the file against the plain sizes next to it. It is published only when it is clearly better than the plain file of its size.${pl && pl.measured_minutes ? ` About ${Math.round(pl.measured_minutes[0])} min to measure and ${Math.round(pl.measured_minutes[1])} min to compare (guesses). The 16-bit file is kept until the comparison is done, so this needs more disk.` : ""}${!(+ac.gb > 0) ? ` <span class="warn" id="ac-gbwhy">Give the size in GB.</span>` : ""}</p>` : ""}
     ${studio}
-    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}`}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}${live ? "" : acTimeBlock(pl)}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
-    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (an estimate; the checks and the export are counted at a fixed time)</p>` : ""}
+    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
     ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
     ${ac.err ? errDiv(ac.err) : ""}${status}${steps}${rep}</div>`;
 }
@@ -2716,14 +2798,33 @@ const AC_CHECK_H = 0.25, AC_EXPORT_H = 0.5;
 function acEtaRange(run, eta, nowMs) {
   if (!run || !run.steps || run.status === "done") return null;
   const stages = (run.plan && run.plan.stages) || [];
+  const time = run.plan && run.plan.time && run.plan.time.steps ? run.plan.time : null;
+  const now = nowMs || Date.now();
   let lo = 0, hi = 0;
   for (const x of run.steps) {
     if (x.status === "done" || x.status === "skipped") continue;
+    // the estimate made before the run: every step that is not done is left with its own range (a running step has the time it has used taken off)
+    const t = time ? time.steps.find((y) => y.id === x.id) : null;
+    if (t) {
+      let a = t.minutes[0] / 60, b = t.minutes[1] / 60;
+      if (x.status === "running") {
+        const left = eta && eta.step === x.id ? Math.max(0, eta.s - (now - eta.at) / 1000) / 3600 : null;
+        if (left != null) {
+          const merge = (t.parts || []).filter((q) => q.id === "merge").reduce((m, q) => [m[0] + q.minutes[0] / 60, m[1] + q.minutes[1] / 60], [0, 0]);   // the merge comes after the training
+          a = left + merge[0]; b = left + merge[1];
+        } else if (x.started && !Number.isNaN(Date.parse(x.started))) {
+          const used = Math.max(0, now - Date.parse(x.started)) / 3600e3;
+          a = Math.max(0.02, a - used); b = Math.max(a, b - used);
+        }
+      }
+      lo += a; hi += b;
+      continue;
+    }
     const m = /^s(\d+)\.(heal|check_cut|check_heal)$/.exec(x.id);
     if (x.id === "export") { lo += AC_EXPORT_H; hi += AC_EXPORT_H; }
     else if (x.id === "check_gguf" || (m && m[2] !== "heal")) { lo += AC_CHECK_H; hi += AC_CHECK_H; }
     else if (m) {
-      const left = eta && eta.step === x.id && x.status === "running" ? Math.max(0, eta.s - ((nowMs || Date.now()) - eta.at) / 1000) / 3600 : null;
+      const left = eta && eta.step === x.id && x.status === "running" ? Math.max(0, eta.s - (now - eta.at) / 1000) / 3600 : null;
       const g = stages[+m[1] - 1];
       if (left != null) { lo += left; hi += left; } else if (g && g.hours) { lo += g.hours[0]; hi += g.hours[1]; }
     }
@@ -2744,15 +2845,46 @@ function acDuration(hours) {
   const m = Math.max(5, Math.round(hours * 60 / step) * step), h = Math.floor(m / 60), r = m % 60;
   return h === 0 ? `${r} min` : r === 0 ? `${h} h` : `${h} h ${String(r).padStart(2, "0")} min`;
 }
+// a range of hours in words and the clock times it ends at: { left: "9 h 30 min to 14 h", when: "tomorrow 02:15–07:45" }
+function acSpan(r, now) {
+  const hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
+  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
+  const dl = acDuration(r.lo), dh = acDuration(hiH);
+  return { left: dl === dh ? dl : `${dl} to ${dh}`, when: a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}` };      // one day word for both ends when they share it
+}
 function acEtaText(run, eta, nowMs) {
   const r = acEtaRange(run, eta, nowMs);
   if (!r) return "";
-  const now = nowMs || Date.now(), hiH = Math.max(r.lo, r.hi), lo = now + r.lo * 3600e3, hi = now + hiH * 3600e3;
-  const a = acClock(lo, now), b = acClock(hi, now), da = acDay(lo, now), db = acDay(hi, now);
-  const dl = acDuration(r.lo), dh = acDuration(hiH);
-  const left = dl === dh ? dl : `${dl} to ${dh}`;
-  const when = a === b ? a : da === db ? `${a}–${acHM(new Date(hi))}` : `${a}–${b}`;      // one day word for both ends when they share it
-  return `about ${left} left (done around ${when})`;
+  const s = acSpan(r, nowMs || Date.now());
+  return `about ${s.left} left (done around ${s.when})`;
+}
+
+// "How long this will take": the estimate of the whole run (plan.time, made by the program from your own earlier jobs where it has them, else from formulas)
+function acStepMin(lo, hi) {
+  const f = (m) => (m < 1 ? "<1" : String(Math.round(m)));
+  if (hi < 60) return lo < 1 && hi < 1 ? "under 1 min" : `${f(lo)}–${f(hi)} min`;
+  const a = acDuration(lo / 60), b = acDuration(hi / 60);
+  return a === b ? a : `${a} to ${b}`;
+}
+function acTimeBlock(pl, nowMs) {
+  const t = pl && pl.time;
+  if (!t || !t.steps || !t.steps.length) return "";
+  const now = nowMs || Date.now(), r = { lo: t.total_h[0], hi: t.total_h[1] }, sp = acSpan(r, now);
+  const tag = (b) => b === "your_history" ? `<span class="tag ac-hist">from your history</span>` : `<span class="tag ac-formula">formula</span>`;
+  const partsOf = (x) => {
+    const q = (x.parts || []).filter((y) => ["cache", "train", "merge"].includes(y.id));
+    return q.length ? `<div class="dim small">${q.map((y) => `${esc(y.label)}: ${acStepMin(y.minutes[0], y.minutes[1])}`).join("; ")}</div>` : "";
+  };
+  const rows = t.steps.map((x) => `<tr data-actime="${esc(x.id)}"><td>${esc(x.label)}${partsOf(x)}${x.note ? `<div class="dim small">${esc(x.note)}</div>` : ""}</td><td>${acStepMin(x.minutes[0], x.minutes[1])}</td><td>${tag(x.basis)}</td></tr>`).join("");
+  const lever = t.lever_h && t.lever_h[1] > 0.5 * r.hi ? `<p class="dim small" id="ac-time-lever">Most of the time is the teacher's answers and the heal: ${acStepMin(t.lever_h[0] * 60, t.lever_h[1] * 60)}. Fewer tokens or one stage shortens it.</p>` : "";
+  const extra = (t.extra || []).map((e) => `<p class="dim small" data-actime-extra="${esc(e.id)}">Possible extra, not counted above: ${esc(e.label)}: ${acStepMin(e.minutes[0], e.minutes[1])}.</p>`).join("");
+  return `<div class="ac-time" id="ac-time"><h3>How long this will take</h3>
+    <p class="ac-total" id="ac-time-total">All of it together takes about <strong>${esc(sp.left)}</strong></p>
+    <p id="ac-time-done">If you press Start now it should be done around ${esc(sp.when)}.</p>
+    <details id="ac-time-steps"><summary>Every step</summary><table class="tbl"><tr><th>Step</th><th>Estimate</th><th>Where from</th></tr>${rows}</table></details>
+    <p class="dim small" id="ac-time-basis">${esc(t.basis)}</p>
+    <p class="dim small" id="ac-time-caveat">${esc((t.notes && t.notes[0]) || "This is an estimate, not a promise.")}</p>
+    ${lever}${extra}${(t.notes || []).slice(1).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}</div>`;
 }
 
 function onAutoEvent(p) {
@@ -2771,6 +2903,14 @@ function wireAuto() {
   set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
   set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
+  document.querySelectorAll("input[name=ac-preset]").forEach((r) => r.onchange = () => { if (r.value === "custom") ac.advOpen = true; else acApplyPreset(r.value); render(); });
+  document.querySelectorAll("input[data-acknob]").forEach((r) => r.onchange = () => {
+    const k = ac.plan && ac.plan.speed && ac.plan.speed.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
+    if (o) acApplySet(o.set);
+    render();
+  });
+  const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
+  set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
   const share = () => ({ host_path: ($("ac-sh-host") || {}).value || "", container_path: ($("ac-sh-cont") || {}).value || "", register_scan_folder: !!($("ac-sh-reg") || {}).checked, finetune_handoff: !!($("ac-sh-hf") || {}).checked });

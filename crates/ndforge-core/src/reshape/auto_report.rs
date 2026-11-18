@@ -71,7 +71,13 @@ pub fn build(st: &AutoState) -> Value {
     let original = st.original.as_ref();
     let last = st.stages.last();
     let actual_b = last.map(|s| s.plan.params_b);
-    let steps: Vec<Value> = st.steps.iter().map(|s| json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": secs_between(&s.started, &s.finished)})).collect();
+    let time = plan.and_then(|p| p.time.as_ref());
+    let steps: Vec<Value> = st.steps.iter().map(|s| {
+        let seconds = secs_between(&s.started, &s.finished);
+        let est = time.and_then(|t| t.steps.iter().find(|x| x.id == s.id));
+        json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": seconds,
+               "estimated_minutes": est.map(|x| json!([x.minutes.0, x.minutes.1])), "actual_minutes": seconds.map(|n| r1(n as f64 / 60.0)), "estimate_basis": est.map(|x| x.basis.clone())})
+    }).collect();
     let active: i64 = st.steps.iter().filter_map(|s| secs_between(&s.started, &s.finished)).sum();
     let mut failed: Vec<String> = Vec::new();
     for s in &st.stages {
@@ -97,8 +103,32 @@ pub fn build(st: &AutoState) -> Value {
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
         "think_gate": st.think_gate, "guardrails": guardrails(st),
-        "compare": st.compare, "target_gb": st.spec.target_gb,
+        "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget, "speed": speed_json(st),
+        "estimate": estimate_json(st, active),
     })
+}
+
+/// The speed settings of the run: the preset, and every value that is not the recommended recipe's with its risk (the plan warns about the same ones before the run starts).
+fn speed_json(st: &AutoState) -> Value {
+    let total_b = st.plan.as_ref().map(|p| p.original_b).unwrap_or(0.0);
+    let stages: Vec<_> = st.stages.iter().map(|s| s.plan.clone()).collect();
+    let dev = super::auto_speed::deviations(&st.spec, &stages, total_b);
+    json!({"preset": st.spec.preset, "recipe": dev.is_empty(), "deviations": dev, "max_hours": st.spec.max_hours})
+}
+
+/// The estimate made before the run next to what the steps took ("estimated vs actual", to tune the next estimate): per finished step the estimated range, the minutes it took
+/// and whether that was `within` the range, `faster` or `slower`; the totals only when the run is over. None for a run saved before the estimate existed.
+fn estimate_json(st: &AutoState, active_seconds: i64) -> Value {
+    let Some(t) = st.plan.as_ref().and_then(|p| p.time.as_ref()) else { return Value::Null };
+    let rows: Vec<Value> = st.steps.iter().filter_map(|s| {
+        let est = t.steps.iter().find(|x| x.id == s.id)?;
+        let actual = if s.status == "done" { secs_between(&s.started, &s.finished).map(|n| n as f64 / 60.0) } else { None };
+        let verdict = actual.map(|a| if a < est.minutes.0 { "faster" } else if a > est.minutes.1 { "slower" } else { "within" });
+        Some(json!({"id": s.id, "label": est.label, "estimated_minutes": [est.minutes.0, est.minutes.1], "actual_minutes": actual.map(r1), "basis": est.basis, "result": verdict}))
+    }).collect();
+    let over = matches!(st.status.as_str(), "done");
+    json!({"total_h": [t.total_h.0, t.total_h.1], "actual_h": if over { json!(r1(active_seconds as f64 / 3600.0)) } else { Value::Null }, "basis": t.basis,
+           "history_steps": t.history_steps, "step_count": t.step_count, "steps": rows})
 }
 
 /// The ways the chosen cut goes beyond what Auto-cut does by itself (with the numbers of its check before healing when there are any): empty for a cut inside the rules.
@@ -135,6 +165,13 @@ fn row(label: &str, verdict: &str, main: &Value) -> String {
     }
     s.push('\n');
     s
+}
+
+fn range(v: &Value) -> String {
+    match (v[0].as_f64(), v[1].as_f64()) {
+        (Some(a), Some(b)) => format!("{a:.1} to {b:.1}"),
+        _ => "-".into(),
+    }
 }
 
 fn num(v: &Value, digits: usize) -> String {
@@ -258,6 +295,16 @@ pub fn markdown(r: &Value) -> String {
             s.push_str(&format!("\nUnsloth Studio: not published ({}).\n", p["why"].as_str().unwrap_or("")));
         }
     }
+    if let Some(e) = r["estimate"].as_object().filter(|e| e["steps"].as_array().is_some_and(|a| !a.is_empty())) {
+        s.push_str("\n## Estimated and actual time\n\nThe estimate shown before the start, next to what the steps took (minutes; only finished steps have an actual time).\n\n");
+        let hours = |v: &Value| v.as_array().map(|a| format!("{} to {}", num(&a[0], 1), num(&a[1], 1))).unwrap_or_else(|| "-".into());
+        s.push_str(&format!("Total: estimated {} hours, actual {} hours. {}\n\n", hours(&e["total_h"]), if e["actual_h"].is_null() { "-".to_string() } else { num(&e["actual_h"], 1) }, e["basis"].as_str().unwrap_or("")));
+        s.push_str("| Step | Estimated | Actual | Result | From |\n|---|---|---|---|---|\n");
+        for x in e["steps"].as_array().cloned().unwrap_or_default() {
+            s.push_str(&format!("| {} | {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["estimated_minutes"].as_array().map(|a| format!("{} to {}", num(&a[0], 1), num(&a[1], 1))).unwrap_or_else(|| "-".into()),
+                                 if x["actual_minutes"].is_null() { "-".to_string() } else { num(&x["actual_minutes"], 1) }, x["result"].as_str().unwrap_or("-"), if x["basis"] == "your_history" { "your history" } else { "formula" }));
+        }
+    }
     if let Some(stages) = r["timings"]["summary"]["stages"].as_object().filter(|m| !m.is_empty()) {
         s.push_str("\n## Where the time went\n\nFrom the timing lines of the job logs; the share is of the time of all the jobs of this run.\n\n| Stage | Seconds | Times | Share |\n|---|---|---|---|\n");
         let mut rows: Vec<(&String, &Value)> = stages.iter().collect();
@@ -267,6 +314,29 @@ pub fn markdown(r: &Value) -> String {
         }
         for a in r["timings"]["advice"].as_array().cloned().unwrap_or_default() {
             s.push_str(&format!("\n- {}{}\n", if a["worth"] == true { "Worth doing: " } else { "" }, a["text"].as_str().unwrap_or("")));
+        }
+    }
+    if let Some(sp) = r["speed"].as_object() {
+        let preset = sp["preset"].as_str().map(|p| format!(" (setting: {p})")).unwrap_or_default();
+        s.push_str(&format!("\n## Speed settings{preset}\n\n"));
+        let devs = sp["deviations"].as_array().cloned().unwrap_or_default();
+        if devs.is_empty() {
+            s.push_str("The recommended recipe: no setting was lowered to save time.\n");
+        } else {
+            s.push_str("These values differ from the recommended recipe. Each one trades quality risk for time:\n\n| Setting | Used | Recipe | Risk |\n|---|---|---|---|\n");
+            for d in devs {
+                s.push_str(&format!("| {} | {} | {} | {} |\n", d["label"].as_str().unwrap_or(""), d["value"].as_str().unwrap_or(""), d["recipe"].as_str().unwrap_or(""), d["risk"].as_str().unwrap_or("")));
+            }
+        }
+        if let Some(b) = r["budget"].as_object().filter(|b| b["dropped"].as_array().is_some_and(|d| !d.is_empty())) {
+            s.push_str(&format!("\nTime limit of {} hours: the estimate went from {} h to {} h by giving up (least harmful first):\n\n", num(&b["max_hours"], 0), range(&b["asked_h"]), range(&b["total_h"])));
+            for d in b["dropped"].as_array().cloned().unwrap_or_default() {
+                s.push_str(&format!("- {}: {} instead of {} (saves {} h). {}\n", d["label"].as_str().unwrap_or(""), d["to"].as_str().unwrap_or(""), d["from"].as_str().unwrap_or(""), range(&d["saves_h"]), d["risk"].as_str().unwrap_or("")));
+            }
+        }
+        if let Some(e) = r["estimate"].as_object().filter(|e| !e["total_h"].is_null()) {
+            let actual = e["actual_h"].as_f64().map(|a| format!("{a:.1} h")).unwrap_or_else(|| "not finished".into());
+            s.push_str(&format!("\nEstimated {} h; took {actual}.\n", range(&e["total_h"])));
         }
     }
     if let Some(n) = r["notes"].as_array().filter(|n| !n.is_empty()) {

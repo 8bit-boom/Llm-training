@@ -233,3 +233,128 @@ pub fn logs_between(dir: &Path, from: &str, to: &str) -> Vec<PathBuf> {
     v.sort();
     v
 }
+
+// ------------------------------------------------------------------------------------------------------------------ your own history, for the time estimate
+
+/// One measured rate of an earlier job: the size it was measured at (billions of parameters, or GB for the rates per GB) and the rate itself.
+/// Throughputs are stored as `tokens per second x billions of parameters`, so that a model of another size is `value / size_b` (linear scaling).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sample {
+    pub size: f64,
+    pub value: f64,
+}
+
+/// What the saved job logs say about this computer: rates per kind of work, newest sample first. The Auto-cut time estimate (`reshape::auto_time`) prefers them to its formulas.
+/// Keys: `teacher_tok_b_s` (the teacher's answers), `train_tok_b_s`, `score_tok_b_s` (measuring), `try_tok_b_s` (Try first), `merge_s_per_gb`, `write_gb_s`,
+/// `load_gb_s:<mode>`, `think_s_per_b:<quick|full>` (seconds of one thinking check per billion parameters).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct History {
+    pub metrics: BTreeMap<String, Vec<Sample>>,
+}
+
+/// How many of the newest samples the median is taken over.
+pub const HISTORY_RECENT: usize = 5;
+
+impl History {
+    /// Adds a sample as the newest one.
+    pub fn push(&mut self, key: &str, size: f64, value: f64) {
+        if size.is_finite() && value.is_finite() && size > 0.0 && value > 0.0 {
+            self.metrics.entry(key.to_string()).or_default().insert(0, Sample { size, value });
+        }
+    }
+
+    /// The median of the newest samples of the same size class (0.5 to 2 times `size`; every sample when none is that close, scaled linearly), and how many there were.
+    pub fn pick(&self, key: &str, size: f64) -> Option<(f64, usize)> {
+        let all = self.metrics.get(key)?;
+        let near: Vec<&Sample> = all.iter().filter(|s| s.size >= size * 0.5 && s.size <= size * 2.0).collect();
+        let used: Vec<f64> = if near.is_empty() { all.iter().take(HISTORY_RECENT).map(|s| s.value).collect() } else { near.iter().take(HISTORY_RECENT).map(|s| s.value).collect() };
+        (!used.is_empty()).then(|| (median(&used), used.len()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metrics.values().all(|v| v.is_empty())
+    }
+
+    /// The history of job logs (texts), oldest first: the newest end up first in every list.
+    pub fn from_texts(texts: &[String]) -> History {
+        let mut h = History::default();
+        for (i, text) in texts.iter().enumerate() {
+            let kind = kind_of(text);
+            let recs = parse_log(text);
+            let header = text.lines().take(4).find_map(|l| l.strip_prefix("# job: ")).and_then(|j| serde_json::from_str::<Value>(j).ok()).unwrap_or(Value::Null);
+            let gb = |t: &Timing| t.fields["bytes"].as_f64().filter(|b| *b > 0.0).map(|b| b / 1e9);
+            // the loads: GB per second by the way the model was loaded
+            for t in recs.iter().filter(|t| t.stage.starts_with("load_") && t.seconds > 0.5) {
+                if let (Some(g), Some(mode)) = (gb(t), t.fields["load"].as_str()) {
+                    h.push(&format!("load_gb_s:{mode}"), g, g / t.seconds);
+                }
+            }
+            // the size of the model the job is about, from the folder it loaded (16-bit files: 2 bytes a parameter)
+            let model_b = |stage: &str| recs.iter().find(|t| t.stage == stage).and_then(gb).map(|g| g / 2.0);
+            match kind.as_str() {
+                "distill_cache" => {
+                    if let (Some(b), Some(t)) = (model_b("load_teacher"), recs.iter().find(|t| t.stage == "teacher_pass")) {
+                        if let Some(tps) = t.fields["tokens_per_s"].as_f64() {
+                            h.push("teacher_tok_b_s", b, tps * b);
+                        }
+                    }
+                }
+                "distill" if model_b("load_teacher").is_none() => {
+                    // the student's size: the merge that follows this job in time is of the same model
+                    let student_b = texts[i + 1..].iter().find(|t| kind_of(t) == "distill_merge").and_then(|t| parse_log(t).iter().find(|r| r.stage == "merge_total").and_then(gb)).map(|g| g / 2.0);
+                    if let (Some(b), Some(t)) = (student_b, recs.iter().find(|t| t.stage == "train")) {
+                        if let Some(tps) = t.fields["tokens_per_s"].as_f64() {
+                            h.push("train_tok_b_s", b, tps * b);
+                        }
+                    }
+                }
+                "distill_merge" => {
+                    if let Some(t) = recs.iter().find(|t| t.stage == "merge_total") {
+                        if let Some(g) = gb(t) {
+                            h.push("merge_s_per_gb", g, t.seconds / g);
+                        }
+                    }
+                }
+                "reshape" => {
+                    if let Some(t) = recs.iter().find(|t| t.stage == "write") {
+                        if let Some(g) = gb(t) {
+                            h.push("write_gb_s", g, g / t.seconds.max(0.01));
+                        }
+                    }
+                }
+                "think_check" => {
+                    // HF backend only (the GGUF check has no load record to take the size from)
+                    if let (Some(b), Some(t)) = (model_b("load_model"), recs.iter().find(|t| t.stage == "think_generate" && t.fields["backend"].is_null())) {
+                        let key = if header["quick"] == json!(true) { "think_s_per_b:quick" } else { "think_s_per_b:full" };
+                        h.push(key, b, t.seconds / b);
+                    }
+                }
+                "reshape_measure" => {
+                    if let (Some(b), Some(t)) = (model_b("load_model"), recs.iter().find(|t| t.stage == "score")) {
+                        if let Some(tok) = t.fields["tokens"].as_f64().filter(|x| *x > 0.0) {
+                            h.push("score_tok_b_s", b, tok / t.seconds.max(0.01) * b);
+                        }
+                    }
+                }
+                "reshape_try" => {
+                    if let Some(b) = model_b("load_model") {
+                        let rates: Vec<f64> = recs.iter().filter(|t| t.stage == "try_pass").filter_map(|t| t.fields["tokens"].as_f64().filter(|x| *x > 0.0).map(|tok| tok / t.seconds.max(0.01) * b)).collect();
+                        if !rates.is_empty() {
+                            h.push("try_tok_b_s", b, median(&rates));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        h
+    }
+
+    /// The history of the newest `n` saved job logs of this computer.
+    pub fn recent(n: usize) -> History {
+        let mut files = crate::envmgr::joblog::latest(n);
+        files.reverse();
+        let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
+        History::from_texts(&texts)
+    }
+}

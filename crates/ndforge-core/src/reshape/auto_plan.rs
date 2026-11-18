@@ -10,9 +10,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub use super::auto_time::{time_estimate, ExtraTime, StepPart, StepTime, TimeEstimate};
 use super::plan::{self, HealDims, HealPlan, Inspect, Mode, Width};
 use super::runs::{heal_choice, HealSpec};
 use crate::error::{Error, Result};
+use crate::timing::History;
 
 /// Whole blocks that may be removed without the owner's confirmation.
 pub const MAX_BLOCKS_FREE: u32 = 4;
@@ -39,6 +41,15 @@ fn two() -> u32 {
 }
 fn q4() -> Vec<String> {
     vec!["q4_k_m".into()]
+}
+
+/// The tokens a retry heal adds to the healed model's own (the original's answers are extended by the difference).
+pub const RETRY_TOKENS_M: u32 = 40;
+
+/// The millions of tokens the SECOND heal of a stage learns on (the retry after a failed check): the stage's own plus `RETRY_TOKENS_M`, rounded up to a budget the heal takes
+/// (10 / 20 / 40 / 80), at most 80. The student of the retry is the healed model, and it learns on ALL of these tokens again (40 + 40 = 80; 20 gives 80 too).
+pub fn retry_total_m(stage_m: u32) -> u32 {
+    plan::HEAL_TOKENS_M.iter().copied().find(|t| *t >= stage_m + RETRY_TOKENS_M).unwrap_or(80)
 }
 
 /// What the person asks Auto-cut for.
@@ -78,11 +89,50 @@ pub struct AutoSpec {
     /// also make a file of about this many GB with "Mixed: measured fit to a size" (docs/AUTO_CUT.md, "A target size"), and compare it with the plain sizes next to it; None = not
     #[serde(default)]
     pub target_gb: Option<f64>,
+    // ---- speed settings (docs/AUTO_CUT.md, "Speed settings"). Every field is at the recommended recipe by default: an older spec plans and runs exactly as before.
+    /// the speed setting the person chose: "thorough" | "balanced" | "fast" | "custom" (`auto_speed.json`); None = not chosen (the recipe)
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// the heal of every stage but the last, in millions of tokens (10 / 20 / 40 / 80); None = the recipe's 40
+    #[serde(default)]
+    pub stage_a_tokens_m: Option<u32>,
+    /// the heal of the last stage; None = the recipe's number for this cut (40, or 80 when more than 30 % is cut)
+    #[serde(default)]
+    pub last_tokens_m: Option<u32>,
+    /// Quick (16 questions) thinking checks; None = follows `quick` (the old behaviour)
+    #[serde(default)]
+    pub think_quick: Option<bool>,
+    /// check the thinking of the unhealed cut of every stage (informational: nothing is decided by it); off = the original is checked after the first heal instead
+    #[serde(default = "yes")]
+    pub check_cut: bool,
+    /// heal again (on the healed model, the original's answers extended) when the thinking check of a healed stage fails
+    #[serde(default = "yes")]
+    pub retry_heal: bool,
+    /// cut one step less and make the stage again after a second failed check (else the run ends `gates_failed`)
+    #[serde(default = "yes")]
+    pub back_off: bool,
+    /// heal every stage on the same sequence length, so the original writes its answers once and the next stage reuses them
+    #[serde(default)]
+    pub share_teacher_cache: bool,
+    /// measure an importance matrix for the small GGUF sizes
+    #[serde(default = "yes")]
+    pub imatrix: bool,
+    /// "I have at most this many hours": the planner drops the least harmful settings until the estimate fits (1 to 336); None = no limit
+    #[serde(default)]
+    pub max_hours: Option<f64>,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
-        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None }
+        AutoSpec {
+            model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None,
+        }
+    }
+
+    /// Are the thinking checks the quick ones (16 questions)? Follows `quick` unless the person chose.
+    pub fn think_quick(&self) -> bool {
+        self.think_quick.unwrap_or(self.quick)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -94,6 +144,21 @@ impl AutoSpec {
         }
         if !(1..=TRY_TOP as u32).contains(&self.think_gate_n) {
             return Err(Error::new(format!("The thinking check before healing looks at 1 to {TRY_TOP} cuts.")));
+        }
+        for t in [self.stage_a_tokens_m, self.last_tokens_m].into_iter().flatten() {
+            if !plan::HEAL_TOKENS_M.contains(&t) {
+                return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens."));
+            }
+        }
+        if let Some(h) = self.max_hours {
+            if !h.is_finite() || !(1.0..=336.0).contains(&h) {
+                return Err(Error::new("The time you have must be between 1 and 336 hours."));
+            }
+        }
+        if let Some(p) = &self.preset {
+            if super::auto_speed::preset(p).is_none() {
+                return Err(Error::new(format!("Unknown speed setting: {p}.")));
+            }
         }
         if let Some(t) = self.target_gb {
             if !t.is_finite() || t <= 0.0 {
@@ -232,8 +297,14 @@ pub fn beyond_guardrails(ins: &Inspect, blocks: u32, intermediate: Option<u32>) 
 pub fn think_check_minutes(ins: &Inspect, blocks: u32, intermediate: Option<u32>, quick: bool) -> f64 {
     let params = size_of(ins, blocks, intermediate) as f64;
     let write = params * ins.bytes_per_param.max(1.0) / 500e6 / 60.0;
-    let check = (if quick { 10.0 } else { 15.0 }) * (params / 1e9 / 17.0).max(1.0);
+    let check = think_check_only_minutes(params / 1e9, quick);
     ((write + check) * 10.0).round() / 10.0
+}
+
+/// The check alone (no writing of the cut): 15 minutes for the full suite, 10 for the quick one, per 17 B of the model, at least once. The one formula the time estimate
+/// (`auto_time`) and the plan's own thinking-check times share.
+pub fn think_check_only_minutes(params_b: f64, quick: bool) -> f64 {
+    (if quick { 10.0 } else { 15.0 }) * (params_b / 17.0).max(1.0)
 }
 
 pub fn think_gate_minutes(ins: &Inspect, cand: &Candidate, quick: bool) -> f64 {
@@ -369,6 +440,12 @@ pub struct StagePlan {
     pub verdict: String,
     pub mode: String,
     pub hours: (f64, f64),
+    /// how the original is loaded for its answers ("auto" | "4bit" | "16bit"); the saved answers of two stages are shared only when this and `seq` are the same
+    #[serde(default)]
+    pub teacher_load: String,
+    /// the sequence length is fixed for the heal (`share_teacher_cache`: every stage uses the same one, so the next stage reuses the original's answers)
+    #[serde(default)]
+    pub seq_pinned: bool,
 }
 
 impl StagePlan {
@@ -386,6 +463,9 @@ impl StagePlan {
     /// The heal of this stage: tokens and, for a model that thinks, the thinking recipe.
     pub fn heal_spec(&self, keep_thinking: bool) -> HealSpec {
         let mut v = json!({"tokens_m": self.tokens_m});
+        if self.seq_pinned {
+            v["seq"] = json!(self.seq);
+        }
         if keep_thinking {
             v["recipe"] = json!(plan::THINKING_RECIPE);
         }
@@ -400,21 +480,41 @@ fn gb(x: f64) -> f64 {
 /// One stage: the cut from `prev` to `st` (stops of the way, from the original), healed with the numbers of the recipe for a student of that size. `index` is 1-based,
 /// `of` the number of stages; the last stage heals with the larger budget.
 pub fn stage_for(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u32, of: u32, vram_gb: Option<f64>) -> StagePlan {
+    stage_with_seq(ins, spec, prev, st, index, of, vram_gb, None)
+}
+
+/// The heal tokens of a stage: the recipe's (40 M for a stage that is not the last, the recipe's number for the last, the size's default without thinking) unless the person chose.
+fn stage_tokens(spec: &AutoSpec, student_b: f64, total_b: f64, last: bool) -> u32 {
+    let chosen = if last { spec.last_tokens_m } else { spec.stage_a_tokens_m };
+    chosen.unwrap_or_else(|| recipe_tokens_m(spec.keep_thinking, student_b, total_b, last))
+}
+
+/// The recipe's heal tokens of a stage (millions): 40 for a stage that is not the last, the recipe's number for the last (`plan::thinking_tokens_m`), the size's default without thinking.
+pub fn recipe_tokens_m(keep_thinking: bool, student_b: f64, total_b: f64, last: bool) -> u32 {
+    match (keep_thinking, last) {
+        (true, true) => plan::thinking_tokens_m(student_b, total_b),
+        (true, false) => STAGE_A_TOKENS_M,
+        (false, _) => plan::default_heal_tokens_m(student_b),
+    }
+}
+
+/// `stage_for` with the sequence length fixed (`pin`, for the stages that share the original's answers).
+#[allow(clippy::too_many_arguments)]
+fn stage_with_seq(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u32, of: u32, vram_gb: Option<f64>, pin: Option<u32>) -> StagePlan {
     let total_b = ins.total_params as f64 / 1e9;
     let params = size_of(ins, st.blocks, st.intermediate);
     let student_b = params as f64 / 1e9;
     let last = index == of;
-    let tokens_m = match (spec.keep_thinking, last) {
-        (true, true) => plan::thinking_tokens_m(student_b, total_b),
-        (true, false) => STAGE_A_TOKENS_M,
-        (false, _) => plan::default_heal_tokens_m(student_b),
-    };
+    let tokens_m = stage_tokens(spec, student_b, total_b, last);
     let dims = match &ins.width_dims {
         Some(d) => HealDims { layers: ins.layers.saturating_sub(st.blocks * ins.period), hidden: d.hidden, vocab: d.vocab },
         None => HealDims::guess(student_b),
     };
-    let hs: HealSpec = serde_json::from_value(if spec.keep_thinking { json!({"tokens_m": tokens_m, "recipe": plan::THINKING_RECIPE}) } else { json!({"tokens_m": tokens_m}) })
-        .unwrap_or_else(|_| unreachable!("a spec made of known keys"));
+    let mut hv = if spec.keep_thinking { json!({"tokens_m": tokens_m, "recipe": plan::THINKING_RECIPE}) } else { json!({"tokens_m": tokens_m}) };
+    if let Some(sq) = pin {
+        hv["seq"] = json!(sq);
+    }
+    let hs: HealSpec = serde_json::from_value(hv).unwrap_or_else(|_| unreachable!("a spec made of known keys"));
     let ch = heal_choice(&hs, student_b, vram_gb, &dims);
     let hp: HealPlan = plan::heal_plan_with(student_b, total_b, vram_gb, &dims, &ch.knobs);
     let m = tokens_m as f64 / 10.0;
@@ -427,17 +527,30 @@ pub fn stage_for(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u3
         tokens_m, seq: ch.knobs.seq, batch: ch.knobs.batch, rank: ch.knobs.rank, cache_gb: gb(tokens_m as f64 * 1e6 * CACHE_BYTES_PER_TOKEN / 1e9),
         heal_gb: hp.est_gb, verdict: hp.verdict.to_string(), mode: hp.mode.to_string(),
         hours: (((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0),
+        teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), seq_pinned: pin.is_some(),
     }
 }
 
 /// The stage plans of the stops `steps`, the first from the original.
+///
+/// With `share_teacher_cache` (and more than one stage) every stage heals on the SMALLEST sequence length any of them would use by itself and sends it to the heal
+/// (`StagePlan::seq_pinned`): the original's saved answers are kept per sequence length, so the second stage then finds the first stage's rows and writes only the tokens
+/// it has more. A shorter sequence than the recipe's cuts the longest reasoning traces of the larger student short; the plan says so.
 pub fn stage_plans(ins: &Inspect, spec: &AutoSpec, steps: &[Step], vram_gb: Option<f64>) -> Vec<StagePlan> {
-    let mut prev = Step { blocks: 0, intermediate: full_width(ins) };
-    steps.iter().enumerate().map(|(n, st)| {
-        let stage = stage_for(ins, spec, prev, *st, n as u32 + 1, steps.len() as u32, vram_gb);
-        prev = *st;
-        stage
-    }).collect()
+    let of = steps.len() as u32;
+    let run = |pin: Option<u32>| -> Vec<StagePlan> {
+        let mut prev = Step { blocks: 0, intermediate: full_width(ins) };
+        steps.iter().enumerate().map(|(n, st)| {
+            let stage = stage_with_seq(ins, spec, prev, *st, n as u32 + 1, of, vram_gb, pin);
+            prev = *st;
+            stage
+        }).collect()
+    };
+    let plans = run(None);
+    match plans.iter().map(|s| s.seq).min() {
+        Some(min) if spec.share_teacher_cache && of > 1 => run(Some(min)),
+        _ => plans,
+    }
 }
 
 /// Bytes per parameter of a GGUF size (llama.cpp's own figures, rounded up).
@@ -571,6 +684,15 @@ pub struct AutoPlan {
     /// with a target size: about how many minutes measuring the fit takes and how many the comparison takes; (None: no target). Guesses.
     #[serde(default)]
     pub measured_minutes: Option<(f64, f64)>,
+    /// the time of the WHOLE run, step by step, before it starts (`auto_time`); None while the plan has blockers
+    #[serde(default)]
+    pub time: Option<TimeEstimate>,
+    /// the speed settings: the time of every preset and of every knob's choices for this model (`auto_speed`); None while the plan has blockers
+    #[serde(default)]
+    pub speed: Option<super::auto_speed::SpeedInfo>,
+    /// with "I have at most N hours": the settings that were given up to fit, or the refusal (`auto_speed::fit_budget`); None without a limit
+    #[serde(default)]
+    pub budget: Option<super::auto_speed::BudgetFit>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -578,7 +700,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None, speed: None, budget: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);
@@ -623,6 +745,8 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
         out.warnings.push("This cut cannot be divided into two stages: it is done in one.".into());
     }
     out.stages = stage_plans(ins, spec, &steps, vram_gb);
+    let natural: Vec<u32> = if spec.share_teacher_cache { stage_plans(ins, &AutoSpec { share_teacher_cache: false, ..spec.clone() }, &steps, vram_gb).iter().map(|s| s.seq).collect() } else { out.stages.iter().map(|s| s.seq).collect() };
+    out.warnings.extend(super::auto_speed::speed_warnings(spec, &out.stages, &natural, original_b));
     for s in &out.stages {
         if s.verdict == "over" {
             out.blockers.push(format!("Healing stage {} ({:.1} B) needs about {:.0} GB on the card (an estimate); this card has {:.0} GB.", s.index, s.params_b, s.heal_gb, vram_gb.unwrap_or(0.0)));
@@ -645,8 +769,8 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     }
     if spec.keep_thinking && spec.think_gate && !out.try_list.is_empty() {
         let n = (spec.think_gate_n as usize).min(out.try_list.len());
-        let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.quick)).sum();
-        let baseline = (if spec.quick { 10.0 } else { 15.0 }) * (ins.total_params as f64 / 1e9 / 17.0).max(1.0);
+        let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.think_quick())).sum();
+        let baseline = (if spec.think_quick() { 10.0 } else { 15.0 }) * (ins.total_params as f64 / 1e9 / 17.0).max(1.0);
         out.think_gate_minutes = Some(((per + baseline) * 10.0).round() / 10.0);
         add_think_gate_disk(ins, &mut disk, &chosen, out.stages.len() == 1);
     }
@@ -656,5 +780,25 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     }
     out.disk = Some(disk);
     out.ok = out.blockers.is_empty();
+    if out.ok {
+        out.time = Some(time_estimate(ins, spec, &out, &History::default()));
+    }
     out
+}
+
+/// `with_history`, and the speed settings of this model and card made with the same history: the time of every preset and what each knob's choices change (`plan.speed`).
+pub fn with_speed(plan: AutoPlan, ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history: &History) -> AutoPlan {
+    let mut plan = with_history(plan, ins, spec, history);
+    if plan.ok {
+        plan.speed = Some(super::auto_speed::speed_info(ins, spec, vram_gb, history));
+    }
+    plan
+}
+
+/// The plan with the time estimate made from this computer's own earlier jobs (`history`) where they say something: what the window shows and what a run saves.
+pub fn with_history(mut plan: AutoPlan, ins: &Inspect, spec: &AutoSpec, history: &History) -> AutoPlan {
+    if plan.ok {
+        plan.time = Some(time_estimate(ins, spec, &plan, history));
+    }
+    plan
 }
