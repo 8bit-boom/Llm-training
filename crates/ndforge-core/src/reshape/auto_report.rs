@@ -103,7 +103,7 @@ pub fn build(st: &AutoState) -> Value {
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
         "think_gate": st.think_gate, "guardrails": guardrails(st),
-        "compare": st.compare, "target_gb": st.spec.target_gb,
+        "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget,
         "estimate": estimate_json(st, active),
     })
 }

@@ -238,3 +238,85 @@ fn the_owners_two_stage_case_with_the_recipe_at_40_m_in_both_stages() {
         assert_eq!(p.stages.iter().map(|s| s.tokens_m).collect::<Vec<_>>(), [40, 40]);
     }
 }
+
+fn fits_for(spec: &AutoSpec, vram: f64, h: f64) -> BudgetFit {
+    fit_budget(&qwen27(), spec, Some(vram), &History::default(), h)
+}
+
+#[test]
+fn the_ladder_gives_up_the_least_harmful_setting_first_and_stops_at_the_first_fit() {
+    let spec = AutoSpec { allow_many_blocks: true, ..AutoSpec::new("qwen3.8-27b", 19.5) };
+    let asked = run(&spec, 36.0).1.total_h;
+    let order = ["think_quick", "quick", "check_cut", "share_teacher_cache", "think_gate_n", "retry_heal", "stage_a_tokens_m", "stages", "last_tokens_m"];
+    // every rung that applies, in order, one more per tighter limit
+    let mut last_len = 0;
+    let mut knobs_seen: Vec<String> = Vec::new();
+    for limit in [asked.1 - 0.2, asked.1 - 2.0, asked.1 - 6.0, asked.1 - 20.0, asked.1 - 30.0, 25.0, 12.5] {
+        let f = fits_for(&spec, 36.0, limit);
+        let knobs: Vec<&str> = f.dropped.iter().map(|d| d.knob.as_str()).collect();
+        println!("limit {limit:.1} h: fits={} total {:?} dropped {knobs:?}", f.fits, f.total_h);
+        let pos: Vec<usize> = knobs.iter().map(|k| order.iter().position(|o| o == k).unwrap()).collect();
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "the ladder order: {knobs:?}");
+        assert!(f.dropped.len() >= last_len, "a tighter limit never gives up fewer settings");
+        last_len = f.dropped.len();
+        if f.fits {
+            assert!(f.total_h.1 <= limit, "{:?} {limit}", f.total_h);
+            // the first fit: without the last setting it would not have fitted
+            if let Some(last) = f.dropped.last() {
+                assert!(f.total_h.1 + last.saves_h.1 > limit - 0.1, "without the last setting given up it did not fit: {:?} {last:?} {limit}", f.total_h);
+            }
+            assert!(f.dropped.iter().all(|d| d.saves_h.1 >= 0.0 && !d.risk.is_empty() && !d.from.is_empty() && !d.to.is_empty()), "{:?}", f.dropped);
+        }
+        knobs_seen.extend(knobs.iter().map(|k| k.to_string()));
+    }
+    assert!(knobs_seen.contains(&"think_quick".to_string()));
+    // a limit that is kept already changes nothing
+    let ok = fits_for(&spec, 36.0, asked.1 + 1.0);
+    assert!(ok.fits && ok.dropped.is_empty());
+    assert_eq!(ok.spec, AutoSpec { max_hours: Some(asked.1 + 1.0), ..spec.clone() });
+}
+
+#[test]
+fn when_even_the_fastest_settings_do_not_fit_it_refuses_in_plain_words() {
+    let spec = AutoSpec { allow_many_blocks: true, ..AutoSpec::new("qwen3.8-27b", 19.5) };
+    let f = fits_for(&spec, 36.0, 3.0);
+    assert!(!f.fits);
+    let m = f.message.as_deref().unwrap();
+    assert!(m.starts_with("Even the fastest settings take about ") && m.contains(" h") && m.ends_with("Choose more time or a larger size."), "{m}");
+    // the whole ladder was used, the last rung is the thinking warning one
+    assert_eq!(f.dropped.last().map(|d| d.knob.as_str()), Some("last_tokens_m"));
+    assert!(f.dropped.last().unwrap().risk.contains("very likely fail"));
+    assert!(f.spec.last_tokens_m == Some(20) && f.spec.stages == 1);
+}
+
+#[test]
+fn a_time_limit_never_drops_a_requested_output_or_the_thinking_itself() {
+    let spec = AutoSpec { allow_many_blocks: true, target_gb: Some(10.6), studio_publish: true, quants: vec!["q4_k_m".into(), "q8_0".into()], keep_intermediate: true, ..AutoSpec::new("qwen3.8-27b", 19.5) };
+    for h in [20.0, 3.0] {
+        let f = fits_for(&spec, 36.0, h);
+        assert_eq!((f.spec.target_gb, f.spec.studio_publish, f.spec.quants.clone(), f.spec.keep_intermediate, f.spec.keep_thinking, f.spec.target_b), (Some(10.6), true, vec!["q4_k_m".to_string(), "q8_0".to_string()], true, true, 19.5));
+        assert!(f.dropped.iter().all(|d| ["think_quick", "quick", "check_cut", "share_teacher_cache", "think_gate_n", "retry_heal", "stage_a_tokens_m", "stages", "last_tokens_m"].contains(&d.knob.as_str())));
+    }
+    // a model that does not think has no thinking checks to shorten
+    let plain = AutoSpec { keep_thinking: false, think_gate: false, allow_many_blocks: true, ..AutoSpec::new("qwen3.8-27b", 19.5) };
+    let f = fits_for(&plain, 36.0, 12.0);
+    assert!(f.dropped.iter().all(|d| !["think_quick", "check_cut", "think_gate_n", "retry_heal"].contains(&d.knob.as_str())), "{:?}", f.dropped.iter().map(|d| d.knob.clone()).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_window_gets_the_list_of_what_was_given_up_or_the_refusal() {
+    let ins = qwen27();
+    let spec = AutoSpec { allow_many_blocks: true, max_hours: Some(30.0), ..AutoSpec::new("qwen3.8-27b", 19.5) };
+    let v = ndforge_core::reshape::auto::preview(&ins, &spec, Some(36.0), Some(2000.0), true);
+    let p: AutoPlan = serde_json::from_value(v["plan"].clone()).unwrap();
+    let b = p.budget.as_ref().unwrap();
+    assert!(!b.dropped.is_empty());
+    assert_eq!(p.ok, b.fits);
+    assert!(p.warnings.iter().any(|w| w.starts_with("To fit your 30 hours")), "{:?}", p.warnings);
+    let hard = ndforge_core::reshape::auto::preview(&ins, &AutoSpec { max_hours: Some(3.0), ..spec }, Some(36.0), Some(2000.0), true);
+    let p: AutoPlan = serde_json::from_value(hard["plan"].clone()).unwrap();
+    assert!(!p.ok && p.blockers.iter().any(|b| b.contains("Even the fastest settings take about")), "{:?}", p.blockers);
+    // without a limit there is no budget
+    let none: AutoPlan = serde_json::from_value(ndforge_core::reshape::auto::preview(&ins, &AutoSpec { allow_many_blocks: true, ..AutoSpec::new("qwen3.8-27b", 19.5) }, Some(36.0), Some(2000.0), true)["plan"].clone()).unwrap();
+    assert!(none.budget.is_none());
+}

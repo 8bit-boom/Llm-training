@@ -67,6 +67,12 @@ impl AutoSpec {
             _ => Map::new(),
         };
         v.insert("think_quick".into(), Value::Bool(self.think_quick()));
+        if !self.keep_thinking {
+            // a model that does not think has no thinking checks: those knobs do not tell the presets apart
+            for k in ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"] {
+                v.insert(k.into(), Value::Null);
+            }
+        }
         KNOBS.iter().filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone()))).collect()
     }
 
@@ -331,4 +337,114 @@ pub fn hours_text(m: (f64, f64)) -> String {
         if t >= 60 { if t % 60 == 0 { format!("{} h", t / 60) } else { format!("{} h {} min", t / 60, t % 60) } } else { format!("{t} min") }
     };
     format!("{} to {}", one(m.0), one(m.1))
+}
+
+// ------------------------------------------------------------------------------------------------------------------ "I have at most N hours"
+
+/// One setting the time budget gave up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Dropped {
+    pub knob: String,
+    pub label: String,
+    pub from: String,
+    pub to: String,
+    /// what this step saved, hours (low, high)
+    pub saves_h: (f64, f64),
+    pub risk: String,
+}
+
+/// The answer to "I have at most N hours": the settings that make the run fit (the least harmful given up first), or the plain sentence that it cannot be done.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetFit {
+    pub max_hours: f64,
+    /// the spec to run: the asked one with the dropped settings applied (`max_hours` stays in it: the run watches the clock)
+    pub spec: AutoSpec,
+    pub dropped: Vec<Dropped>,
+    pub fits: bool,
+    /// the estimate of the asked settings, and of the settings the run will use, hours (low, high)
+    pub asked_h: (f64, f64),
+    pub total_h: (f64, f64),
+    pub message: Option<String>,
+}
+
+/// One rung of the ladder: a setting that can be given up, where it applies, how, and what it costs in quality.
+struct Rung {
+    knob: &'static str,
+    label: &'static str,
+    risk: &'static str,
+    to: &'static str,
+    applies: fn(&AutoSpec, &AutoPlan) -> bool,
+    from: fn(&AutoSpec, &AutoPlan) -> String,
+    apply: fn(&mut AutoSpec),
+}
+
+fn tokens_text(m: u32) -> String {
+    format!("{m} M tokens")
+}
+
+fn ladder() -> Vec<Rung> {
+    vec![
+        Rung { knob: "think_quick", label: "Thinking checks", to: "Quick (16 questions)", risk: "The quick checks ask 16 questions instead of 32: about a third faster, and a close call can go either way.",
+               applies: |s, _| s.keep_thinking && !s.think_quick(), from: |_, _| "Full (32 questions)".into(), apply: |s| s.think_quick = Some(true) },
+        Rung { knob: "quick", label: "Try first", to: "Quick (64 texts)", risk: "Try first measures on 64 texts instead of 128: a close race between two cuts is less certain.",
+               applies: |s, _| !s.quick, from: |_, _| "Full (128 texts)".into(), apply: |s| s.quick = true },
+        Rung { knob: "check_cut", label: "Check of each unhealed cut", to: "off", risk: "The unhealed cut is not checked for thinking (that check only informs); the original is checked after the first heal, so the gates keep their yardstick.",
+               applies: |s, _| s.keep_thinking && s.check_cut, from: |_, _| "on".into(), apply: |s| s.check_cut = false },
+        Rung { knob: "share_teacher_cache", label: "Sequence length of the stages", to: "the same in both stages", risk: "Both stages heal on the shorter sequence length: the larger student's longest reasoning traces are cut short. The original writes its answers once.",
+               applies: |s, p| !s.share_teacher_cache && p.stages.len() > 1, from: |_, p| format!("each stage on its own ({})", p.stages.iter().map(|g| g.seq.to_string()).collect::<Vec<_>>().join(", ")), apply: |s| s.share_teacher_cache = true },
+        Rung { knob: "think_gate_n", label: "Thinking check before healing", to: "the best cut only", risk: "Only the cut with the lowest error is checked for thinking before healing: a cut with a low error and little thinking may be chosen.",
+               applies: |s, p| s.keep_thinking && s.think_gate && s.think_gate_n > 1 && !p.try_list.is_empty(), from: |s, _| format!("the best {} cuts", s.think_gate_n), apply: |s| s.think_gate_n = 1 },
+        Rung { knob: "retry_heal", label: "Retry heal after a failed check", to: "off", risk: "When a thinking check of a healed stage fails, the stage is not healed again: Auto-cut goes straight to cutting one step less (a larger model).",
+               applies: |s, _| s.keep_thinking && s.retry_heal, from: |_, _| "on".into(), apply: |s| s.retry_heal = false },
+        Rung { knob: "stage_a_tokens_m", label: "Heal tokens of the first stage", to: "20 M tokens", risk: "The first stage learns half as much, so the second stage starts from a weaker model. Below the recipe a model that thinks has failed the thinking checks before.",
+               applies: |s, p| p.stages.len() > 1 && p.stages[0].tokens_m > 20 && s.stage_a_tokens_m.is_none_or(|t| t > 20), from: |_, p| tokens_text(p.stages[0].tokens_m), apply: |s| s.stage_a_tokens_m = Some(20) },
+        Rung { knob: "stages", label: "Stages", to: "one stage", risk: "One stage cuts everything at once and heals once: it skips a cut, a check, a merge and a whole heal, and is the riskier way for a model that thinks.",
+               applies: |s, p| s.stages > 1 && p.stages.len() > 1, from: |_, p| format!("{} stages", p.stages.len()), apply: |s| s.stages = 1 },
+        Rung { knob: "last_tokens_m", label: "Heal tokens of the last stage", to: "20 M tokens", risk: "The last stage learns on 20 M tokens, far below the recipe: a model that thinks will very likely fail its thinking checks and the run may end without a model to keep. The last resort.",
+               applies: |s, p| p.stages.last().is_some_and(|g| g.tokens_m > 20) && s.last_tokens_m.is_none_or(|t| t > 20), from: |_, p| tokens_text(p.stages.last().map(|g| g.tokens_m).unwrap_or(0)), apply: |s| s.last_tokens_m = Some(20) },
+    ]
+}
+
+/// Makes the run fit `max_hours`: gives up the settings of the ladder one at a time, the least harmful first (quick thinking checks, quick Try first, no check of the cut, the same
+/// sequence length in both stages, one cut checked before healing, no retry, a lighter first stage, one stage, a light last stage) and stops at the first that fits on the HIGH end
+/// of the estimate (a retry is never in it). Never touches what was asked for: the sizes, the measured file, Studio, the quants, the thinking itself. When even the last rung does
+/// not fit it says so in plain words and the spec stays the asked one with all of them applied (for the numbers).
+pub fn fit_budget(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history: &History, max_hours: f64) -> BudgetFit {
+    let mut cur = AutoSpec { max_hours: Some(max_hours), ..spec.clone() };
+    let nothing = |cur: AutoSpec| BudgetFit { max_hours, spec: cur, dropped: Vec::new(), fits: true, asked_h: (0.0, 0.0), total_h: (0.0, 0.0), message: None };
+    let Some((mut p, mut t)) = timed(ins, &cur, vram_gb, history) else { return nothing(cur) };
+    let asked_h = t.total_h;
+    let mut dropped: Vec<Dropped> = Vec::new();
+    if t.total_h.1 > max_hours {
+        for r in ladder() {
+            if !(r.applies)(&cur, &p) {
+                continue;
+            }
+            let from = (r.from)(&cur, &p);
+            let mut next = cur.clone();
+            (r.apply)(&mut next);
+            next.preset = Some("custom".into());
+            let Some((np, nt)) = timed(ins, &next, vram_gb, history) else { continue };
+            dropped.push(Dropped { knob: r.knob.into(), label: r.label.into(), from, to: r.to.into(), saves_h: (r1h(t.total_h.0 - nt.total_h.0), r1h(t.total_h.1 - nt.total_h.1)), risk: r.risk.into() });
+            (cur, p, t) = (next, np, nt);
+            if t.total_h.1 <= max_hours {
+                break;
+            }
+        }
+    }
+    let fits = t.total_h.1 <= max_hours;
+    let message = (!fits).then(|| format!("Even the fastest settings take about {} for this cut, and you have {max_hours:.0} h. Choose more time or a larger size.", hours_text((t.total_h.0 * 60.0, t.total_h.1 * 60.0))));
+    BudgetFit { max_hours, spec: cur, dropped, fits, asked_h, total_h: t.total_h, message }
+}
+
+/// The sentences for the plan, the notes and the report: what the time limit made Auto-cut give up, each with its risk.
+pub fn budget_sentences(fit: &BudgetFit) -> Vec<String> {
+    if fit.dropped.is_empty() {
+        return Vec::new();
+    }
+    let mut v = vec![format!("To fit your {:.0} hours the settings were changed: the estimate went from {:.0}-{:.0} h to {:.0}-{:.0} h.", fit.max_hours, fit.asked_h.0, fit.asked_h.1, fit.total_h.0, fit.total_h.1)];
+    for d in &fit.dropped {
+        v.push(format!("{}: {} instead of {} (saves {:.1}-{:.1} h). {}", d.label, d.to, d.from, d.saves_h.0, d.saves_h.1, d.risk));
+    }
+    v
 }

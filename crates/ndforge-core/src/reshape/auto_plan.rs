@@ -690,6 +690,9 @@ pub struct AutoPlan {
     /// the speed settings: the time of every preset and of every knob's choices for this model (`auto_speed`); None while the plan has blockers
     #[serde(default)]
     pub speed: Option<super::auto_speed::SpeedInfo>,
+    /// with "I have at most N hours": the settings that were given up to fit, or the refusal (`auto_speed::fit_budget`); None without a limit
+    #[serde(default)]
+    pub budget: Option<super::auto_speed::BudgetFit>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -697,7 +700,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None, speed: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None, speed: None, budget: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);

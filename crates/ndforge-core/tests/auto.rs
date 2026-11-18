@@ -77,13 +77,15 @@ struct Mock {
     /// the heal specs as the heal got them, and the `imatrix` of every export_options call
     heal_specs: Vec<Value>,
     imatrix: Vec<bool>,
+    /// the clock of the time limit (seconds); None = the real one
+    clock: Option<i64>,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(),
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None,
         }
     }
 
@@ -112,6 +114,9 @@ impl Effects for Mock {
     }
     fn stopped(&self) -> bool {
         self.stop_flag
+    }
+    fn now_secs(&self) -> i64 {
+        self.clock.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
     }
     fn model(&self, id: &str) -> Result<ModelRef> {
         Ok(ModelRef { id: id.into(), repo: "org/Qwen3.8-27B".into(), name: "Qwen3.8 27B".into(), family: "qwen3_5".into() })
@@ -1391,4 +1396,66 @@ fn the_importance_matrix_is_left_out_when_it_is_off() {
     let mut on = Mock::new();
     start(&project(d2.path()), &mut on, spec(21.1)).unwrap();
     assert_eq!(on.imatrix, vec![true]);
+}
+
+// ---- "I have at most N hours"
+
+#[test]
+fn a_time_limit_gives_up_the_least_harmful_settings_and_the_run_says_so() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    // the recipe of this cut takes about 50 to 100 hours; 60 needs a few settings given up
+    let st = start(&p, &mut fx, AutoSpec { max_hours: Some(60.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let b = st.budget.as_ref().unwrap();
+    assert!(b.fits && !b.dropped.is_empty(), "{b:?}");
+    assert_eq!(st.spec.preset.as_deref(), Some("custom"));
+    assert_eq!(st.spec.max_hours, Some(60.0), "the limit stays in the spec: the run watches the clock");
+    assert!(st.plan.as_ref().unwrap().time.as_ref().unwrap().total_h.1 <= 60.0);
+    assert!(st.notes.iter().any(|n| n.contains("To fit your 60 hours")) && b.dropped.iter().all(|d| st.notes.iter().any(|n| n.contains(&d.label) && n.contains(&d.risk))), "{:?}", st.notes);
+    // the report lists them
+    let rep = report_of(&p, Some(&st.id)).unwrap();
+    assert!(rep["markdown"].as_str().unwrap().contains("To fit your 60 hours"), "{}", rep["markdown"]);
+    assert_eq!(rep["report"]["budget"]["fits"], true);
+}
+
+#[test]
+fn a_time_limit_that_cannot_be_kept_ends_the_plan_in_plain_words_and_starts_nothing() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let e = start(&p, &mut fx, AutoSpec { max_hours: Some(2.0), ..spec(21.1) }).unwrap_err();
+    assert!(e.0.contains("Even the fastest settings take about") && e.0.contains("Choose more time or a larger size"), "{}", e.0);
+    assert!(fx.cuts == 0 && fx.heals == 0, "nothing was made");
+}
+
+#[test]
+fn a_retry_that_would_end_after_the_time_limit_is_not_started() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut late = Mock::new();
+    late.checks.insert("healed".into(), bad());
+    // the clock is a thousand hours ahead of the start of the run: no retry fits
+    late.clock = Some(late.now_secs() + 1000 * 3600);
+    let st = start(&p, &mut late, AutoSpec { max_hours: Some(336.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    assert!(st.error.as_deref().unwrap().contains("would end after your time limit of 336 hours"), "{:?}", st.error);
+    assert_eq!((st.stages[0].attempts.len(), late.heal_specs.len(), late.cuts), (1, 1, 1), "no second heal, no cut made again");
+    assert!(late.removed.is_empty());
+    // on time: the retry and the back-off run as always
+    let d2 = tempdir().unwrap();
+    let mut on_time = Mock::new();
+    on_time.checks.insert("healed".into(), bad());
+    let st = start(&project(d2.path()), &mut on_time, AutoSpec { max_hours: Some(336.0), ..spec(21.1) }).unwrap();
+    assert_eq!(st.stages[0].attempts.len(), 3);
+    assert!(st.error.as_deref().unwrap().contains("after 3 tries"));
+    // the guard is also for the stage made again (the retry is switched off, the clock is late)
+    let d3 = tempdir().unwrap();
+    let mut back = Mock::new();
+    back.checks.insert("healed".into(), bad());
+    back.clock = Some(back.now_secs() + 1000 * 3600);
+    let st = start(&project(d3.path()), &mut back, AutoSpec { max_hours: Some(336.0), retry_heal: false, ..spec(21.1) }).unwrap();
+    assert!(st.error.as_deref().unwrap().contains("Making the stage again with a smaller cut would end after your time limit"), "{:?}", st.error);
+    assert_eq!(back.cuts, 1);
 }

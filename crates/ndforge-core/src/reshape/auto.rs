@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::auto_speed;
 use super::auto_plan::{self, AutoPlan, AutoSpec, Candidate, StagePlan};
 use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
@@ -99,6 +100,10 @@ pub trait Effects {
     /// free space on the disk the models are written to
     fn free_disk_gb(&self) -> Option<f64>;
     /// what this computer's saved job logs say about its speed (the time estimate); nothing by default
+    /// The clock of the time limit (seconds since 1970); the stand-in of a test sets it.
+    fn now_secs(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
     fn history(&self) -> crate::timing::History {
         crate::timing::History::default()
     }
@@ -225,6 +230,9 @@ pub struct AutoState {
     /// the comparison of the measured file with the plain sizes (a run with a target size): `{"promoted": bool, "promotion", "verdict", "rows", "skipped"}`; None for a run without it
     #[serde(default)]
     pub compare: Option<Value>,
+    /// "I have at most N hours": what the time limit made the run give up (`auto_speed::fit_budget`); None for a run without a limit
+    #[serde(default)]
+    pub budget: Option<super::auto_speed::BudgetFit>,
 }
 
 impl AutoState {
@@ -232,7 +240,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None,
         }
     }
 
@@ -560,6 +568,18 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
         return Err(Error::new("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text."));
     }
     let ins = out!(fx.inspect(&model)?);
+    // "I have at most N hours": the least harmful settings are given up until the estimate fits, and every one of them is a note of the run and a line of the report
+    if let Some(h) = st.spec.max_hours {
+        let fit = auto_speed::fit_budget(&ins, &st.spec, fx.vram_gb(), &fx.history(), h);
+        st.budget = Some(fit.clone());
+        if !fit.fits {
+            return Err(Error::new(fit.message.clone().unwrap_or_else(|| "The run does not fit the time you have.".into())));
+        }
+        if !fit.dropped.is_empty() {
+            st.spec = fit.spec.clone();
+            st.notes.extend(auto_speed::budget_sentences(&fit));
+        }
+    }
     let plan = auto_plan::plan(&ins, &st.spec, fx.vram_gb(), fx.free_disk_gb());
     let plan = auto_plan::with_speed(plan, &ins, &st.spec, fx.vram_gb(), &fx.history());
     if !plan.ok {
@@ -974,6 +994,14 @@ fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn E
         0 if !st.spec.retry_heal => 1,
         a => a,
     };
+    // "I have at most N hours": a retry or a stage made again that would end after the limit is not started
+    if attempt <= 1 && (attempt == 0 || st.spec.back_off) {
+        if let Some(why) = too_late(st, idx, attempt == 0, fx.now_secs()) {
+            st.notes.push(why.clone());
+            st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}); {why} The run stops here with its report."));
+            return Ok(Flow::Halt("gates_failed".into()));
+        }
+    }
     match attempt {
         0 => {
             let stage_m = st.stages[idx].plan.tokens_m;
@@ -1001,6 +1029,32 @@ fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn E
     }
     st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}) after {} tries; the run stops here. The report says what was tried.", st.stages[idx].attempts.len()));
     Ok(Flow::Halt("gates_failed".into()))
+}
+
+/// With a time limit: would the next try of stage `idx` (the retry heal when `retry`, else the stage made again) end after it? The cost is the high end of the estimate of that try
+/// plus the steps that are still to run (the plan's estimate), the time left is the limit minus the time since the run was created. None when there is no limit or it is kept.
+fn too_late(st: &AutoState, idx: usize, retry: bool, now_secs: i64) -> Option<String> {
+    let max = st.spec.max_hours?;
+    let t = st.plan.as_ref()?.time.as_ref()?;
+    let started = chrono::NaiveDateTime::parse_from_str(&st.created, "%Y-%m-%dT%H:%M:%SZ").ok()?.and_utc().timestamp();
+    let left_h = max - (now_secs - started).max(0) as f64 / 3600.0;
+    let n = idx + 1;
+    let hi = |id: &str| t.steps.iter().find(|x| x.id == id).map(|x| x.minutes.1).unwrap_or(0.0);
+    let mine = |what: &str| format!("s{n}.{what}");
+    let cost = if retry {
+        // the last stage's retry has its own line in the estimate; another stage's is its heal at the retry's budget and its check
+        match t.extra.iter().find(|e| e.id == "retry_heal").filter(|_| idx + 1 == st.stages.len()) {
+            Some(e) => e.minutes.1,
+            None => hi(&mine("heal")) * auto_plan::retry_total_m(st.stages[idx].plan.tokens_m) as f64 / st.stages[idx].plan.tokens_m.max(1) as f64 + hi(&mine("check_heal")),
+        }
+    } else {
+        ["cut", "check_cut", "heal", "check_heal"].iter().map(|w| hi(&mine(w))).sum()
+    };
+    // what has not run yet and does not belong to this stage
+    let prefix = format!("s{n}.");
+    let rest: f64 = st.steps.iter().filter(|s| s.status != "done" && s.status != "skipped" && !s.id.starts_with(&prefix)).map(|s| hi(&s.id)).sum();
+    let need_h = (cost + rest) / 60.0;
+    (need_h > left_h).then(|| format!("{} would end after your time limit of {max:.0} hours (it needs about {need_h:.0} h more, {:.0} h are left).", if retry { "A retry heal" } else { "Making the stage again with a smaller cut" }, left_h.max(0.0)))
 }
 
 /// Backs the cut of stage `idx` off by one step and makes a fresh stage of it (the stages after it are planned again from the new stop). Err(why) when nothing is left to give back,
@@ -1210,7 +1264,19 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 /// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
 pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
-    let mut plan = auto_plan::with_speed(auto_plan::plan(ins, spec, vram_gb, free_gb), ins, spec, vram_gb, &crate::timing::History::recent(HISTORY_LOGS));
+    let history = crate::timing::History::recent(HISTORY_LOGS);
+    // with a time limit the plan is the one of the settings the run will use (what start would do), with the list of what was given up
+    let fit = spec.max_hours.map(|h| auto_speed::fit_budget(ins, spec, vram_gb, &history, h));
+    let used = fit.as_ref().filter(|f| f.fits).map(|f| f.spec.clone()).unwrap_or_else(|| spec.clone());
+    let mut plan = auto_plan::with_speed(auto_plan::plan(ins, &used, vram_gb, free_gb), ins, &used, vram_gb, &history);
+    if let Some(f) = fit {
+        if !f.fits {
+            plan.ok = false;
+            plan.blockers.extend(f.message.clone());
+        }
+        plan.warnings.splice(0..0, auto_speed::budget_sentences(&f));
+        plan.budget = Some(f);
+    }
     if !has_training_data {
         plan.ok = false;
         plan.blockers.push("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text.".into());
