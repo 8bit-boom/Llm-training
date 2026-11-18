@@ -36,14 +36,10 @@ impl<'a> RealEffects<'a> {
     #[allow(clippy::too_many_arguments)]
     fn export_with(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, mixed: &MixedOptions) -> Result<Out<Value>> {
         let stop = self.stop.clone();
-        let mut events = Vec::new();
         let dir = std::path::PathBuf::from(&healed.dir);
         // the matrix for the small sizes is measured on the finished model, on text that looks like what it will be asked: with thinking when it keeps thinking (docs/IMATRIX.md)
         let imatrix = ImatrixOptions { enabled: true, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
-        let r = crate::export::runs::execute_model_folder_full(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, mixed, &stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = crate::export::runs::execute_model_folder_full(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, mixed, &stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         if self.stop.load(Ordering::SeqCst) && r.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
             return Ok(Out::Stopped);
         }
@@ -56,12 +52,18 @@ impl<'a> RealEffects<'a> {
         Ok(Out::Done(json!({"dir": exports, "hf_dir": healed.dir, "ggufs": ggufs, "exports": metas.iter().map(|m| m["name"].clone()).collect::<Vec<_>>()})))
     }
 
-    /// A worker event as the window gets it: the same events as on the Slim page, tagged with the step of the run.
-    fn forward(&mut self, mut e: Value) {
-        e["phase"] = json!("auto");
-        e["auto_step"] = json!(self.step);
-        (self.on_event)(e);
-    }
+}
+
+/// A worker event as the window gets it: the same events as on the Slim page, tagged with the step of the run.
+pub fn tag(mut e: Value, step: &str) -> Value {
+    e["phase"] = json!("auto");
+    e["auto_step"] = json!(step);
+    e
+}
+
+/// Forwards one event at once (while the job still runs), so the card shows a heal, a cut or a check as it happens.
+fn send(on_event: &mut dyn FnMut(Value), step: &str, e: Value) {
+    on_event(tag(e, step));
 }
 
 /// A job that ended because the person pressed Stop: `Err("Cancelled." | "Stopped...")`, or a result with `stopped: true`.
@@ -118,11 +120,7 @@ impl Effects for RealEffects<'_> {
     fn inspect(&mut self, model: &ModelRef) -> Result<Out<Inspect>> {
         let m = catalog::find(&model.id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = runs::inspect(&m, &stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = runs::inspect(&m, &stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         match r {
             Err(e) if e.is_cancelled() => Ok(Out::Stopped),
             r => r.map(Out::Done),
@@ -131,32 +129,20 @@ impl Effects for RealEffects<'_> {
 
     fn measure(&mut self, model_id: &str, samples: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Out<Value>> {
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = runs::measure_with(self.p, model_id, samples, 512, load, reasoning, false, stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = runs::measure_with(self.p, model_id, samples, 512, load, reasoning, false, stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         done(r, Ok)
     }
 
     fn try_run(&mut self, spec: &TrySpec) -> Result<Out<Value>> {
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = runs::try_run(self.p, spec, stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = runs::try_run(self.p, spec, stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         let p = self.p;
         done(r, |_| Ok(runs::try_results_with(p, &spec.model_id, spec.samples, spec.len, &spec.load, spec.reasoning.as_ref())?["analysis"].clone()))
     }
 
     fn cut(&mut self, spec: &ReshapeSpec) -> Result<Out<CutRef>> {
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = runs::execute_with_grace(self.p, spec, stop, GRACE, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = runs::execute_with_grace(self.p, spec, stop, GRACE, &mut |e| send(&mut *self.on_event, &self.step, e));
         done(r, |v| match (v["name"].as_str(), v["model_id"].as_str()) {
             (Some(name), Some(id)) => Ok(CutRef { name: name.into(), model_id: id.into() }),
             _ => Err(Error::new("The cut did not give a model.")),
@@ -166,11 +152,7 @@ impl Effects for RealEffects<'_> {
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>> {
         let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None };
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = thinkcheck::run(self.p, &spec, stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         done(r, Ok)
     }
 
@@ -181,11 +163,7 @@ impl Effects for RealEffects<'_> {
         };
         let teacher = source_of(teacher_repo);
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = heal_source::heal_from_source(self.p, &student, Some(&teacher), spec, self.vram_gb, stop, GRACE, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = heal_source::heal_from_source(self.p, &student, Some(&teacher), spec, self.vram_gb, stop, GRACE, &mut |e| send(&mut *self.on_event, &self.step, e));
         done(r, |v| match (v["name"].as_str(), v["model_id"].as_str(), v["healed_dir"].as_str()) {
             (Some(name), Some(id), Some(dir)) => {
                 let keys = ["kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss", "tokens_seen", "steps"];
@@ -242,11 +220,7 @@ impl Effects for RealEffects<'_> {
         let quants: Vec<QuantPick> = picks.iter().filter_map(|p| serde_json::from_value(p.clone()).ok()).collect();
         let spec = CompareSpec { reference: ReferenceSpec { kind: "file".into(), file: Some(reference.to_string()), source: None }, quants, text, ..Default::default() };
         let stop = self.stop.clone();
-        let mut events = Vec::new();
-        let r = quantcheck::compare(self.p, &spec, &stop, &mut |e| events.push(e));
-        for e in events {
-            self.forward(e);
-        }
+        let r = quantcheck::compare(self.p, &spec, &stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         done(r, Ok)
     }
 
@@ -264,18 +238,13 @@ impl Effects for RealEffects<'_> {
         let spec = publish::PublishSpec { name: model_name.to_string(), files, hf_folder: export["hf_dir"].as_str().map(std::path::PathBuf::from), readme: Some(readme) };
         let free = crate::envmgr::health::free_disk_gb(std::path::Path::new(share.host_path.trim()));
         let ctx = publish::Ctx { client: client.as_ref(), free_gb: free, stop: &self.stop };
-        let step = self.step.clone();
         let mut last = 0.0f64;
-        let mut events = Vec::new();
         let r = publish::publish(&share, &spec, &ctx, &mut |f| {
             if f - last >= 0.02 || f >= 1.0 {
                 last = f;
-                events.push(json!({"kind": "progress", "phase": "auto", "auto_step": step, "step": "publish", "value": f, "text": "Copying to the Unsloth Studio share"}));
+                send(&mut *self.on_event, &self.step, json!({"kind": "progress", "step": "publish", "value": f, "text": "Copying to the Unsloth Studio share"}));
             }
         });
-        for e in events {
-            (self.on_event)(e);
-        }
         match r {
             Err(e) if e.0 == "Stopped." => Ok(Out::Stopped),
             r => r.map(Out::Done),

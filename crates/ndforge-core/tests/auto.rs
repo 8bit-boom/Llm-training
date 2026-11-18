@@ -1221,3 +1221,11 @@ fn a_comparison_that_fails_does_not_lose_the_files_the_reference_stays_and_the_m
     assert!(!fx.done.iter().any(|d| d.starts_with("remove export")), "the 16-bit file is kept so that Compare quants can be run by hand");
     assert!(fx.done.iter().any(|d| d.ends_with("cut to 21.1B 2")));
 }
+
+#[test]
+fn a_worker_event_is_tagged_with_the_step_and_keeps_its_own_keys() {
+    let e = ndforge_core::reshape::auto_fx::tag(json!({"kind": "metric", "step": 12, "eta_s": 900}), "s1.heal");
+    assert_eq!(e["phase"], "auto");
+    assert_eq!(e["auto_step"], "s1.heal");
+    assert_eq!((e["kind"].as_str(), e["step"].as_i64(), e["eta_s"].as_i64()), (Some("metric"), Some(12), Some(900)));
+}
