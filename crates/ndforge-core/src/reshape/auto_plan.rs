@@ -80,11 +80,50 @@ pub struct AutoSpec {
     /// also make a file of about this many GB with "Mixed: measured fit to a size" (docs/AUTO_CUT.md, "A target size"), and compare it with the plain sizes next to it; None = not
     #[serde(default)]
     pub target_gb: Option<f64>,
+    // ---- speed settings (docs/AUTO_CUT.md, "Speed settings"). Every field is at the recommended recipe by default: an older spec plans and runs exactly as before.
+    /// the speed setting the person chose: "thorough" | "balanced" | "fast" | "custom" (`auto_speed.json`); None = not chosen (the recipe)
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// the heal of every stage but the last, in millions of tokens (10 / 20 / 40 / 80); None = the recipe's 40
+    #[serde(default)]
+    pub stage_a_tokens_m: Option<u32>,
+    /// the heal of the last stage; None = the recipe's number for this cut (40, or 80 when more than 30 % is cut)
+    #[serde(default)]
+    pub last_tokens_m: Option<u32>,
+    /// Quick (16 questions) thinking checks; None = follows `quick` (the old behaviour)
+    #[serde(default)]
+    pub think_quick: Option<bool>,
+    /// check the thinking of the unhealed cut of every stage (informational: nothing is decided by it); off = the original is checked after the first heal instead
+    #[serde(default = "yes")]
+    pub check_cut: bool,
+    /// heal again (on the healed model, the original's answers extended) when the thinking check of a healed stage fails
+    #[serde(default = "yes")]
+    pub retry_heal: bool,
+    /// cut one step less and make the stage again after a second failed check (else the run ends `gates_failed`)
+    #[serde(default = "yes")]
+    pub back_off: bool,
+    /// heal every stage on the same sequence length, so the original writes its answers once and the next stage reuses them
+    #[serde(default)]
+    pub share_teacher_cache: bool,
+    /// measure an importance matrix for the small GGUF sizes
+    #[serde(default = "yes")]
+    pub imatrix: bool,
+    /// "I have at most this many hours": the planner drops the least harmful settings until the estimate fits (1 to 336); None = no limit
+    #[serde(default)]
+    pub max_hours: Option<f64>,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
-        AutoSpec { model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None }
+        AutoSpec {
+            model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None,
+        }
+    }
+
+    /// Are the thinking checks the quick ones (16 questions)? Follows `quick` unless the person chose.
+    pub fn think_quick(&self) -> bool {
+        self.think_quick.unwrap_or(self.quick)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -96,6 +135,21 @@ impl AutoSpec {
         }
         if !(1..=TRY_TOP as u32).contains(&self.think_gate_n) {
             return Err(Error::new(format!("The thinking check before healing looks at 1 to {TRY_TOP} cuts.")));
+        }
+        for t in [self.stage_a_tokens_m, self.last_tokens_m].into_iter().flatten() {
+            if !plan::HEAL_TOKENS_M.contains(&t) {
+                return Err(Error::new("Heal on 10, 20, 40 or 80 million tokens."));
+            }
+        }
+        if let Some(h) = self.max_hours {
+            if !h.is_finite() || !(1.0..=336.0).contains(&h) {
+                return Err(Error::new("The time you have must be between 1 and 336 hours."));
+            }
+        }
+        if let Some(p) = &self.preset {
+            if super::auto_speed::preset(p).is_none() {
+                return Err(Error::new(format!("Unknown speed setting: {p}.")));
+            }
         }
         if let Some(t) = self.target_gb {
             if !t.is_finite() || t <= 0.0 {

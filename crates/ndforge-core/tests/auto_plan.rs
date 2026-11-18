@@ -280,3 +280,63 @@ fn the_owners_first_cut_is_beyond_the_guardrails_and_the_checks_take_an_estimate
     let small = Candidate { params: 5_000_000_000, ..c.clone() };
     assert!(think_gate_minutes(&ins, &small, true) >= 10.0, "never less than one unit of the check");
 }
+
+// ---- the speed settings (reshape::auto_speed): presets as data, and a legacy spec is the recommended recipe
+
+#[test]
+fn an_old_spec_without_the_speed_fields_loads_with_the_recipe_defaults() {
+    let old = json!({"model_id": "qwen3.8-27b", "target_b": 21.1, "keep_thinking": true, "stages": 2, "quick": false, "keep_intermediate": false, "allow_many_blocks": false,
+                     "quants": ["q4_k_m"], "studio_publish": false, "think_gate": true, "think_gate_n": 2});
+    let s: AutoSpec = serde_json::from_value(old).unwrap();
+    assert_eq!(s, spec(21.1));
+    assert!(s.check_cut && s.retry_heal && s.back_off && s.imatrix && !s.share_teacher_cache);
+    assert_eq!((s.preset.clone(), s.stage_a_tokens_m, s.last_tokens_m, s.think_quick, s.max_hours), (None, None, None, None, None));
+    assert!(!s.think_quick(), "the checks follow `quick`");
+    assert!(AutoSpec { quick: true, ..s }.think_quick());
+}
+
+#[test]
+fn the_presets_are_data_and_each_one_is_a_valid_spec() {
+    let ps = ndforge_core::reshape::auto_speed::presets();
+    assert_eq!(ps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["thorough", "balanced", "fast", "custom"]);
+    for p in &ps {
+        assert!(!p.label.is_empty() && !p.blurb.is_empty() && !p.risk.is_empty(), "{p:?}");
+        for k in p.set.keys() {
+            assert!(ndforge_core::reshape::auto_speed::KNOBS.contains(&k.as_str()), "{k} is not a speed knob");
+        }
+        let mine = AutoSpec { keep_intermediate: true, studio_publish: true, target_gb: Some(10.0), ..spec(21.1) }.with_preset(&p.id).unwrap();
+        mine.validate().unwrap();
+        assert_eq!(mine.preset.as_deref(), Some(p.id.as_str()));
+        // what is not a speed knob stays
+        assert!(mine.keep_intermediate && mine.studio_publish && mine.target_gb == Some(10.0) && mine.target_b == 21.1 && mine.model_id == "qwen3.8-27b");
+    }
+    assert!(spec(21.1).with_preset("nope").is_err());
+    assert!(AutoSpec { preset: Some("nope".into()), ..spec(21.1) }.validate().is_err());
+}
+
+#[test]
+fn the_legacy_spec_is_the_thorough_recipe_and_plans_the_same() {
+    let ins = qwen27();
+    let legacy = spec(21.1);
+    let thorough = legacy.with_preset("thorough").unwrap();
+    assert_eq!(legacy.matching_preset().as_deref(), Some("thorough"));
+    let (a, b) = (plan(&ins, &legacy, Some(32.0), Some(900.0)), plan(&ins, &thorough, Some(32.0), Some(900.0)));
+    assert!(a.ok, "{:?}", a.blockers);
+    assert_eq!(a, b, "the plan of a legacy spec and of Thorough are the same");
+    // a single changed knob is not a preset any more
+    assert_eq!(AutoSpec { check_cut: false, ..legacy.clone() }.matching_preset(), None);
+    assert_eq!(legacy.with_preset("balanced").unwrap().matching_preset().as_deref(), Some("balanced"));
+    assert_eq!(legacy.with_preset("fast").unwrap().matching_preset().as_deref(), Some("fast"));
+    // the knobs must be set to something that exists
+    assert!(AutoSpec { last_tokens_m: Some(30), ..legacy.clone() }.validate().is_err());
+    assert!(AutoSpec { stage_a_tokens_m: Some(15), ..legacy.clone() }.validate().is_err());
+    assert!(AutoSpec { max_hours: Some(0.5), ..legacy.clone() }.validate().is_err());
+    assert!(AutoSpec { max_hours: Some(48.0), last_tokens_m: Some(20), ..legacy }.validate().is_ok());
+}
+
+#[test]
+fn the_default_preset_is_balanced_for_big_models_only() {
+    assert_eq!(ndforge_core::reshape::auto_speed::default_preset(27.8), "balanced");
+    assert_eq!(ndforge_core::reshape::auto_speed::default_preset(15.0), "balanced");
+    assert_eq!(ndforge_core::reshape::auto_speed::default_preset(8.0), "thorough");
+}

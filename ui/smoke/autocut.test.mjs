@@ -241,3 +241,11 @@ test("during a run the time left is the sum of the steps not done yet (a running
   // a step the estimate does not know falls back to the fixed allowance
   assert.deepEqual(JSON.parse(JSON.stringify(b.run(`acEtaRange({ status: "running", steps: [{ id: "check_gguf", status: "pending" }], plan: { stages: [], time: ${JSON.stringify(t)} } }, null, ${now})`))), { lo: 0.25, hi: 0.25 });
 });
+
+test("the speed presets of the window are the table of auto_speed.json", async () => {
+  const { readFileSync } = await import("node:fs");
+  const file = JSON.parse(readFileSync(new URL("../../crates/ndforge-core/src/reshape/auto_speed.json", import.meta.url), "utf8"));
+  const b = browser();
+  assert.deepEqual(plain(b.run("AC_SPEED_PRESETS")), file.presets);
+  assert.deepEqual(file.presets.map((p) => p.id), ["thorough", "balanced", "fast", "custom"]);
+});
