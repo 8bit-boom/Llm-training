@@ -2626,7 +2626,8 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, gate: true, stages: 2, quick: false, keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
+  sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
@@ -2644,10 +2645,43 @@ function acDefaults() {
   const total = ins.total_params / 1e9;
   if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
   if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (!ac.spInit) { ac.spInit = true; acApplyPreset(total >= 15 ? "balanced" : "thorough"); }      // a big model takes days: Balanced is chosen for it, the recommended recipe is one click away
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
+// the speed knobs as the program names them (the same fields as AC_SPEED_PRESETS[].set)
+function acKnobs() {
+  const sp = ac.sp;
+  return { stages: ac.stages, stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, share_teacher_cache: !!sp.share, quick: !!ac.quick, think_quick: sp.tq == null ? !!ac.quick : !!sp.tq, think_gate: !!ac.gate, think_gate_n: ac.gateN,
+    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix };
+}
+const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
+// the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
+function acPresetNow() {
+  const kn = acKnobs();
+  const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
+    if (!ac.thinking && AC_THINK_KNOBS.includes(k)) return true;
+    return kn[k] === (k === "think_quick" && v === null ? p.set.quick : v);
+  }));
+  return hit ? hit.id : "custom";
+}
+function acApplyPreset(id) {
+  const p = AC_SPEED_PRESETS.find((x) => x.id === id);
+  if (!p) return;
+  acApplySet(p.set);
+}
+// a choice of a knob (or a preset) sets these spec fields
+function acApplySet(set) {
+  for (const [k, v] of Object.entries(set)) {
+    if (k === "stages") ac.stages = v; else if (k === "quick") ac.quick = !!v; else if (k === "think_gate") ac.gate = !!v; else if (k === "think_gate_n") ac.gateN = v;
+    else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
+    else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
+  }
+}
 function acSpec() {
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: 2, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish, ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}) };
+  const sp = ac.sp;
+  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
+    ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2665,6 +2699,46 @@ function acRefresh() {
   const token = ++ac.planTok;
   invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
     .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+}
+
+// a change of the total in hours: "−6 h to −11 h" (minutes in)
+function acDelta(d) {
+  if (!d) return "";
+  const [lo, hi] = [Math.min(d[0], d[1]), Math.max(d[0], d[1])];
+  if (Math.abs(lo) < 3 && Math.abs(hi) < 3) return "no change";
+  const sign = hi < 0 ? "−" : lo > 0 ? "+" : "±", a = acDuration(Math.abs(hi < 0 ? hi : lo) / 60), b = acDuration(Math.max(Math.abs(lo), Math.abs(hi)) / 60);
+  return a === b ? `${sign}${a}` : `${sign}${a} to ${sign}${b}`;
+}
+const acTotal = (t) => t ? `${acStepMin(t[0] * 60, t[1] * 60)}` : "";
+// the speed settings: the presets with their totals, the biggest levers with the change each choice makes, the rest under "More speed settings", and the time limit
+function acSpeedBlock(pl, live) {
+  const lock = live ? "disabled" : "", sp = pl && pl.speed, now = acPresetNow(), think = !!ac.thinking;
+  const row = (p) => {
+    const t = sp && sp.presets.find((x) => x.id === p.id), tt = p.id === "custom" ? sp && sp.total_h : t && t.total_h;
+    const risk = p.id === "fast" && think ? `<div class="err" data-acspeed-warn="fast">${esc(p.risk)} A model that thinks will very likely lose its reasoning with these settings.</div>` : `<div class="dim small">${esc(p.risk)}</div>`;
+    return `<label class="opt ac-preset" data-acpreset="${esc(p.id)}"><input type="radio" name="ac-preset" value="${esc(p.id)}" ${now === p.id ? "checked" : ""} ${lock}> <strong>${esc(p.label)}</strong>${tt ? ` <span class="ac-ptotal">about ${esc(acTotal(tt))}</span>` : ""}
+      <div class="dim small">${esc(p.blurb)}</div>${now === p.id || p.id === "fast" ? risk : ""}${t && t.retry_h && p.id !== "custom" ? `<div class="dim small">If a thinking check fails, a retry adds ${esc(acTotal(t.retry_h))} (not counted).</div>` : ""}</label>`;
+  };
+  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${o.current ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
+      <span class="dim small ac-delta">${o.current ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
+  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
+  const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
+  const bud = pl && pl.budget;
+  const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
+      <ul>${bud.dropped.map((d) => `<li data-acdropped="${esc(d.knob)}"><strong>${esc(d.label)}</strong>: ${esc(d.to)} instead of ${esc(d.from)} (saves ${esc(acTotal(d.saves_h))}). <span class="dim small">${esc(d.risk)}</span></li>`).join("")}</ul></div>` : `<p class="dim small" id="ac-budget-ok">Your settings already fit.</p>`) : "";
+  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast</h3>
+    <p class="dim small">Healing is most of the time. The recommended recipe is the safest; the others trade quality risk for hours, and every value that is not the recipe's is listed in the plan and in the report.</p>
+    ${AC_SPEED_PRESETS.map(row).join("")}
+    ${sp ? `<div class="ac-levers" id="ac-levers"><h4>What takes the time</h4><table class="tbl">${big.map(optRow).join("")}</table></div>` : ""}
+    ${rest.length ? `<details id="ac-adv" ${ac.advOpen ? "open" : ""}><summary>More speed settings</summary><table class="tbl">${rest.map(optRow).join("")}</table></details>` : ""}
+    <label class="opt"><input type="checkbox" id="ac-maxon" ${ac.maxOn ? "checked" : ""} ${lock}> I have at most <input type="text" id="ac-maxh" value="${esc(ac.maxH)}" placeholder="48" style="width:60px;flex:0" ${lock}> hours <span class="dim small">the least harmful settings are given up until it fits, or you are told it cannot</span></label>
+    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}</div>`;
+}
+
+// the change one choice of a knob makes, as a small note after its label (nothing while there is no plan or for the choice that is on)
+function acKnobDelta(pl, knob, labelStart) {
+  const k = pl && pl.speed && pl.speed.knobs.find((x) => x.knob === knob), o = k && k.options.find((x) => x.label.startsWith(labelStart));
+  return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
 function autoCard() {
@@ -2699,8 +2773,9 @@ function autoCard() {
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
     ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
-    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage</label>
-      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick</label></div>
+    ${acSpeedBlock(pl, live)}
+    <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)${acKnobDelta(pl, "stages", "Two")}</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage${acKnobDelta(pl, "stages", "One")}</label>
+      <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full${acKnobDelta(pl, "quick", "Full")}</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick${acKnobDelta(pl, "quick", "Quick")} <span class="dim small">(Try first)</span></label></div>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
     ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
@@ -2828,6 +2903,14 @@ function wireAuto() {
   set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
   set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
+  document.querySelectorAll("input[name=ac-preset]").forEach((r) => r.onchange = () => { if (r.value === "custom") ac.advOpen = true; else acApplyPreset(r.value); render(); });
+  document.querySelectorAll("input[data-acknob]").forEach((r) => r.onchange = () => {
+    const k = ac.plan && ac.plan.speed && ac.plan.speed.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
+    if (o) acApplySet(o.set);
+    render();
+  });
+  const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
+  set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
   const share = () => ({ host_path: ($("ac-sh-host") || {}).value || "", container_path: ($("ac-sh-cont") || {}).value || "", register_scan_folder: !!($("ac-sh-reg") || {}).checked, finetune_handoff: !!($("ac-sh-hf") || {}).checked });

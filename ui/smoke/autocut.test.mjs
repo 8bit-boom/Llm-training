@@ -29,7 +29,9 @@ test("the card has a size slider for the model, keep thinking on for Qwen3.5/3.8
   const html = card(b);
   assert.match(html, /<h2>Auto-cut \(one click\)<\/h2>/);
   assert.match(html, /id="ac-target" min="9" max="26" step="0.5" value="21"/);
-  assert.match(html, /id="ac-think" checked/); assert.match(html, /name="ac-stages" value="2" checked/); assert.match(html, /name="ac-quick" value="full" checked/);
+  assert.match(html, /id="ac-think" checked/); assert.match(html, /name="ac-stages" value="2" checked/);
+  // a model of 27.8 B has Balanced chosen for it (a heal of a big model takes days); Try first is Quick in it
+  assert.match(html, /name="ac-preset" value="balanced" checked/); assert.match(html, /name="ac-quick" value="quick" checked/);
   assert.match(html, /<td>1 of 2<\/td><td>24\.5 B, MLP 14,080<\/td><td>12 % of the original<\/td><td>40 M tokens, about 8–14 h<\/td>/);
   assert.match(html, /Disk: up to 197 GB at "stage 2: the healed model", 111 GB left/);
   assert.doesNotMatch(html, /data-acstep/); assert.doesNotMatch(html, /id="ac-stop"/); assert.doesNotMatch(html, /id="ac-continue"/);
@@ -53,10 +55,12 @@ test("blockers disable Start and are shown; warnings are shown; the confirmation
 test("the spec follows the choices, the plan is asked with the model's description, and Start sends the spec", async () => {
   const b = browser({ auto_plan: { plan: plan() }, auto_start: null });
   open(b);
-  b.run(`ac.target = 18; ac.stages = 1; ac.quick = true; ac.keep = true; ac.many = true; ac.publish = true; acRefresh()`);
+  b.run(`acDefaults(); ac.target = 18; ac.stages = 1; ac.keep = true; ac.many = true; ac.publish = true; acRefresh()`);
   await tick();
   const c = b.calls.find((x) => x[0] === "auto_plan");
-  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true });
+  // Balanced was chosen for the big model; one stage instead of two makes it Custom. The speed fields are all sent.
+  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true,
+    preset: "custom", stage_a_tokens_m: 20, last_tokens_m: null, think_quick: true, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: true, imatrix: true });
   assert.equal(c[1].inspect.total_params, 27.78e9);
   assert.equal(b.run("ac.plan.ok"), true);
   const n = b.calls.filter((x) => x[0] === "auto_plan").length;
@@ -248,4 +252,109 @@ test("the speed presets of the window are the table of auto_speed.json", async (
   const b = browser();
   assert.deepEqual(plain(b.run("AC_SPEED_PRESETS")), file.presets);
   assert.deepEqual(file.presets.map((p) => p.id), ["thorough", "balanced", "fast", "custom"]);
+});
+
+
+const speedPlan = (over = {}) => plan({
+  speed: { current_preset: "balanced", default_preset: "balanced", total_h: [33, 61],
+    presets: [["thorough", [57, 108], [23, 37]], ["balanced", [33, 61], [23, 37]], ["fast", [11, 22], null], ["custom", [33, 61], null]].map(([id, t, r]) => ({ id, label: id, total_h: t, retry_h: r })),
+    knobs: [
+      { knob: "last_tokens_m", label: "Heal tokens of the last stage", risk: "Fewer tokens is faster.", options: [10, 20, 40, 80].map((t) => ({ label: `${t} M${t === 80 ? " (recipe)" : ""}`, set: { last_tokens_m: t === 80 ? null : t }, current: t === 80, total_h: [10 + t / 2, 20 + t], delta_min: t === 80 ? [0, 0] : [-(80 - t) * 8, -(80 - t) * 12] })) },
+      { knob: "share_teacher_cache", label: "Sequence length of the stages", risk: "Shorter sequence.", options: [{ label: "Same in both stages", set: { share_teacher_cache: true }, current: true, total_h: [33, 61], delta_min: [0, 0] }, { label: "Each on its own", set: { share_teacher_cache: false }, current: false, total_h: [40, 70], delta_min: [420, 540] }] },
+      { knob: "stages", label: "Stages", risk: "x", options: [{ label: "Two stages (recipe)", set: { stages: 2 }, current: true, total_h: [33, 61], delta_min: [0, 0] }, { label: "One stage", set: { stages: 1 }, current: false, total_h: [20, 40], delta_min: [-780, -1260] }] },
+      { knob: "imatrix", label: "Importance matrix for the export", risk: "Less exact small sizes.", options: [{ label: "On (recipe)", set: { imatrix: true }, current: true, total_h: [33, 61], delta_min: [0, 0] }, { label: "Off", set: { imatrix: false }, current: false, total_h: [32.8, 60.7], delta_min: [-10, -20] }] }] },
+  ...over });
+
+test("the presets show their totals, a preset sets the spec, and any change of a knob turns the choice to Custom", async () => {
+  const fake = (value, dataset = {}) => ({ value, dataset, checked: false, onchange: null });
+  const radios = ["thorough", "balanced", "fast", "custom"].map((v) => fake(v));
+  const b = makeBrowser({ answers: { auto_plan: { plan: speedPlan() } }, state: baseState, groups: { "input[name=ac-preset]": radios } });
+  open(b, {}, `ac.plan = ${JSON.stringify(speedPlan())}; acDefaults()`);
+  let html = card(b);
+  for (const id of ["thorough", "balanced", "fast", "custom"]) assert.match(html, new RegExp(`name="ac-preset" value="${id}"`));
+  assert.match(html, /data-acpreset="thorough"[\s\S]*?about 57 h to 108 h/); assert.match(html, /data-acpreset="fast"[\s\S]*?about 11 h to 22 h/);
+  assert.match(html, /name="ac-preset" value="balanced" checked/);
+  assert.match(html, /If a thinking check fails, a retry adds 23 h to 37 h/);
+  // Thorough: the recipe
+  b.run(`acApplyPreset("thorough")`);
+  let s = plain(b.run("acSpec()"));
+  assert.deepEqual([s.preset, s.stages, s.stage_a_tokens_m, s.last_tokens_m, s.quick, s.think_quick, s.share_teacher_cache, s.check_cut, s.retry_heal, s.back_off, s.imatrix], ["thorough", 2, null, null, false, null, false, true, true, true, true]);
+  // Fast
+  b.run(`acApplyPreset("fast")`);
+  s = plain(b.run("acSpec()"));
+  assert.deepEqual([s.preset, s.stages, s.last_tokens_m, s.quick, s.think_quick, s.think_gate_n, s.check_cut, s.retry_heal, s.back_off, s.imatrix], ["fast", 1, 20, true, true, 1, false, false, false, false]);
+  // one knob changed: Custom, and the radio says so
+  b.run(`acApplyPreset("balanced"); acApplySet({ imatrix: false })`);
+  assert.equal(b.run("acSpec().preset"), "custom"); assert.match(card(b), /name="ac-preset" value="custom" checked/);
+  b.run(`acApplySet({ imatrix: true })`);
+  assert.equal(b.run("acSpec().preset"), "balanced", "set back, it is the preset again");
+  // the radio buttons do it
+  b.run("wireAuto()");
+  const fast = radios.find((r) => r.value === "fast"); fast.checked = true; fast.onchange();
+  assert.equal(b.run("acSpec().stages"), 1); assert.equal(b.run("acSpec().last_tokens_m"), 20);
+});
+
+test("the biggest levers are shown with the change each choice makes, and a choice sets its fields", () => {
+  const knobRadios = [0, 1, 2, 3].map((i) => ({ value: "", dataset: { acknob: "last_tokens_m", acopt: String(i) }, checked: false, onchange: null }));
+  const b = makeBrowser({ state: baseState, groups: { "input[data-acknob]": knobRadios } });
+  open(b, {}, `ac.plan = ${JSON.stringify(speedPlan())}; acDefaults()`);
+  const html = card(b);
+  assert.match(html, /id="ac-levers"[\s\S]*Heal tokens of the last stage/);
+  assert.match(html, /data-acopt="0"[^>]*>\s*10 M\s*<span[^>]*>−\d+ h/);
+  assert.match(html, /80 M \(recipe\)\s*<span class="dim small ac-delta">now/);
+  assert.match(html, /Each on its own\s*<span[^>]*>\+/);
+  // the rest is behind "More speed settings"
+  assert.match(html, /<details id="ac-adv"[^>]*><summary>More speed settings<\/summary>[\s\S]*Importance matrix/);
+  assert.doesNotMatch(html.slice(0, html.indexOf("More speed settings")), /Importance matrix/);
+  // stages and Try first keep their own radios, with the change next to them
+  assert.match(html, /One stage <span class="dim small ac-delta">−13 h to −21 h/);
+  // picking 20 M sets the field; picking the recipe puts the recipe back (null), so the preset stays a preset
+  b.run("wireAuto()");
+  const pick = (i) => { const r = knobRadios[i]; r.checked = true; r.onchange(); };
+  b.run(`ac.plan = ${JSON.stringify(speedPlan())}`);
+  pick(1); assert.equal(b.run("acSpec().last_tokens_m"), 20); assert.equal(b.run("acSpec().preset"), "custom");
+  b.run(`ac.plan = ${JSON.stringify(speedPlan())}`);
+  pick(3); assert.equal(b.run("acSpec().last_tokens_m"), null); assert.equal(b.run("acSpec().preset"), "balanced");
+  assert.equal(b.run("acDelta([-360, -660])"), "−6 h to −11 h"); assert.equal(b.run("acDelta([0, 0])"), "no change"); assert.equal(b.run("acDelta([420, 540])"), "+7 h to +9 h");
+});
+
+test("Fast shows a red warning for a model that thinks and not for one that does not; the plan's warnings name every value below the recipe", () => {
+  const b = browser();
+  open(b, {}, `ac.plan = ${JSON.stringify(speedPlan({ warnings: ["The last stage heals on 20 M tokens; the recipe for a cut of this size is 80 M. In an earlier real run, healing below the recipe failed the thinking checks."] }))}; acDefaults(); acApplyPreset("fast")`);
+  let html = card(b);
+  assert.match(html, /class="err" data-acspeed-warn="fast">[^<]*very likely lose its reasoning/);
+  assert.match(html, /class="warn">The last stage heals on 20 M tokens; the recipe for a cut of this size is 80 M\. In an earlier real run/);
+  // Balanced says it can fail the thinking checks (a plain sentence, not the red one)
+  b.run(`acApplyPreset("balanced")`);
+  html = card(b);
+  assert.match(html, /Runs that healed below the recipe have failed the thinking checks before/);
+  // a model that does not think has no such warning, and its thinking knobs do not make the preset Custom
+  b.run(`ac.thinking = false; acApplyPreset("fast")`);
+  assert.doesNotMatch(card(b), /data-acspeed-warn/);
+  b.run(`acApplyPreset("thorough"); ac.sp.retry_heal = false; ac.sp.check_cut = false; ac.gate = false`);
+  assert.equal(b.run("acPresetNow()"), "thorough");
+});
+
+test("a small model has the recipe chosen, and the time limit shows what was given up or the refusal", () => {
+  const b = browser();
+  b.run(`state = ${JSON.stringify(baseState())}; page = "reshape"; rs.state = ${JSON.stringify(pageState())}; rs.model = "small"; rs.options = { inspect: ${JSON.stringify(insp({ total_params: 8e9 }))}, options: [], width: null, width_options: null };`);
+  card(b);
+  assert.equal(b.run("acSpec().preset"), "thorough");
+  assert.equal(b.run("acSpec().max_hours"), undefined, "no limit unless asked");
+  b.run(`ac.maxOn = true; ac.maxH = "30"`);
+  assert.equal(b.run("acSpec().max_hours"), 30);
+  const dropped = [{ knob: "think_quick", label: "Thinking checks", from: "Full (32 questions)", to: "Quick (16 questions)", saves_h: [0.6, 1.1], risk: "A close call can go either way." },
+                   { knob: "retry_heal", label: "Retry heal after a failed check", from: "on", to: "off", saves_h: [0, 0], risk: "A failed check goes straight to cutting one step less." }];
+  b.run(`ac.plan = ${JSON.stringify(speedPlan({ budget: { max_hours: 30, fits: true, asked_h: [57, 108], total_h: [20, 29.5], dropped } }))}`);
+  let html = card(b);
+  assert.match(html, /id="ac-budget-list"[\s\S]*These settings are given up|id="ac-budget-list"[\s\S]*given up/);
+  assert.match(html, /data-acdropped="think_quick"[\s\S]*Quick \(16 questions\) instead of Full \(32 questions\)[\s\S]*A close call can go either way/);
+  assert.match(html, /data-acdropped="retry_heal"/);
+  b.run(`ac.plan = ${JSON.stringify(speedPlan({ ok: false, blockers: ["Even the fastest settings take about 12 h to 24 h for this cut, and you have 3 h. Choose more time or a larger size."], budget: { max_hours: 3, fits: false, asked_h: [57, 108], total_h: [12, 24], dropped } }))}`);
+  html = card(b);
+  assert.match(html, /class="err">Even the fastest settings take about 12 h to 24 h/); assert.match(html, /id="ac-go"[^>]*disabled/);
+  b.run(`ac.maxOn = false`);
+  assert.doesNotMatch(card(b), /id="ac-budget-list"/);
+  b.run(`ac.maxOn = true; ac.maxH = ""`);
+  assert.match(card(b), /id="ac-maxwhy"/);
 });
