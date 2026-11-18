@@ -71,7 +71,13 @@ pub fn build(st: &AutoState) -> Value {
     let original = st.original.as_ref();
     let last = st.stages.last();
     let actual_b = last.map(|s| s.plan.params_b);
-    let steps: Vec<Value> = st.steps.iter().map(|s| json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": secs_between(&s.started, &s.finished)})).collect();
+    let time = plan.and_then(|p| p.time.as_ref());
+    let steps: Vec<Value> = st.steps.iter().map(|s| {
+        let seconds = secs_between(&s.started, &s.finished);
+        let est = time.and_then(|t| t.steps.iter().find(|x| x.id == s.id));
+        json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": seconds,
+               "estimated_minutes": est.map(|x| json!([x.minutes.0, x.minutes.1])), "actual_minutes": seconds.map(|n| r1(n as f64 / 60.0)), "estimate_basis": est.map(|x| x.basis.clone())})
+    }).collect();
     let active: i64 = st.steps.iter().filter_map(|s| secs_between(&s.started, &s.finished)).sum();
     let mut failed: Vec<String> = Vec::new();
     for s in &st.stages {
@@ -98,7 +104,23 @@ pub fn build(st: &AutoState) -> Value {
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
         "think_gate": st.think_gate, "guardrails": guardrails(st),
         "compare": st.compare, "target_gb": st.spec.target_gb,
+        "estimate": estimate_json(st, active),
     })
+}
+
+/// The estimate made before the run next to what the steps took ("estimated vs actual", to tune the next estimate): per finished step the estimated range, the minutes it took
+/// and whether that was `within` the range, `faster` or `slower`; the totals only when the run is over. None for a run saved before the estimate existed.
+fn estimate_json(st: &AutoState, active_seconds: i64) -> Value {
+    let Some(t) = st.plan.as_ref().and_then(|p| p.time.as_ref()) else { return Value::Null };
+    let rows: Vec<Value> = st.steps.iter().filter_map(|s| {
+        let est = t.steps.iter().find(|x| x.id == s.id)?;
+        let actual = if s.status == "done" { secs_between(&s.started, &s.finished).map(|n| n as f64 / 60.0) } else { None };
+        let verdict = actual.map(|a| if a < est.minutes.0 { "faster" } else if a > est.minutes.1 { "slower" } else { "within" });
+        Some(json!({"id": s.id, "label": est.label, "estimated_minutes": [est.minutes.0, est.minutes.1], "actual_minutes": actual.map(r1), "basis": est.basis, "result": verdict}))
+    }).collect();
+    let over = matches!(st.status.as_str(), "done");
+    json!({"total_h": [t.total_h.0, t.total_h.1], "actual_h": if over { json!(r1(active_seconds as f64 / 3600.0)) } else { Value::Null }, "basis": t.basis,
+           "history_steps": t.history_steps, "step_count": t.step_count, "steps": rows})
 }
 
 /// The ways the chosen cut goes beyond what Auto-cut does by itself (with the numbers of its check before healing when there are any): empty for a cut inside the rules.
@@ -256,6 +278,16 @@ pub fn markdown(r: &Value) -> String {
             s.push_str(&format!("\nUnsloth Studio: published to `{}` (inside Studio: `{}`).\n", p["host_path"].as_str().unwrap_or(""), p["container_path"].as_str().unwrap_or("")));
         } else {
             s.push_str(&format!("\nUnsloth Studio: not published ({}).\n", p["why"].as_str().unwrap_or("")));
+        }
+    }
+    if let Some(e) = r["estimate"].as_object().filter(|e| e["steps"].as_array().is_some_and(|a| !a.is_empty())) {
+        s.push_str("\n## Estimated and actual time\n\nThe estimate shown before the start, next to what the steps took (minutes; only finished steps have an actual time).\n\n");
+        let hours = |v: &Value| v.as_array().map(|a| format!("{} to {}", num(&a[0], 1), num(&a[1], 1))).unwrap_or_else(|| "-".into());
+        s.push_str(&format!("Total: estimated {} hours, actual {} hours. {}\n\n", hours(&e["total_h"]), if e["actual_h"].is_null() { "-".to_string() } else { num(&e["actual_h"], 1) }, e["basis"].as_str().unwrap_or("")));
+        s.push_str("| Step | Estimated | Actual | Result | From |\n|---|---|---|---|---|\n");
+        for x in e["steps"].as_array().cloned().unwrap_or_default() {
+            s.push_str(&format!("| {} | {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["estimated_minutes"].as_array().map(|a| format!("{} to {}", num(&a[0], 1), num(&a[1], 1))).unwrap_or_else(|| "-".into()),
+                                 if x["actual_minutes"].is_null() { "-".to_string() } else { num(&x["actual_minutes"], 1) }, x["result"].as_str().unwrap_or("-"), if x["basis"] == "your_history" { "your history" } else { "formula" }));
         }
     }
     if let Some(stages) = r["timings"]["summary"]["stages"].as_object().filter(|m| !m.is_empty()) {

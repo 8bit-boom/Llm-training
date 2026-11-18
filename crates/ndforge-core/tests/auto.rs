@@ -567,6 +567,15 @@ fn a_healed_model_that_misses_a_gate_is_healed_again_with_40_million_more_tokens
     let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
     assert!(md.contains("passed on the second heal") && md.contains("healed again"), "{md}");
     assert_eq!(st.report, Some(json!({"json": "auto_report.json", "md": "auto_report.md"})));
+    // the estimate made before the run is kept next to what the steps took (additive keys; the old ones stay)
+    let est = &rep["estimate"];
+    assert!(est["total_h"][1].as_f64().unwrap() >= est["total_h"][0].as_f64().unwrap() && est["total_h"][0].as_f64().unwrap() > 0.0, "{est}");
+    assert!(est["actual_h"].is_number() && est["basis"].as_str().unwrap().contains("steps"), "{est}");
+    let rows = est["steps"].as_array().unwrap();
+    assert!(rows.iter().any(|x| x["id"] == "s1.heal" && x["estimated_minutes"].is_array() && x["actual_minutes"].is_number() && ["within", "faster", "slower"].contains(&x["result"].as_str().unwrap())), "{rows:?}");
+    let heal = rep["steps"].as_array().unwrap().iter().find(|x| x["id"] == "s1.heal").unwrap();
+    assert!(heal["estimated_minutes"].is_array() && heal["seconds"].is_number() && heal["status"] == "done" && heal["estimate_basis"] == "formula", "{heal}");
+    assert!(md.contains("## Estimated and actual time") && md.contains("| Stage 1 of 2: heal |"), "{md}");
 }
 
 #[test]
