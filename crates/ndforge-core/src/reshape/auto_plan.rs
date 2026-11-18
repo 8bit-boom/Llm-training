@@ -43,6 +43,15 @@ fn q4() -> Vec<String> {
     vec!["q4_k_m".into()]
 }
 
+/// The tokens a retry heal adds to the healed model's own (the original's answers are extended by the difference).
+pub const RETRY_TOKENS_M: u32 = 40;
+
+/// The millions of tokens the SECOND heal of a stage learns on (the retry after a failed check): the stage's own plus `RETRY_TOKENS_M`, rounded up to a budget the heal takes
+/// (10 / 20 / 40 / 80), at most 80. The student of the retry is the healed model, and it learns on ALL of these tokens again (40 + 40 = 80; 20 gives 80 too).
+pub fn retry_total_m(stage_m: u32) -> u32 {
+    plan::HEAL_TOKENS_M.iter().copied().find(|t| *t >= stage_m + RETRY_TOKENS_M).unwrap_or(80)
+}
+
 /// What the person asks Auto-cut for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoSpec {
@@ -431,6 +440,12 @@ pub struct StagePlan {
     pub verdict: String,
     pub mode: String,
     pub hours: (f64, f64),
+    /// how the original is loaded for its answers ("auto" | "4bit" | "16bit"); the saved answers of two stages are shared only when this and `seq` are the same
+    #[serde(default)]
+    pub teacher_load: String,
+    /// the sequence length is fixed for the heal (`share_teacher_cache`: every stage uses the same one, so the next stage reuses the original's answers)
+    #[serde(default)]
+    pub seq_pinned: bool,
 }
 
 impl StagePlan {
@@ -448,6 +463,9 @@ impl StagePlan {
     /// The heal of this stage: tokens and, for a model that thinks, the thinking recipe.
     pub fn heal_spec(&self, keep_thinking: bool) -> HealSpec {
         let mut v = json!({"tokens_m": self.tokens_m});
+        if self.seq_pinned {
+            v["seq"] = json!(self.seq);
+        }
         if keep_thinking {
             v["recipe"] = json!(plan::THINKING_RECIPE);
         }
@@ -462,21 +480,36 @@ fn gb(x: f64) -> f64 {
 /// One stage: the cut from `prev` to `st` (stops of the way, from the original), healed with the numbers of the recipe for a student of that size. `index` is 1-based,
 /// `of` the number of stages; the last stage heals with the larger budget.
 pub fn stage_for(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u32, of: u32, vram_gb: Option<f64>) -> StagePlan {
+    stage_with_seq(ins, spec, prev, st, index, of, vram_gb, None)
+}
+
+/// The heal tokens of a stage: the recipe's (40 M for a stage that is not the last, the recipe's number for the last, the size's default without thinking) unless the person chose.
+fn stage_tokens(spec: &AutoSpec, student_b: f64, total_b: f64, last: bool) -> u32 {
+    let chosen = if last { spec.last_tokens_m } else { spec.stage_a_tokens_m };
+    chosen.unwrap_or(match (spec.keep_thinking, last) {
+        (true, true) => plan::thinking_tokens_m(student_b, total_b),
+        (true, false) => STAGE_A_TOKENS_M,
+        (false, _) => plan::default_heal_tokens_m(student_b),
+    })
+}
+
+/// `stage_for` with the sequence length fixed (`pin`, for the stages that share the original's answers).
+#[allow(clippy::too_many_arguments)]
+fn stage_with_seq(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u32, of: u32, vram_gb: Option<f64>, pin: Option<u32>) -> StagePlan {
     let total_b = ins.total_params as f64 / 1e9;
     let params = size_of(ins, st.blocks, st.intermediate);
     let student_b = params as f64 / 1e9;
     let last = index == of;
-    let tokens_m = match (spec.keep_thinking, last) {
-        (true, true) => plan::thinking_tokens_m(student_b, total_b),
-        (true, false) => STAGE_A_TOKENS_M,
-        (false, _) => plan::default_heal_tokens_m(student_b),
-    };
+    let tokens_m = stage_tokens(spec, student_b, total_b, last);
     let dims = match &ins.width_dims {
         Some(d) => HealDims { layers: ins.layers.saturating_sub(st.blocks * ins.period), hidden: d.hidden, vocab: d.vocab },
         None => HealDims::guess(student_b),
     };
-    let hs: HealSpec = serde_json::from_value(if spec.keep_thinking { json!({"tokens_m": tokens_m, "recipe": plan::THINKING_RECIPE}) } else { json!({"tokens_m": tokens_m}) })
-        .unwrap_or_else(|_| unreachable!("a spec made of known keys"));
+    let mut hv = if spec.keep_thinking { json!({"tokens_m": tokens_m, "recipe": plan::THINKING_RECIPE}) } else { json!({"tokens_m": tokens_m}) };
+    if let Some(sq) = pin {
+        hv["seq"] = json!(sq);
+    }
+    let hs: HealSpec = serde_json::from_value(hv).unwrap_or_else(|_| unreachable!("a spec made of known keys"));
     let ch = heal_choice(&hs, student_b, vram_gb, &dims);
     let hp: HealPlan = plan::heal_plan_with(student_b, total_b, vram_gb, &dims, &ch.knobs);
     let m = tokens_m as f64 / 10.0;
@@ -489,17 +522,30 @@ pub fn stage_for(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u3
         tokens_m, seq: ch.knobs.seq, batch: ch.knobs.batch, rank: ch.knobs.rank, cache_gb: gb(tokens_m as f64 * 1e6 * CACHE_BYTES_PER_TOKEN / 1e9),
         heal_gb: hp.est_gb, verdict: hp.verdict.to_string(), mode: hp.mode.to_string(),
         hours: (((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0),
+        teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), seq_pinned: pin.is_some(),
     }
 }
 
 /// The stage plans of the stops `steps`, the first from the original.
+///
+/// With `share_teacher_cache` (and more than one stage) every stage heals on the SMALLEST sequence length any of them would use by itself and sends it to the heal
+/// (`StagePlan::seq_pinned`): the original's saved answers are kept per sequence length, so the second stage then finds the first stage's rows and writes only the tokens
+/// it has more. A shorter sequence than the recipe's cuts the longest reasoning traces of the larger student short; the plan says so.
 pub fn stage_plans(ins: &Inspect, spec: &AutoSpec, steps: &[Step], vram_gb: Option<f64>) -> Vec<StagePlan> {
-    let mut prev = Step { blocks: 0, intermediate: full_width(ins) };
-    steps.iter().enumerate().map(|(n, st)| {
-        let stage = stage_for(ins, spec, prev, *st, n as u32 + 1, steps.len() as u32, vram_gb);
-        prev = *st;
-        stage
-    }).collect()
+    let of = steps.len() as u32;
+    let run = |pin: Option<u32>| -> Vec<StagePlan> {
+        let mut prev = Step { blocks: 0, intermediate: full_width(ins) };
+        steps.iter().enumerate().map(|(n, st)| {
+            let stage = stage_with_seq(ins, spec, prev, *st, n as u32 + 1, of, vram_gb, pin);
+            prev = *st;
+            stage
+        }).collect()
+    };
+    let plans = run(None);
+    match plans.iter().map(|s| s.seq).min() {
+        Some(min) if spec.share_teacher_cache && of > 1 => run(Some(min)),
+        _ => plans,
+    }
 }
 
 /// Bytes per parameter of a GGUF size (llama.cpp's own figures, rounded up).
@@ -688,6 +734,8 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
         out.warnings.push("This cut cannot be divided into two stages: it is done in one.".into());
     }
     out.stages = stage_plans(ins, spec, &steps, vram_gb);
+    let natural: Vec<u32> = if spec.share_teacher_cache { stage_plans(ins, &AutoSpec { share_teacher_cache: false, ..spec.clone() }, &steps, vram_gb).iter().map(|s| s.seq).collect() } else { out.stages.iter().map(|s| s.seq).collect() };
+    out.warnings.extend(super::auto_speed::speed_warnings(spec, &out.stages, &natural, original_b));
     for s in &out.stages {
         if s.verdict == "over" {
             out.blockers.push(format!("Healing stage {} ({:.1} B) needs about {:.0} GB on the card (an estimate); this card has {:.0} GB.", s.index, s.params_b, s.heal_gb, vram_gb.unwrap_or(0.0)));
@@ -710,8 +758,8 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     }
     if spec.keep_thinking && spec.think_gate && !out.try_list.is_empty() {
         let n = (spec.think_gate_n as usize).min(out.try_list.len());
-        let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.quick)).sum();
-        let baseline = (if spec.quick { 10.0 } else { 15.0 }) * (ins.total_params as f64 / 1e9 / 17.0).max(1.0);
+        let per: f64 = out.try_list.iter().take(n).map(|c| think_gate_minutes(ins, c, spec.think_quick())).sum();
+        let baseline = (if spec.think_quick() { 10.0 } else { 15.0 }) * (ins.total_params as f64 / 1e9 / 17.0).max(1.0);
         out.think_gate_minutes = Some(((per + baseline) * 10.0).round() / 10.0);
         add_think_gate_disk(ins, &mut disk, &chosen, out.stages.len() == 1);
     }

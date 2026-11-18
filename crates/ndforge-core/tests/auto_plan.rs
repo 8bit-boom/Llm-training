@@ -340,3 +340,64 @@ fn the_default_preset_is_balanced_for_big_models_only() {
     assert_eq!(ndforge_core::reshape::auto_speed::default_preset(15.0), "balanced");
     assert_eq!(ndforge_core::reshape::auto_speed::default_preset(8.0), "thorough");
 }
+
+fn big(target: f64) -> AutoSpec {
+    AutoSpec { allow_many_blocks: true, ..spec(target) }
+}
+
+#[test]
+fn the_speed_knobs_set_the_tokens_of_the_stages() {
+    let ins = qwen27();
+    let base = plan(&ins, &big(17.4), Some(32.0), Some(2000.0));
+    assert_eq!(base.stages.iter().map(|s| s.tokens_m).collect::<Vec<_>>(), [40, 80], "the recipe");
+    assert!(base.warnings.iter().all(|w| !w.contains("recipe is") && !w.contains("recipe for a cut")), "{:?}", base.warnings);
+    let p = plan(&ins, &AutoSpec { stage_a_tokens_m: Some(20), last_tokens_m: Some(40), ..big(17.4) }, Some(32.0), Some(2000.0));
+    assert_eq!(p.stages.iter().map(|s| s.tokens_m).collect::<Vec<_>>(), [20, 40]);
+    // below the recipe is said loudly, the recipe's own numbers are not
+    assert!(p.warnings.iter().any(|w| w.contains("last stage heals on 40 M tokens") && w.contains("recipe for a cut of this size is 80 M") && w.contains("failed the thinking checks")), "{:?}", p.warnings);
+    assert!(p.warnings.iter().any(|w| w.contains("first stage heals on 20 M tokens") && w.contains("recipe is 40 M")), "{:?}", p.warnings);
+    let up = plan(&ins, &AutoSpec { stage_a_tokens_m: Some(80), last_tokens_m: Some(80), ..big(17.4) }, Some(32.0), Some(2000.0));
+    assert_eq!(up.stages.iter().map(|s| s.tokens_m).collect::<Vec<_>>(), [80, 80]);
+    assert!(up.warnings.iter().all(|w| !w.contains("recipe")), "{:?}", up.warnings);
+    // one stage: the last-stage number is the only one
+    let one = plan(&ins, &AutoSpec { stages: 1, last_tokens_m: Some(20), stage_a_tokens_m: Some(10), ..spec(21.1) }, Some(32.0), Some(2000.0));
+    assert_eq!(one.stages.iter().map(|s| s.tokens_m).collect::<Vec<_>>(), [20]);
+}
+
+#[test]
+fn every_value_below_the_recipe_is_a_warning_and_the_recipe_has_none() {
+    let ins = qwen27();
+    let recipe = plan(&ins, &spec(21.1), Some(32.0), Some(2000.0));
+    assert!(recipe.ok && recipe.warnings.iter().all(|w| w.contains("tight on this card")), "only the card's own warning: {:?}", recipe.warnings);
+    let fast = plan(&ins, &spec(21.1).with_preset("fast").unwrap(), Some(32.0), Some(2000.0));
+    assert!(fast.ok, "{:?}", fast.blockers);
+    let all = fast.warnings.join(" | ");
+    for want in ["last stage heals on 20 M tokens", "One stage cuts", "not checked for thinking", "quick ones", "64 texts", "No retry", "No back-off", "No importance matrix"] {
+        assert!(all.contains(want), "{want}: {all}");
+    }
+}
+
+#[test]
+fn the_shared_cache_pins_one_sequence_length_and_the_stage_heals_send_it() {
+    let ins = qwen27();
+    // a card on which the larger student heals on 4096 and the smaller one on 8192 (36 GB)
+    let alone = plan(&ins, &big(17.4), Some(36.0), Some(2000.0));
+    let nat: Vec<u32> = alone.stages.iter().map(|s| s.seq).collect();
+    assert_eq!(nat, [4096, 8192]);
+    assert!(alone.stages.iter().all(|s| !s.seq_pinned) && alone.stages.iter().all(|s| s.heal_spec(true).seq.is_none()));
+    assert!(alone.warnings.iter().any(|w| w.contains("different sequence lengths") && w.contains("stage 1: 4096") && w.contains("stage 2: 8192")), "the plan says why the answers are written twice: {:?}", alone.warnings);
+    let shared = plan(&ins, &AutoSpec { share_teacher_cache: true, ..big(17.4) }, Some(36.0), Some(2000.0));
+    assert!(shared.ok, "{:?}", shared.blockers);
+    assert_eq!(shared.stages.iter().map(|s| (s.seq, s.seq_pinned)).collect::<Vec<_>>(), [(4096, true), (4096, true)]);
+    assert!(shared.stages.iter().all(|s| s.heal_spec(true).seq == Some(4096) && s.heal_spec(false).seq == Some(4096)), "the heal gets the length, so `max_len` matches");
+    assert!(shared.warnings.iter().any(|w| w.contains("Stage 2 heals on sequence length 4096 instead of 8192")), "{:?}", shared.warnings);
+    assert!(shared.warnings.iter().all(|w| !w.contains("different sequence lengths")));
+    // the same on a card where the recipe's sequence is the same anyway: nothing is cut, the length is still sent
+    let same = plan(&ins, &AutoSpec { share_teacher_cache: true, ..big(17.4) }, Some(32.0), Some(2000.0));
+    assert!(same.stages.iter().all(|s| s.seq_pinned && s.seq == 4096), "{:?}", same.stages.iter().map(|s| s.seq).collect::<Vec<_>>());
+    assert!(same.warnings.iter().all(|w| !w.contains("instead of")), "{:?}", same.warnings);
+    // the load of the original is the same for both stages
+    assert!(shared.stages.iter().all(|s| s.teacher_load == "auto" && s.mode == "cache"));
+    // one stage: nothing to share
+    assert!(plan(&ins, &AutoSpec { share_teacher_cache: true, stages: 1, ..spec(21.1) }, Some(36.0), Some(2000.0)).stages.iter().all(|s| !s.seq_pinned));
+}

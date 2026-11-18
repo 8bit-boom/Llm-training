@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::auto_plan::AutoSpec;
+use super::auto_plan::{AutoSpec, StagePlan};
+use super::plan;
 use crate::error::{Error, Result};
 
 const PRESETS_JSON: &str = include_str!("auto_speed.json");
@@ -76,4 +77,66 @@ impl AutoSpec {
             self.with_preset(&p.id).map(|s| s.knob_values() == mine).unwrap_or(false)
         }).map(|p| p.id)
     }
+}
+
+/// What a person who chose a faster setting gives up, one plain sentence per value that is not the recommended recipe's (the plan shows them as warnings and the report lists
+/// them again). `stages` are the planned stages (with the shared sequence length when `share_teacher_cache` is on), `natural_seq` the sequence length each stage would heal on
+/// by itself. Empty for the recipe.
+pub fn speed_warnings(spec: &AutoSpec, stages: &[StagePlan], natural_seq: &[u32], total_b: f64) -> Vec<String> {
+    let mut w = Vec::new();
+    let thinking = spec.keep_thinking;
+    let n = stages.len();
+    let evidence = "In an earlier real run, healing below the recipe failed the thinking checks; the checks after each stage will tell, and a failed check costs a retry.";
+    if let Some(last) = stages.last() {
+        let recipe = if thinking { plan::thinking_tokens_m(last.params_b, total_b) } else { plan::default_heal_tokens_m(last.params_b) };
+        if last.tokens_m < recipe {
+            w.push(if thinking {
+                format!("The last stage heals on {} M tokens; the recipe for a cut of this size is {recipe} M. {evidence}", last.tokens_m)
+            } else {
+                format!("The last stage heals on {} M tokens; the usual number for a model of this size is {recipe} M. The healed model may be clearly weaker.", last.tokens_m)
+            });
+        }
+    }
+    if n > 1 && thinking && stages[0].tokens_m < super::auto_plan::STAGE_A_TOKENS_M {
+        w.push(format!("The first stage heals on {} M tokens; the recipe is {} M. The second stage starts from a model that learned less. {evidence}", stages[0].tokens_m, super::auto_plan::STAGE_A_TOKENS_M));
+    }
+    if thinking && spec.stages == 1 && n == 1 && stages[0].cut_pct > 15.0 {
+        w.push(format!("One stage cuts {:.0} % of the model in a single step; the recipe heals half of it first. For a model that thinks this is the riskier way.", stages[0].cut_pct));
+    }
+    if !spec.check_cut && thinking {
+        w.push("The unhealed cut is not checked for thinking (its check only informs; nothing is decided by it). The original is checked after the first heal instead, so the gates still have their yardstick.".into());
+    }
+    if spec.think_quick() && thinking {
+        w.push("The thinking checks are the quick ones (16 questions): they take about a third less time and are noisier, so a close call can go either way.".into());
+    }
+    if spec.quick {
+        w.push(format!("Try first measures each cut on {} texts instead of {}: it is quicker and a close race between two cuts is less certain.", plan::TRY_QUICK_SAMPLES, plan::TRY_FULL_SAMPLES));
+    }
+    if thinking && !spec.retry_heal {
+        w.push("No retry: when a thinking check of a healed stage fails, Auto-cut does not heal it again but goes straight to cutting one step less.".into());
+    }
+    if !spec.back_off {
+        w.push("No back-off: when a stage still fails its thinking check (after the retry, if there is one), the run ends with the report instead of cutting one step less.".into());
+    }
+    if !spec.imatrix {
+        w.push("No importance matrix is measured for the export: the small sizes (Q4 and below) are made without it and are a little less exact.".into());
+    }
+    if n > 1 && spec.share_teacher_cache {
+        let pin = stages.iter().map(|s| s.seq).min().unwrap_or(0);
+        if stages.iter().all(|s| s.mode != "cache") {
+            w.push("Same sequence length in both stages is on, but this card heals with the original next to the student (no saved answers): it changes nothing here.".into());
+        }
+        for (g, nat) in stages.iter().zip(natural_seq) {
+            if *nat > pin {
+                w.push(format!("Stage {} heals on sequence length {pin} instead of {nat} so that the original writes its answers once and the next stage reuses them: reasoning traces longer than {pin} tokens are cut short in that stage.", g.index));
+            }
+        }
+    } else if n > 1 {
+        let c: Vec<&StagePlan> = stages.iter().filter(|s| s.mode == "cache").collect();
+        if c.len() > 1 && c.iter().any(|s| s.seq != c[0].seq || s.teacher_load != c[0].teacher_load) {
+            w.push(format!("The stages heal on different sequence lengths ({}): the original's saved answers cannot be reused by the next stage, so it writes them again (many hours). \"Same sequence length in both stages\" shortens that, at the price of a shorter sequence in the larger stage.",
+                           c.iter().map(|s| format!("stage {}: {}", s.index, s.seq)).collect::<Vec<_>>().join(", ")));
+        }
+    }
+    w
 }

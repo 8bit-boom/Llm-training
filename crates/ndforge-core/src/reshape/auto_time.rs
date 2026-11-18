@@ -268,10 +268,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
                 let gb = gb16(c.params);
                 parts.push(p("write", format!("write the cut of {:.1} B", c.params_b), at_rate(h, "write_gb_s", gb, gb, (gb / WRITE_GB_S.0 / 60.0, gb / WRITE_GB_S.1 / 60.0))));
                 parts.push(p("load", format!("load the cut of {:.1} B", c.params_b), load(h, gb, "16bit")));
-                parts.push(p("check", format!("thinking check of the cut of {:.1} B", c.params_b), think_check(h, c.params as f64 / 1e9, spec.quick)));
+                parts.push(p("check", format!("thinking check of the cut of {:.1} B", c.params_b), think_check(h, c.params as f64 / 1e9, spec.think_quick())));
             }
             parts.push(p("load", "load the original", load(h, orig_gb, mode)));
-            parts.push(p("check", "thinking check of the original (the yardstick)", think_check(h, ob, spec.quick)));
+            parts.push(p("check", "thinking check of the original (the yardstick)", think_check(h, ob, spec.think_quick())));
             steps.push(step("think_gate", "Check the thinking of the best cuts before healing", parts, None));
         }
     }
@@ -299,10 +299,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             let mut note = None;
             if i == 0 && !(spec.think_gate && !plan.try_list.is_empty()) {
                 parts.push(p("load", "load the original", load(h, orig_gb, mode)));
-                parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.quick)));
+                parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.think_quick())));
                 note = Some("The original is checked once, here, because the check before healing is off.".to_string());
             }
-            parts.push(p("check", "thinking check of the cut", think_check(h, sb, spec.quick)));
+            parts.push(p("check", "thinking check of the cut", think_check(h, sb, spec.think_quick())));
             steps.push(step(&format!("s{n}.check_cut"), format!("{t}thinking check of the cut"), parts, note));
         }
 
@@ -310,7 +310,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
         steps.push(step(&format!("s{n}.heal"), format!("{t}heal"), parts, note));
 
         if thinking {
-            let parts = vec![start("start of the job", 1.0), p("load", "load the healed model", load(h, gb, "16bit")), p("check", "thinking check of the healed model", think_check(h, sb, spec.quick))];
+            let parts = vec![start("start of the job", 1.0), p("load", "load the healed model", load(h, gb, "16bit")), p("check", "thinking check of the healed model", think_check(h, sb, spec.think_quick()))];
             steps.push(step(&format!("s{n}.check_heal"), format!("{t}thinking check of the healed model"), parts, None));
         }
         prev_params = g.params;
@@ -334,7 +334,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     steps.push(step("export", "Make the GGUF files", parts, None));
     if thinking {
         let parts = vec![start("start of the job", 1.0), p("check", "thinking check of the GGUF (llama.cpp)", {
-            let c = think_check(&History::default(), fb, spec.quick);
+            let c = think_check(&History::default(), fb, spec.think_quick());
             fixed(c.lo, c.hi)
         })];
         steps.push(step("check_gguf", "Thinking check of the GGUF", parts, Some("No earlier GGUF check of yours says how long it takes at this size: a formula.".to_string())));
@@ -357,7 +357,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             let (mut parts, _) = heal_parts(h, ins, plan, g, g.tokens_m + RETRY_TOKENS_M);
             let gb = gb16(g.params);
             parts.push(p("load", "load the healed model", load(h, gb, "16bit")));
-            parts.push(p("check", "thinking check of the healed model", think_check(h, g.params as f64 / 1e9, spec.quick)));
+            parts.push(p("check", "thinking check of the healed model", think_check(h, g.params as f64 / 1e9, spec.think_quick())));
             let s = step("retry_heal", "", parts, None);
             extra.push(ExtraTime {
                 id: "retry_heal".into(), label: "If the last stage fails its thinking check: heal it again with 40 M more tokens and check it again".into(), minutes: s.minutes,

@@ -25,11 +25,13 @@ pub struct RealEffects<'a> {
     pub vram_gb: Option<f64>,
     on_event: &'a mut dyn FnMut(Value),
     step: String,
+    /// measure an importance matrix for the small sizes of the export (`AutoSpec::imatrix`)
+    imatrix: bool,
 }
 
 impl<'a> RealEffects<'a> {
     pub fn new(p: &'a Project, stop: Arc<AtomicBool>, vram_gb: Option<f64>, on_event: &'a mut dyn FnMut(Value)) -> Self {
-        RealEffects { p, stop, vram_gb, on_event, step: "plan".into() }
+        RealEffects { p, stop, vram_gb, on_event, step: "plan".into(), imatrix: true }
     }
 
     /// The export of the healed model with the options of the mixed sizes.
@@ -38,7 +40,7 @@ impl<'a> RealEffects<'a> {
         let stop = self.stop.clone();
         let dir = std::path::PathBuf::from(&healed.dir);
         // the matrix for the small sizes is measured on the finished model, on text that looks like what it will be asked: with thinking when it keeps thinking (docs/IMATRIX.md)
-        let imatrix = ImatrixOptions { enabled: true, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
+        let imatrix = ImatrixOptions { enabled: self.imatrix, reasoning: keep_thinking.then(ReasoningCalib::default), ..ImatrixOptions::default() };
         let r = crate::export::runs::execute_model_folder_full(self.p, run, &dir, family, quants, NUM_CTX, keep_thinking, &imatrix, mixed, &stop, &mut |e| send(&mut *self.on_event, &self.step, e));
         if self.stop.load(Ordering::SeqCst) && r.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
             return Ok(Out::Stopped);
@@ -197,6 +199,10 @@ impl Effects for RealEffects<'_> {
     fn drop_teacher_cache(&mut self, models: &[String]) -> Result<()> {
         runs::drop_teacher_caches_of(self.p, models);
         Ok(())
+    }
+
+    fn export_options(&mut self, imatrix: bool) {
+        self.imatrix = imatrix;
     }
 
     fn export(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool) -> Result<Out<Value>> {
