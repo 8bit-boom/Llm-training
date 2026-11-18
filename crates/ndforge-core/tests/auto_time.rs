@@ -166,10 +166,12 @@ fn your_history_overrides_the_formula_and_is_tagged() {
     assert_eq!(heal.basis, "your_history", "{heal:?}");
     assert!(heal.parts.iter().filter(|x| ["cache", "train", "merge"].contains(&x.id.as_str())).all(|x| x.basis == "your_history"));
     assert_ne!(heal.minutes, find(&none, "s2.heal").unwrap().minutes);
-    // 80 M tokens at 1,200 / s for the teacher: 22.2 h x 0.85 .. 1.25
-    let cache = heal.parts.iter().find(|x| x.id == "cache").unwrap();
-    let point = 80e6 / 1200.0 / 60.0;
-    assert!((cache.minutes.0 / (point * 0.85) - 1.0).abs() < 0.01 && (cache.minutes.1 / (point * 1.25) - 1.0).abs() < 0.01, "{cache:?} {point}");
+    // stage 1: 40 M tokens at 1,200 / s for the teacher: 11.1 h x 0.85 .. 1.25; stage 2 (80 M, the same sequence length) writes only the 40 M that stage 1 did not
+    let point = 40e6 / 1200.0 / 60.0;
+    for id in ["s1.heal", "s2.heal"] {
+        let cache = find(&own, id).unwrap().parts.iter().find(|x| x.id == "cache").unwrap();
+        assert!((cache.minutes.0 / (point * 0.85) - 1.0).abs() < 0.01 && (cache.minutes.1 / (point * 1.25) - 1.0).abs() < 0.01, "{id}: {cache:?} {point}");
+    }
     assert!(own.history_steps >= 4 && own.history_steps < own.step_count, "{} of {}", own.history_steps, own.step_count);
     assert!(own.basis.starts_with(&format!("{} of {} steps use your own earlier runs", own.history_steps, own.step_count)), "{}", own.basis);
     // what was not measured stays a formula

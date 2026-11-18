@@ -561,7 +561,7 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     }
     let ins = out!(fx.inspect(&model)?);
     let plan = auto_plan::plan(&ins, &st.spec, fx.vram_gb(), fx.free_disk_gb());
-    let plan = auto_plan::with_history(plan, &ins, &st.spec, &fx.history());
+    let plan = auto_plan::with_speed(plan, &ins, &st.spec, fx.vram_gb(), &fx.history());
     if !plan.ok {
         st.plan = Some(plan.clone());
         return Err(Error::new(plan.blockers.join(" ")));
@@ -1210,7 +1210,7 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 /// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
 pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
-    let mut plan = auto_plan::with_history(auto_plan::plan(ins, spec, vram_gb, free_gb), ins, spec, &crate::timing::History::recent(HISTORY_LOGS));
+    let mut plan = auto_plan::with_speed(auto_plan::plan(ins, spec, vram_gb, free_gb), ins, spec, vram_gb, &crate::timing::History::recent(HISTORY_LOGS));
     if !has_training_data {
         plan.ok = false;
         plan.blockers.push("Save a training-data version in Step 2 first: the layers are measured and healed on your world's text.".into());

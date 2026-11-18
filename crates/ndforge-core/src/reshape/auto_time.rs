@@ -33,14 +33,14 @@ const SCORE_MIN_PER_B: (f64, f64) = (0.35, 1.0);
 const PASS_TOK_B_S: (f64, f64) = (80_000.0, 40_000.0);
 const CONVERT_MIN_PER_GB: (f64, f64) = (0.1, 0.2);
 const QUANT_MIN_PER_GB: (f64, f64) = (0.1, 0.3);
+/// Measuring the importance matrix of the export, minutes per billion parameters (a guess: about 10 to 20 minutes for 17 B).
+const IMATRIX_MIN_PER_B: (f64, f64) = (0.6, 1.2);
 const COPY_GB_S: (f64, f64) = (1.0, 0.2);
 const CHECK_SPREAD: (f64, f64) = (0.8, 1.4);
 /// Tokens of a measuring or Try-first pass per sample (`calib_len`).
 const LEN: f64 = 512.0;
 const MEASURE_SAMPLES: f64 = 256.0;
 const CUT_CHECK_SAMPLES: f64 = 128.0;
-/// The extra heal after a failed thinking check, in millions of tokens (`auto::step_check_heal`).
-const RETRY_TOKENS_M: u32 = 40;
 
 /// A part of a step (what takes the time inside it): loading, the teacher's answers, the training, the merge ...
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -203,19 +203,24 @@ fn tag(of: u32, n: u32) -> String {
     if of > 1 { format!("Stage {n} of {of}: ") } else { String::new() }
 }
 
-/// The three jobs of a heal (the teacher's answers when they are saved first, the training, the merge) with `tokens_m` million tokens.
-fn heal_parts(h: &History, ins: &Inspect, plan: &AutoPlan, g: &StagePlan, tokens_m: u32) -> (Vec<P>, Option<String>) {
+/// The three jobs of a heal (the teacher's answers when they are saved first, the training, the merge): the student learns on `tokens_m` million tokens; the original writes
+/// `teacher_m` million of them (the rest are in the shared saved answers already: written by an earlier stage on the same sequence length, or by this stage's first heal).
+fn heal_parts(h: &History, ins: &Inspect, plan: &AutoPlan, g: &StagePlan, tokens_m: u32, teacher_m: u32) -> (Vec<P>, Option<String>) {
     let (ob, sb) = (ins.total_params as f64 / 1e9, g.params as f64 / 1e9);
     let tokens = tokens_m as f64 * 1e6;
     let units = tokens / 5e6;
+    let (t_tokens, t_units) = (teacher_m as f64 * 1e6, teacher_m as f64 * 1e6 / 5e6);
     let orig_gb = ins.total_params as f64 * if ins.bytes_per_param > 0.0 { ins.bytes_per_param } else { 2.0 } / 1e9;
     let cache = g.mode == "cache";
     let mut v = vec![start("start of the jobs and the evaluations", if cache { 3.0 } else { 2.0 })];
     let mut note = None;
-    if cache {
+    if cache && teacher_m == 0 {
+        v.push(p("cache", "the original's answers are saved already (same sequence length): none to write", fixed(0.0, 0.0)));
+    } else if cache {
         v.push(p("load", "load the original", load(h, orig_gb, &plan.measure_load)));
-        let f = (CACHE_H_PER_5M.0 * 60.0 * units * ob / CACHE_REF_B, CACHE_H_PER_5M.1 * 60.0 * units * ob / CACHE_REF_B);
-        v.push(p("cache", format!("the original writes its answers ({tokens_m} M tokens)"), at_rate(h, "teacher_tok_b_s", ob, tokens * ob, f)));
+        let f = (CACHE_H_PER_5M.0 * 60.0 * t_units * ob / CACHE_REF_B, CACHE_H_PER_5M.1 * 60.0 * t_units * ob / CACHE_REF_B);
+        let what = if teacher_m < tokens_m { format!("the original writes its answers ({teacher_m} M more tokens; {} M are saved already)", tokens_m - teacher_m) } else { format!("the original writes its answers ({tokens_m} M tokens)") };
+        v.push(p("cache", what, at_rate(h, "teacher_tok_b_s", ob, t_tokens * ob, f)));
     } else {
         v.push(p("load", "load the original next to the student (4-bit)", load(h, orig_gb, "4bit")));
         note = Some("The card holds the original and the student together: the original answers while the student learns (no saved answers).".to_string());
@@ -277,6 +282,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     }
 
     let mut prev_params = ins.total_params;
+    // the original's saved answers are kept per sequence length and way of loading it (`distilljob.shared_store_id`): a later stage on the same ones finds the rows an
+    // earlier stage wrote and writes only the tokens it has more. (stage index, seq, load, tokens) of the stages that save answers.
+    let mut saved: Vec<(u32, u32, String, u32)> = Vec::new();
+    let mut reuse_of: Vec<u32> = Vec::new();
     for (i, g) in plan.stages.iter().enumerate() {
         let n = i as u32 + 1;
         let t = tag(of, n);
@@ -294,10 +303,12 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
         }
         steps.push(step(&format!("s{n}.cut"), format!("{t}cut"), parts, None));
 
-        if thinking {
+        // the original is the yardstick of the gates: checked once, in the check of the first cut, or (no check of the cut, no check before healing) in the check of the first healed model
+        let baseline_here = i == 0 && !(spec.think_gate && !plan.try_list.is_empty());
+        if thinking && spec.check_cut {
             let mut parts = vec![start("start of the job", 1.0), p("load", "load the cut", load(h, gb, "16bit"))];
             let mut note = None;
-            if i == 0 && !(spec.think_gate && !plan.try_list.is_empty()) {
+            if baseline_here {
                 parts.push(p("load", "load the original", load(h, orig_gb, mode)));
                 parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.think_quick())));
                 note = Some("The original is checked once, here, because the check before healing is off.".to_string());
@@ -306,12 +317,33 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             steps.push(step(&format!("s{n}.check_cut"), format!("{t}thinking check of the cut"), parts, note));
         }
 
-        let (parts, note) = heal_parts(h, ins, plan, g, g.tokens_m);
+        let same: u32 = if g.mode == "cache" { saved.iter().filter(|(_, sq, ld, _)| *sq == g.seq && *ld == g.teacher_load).map(|x| x.3).max().unwrap_or(0) } else { 0 };
+        let reuse = same.min(g.tokens_m);
+        reuse_of.push(same);
+        let (parts, mut note) = heal_parts(h, ins, plan, g, g.tokens_m, g.tokens_m - reuse);
+        if reuse > 0 {
+            let from = saved.iter().find(|(_, sq, ld, tk)| *sq == g.seq && *ld == g.teacher_load && *tk == same).map(|x| x.0 + 1).unwrap_or(1);
+            note = Some(format!("The original's answers for the first {reuse} M tokens were written by stage {from} on the same sequence length ({}): they are not written again.", g.seq));
+        } else if i > 0 && g.mode == "cache" && saved.iter().any(|(_, sq, ld, _)| *sq != g.seq || *ld != g.teacher_load) {
+            let other = saved.iter().find(|(_, sq, ld, _)| *sq != g.seq || *ld != g.teacher_load).map(|x| x.1).unwrap_or(0);
+            note = Some(format!("Stage 1 healed on sequence length {other} and this stage on {}: the saved answers do not fit, so the original writes them all again. \"Same sequence length in both stages\" avoids that.", g.seq));
+        }
+        if g.mode == "cache" {
+            saved.push((i as u32, g.seq, g.teacher_load.clone(), g.tokens_m));
+        }
         steps.push(step(&format!("s{n}.heal"), format!("{t}heal"), parts, note));
 
         if thinking {
-            let parts = vec![start("start of the job", 1.0), p("load", "load the healed model", load(h, gb, "16bit")), p("check", "thinking check of the healed model", think_check(h, sb, spec.think_quick()))];
-            steps.push(step(&format!("s{n}.check_heal"), format!("{t}thinking check of the healed model"), parts, None));
+            let mut parts = vec![start("start of the job", 1.0)];
+            let mut note = None;
+            if baseline_here && !spec.check_cut {
+                parts.push(p("load", "load the original", load(h, orig_gb, mode)));
+                parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.think_quick())));
+                note = Some("The original is checked once, here, because neither the cut nor the check before healing was checked.".to_string());
+            }
+            parts.push(p("load", "load the healed model", load(h, gb, "16bit")));
+            parts.push(p("check", "thinking check of the healed model", think_check(h, sb, spec.think_quick())));
+            steps.push(step(&format!("s{n}.check_heal"), format!("{t}thinking check of the healed model"), parts, note));
         }
         prev_params = g.params;
     }
@@ -325,6 +357,9 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     let mut parts = vec![start("start of the job", 1.0), p("convert", format!("convert to a 16-bit GGUF ({f16_gb:.0} GB)"), fixed(CONVERT_MIN_PER_GB.0 * f16_gb, CONVERT_MIN_PER_GB.1 * f16_gb))];
     for q in &plain {
         parts.push(p("quantize", format!("make {}", q.to_uppercase()), fixed(QUANT_MIN_PER_GB.0 * f16_gb, QUANT_MIN_PER_GB.1 * f16_gb)));
+    }
+    if spec.imatrix && !plain.is_empty() {
+        parts.push(p("measure", "measure the importance matrix for the small sizes", fixed(IMATRIX_MIN_PER_B.0 * fb, IMATRIX_MIN_PER_B.1 * fb)));
     }
     if measured {
         let m = r1(2.0 + 0.25 * fb);
@@ -352,15 +387,18 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     // what shortens the run most: the teacher's answers and the training
     let lever: (f64, f64) = steps.iter().filter(|s| s.id.ends_with(".heal")).flat_map(|s| s.parts.iter()).filter(|x| x.id == "cache" || x.id == "train").fold((0.0, 0.0), |a, x| (a.0 + x.minutes.0, a.1 + x.minutes.1));
 
-    if thinking {
-        if let Some(g) = plan.stages.last() {
-            let (mut parts, _) = heal_parts(h, ins, plan, g, g.tokens_m + RETRY_TOKENS_M);
+    if thinking && spec.retry_heal {
+        if let (Some(g), Some(same)) = (plan.stages.last(), reuse_of.last()) {
+            // the student of the retry is the healed model and learns on ALL the tokens of the second heal (40 + 40 = 80); the original adds only the rows it has not written
+            let total = auto_plan::retry_total_m(g.tokens_m);
+            let have = if g.mode == "cache" { g.tokens_m.max(*same) } else { 0 };
+            let (mut parts, _) = heal_parts(h, ins, plan, g, total, total.saturating_sub(have));
             let gb = gb16(g.params);
             parts.push(p("load", "load the healed model", load(h, gb, "16bit")));
             parts.push(p("check", "thinking check of the healed model", think_check(h, g.params as f64 / 1e9, spec.think_quick())));
             let s = step("retry_heal", "", parts, None);
             extra.push(ExtraTime {
-                id: "retry_heal".into(), label: "If the last stage fails its thinking check: heal it again with 40 M more tokens and check it again".into(), minutes: s.minutes,
+                id: "retry_heal".into(), label: format!("If the last stage fails its thinking check: heal it again (the healed model learns on {total} M tokens, {} M more of the original's answers) and check it again", total.saturating_sub(have)), minutes: s.minutes,
                 note: "Only when a check fails, and only once per stage. It is not in the total.".into(),
             });
         }

@@ -486,11 +486,16 @@ pub fn stage_for(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u3
 /// The heal tokens of a stage: the recipe's (40 M for a stage that is not the last, the recipe's number for the last, the size's default without thinking) unless the person chose.
 fn stage_tokens(spec: &AutoSpec, student_b: f64, total_b: f64, last: bool) -> u32 {
     let chosen = if last { spec.last_tokens_m } else { spec.stage_a_tokens_m };
-    chosen.unwrap_or(match (spec.keep_thinking, last) {
+    chosen.unwrap_or_else(|| recipe_tokens_m(spec.keep_thinking, student_b, total_b, last))
+}
+
+/// The recipe's heal tokens of a stage (millions): 40 for a stage that is not the last, the recipe's number for the last (`plan::thinking_tokens_m`), the size's default without thinking.
+pub fn recipe_tokens_m(keep_thinking: bool, student_b: f64, total_b: f64, last: bool) -> u32 {
+    match (keep_thinking, last) {
         (true, true) => plan::thinking_tokens_m(student_b, total_b),
         (true, false) => STAGE_A_TOKENS_M,
         (false, _) => plan::default_heal_tokens_m(student_b),
-    })
+    }
 }
 
 /// `stage_for` with the sequence length fixed (`pin`, for the stages that share the original's answers).
@@ -682,6 +687,9 @@ pub struct AutoPlan {
     /// the time of the WHOLE run, step by step, before it starts (`auto_time`); None while the plan has blockers
     #[serde(default)]
     pub time: Option<TimeEstimate>,
+    /// the speed settings: the time of every preset and of every knob's choices for this model (`auto_speed`); None while the plan has blockers
+    #[serde(default)]
+    pub speed: Option<super::auto_speed::SpeedInfo>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
@@ -689,7 +697,7 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None, speed: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);
@@ -773,6 +781,15 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
         out.time = Some(time_estimate(ins, spec, &out, &History::default()));
     }
     out
+}
+
+/// `with_history`, and the speed settings of this model and card made with the same history: the time of every preset and what each knob's choices change (`plan.speed`).
+pub fn with_speed(plan: AutoPlan, ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history: &History) -> AutoPlan {
+    let mut plan = with_history(plan, ins, spec, history);
+    if plan.ok {
+        plan.speed = Some(super::auto_speed::speed_info(ins, spec, vram_gb, history));
+    }
+    plan
 }
 
 /// The plan with the time estimate made from this computer's own earlier jobs (`history`) where they say something: what the window shows and what a run saves.
