@@ -172,8 +172,16 @@ check before healing the original is checked once inside `s1.check_cut` instead.
 The teacher's answers and the training are most of the run; on the owner's case (27 B to 17.4 B, two stages, 40 M and 80 M tokens) the reference numbers make it a matter of days, more than the heal hours the stage
 table shows (`StagePlan.hours` is an older, kinder formula and is unchanged). Once there are earlier runs in the logs the estimate follows them instead.
 
-**Not in the total.** Waiting in the queue; downloading the base model; the computer going to sleep (Windows: switch sleep off for a long run); and a retry. When a thinking check fails the last stage is healed again with
-40 M more tokens and checked again (`extra`, id `retry_heal`, shown on its own line "Possible extra, not counted above" and only with Keep thinking). It happens at most once per stage.
+**Not in the total.** Waiting in the queue; downloading the base model; the computer going to sleep (Windows: switch sleep off for a long run); and a retry. When a thinking check fails the last stage is healed again
+(`extra`, id `retry_heal`, shown on its own line "Possible extra, not counted above" and only with Keep thinking, and not at all when the retry is switched off). It happens at most once per stage. **The retry is the
+healed model learning on 80 M tokens**, not 40 M more: the student is the healed model and it trains on ALL the tokens of the second heal (the stage's own plus 40 M, rounded up to a budget the heal takes: 40 gives
+80, 20 gives 80, 80 stays 80 (it used to fail the heal's own check of the budget)). Only the original's answers are extended, by the difference (a stage on 40 M asks for 40 M more); the estimate counts exactly that.
+
+**The original's answers are written once per sequence length.** The saved answers are kept per teacher, tokenizer, `k`, sequence length (`max_len`) and way of loading the original (`distilljob.shared_store_id`);
+a later stage on the same ones finds the earlier stage's rows and writes only the tokens it has more. The estimate knows: when both stages heal on the same sequence length (it is the recipe's own choice per
+student size and card: 4096 for both on a 32 GB card for a 19.7 B student after a 26 B one, but 4096 then 8192 on a 36 GB card) the second stage's "the original writes its answers" part is the tokens it has more
+(none when both heal on 40 M), else the original writes them again and the step's note says why. The knob "same sequence length in both stages" (`share_teacher_cache`) makes the second case the first by healing
+every stage on the shortest sequence length any of them would use and sending it to the heal (`StagePlan.seq_pinned`, `HealSpec.seq`).
 
 **The window.** The block shows the total as hours and minutes (to 5 minutes below 10 h, to 30 minutes from 10 h, like the time left), "if you press Start now it should be done around <clock range, with
 "tomorrow" or the weekday>", a collapsible table of every step (range, from your history / formula; the heal shows its teacher, training and merge), the basis line, a one-line caveat and, when the teacher's answers and
@@ -183,6 +191,50 @@ merge). A run saved before the estimate existed keeps the older rule (the stage 
 
 **Compared with what happened.** The report (`auto_report.json` / `.md`) has, additively, `estimated_minutes`, `actual_minutes` and `estimate_basis` on every step and an `estimate` object (`total_h`, `actual_h`,
 `basis`, per step `result`: within / faster / slower than the range) and a section "Estimated and actual time", so that the formulas can be tuned from real runs. Nothing here has been checked against a real run yet.
+
+## Speed settings (`reshape/auto_speed.rs`, `auto_speed.json`)
+
+Healing is most of a run (the teacher's answers and the student's training), so the card has one choice of how careful and how fast, with the estimated total of each for the model and card in front of you.
+**Rule: legacy = Thorough.** A spec with every speed field at its default (an older `auto.json`, a spec from an older window) is the recommended recipe and plans and runs exactly as before.
+
+| Preset | What it sets | Risk |
+|---|---|---|
+| Thorough (recommended recipe) | two stages, the first on 40 M tokens, the last on the recipe's 40 or 80 M, full thinking checks (32 questions), a check of every cut, the best 2 cuts checked before healing, a retry and a back-off | none beyond the cut itself |
+| Balanced (chosen for a model of 15 B or more) | the first stage on 20 M tokens, the same sequence length in both stages, quick thinking checks (16 questions), a quick Try first (64 texts) | the first stage learns half as much, the quick checks are noisier; healing below the recipe has failed the thinking checks in a real run, the checks will tell |
+| Fast (quick look) | one stage on 20 M tokens, quick checks, the best cut only before healing, no check of the cut, no retry, no back-off, no importance matrix | far below the recipe: a model that thinks will very likely lose its reasoning (a red warning for such a model) |
+| Custom | any change in the knobs below | each value below the recipe is listed |
+
+The presets are data (`reshape/auto_speed.json`; `AutoSpec::with_preset`); the window holds the same table (`AC_SPEED_PRESETS`, a smoke test compares them). Any change of a knob turns the choice to Custom; setting
+the knobs back to a preset's values makes it that preset again. The values (all `#[serde(default)]` on `AutoSpec`): `preset`, `stage_a_tokens_m` / `last_tokens_m` (None = the recipe; 10 / 20 / 40 / 80),
+`think_quick` (None = follows `quick`), `check_cut`, `retry_heal`, `back_off` (default on), `share_teacher_cache` (default off), `imatrix` (default on), `max_hours`.
+
+| Knob | Choices | What it saves | What it gives up |
+|---|---|---|---|
+| heal tokens of the last stage | 10 / 20 / 40 / 80 M (recipe 40, or 80 above 30 % cut) | linear: every 10 M is about 1.8 to 3.3 h of the student plus the teacher's answers (the window shows each choice's hours) | learns less; below the recipe thinking has failed the checks |
+| heal tokens of the first stage | the same (recipe 40) | the same, for the first stage | the second stage starts from a weaker model |
+| stages | 2 / 1 | a cut, a check, a merge and a whole heal | everything cut at once; riskier for thinking |
+| same sequence length in both stages | off / on | the original writing the same answers twice (hours when the lengths differ; nothing when they do not: the note says so) | the larger student sees its longest reasoning traces cut short |
+| thinking checks | Full 32 questions / Quick 16 | about a third of each of 6 or 7 checks | noisier gates |
+| Try first | Full 128 texts / Quick 64 | minutes | a close race is less certain |
+| check before healing | the best 2 cuts / the best 1 / off | about 20 minutes per cut | a cut with a low error but little thinking may be chosen |
+| check of the unhealed cut | on / off | about 20 minutes per stage | none for the result (it only informs); the original is then checked after the first heal |
+| retry heal | on / off | nothing unless a check fails: then the 80 M tokens retry | goes straight to cutting one step less |
+| back-off | on / off | a whole stage, only if the checks fail twice | the run ends with its report |
+| importance matrix | on / off | 10 to 20 minutes | the small sizes are a little less exact |
+
+Not speed knobs and never changed here: the LoRA size, the sequence length (except the shared-length knob), the teacher's top-k, how the original is loaded, gradient checkpointing, the batch, the general-text share, the
+kept intermediate files, and everything that is a requested output (the measured file and its comparison, Studio, the sizes).
+
+**Every value below the recipe is said, three times**: a warning in the plan before Start (`auto_speed::speed_warnings`: the heal tokens below the recipe quote that healing below the recipe failed the thinking
+checks in a real run), a note of the run, and the report's section "Speed settings" (`auto_speed::deviations`: setting, used, recipe, risk). `plan.speed` (additive, from `auto_plan::with_speed`) carries the total of
+every preset (with the retry apart), and every knob with every choice's total and its change in minutes; the window shows them ("−6 h to −11 h").
+
+**"I have at most N hours"** (`max_hours`, 1 to 336). `auto_speed::fit_budget` gives up settings one at a time, the least harmful first, and stops at the first that fits on the HIGH end of the estimate (a retry is
+never in it): quick thinking checks, quick Try first, no check of the cut, the same sequence length, one cut checked before healing, no retry, the first stage on 20 M, one stage, the last stage on 20 M (the last
+resort: a model that thinks will very likely fail its checks). Only values that are not already lower are touched, and nothing that was asked for (the thinking itself, the sizes, the measured file, Studio) is dropped. The plan
+lists what was given up with the hours each saved and its risk; the run does the same when it starts (step `plan`, in the notes and the report: `budget`) and keeps `max_hours`. When even the last rung does not fit the plan is
+refused: "Even the fastest settings take about X to Y for this cut, and you have N h. Choose more time or a larger size." A guard watches the clock: before a retry heal or a stage made again, if the estimate of that try plus
+the steps still to run would end after the limit (counted from the creation of the run), the run ends `gates_failed` with its report and says "would end after your time limit".
 
 ## The report (`reshape/auto_report.rs`)
 
@@ -205,7 +257,7 @@ the registration is not checked against that list.
 ## The page (`ui/app.js`, "Auto-cut (one click)")
 
 A card at the top of the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
-Full or Quick, *keep the intermediate files*, the confirmation of more than 4 blocks (only when the plan says it is needed), and the Studio publish box with the share fields (Save and Check). Under them the plan: blockers (red, Start
+Full or Quick, **How careful, how fast** (the presets with their totals, the heal tokens and the sequence length of the stages with the hours each choice changes, More speed settings, "I have at most N hours"), *keep the intermediate files*, the confirmation of more than 4 blocks (only when the plan says it is needed), and the Studio publish box with the share fields (Save and Check). Under them the plan: blockers (red, Start
 disabled), warnings, the stages (size, cut, healing tokens and hours, card), the disk and **How long this will take** (see "How long it takes"). Start / Stop / Continue / Show the report, then a **stepper** of the run's steps (done, running, pending, skipped, failed, with the note of the step), the live text
 and bar of the running job, and the report as text.
 
@@ -218,6 +270,8 @@ file at every step event, so the stepper is what the file says. Tests: `ui/smoke
 
 Nothing here ran on a real model, card or Studio (the publish ran against a stand-in server and temporary folders only). The planner is arithmetic: the sizes equal the Slim page's, the timeline is a sum, the card estimates are the Heal card's estimates. The state machine
 is tested with a stand-in for every job; `RealEffects` (the wiring to the real jobs, including `publish`, which reads the global settings) has only been compiled and read, not run against a worker; the page was only run in a stand-in browser, never in the window.
+
+The speed settings have not run on a real model: whether Balanced or Fast keep thinking is unknown (Fast very likely does not), as is the real saving of each knob and whether the two stages really heal on different sequence lengths on your card (the plan prints both). Events reach the card while a job runs now (they were held back until it ended).
 
 The Auto-cut card says how long the rest takes and when it will be done: "about 3 h 20 min to 20 h left (done around 22:09–tomorrow 14:49)". Durations are rounded to 5 minutes below 10 hours and to 30 minutes from 10 hours up, so they do not claim false precision. An end of the range that falls on another calendar day names it ("tomorrow", or a short weekday name two or more days on), so the high end never reads as earlier than the low end. A finished run shows nothing.
 

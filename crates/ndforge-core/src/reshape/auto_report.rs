@@ -103,9 +103,17 @@ pub fn build(st: &AutoState) -> Value {
         "active_minutes": r1(active as f64 / 60.0),
         "try": st.try_result, "measure": st.measure, "notes": st.notes, "steps": steps,
         "think_gate": st.think_gate, "guardrails": guardrails(st),
-        "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget,
+        "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget, "speed": speed_json(st),
         "estimate": estimate_json(st, active),
     })
+}
+
+/// The speed settings of the run: the preset, and every value that is not the recommended recipe's with its risk (the plan warns about the same ones before the run starts).
+fn speed_json(st: &AutoState) -> Value {
+    let total_b = st.plan.as_ref().map(|p| p.original_b).unwrap_or(0.0);
+    let stages: Vec<_> = st.stages.iter().map(|s| s.plan.clone()).collect();
+    let dev = super::auto_speed::deviations(&st.spec, &stages, total_b);
+    json!({"preset": st.spec.preset, "recipe": dev.is_empty(), "deviations": dev, "max_hours": st.spec.max_hours})
 }
 
 /// The estimate made before the run next to what the steps took ("estimated vs actual", to tune the next estimate): per finished step the estimated range, the minutes it took
@@ -157,6 +165,13 @@ fn row(label: &str, verdict: &str, main: &Value) -> String {
     }
     s.push('\n');
     s
+}
+
+fn range(v: &Value) -> String {
+    match (v[0].as_f64(), v[1].as_f64()) {
+        (Some(a), Some(b)) => format!("{a:.1} to {b:.1}"),
+        _ => "-".into(),
+    }
 }
 
 fn num(v: &Value, digits: usize) -> String {
@@ -299,6 +314,29 @@ pub fn markdown(r: &Value) -> String {
         }
         for a in r["timings"]["advice"].as_array().cloned().unwrap_or_default() {
             s.push_str(&format!("\n- {}{}\n", if a["worth"] == true { "Worth doing: " } else { "" }, a["text"].as_str().unwrap_or("")));
+        }
+    }
+    if let Some(sp) = r["speed"].as_object() {
+        let preset = sp["preset"].as_str().map(|p| format!(" (setting: {p})")).unwrap_or_default();
+        s.push_str(&format!("\n## Speed settings{preset}\n\n"));
+        let devs = sp["deviations"].as_array().cloned().unwrap_or_default();
+        if devs.is_empty() {
+            s.push_str("The recommended recipe: no setting was lowered to save time.\n");
+        } else {
+            s.push_str("These values differ from the recommended recipe. Each one trades quality risk for time:\n\n| Setting | Used | Recipe | Risk |\n|---|---|---|---|\n");
+            for d in devs {
+                s.push_str(&format!("| {} | {} | {} | {} |\n", d["label"].as_str().unwrap_or(""), d["value"].as_str().unwrap_or(""), d["recipe"].as_str().unwrap_or(""), d["risk"].as_str().unwrap_or("")));
+            }
+        }
+        if let Some(b) = r["budget"].as_object().filter(|b| b["dropped"].as_array().is_some_and(|d| !d.is_empty())) {
+            s.push_str(&format!("\nTime limit of {} hours: the estimate went from {} h to {} h by giving up (least harmful first):\n\n", num(&b["max_hours"], 0), range(&b["asked_h"]), range(&b["total_h"])));
+            for d in b["dropped"].as_array().cloned().unwrap_or_default() {
+                s.push_str(&format!("- {}: {} instead of {} (saves {} h). {}\n", d["label"].as_str().unwrap_or(""), d["to"].as_str().unwrap_or(""), d["from"].as_str().unwrap_or(""), range(&d["saves_h"]), d["risk"].as_str().unwrap_or("")));
+            }
+        }
+        if let Some(e) = r["estimate"].as_object().filter(|e| !e["total_h"].is_null()) {
+            let actual = e["actual_h"].as_f64().map(|a| format!("{a:.1} h")).unwrap_or_else(|| "not finished".into());
+            s.push_str(&format!("\nEstimated {} h; took {actual}.\n", range(&e["total_h"])));
         }
     }
     if let Some(n) = r["notes"].as_array().filter(|n| !n.is_empty()) {

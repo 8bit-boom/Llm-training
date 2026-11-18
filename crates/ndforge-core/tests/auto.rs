@@ -1459,3 +1459,35 @@ fn a_retry_that_would_end_after_the_time_limit_is_not_started() {
     assert!(st.error.as_deref().unwrap().contains("Making the stage again with a smaller cut would end after your time limit"), "{:?}", st.error);
     assert_eq!(back.cuts, 1);
 }
+
+#[test]
+fn the_report_lists_every_speed_setting_that_is_not_the_recipe_with_its_risk() {
+    let (d1, d2, d3) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+    // the recipe: nothing to list
+    let (p, mut fx) = (project(d1.path()), Mock::new());
+    let st = start(&p, &mut fx, gspec(21.1)).unwrap();
+    let md = report_of(&p, Some(&st.id)).unwrap()["markdown"].as_str().unwrap().to_string();
+    assert!(md.contains("## Speed settings") && md.contains("The recommended recipe: no setting was lowered to save time."), "{md}");
+    assert_eq!(report_of(&p, Some(&st.id)).unwrap()["report"]["speed"]["recipe"], true);
+    // Fast: every value is a row with its risk
+    let (p, mut fx) = (project(d2.path()), Mock::new());
+    let st = start(&p, &mut fx, gspec(21.1).with_preset("fast").unwrap()).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let r = report_of(&p, Some(&st.id)).unwrap();
+    let md = r["markdown"].as_str().unwrap();
+    assert!(md.contains("## Speed settings (setting: fast)"), "{md}");
+    for (label, used) in [("Heal tokens", "20 M tokens"), ("Stages", "one stage"), ("Try first", "Quick (64 texts)"), ("Thinking checks", "Quick (16 questions)"), ("Thinking check before healing", "the best 1 cut"),
+                          ("Check of each unhealed cut", "off"), ("Retry heal after a failed check", "off"), ("Cut one step less after a second failed check", "off"), ("Importance matrix for the export", "off")] {
+        assert!(md.lines().any(|l| l.starts_with(&format!("| {label} | {used} |"))), "{label}: {md}");
+    }
+    assert!(md.contains("very likely fail"), "{md}");
+    assert!(r["report"]["speed"]["deviations"].as_array().unwrap().len() >= 9);
+    // Balanced: its first stage and the shared length
+    let (p, mut fx) = (project(d3.path()), Mock::new());
+    fx.vram = Some(36.0);
+    let st = start(&p, &mut fx, AutoSpec { allow_many_blocks: true, ..gspec(17.4) }.with_preset("balanced").unwrap()).unwrap();
+    let md = report_of(&p, Some(&st.id)).unwrap()["markdown"].as_str().unwrap().to_string();
+    assert!(md.contains("| Heal tokens of the first stage | 20 M tokens | 40 M tokens |") && md.contains("| Sequence length of the stages | the same in both stages (4096) |"), "{md}");
+    // the plan's warnings and the notes said it before the run
+    assert!(st.notes.iter().any(|n| n.contains("first stage heals on 20 M tokens")), "{:?}", st.notes);
+}

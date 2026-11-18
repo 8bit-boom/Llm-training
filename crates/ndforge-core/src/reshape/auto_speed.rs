@@ -148,6 +148,25 @@ pub fn speed_warnings(spec: &AutoSpec, stages: &[StagePlan], natural_seq: &[u32]
     w
 }
 
+
+/// What giving a knob up costs in quality, in plain words (the plan's knob table, the time limit's list of what was given up and the report all say this).
+pub fn knob_risk(knob: &str) -> &'static str {
+    match knob {
+        "think_quick" => "The quick checks ask 16 questions instead of 32: about a third faster, and a close call can go either way.",
+        "quick" => "Try first measures on 64 texts instead of 128: a close race between two cuts is less certain.",
+        "check_cut" => "The unhealed cut is not checked for thinking (that check only informs); the original is checked after the first heal, so the gates keep their yardstick.",
+        "share_teacher_cache" => "Both stages heal on the shorter sequence length: the larger student's longest reasoning traces are cut short. The original writes its answers once.",
+        "think_gate_n" => "Only the cut with the lowest error is checked for thinking before healing: a cut with a low error and little thinking may be chosen.",
+        "retry_heal" => "When a thinking check of a healed stage fails, the stage is not healed again: Auto-cut goes straight to cutting one step less (a larger model).",
+        "stage_a_tokens_m" => "The first stage learns less, so the second stage starts from a weaker model. Below the recipe a model that thinks has failed the thinking checks before.",
+        "stages" => "One stage cuts everything at once and heals once: it skips a cut, a check, a merge and a whole heal, and is the riskier way for a model that thinks.",
+        "last_tokens_m" => "Fewer tokens is linearly faster and learns less. Below the recipe a model that thinks has failed the thinking checks before; on 20 M tokens it will very likely fail them and the run may end without a model to keep.",
+        "back_off" => "Without it the run ends with its report when a stage still fails; with it a stage is made again, larger.",
+        "imatrix" => "The small sizes (Q4 and below) are made without it and are a little less exact.",
+        _ => "",
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------ what every choice costs in time
 
 /// One choice of a knob with the time of the whole run when it is chosen (everything else as it is now).
@@ -246,7 +265,7 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
     let student_b = |last: bool| base_plan.stages.get(if last { n.saturating_sub(1) } else { 0 }).map(|s| s.params_b).unwrap_or(total_b);
 
     // the heal tokens: the biggest lever, linear in the time
-    let tokens = |knob: &str, label: &str, last: bool, risk: &str| -> SpeedKnob {
+    let tokens = |knob: &str, label: &str, last: bool| -> SpeedKnob {
         let recipe = auto_plan::recipe_tokens_m(thinking, student_b(last), total_b, last);
         let idx = if last { n.saturating_sub(1) } else { 0 };
         let now = base_plan.stages.get(idx).map(|s| s.tokens_m);
@@ -256,18 +275,17 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
             let t = *t;
             option(label, set, &move |_, _| now == Some(t), None)
         }).collect();
-        SpeedKnob { knob: knob.into(), label: label.into(), risk: risk.into(), options }
+        SpeedKnob { knob: knob.into(), label: label.into(), risk: knob_risk(knob).into(), options }
     };
-    knobs.push(tokens("last_tokens_m", if n > 1 { "Heal tokens of the last stage" } else { "Heal tokens" }, true,
-                      "Fewer tokens is linearly faster and learns less. Below the recipe a model that thinks has failed the thinking checks before."));
+    knobs.push(tokens("last_tokens_m", if n > 1 { "Heal tokens of the last stage" } else { "Heal tokens" }, true));
     if n > 1 {
-        knobs.push(tokens("stage_a_tokens_m", "Heal tokens of the first stage", false, "The second stage starts from what the first one learned: a lighter first stage makes the second one's job harder."));
+        knobs.push(tokens("stage_a_tokens_m", "Heal tokens of the first stage", false));
     }
     // the number of stages
     {
         let opts: Vec<SpeedOption> = [2u32, 1].iter().map(|k| option(if *k == 1 { "One stage".into() } else { "Two stages (recipe)".into() }, set_of(&[("stages", Value::from(*k))]), &move |p, _| p.stages.len() as u32 == (*k).min(2), None)).collect();
         if opts.iter().filter_map(|o| o.total_h).collect::<Vec<_>>().windows(2).any(|w| w[0] != w[1]) {
-            knobs.push(SpeedKnob { knob: "stages".into(), label: "Stages".into(), risk: "One stage cuts everything at once and heals once: it skips a cut, a check, a merge and a whole heal, and is the riskier way for a model that thinks.".into(), options: opts });
+            knobs.push(SpeedKnob { knob: "stages".into(), label: "Stages".into(), risk: knob_risk("stages").into(), options: opts });
         }
     }
     // the shared sequence length (and with it the shared answers of the original)
@@ -277,31 +295,31 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
         let note = same_already.then(|| format!("On this card both stages already heal on sequence length {}: the original's answers are reused without this choice.", natural.first().copied().unwrap_or(0)));
         let opts = [(true, "Same sequence length in both stages: the original writes its answers once"), (false, "Each stage on its own sequence length (recipe)")].iter()
             .map(|(on, l)| option(l.to_string(), set_of(&[("share_teacher_cache", Value::Bool(*on))]), &move |_, a| a.share_teacher_cache == *on, note.clone())).collect();
-        knobs.push(SpeedKnob { knob: "share_teacher_cache".into(), label: "Sequence length of the stages".into(), risk: "Both stages heal on the shorter sequence length, so the larger student sees its longest reasoning traces cut short. It saves the original writing the same answers twice (the biggest saving when the lengths differ).".into(), options: opts });
+        knobs.push(SpeedKnob { knob: "share_teacher_cache".into(), label: "Sequence length of the stages".into(), risk: knob_risk("share_teacher_cache").into(), options: opts });
     }
     if thinking {
-        knobs.push(SpeedKnob { knob: "think_quick".into(), label: "Thinking checks".into(), risk: "The quick checks ask 16 questions instead of 32: a third faster, and a close call can go either way.".into(), options:
+        knobs.push(SpeedKnob { knob: "think_quick".into(), label: "Thinking checks".into(), risk: knob_risk("think_quick").into(), options:
             [(false, "Full (32 questions, recipe)"), (true, "Quick (16 questions)")].iter().map(|(q, l)| option(l.to_string(), set_of(&[("think_quick", Value::Bool(*q))]), &move |_, a| a.think_quick() == *q, None)).collect() });
     }
-    knobs.push(SpeedKnob { knob: "quick".into(), label: "Try first".into(), risk: "Fewer texts: quicker, and a close race between two cuts is less certain.".into(), options:
+    knobs.push(SpeedKnob { knob: "quick".into(), label: "Try first".into(), risk: knob_risk("quick").into(), options:
         [(false, "Full (128 texts, recipe)"), (true, "Quick (64 texts)")].iter().map(|(q, l)| option(l.to_string(), set_of(&[("quick", Value::Bool(*q))]), &move |_, a| a.quick == *q, None)).collect() });
     if thinking {
         let off = set_of(&[("think_gate", Value::Bool(false))]);
         let one = set_of(&[("think_gate", Value::Bool(true)), ("think_gate_n", Value::from(1))]);
         let two = set_of(&[("think_gate", Value::Bool(true)), ("think_gate_n", Value::from(2))]);
-        knobs.push(SpeedKnob { knob: "think_gate_n".into(), label: "Thinking check before healing".into(), risk: "Checks the best cuts for thinking before any heal and picks by how they think; with fewer cuts a cut with a low error but little thinking may be healed.".into(), options: vec![
+        knobs.push(SpeedKnob { knob: "think_gate_n".into(), label: "Thinking check before healing".into(), risk: knob_risk("think_gate_n").into(), options: vec![
             option("Off".into(), off, &|_, a| !a.think_gate, None),
             option("The best cut only".into(), one, &|_, a| a.think_gate && a.think_gate_n == 1, None),
             option("The best 2 cuts (recipe)".into(), two, &|_, a| a.think_gate && a.think_gate_n == 2, None)] });
-        knobs.push(SpeedKnob { knob: "check_cut".into(), label: "Check of each unhealed cut".into(), risk: "Informational only (nothing is decided by it), but the original is then checked after the first heal, so the gates keep their yardstick.".into(), options:
+        knobs.push(SpeedKnob { knob: "check_cut".into(), label: "Check of each unhealed cut".into(), risk: knob_risk("check_cut").into(), options:
             [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("check_cut", Value::Bool(*on))]), &move |_, a| a.check_cut == *on, None)).collect() });
         let saves = retry_h.map(|r| format!("Saves nothing unless a check fails; then it saves {} of the retry.", hours_text(r)));
-        knobs.push(SpeedKnob { knob: "retry_heal".into(), label: "Retry heal after a failed check".into(), risk: "The retry heals the healed model again on 80 M tokens. Without it a failed check goes straight to cutting one step less.".into(), options:
+        knobs.push(SpeedKnob { knob: "retry_heal".into(), label: "Retry heal after a failed check".into(), risk: knob_risk("retry_heal").into(), options:
             [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("retry_heal", Value::Bool(*on))]), &move |_, a| a.retry_heal == *on, if *on { None } else { saves.clone() })).collect() });
     }
-    knobs.push(SpeedKnob { knob: "back_off".into(), label: "Cut one step less after a second failed check".into(), risk: "Without it the run ends with its report when a stage still fails; with it a stage is made again, larger.".into(), options:
+    knobs.push(SpeedKnob { knob: "back_off".into(), label: "Cut one step less after a second failed check".into(), risk: knob_risk("back_off").into(), options:
         [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("back_off", Value::Bool(*on))]), &move |_, a| a.back_off == *on, if *on { None } else { Some("Saves a whole stage only if the checks fail twice.".into()) })).collect() });
-    knobs.push(SpeedKnob { knob: "imatrix".into(), label: "Importance matrix for the export".into(), risk: "The small sizes (Q4 and below) are made without it and are a little less exact.".into(), options:
+    knobs.push(SpeedKnob { knob: "imatrix".into(), label: "Importance matrix for the export".into(), risk: knob_risk("imatrix").into(), options:
         [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("imatrix", Value::Bool(*on))]), &move |_, a| a.imatrix == *on, None)).collect() });
 
     let presets = presets().into_iter().map(|pr| {
@@ -384,23 +402,23 @@ fn tokens_text(m: u32) -> String {
 
 fn ladder() -> Vec<Rung> {
     vec![
-        Rung { knob: "think_quick", label: "Thinking checks", to: "Quick (16 questions)", risk: "The quick checks ask 16 questions instead of 32: about a third faster, and a close call can go either way.",
+        Rung { knob: "think_quick", label: "Thinking checks", to: "Quick (16 questions)", risk: knob_risk("think_quick"),
                applies: |s, _| s.keep_thinking && !s.think_quick(), from: |_, _| "Full (32 questions)".into(), apply: |s| s.think_quick = Some(true) },
-        Rung { knob: "quick", label: "Try first", to: "Quick (64 texts)", risk: "Try first measures on 64 texts instead of 128: a close race between two cuts is less certain.",
+        Rung { knob: "quick", label: "Try first", to: "Quick (64 texts)", risk: knob_risk("quick"),
                applies: |s, _| !s.quick, from: |_, _| "Full (128 texts)".into(), apply: |s| s.quick = true },
-        Rung { knob: "check_cut", label: "Check of each unhealed cut", to: "off", risk: "The unhealed cut is not checked for thinking (that check only informs); the original is checked after the first heal, so the gates keep their yardstick.",
+        Rung { knob: "check_cut", label: "Check of each unhealed cut", to: "off", risk: knob_risk("check_cut"),
                applies: |s, _| s.keep_thinking && s.check_cut, from: |_, _| "on".into(), apply: |s| s.check_cut = false },
-        Rung { knob: "share_teacher_cache", label: "Sequence length of the stages", to: "the same in both stages", risk: "Both stages heal on the shorter sequence length: the larger student's longest reasoning traces are cut short. The original writes its answers once.",
+        Rung { knob: "share_teacher_cache", label: "Sequence length of the stages", to: "the same in both stages", risk: knob_risk("share_teacher_cache"),
                applies: |s, p| !s.share_teacher_cache && p.stages.len() > 1, from: |_, p| format!("each stage on its own ({})", p.stages.iter().map(|g| g.seq.to_string()).collect::<Vec<_>>().join(", ")), apply: |s| s.share_teacher_cache = true },
-        Rung { knob: "think_gate_n", label: "Thinking check before healing", to: "the best cut only", risk: "Only the cut with the lowest error is checked for thinking before healing: a cut with a low error and little thinking may be chosen.",
+        Rung { knob: "think_gate_n", label: "Thinking check before healing", to: "the best cut only", risk: knob_risk("think_gate_n"),
                applies: |s, p| s.keep_thinking && s.think_gate && s.think_gate_n > 1 && !p.try_list.is_empty(), from: |s, _| format!("the best {} cuts", s.think_gate_n), apply: |s| s.think_gate_n = 1 },
-        Rung { knob: "retry_heal", label: "Retry heal after a failed check", to: "off", risk: "When a thinking check of a healed stage fails, the stage is not healed again: Auto-cut goes straight to cutting one step less (a larger model).",
+        Rung { knob: "retry_heal", label: "Retry heal after a failed check", to: "off", risk: knob_risk("retry_heal"),
                applies: |s, _| s.keep_thinking && s.retry_heal, from: |_, _| "on".into(), apply: |s| s.retry_heal = false },
-        Rung { knob: "stage_a_tokens_m", label: "Heal tokens of the first stage", to: "20 M tokens", risk: "The first stage learns half as much, so the second stage starts from a weaker model. Below the recipe a model that thinks has failed the thinking checks before.",
+        Rung { knob: "stage_a_tokens_m", label: "Heal tokens of the first stage", to: "20 M tokens", risk: knob_risk("stage_a_tokens_m"),
                applies: |s, p| p.stages.len() > 1 && p.stages[0].tokens_m > 20 && s.stage_a_tokens_m.is_none_or(|t| t > 20), from: |_, p| tokens_text(p.stages[0].tokens_m), apply: |s| s.stage_a_tokens_m = Some(20) },
-        Rung { knob: "stages", label: "Stages", to: "one stage", risk: "One stage cuts everything at once and heals once: it skips a cut, a check, a merge and a whole heal, and is the riskier way for a model that thinks.",
+        Rung { knob: "stages", label: "Stages", to: "one stage", risk: knob_risk("stages"),
                applies: |s, p| s.stages > 1 && p.stages.len() > 1, from: |_, p| format!("{} stages", p.stages.len()), apply: |s| s.stages = 1 },
-        Rung { knob: "last_tokens_m", label: "Heal tokens of the last stage", to: "20 M tokens", risk: "The last stage learns on 20 M tokens, far below the recipe: a model that thinks will very likely fail its thinking checks and the run may end without a model to keep. The last resort.",
+        Rung { knob: "last_tokens_m", label: "Heal tokens of the last stage", to: "20 M tokens", risk: knob_risk("last_tokens_m"),
                applies: |s, p| p.stages.last().is_some_and(|g| g.tokens_m > 20) && s.last_tokens_m.is_none_or(|t| t > 20), from: |_, p| tokens_text(p.stages.last().map(|g| g.tokens_m).unwrap_or(0)), apply: |s| s.last_tokens_m = Some(20) },
     ]
 }
@@ -445,6 +463,73 @@ pub fn budget_sentences(fit: &BudgetFit) -> Vec<String> {
     let mut v = vec![format!("To fit your {:.0} hours the settings were changed: the estimate went from {:.0}-{:.0} h to {:.0}-{:.0} h.", fit.max_hours, fit.asked_h.0, fit.asked_h.1, fit.total_h.0, fit.total_h.1)];
     for d in &fit.dropped {
         v.push(format!("{}: {} instead of {} (saves {:.1}-{:.1} h). {}", d.label, d.to, d.from, d.saves_h.0, d.saves_h.1, d.risk));
+    }
+    v
+}
+
+// ------------------------------------------------------------------------------------------------------------------ the report
+
+/// A speed setting that is not the recommended recipe's, with its risk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Deviation {
+    pub knob: String,
+    pub label: String,
+    pub value: String,
+    pub recipe: String,
+    pub risk: String,
+}
+
+/// Every speed setting of the run that differs from the recommended recipe, as plain sentences with the risk of each: the report's "Speed settings" section. `stages` are the planned
+/// stages (their tokens and sequence lengths are what the run used), `total_b` the original's size. Empty for the recipe.
+pub fn deviations(spec: &AutoSpec, stages: &[StagePlan], total_b: f64) -> Vec<Deviation> {
+    let mut v = Vec::new();
+    let thinking = spec.keep_thinking;
+    let mut add = |knob: &str, label: &str, value: String, recipe: String| v.push(Deviation { knob: knob.into(), label: label.into(), value, recipe, risk: knob_risk(knob).into() });
+    let (first, last) = (stages.first(), stages.last());
+    if let Some(g) = last {
+        let recipe = auto_plan::recipe_tokens_m(thinking, g.params_b, total_b, true);
+        if g.tokens_m != recipe {
+            add("last_tokens_m", if stages.len() > 1 { "Heal tokens of the last stage" } else { "Heal tokens" }, tokens_text(g.tokens_m), tokens_text(recipe));
+        }
+    }
+    if stages.len() > 1 {
+        if let Some(g) = first {
+            let recipe = auto_plan::recipe_tokens_m(thinking, g.params_b, total_b, false);
+            if g.tokens_m != recipe {
+                add("stage_a_tokens_m", "Heal tokens of the first stage", tokens_text(g.tokens_m), tokens_text(recipe));
+            }
+        }
+        if spec.share_teacher_cache {
+            add("share_teacher_cache", "Sequence length of the stages", format!("the same in both stages ({})", stages.iter().map(|s| s.seq).min().unwrap_or(0)), "each stage on its own".into());
+        }
+    }
+    if spec.stages == 1 {
+        add("stages", "Stages", "one stage".into(), "two stages".into());
+    }
+    if spec.quick {
+        add("quick", "Try first", format!("Quick ({} texts)", plan::TRY_QUICK_SAMPLES), format!("Full ({} texts)", plan::TRY_FULL_SAMPLES));
+    }
+    if thinking {
+        if spec.think_quick() {
+            add("think_quick", "Thinking checks", "Quick (16 questions)".into(), "Full (32 questions)".into());
+        }
+        if !spec.think_gate {
+            add("think_gate_n", "Thinking check before healing", "off".into(), "the best 2 cuts".into());
+        } else if spec.think_gate_n != 2 {
+            add("think_gate_n", "Thinking check before healing", format!("the best {} cut{}", spec.think_gate_n, if spec.think_gate_n == 1 { "" } else { "s" }), "the best 2 cuts".into());
+        }
+        if !spec.check_cut {
+            add("check_cut", "Check of each unhealed cut", "off".into(), "on".into());
+        }
+        if !spec.retry_heal {
+            add("retry_heal", "Retry heal after a failed check", "off".into(), "on".into());
+        }
+    }
+    if !spec.back_off {
+        add("back_off", "Cut one step less after a second failed check", "off".into(), "on".into());
+    }
+    if !spec.imatrix {
+        add("imatrix", "Importance matrix for the export", "off".into(), "on".into());
     }
     v
 }
