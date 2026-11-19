@@ -162,6 +162,18 @@ fn forward_pass(h: &History, b: f64, samples: f64, mode: &str) -> R {
     at_rate(h, "try_tok_b_s", b, work, (work / PASS_TOK_B_S.0 / 60.0 * f, work / PASS_TOK_B_S.1 / 60.0 * f))
 }
 
+/// Minutes (low, high) of one Try-first pass over `samples` texts of a model of `b` billion parameters loaded as `mode` (this computer's own passes when it has measured some).
+pub fn try_pass_minutes(h: &History, b: f64, samples: u32, mode: &str) -> (f64, f64) {
+    let r = forward_pass(h, b, samples as f64, mode);
+    (r.lo, r.hi)
+}
+
+/// Minutes (low, high) to load a model of `gb` gigabytes as `mode`.
+pub fn load_minutes(h: &History, gb: f64, mode: &str) -> (f64, f64) {
+    let r = load(h, gb, mode);
+    (r.lo, r.hi)
+}
+
 /// One thinking check of a model of `b` billion parameters (the check itself; writing and loading are other parts).
 fn think_check(h: &History, b: f64, quick: bool) -> R {
     let key = if quick { "think_s_per_b:quick" } else { "think_s_per_b:full" };
@@ -256,15 +268,25 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     ], (mode == "offload").then(|| "The original does not fit the card: it is spread over the card and the PC's memory, which is several times slower.".to_string())));
 
     if !plan.try_list.is_empty() {
-        let samples = spec.try_samples() as f64;
-        let n = plan.try_list.len() + plan.try_list.iter().filter(|c| c.blocks > 0 && c.intermediate.is_some() && Some(c.intermediate.unwrap_or(0)) != auto_plan::full_width(ins)).count();
-        let pass = forward_pass(h, ob, samples, mode);
-        // the high end: the whole question asked again with 256 samples when the two halves of the text name different winners
-        let (lo, hi) = (pass.lo * n as f64, pass.hi * n as f64 * 2.0);
-        steps.push(step("try", "Try the cuts", vec![
-            start("start of the job", 2.0), p("load", "load the original", load(h, orig_gb, mode)),
-            P { id: "measure", label: format!("{n} passes of {} texts (the high end counts a repeat with 256)", samples as u32), r: R { lo, hi, hist: pass.hist } },
-        ], None));
+        if let Some(m) = spec.search_minutes {
+            // the search measures for as long as it is given (the load is part of it) and may end sooner when every round is done
+            let m = m as f64;
+            let l = load(h, orig_gb, mode);
+            steps.push(step("try", "Find the best cut", vec![
+                start("start of the job", 1.0), p("load", "load the original", l),
+                P { id: "measure", label: format!("the search for the best cut (at most {m:.0} minutes, load included)"), r: R { lo: (m * 0.5 - l.lo - START.0).max(1.0), hi: (m - l.hi - START.1).max(1.0), hist: false } },
+            ], Some("The search stops when its time is used; it may finish sooner when every round is done.".to_string())));
+        } else {
+            let samples = spec.try_samples() as f64;
+            let n = plan.try_list.len() + plan.try_list.iter().filter(|c| c.blocks > 0 && c.intermediate.is_some() && Some(c.intermediate.unwrap_or(0)) != auto_plan::full_width(ins)).count();
+            let pass = forward_pass(h, ob, samples, mode);
+            // the high end: the whole question asked again with 256 samples when the two halves of the text name different winners
+            let (lo, hi) = (pass.lo * n as f64, pass.hi * n as f64 * 2.0);
+            steps.push(step("try", "Try the cuts", vec![
+                start("start of the job", 2.0), p("load", "load the original", load(h, orig_gb, mode)),
+                P { id: "measure", label: format!("{n} passes of {} texts (the high end counts a repeat with 256)", samples as u32), r: R { lo, hi, hist: pass.hist } },
+            ], None));
+        }
 
         if thinking && spec.think_gate {
             let k = (spec.think_gate_n as usize).min(plan.try_list.len());

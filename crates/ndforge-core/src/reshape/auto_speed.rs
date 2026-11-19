@@ -44,7 +44,7 @@ pub fn default_preset(total_b: f64) -> &'static str {
 }
 
 /// The AutoSpec fields the presets set (the speed knobs).
-pub const KNOBS: [&str; 12] = ["stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix"];
+pub const KNOBS: [&str; 13] = ["search_minutes", "stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix"];
 
 impl AutoSpec {
     /// The spec with the values of preset `id` on top of it (everything that is not a speed knob stays). "custom" only names the choice.
@@ -73,7 +73,8 @@ impl AutoSpec {
                 v.insert(k.into(), Value::Null);
             }
         }
-        KNOBS.iter().filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone()))).collect()
+        // how long the search for the best cut looks is not part of what makes a recipe: a legacy spec (no search) is still the recommended recipe
+        KNOBS.iter().filter(|k| **k != "search_minutes").filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone()))).collect()
     }
 
     /// The preset whose values the speed knobs have (the recommended recipe for a legacy spec), None when they are a mix: "Custom".

@@ -57,6 +57,49 @@ They are **rules of thumb chosen by the owner, not measurements**: nobody has me
 - Rust `reshape/runs.rs`: `TrySpec`, `try_job`, `try_plan`, `try_run`, `try_results`; `reshape/plan.rs`: `default_try_samples`. Window commands `reshape_try_plan`, `reshape_try_results`, `reshape_try_start` (events on `reshape-event` with `phase: "try"`; Stop is `reshape_stop`).
 - Page: `ui/app.js` (`tryCard` and the functions before `renderReshape`), smoke tests `ui/smoke/try.test.mjs`. In-app help: `crates/ndforge-core/help/reshape.md`.
 
+## The automatic search ("Find the best cut for me")
+
+The first option of the card. For a size (parameters, the size of the Q4_K_M file, a share to keep, or "the best trade-off") the program decides which cuts to measure, measures them in **one** model load and ranks them.
+
+**Where it lives.** It is a key of the same job: `reshape_try` with `want.search` (`reshapetry._search_loop`, no new job or event type, no contract change). The rounds are planned by `worker/ndforge_worker/reshapesearch.py` (pure Python: from the passes already measured and a context it says which passes come next, deterministically; a stop and a repeat goes on where it was). The ranking, the confidence, the confirmation and the thinking check are in `crates/ndforge-core/src/reshape/search.rs`. Every pass uses the ordinary pass keys (`d=3,7,11|w=10752`) in the ordinary `reshape_try.json`, so the passes are shared with the manual card and with Auto-cut, and a repeated search costs nothing for the passes it has.
+
+**The target.** The target size fixes how many blocks go together with which MLP width (`auto_plan::candidates`, inside the guardrails: the width-first floor and at most 4 blocks; Expert can allow more). What is unknown is *which* blocks. Trade-off mode looks at five sizes (90, 85, 80, 76 and 70 % of the parameters; not below 20 B for a model that thinks).
+
+**The rounds**, in the order that keeps the most useful answers when the time runs out:
+
+1. `singles`: the original and every block that may be cut, on its own (about 15 passes for 16 blocks).
+2. `width_refs`: the widths of the cuts, with no block removed.
+3. `sets_k`: for every number of blocks k of 2 or more: the six best sets by an additive prediction (the original plus the sum of the single increases, over the best k + 3 singles), the two best neighbouring runs by the same prediction and the program's own choice from the measurement. Only depth.
+4. `combined`: the best three sets of each k at the width that k's target size needs: the cuts that could really be made.
+5. `refine1`, `refine2`: around the best two cuts, one block swapped for one of the best unused singles; the six best predictions are measured.
+
+About 50 to 75 passes for a 27 B model. "Every neighbouring run too" (Expert) adds the older sweep. The finalists are the best three, kept diverse: at most two with the same number of blocks, and a set that differs from a better one by a single block gives way to the next.
+
+**The time.** One pass takes about 16 s for a 27 B in 4-bit (a guess until this computer has measured one; the plan line says "an estimate") plus loading once. Before every pass the worker checks that the elapsed time plus one more pass fits the minutes given (10, 20, 60 or your own number, 5 to 240); if not it stops with `stop_reason: "budget"` and everything measured is ranked. The other reasons are `done`, `stopped` (Stop keeps everything) and `max_passes` (at most 400). The plan line says how many passes fit ("40 fit the 20 minutes: rounds 1 to 2").
+
+**What you see.** While it runs: "Round 3 of 5 (sets of blocks) · pass 34 of about 72 · up to 9 min left", a bar and a table of the best ten cuts so far (blocks out, MLP, the change of the error with its colour band, whether the two halves of the text agree). At the end: the best cut, a reason in plain words, how sure the call is (**clear**; **a close call**: the best two differ by less than the larger of their noise, the noise being the difference of the two halves of the text; **uncertain**: the halves name different winners), guardrail flags, and:
+
+- *Use this cut in Auto-cut* (the cut is pinned on the Auto-cut card and Auto-cut does not search again),
+- *Cut it now* (fills the Make form with exactly these blocks and the width),
+- *Cut and heal it (Auto-cut, one stage)*.
+
+A close call is asked again with 128 samples (one load, a few passes at twice the length) when the first answer used fewer; the new numbers decide among those cuts. In trade-off mode the recommendation is the smallest size whose best cut raises the error by at most 10 % (the second colour edge) and stays inside the guardrails: a **rule of thumb**, labelled so.
+
+**The thinking check of the best two** (for a model that thinks; on by default when the disk allows, or by the button "Check the thinking of the top 2"): the program writes each of the two cuts, checks the original once and the cut, and deletes the cut again. One cut is on the disk at a time; nothing is kept. A stop in the middle continues with the cut that was written (`models/_search/<id>/search.json` keeps it as `pending`). When the check has run, `rank_thinking` decides between the two (the error breaks a tie); until it has run, the answer says "Thinking not checked".
+
+**What it can and cannot know.**
+
+- It measures the **text-prediction error on your own text** (with reasoning text when the model keeps thinking), with the cut imitated by hooks; the torch tests prove that equals the cut that is written. It does **not** measure the quality after healing.
+- For a model that thinks, **a low error does not prove it can still think.** In the owner's own run one cut had 16.9 % less error and closed its reasoning in 0.50 of the answers against 0.97. Only the thinking check decides, and a result without it says so.
+- With about 70 candidates the winner is partly luck (the winner's curse): the noise column, the halves check and the confirmation with more text show how close it is. A confident-looking first place can be a coin toss.
+- The estimates (time per pass, passes that fit) are estimates until this computer has measured them.
+
+**Auto-cut.** With `search_minutes` (the speed presets set it: Thorough 30, Balanced 20, Fast 10; none for a spec saved earlier) the step `try` is this search for the one target size (loss only), writes its best three cuts as the candidates of the thinking check before healing (`AutoState.try_cands`) and chooses the lowest error. With a pinned cut (`AutoSpec.cut`) there is no search and no thinking check before healing. With two stages the searched blocks are cut exactly when stage 1 takes out all of them; otherwise a later stage measures again on the healed model, as before.
+
+Code: `reshapesearch.py`, `reshapetry.py` (`_search_loop`, `search_summary`), `reshape/search.rs`, `runs.rs` (`TrySpec.search`), commands `reshape_search_plan`, `reshape_search_start`, `reshape_search_status`, `ui/app.js` (`trySearchBlock`). Tests: `worker/tests/test_reshapesearch.py`, `test_reshapetry_search.py`, `test_reshape_try_torch.py` (the search on a tiny model), `crates/ndforge-core/tests/search.rs`, `ui/smoke/try.test.mjs`.
+
+Not verified: the real time per pass and load on a 27 B; whether about 70 passes find a better cut than the 66-pass sweep of neighbouring runs; whether non-contiguous sets heal as well as neighbouring ones; how Quick and Full thinking checks agree on close calls.
+
 ## Tests
 
 - `worker/tests/test_reshape_try.py` (no torch): keys, windows, choices, the order of passes, bands, rows, stability, cheapest window, the analysis, the cache key and its reasons, results file, time estimate, and the plan job through the real worker entry point.

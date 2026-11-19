@@ -319,7 +319,12 @@ fn the_legacy_spec_is_the_thorough_recipe_and_plans_the_same() {
     let ins = qwen27();
     let legacy = spec(21.1);
     let thorough = legacy.with_preset("thorough").unwrap();
+    // the presets also say how long the search for the best cut looks (Thorough 30, Balanced 20, Fast 10 minutes); a legacy spec has none and Try first stays the classic one
+    assert_eq!([("thorough", Some(30)), ("balanced", Some(20)), ("fast", Some(10))].map(|(id, m)| (legacy.with_preset(id).unwrap().search_minutes, m)).iter().all(|(a, b)| a == b), true);
+    assert_eq!(legacy.search_minutes, None);
     assert_eq!(legacy.matching_preset().as_deref(), Some("thorough"));
+    assert_eq!(thorough.matching_preset().as_deref(), Some("thorough"));
+    let thorough = AutoSpec { search_minutes: None, ..thorough };
     let (a, b) = (plan(&ins, &legacy, Some(32.0), Some(900.0)), plan(&ins, &thorough, Some(32.0), Some(900.0)));
     assert!(a.ok, "{:?}", a.blockers);
     assert_eq!(a, b, "the plan of a legacy spec and of Thorough are the same");
@@ -400,4 +405,40 @@ fn the_shared_cache_pins_one_sequence_length_and_the_stage_heals_send_it() {
     assert!(shared.stages.iter().all(|s| s.teacher_load == "auto" && s.mode == "cache"));
     // one stage: nothing to share
     assert!(plan(&ins, &AutoSpec { share_teacher_cache: true, stages: 1, ..spec(21.1) }, Some(36.0), Some(2000.0)).stages.iter().all(|s| !s.seq_pinned));
+}
+
+#[test]
+fn the_search_minutes_and_a_chosen_cut_are_checked_and_a_chosen_cut_is_the_plans_choice() {
+    use ndforge_core::reshape::auto_plan::PinnedCut;
+    let ins = qwen27();
+    assert!(AutoSpec { search_minutes: Some(4), ..spec(21.1) }.validate().is_err());
+    assert!(AutoSpec { search_minutes: Some(241), ..spec(21.1) }.validate().is_err());
+    assert!(AutoSpec { search_minutes: Some(30), ..spec(21.1) }.validate().is_ok());
+    let none = PinnedCut { blocks: vec![], intermediate: None, loss: None, search_id: None, think: None };
+    assert!(AutoSpec { cut: Some(none), ..spec(21.1) }.validate().is_err());
+    let twice = PinnedCut { blocks: vec![3, 3], intermediate: Some(10752), loss: None, search_id: None, think: None };
+    assert!(AutoSpec { cut: Some(twice), ..spec(21.1) }.validate().is_err());
+    // a chosen cut that reaches the size is the chosen candidate, with no candidates to try
+    let free = plan(&ins, &spec(21.1), Some(32.0), Some(900.0)).chosen.unwrap();
+    let blocks: Vec<u32> = (0..free.blocks).map(|i| 3 + 2 * i).collect();
+    let pin = PinnedCut { blocks: blocks.clone(), intermediate: free.intermediate, loss: Some(2.0), search_id: Some("s".into()), think: None };
+    let p = plan(&ins, &AutoSpec { cut: Some(pin), ..spec(21.1) }, Some(32.0), Some(900.0));
+    assert!(p.ok, "{:?}", p.blockers);
+    assert!(p.try_list.is_empty());
+    assert_eq!((p.chosen.as_ref().unwrap().blocks, p.chosen.as_ref().unwrap().intermediate), (free.blocks, free.intermediate));
+    // one that does not: refused with the reason; the first and the last block are never cut
+    let wrong = PinnedCut { blocks: vec![2], intermediate: None, loss: None, search_id: None, think: None };
+    let bad = plan(&ins, &AutoSpec { cut: Some(wrong), ..spec(21.1) }, Some(32.0), Some(900.0));
+    assert!(!bad.ok && bad.blockers.iter().any(|b| b.contains("not 21.1 B")), "{:?}", bad.blockers);
+    let first = PinnedCut { blocks: vec![0], intermediate: free.intermediate, loss: None, search_id: None, think: None };
+    assert!(!plan(&ins, &AutoSpec { cut: Some(first), ..spec(21.1) }, Some(32.0), Some(900.0)).ok);
+    // the time estimate has no try step and no thinking gate for it
+    let t = plan(&ins, &AutoSpec { cut: Some(PinnedCut { blocks, intermediate: free.intermediate, loss: None, search_id: None, think: None }), ..spec(21.1) }, Some(32.0), Some(900.0)).time.unwrap();
+    assert!(!t.steps.iter().any(|s| s.id == "try" || s.id == "think_gate"));
+    // the search is one step with its own label and a time that follows the minutes
+    let s30 = plan(&ins, &AutoSpec { search_minutes: Some(30), ..spec(21.1) }, Some(32.0), Some(900.0)).time.unwrap();
+    let s10 = plan(&ins, &AutoSpec { search_minutes: Some(10), ..spec(21.1) }, Some(32.0), Some(900.0)).time.unwrap();
+    let step = |t: &ndforge_core::reshape::auto_plan::TimeEstimate| t.steps.iter().find(|s| s.id == "try").unwrap().clone();
+    assert_eq!(step(&s30).label, "Find the best cut");
+    assert!(step(&s30).minutes.1 > step(&s10).minutes.1 && step(&s30).minutes.1 <= 31.0);
 }

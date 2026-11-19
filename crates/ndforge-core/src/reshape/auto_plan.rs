@@ -120,13 +120,38 @@ pub struct AutoSpec {
     /// "I have at most this many hours": the planner drops the least harmful settings until the estimate fits (1 to 336); None = no limit
     #[serde(default)]
     pub max_hours: Option<f64>,
+    /// a desktop notification when a stage has been healed (and checked): "stage 1 of 2 healed, 48 %, about 14 h left"
+    #[serde(default = "yes")]
+    pub notify_stages: bool,
+    /// "Find the best cut" (reshape::search) for this many minutes instead of the classic Try first on the planner's own few cuts; None = the classic Try first (what runs saved before it did)
+    #[serde(default)]
+    pub search_minutes: Option<u32>,
+    /// a cut chosen earlier (Try first's search, "Use this cut in Auto-cut"): the run does not search or try again
+    #[serde(default)]
+    pub cut: Option<PinnedCut>,
+}
+
+/// A cut that the person chose before the run (from the search of the Try first card). The blocks are the exact set to take out; `loss` and `think` are what was measured.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinnedCut {
+    pub blocks: Vec<u32>,
+    /// the MLP width after the cut; None = unchanged
+    #[serde(default)]
+    pub intermediate: Option<u32>,
+    #[serde(default)]
+    pub loss: Option<f64>,
+    #[serde(default)]
+    pub search_id: Option<String>,
+    /// the thinking check of the cut when the search ran it: `{verdict, score, main, original}`
+    #[serde(default)]
+    pub think: Option<Value>,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None,
         }
     }
 
@@ -153,6 +178,17 @@ impl AutoSpec {
         if let Some(h) = self.max_hours {
             if !h.is_finite() || !(1.0..=336.0).contains(&h) {
                 return Err(Error::new("The time you have must be between 1 and 336 hours."));
+            }
+        }
+        if self.search_minutes.is_some_and(|m| !(5..=240).contains(&m)) {
+            return Err(Error::new("The search for the best cut takes 5 to 240 minutes."));
+        }
+        if let Some(c) = &self.cut {
+            let mut b = c.blocks.clone();
+            b.sort_unstable();
+            b.dedup();
+            if b.len() != c.blocks.len() || (c.blocks.is_empty() && c.intermediate.is_none()) {
+                return Err(Error::new("The chosen cut needs its blocks (each once) or a width."));
             }
         }
         if let Some(p) = &self.preset {
@@ -333,12 +369,30 @@ fn candidate(ins: &Inspect, blocks: u32, intermediate: Option<u32>, target_param
 /// The ways to reach `target_b`, best first: for every number of blocks, the MLP width that comes nearest (never thinner than `width_floor`); the ones on target before
 /// the others, fewer blocks before more (width first), then the nearer. A model that cannot be thinned gets block counts only.
 pub fn candidates(ins: &Inspect, target_b: f64) -> Vec<Candidate> {
+    candidates_from(ins, target_b, width_floor(ins))
+}
+
+/// `candidates` without the width-first floor: every width the model offers (the search's Expert option "beyond the floor"; such a cut is flagged by `beyond_guardrails`).
+pub fn candidates_free(ins: &Inspect, target_b: f64) -> Vec<Candidate> {
+    candidates_from(ins, target_b, widths(ins).first().copied())
+}
+
+/// One way to reach `target_b` with `blocks` removed and the MLP at `intermediate` (None: not thinned).
+pub fn candidate_at(ins: &Inspect, blocks: u32, intermediate: Option<u32>, target_b: f64) -> Candidate {
+    candidate(ins, blocks, intermediate, target_b * 1e9)
+}
+
+/// The most blocks the model allows to be removed.
+pub fn max_blocks(ins: &Inspect) -> u32 {
+    block_limit(ins)
+}
+
+fn candidates_from(ins: &Inspect, target_b: f64, floor: Option<u32>) -> Vec<Candidate> {
     if !ins.supported || ins.blocks == 0 {
         return Vec::new();
     }
     let target = target_b * 1e9;
     let hi = block_limit(ins);
-    let floor = width_floor(ins);
     let ws: Vec<u32> = match floor {
         Some(f) => widths(ins).into_iter().filter(|w| *w >= f).collect(),
         None => Vec::new(),
@@ -725,6 +779,25 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     out.candidates = candidates(ins, spec.target_b);
     out.try_list = try_list(&out.candidates, spec.allow_many_blocks);
     out.chosen = pick(&out.candidates, spec.allow_many_blocks);
+    // a cut the person chose before the run: it is the chosen one; nothing is tried or searched (the try step and the thinking gate are left out)
+    if let Some(c) = &spec.cut {
+        let pinned = candidate_at(ins, c.blocks.len() as u32, c.intermediate.or(full_width(ins)), spec.target_b);
+        if c.blocks.iter().any(|b| *b == 0 || *b + 1 >= ins.blocks) || c.blocks.len() as u32 > block_limit(ins) {
+            out.blockers.push("The chosen cut takes out a block that may not be cut (the first and the last stay, at most half of them go). Remove it from Auto-cut and choose again.".into());
+            return out;
+        }
+        if !pinned.on_target {
+            out.blockers.push(format!("The chosen cut makes a model of {:.1} B, not {:.1} B. Remove the chosen cut or change the size.", pinned.params_b, spec.target_b));
+            return out;
+        }
+        if pinned.needs_confirmation && !spec.allow_many_blocks {
+            out.blockers.push(format!("The chosen cut removes {} blocks; confirm that more than {MAX_BLOCKS_FREE} may go, or choose again.", pinned.blocks));
+            return out;
+        }
+        out.warnings.extend(beyond_guardrails(ins, pinned.blocks, pinned.intermediate).into_iter().map(|m| format!("The chosen cut goes beyond the safe limits: {m}")));
+        out.try_list = Vec::new();
+        out.chosen = Some(pinned);
+    }
     let Some(chosen) = out.chosen.clone() else {
         let gentle = out.candidates.iter().filter(|c| !c.needs_confirmation).map(|c| c.params_b).fold(f64::INFINITY, f64::min);
         let any_on_target = out.candidates.iter().any(|c| c.on_target);

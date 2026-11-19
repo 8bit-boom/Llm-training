@@ -332,6 +332,7 @@ def run_items(backend, main: list, control: list, settings: dict, should_stop=la
     by_id = {it["id"]: (it, True) for it in main} | {it["id"]: (it, False) for it in control}
     reqs = requests_for(main, control, settings)
     done: list = []
+    t0 = time.monotonic()
 
     def on_result(raw: dict) -> None:
         item, is_main = by_id[raw["id"]]
@@ -339,7 +340,8 @@ def run_items(backend, main: list, control: list, settings: dict, should_stop=la
         r["control"] = not is_main
         done.append(r)
         protocol.emit("think_item", id=r["id"], ok=r["ok"], closed=r["closed"], think_tokens=r["think_tokens"], control=r["control"])
-        protocol.progress("think", len(done) / max(1, len(reqs)), f"Question {len(done)} of {len(reqs)}")
+        protocol.progress("think", len(done) / max(1, len(reqs)), f"Question {len(done)} of {len(reqs)}",
+                          protocol.make_detail("questions", len(done), len(reqs), t0, rate_unit="questions/s"))
 
     backend.generate(reqs, settings, on_result, should_stop, job or {})
     return {"items": [r for r in done if not r["control"]], "control": [r for r in done if r["control"]], "stopped": len(done) < len(reqs)}

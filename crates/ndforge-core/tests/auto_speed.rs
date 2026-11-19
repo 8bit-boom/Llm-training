@@ -75,12 +75,13 @@ fn the_presets_get_faster_and_the_table_is_printed() {
     assert!(fa.1 < ba.1 && ba.1 < th.1 && fa.0 < ba.0 && ba.0 < th.0, "{fa:?} < {ba:?} < {th:?}");
     // Custom is "what you have": the current total
     let c = si.presets.iter().find(|p| p.id == "custom").unwrap().total_h.unwrap();
-    assert_eq!(c, th, "the legacy spec is the recipe");
-    assert_eq!(si.total_h, th);
+    // the preset also looks for the best cut for 30 minutes (the classic Try first takes a few minutes): the totals are close, not the same
+    assert!((c.0 - th.0).abs() < 0.5 && (c.1 - th.1).abs() < 0.5, "the legacy spec is the recipe with the classic Try first: {c:?} {th:?}");
+    assert_eq!(c, si.total_h);
     assert_eq!(si.current_preset.as_deref(), Some("thorough"));
     assert_eq!(si.default_preset, "balanced");
     // the thorough total is the plain estimate of the legacy spec
-    assert_eq!(th, run(&owner(), 32.0).1.total_h);
+    assert_eq!(c, run(&owner(), 32.0).1.total_h);
     // a retry is not in any total
     assert!(si.presets.iter().filter(|p| p.id != "fast" && p.id != "custom").all(|p| p.retry_h.is_some()));
     assert!(si.presets.iter().find(|p| p.id == "fast").unwrap().retry_h.is_none(), "Fast has no retry");

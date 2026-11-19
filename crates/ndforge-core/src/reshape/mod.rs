@@ -4,10 +4,12 @@
 pub mod auto;
 pub mod auto_fx;
 pub mod auto_plan;
+pub mod auto_progress;
 pub mod auto_report;
 pub mod auto_speed;
 pub mod auto_time;
 pub mod heal_source;
 pub mod plan;
 pub mod runs;
+pub mod search;
 pub mod thinkcheck;

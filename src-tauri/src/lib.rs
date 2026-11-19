@@ -934,6 +934,46 @@ fn reshape_try_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, 
     })
 }
 
+// ------------------------------------------------------------------------------------------------ the automatic best-cut search (docs/TRY_FIRST.md)
+
+/// The plan of a search for the model the Slim page shows (`inspect` is its description): the cuts that reach the target, the rounds, the passes and the time, what fits the budget.
+/// Runs no job.
+#[tauri::command(async)]
+fn reshape_search_plan(spec: Value, inspect: Value) -> Out<Value> {
+    let spec: ndforge_core::reshape::search::SearchSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let ins: ndforge_core::reshape::plan::Inspect = serde_json::from_value(inspect).map_err(|e| format!("The model's description is not valid: {e}"))?;
+    ndforge_core::reshape::search::plan(&ins, &spec, card_vram_gb(), &ndforge_core::timing::History::recent(60)).map(|p| serde_json::json!(p)).map_err(|e| e.to_string())
+}
+
+/// Runs a search (`resume`: the id of a stopped one). Events on "reshape-event" tagged {"phase": "search"}: the worker's (`try_pass` with the round, the time left and the best cut so far)
+/// and {"kind": "search", "status": "measuring" | "confirming" | "writing_cut"}; the end is {"kind": "done", "data": <search.json>}. Stop is `reshape_stop`; what was measured is kept.
+#[tauri::command]
+fn reshape_search_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value, resume: Option<String>) -> Out<()> {
+    let spec: ndforge_core::reshape::search::SearchSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let opts = JobOpts { phase: Some("search"), tag_events: true, awake: awake_if_set(), kind: "try", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| {
+        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), emit);
+        ndforge_core::reshape::search::run(&p, &mut fx, &spec, resume.as_deref()).map_err(|e| e.to_string())
+    })
+}
+
+/// The newest search of the project (`search.json`), or, for a search that was stopped before it finished, what it measured so far (`spec` and `inspect` as for the plan).
+#[tauri::command(async)]
+fn reshape_search_status(s: State<App>, spec: Option<Value>, inspect: Option<Value>) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let saved = ndforge_core::reshape::search::latest(&p);
+    let partial = match (spec, inspect) {
+        (Some(sp), Some(ins)) => {
+            let sp: ndforge_core::reshape::search::SearchSpec = serde_json::from_value(sp).map_err(|e| format!("The choice is not valid: {e}"))?;
+            let ins: ndforge_core::reshape::plan::Inspect = serde_json::from_value(ins).map_err(|e| format!("The model's description is not valid: {e}"))?;
+            ndforge_core::reshape::search::partial(&p, &sp, &ins, card_vram_gb()).ok()
+        }
+        _ => None,
+    };
+    Ok(serde_json::json!({"search": saved, "partial": partial}))
+}
+
 /// The thinking check (docs/THINKING_CHECK.md): what the result page shows for a made model (saved numbers of every model checked, the gates, the GGUF files of the exports).
 #[tauri::command(async)]
 fn think_check_results(s: State<App>, name: String) -> Out<Value> {
@@ -983,17 +1023,86 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
     let m = lock(&s);
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
+    let toasts = m.settings.notifications;
     drop(m);
+    // what the stage notifications need to know: the setting of the run (a continued run keeps its own) and whether it thinks
+    let (notify_stages, thinking) = match (&spec, &resume) {
+        (Some(sp), _) => (sp.notify_stages, sp.keep_thinking),
+        (None, Some(id)) => ndforge_core::reshape::auto::load(&ndforge_core::reshape::auto::run_dir(&p, id)).map(|st| (st.spec.notify_stages, st.spec.keep_thinking)).unwrap_or((true, true)),
+        _ => (true, true),
+    };
     let opts = JobOpts { phase: Some("auto"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "auto", ..JobOpts::new("reshape-event") };
+    let handle = app.clone();
     spawn_job(app, &tasks, opts, move |stop, emit| {
-        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), emit);
-        match (&resume, spec) {
+        let mut bar = AutoBar::new(&handle, toasts && notify_stages, thinking);
+        let mut wrapped = |v: Value| {
+            bar.see(&v);
+            emit(v);
+        };
+        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), &mut wrapped);
+        let r = match (&resume, spec) {
             (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
             (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
             _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
-        }
-        .map(|st| serde_json::json!(st)).map_err(|e| e.to_string())
+        };
+        drop(fx);
+        bar.reset();
+        r.map(|st| serde_json::json!(st)).map_err(|e| e.to_string())
     })
+}
+
+/// What an Auto-cut shows outside the page: the window title and the taskbar progress (Windows; the other systems ignore the bar), refreshed every 5 seconds, and the
+/// notification at the end of a stage. Both are put back when the run ends.
+struct AutoBar {
+    app: tauri::AppHandle,
+    title0: Option<String>,
+    last: Option<std::time::Instant>,
+    snap: Value,
+    notify: bool,
+    thinking: bool,
+    shown: bool,
+}
+
+impl AutoBar {
+    fn new(app: &tauri::AppHandle, notify: bool, thinking: bool) -> Self {
+        let title0 = app.get_webview_window("main").and_then(|w| w.title().ok());
+        AutoBar { app: app.clone(), title0, last: None, snap: Value::Null, notify, thinking, shown: false }
+    }
+
+    fn see(&mut self, v: &Value) {
+        use tauri::window::{ProgressBarState, ProgressBarStatus};
+        if v["kind"] == "auto_progress" {
+            self.snap = v.clone();
+            if self.last.map(|t| t.elapsed().as_secs() >= 5).unwrap_or(true) {
+                self.last = Some(std::time::Instant::now());
+                if let Some(w) = self.app.get_webview_window("main") {
+                    let _ = w.set_title(&ndforge_core::reshape::auto_progress::title_of(v));
+                    let _ = w.set_progress_bar(ProgressBarState { status: Some(ProgressBarStatus::Normal), progress: Some(v["pct"].as_f64().unwrap_or(0.0).clamp(0.0, 100.0).round() as u64) });
+                    self.shown = true;
+                }
+            }
+        } else if self.notify && v["kind"] == "auto" && v["status"] == "done" {
+            let id = v["auto_step"].as_str().unwrap_or("");
+            if let (Some(n), Some(of)) = (ndforge_core::notify::auto_stage_end(id, self.thinking), self.snap["stage"]["of"].as_u64()) {
+                if (n as u64) < of {
+                    let left = (self.snap["state"] == "live").then(|| self.snap["left_s"][0].as_f64().zip(self.snap["left_s"][1].as_f64()).map(|(a, b)| (a + b) / 120.0)).flatten();
+                    let (t, b) = ndforge_core::notify::stage_toast(n, of as u32, self.snap["pct"].as_f64().unwrap_or(0.0), left);
+                    Toast(self.app.clone()).show(&t, &b);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        use tauri::window::{ProgressBarState, ProgressBarStatus};
+        if !self.shown {
+            return;
+        }
+        if let Some(w) = self.app.get_webview_window("main") {
+            let _ = w.set_title(self.title0.as_deref().unwrap_or("ND Lore Forge"));
+            let _ = w.set_progress_bar(ProgressBarState { status: Some(ProgressBarStatus::None), progress: None });
+        }
+    }
 }
 
 /// Stop: the running job ends at its next safe point, the run keeps its state and can be continued.
@@ -1608,7 +1717,7 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

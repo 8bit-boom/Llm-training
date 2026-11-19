@@ -252,7 +252,8 @@ def gguf_with_llama_cpp(cfg, merged: Path, out: Path, quants, report: dict = Non
             if im and imatrix.stop_requested(im):
                 raise imatrix.Stopped()
             final = out / f"model-{quant}.gguf"
-            protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}")
+            protocol.progress("gguf", 0.5 + 0.4 * i / max(1, len(others)), f"Shrinking to {quant.upper()}",
+                              protocol.make_detail("files", i, len(others)))
             if quant in mixedquant.MIXED_IDS:
                 _make_mixed(cfg, quantize, f16, final, quant, matrix, report, im, mixed_report if mixed_report is not None else {})
                 files[quant] = final

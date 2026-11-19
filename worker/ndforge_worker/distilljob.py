@@ -675,6 +675,7 @@ def run_cache(cfg: dict) -> int:
     window_rows = max(WINDOW_ROWS, batch)
     t0 = last_log = time.monotonic()
     seen_tokens = 0
+    tokens_before = writer.tokens
     rows_before = writer.done_rows
     try:
         i = writer.done_rows
@@ -707,7 +708,8 @@ def run_cache(cfg: dict) -> int:
                     answers[j] = a
                     seen_tokens += len(window[j]["input_ids"])
                 pos += len(idx)
-                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}")
+                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}",
+                                  protocol.make_detail("tokens", min(tokens_before + seen_tokens, total_tokens), total_tokens, t0, rate_unit="tokens/s", done_at_start=tokens_before))
                 if time.monotonic() - last_log >= SPEED_LOG_EVERY:
                     last_log = time.monotonic()
                     protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far; this row: {len(window[idx[0]]['input_ids']):,} tokens)")
@@ -1208,11 +1210,13 @@ def merge(cfg: dict) -> int:
     fsutil.ensure_parent(final)
     out.mkdir(parents=True)
     last = [-1.0]
+    t_merge_start = time.monotonic()
 
     def on_progress(done, total):
         if total and (done / total - last[0] >= 0.01 or done == total):
             last[0] = done / total
-            protocol.progress("merge", done / total, f"Saving the healed model: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
+            protocol.progress("merge", done / total, f"Saving the healed model: {done / 1e9:.1f} of {total / 1e9:.1f} GB",
+                              protocol.make_detail("GB", done / 1e9, total / 1e9, t_merge_start, rate_unit="GB/s"))
 
     try:
         clock: dict = {}

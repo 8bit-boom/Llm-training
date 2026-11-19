@@ -459,11 +459,126 @@ def _config_and_dir(repo: str, download: bool):
     return json.loads((d / "config.json").read_text(encoding="utf-8")), d
 
 
+SEARCH_MAX_PASSES = 400
+SEARCH_MAX_GROUPS = 8
+SEARCH_ROWS_KEPT = 40
+SEARCH_BUDGET_MIN = (5, 240)
+
+
+def _search_wants_width(search) -> bool:
+    return isinstance(search, dict) and any(c.get("width") for g in search.get("groups") or () if isinstance(g, dict) for c in g.get("cuts") or () if isinstance(c, dict))
+
+
+def _search_context(search: dict, nb: int, pf: int, pl: int, strategy: str, matrix) -> dict:
+    """The request's `want.search` -> the context of the round planner (checked): the groups of target cuts, the budget in seconds and the block limits of the model."""
+    groups = search.get("groups")
+    if not isinstance(groups, list) or not groups or len(groups) > SEARCH_MAX_GROUPS:
+        raise ReshapeError(f"The search needs between 1 and {SEARCH_MAX_GROUPS} target sizes.")
+    movable = len(candidates(nb, pf, pl))
+    for g in groups:
+        cuts = g.get("cuts") if isinstance(g, dict) else None
+        if not isinstance(cuts, list) or not cuts:
+            raise ReshapeError("Every target size of the search needs at least one cut.")
+        for c in cuts:
+            if not isinstance(c, dict) or int(c.get("k", -1)) < 0 or int(c["k"]) > movable:
+                raise ReshapeError("A cut of the search takes out more blocks than may be cut.")
+    minutes = float(search.get("budget_min", 20))
+    if not SEARCH_BUDGET_MIN[0] <= minutes <= SEARCH_BUDGET_MIN[1]:
+        raise ReshapeError(f"The time for the search is {SEARCH_BUDGET_MIN[0]} to {SEARCH_BUDGET_MIN[1]} minutes.")
+    ctx = {k: v for k, v in search.items() if k not in ("budget_min",)}
+    ctx.update(nb=nb, pf=pf, pl=pl, strategy=strategy, matrix=matrix, budget_s=minutes * 60.0, groups=groups)
+    ctx["max_passes"] = min(int(search.get("max_passes", SEARCH_MAX_PASSES)), SEARCH_MAX_PASSES)
+    return ctx
+# what a pass costs before one was timed in this job: the measured seconds of the saved answers, else this guess (the same as the plan's)
+SEARCH_FALLBACK_SECONDS = 20.0
+
+
+def search_signature(ctx: dict) -> str:
+    """What the search's answers depend on besides the passes: the target groups and the sizes of the rounds. Another signature starts the rounds from the first."""
+    keep = {k: v for k, v in ctx.items() if k not in ("rounds", "budget_s", "budget_min", "matrix")}
+    return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _search_loop(data: dict, ctx: dict, run_pass, stop, clock, budget_s: float, on_pass, t0: float | None = None, max_passes: int = SEARCH_MAX_PASSES) -> dict:
+    """The adaptive search: ask the round planner for the next passes, measure them one by one, until it is done, the time is used, the person stops it or there are too many
+    passes. Pure apart from the callbacks: `run_pass(key)` returns the pass's result (raising `_Stopped` when the stop file appears), `clock()` is a steady clock in seconds,
+    `on_pass(info)` is told about every pass (the caller merges, saves and reports it). A pass that is cached costs nothing and is never asked for.
+    Before every pass: elapsed + the time of a pass must fit `budget_s`, else the search stops with "budget" (what was measured is kept). Returns
+    {"stop_reason": "done" | "stopped" | "budget" | "max_passes", "rounds": [...], "measured": n}."""
+    from . import reshapesearch
+    t0 = clock() if t0 is None else t0
+    sig = search_signature(ctx)
+    saved = data.get("search") or {}
+    rounds = [dict(r) for r in saved.get("rounds") or ()] if saved.get("sig") == sig else []
+    measured = 0
+    reason = "done"
+    while True:
+        r = reshapesearch.next_round(data["passes"], dict(ctx, rounds=rounds))
+        if r is None:
+            break
+        rec = next((x for x in rounds if x["name"] == r["name"]), None)
+        if rec is None:
+            rec = {"name": r["name"], "keys": r["all_keys"], "done": False}
+            rounds.append(rec)
+        interrupted = False
+        for key in r["keys"]:
+            if key in data["passes"]:
+                continue
+            if stop():
+                reason, interrupted = "stopped", True
+                break
+            if len(data["passes"]) >= max_passes:
+                reason, interrupted = "max_passes", True
+                break
+            spp = data.get("seconds_per_pass") or SEARCH_FALLBACK_SECONDS
+            elapsed = clock() - t0
+            if elapsed + spp > budget_s:
+                reason, interrupted = "budget", True
+                break
+            try:
+                res = run_pass(key)
+            except _Stopped:
+                reason, interrupted = "stopped", True
+                break
+            measured += 1
+            merge_pass(data, key, res)
+            data["search"] = {"sig": sig, "rounds": rounds, "stop_reason": None, "budget_s": budget_s}
+            on_pass({"key": key, "result": res, "round": r["name"], "round_label": r["label"], "planned_total": max(r["planned_total"], len(data["passes"])),
+                     "budget_left_s": max(0.0, budget_s - (clock() - t0)), "measured": measured, "round_index": [x["name"] for x in rounds].index(r["name"]) + 1})
+        if interrupted:
+            break
+        rec["done"] = True
+    data["search"] = {"sig": sig, "rounds": rounds, "stop_reason": reason, "budget_s": budget_s, "elapsed_s": round(clock() - t0, 1)}
+    return {"stop_reason": reason, "rounds": rounds, "measured": measured}
+
+
+def search_summary(data: dict, ctx: dict) -> dict:
+    """What `data["search"]` and the analysis say about the search: its rounds, why it ended, the ranking and the finalists of every group."""
+    from . import reshapesearch
+    s = dict(data.get("search") or {})
+    s["ranking"] = reshapesearch.ranking(data["passes"], ctx)
+    s["finalists"] = reshapesearch.finalists(data["passes"], ctx)
+    s["groups"] = [{"label": g.get("label"), "target_b": g.get("target_b")} for g in ctx.get("groups") or ()]
+    # the numbers of the best cuts of every group (the program ranks and explains them): loss and the two halves
+    keep = {k for keys in s["ranking"].values() for k in keys[:SEARCH_ROWS_KEPT]} | {k for keys in s["finalists"].values() for k in keys}
+    s["rows"] = {k: {"loss": data["passes"][k]["loss"], "loss_h1": data["passes"][k].get("loss_h1"), "loss_h2": data["passes"][k].get("loss_h2")} for k in sorted(keep) if k in data["passes"]}
+    s["rounds"] = [{"name": r["name"], "keys": r["keys"], "done": r.get("done", False)} for r in s.get("rounds") or ()]
+    return s
+
+
+def _best_so_far(passes: dict, ctx: dict):
+    """(key, loss) of the best measured cut of the first group, or None."""
+    from . import reshapesearch
+    rk = reshapesearch.ranking(passes, ctx).get("0") or []
+    return (rk[0], passes[rk[0]]["loss"]) if rk else None
+
+
 def run_try(cfg: dict) -> int:
     """job reshape_try (see the top of this file). The result: {"analysis", "passes_total", "passes_done", "stopped", "seconds_per_pass", "load", "tokens", "dir"}; with
     cfg["plan_only"] only the number of passes and the time they will take (no model is loaded, no torch is needed)."""
     from . import reshapejob
     protocol.reserve_stdout()
+    t_job0 = time.monotonic()
     repo = cfg["source"]["repo"]
     plan_only = bool(cfg.get("plan_only"))
     config, src_dir = _config_and_dir(repo, not plan_only)
@@ -480,7 +595,7 @@ def run_try(cfg: dict) -> int:
     dims = None if why else reshape_width.width_dims(config)
     divisor = int(cfg.get("ffn_divisor", reshape_width.FFN_DIVISOR))
     want = cfg.get("want") or {}
-    wants_width = bool(want.get("widths")) or any(c.get("width") for c in want.get("choices") or ())
+    wants_width = bool(want.get("widths")) or any(c.get("width") for c in want.get("choices") or ()) or _search_wants_width(want.get("search"))
     if wants_width and why:
         raise ReshapeError(why)
     calib = cfg.get("calibration") or {}
@@ -495,6 +610,10 @@ def run_try(cfg: dict) -> int:
         raise ReshapeError("Trying a width needs the measurement of the neurons. Measure the model first.")
     matrix = (meas["meta"].get("matrix") or None) if meas else None
     keys = expand_want(want, nb, pf, pl, strategy, matrix, dims, divisor)
+    search = want.get("search") if isinstance(want.get("search"), dict) else None
+    sctx = None
+    if search is not None:
+        sctx = _search_context(search, nb, pf, pl, strategy, matrix)
     folder = Path(cfg["out_dir"])
     if cfg.get("force") and (folder / TRY_FILE).is_file():
         (folder / TRY_FILE).unlink()
@@ -502,7 +621,9 @@ def run_try(cfg: dict) -> int:
     data = read_results(folder, key if src_dir else None, protocol.log) if src_dir else None
     if data is None:
         data = empty_results(key)
-    todo = [k for k in keys if k not in data["passes"]]
+    # the search measures the original in its own first round: the plain list leaves it out, so every pass of a search carries its round
+    own = (lambda ks: [k for k in ks if k != BASE_KEY]) if sctx is not None and not (want.get("blocks") or want.get("runs") or want.get("widths") or want.get("choices")) else (lambda ks: list(ks))
+    todo = own([k for k in keys if k not in data["passes"]])
     mm = meas["meta"] if meas else {}
     known, known_tokens = data["seconds_per_pass"], data["tokens"]
     if known is None and mm.get("seconds_per_pass"):
@@ -511,19 +632,35 @@ def run_try(cfg: dict) -> int:
     est = estimate(len(todo), known, tokens, known_tokens, float(cfg.get("params_b") or 10.0), cfg.get("load", "auto"),
                    int(calib.get("samples", 64)) * min(int(calib.get("max_len", 512)), GUESS_TOKENS_PER_SAMPLE))
     plan = {"passes_total": len(keys), "passes_cached": len(keys) - len(todo), "passes_todo": len(todo), "needs_measurement": needs_measurement, **est}
+    if sctx is not None:
+        from . import reshapesearch
+        rounds_plan = reshapesearch.round_plan(data["passes"], sctx)
+        load_s = float(sctx.get("load_s") or 0.0)
+        plan["search"] = {"rounds": rounds_plan, "planned_total": reshapesearch.planned_total(data["passes"], sctx), "passes_cached": len(data["passes"]), "budget_s": sctx["budget_s"],
+                          "load_s": load_s, "affordable": reshapesearch.affordable(rounds_plan, est["seconds_per_pass"], sctx["budget_s"], load_s)}
     if plan_only:
         protocol.result(plan)
         return 0
 
     def finish(stopped: bool) -> int:
         data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+        if sctx is not None:
+            data["analysis"]["search"] = search_summary(data, sctx)
         write_results(folder, data)
         protocol.progress("try", 1.0, "")
-        protocol.result({"analysis": data["analysis"], "passes_total": len(keys), "passes_done": len(keys) - len([k for k in keys if k not in data["passes"]]),
-                         "stopped": stopped, "seconds_per_pass": data["seconds_per_pass"], "load": data["load_used"], "tokens": data["tokens"], "dir": str(folder)})
+        out = {"analysis": data["analysis"], "passes_total": len(keys), "passes_done": len(keys) - len([k for k in keys if k not in data["passes"]]),
+               "stopped": stopped, "seconds_per_pass": data["seconds_per_pass"], "load": data["load_used"], "tokens": data["tokens"], "dir": str(folder)}
+        if sctx is not None:
+            out["stop_reason"] = (data.get("search") or {}).get("stop_reason") or ("stopped" if stopped else "done")
+        protocol.result(out)
         return 0
 
-    if not todo:
+    def search_pending() -> bool:
+        from . import reshapesearch
+        saved = (data.get("search") or {}) if data.get("search", {}).get("sig") == search_signature(sctx) else {}
+        return reshapesearch.next_round(data["passes"], dict(sctx, rounds=saved.get("rounds") or [])) is not None
+
+    if not todo and not (sctx is not None and search_pending()):
         protocol.log("Every answer is already saved; nothing is run.")
         return finish(False)
     reshapejob._require_torch()
@@ -535,7 +672,7 @@ def run_try(cfg: dict) -> int:
     if data["load_used"] not in (None, mode):
         protocol.log(f"The earlier answers were made with the model loaded as {data['load_used']}; they are computed again as {mode}.")
         data = empty_results(key)
-        todo = list(keys)
+        todo = own(keys)
     stop_file = folder.parent / "STOP"
     stop = stop_file.exists
     from transformers import AutoTokenizer
@@ -553,36 +690,63 @@ def run_try(cfg: dict) -> int:
     mlp = meas["mlp"] if meas else None
     size = dims["intermediate"] if dims else 0
     stopped = False
+    t_pass0 = time.monotonic()
+    state = {"batches": batches, "model": model, "layers": layers}
+
+    def run_pass(k):
+        """One pass; a graphics card that runs out of memory is asked again with one text at a time."""
+        try:
+            try:
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+            except RuntimeError as exc:
+                if not reshapejob._is_oom(exc):
+                    raise
+                protocol.log("Out of memory; trying again with one text at a time.")
+                reshapejob._free()
+                state["batches"] = reshapejob._split_single(state["batches"])
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+        except RuntimeError as exc:
+            if reshapejob._is_oom(exc):
+                raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
+            raise
+
+    def on_search_pass(info: dict) -> None:
+        res = info["result"]
+        protocol.timing("try_pass", res["seconds"], key=info["key"], tokens=data["tokens"])
+        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+        data["analysis"]["search"] = search_summary(data, sctx)
+        write_results(folder, data)
+        best = _best_so_far(data["passes"], sctx)
+        done, total = len(data["passes"]), max(info["planned_total"], len(data["passes"]))
+        protocol.progress("try", min(done / total, 0.999), f"Round {info['round_index']} ({info['round_label']}): pass {done} of about {total}: {describe_key(info['key'])}",
+                          protocol.make_detail("passes", done, total, t_pass0, rate_unit="passes/s", done_at_start=done - info["measured"]))
+        protocol.emit("try_pass", key=info["key"], loss=res["loss"], seconds=res["seconds"], done=done, total=total, seconds_per_pass=data["seconds_per_pass"], analysis=data["analysis"],
+                      round=info["round"], round_label=info["round_label"], round_index=info["round_index"], planned_total=total, budget_left_s=round(info["budget_left_s"], 1),
+                      best={"key": best[0], "loss": best[1]} if best else None)
+
     try:
         for i, k in enumerate(todo):
             if stop():
                 stopped = True
                 break
-            protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}")
+            protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}", protocol.make_detail("passes", i, len(todo), t_pass0, rate_unit="passes/s"))
             try:
-                try:
-                    res = _one_pass(model, layers, batches, period, k, mlp, size, stop)
-                except RuntimeError as exc:
-                    if not reshapejob._is_oom(exc):
-                        raise
-                    protocol.log("Out of memory; trying again with one text at a time.")
-                    reshapejob._free()
-                    batches = reshapejob._split_single(batches)
-                    res = _one_pass(model, layers, batches, period, k, mlp, size, stop)
+                res = run_pass(k)
             except _Stopped:
                 stopped = True
                 break
-            except RuntimeError as exc:
-                if reshapejob._is_oom(exc):
-                    raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
-                raise
             protocol.timing("try_pass", res["seconds"], key=k, tokens=data["tokens"])
             merge_pass(data, k, res)
             data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
             write_results(folder, data)
             protocol.emit("try_pass", key=k, loss=res["loss"], seconds=res["seconds"], done=i + 1, total=len(todo), seconds_per_pass=data["seconds_per_pass"],
                           analysis=data["analysis"])
+        if sctx is not None and not stopped:
+            outcome = _search_loop(data, sctx, run_pass, stop, time.monotonic, sctx["budget_s"], on_search_pass, t0=t_job0, max_passes=sctx["max_passes"])
+            stopped = outcome["stop_reason"] == "stopped"
+            protocol.log(f"The search ended: {outcome['stop_reason']} after {outcome['measured']} new cuts.")
     finally:
+        state.clear()
         del layers
         del model
         reshapejob._free()
