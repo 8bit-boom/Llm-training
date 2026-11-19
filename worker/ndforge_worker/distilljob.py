@@ -271,6 +271,32 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
     return rows, stats
 
 
+def _cycle(rows: list, idx: list, want: int, rng, block: int) -> list[int]:
+    """Row indices from `idx` (cycled in a fresh shuffled order, shuffled in blocks) until their tokens reach `want`."""
+    chosen: list[int] = []
+    got = 0
+    while idx and got < want:
+        blocks = [idx[a:a + block] for a in range(0, len(idx), block)]
+        rng.shuffle(blocks)
+        for b in blocks:
+            b = list(b)
+            rng.shuffle(b)
+            for i in b:
+                if got >= want:
+                    break
+                chosen.append(i)
+                got += len(rows[i]["input_ids"])
+    return chosen
+
+
+def _interleave(chosen: list[int], seed: int, block: int) -> list[int]:
+    """the two kinds are interleaved by block so that every stretch of the run has both"""
+    rng2 = random.Random(seed + 1)
+    chunks = [chosen[a:a + block] for a in range(0, len(chosen), block)]
+    rng2.shuffle(chunks)
+    return [i for c in chunks for i in c]
+
+
 def training_order(rows: list, tokens: int, general_share: float, seed: int = 3407, block: int = 64) -> list[int]:
     """Row indices (repeated as needed) for a run of about `tokens` tokens: the share `general_share` of them from the rows with source "general", the rest
     from "project" rows, each group cycled through in a fresh shuffled order. Locality: the order is shuffled in blocks of `block` consecutive rows, so
@@ -285,23 +311,55 @@ def training_order(rows: list, tokens: int, general_share: float, seed: int = 34
     rng = random.Random(seed)
     chosen: list[int] = []
     for kind in ("project", "general"):
-        idx, want, got = by[kind], int(tokens * share[kind]), 0
-        while idx and got < want:
-            blocks = [idx[a:a + block] for a in range(0, len(idx), block)]
-            rng.shuffle(blocks)
-            for b in blocks:
-                b = list(b)
-                rng.shuffle(b)
-                for i in b:
-                    if got >= want:
-                        break
-                    chosen.append(i)
-                    got += len(rows[i]["input_ids"])
-    # the two kinds are interleaved by block so that every stretch of the run has both
-    rng2 = random.Random(seed + 1)
-    chunks = [chosen[a:a + block] for a in range(0, len(chosen), block)]
-    rng2.shuffle(chunks)
-    return [i for c in chunks for i in c]
+        chosen += _cycle(rows, by[kind], int(tokens * share[kind]), rng, block)
+    return _interleave(chosen, seed, block)
+
+
+# ------------------------------------------------------------------------------------------------------------ healing in rounds
+# One heal is trained in rounds (docs/HEAL_ROUNDS.md): each round learns from all project rows (cycled as in a normal run) and the general rows the teacher answered FOR THIS
+# ROUND (rows general_from .. general_to-1 of the run's row list), so no general row is repeated across rounds. The optimizer and the scheduler position go on from round
+# to round; the learning rate of a round has its own warm-up, plateau and cool-down, so that every round ends with an annealed adapter that can be checked.
+
+DEFAULT_ROUND_SCHEDULE = {"v": 1, "gamma": 0.85, "floor": 0.35, "cooldown": 0.2, "min_ratio": 0.05, "rewarm_share": 0.1, "rewarm_max": 10}
+
+
+def round_lr_factor(step: int, s_start: int, steps: int, index: int, warmup: int, sch: dict) -> float:
+    """The learning-rate factor (times the base rate) at global optimizer step `step` for round `index` (1, 2, ...), which has `steps` steps and starts at global step
+    `s_start`. Round 1 warms up from 0 (over the job's warm-up, at most a quarter of the round); a later round re-warms from `min_ratio` x its peak over `rewarm_share`
+    of the round (at most `rewarm_max` steps). The peak falls by `gamma` per round down to `floor`. The last `cooldown` share of every round decays as 1 - sqrt(u) to
+    `min_ratio` x the peak. Pure (no torch): the trainer wraps it in a LambdaLR."""
+    t = min(max(int(step) - int(s_start), 0), max(int(steps) - 1, 0))
+    peak = max(sch["floor"], sch["gamma"] ** (index - 1))
+    if index == 1:
+        w, lo = min(int(warmup), math.ceil(0.25 * steps)), 0.0
+    else:
+        w, lo = min(sch["rewarm_max"], math.ceil(sch["rewarm_share"] * steps)), sch["min_ratio"] * peak
+    w = max(w, 1)
+    c = max(1, math.ceil(sch["cooldown"] * steps))
+    if t < w:
+        return lo + (peak - lo) * (t + 1) / w
+    if t >= steps - c:
+        u = (t - (steps - c) + 1) / c
+        return peak * (sch["min_ratio"] + (1 - sch["min_ratio"]) * (1 - math.sqrt(min(u, 1.0))))
+    return peak
+
+
+def round_order(rows: list, general_from: int, general_to: int, round_tokens: int, general_share: float, seed: int, block: int = 64) -> list[int]:
+    """The row indices of one round: every project row (cycled in a fresh shuffled order, as in training_order) and the general rows `general_from` .. `general_to - 1`
+    (each once, never more than they hold), about `round_tokens` tokens in all, the general part at most `general_share` of them. Interleaved in blocks like training_order."""
+    proj = [i for i, r in enumerate(rows) if r.get("source") != "general"]
+    gen = [i for i in range(max(0, general_from), min(general_to, len(rows))) if rows[i].get("source") == "general"]
+    gen_tokens = sum(len(rows[i]["input_ids"]) for i in gen)
+    want_g = min(int(round_tokens * general_share), gen_tokens) if proj else min(round_tokens, gen_tokens)
+    want_p = round_tokens - want_g if proj else 0
+    rng = random.Random(seed)
+    chosen = _cycle(rows, proj, want_p, rng, block) + _cycle(rows, gen, want_g, rng, block)
+    return _interleave(chosen, seed, block)
+
+
+def round_slice(order: list, steps_done: int, per_step: int) -> list:
+    """What is left of a round's order after `steps_done` optimizer steps of `per_step` rows: a crash in the middle of a round continues exactly here."""
+    return list(order[max(0, int(steps_done)) * max(1, int(per_step)):])
 
 
 # ============================================================================================================ the cache
