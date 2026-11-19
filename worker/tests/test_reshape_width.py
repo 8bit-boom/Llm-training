@@ -628,6 +628,9 @@ def test_a_width_cut_removes_the_multi_token_head_and_says_so(tmp_path):
     d = fake_dims()
     assert g["mtp"] == 0 and g["total"] == r["params_after"] == rw.params_for(d, fake_types(), {"intermediate": 20, "lin_v_heads": 4, "heads": 4}, g["vision"], g["other"] - d["hidden"])
     assert imatrix.folder_has_mtp(final) is False
+    bd = r["params_breakdown"]
+    assert bd["total"] == r["params_after"] == bd["text_layers"] + bd["embeddings"] + bd["output"] + bd["vision"] + bd["mtp"] + bd["other"]
+    assert bd["mtp"] == 0 and bd["mtp_removed"] == removed and bd["text_layers"] > 0
 
 
 def test_a_depth_only_cut_keeps_the_head_with_a_note(tmp_path):
@@ -642,6 +645,10 @@ def test_a_depth_only_cut_keeps_the_head_with_a_note(tmp_path):
     assert any(k.startswith("mtp.") for k in st.list_tensors(final))
     assert any("kept unchanged" in n and "speculative decoding accepts fewer tokens" in n for n in ev[-1]["data"]["notes"])
     assert imatrix.folder_has_mtp(final) is True
+    r = ev[-1]["data"]
+    bd = r["params_breakdown"]
+    assert bd["total"] == r["params_after"] and bd["mtp"] > 0 and bd["mtp_removed"] == 0
+    assert bd["text_layers"] + bd["embeddings"] + bd["output"] + bd["vision"] + bd["mtp"] + bd["other"] == bd["total"]
 
 
 def test_keep_mtp_restores_the_old_slicing(tmp_path):

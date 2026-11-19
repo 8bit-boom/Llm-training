@@ -934,3 +934,20 @@ test("the Heal card shows what the rows cover and the advice when reasoning rows
   b.run("rs.hl.opts.heal = { status: 'stopped' }");
   assert.doesNotMatch(b.run("renderReshape()"), /id="hl-coverage"/);
 });
+
+test("the size lines and a made model say where the parameters are", () => {
+  const b = browser();
+  const bd = { text_layers: 19.0e9, embeddings: 1.27e9, output: 1.27e9, vision: 0.46e9, mtp: 0, other: 0.0001e9, total: 21.9e9, mtp_removed: 0.3e9 };
+  assert.equal(b.run(`breakdownLine(${JSON.stringify(bd)})`), "text layers 19.00 B · embeddings 1.27 B · output 1.27 B · vision 0.46 B · multi-token head removed 0.30 B · other 0.00 B · file total 21.90 B");
+  assert.equal(b.run("breakdownLine(null)"), "");
+  open(b, pageState());
+  b.run(`rs.options.options = rs.options.options.map((o) => ({ ...o, breakdown: ${JSON.stringify(bd)} }))`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="rs-breakdown">text layers 19.00 B · embeddings 1.27 B/);
+  const m = thinModel();
+  m.summary.params_breakdown = bd;
+  open(b, pageState({ made: [m] }));
+  assert.match(b.run("renderReshape()"), /id="rs-made-breakdown">text layers 19.00 B .* file total 21.90 B/);
+  open(b, pageState({ made: [thinModel()] }));
+  assert.doesNotMatch(b.run("renderReshape()"), /rs-made-breakdown/);
+});

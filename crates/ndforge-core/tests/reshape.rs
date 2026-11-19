@@ -216,6 +216,39 @@ fn width_parameter_counts_equal_the_workers_table() {
         let w = WidthSizes { intermediate: c["width"]["intermediate"].as_u64().unwrap() as u32, lin_v_heads: c["width"]["lin_v_heads"].as_u64().unwrap() as u32, heads: c["width"]["heads"].as_u64().unwrap() as u32 };
         let got = width_params_dims(&d, c["n_lin"].as_u64().unwrap(), c["n_full"].as_u64().unwrap(), &w, c["vision"].as_u64().unwrap(), c["other"].as_u64().unwrap());
         assert_eq!(got, c["params"].as_u64().unwrap(), "{}", c["name"]);
+        // the parts add up to the same total, whatever the case
+        let b = width_breakdown_dims(&d, c["n_lin"].as_u64().unwrap(), c["n_full"].as_u64().unwrap(), &w, c["vision"].as_u64().unwrap(), c["other"].as_u64().unwrap());
+        assert_eq!(b.total, got, "{}", c["name"]);
+        assert_eq!(b.text_layers + b.embeddings + b.output + b.vision + b.mtp + b.other, b.total, "{}", c["name"]);
+        assert_eq!(b.vision, c["vision"].as_u64().unwrap());
+        assert_eq!(b.mtp_removed > 0, w.intermediate != d.intermediate || w.heads != d.heads, "the head goes with a thinner MLP or fewer heads: {}", c["name"]);
+    }
+}
+
+#[test]
+fn the_breakdown_of_every_size_option_adds_up_and_names_the_multi_token_head() {
+    let ins = qwen27();
+    for blocks in [0, 1, 2] {
+        for o in width_options(&ins, blocks, None, None, None) {
+            let b = o.breakdown.as_ref().expect("a width option has its parts");
+            assert!(((b.total as f64 / 1e9 * 100.0).round() / 100.0 - o.params_b).abs() < 1e-9, "{o:?}");
+            assert_eq!(b.text_layers + b.embeddings + b.output + b.vision + b.mtp + b.other, b.total);
+            if o.intermediate != Some(17408) {
+                assert_eq!((b.mtp, b.mtp_removed > 0), (0, true), "a thinner MLP removes the multi-token head");
+            }
+        }
+    }
+    // the document's numbers: at 9,728 the text model is about 19.35 B and with the vision tower 19.81 B
+    let b = width_options(&ins, 0, None, None, None).into_iter().find(|o| o.intermediate == Some(9728)).unwrap().breakdown.unwrap();
+    assert_eq!(((b.total - b.vision) as f64 / 1e9 * 100.0).round() / 100.0, 19.35);
+    assert_eq!((b.total as f64 / 1e9 * 100.0).round() / 100.0, 19.81);
+    assert!(b.line().contains("vision 0.46 B") && b.line().contains("multi-token head removed") && b.line().contains("file total 19.81 B"), "{}", b.line());
+    // the old model has no breakdown in its option JSON until it is asked for, and layer options carry one that adds up
+    for o in options(&big(), Mode::Prune, None) {
+        let b = o.breakdown.expect("a layer option has its parts");
+        assert_eq!(b.total, params_after(&big(), Mode::Prune, o.blocks));
+        assert_eq!(b.text_layers + b.embeddings + b.output + b.vision + b.mtp + b.other, b.total);
+        assert_eq!(b.mtp_removed, 0);
     }
 }
 

@@ -268,6 +268,44 @@ pub fn shape_of(spec: &ReshapeSpec) -> Shape {
     }
 }
 
+/// Where the parameters of a model are: the decoder layers of the text model, the input embeddings, the output layer (0 when it is tied to the embeddings), the vision tower, the
+/// multi-token head, and the rest (final norm and small things). `total` is the sum and equals `params_after` / `width_params`; `mtp_removed` is what a cut took out with the
+/// multi-token head (not part of `total`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParamsBreakdown {
+    pub text_layers: u64,
+    pub embeddings: u64,
+    pub output: u64,
+    pub vision: u64,
+    pub mtp: u64,
+    pub other: u64,
+    pub total: u64,
+    pub mtp_removed: u64,
+}
+
+impl ParamsBreakdown {
+    /// The one line of the page: "text layers 19.0 B · embeddings 1.3 B · ...".
+    pub fn line(&self) -> String {
+        let b = |x: u64| format!("{:.2} B", x as f64 / 1e9);
+        let mut parts = vec![format!("text layers {}", b(self.text_layers)), format!("embeddings {}", b(self.embeddings))];
+        if self.output > 0 {
+            parts.push(format!("output {}", b(self.output)));
+        }
+        if self.vision > 0 {
+            parts.push(format!("vision {}", b(self.vision)));
+        }
+        if self.mtp > 0 {
+            parts.push(format!("multi-token head {}", b(self.mtp)));
+        }
+        if self.mtp_removed > 0 {
+            parts.push(format!("multi-token head removed {}", b(self.mtp_removed)));
+        }
+        parts.push(format!("other {}", b(self.other)));
+        format!("{} · file total {}", parts.join(" · "), b(self.total))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SizeOption {
     pub blocks: u32,
@@ -282,6 +320,9 @@ pub struct SizeOption {
     pub intermediate: Option<u32>,
     /// the size is known exactly before anything is measured (width: from the dimensions; layers: the layers are all alike, so also; "about" is for odd models)
     pub exact: bool,
+    /// where the parameters are (additive; absent when the model's parts are not known)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<ParamsBreakdown>,
 }
 
 /// (min, max) blocks that can be dropped / added; max is 0 when nothing is feasible. Same rule as `reshape.limits` in the worker.
@@ -349,7 +390,7 @@ pub fn options(ins: &Inspect, mode: Mode, vram_gb: Option<f64>) -> Vec<SizeOptio
             blocks, layers: layers_after(ins, mode, blocks), params_b: (params_b * 100.0).round() / 100.0,
             disk_gb: ((params as f64 * bytes_per_param(ins)) / 1e9 * 10.0).round() / 10.0,
             vram_lora_gb: lora, vram_qlora_gb: qlora, fits_lora: vram_gb.map(|v| lora <= v), fits_qlora: vram_gb.map(|v| qlora <= v),
-            intermediate: None, exact: mode == Mode::Grow,
+            intermediate: None, exact: mode == Mode::Grow, breakdown: depth_breakdown(ins, mode, blocks),
         }
     }).collect()
 }
@@ -534,6 +575,11 @@ pub fn resolve_width(d: &WidthDims, w: &Width) -> WidthSizes {
 /// embeddings + output layer + final norm + multi-token head (not counted when the cut thins the MLP or the attention heads) + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
 /// `worker/tests/data/width_params.json` is read by both test suites.
 pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> u64 {
+    width_breakdown_dims(d, n_lin, n_full, w, vision, other).total
+}
+
+/// The same count as `width_params_dims`, in its parts (the sum of the parts is the total, by construction).
+pub fn width_breakdown_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> ParamsBreakdown {
     let (h, hd, kv) = (d.hidden as u64, d.head_dim as u64, d.kv_heads as u64);
     let (i, nh) = (w.intermediate as u64, w.heads as u64);
     let (nk, nv, dk, dv) = (d.lin_k_heads as u64, w.lin_v_heads as u64, d.lin_k_dim as u64, d.lin_v_dim as u64);
@@ -544,9 +590,34 @@ pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes,
     let att = h * nh * hd * 2 + 2 * h * kv * hd + nh * hd * h + 2 * hd;
     let layers = n_lin * (gdn + mlp + norms) + n_full * (att + mlp + norms);
     // a cut that thins the MLP or the attention heads removes the multi-token head (the mirror of `mtp_removed` in the worker)
-    let mtp = if w.intermediate != d.intermediate || w.heads != d.heads { 0 } else { d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h) };
+    let mtp_full = d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h);
+    let removed = w.intermediate != d.intermediate || w.heads != d.heads;
+    let mtp = if removed { 0 } else { mtp_full };
     let head = if d.tied { 0 } else { d.vocab as u64 * h };
-    layers + d.vocab as u64 * h + head + h + mtp + vision + other
+    let embeddings = d.vocab as u64 * h;
+    let rest = h + other;
+    ParamsBreakdown { text_layers: layers, embeddings, output: head, vision, mtp, other: rest, total: layers + embeddings + head + rest + mtp + vision,
+                      mtp_removed: if removed { mtp_full } else { 0 } }
+}
+
+/// The breakdown of a thinned model with the layers `layers_kept` (see `width_params`); None when the model cannot be thinned.
+pub fn width_breakdown(ins: &Inspect, layers_kept: &[usize], w: &Width) -> Option<ParamsBreakdown> {
+    let d = ins.width_dims.as_ref()?;
+    let n_full = layers_kept.iter().filter(|i| layer_is_full(ins, **i)).count() as u64;
+    let n_lin = layers_kept.len() as u64 - n_full;
+    Some(width_breakdown_dims(d, n_lin, n_full, &resolve_width(d, w), ins.vision_params, ins.other_params.saturating_sub(d.hidden as u64)))
+}
+
+/// The breakdown of a model with whole blocks removed or added (`params_after`): the layers are what is left after the other parts, so the parts add up to the total. None when
+/// the inspection does not know the other parts (their sum is more than the total).
+pub fn depth_breakdown(ins: &Inspect, mode: Mode, blocks: u32) -> Option<ParamsBreakdown> {
+    let total = params_after(ins, mode, blocks);
+    let fixed = ins.embed_params + ins.lm_head_params + ins.vision_params + ins.mtp_params + ins.other_params;
+    if fixed > total {
+        return None;
+    }
+    Some(ParamsBreakdown { text_layers: total - fixed, embeddings: ins.embed_params, output: ins.lm_head_params, vision: ins.vision_params, mtp: ins.mtp_params, other: ins.other_params,
+                           total, mtp_removed: 0 })
 }
 
 fn layer_is_full(ins: &Inspect, i: usize) -> bool {
@@ -565,10 +636,7 @@ pub fn kept_layers(ins: &Inspect, blocks: u32) -> Vec<usize> {
 
 /// Exact parameters of the model after thinning, with the layers `layers_kept` (indices into the original) left. 0 when the model cannot be thinned.
 pub fn width_params(ins: &Inspect, layers_kept: &[usize], w: &Width) -> u64 {
-    let Some(d) = &ins.width_dims else { return 0 };
-    let n_full = layers_kept.iter().filter(|i| layer_is_full(ins, **i)).count() as u64;
-    let n_lin = layers_kept.len() as u64 - n_full;
-    width_params_dims(d, n_lin, n_full, &resolve_width(d, w), ins.vision_params, ins.other_params.saturating_sub(d.hidden as u64))
+    width_breakdown(ins, layers_kept, w).map(|b| b.total).unwrap_or(0)
 }
 
 /// The MLP width nearest to `num / den` of the original, among the offered sizes.
@@ -603,6 +671,7 @@ pub fn width_options(ins: &Inspect, depth_blocks: u32, vram_gb: Option<f64>, lin
             disk_gb: ((params as f64 * bytes_per_param(ins)) / 1e9 * 10.0).round() / 10.0,
             vram_lora_gb: lora, vram_qlora_gb: qlora, fits_lora: vram_gb.map(|v| lora <= v), fits_qlora: vram_gb.map(|v| qlora <= v),
             intermediate: Some(i), exact: i <= d.intermediate,
+            breakdown: width_breakdown(ins, &kept, &Width { intermediate: i, lin_v_heads, heads }),
         }
     }).collect()
 }

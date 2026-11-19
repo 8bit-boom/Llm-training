@@ -451,7 +451,7 @@ def test_inspect_of_a_hub_model_reads_headers_only(tmp_path, monkeypatch):
 from fakemodel import tensor_numbers  # noqa: E402
 from stfile import fill, read_folder  # noqa: E402
 
-RESULT_KEYS = {"model_dir", "mode", "layers_before", "layers_after", "src_layers", "dropped", "duplicated", "zero_init", "params_before", "params_after",
+RESULT_KEYS = {"model_dir", "mode", "layers_before", "layers_after", "src_layers", "dropped", "duplicated", "zero_init", "params_before", "params_after", "params_breakdown",
                "bytes_written", "loss_before", "loss_after", "ppl_before", "ppl_after", "stable", "boundary_distance", "chosen_blocks", "load", "seconds",
                "notes", "stopped", "shape", "width"}
 

@@ -2243,11 +2243,24 @@ function patternText(ins) {
 
 function rsOption() { return rs.options && rs.options.options.find((o) => o.blocks === rs.blocks) || null; }
 
+// Where the parameters are: "text layers 19.00 B · embeddings 1.27 B · ... · file total 19.81 B" (the same words as `ParamsBreakdown::line` in the program).
+function breakdownLine(b) {
+  if (!b || b.total == null) return "";
+  const x = (n) => ((+n || 0) / 1e9).toFixed(2) + " B";
+  const parts = [`text layers ${x(b.text_layers)}`, `embeddings ${x(b.embeddings)}`];
+  if (b.output > 0) parts.push(`output ${x(b.output)}`);
+  if (b.vision > 0) parts.push(`vision ${x(b.vision)}`);
+  if (b.mtp > 0) parts.push(`multi-token head ${x(b.mtp)}`);
+  if (b.mtp_removed > 0) parts.push(`multi-token head removed ${x(b.mtp_removed)}`);
+  parts.push(`other ${x(b.other)}`);
+  return `${parts.join(" · ")} · file total ${x(b.total)}`;
+}
+
 function rsSizeInfo() {
   const o = rsOption(), op = rs.options, v = op && op.vram_gb;
   if (!o) return `<span class="dim">Nothing can be changed in whole blocks for this model.</span>`;
   const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
-  return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+  return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}${o.breakdown ? `<br><span class="dim small" id="rs-breakdown">${esc(breakdownLine(o.breakdown))}</span>` : ""}`;
 }
 
 const thou = (n) => Number(n).toLocaleString("en-US");
@@ -2284,7 +2297,7 @@ function rsWidthInfo() {
   if (!o) return `<span class="dim">Choose how thin the layers become.</span>`;
   const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
   const cut = full ? Math.round(100 * (1 - o.intermediate / full)) : null;
-  return `MLP ${thou(o.intermediate)}${full ? " of " + thou(full) + " (−" + cut + " %)" : ""} · <strong>${o.layers} layers · ${o.params_b} B parameters${o.exact ? " (exact)" : ""}</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+  return `MLP ${thou(o.intermediate)}${full ? " of " + thou(full) + " (−" + cut + " %)" : ""} · <strong>${o.layers} layers · ${o.params_b} B parameters${o.exact ? " (exact)" : ""}</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}${o.breakdown ? `<br><span class="dim small" id="rs-breakdown">${esc(breakdownLine(o.breakdown))}</span>` : ""}`;
 }
 
 // the part of "2 · What to do" for thinner layers: the way, the width slider(s), the Expert axes and the measuring
@@ -2694,6 +2707,7 @@ function madeCard(m) {
   return `<div class="card wide"><h2>${esc(m.name)}</h2>
     ${slim && m.scores && m.scores.boundary_distance ? barChart(m.scores.boundary_distance, m.scores.chosen_blocks || []) : (sm.boundary_distance ? barChart(sm.boundary_distance, sm.chosen_blocks || []) : "")}${meanChart}
     <p><strong>${esc(what)}</strong> · ${sm.layers_before} → ${sm.layers_after} layers · ${gb(sm.params_before)} → ${gb(sm.params_after)} billion parameters · ${m.size_gb} GB on disk</p>
+    ${sm.params_breakdown ? `<p class="dim small" id="rs-made-breakdown">${esc(breakdownLine(sm.params_breakdown))}</p>` : ""}
     ${loss ? `<p>${esc(loss)}</p>` : ""}${stab}
     ${slim && sm.stable === false && !wide ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
     ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}

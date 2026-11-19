@@ -42,6 +42,11 @@ fn stage_json(s: &StageState) -> Value {
     let p = &s.plan;
     let summary = s.heal.as_ref().and_then(|h| h.summary.clone()).unwrap_or(Value::Null);
     let mut out = stage_core(s, p, &summary);
+    // where the stage's parameters are (the plan; absent for a plan saved by an older version)
+    if let Some(b) = &p.breakdown {
+        out["breakdown"] = json!(b);
+        out["breakdown_line"] = json!(b.line());
+    }
     // what the heal's rows cover (the worker's summary; absent for an older worker)
     if summary["coverage"].is_object() {
         out["coverage"] = summary["coverage"].clone();
@@ -258,6 +263,11 @@ pub fn markdown(r: &Value) -> String {
         let result = if st["passed"] == true { if st["backed_off"] == true { "passed after backing off" } else if st["retries"].as_u64().unwrap_or(0) > 0 { "passed on the second heal" } else { "passed" } } else { "not passed" };
         s.push_str(&format!("| {} of {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n", st["index"], st["of"], num(&st["params_b"], 2), num(&st["cut_pct"], 1), st["blocks_cut"], st["mlp_width"].as_u64().map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
                              st["tokens_m"], num(&st["kl_first"], 3), num(&st["kl_last"], 3), num(&st["loss_before"], 3), num(&st["loss_after"], 3), num(&st["teacher_loss"], 3), st["attempts"].as_array().map(|a| a.len()).unwrap_or(0), result));
+    }
+    for st in r["stages"].as_array().cloned().unwrap_or_default() {
+        if let Some(line) = st["breakdown_line"].as_str() {
+            s.push_str(&format!("\nStage {}: {line}.\n", st["index"]));
+        }
     }
     for st in r["stages"].as_array().cloned().unwrap_or_default() {
         if let Some(l) = st["cut_loss"].as_f64() {

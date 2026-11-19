@@ -55,6 +55,21 @@ Every layer keeps its shape except the MLP, which loses neurons (multiples of 25
 
 **Both** (remove blocks and thin the rest): 60 layers with MLP 12,288 is 21.46 B; 56 layers with MLP 13,312 is 21.15 B.
 
+### 2c. Where the parameters are (text only, with the vision tower, with the multi-token head)
+
+A width cut that thins the MLP removes the multi-token head (it no longer fits), so the table above, which still counts it, is higher than the file the program writes. The page and the Auto-cut report now show the parts of every size (`ParamsBreakdown`: text layers, embeddings, output layer, vision tower, multi-token head, rest, file total; the parts add up to the size shown). For the 27 B at its own head count (computed from the same formula, exact):
+
+| MLP width | text model only | with the vision tower (the file) | with the multi-token head kept and sliced |
+|---|---|---|---|
+| 17,408 (original) | 27.32 B | 27.78 B | 27.78 B |
+| 13,312 | 22.87 B | 23.33 B | 23.69 B |
+| 12,288 | 21.86 B | 22.32 B | 22.67 B |
+| 10,752 | 20.35 B | 20.81 B | 21.14 B |
+| 9,728 | 19.35 B | 19.81 B | 20.11 B |
+| 8,704 | 18.34 B | 18.80 B | 19.09 B |
+
+So a figure such as "20.23 B at 9,728" in an outside note is another way of counting (it keeps a head); the program's number is the second column, the size of the files it writes. A model made by the program reports the same parts in its result (`params_breakdown`) and the page shows them under the size.
+
 ## 3. Recommendations
 
 0. **Prefer thinner layers (MLP 13,312, 23.7 B) for the first try, and heal it.** It is the page's first position. Go to 10,752 (21.1 B), or to *Both* (one block less and MLP 12,288, 21.5 B), only after the

@@ -627,8 +627,9 @@ fn a_healed_model_that_misses_a_gate_is_healed_again_with_40_million_more_tokens
     let rep: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("auto_report.json")).unwrap()).unwrap();
     assert_eq!((rep["status"].as_str(), rep["retries"].as_u64()), (Some("done"), Some(1)));
     assert!(rep["stages"].as_array().unwrap().iter().any(|s| s["coverage"]["chat_rows"]["cut"] == 1), "what the heal's rows cover is in the report: {rep}");
+    assert!(rep["stages"].as_array().unwrap().iter().all(|s| s["breakdown_line"].as_str().is_some_and(|l| l.contains("text layers") && l.contains("file total"))), "{rep}");
     let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
-    assert!(md.contains("passed on the second heal") && md.contains("healed again"), "{md}");
+    assert!(md.contains("passed on the second heal") && md.contains("healed again") && md.contains("file total"), "{md}");
     assert_eq!(st.report, Some(json!({"json": "auto_report.json", "md": "auto_report.md"})));
     // the estimate made before the run is kept next to what the steps took (additive keys; the old ones stay)
     let est = &rep["estimate"];

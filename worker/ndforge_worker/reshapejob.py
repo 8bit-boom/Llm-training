@@ -1042,6 +1042,7 @@ def run(cfg: dict) -> int:
     protocol.progress("done", 1.0, "")
     protocol.result({"model_dir": str(final), "mode": mode, "layers_before": n_layers, "layers_after": len(src), "src_layers": src, "dropped": info["dropped"],
                      "duplicated": info["duplicated"], "zero_init": zero_init, "params_before": groups["total"], "params_after": info["params_after"],
+                     "params_breakdown": reshape.breakdown(new_groups, None, groups) if width else reshape.breakdown(groups, src),
                      "bytes_written": need, "loss_before": loss_before, "loss_after": loss_after, "ppl_before": _ppl(loss_before), "ppl_after": _ppl(loss_after), "stable": stable,
                      "boundary_distance": (scores or {}).get("boundary_distance"), "chosen_blocks": chosen if mode == "prune" else None, "load": load_used,
                      "seconds": round(time.monotonic() - started, 1), "notes": notes, "stopped": False,
