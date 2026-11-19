@@ -2817,7 +2817,7 @@ function acRefresh() {
   if (sig === ac.planFor) return;
   ac.planFor = sig; ac.plan = null; ac.planErr = null;
   const token = ++ac.planTok;
-  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (page === "reshape") render(); } })
     .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
 }
 
@@ -2831,22 +2831,42 @@ function acDelta(d) {
 }
 const acTotal = (t) => t ? `${acStepMin(t[0] * 60, t[1] * 60)}` : "";
 // the speed settings: the presets with their totals, the biggest levers with the change each choice makes, the rest under "More speed settings", and the time limit
+// The table of speed settings of the last plan that came, kept while the next one is on its way (`acRefresh` drops `ac.plan` at every change). The radios show the LOCAL state
+// (`acOptionOn`) and a click uses the `set` of this table, so neither depends on a plan being there at that moment.
+function acRememberSpeed(pl) {
+  if (pl && pl.speed && pl.speed.knobs && pl.speed.knobs.length) ac.speedCache = { model: rs.model, speed: pl.speed };
+}
+function acSpeedTable(pl) {
+  if (pl && pl.speed) return { sp: pl.speed, stale: false };
+  const c = ac.speedCache;
+  return c && c.model === rs.model ? { sp: c.speed, stale: true } : { sp: null, stale: false };
+}
+// does this choice of a knob match what the local state has now? (the same comparison as `acPresetNow`)
+function acOptionOn(o) {
+  const kn = acKnobs();
+  return Object.entries(o.set || {}).every(([k, v]) => {
+    if (k === "search_minutes") return (ac.sp.search || null) === (v || null);
+    if (k === "think_quick" && v === null) return ac.sp.tq == null;
+    if (k === "heal_rounds") return JSON.stringify(kn[k]) === JSON.stringify(v);
+    return k in kn ? kn[k] === v : true;
+  });
+}
 function acSpeedBlock(pl, live) {
-  const lock = live ? "disabled" : "", sp = pl && pl.speed, now = acPresetNow(), think = !!ac.thinking;
+  const tbl = acSpeedTable(pl), lock = live ? "disabled" : "", sp = tbl.sp, now = acPresetNow(), think = !!ac.thinking;
   const row = (p) => {
     const t = sp && sp.presets.find((x) => x.id === p.id), tt = p.id === "custom" ? sp && sp.total_h : t && t.total_h;
     const risk = p.id === "fast" && think ? `<div class="err" data-acspeed-warn="fast">${esc(p.risk)} A model that thinks will very likely lose its reasoning with these settings.</div>` : `<div class="dim small">${esc(p.risk)}</div>`;
     return `<label class="opt ac-preset" data-acpreset="${esc(p.id)}"><input type="radio" name="ac-preset" value="${esc(p.id)}" ${now === p.id ? "checked" : ""} ${lock}> <strong>${esc(p.label)}</strong>${tt ? ` <span class="ac-ptotal">about ${esc(acTotal(tt))}</span>` : ""}
       <div class="dim small">${esc(p.blurb)}</div>${now === p.id || p.id === "fast" ? risk : ""}${t && t.retry_h && p.id !== "custom" ? `<div class="dim small">If a thinking check fails, a retry adds ${esc(acTotal(t.retry_h))} (not counted).</div>` : ""}</label>`;
   };
-  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${o.current ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
-      <span class="dim small ac-delta">${o.current ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
+  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${acOptionOn(o) ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
+      <span class="dim small ac-delta">${acOptionOn(o) ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
   const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
   const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
   const bud = pl && pl.budget;
   const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
       <ul>${bud.dropped.map((d) => `<li data-acdropped="${esc(d.knob)}"><strong>${esc(d.label)}</strong>: ${esc(d.to)} instead of ${esc(d.from)} (saves ${esc(acTotal(d.saves_h))}). <span class="dim small">${esc(d.risk)}</span></li>`).join("")}</ul></div>` : `<p class="dim small" id="ac-budget-ok">Your settings already fit.</p>`) : "";
-  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast</h3>
+  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast${tbl.stale ? ` <span class="dim small" id="ac-updating">updating…</span>` : ""}</h3>
     <p class="dim small">Healing is most of the time. The recommended recipe is the safest; the others trade quality risk for hours, and every value that is not the recipe's is listed in the plan and in the report.</p>
     ${AC_SPEED_PRESETS.map(row).join("")}
     ${sp ? `<div class="ac-levers" id="ac-levers"><h4>What takes the time</h4><table class="tbl">${big.map(optRow).join("")}</table></div>` : ""}
@@ -3078,9 +3098,11 @@ function wireAuto() {
   set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
   document.querySelectorAll("input[name=ac-preset]").forEach((r) => r.onchange = () => { if (r.value === "custom") ac.advOpen = true; else acApplyPreset(r.value); render(); });
   document.querySelectorAll("input[data-acknob]").forEach((r) => r.onchange = () => {
-    const k = ac.plan && ac.plan.speed && ac.plan.speed.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
-    if (o) acApplySet(o.set);
+    const sp = acSpeedTable(ac.plan).sp, k = sp && sp.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
+    if (o) acApplySet(o.set);                          // never dropped: the table of the last plan is kept while a new one is on its way
+    const y = typeof window !== "undefined" && window ? window.scrollY : 0;
     render();
+    if (y && typeof window.scrollTo === "function") window.scrollTo(0, y);
   });
   const pr = $("ac-pin-remove"); if (pr) pr.onclick = () => { ac.pin = null; ac.err = null; render(); };
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });

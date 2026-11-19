@@ -497,3 +497,74 @@ test("during the heal the sub-status and the round chips come from the auto_prog
   const chips = [...html.matchAll(/ac-rchip-(done|now|next)/g)].map((m) => m[1]);
   assert.deepEqual(chips, ["done", "done", "now", "next", "next", "next", "next", "next"]);
 });
+
+// ---- the knob radios must follow what was clicked at once, not the plan that is still on its way (owner's bug report: about half of the clicks did not show)
+
+const knobRadiosOf = (b) => {
+  const r = [];
+  const re = /data-acknob="([a-z_]+)" data-acopt="(\d+)"/g;
+  for (const m of card(b).matchAll(re)) r.push({ value: "", dataset: { acknob: m[1], acopt: m[2] }, checked: false, onchange: null });
+  return r;
+};
+const isChecked = (html, knob, opt) => new RegExp(`data-acknob="${knob}" data-acopt="${opt}" checked`).test(html);
+
+test("a click on a knob radio shows at once and is sent with the next plan request, even while the plan is null or its answer is slow", async () => {
+  let release;
+  const slow = new Promise((r) => { release = r; });
+  const b = makeBrowser({ answers: { auto_plan: () => slow }, state: baseState, groups: {} });
+  open(b, {}, `ac.plan = ${JSON.stringify(speedPlan())}; acDefaults(); ac.speedCache = null`);
+  b.run("acRememberSpeed(ac.plan)");                       // the table of the last plan, kept while a new one is on its way
+  const radios = knobRadiosOf(b);
+  b.groups["input[data-acknob]"] = radios;
+  b.run("wireAuto()");
+  const find = (knob, i) => radios.find((r) => r.dataset.acknob === knob && r.dataset.acopt === String(i));
+  assert.equal(isChecked(card(b), "imatrix", 0), true);
+  // click "Off" of the importance matrix: the plan is dropped and asked again (the answer does not come)
+  find("imatrix", 1).checked = true; find("imatrix", 1).onchange();
+  b.run("acRefresh()");
+  assert.equal(b.run("ac.plan"), null);
+  let html = card(b);
+  assert.equal(isChecked(html, "imatrix", 1), true, "the clicked choice is the checked one at once");
+  assert.equal(isChecked(html, "imatrix", 0), false);
+  assert.match(html, /name="ac-preset" value="custom" checked/, "a knob click makes the preset Custom before the plan returns");
+  assert.match(html, /id="ac-updating"/, "the old deltas stay, marked as updating");
+  assert.match(html, /data-acopt="1"[^>]*>\s*Off\s*<span[^>]*>now/);
+  // a second click on another knob while the plan is still null: both stick
+  find("last_tokens_m", 1).checked = true; find("last_tokens_m", 1).onchange();
+  b.run("acRefresh()");
+  html = card(b);
+  assert.equal(isChecked(html, "last_tokens_m", 1), true); assert.equal(isChecked(html, "imatrix", 1), true);
+  const sent = b.calls.filter((x) => x[0] === "auto_plan").at(-1)[1].spec;
+  assert.equal(plain(sent).imatrix, false); assert.equal(plain(sent).last_tokens_m, 20);
+  // the recipe value again: back to the preset
+  find("last_tokens_m", 3).checked = true; find("last_tokens_m", 3).onchange();
+  find("imatrix", 0).checked = true; find("imatrix", 0).onchange();
+  html = card(b);
+  assert.equal(isChecked(html, "last_tokens_m", 3), true); assert.equal(isChecked(html, "imatrix", 0), true);
+  assert.equal(b.run("acSpec().preset"), "balanced"); assert.match(html, /name="ac-preset" value="balanced" checked/);
+  release({ plan: speedPlan() });
+  await tick();
+});
+
+test("without any table yet the knob radios are not offered at all, and a table from another model is not used", () => {
+  const b = browser();
+  open(b, {}, `ac.plan = null; acDefaults()`);
+  assert.doesNotMatch(card(b), /data-acknob=/);
+  b.run(`ac.plan = ${JSON.stringify(speedPlan())}; acRememberSpeed(ac.plan); ac.plan = null`);
+  assert.match(card(b), /data-acknob="imatrix"/);
+  b.run(`rs.model = "another-model"`);
+  assert.doesNotMatch(card(b), /data-acknob=/, "the table belongs to the model it was made for");
+});
+
+test("two quick clicks on different knobs while the table is stale both stick in the spec", () => {
+  const b = browser();
+  open(b, {}, `ac.plan = ${JSON.stringify(speedPlan())}; acDefaults(); acRememberSpeed(ac.plan); ac.plan = null`);
+  const radios = knobRadiosOf(b);
+  b.groups["input[data-acknob]"] = radios;
+  b.run("wireAuto()");
+  const pick = (knob, i) => { const r = radios.find((x) => x.dataset.acknob === knob && x.dataset.acopt === String(i)); r.checked = true; r.onchange(); };
+  pick("imatrix", 1); pick("share_teacher_cache", 1);
+  const s = plain(b.run("acSpec()"));
+  assert.equal(s.imatrix, false); assert.equal(s.share_teacher_cache, false);
+  assert.equal(isChecked(card(b), "imatrix", 1), true); assert.equal(isChecked(card(b), "share_teacher_cache", 1), true);
+});

@@ -252,7 +252,23 @@ fn timed(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history: &History
 /// Everything the window needs to choose speed settings: the total of every preset and of every choice of every knob, each with everything else as it is now.
 pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history: &History) -> SpeedInfo {
     let total_b = ins.total_params as f64 / 1e9;
-    let Some((base_plan, base)) = timed(ins, spec, vram_gb, history) else {
+    // every choice of every knob is a plan and a time estimate of the spec with that one change; choices that give the same spec (the one that is on, a value several knobs share)
+    // are made once. The answer is the same as without it: the estimate depends on nothing but the spec, the model, the card and the history.
+    let memo: std::cell::RefCell<std::collections::HashMap<String, Option<(AutoPlan, TimeEstimate)>>> = Default::default();
+    let timed_m = |s: &AutoSpec| -> Option<(AutoPlan, TimeEstimate)> {
+        let key = serde_json::to_string(s).unwrap_or_default();
+        if !key.is_empty() {
+            if let Some(hit) = memo.borrow().get(&key) {
+                return hit.clone();
+            }
+        }
+        let made = timed(ins, s, vram_gb, history);
+        if !key.is_empty() {
+            memo.borrow_mut().insert(key, made.clone());
+        }
+        made
+    };
+    let Some((base_plan, base)) = timed_m(spec) else {
         return SpeedInfo { presets: Vec::new(), knobs: Vec::new(), current_preset: spec.matching_preset(), default_preset: default_preset(total_b).into(), total_h: (0.0, 0.0) };
     };
     let thinking = spec.keep_thinking;
@@ -261,7 +277,7 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
     let delta = |t: (f64, f64)| (r1h((t.0 - base.total_h.0) * 60.0) + 0.0, r1h((t.1 - base.total_h.1) * 60.0) + 0.0);
     let option = |label: String, set: Map<String, Value>, current: &dyn Fn(&AutoPlan, &AutoSpec) -> bool, note: Option<String>| -> SpeedOption {
         let alt = patched(spec, &set);
-        match alt.as_ref().and_then(|a| timed(ins, a, vram_gb, history).map(|(p, t)| (a, p, t))) {
+        match alt.as_ref().and_then(|a| timed_m(a).map(|(p, t)| (a, p, t))) {
             Some((a, p, t)) => SpeedOption { label, set, current: current(&p, a), total_h: Some(t.total_h), delta_min: Some(delta(t.total_h)), note },
             None => SpeedOption { label, set, current: false, total_h: None, delta_min: None, note: Some("This cannot be planned with this choice.".into()) },
         }
@@ -341,7 +357,7 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
 
     let presets = presets().into_iter().map(|pr| {
         let mut row = PresetTime { id: pr.id.clone(), label: pr.label.clone(), blurb: pr.blurb.clone(), risk: pr.risk.clone(), total_h: None, retry_h: None, why: None };
-        match spec.with_preset(&pr.id).ok().and_then(|s| timed(ins, &s, vram_gb, history)) {
+        match spec.with_preset(&pr.id).ok().and_then(|s| timed_m(&s)) {
             Some((_, t)) => {
                 row.total_h = Some(t.total_h);
                 row.retry_h = t.extra.iter().find(|e| e.id == "retry_heal").map(|e| (r1h(e.minutes.0 / 60.0), r1h(e.minutes.1 / 60.0)));

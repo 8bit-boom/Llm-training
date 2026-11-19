@@ -350,11 +350,29 @@ impl History {
         h
     }
 
-    /// The history of the newest `n` saved job logs of this computer.
+    /// The history of the newest `n` saved job logs of this computer. Parsing up to 60 logs takes a while and the window asks for a plan after every click, so the last answer is
+    /// kept in memory and reused while the files are the same ones (name, size and modification time); a new or changed log makes it again.
     pub fn recent(n: usize) -> History {
         let mut files = crate::envmgr::joblog::latest(n);
         files.reverse();
+        let key: Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)> = files.iter().map(|f| {
+            let m = std::fs::metadata(f).ok();
+            (f.clone(), m.as_ref().map(|m| m.len()).unwrap_or(0), m.and_then(|m| m.modified().ok()))
+        }).collect();
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)>, History)>>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(g) = cache.lock() {
+            if let Some((k, h)) = g.as_ref() {
+                if *k == key {
+                    return h.clone();
+                }
+            }
+        }
         let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
-        History::from_texts(&texts)
+        let h = History::from_texts(&texts);
+        if let Ok(mut g) = cache.lock() {
+            *g = Some((key, h.clone()));
+        }
+        h
     }
 }
