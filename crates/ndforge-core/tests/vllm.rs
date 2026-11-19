@@ -84,8 +84,8 @@ fn the_status_lines_and_the_guided_text() {
 #[test]
 fn the_preflight_blocks_a_busy_card_and_a_missing_engine() {
     let s = VllmSettings::default();
-    let busy = preflight_checks(&s, &gather_facts(&runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 6144, 32768\n")]), &s));
-    assert!(busy.iter().any(|c| c.id == "vllm_gpu" && c.light == Light::Fail && c.detail.contains("6.0 GB")));
+    let busy = preflight_checks(&s, &gather_facts(&runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 12288, 32768\n")]), &s));
+    assert!(busy.iter().any(|c| c.id == "vllm_gpu" && c.light == Light::Fail && c.detail.contains("12.0 GB")));
     assert!(busy.iter().any(|c| c.id == "vllm_engine" && c.light == Light::Ok));
     let free = preflight_checks(&s, &gather_facts(&runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 1200, 32768\n")]), &s));
     assert!(free.iter().all(|c| c.light != Light::Fail));
@@ -144,4 +144,22 @@ fn the_self_test_compares_with_the_saved_standard_results_of_the_project() {
     assert_eq!(c["hf"], json!(t.join("original.quick.json")), "never the vLLM file");
     assert!(c.get("llama").is_none());
     assert_eq!(compare_files(None), json!({}));
+}
+
+#[test]
+fn the_card_is_shared_with_the_desktop_the_share_is_lowered_not_refused() {
+    let p = gpu_plan(Some(32607), Some(1931), 0.88);
+    assert_eq!((p.ok, p.lowered, p.util), (Some(true), false, 0.88));
+    let q = gpu_plan(Some(32607), Some(2713), 0.88);      // the owner's card with the desktop on it
+    assert_eq!(q.ok, Some(true));
+    assert!(q.util <= 0.88 && q.util >= 0.70);
+    let l = gpu_plan(Some(32607), Some(4500), 0.88);
+    assert!(l.lowered && l.util < 0.88 && l.text.contains("vLLM will take") && l.text.contains("instead of 0.88"));
+    assert!(l.util * 32607.0 <= 32607.0 - 4500.0 - 500.0);
+    assert_eq!(gpu_plan(Some(32607), Some(12288), 0.88).ok, Some(false));
+    assert!(gpu_plan(Some(32607), Some(12288), 0.88).text.contains("Close those programs"));
+    for (t, u) in [(None, None), (Some(32607), None), (Some(0), Some(1))] {
+        let g = gpu_plan(t, u, 0.88);
+        assert_eq!((g.ok, g.util), (None, 0.88));
+    }
 }

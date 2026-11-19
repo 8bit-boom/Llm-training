@@ -141,4 +141,4 @@ Under Training setup, "vLLM engine (experimental)" switches the engine on; then 
 vLLM asks all questions at once (40 in parallel) and is estimated at about 400 tokens per second (the standard engine: about 55, llama-server: about 165) plus 2-5 minutes of start-up; the plan
 says so. Its results are kept in their own files (`<target>.<mode>.vllm.json`) and shown in their own table: a model is judged against the original checked **the same way** (the numbers of two
 engines are not identical: same distribution, other random numbers). Before a vLLM check starts, the checklist asks that the engine exists (Docker, Docker inside WSL, WSLc, or vLLM in WSL) and
-that nothing else uses more than about 2 GB of the graphics card (vLLM reserves about 88 %).
+that the graphics card has room: vLLM reserves 0.88 of it, and when other programs use some the share is lowered to fit (down to 0.70; below that the start is refused with the amount).

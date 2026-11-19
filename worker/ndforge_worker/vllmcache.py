@@ -290,10 +290,15 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
     e = container_config(job)
     tcfg = (job.get("engine") or {}).get("teacher") or {}
     sel = select_teacher(tcfg, origin, origin_dir)
+    total, used = vllmengine.gpu_mb()
+    g = vllmengine.plan_gpu_util(total, used, float((job.get("engine") or {}).get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
+    if g["ok"] is False:
+        raise VllmCacheError(g["text"])
+    job = {**job, "engine": {**(job.get("engine") or {}), "gpu_memory_utilization": g["util"]}}
     box = Container(e, sel["model"])
     t0 = time.monotonic()
     result: dict = {"engine": f"vllm-{e['version']}", "teacher_quant": sel["quant"], "route": sel["route"], "reason": sel["reason"], "stopped": False, "notes": [],
-                    "load_phases": [], "startup_seconds": None, "rows": 0, "tokens": 0, "tokens_per_s": 0.0}
+                    "load_phases": [], "gpu": g, "startup_seconds": None, "rows": 0, "tokens": 0, "tokens_per_s": 0.0}
     if sel["route"] == "bnb" and vllmengine.under_mnt(str(origin_dir)) and box.kind in ("wsl", "docker_wsl"):
         result["notes"].append("The original's folder is on a Windows drive: the engine reads it through a slow share (9p); copying it into the WSL filesystem makes the start much faster.")
     tmp_ctx = tempfile.TemporaryDirectory(prefix="ndforge-vllm-")

@@ -61,7 +61,8 @@ WSLC_TEMPLATES = {"run": "wslc run -d --name {name} {gpu_flag} --shm-size {shm} 
                   "gputest": "wslc run --rm {gpu_flag} {test_image} nvidia-smi",
                   "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04",
                   # GUESS (docker-like; the syntax of `wslc cp` / `wslc exec` is NOT yet seen: the self-test captures `wslc cp --help` and `wslc exec --help`). Used by the teacher cache (vllmcache.py).
-                  "cp_in": "wslc cp {src} {name}:{dst}", "cp_out": "wslc cp {name}:{src} {dst}", "exec": "wslc exec {name} {args}",
+                  "cp_in": "wslc cp {src} {name}:{dst}", "cp_out": "wslc cp {name}:{src} {dst}", "exec": "wslc exec {name} {args}", "exec_detached": "wslc exec -d {name} {args}",          # cp / exec: from the owner's `wslc --help` (3.0.5), docker-like; not yet tested together
+                  
                   "run_idle": "wslc run -d --name {name} {gpu_flag} --shm-size {shm} -v {model_dir}:/models {env} --entrypoint sleep {image} infinity"}
 WSLC_HELP_COMMANDS = (["wslc", "--version"], ["wslc", "info"], ["wslc", "--help"], ["wslc", "run", "--help"], ["wslc", "system", "--help"], ["wslc", "container", "--help"],
                       ["wslc", "stop", "--help"], ["wslc", "remove", "--help"], ["wslc", "list", "--help"], ["wslc", "logs", "--help"], ["wslc", "pull", "--help"],
@@ -91,6 +92,7 @@ def _win_kw() -> dict:
 _popen = subprocess.Popen
 _run = subprocess.run
 _which = shutil.which
+_smi_run = subprocess.run                          # the hook of the card-memory question (tests replace it)
 
 
 # ------------------------------------------------------------------------------------------------------------------ pure helpers
@@ -175,12 +177,51 @@ def wslc_templates(cfg: dict) -> dict:
     return {**WSLC_TEMPLATES, **{k: v for k, v in (cfg.get("wslc") or {}).items() if k in WSLC_TEMPLATES}}
 
 
+UTIL_FLOOR = 0.70                                       # below this share of the card the engine is not started
+UTIL_MARGIN_MB = 512                                    # free memory wanted above what the engine reserves
+UTIL_KEEP_MB = 614                                      # left free when the utilization is lowered (about 0.6 GB)
+
+
+def plan_gpu_util(total_mb, used_mb, configured: float = DEFAULT_GPU_UTIL) -> dict:
+    """What `--gpu-memory-utilization` can be on a card that already has `used_mb` of `total_mb` in use (the desktop, a browser ...). The engine reserves `util x total`: when
+    `free >= needed + 0.5 GB` nothing changes; else the utilization is LOWERED to `(free - 0.6 GB) / total`; below 0.70 the start is refused with the amount in plain words.
+    -> {"util", "ok": True | False | None (unknown: nvidia-smi unreadable, continuing), "lowered": bool, "text"}."""
+    if not total_mb or used_mb is None:
+        return {"util": float(configured), "ok": None, "lowered": False, "text": "The memory in use on the card could not be read (nvidia-smi did not answer): continuing with the configured utilization."}
+    total, used = float(total_mb), float(used_mb)
+    free = total - used
+    needed = configured * total
+    if free >= needed + UTIL_MARGIN_MB:
+        return {"util": float(configured), "ok": True, "lowered": False, "text": f"{used / 1024:.1f} GB of the card are in use; {free / 1024:.1f} GB are free and the engine takes {needed / 1024:.1f} GB ({configured:g} of the card): fine."}
+    util = min(float(configured), (free - UTIL_KEEP_MB) / total)
+    if util < UTIL_FLOOR:
+        return {"util": float(configured), "ok": False, "lowered": False, "text": f"{used / 1024:.1f} GB of the card ({total / 1024:.1f} GB) are in use by other programs (the desktop, a browser, Ollama, llama-server ...): only {free / 1024:.1f} GB are free, "
+                f"and even {UTIL_FLOOR:g} of the card ({UTIL_FLOOR * total / 1024:.1f} GB) does not fit. Close those programs and try again."}
+    util = round(util - 0.0049, 2)                      # rounded down to two decimals
+    return {"util": util, "ok": True, "lowered": True, "text": f"Other programs use {used / 1024:.1f} GB of the card; vLLM will take {util:g} instead of {configured:g} of it."}
+
+
+def gpu_mb():
+    """(total_mb, used_mb) from nvidia-smi, or (None, None)."""
+    try:
+        r = _smi_run(["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"], capture_output=True, stdin=subprocess.DEVNULL, timeout=30, **_win_kw())
+        line = ((getattr(r, "stdout", b"") or b"").decode("utf-8", "replace").strip().splitlines() or [""])[0]
+        a, b = [int(x.strip()) for x in line.split(",")[:2]]
+        return a, b
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
+        return None, None
+
+
 def wslc_running(text: str, name: str):
     """True / False / None from the output of `wslc list -a --format json` (the field names are UNKNOWN: read defensively, the self-test report shows one real sample): the container is looked for by
     name in every string of the list; found with a state word -> running or not; not in the list -> False; no list could be read -> None."""
     try:
         data = json.loads(text)
     except ValueError:
+        # not JSON (a table, an unknown format): the name anywhere in the raw output counts as running when the line does not say it stopped
+        for ln in text.splitlines():
+            if name.lower() in ln.lower():
+                return False if re.search(r"exited|stopped|dead|created", ln, re.I) else True
         return None
     items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
     name = name.lower()
@@ -191,12 +232,10 @@ def wslc_running(text: str, name: str):
         states = []
         if isinstance(it, dict):
             states = [str(v).lower() for k, v in it.items() if str(k).lower() in ("state", "status", "running") and not isinstance(v, (dict, list))]
-        joined = " ".join(states)
-        if "running" in joined or joined.strip() == "true" or joined.startswith("up"):
-            return True
-        if any(w in joined for w in ("exited", "stopped", "dead", "created", "false", "terminated")):
+        joined = " ".join(states) or flat
+        if any(w in joined for w in ("exited", "stopped", "dead", "created", "terminated", "false")):
             return False
-        return None
+        return True                                    # listed, and nothing says it stopped (the field names are unknown): running
     return False if items or text.strip() in ("[]", "") else None
 
 
@@ -211,7 +250,7 @@ def wslc_help(limit: int = HELP_LIMIT) -> dict:
             r = _run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=30, **_win_kw())
             raw = (getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")
             text = raw.decode("utf-16-le", "replace") if raw[:2] in (b"\xff\xfe",) or (len(raw) > 4 and raw[1:2] == b"\x00") else raw.decode("utf-8", "replace")
-            out[" ".join(cmd)] = {"returncode": getattr(r, "returncode", None), "output": protocol.scrub(text.replace("\x00", ""))[:limit]}
+            out[" ".join(cmd)] = {"returncode": getattr(r, "returncode", None), "output": re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", protocol.scrub(text.replace("\x00", "")).replace("\r\n", "\n").replace("\r", "\n"))[:limit]}
         except (OSError, subprocess.SubprocessError) as exc:
             out[" ".join(cmd)] = {"returncode": None, "output": f"could not run: {exc}"}
     return out

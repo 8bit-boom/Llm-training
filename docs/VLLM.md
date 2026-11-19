@@ -39,7 +39,7 @@ Models: prefer a NAMED volume (`ndforge-vllm-hf`, the default for a Hub id) or a
   the WSLc templates. "Look for the engine" asks `docker version`, `wsl.exe -- docker version`, `wslc --version`, a vLLM install in WSL, `wsl --version` and `nvidia-smi`; it starts and installs
   nothing and prints plain install text when nothing is found (Docker Desktop or Docker in WSL or WSLc or a vLLM environment; Windows driver 580 or newer; about 60 GB of disk).
 - **Thinking check card**: the engine choice and the separate vLLM table (see docs/THINKING_CHECK.md).
-- **Before a vLLM check** the checklist asks: an engine is there, the card is free (nothing else above 2 GB), driver and WSL not too old (versions are compared as numbers; unreadable = "unknown, continuing").
+- **Before a vLLM check** the checklist asks: an engine is there, the card has room (the engine reserves 0.88 of it; when other programs such as the desktop use some, the share is LOWERED to fit, down to 0.70, and only below that is the start refused), driver and WSL not too old (versions are compared as numbers; unreadable = "unknown, continuing").
 
 ## Choosing the weights (step 4)
 
@@ -73,7 +73,7 @@ estimate from a research report, not measured here; the self-test measures your 
 The research report's 1-hour experiment, run for you as far as the app can. You choose a model (a folder or a Hugging Face id; the default is the configured pre-quantized original, about 21 GB:
 the card asks you to confirm the download) and press **Run the vLLM self-test**. It:
 
-1. checks the NVIDIA driver (580 or newer), the WSL version, that nothing else uses more than 2 GB of the card, that the model folder is not on a slow `/mnt/` share, and that a throw-away
+1. checks the NVIDIA driver (580 or newer), the WSL version, that the card has room next to what the desktop already uses (`needed = 0.88 x card`, `free = card - used`; when `free < needed + 0.5 GB` the utilization is lowered to `(free - 0.6 GB) / card`, below 0.70 the test refuses and names the amount; an unreadable nvidia-smi continues with a note; the lowered value is used for the weights-fit check and recorded in the report), that the model folder is not on a slow `/mnt/` share, and that a throw-away
    container can see the card (`nvidia-smi` in `nvidia/cuda:13.0.0-base-ubuntu24.04`; the way it is run depends on the engine kind). When `wslc` is on the PATH its help is captured verbatim.
 2. starts the engine, waits for `/health`, records the start-up time, the attention / GDN kernel and cache log lines, and checks that `/health` answers from the Windows side (if not: the WSL
    address workaround `wsl.exe hostname -I` as a hint; mirrored networking may matter, unverified).
@@ -163,3 +163,7 @@ The app no longer starts engine containers with `--rm`: a container that crashed
 ### Unknowns (the self-test and the teacher check are meant to answer them)
 
 Whether `vllm-bnb-plugin` works for this architecture and how fast it is; the real shape of `prompt_logprobs` with `flat_logprobs`; the scoring speed on your PC; the WSLc `cp`/`exec` syntax; whether the AWQ teacher is "close" to the NF4 one on your data; how much of the start-up is download, weight load or graph capture (the check's `load_phases`).
+
+### Update: the real `wslc cp` / `exec` syntax and what the last report showed
+
+From the owner's report (wslc 3.0.5): `wslc cp [-a] [-L] [-q] <source> <target>` (source: local path, `CONTAINER:PATH` or `-`; target: local path or `CONTAINER:PATH`) and `wslc exec [-d] [-e KEY=VAL] [--env-file] [-i] [-t] [-u user] [-w dir] <container-id> <command> [<arguments>...]`: the defaults are `wslc cp {src} {name}:{dst}`, `wslc cp {name}:{src} {dst}`, `wslc exec {name} {args}` and (detached) `wslc exec -d {name} {args}` (editable; the combination is untested). `wslc list -a --format json` printed nothing when no container existed, so its field names are still unknown: the self-test saves a sample right after its own container starts and in the failure path, and the running check accepts several shapes (a name found in the output with no stop word counts as running). Captured console text is tidied (CRLF, blank-line runs) and a failed run still prints the criteria as "not reached".

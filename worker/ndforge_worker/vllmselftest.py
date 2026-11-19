@@ -75,13 +75,13 @@ def model_facts(model: str, quant: str = "none") -> dict:
     return {"model": model, "params_b": params, "params_source": psrc, "weights_gb": gb, "weights_source": src, "quant": q, "note": note}
 
 
-def fit_problem(facts: dict, vram_gb, default_model: str = "") -> str | None:
+def fit_problem(facts: dict, vram_gb, default_model: str = "", util: float | None = None) -> str | None:
     """A plain refusal when the weights (16-bit) cannot fit the card next to the cache; None when they fit or the size is not known."""
     from . import vllmquant
     gb = facts.get("weights_gb")
     if not gb or not vram_gb or facts.get("quant") != "16-bit":
         return None
-    usable = vram_gb * vllmquant.GPU_UTIL - vllmquant.CACHE_GB
+    usable = vram_gb * (util or vllmquant.GPU_UTIL) - vllmquant.CACHE_GB
     if gb <= usable:
         return None
     return (f"{facts['model']} is about {gb:.0f} GB in 16-bit; your card has {vram_gb:.0f} GB (about {usable:.0f} GB are usable by the engine). Use the pre-quantized id (leave the model field empty for the default "
@@ -152,7 +152,7 @@ def gpu_test_command(cfg: dict) -> list | None:
     return None
 
 
-def prerequisites(cfg: dict, model: str, gpu_test: bool = True) -> list:
+def prerequisites(cfg: dict, model: str, gpu_test: bool = True, util: float = vllmengine.DEFAULT_GPU_UTIL) -> list:
     """[{"id", "ok": True | False | None, "detail", "output"?}]: None = unknown (continuing)."""
     out = []
     smi = _run(["nvidia-smi", "--query-gpu=driver_version,memory.used,memory.total", "--format=csv,noheader,nounits"], 30)
@@ -161,7 +161,9 @@ def prerequisites(cfg: dict, model: str, gpu_test: bool = True) -> list:
         major = int(parts[0].split(".")[0]) if parts[0].split(".")[0].isdigit() else None
         out.append({"id": "driver", "ok": None if major is None else major >= 580, "detail": f"NVIDIA driver {parts[0]} (580 or newer is wanted for the CUDA 13 images)"})
         used = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-        out.append({"id": "gpu_free", "ok": None if used is None else used <= 2048, "detail": f"{used} MB of the card are in use (vLLM reserves about 88 %: close other programs)" if used is not None else "the memory in use could not be read"})
+        total = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        g = vllmengine.plan_gpu_util(total, used, util)
+        out.append({"id": "gpu_free", "ok": g["ok"], "detail": g["text"], "gpu_util": g["util"], "lowered": g["lowered"]})
     else:
         out.append({"id": "driver", "ok": None, "detail": "nvidia-smi did not answer on this side (unknown, continuing)", "output": smi["output"]})
     w = _run(["wsl.exe", "--version"], 30)
@@ -231,14 +233,14 @@ def criteria_of(rep: dict) -> list:
 
 def markdown(rep: dict) -> str:
     L = ["# vLLM self-test", "", f"**{rep['verdict'].upper()}**: {rep['verdict_text']}", "", f"> {NOTE}", "", f"Created {rep['created']} - model `{rep.get('model')}` - engine {rep.get('engine', {}).get('kind')} ({rep.get('engine', {}).get('image', '')})", ""]
-    L += ["## Success criteria (from the report)", ""] + [f"- [{'x' if c['ok'] else ' ' if c['ok'] is False else '?'}] {c['label']}: {c['value']}" for c in rep.get("criteria", [])] + [""]
+    L += ["## Success criteria (from the report)", ""] + [f"- [{'x' if c['ok'] else ' ' if c['ok'] is False else '?'}] {c['label']}: {'not reached' if c.get('not_reached') else c['value']}" for c in rep.get("criteria", [])] + [""]
     L += ["## Prerequisites", ""] + [f"- [{'x' if p['ok'] else ' ' if p['ok'] is False else '?'}] {p['id']}: {p['detail']}" for p in rep.get("prerequisites", [])] + [""]
     if rep.get("download_note"):
         L += [rep["download_note"], ""]
     mi = rep.get("model_info")
     if mi:
         L += ["## What was tested", "", f"Model `{mi['model']}`: {mi.get('params_b') if mi.get('params_b') is not None else 'unknown'} B parameters ({mi.get('params_source')}), {mi.get('quant')}, weights {mi.get('weights_gb') if mi.get('weights_gb') is not None else 'unknown'} GB ({mi.get('weights_source')}). "
-              f"GPU: {(rep.get('gpu') or {}).get('name') or 'unknown'}, {(rep.get('gpu') or {}).get('memory_gb') or 'unknown'} GB, driver {(rep.get('gpu') or {}).get('driver') or 'unknown'}. Engine {rep.get('engine', {}).get('kind')} {rep.get('engine', {}).get('version')}.",
+              f"GPU: {(rep.get('gpu') or {}).get('name') or 'unknown'}, {(rep.get('gpu') or {}).get('memory_gb') or 'unknown'} GB, driver {(rep.get('gpu') or {}).get('driver') or 'unknown'}. Engine {rep.get('engine', {}).get('kind')} {rep.get('engine', {}).get('wslc_version') or rep.get('engine', {}).get('version')}; vLLM takes {rep.get('gpu_util', 'the configured share')} of the card.",
               "The speeds below belong to THIS model: the program scales them by size when it plans for another one.", ""] + ([mi["note"], ""] if mi.get("note") else [])
     if rep.get("error"):
         L += ["## Error", "", rep["error"], ""]
@@ -279,6 +281,8 @@ def markdown(rep: dict) -> str:
         L += ["## Sample answers (look at them: garbled text means a problem)", ""] + [f"### {x['id']}\n\n    {x['text'][:600]!r}\n" for x in rep["samples"]]
     if rep.get("wslc"):
         L += ["## wslc help (for adapting the templates)", "", "wslc syntax unverified.", ""]
+        for smp in rep["wslc"].get("list_samples", []):
+            L += [f"### `wslc list -a --format json` at {smp['at']} (exit code {smp['returncode']}): the real field names", "", "    " + (smp["output"] or "(empty)").replace("\n", "\n    "), ""]
         for k, v in rep["wslc"].get("help", {}).items():
             L += [f"### {k} (exit code {v['returncode']})", "", "```", v["output"], "```", ""]
         if rep["wslc"].get("loopback"):
@@ -289,11 +293,25 @@ def markdown(rep: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+def list_sample(rep: dict, cfg: dict) -> None:
+    """One `wslc list -a --format json` sample while the engine's container exists (and again in the failure path before it is removed): the real field names of the JSON."""
+    if cfg.get("kind") != "wslc":
+        return
+    r = _run(["wslc", "list", "-a", "--format", "json"], 60)
+    rep.setdefault("wslc", {}).setdefault("list_samples", []).append({"at": time.strftime("%H:%M:%S"), "output": tidy(r["output"])[-3000:], "returncode": r["returncode"]})
+
+
+def tidy(text: str) -> str:
+    """Captured console output: CRLF and lone CR become newlines and runs of blank lines collapse (wslc prints CRLF that was converted twice)."""
+    t = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", t)
+
+
 def _write(out_dir: Path, rep: dict) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     # the report leaves the PC (the person pastes it into an issue): no user name, no home folder in it
     (out_dir / "vllm_selftest.json").write_text(protocol.redact_user(protocol.scrub(json.dumps(rep, ensure_ascii=False, indent=1))), encoding="utf-8")
-    (out_dir / "vllm_selftest.md").write_text(protocol.redact_user(protocol.scrub(markdown(rep))), encoding="utf-8")
+    (out_dir / "vllm_selftest.md").write_text(tidy(protocol.redact_user(protocol.scrub(markdown(rep)))), encoding="utf-8")
 
 
 def reachability(engine: "vllmengine.Engine") -> dict:
@@ -340,10 +358,19 @@ def run(job: dict) -> int:
             rep["error"] = refuse                           # nothing is started and nothing is waited for
             return _finish(rep, out_dir, t_start)
         t_pre = time.monotonic()
-        rep["prerequisites"] = prerequisites(cfg, model, bool(job.get("gpu_test", True)))
+        rep["prerequisites"] = prerequisites(cfg, model, bool(job.get("gpu_test", True)), float((job.get("engine") or {}).get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
+        gfree = next((p for p in rep["prerequisites"] if p["id"] == "gpu_free"), None)
+        util_now = float(gfree["gpu_util"]) if gfree and gfree.get("gpu_util") else float((job.get("engine") or {}).get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL)
+        rep["gpu_util"] = util_now
+        refuse = fit_problem(rep["model_info"], vram_gb, util=util_now)          # the card's free memory counts: usable = utilization x card - cache
+        if refuse:
+            rep["error"] = refuse
+            return _finish(rep, out_dir, t_start)
         rep["timings"]["prerequisites_s"] = round(time.monotonic() - t_pre, 1)
         if cfg["kind"] == "wslc" or vllmengine._which("wslc"):
             rep["wslc"] = {"help": vllmengine.wslc_help()}
+            ver = (rep["wslc"]["help"].get("wslc --version") or {}).get("output", "").strip().splitlines()
+            rep["engine"]["wslc_version"] = ver[0].strip() if ver else None
         if should_stop():
             rep["stopped"] = True
             return _finish(rep, out_dir, t_start)
@@ -356,15 +383,17 @@ def run(job: dict) -> int:
         main, control = thinkcheck.questions(thinkcheck.load_suite(), settings)
         reqs = thinkcheck.requests_for(main, control, settings)
         e = job.get("engine") or {}
-        engine = vllmengine.Engine(cfg, model, adapter=adapter, quant=thinkcheck_vllm.quant_of(job), extra_args=e.get("extra_args"))
+        engine = vllmengine.Engine(cfg, model, adapter=adapter, quant=thinkcheck_vllm.quant_of(job), extra_args=e.get("extra_args"), gpu_util=util_now)
         protocol.progress("selftest", 0.15, "Starting the engine (a first start downloads the image and the model)")
         t_wait = time.monotonic()
         try:
             engine.start()
+            list_sample(rep, cfg)
             engine.wait_ready(float(job.get("start_timeout") or vllmengine.DEFAULT_START_TIMEOUT), should_stop)
         except vllmengine.EngineError as exc:
             rep["error"] = str(exc)
             rep["timings"]["waited_for_ready_s"] = round(time.monotonic() - t_wait, 1)
+            list_sample(rep, cfg)
             rep["exit_logs"] = engine.exit_logs or engine.logs_tail(60)       # read before `_finish` removes the container
             rep["highlights"] = vllmengine.log_highlights(rep["exit_logs"] + "\n" + engine.log_text())
             return _finish(rep, out_dir, t_start, engine)
@@ -427,7 +456,7 @@ def _finish(rep: dict, out_dir: Path, t_start: float, engine=None) -> int:
             rep["exit_logs"] = engine.exit_logs
     if engine is not None and engine.kind == "wslc":
         rep.setdefault("hints", []).append("wslc syntax unverified: the commands above are templates; adapt them from the help output in this report.")
-    rep["criteria"] = criteria_of(rep) if not rep.get("error") and not rep.get("stopped") else []
+    rep["criteria"] = criteria_of(rep) if not rep.get("error") and not rep.get("stopped") else [{**c, "value": None, "ok": None, "not_reached": True} for c in criteria_of({})]
     rep["verdict"], rep["verdict_text"] = verdict(rep)
     if rep.get("short_answers") and rep.get("answer_tokens"):
         rep["verdict_text"] += " " + short_sentence(rep["answer_tokens"])

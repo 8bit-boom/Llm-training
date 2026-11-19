@@ -69,7 +69,7 @@ def test_wslc_list_json_is_read_defensively():
     assert ve.wslc_running("[]", "ndforge-vllm-5") is False
     assert ve.wslc_running('[{"Name": "other", "State": "running"}]', "ndforge-vllm-5") is False
     assert ve.wslc_running("not json", "ndforge-vllm-5") is None
-    assert ve.wslc_running('[{"id": "ndforge-vllm-5", "weird": 1}]', "ndforge-vllm-5") is None
+    assert ve.wslc_running('[{"id": "ndforge-vllm-5", "weird": 1}]', "ndforge-vllm-5") is True
     t = ve.WSLC_TEMPLATES
     assert (t["stop"], t["remove"], t["logs"], t["pull"]) == ("wslc stop -t 30 {name}", "wslc remove -f {name}", "wslc logs -n 60 {name}", "wslc pull -q {image}")
 

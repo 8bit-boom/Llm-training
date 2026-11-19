@@ -20,7 +20,9 @@ pub const MIN_DRIVER: u32 = 580;
 /// The WSL version the report names (the crash fix); newer is assumed fine.
 pub const MIN_WSL: [u32; 3] = [2, 7, 3];
 /// vLLM reserves about 88 % of the card: anything else using more than this blocks a start.
-pub const BUSY_MB: u64 = 2048;
+pub const DEFAULT_UTIL: f64 = 0.88;
+/// Below this share of the card the engine is not started; the share is lowered to fit next to what other programs already use (same rule as the worker's `plan_gpu_util`).
+pub const UTIL_FLOOR: f64 = 0.70;
 pub const KINDS: [&str; 5] = ["docker", "docker_wsl", "wslc", "wsl", "url"];
 
 /// Runs a program: `Some((succeeded, output))`, None when it could not be started or took too long.
@@ -37,6 +39,34 @@ pub fn real_runner(args: &[&str]) -> Option<(bool, String)> {
         let _ = tx.send(cmd.output().ok().map(|o| (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)).replace('\0', ""))));
     });
     rx.recv_timeout(Duration::from_secs(25)).ok().flatten()
+}
+
+/// How much of the card vLLM may take when other programs already use `used_mb` of `total_mb`: the engine reserves `util x total`; it needs `free >= that + 0.5 GB`, else the share is lowered to
+/// `(free - 0.6 GB) / total`; below 0.70 it is refused. `ok` None = the memory could not be read (continuing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPlan {
+    pub util: f64,
+    pub ok: Option<bool>,
+    pub lowered: bool,
+    pub text: String,
+}
+
+pub fn gpu_plan(total_mb: Option<u64>, used_mb: Option<u64>, configured: f64) -> GpuPlan {
+    let (Some(total), Some(used)) = (total_mb.filter(|t| *t > 0), used_mb) else {
+        return GpuPlan { util: configured, ok: None, lowered: false, text: "The memory in use on the card could not be read (nvidia-smi did not answer): continuing with the configured share.".into() };
+    };
+    let (t, u) = (total as f64, used as f64);
+    let free = t - u;
+    let gb = |x: f64| x / 1024.0;
+    if free >= configured * t + 512.0 {
+        return GpuPlan { util: configured, ok: Some(true), lowered: false, text: format!("{:.1} GB of the card are in use; {:.1} GB are free and the engine takes {:.1} GB ({configured} of the card): fine.", gb(u), gb(free), gb(configured * t)) };
+    }
+    let util = configured.min((free - 614.0) / t);
+    if util < UTIL_FLOOR {
+        return GpuPlan { util: configured, ok: Some(false), lowered: false, text: format!("{:.1} GB of the card ({:.1} GB) are in use by other programs (the desktop, a browser, Ollama, llama-server ...): only {:.1} GB are free, and even {UTIL_FLOOR} of the card ({:.1} GB) does not fit. Close those programs and try again.", gb(u), gb(t), gb(free), gb(UTIL_FLOOR * t)) };
+    }
+    let util = ((util - 0.0049) * 100.0).round() / 100.0;
+    GpuPlan { util, ok: Some(true), lowered: true, text: format!("Other programs use {:.1} GB of the card; vLLM will take {util} instead of {configured} of it.", gb(u)) }
 }
 
 /// The first `x.y` or `x.y.z...` number in a text, as numbers (tolerant of localized labels: "WSL version: 3.0.1.0", "Version de WSL : 2.7.3").
@@ -185,7 +215,7 @@ pub fn status(s: &VllmSettings, run: Runner) -> Value {
            "driver": f.driver, "vram_used_mb": f.vram_used_mb, "vram_total_mb": f.vram_total_mb})
 }
 
-/// The checks before a vLLM job: the engine is there, the graphics card is free (nothing else uses more than about 2 GB), the driver and WSL are not too old.
+/// The checks before a vLLM job: the engine is there, the graphics card has room (`gpu_plan`: the share is lowered to fit next to other programs, refused below 0.70), the driver and WSL are not too old.
 pub fn preflight_checks(s: &VllmSettings, f: &Facts) -> Vec<Check> {
     let c = |id, label, light, detail: &str, fix: &str| Check { id, label, light, detail: detail.to_string(), fix: fix.to_string(), action: None };
     let used = used_kind(s, f);
@@ -196,12 +226,12 @@ pub fn preflight_checks(s: &VllmSettings, f: &Facts) -> Vec<Check> {
         c("vllm_engine", "vLLM engine (experimental)", Light::Fail, "No way to run the vLLM engine was found (Docker, Docker inside WSL, WSLc, or vLLM in WSL).",
           "Open Settings, vLLM engine: it explains what to install. Or check with the standard engine instead.")
     });
-    match f.vram_used_mb {
-        Some(u) if u > BUSY_MB => out.push(c("vllm_gpu", "Graphics card free", Light::Fail, &format!("Something else is using {:.1} GB of the graphics card's memory; the vLLM engine takes about 88 % of it.", u as f64 / 1024.0),
-                                              "Close the programs that use the card (a browser tab with video, Ollama, llama-server, a training run), then try again.")),
-        Some(u) => out.push(c("vllm_gpu", "Graphics card free", Light::Ok, &format!("{:.1} GB in use.", u as f64 / 1024.0), "")),
-        None => out.push(c("vllm_gpu", "Graphics card free", Light::Warn, "The memory in use could not be read (nvidia-smi did not answer).", "Install or update the NVIDIA driver.")),
-    }
+    let g = gpu_plan(f.vram_total_mb, f.vram_used_mb, DEFAULT_UTIL);
+    out.push(match g.ok {
+        Some(true) => c("vllm_gpu", "Graphics card free", Light::Ok, &g.text, ""),
+        Some(false) => c("vllm_gpu", "Graphics card free", Light::Fail, &g.text, "Close the programs that use the card (a browser tab with video, Ollama, llama-server, a training run), then try again."),
+        None => c("vllm_gpu", "Graphics card free", Light::Warn, &g.text, "Install or update the NVIDIA driver."),
+    });
     if !f.driver.is_empty() {
         let (l, t) = driver_check(&f.driver);
         if l != Light::Ok {

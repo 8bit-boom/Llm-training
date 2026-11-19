@@ -76,6 +76,12 @@ def make_engine(job: dict) -> "vllmengine.Engine":
     except vllmengine.EngineError as exc:
         raise ThinkCheckError(str(exc)) from exc
     e = job.get("engine") or {}
+    total, used = vllmengine.gpu_mb()
+    g = vllmengine.plan_gpu_util(total, used, float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
+    if g["ok"] is False:
+        raise ThinkCheckError(g["text"])
+    job["engine"] = e = {**e, "gpu_memory_utilization": g["util"]}          # lowered when other programs use the card; the weights' fit below uses it
+    job.setdefault("_engine_report", {})["gpu"] = g
     pick = pick_of(job)
     if pick["fits"] is False:
         raise ThinkCheckError(pick["reason"])
