@@ -15,3 +15,4 @@ pub mod plan;
 pub mod runs;
 pub mod search;
 pub mod thinkcheck;
+pub mod tracegen;

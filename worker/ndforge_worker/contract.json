@@ -27,6 +27,7 @@
   "selftest",
   "think_check",
   "think_check_plan",
+  "trace_gen",
   "train",
   "vllm_selftest"
  ],
@@ -73,6 +74,7 @@
   "reshape_refused",
   "think_check_failed",
   "torch_missing",
+  "trace_gen_failed",
   "train_failed",
   "unknown_job",
   "usage",

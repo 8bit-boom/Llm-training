@@ -56,6 +56,18 @@ plus the adapter is "closer to what ships", not "as trained"). Round numbers fro
 the self-test (LoRA folder field) shows the same numbers and sensible answers on 2-3 rounds. DoRA and LoftQ adapters are not served by vLLM: a round with one falls back to the standard
 engine; so does any vLLM problem; the result carries a plain `fallback` note and the log says it. A round check never fails because of the experiment.
 
+## Thinking answers written by the original (step 6)
+
+Under a made model, "Make thinking answers with the original model": the original (or a model of your choice) answers prompts WITH its thinking; kept answers go to
+`models/<name>/trace_gen/answers.jsonl` in the format of a heal's "My own file" general source (`messages` with `<think>...</think>` inline). The way is chosen by the worker: the experimental vLLM
+engine when it is switched on and works, else llama-server (a GGUF file and llama.cpp), else the standard engine; a way that fails falls back to the next with a plain note. For the 27 B original
+the configured pre-quantized checkpoint is served (its answers differ a little from the original's).
+
+An answer is kept when `</think>` was written, the answer after it is not empty, the token limit (default 6144) did not cut it, it is no loop (`thinkcheck.loop_detect`) and not garbled
+(`garbage_detect`). Rejected prompts are remembered (`answers.jsonl.rejected.jsonl`; delete it to retry) and a second run goes on with new prompts (resume by the hash of the prompt); Stop keeps
+what was written. **Speed**: the report estimates 350-550 tokens per second on vLLM (1.3-2.0 million tokens per hour) against about 0.2 million on the standard engine, i.e. 5-10 times: an
+estimate from a research report, not measured here; the self-test measures your PC. llama-server with many slots was never measured on this model.
+
 ## The vLLM self-test (Training setup, vLLM engine card)
 
 The research report's 1-hour experiment, run for you as far as the app can. You choose a model (a folder or a Hugging Face id; the default is the configured pre-quantized original, about 21 GB:

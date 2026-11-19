@@ -74,3 +74,21 @@ test("the self-test card warns about the download, is disabled while the engine 
   b.run(`onVllmEvent({ kind: "done" })`);
   assert.equal(b.run("vl.run"), null);
 });
+
+test("the thinking-answers card names the original, explains the filters and the estimate, and shows what is kept", () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState() });
+  open(b, null);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Make thinking answers with the original model/); assert.match(html, /the thinking must be closed/); assert.match(html, /The standard engine is used/);
+  assert.match(html, /id="tg-go"[^>]*disabled/, "nothing to ask without prompts");
+  open(b, { enabled: true, kind: "auto" });
+  b.run(`tg.name = ${JSON.stringify(NAME)}; tg.source = "p.jsonl"; tg.state = { file: "/p/answers.jsonl", count: 12, rejected: 3, bytes: 1 }`);
+  html = b.run("renderReshape()");
+  assert.match(html, /experimental vLLM engine will be used/); assert.match(html, /an estimate from a research report/);
+  assert.doesNotMatch(html, /id="tg-go"[^>]*disabled/);
+  assert.match(html, /12 answers are kept in/); assert.match(html, /3 prompts were rejected/);
+  b.run(`tg.run = { name: ${JSON.stringify(NAME)}, text: "Answer 3 of 10", progress: 0.3 }`);
+  assert.match(b.run("renderReshape()"), /id="tg-stop"/);
+  b.run(`onTraceEvent({ kind: "done", data: { kept: 7, attempted: 10, backend: "vllm", stopped: false, notes: [] } })`);
+  assert.match(b.run("tg.ok"), /Done\. 7 of 10 answers kept \(way: vllm\)/);
+});

@@ -2835,7 +2835,7 @@ function madeCard(m) {
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}${traceCard(m)}</div>`;
 }
 
 
@@ -3313,6 +3313,56 @@ function onThinkEvent(p) {
     if (name) { tkLoad(name); return; }
   }
   if (page === "reshape") render();
+}
+
+// "Make thinking answers with the original model" (worker job trace_gen, docs/VLLM.md): the original writes thinking answers for prompts; they are filtered and kept in a jsonl file that a
+// heal can use as "My own file". The way (vLLM when it is switched on, else llama-server, else the standard engine) is chosen by the worker; speeds are estimates.
+const tg = { name: null, state: null, source: "", column: "", limit: 200, run: null, err: null, ok: null };
+function traceCard(m) {
+  if (!m.summary || m.status !== "done") return "";
+  const s = tg.name === m.name ? tg.state : null;
+  const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || rs.tk.run || tg.run;
+  const vOn = !!vllmSettings().enabled;
+  return `<div class="card-in" id="tg-card"><h3>Make thinking answers with the original model</h3>
+    <p class="dim small">The original model writes answers WITH its thinking for prompts you give (a file or a dataset), so a heal can learn from them. Each answer is checked: the thinking must be closed, the answer not empty, not cut by the length limit, no loops, no garbled text; the rest is thrown away and not asked again. A second run goes on where the first stopped; Stop keeps what was written. ${vOn ? "The experimental vLLM engine will be used when it works (estimated 5 to 10 times faster than the standard engine: an estimate from a research report, not measured on this PC); otherwise the standard engine." : "The standard engine is used (slow for a big original: the vLLM engine in Training setup is the experimental, faster way)."}</p>
+    <div class="row"><label>Prompts: a file or a Hugging Face dataset <input type="text" id="tg-source" value="${esc(tg.source)}" placeholder="C:\\prompts.jsonl or mlabonne/open-perfectblend" style="min-width:300px"></label>
+      <label>Column (optional) <input type="text" id="tg-column" value="${esc(tg.column)}" style="width:8em"></label>
+      <label>Prompts to try <input type="number" id="tg-limit" min="1" value="${esc(String(tg.limit))}" style="width:6em"></label></div>
+    ${pfBox("trace_gen", vOn ? { backend: "vllm" } : {})}
+    <div class="row"><button class="primary" id="tg-go" ${busy || !rs.state.env_ready || !tg.source.trim() ? "disabled" : ""}>Make the answers</button>${tg.run && tg.run.name === m.name ? `<button class="secondary" id="tg-stop">Stop</button>` : ""}</div>
+    ${tg.run && tg.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tg.run.text)}</div>${tg.run.progress != null ? `<progress max="1" value="${tg.run.progress}"></progress>` : ""}` : ""}
+    ${tg.err ? errDiv(tg.err, "p") : tg.ok ? `<p class="ok">${esc(tg.ok)}</p>` : ""}
+    ${s && s.count ? `<p class="small" id="tg-state">${s.count} answers are kept in <code>${esc(s.file)}</code> ${copyBtn(s.file)} (${s.rejected} prompts were rejected). Use the file as "My own file" in the general text of a heal.</p>` : ""}</div>`;
+}
+async function tgLoad(name) {
+  tg.name = name;
+  try { tg.state = await invoke("trace_gen_state", { name }); } catch (_) { tg.state = null; }
+  if (page === "reshape") render();
+}
+function onTraceEvent(p) {
+  if (p.kind === "progress") { if (tg.run) { tg.run.text = p.text || p.step; tg.run.progress = p.value; } }
+  else if (p.kind === "error") { tg.run = null; tg.err = p.text; }
+  else if (p.kind === "done") {
+    const d = p.data || {}, name = tg.run && tg.run.name;
+    tg.run = null;
+    tg.ok = `${d.stopped ? "Stopped. " : "Done. "}${d.kept || 0} of ${d.attempted || 0} answers kept${d.backend ? " (way: " + d.backend + ")" : ""}${(d.notes || []).length ? ". " + d.notes.join(" ") : ""}${d.note ? " " + d.note : ""}`;
+    if (name) { tgLoad(name); return; }
+  }
+  if (page === "reshape") render();
+}
+function wireTrace() {
+  const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
+  if (m && tg.name !== m.name && !tg.run) tgLoad(m.name);
+  const src = $("tg-source"); if (src) src.oninput = () => { tg.source = src.value; };
+  const col = $("tg-column"); if (col) col.oninput = () => { tg.column = col.value; };
+  const lim = $("tg-limit"); if (lim) lim.oninput = () => { tg.limit = Math.max(1, Math.floor(+lim.value) || 200); };
+  const go = $("tg-go"); if (go) go.onclick = () => {
+    if (!m) return;
+    tg.source = (($("tg-source") || {}).value || "").trim(); tg.column = (($("tg-column") || {}).value || "").trim(); tg.limit = Math.max(1, Math.floor(+(($("tg-limit") || {}).value) || 200));
+    tg.run = { name: m.name, text: "Starting…", progress: null }; tg.err = null; tg.ok = null; render();
+    invoke("trace_gen_start", { spec: { name: m.name, source: tg.source, column: tg.column || null, limit: tg.limit } }).catch((e) => { tg.run = null; tg.err = String(e); render(); });
+  };
+  const st = $("tg-stop"); if (st) st.onclick = () => { if (tg.run) tg.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
 
 function wireThink() {
@@ -3912,6 +3962,7 @@ function onReshapeEvent(p) {
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
+  if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "healbench") return onHealBenchEvent(p);
   if (p.phase === "try") return onTryEvent(p);
@@ -4088,6 +4139,7 @@ function wireReshape() {
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
   wireHealSection();
   wireThink();
+  wireTrace();
   wireAuto();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
