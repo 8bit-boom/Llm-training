@@ -1894,3 +1894,55 @@ fn the_report_of_a_run_with_rounds_has_the_table_the_stop_and_the_comparison_wit
     let md2 = std::fs::read_to_string(run_dir(&p2, &st2.id).join("auto_report.md")).unwrap();
     assert!(!md2.contains("Healing in rounds"));
 }
+
+#[test]
+fn a_heal_in_rounds_weighs_its_worst_case_says_where_it_is_and_jumps_forward_when_it_stops_early() {
+    use ndforge_core::reshape::auto_progress::ProgressTracker;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let mut st = start(&p, &mut fx, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let rt = st.plan.as_ref().unwrap().time.as_ref().unwrap().steps.iter().find(|s| s.id == "s1.heal").unwrap().rounds.clone().expect("the plan has the rounds");
+    // the first heal is running, everything before it is done
+    for s in st.steps.iter_mut() {
+        s.status = if s.id == "s1.heal" { "running".into() } else if matches!(s.id.as_str(), "plan" | "measure" | "try" | "s1.cut" | "s1.check_cut") { "done".into() } else { "pending".into() };
+    }
+    let mut t = ProgressTracker::new();
+    let first = t.sync(&st, 1000.0);
+    let w = first["steps"].as_array().unwrap().iter().find(|s| s["id"] == "s1.heal").unwrap()["weight_min"].as_f64().unwrap();
+    assert!((w - (rt.worst.1 * 10.0).round() / 10.0).abs() < 0.11, "the weight is the worst case: {w} {:?}", rt.worst);
+    // round 3 of 8 trains: the bar is a fraction of the worst case, the line under it says where the heal is
+    let rounds_max = rt.rounds.1;
+    for (n, decision) in [(1, "continue"), (2, "continue")] {
+        t.on_event(&json!({"kind": "heal_round", "phase": "heal", "round": n, "rounds_max": rounds_max, "tokens_m": 5.0 * n as f64, "cap_m": 40.0, "decision": decision, "check": if n == 2 { json!({"mode": "quick", "verdict": "fail", "main": {"closed_rate": 0.69, "loop_rate": 0.13}}) } else { Value::Null }}), 1010.0 + n as f64 * 2.0);
+    }
+    let a = t.on_event(&json!({"kind": "metric", "step": 100, "total_steps": 200, "round": 3, "tok_s": 1000.0}), 1030.0).unwrap();
+    let sub = a["step"]["sub"].as_str().unwrap();
+    assert!(sub.starts_with(&format!("Round 3 of up to {rounds_max} · 10 M of 40 M tokens · last check: fail (closed 69 %, loops 13 %)")), "{sub}");
+    assert_eq!(a["state"], "live");
+    assert_eq!(a["step"]["rounds"]["n"], 3);
+    let (lo, hi) = (a["left_s"][0].as_f64().unwrap(), a["left_s"][1].as_f64().unwrap());
+    assert!(lo > 0.0 && lo < hi, "{lo} {hi}: a range, the best case below the worst");
+    // a stop decision: only the merge and the check of the merged model are left; the heal is at its end
+    let before = a["step"]["pct"].as_f64().unwrap();
+    let b = t.on_event(&json!({"kind": "heal_round", "phase": "heal", "round": 3, "rounds_max": rounds_max, "tokens_m": 15.0, "cap_m": 40.0, "decision": "stop_pass", "check": {"verdict": "pass", "main": {"closed_rate": 0.97, "loop_rate": 0.0}}}), 1040.0).unwrap();
+    assert!(b["step"]["pct"].as_f64().unwrap() > before && b["step"]["pct"].as_f64().unwrap() >= 95.0, "{b}");
+    assert!(b["step"]["sub"].as_str().unwrap().starts_with("After round 3 · 15 M of 40 M tokens"), "{}", b["step"]["sub"]);
+    // when the step is done it counts for its whole weight: the bar jumps forward
+    let mut done = st.clone();
+    done.steps.iter_mut().find(|s| s.id == "s1.heal").unwrap().status = "done".into();
+    let c = t.sync(&done, 1100.0);
+    assert!(c["pct"].as_f64().unwrap() > b["pct"].as_f64().unwrap());
+    // a step that is not a heal in rounds is untouched
+    let mut t2 = ProgressTracker::new();
+    let mut plain_fx = Mock::new();
+    let plain = start(&project(tempdir().unwrap().path()), &mut plain_fx, spec(21.1)).unwrap();
+    let mut plain_run = plain.clone();
+    for s in plain_run.steps.iter_mut() {
+        s.status = if s.id == "s1.heal" { "running".into() } else if matches!(s.id.as_str(), "plan" | "measure" | "try" | "s1.cut" | "s1.check_cut") { "done".into() } else { "pending".into() };
+    }
+    let snap = t2.sync(&plain_run, 1000.0);
+    assert!(snap["step"].get("rounds").is_none());
+    assert!(t2.on_event(&json!({"kind": "heal_round", "round": 1, "decision": "continue"}), 1005.0).is_none(), "the event means nothing to a heal that is not in rounds");
+}

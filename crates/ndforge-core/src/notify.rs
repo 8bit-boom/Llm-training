@@ -58,6 +58,31 @@ pub fn stage_toast(n: u32, of: u32, pct: f64, left_min: Option<f64>) -> (String,
     (format!("Auto-cut: stage {n} of {of} healed"), format!("{} % done{left}.", pct.round() as i64))
 }
 
+/// The notification for a `heal_round` event of a heal in rounds, only where the person is told: the round that passed, the end of the rounds (cap, plateau, time) and the result of the merged
+/// model. (title, body); None for every other decision. Pure text; webhooks never get it (they say the kind and the status only).
+pub fn heal_round_toast(ev: &Value) -> Option<(String, String)> {
+    let n = ev["round"].as_u64().unwrap_or(0);
+    let tokens = ev["tokens_m"].as_f64().unwrap_or(0.0);
+    let cap = ev["cap_m"].as_f64().unwrap_or(0.0);
+    let m = |x: f64| if x.fract() == 0.0 { format!("{}", x as i64) } else { format!("{x:.1}") };
+    match ev["decision"].as_str()? {
+        "stop_pass" => Some((format!("Auto-cut: heal round {n} passed the thinking check"), "Merging the model and checking the merged model.".into())),
+        "stop_plateau" => Some((format!("Auto-cut: healing stopped after round {n}"), "Neither the thinking nor the loss improves any more. Merging the model and checking it.".into())),
+        "stop_cap" | "stop_never" => Some((format!("Auto-cut: healing reached its most tokens ({} M)", m(cap)), "Merging the model and checking the merged model.".into())),
+        "stop_time" => Some((format!("Auto-cut: healing stopped after round {n}"), "The time limit leaves no room for another round. Merging the model and checking it.".into())),
+        "merged_fail" => Some((format!("Auto-cut: the merged model did not pass after round {n}"), "Healing goes on; it now needs two passed checks in a row.".into())),
+        "final" => {
+            let verdict = ev["check"]["verdict"].as_str().unwrap_or("fail");
+            if verdict == "fail" {
+                Some(("Auto-cut: the merged model did not pass its thinking check".into(), format!("Not good enough after {} M tokens.", m(tokens))))
+            } else {
+                Some((format!("Auto-cut: the merged model passed its thinking check ({verdict})"), format!("After {} M tokens of at most {} M.", m(tokens), m(cap))))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// "It is done. It took 31 h (estimated 28-40 h)." for a finished Auto-cut, from its saved state; plain "It is done." without the figures.
 pub fn auto_done_body(state: &Value) -> String {
     let took = state["progress"]["elapsed_s"].as_f64().filter(|s| *s > 0.0);

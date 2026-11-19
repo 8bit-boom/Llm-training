@@ -89,6 +89,9 @@ pub struct RoundsTime {
     pub worst: (f64, f64),
     /// the heal reads the saved answers of a model that thinks (checks), or only watches the loss
     pub thinking: bool,
+    /// the merge and the check of the merged model, which come once at the end
+    #[serde(default)]
+    pub tail: (f64, f64),
 }
 
 /// What the time of a heal in rounds depends on.
@@ -379,6 +382,7 @@ pub fn rounds_estimate(h: &History, i: &RoundsIn) -> (Vec<StepPart>, RoundsTime)
     }
     let tail = rounds_tail(h, i);
     let t = sum_r(&tail, |_| true);
+    let t_tail = t;
     best = (best.0 + t.0, best.1 + t.1);
     worst = (worst.0 + t.0, worst.1 + t.1);
     // one round of the middle with its check, the original answering all of it
@@ -401,7 +405,7 @@ pub fn rounds_estimate(h: &History, i: &RoundsIn) -> (Vec<StepPart>, RoundsTime)
     }
     let t = RoundsTime {
         round_m: i.round_m, first_check_m: first.round() as u32, cap_m: i.cap_m, rounds: (n_min, n_max), per_round: (r1(per.0), r1(per.1)), overhead_share, best: (r1(best.0), r1(best.1)), worst: (r1(worst.0), r1(worst.1)),
-        thinking: i.thinking,
+        thinking: i.thinking, tail: (r1(t_tail.0), r1(t_tail.1)),
     };
     (parts, t)
 }

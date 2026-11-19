@@ -1081,6 +1081,11 @@ impl AutoBar {
                     self.shown = true;
                 }
             }
+        } else if self.notify && v["kind"] == "heal_round" {
+            // a heal in rounds: only a stop decision or the verdict on the merged model is told (not every round)
+            if let Some((t, b)) = ndforge_core::notify::heal_round_toast(v) {
+                Toast(self.app.clone()).show(&t, &b);
+            }
         } else if self.notify && v["kind"] == "auto" && v["status"] == "done" {
             let id = v["auto_step"].as_str().unwrap_or("");
             if let (Some(n), Some(of)) = (ndforge_core::notify::auto_stage_end(id, self.thinking), self.snap["stage"]["of"].as_u64()) {

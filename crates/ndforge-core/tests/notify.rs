@@ -102,3 +102,21 @@ fn the_window_title_comes_from_the_snapshot() {
     let est = json!({"pct": 3.0, "state": "estimating", "left_s": [1.0, 2.0], "stage": null, "step": {"label": "Measure the model"}});
     assert_eq!(title_of(&est), "Auto-cut 3 % · Measure the model");
 }
+
+#[test]
+fn a_heal_in_rounds_tells_the_person_only_when_it_stops_or_the_merged_model_is_judged() {
+    let ev = |d: &str, extra: serde_json::Value| { let mut e = json!({"kind": "heal_round", "round": 3, "tokens_m": 15.0, "cap_m": 40.0, "decision": d}); for (k, v) in extra.as_object().cloned().unwrap_or_default() { e[k] = v; } e };
+    assert_eq!(heal_round_toast(&ev("continue", json!({}))), None);
+    assert_eq!(heal_round_toast(&ev("baseline", json!({}))), None);
+    let (t, b) = heal_round_toast(&ev("stop_pass", json!({}))).unwrap();
+    assert_eq!((t.as_str(), b.as_str()), ("Auto-cut: heal round 3 passed the thinking check", "Merging the model and checking the merged model."));
+    assert!(heal_round_toast(&ev("stop_plateau", json!({}))).unwrap().1.contains("Neither the thinking nor the loss"));
+    assert!(heal_round_toast(&ev("stop_cap", json!({}))).unwrap().0.contains("most tokens (40 M)"));
+    assert!(heal_round_toast(&ev("stop_time", json!({}))).unwrap().1.contains("time limit"));
+    assert!(heal_round_toast(&ev("merged_fail", json!({}))).unwrap().1.contains("two passed checks in a row"));
+    assert_eq!(heal_round_toast(&ev("final", json!({"check": {"verdict": "fail"}, "tokens_m": 40.0}))).unwrap(), ("Auto-cut: the merged model did not pass its thinking check".to_string(), "Not good enough after 40 M tokens.".to_string()));
+    let (t, b) = heal_round_toast(&ev("final", json!({"check": {"verdict": "warn"}}))).unwrap();
+    assert!(t.contains("passed") && t.contains("warn") && b == "After 15 M tokens of at most 40 M.");
+    // the webhook still says the kind and the status only
+    assert_eq!(webhook_text("auto", "finished"), "ND Lore Forge: auto-cut finished");
+}
