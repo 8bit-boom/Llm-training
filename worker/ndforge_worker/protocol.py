@@ -48,8 +48,29 @@ def log(text: str) -> None:
     emit("log", text=text)
 
 
-def progress(step: str, value: float, text: str = "") -> None:
-    emit("progress", step=step, value=round(float(value), 4), text=text)
+def progress(step: str, value: float, text: str = "", detail: dict | None = None) -> None:
+    """A progress line. `detail` (optional, see `make_detail`) is an additive key: without it the line is byte-identical to the older ones."""
+    if detail:
+        emit("progress", step=step, value=round(float(value), 4), text=text, detail=detail)
+    else:
+        emit("progress", step=step, value=round(float(value), 4), text=text)
+
+
+def make_detail(unit: str, done, total, started: float | None = None, now: float | None = None, rate_unit: str | None = None,
+                done_at_start=0) -> dict:
+    """What a progress line says in numbers: `{unit, done, total, rate, rate_unit, eta_s}`. The rate comes from the work done since `started`
+    (a monotonic time; `done_at_start` is what was done before this run began), the estimate of the time left from the rate; both are left out until there is a rate."""
+    d: dict = {"unit": unit, "done": round(float(done), 3), "total": round(float(total), 3)}
+    if started is not None:
+        spent = (now if now is not None else time.monotonic()) - started
+        gained = float(done) - float(done_at_start)
+        if spent > 0 and gained > 0:
+            rate = gained / spent
+            d["rate"] = round(rate, 3)
+            if rate_unit:
+                d["rate_unit"] = rate_unit
+            d["eta_s"] = round(max(0.0, float(total) - float(done)) / rate, 1)
+    return d
 
 
 # keys the running job collects for its result (which kernels ran, the timings): `result` adds them to a dict answer unless the answer has the key already

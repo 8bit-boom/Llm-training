@@ -134,6 +134,18 @@ fn worker_events_and_crashes_are_reported() {
     let r = run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |e| ev.push(e)).unwrap();
     assert_eq!(r, json!({"ok": true}));
     assert_eq!(ev, vec![WorkerEvent::Log("hi".into()), WorkerEvent::Progress { step: "s".into(), value: 0.5, text: "half".into() }, WorkerEvent::Log("not json".into())]);
+    // a progress line with `detail` keeps it, tagged "progress"; one without stays a plain Progress
+    std::fs::write(&fake, "#!/bin/sh\necho '{\"type\":\"progress\",\"step\":\"cache\",\"value\":0.5,\"text\":\"t\",\"detail\":{\"unit\":\"tokens\",\"done\":5,\"total\":10}}'\necho '{\"type\":\"result\",\"data\":{}}'\n").unwrap();
+    let mut ev = Vec::new();
+    run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |e| ev.push(e)).unwrap();
+    match &ev[0] {
+        WorkerEvent::Other(v) => {
+            assert_eq!(v["kind"], "progress");
+            assert_eq!(v["step"], "cache");
+            assert_eq!(v["detail"]["total"], 10);
+        }
+        other => panic!("{other:?}"),
+    }
     std::fs::write(&fake, "#!/bin/sh\nexit 7\n").unwrap();
     assert!(run_job(&fake, d.path(), &json!({"job": "x"}), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0.contains("exit code 7"));
     std::fs::write(&fake, "#!/bin/sh\necho '{\"type\":\"error\",\"code\":\"c\",\"message\":\"Plain words\"}'\nexit 1\n").unwrap();

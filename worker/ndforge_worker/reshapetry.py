@@ -553,12 +553,13 @@ def run_try(cfg: dict) -> int:
     mlp = meas["mlp"] if meas else None
     size = dims["intermediate"] if dims else 0
     stopped = False
+    t_pass0 = time.monotonic()
     try:
         for i, k in enumerate(todo):
             if stop():
                 stopped = True
                 break
-            protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}")
+            protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}", protocol.make_detail("passes", i, len(todo), t_pass0, rate_unit="passes/s"))
             try:
                 try:
                     res = _one_pass(model, layers, batches, period, k, mlp, size, stop)

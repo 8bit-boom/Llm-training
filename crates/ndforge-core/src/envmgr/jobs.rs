@@ -122,6 +122,12 @@ pub fn run_job(python: &Path, worker_dir: &Path, job: &Value, cancel: &AtomicBoo
         match serde_json::from_str::<Value>(line) {
             Ok(v) => match v["type"].as_str() {
                 Some("log") => on_event(WorkerEvent::Log(scrub(v["text"].as_str().unwrap_or("")))),
+                // a line with numbers (`detail`, additive) goes on as it came, tagged for the window; a plain line stays a `Progress`
+                Some("progress") if v["detail"].is_object() => {
+                    let mut line = v.clone();
+                    line["kind"] = serde_json::json!("progress");
+                    on_event(WorkerEvent::Other(line))
+                }
                 Some("progress") => on_event(WorkerEvent::Progress {
                     step: v["step"].as_str().unwrap_or("").to_string(), value: v["value"].as_f64().unwrap_or(0.0), text: v["text"].as_str().unwrap_or("").to_string(),
                 }),
