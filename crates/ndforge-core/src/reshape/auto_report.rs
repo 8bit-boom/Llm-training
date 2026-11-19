@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use super::auto::{AutoState, StageState};
+use super::auto_plan::StagePlan;
 use super::runs::write_json;
 use crate::error::Result;
 
@@ -40,6 +41,16 @@ fn failed_gates(check: &Option<Value>) -> Vec<String> {
 fn stage_json(s: &StageState) -> Value {
     let p = &s.plan;
     let summary = s.heal.as_ref().and_then(|h| h.summary.clone()).unwrap_or(Value::Null);
+    let mut out = stage_core(s, p, &summary);
+    // a stage healed in rounds: the latest heal's rounds hold every round (an extension goes on from the same ones); additive, absent without rounds
+    if let Some(r) = s.rounds.last() {
+        out["rounds"] = r.clone();
+        out["rounds_saved_m"] = json!((p.tokens_m as f64 + s.extra_tokens_m as f64 - r["tokens_m"].as_f64().unwrap_or(0.0)).max(0.0));
+    }
+    out
+}
+
+fn stage_core(s: &StageState, p: &StagePlan, summary: &Value) -> Value {
     json!({
         "index": p.index, "of": p.of, "params_b": p.params_b, "cut_pct": p.cut_pct, "blocks_cut": p.blocks_cut, "blocks_after": p.blocks_after,
         "mlp_width": p.intermediate_after, "tokens_m": s.heal.as_ref().map(|h| h.tokens_m).unwrap_or(p.tokens_m), "seq": p.seq, "rank": p.rank,
@@ -178,6 +189,45 @@ fn num(v: &Value, digits: usize) -> String {
     v.as_f64().map(|x| format!("{x:.digits$}")).unwrap_or_else(|| "-".into())
 }
 
+/// The section of a stage that healed in rounds: one row per round, the checks of the merged model, why it stopped, the tokens it did not need, and how the check of the model as it was
+/// trained compares with the check of the merged model (docs/HEAL_ROUNDS.md; experimental).
+fn rounds_markdown(st: &Value) -> String {
+    let r = &st["rounds"];
+    let mut s = format!("\n## Healing in rounds, stage {} (experimental)\n\n", st["index"]);
+    let reason = match r["stop"]["reason"].as_str().unwrap_or("") {
+        "pass" => "a round passed the thinking check",
+        "plateau" => "neither the thinking nor the loss improved any more",
+        "cap" => "the most tokens were trained",
+        "time" => "the time limit left no room for another round",
+        _ => "it ended",
+    };
+    s.push_str(&format!("It stopped after round {} ({} M tokens of at most {} M): {reason}. ", r["stop"]["round"], num(&r["stop"]["tokens_m"], 0), num(&r["cap_m"], 0)));
+    if let Some(saved) = st["rounds_saved_m"].as_f64().filter(|x| *x > 0.0) {
+        s.push_str(&format!("That is {saved:.0} M tokens less than the budget. "));
+    }
+    s.push_str("\n\n| Round | Tokens so far (M) | Finishes reasoning | Right answers | Loops | Score | Loss on your text | Decision | Minutes |\n|---|---|---|---|---|---|---|---|---|\n");
+    for x in r["rows"].as_array().cloned().unwrap_or_default() {
+        let m = &x["check"]["main"];
+        let (c, a, l, sc) = if m.is_object() { (pct(&m["closed_rate"]), pct(&m["accuracy"]), pct(&m["loop_rate"]), num(&x["check"]["score"], 2)) } else { ("-".into(), "-".into(), "-".into(), "-".into()) };
+        s.push_str(&format!("| {} | {} | {c} | {a} | {l} | {sc} | {} | {} | {} |\n", x["n"], num(&x["tokens_m"], 1), num(&x["calib_loss"], 3), x["decision"].as_str().unwrap_or("-"), x["seconds"].as_f64().map(|t| format!("{:.0}", t / 60.0)).unwrap_or_else(|| "-".into())));
+    }
+    for m in r["merged_checks"].as_array().cloned().unwrap_or_default() {
+        s.push_str(&format!("\nThe merged model after round {} did not pass ({}); healing went on and then needed two passed checks in a row.\n", m["after_round"], m["failed"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()));
+    }
+    if r["final"].is_object() {
+        let f = &r["final"];
+        s.push_str(&format!("\nThe merged model's check ({}): {}. Finishes reasoning {}, right answers {}, loops {}.", f["mode"].as_str().unwrap_or("-"), f["verdict"].as_str().unwrap_or("-"), pct(&f["main"]["closed_rate"]), pct(&f["main"]["accuracy"]), pct(&f["main"]["loop_rate"])));
+        // the check during healing looked at base + adapter, the final one at the merged weights: the same mode, side by side
+        let last = r["rows"].as_array().and_then(|a| a.iter().rev().find(|x| x["check"]["main"].is_object() && x["check"]["mode"] == f["mode"]).cloned());
+        if let Some(x) = last {
+            s.push_str(&format!(" The last round check in the same mode (the model as trained, base + adapter): finishes reasoning {}, right answers {}, loops {}.", pct(&x["check"]["main"]["closed_rate"]), pct(&x["check"]["main"]["accuracy"]), pct(&x["check"]["main"]["loop_rate"])));
+        }
+        s.push('\n');
+    }
+    s.push_str("\nExperimental: how long the loads and the checks of a round really take, whether the checks during healing agree with the check of the merged model, and whether healing in rounds ends as good as one long heal were not measured.\n");
+    s
+}
+
 /// The report as a page of Markdown.
 pub fn markdown(r: &Value) -> String {
     let mut s = String::new();
@@ -217,6 +267,9 @@ pub fn markdown(r: &Value) -> String {
             s.push_str(&format!("| {} blocks, MLP {} ({} B) | {} | {} | {} | {} | {} |\n", x["blocks"], x["intermediate"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unchanged".into()), num(&x["params_b"], 2), num(&x["loss"], 3),
                                  pct(&m["closed_rate"]), pct(&m["loop_rate"]), pct(&m["accuracy"]), if x["row"] == r["think_gate"]["winner"] { "yes" } else { "" }));
         }
+    }
+    for st in r["stages"].as_array().cloned().unwrap_or_default().iter().filter(|st| st["rounds"].is_object()) {
+        s.push_str(&rounds_markdown(st));
     }
     if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
         s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");

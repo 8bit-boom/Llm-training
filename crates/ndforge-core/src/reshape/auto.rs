@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::auto_speed;
+use super::heal_rounds;
 use super::auto_plan::{self, AutoPlan, AutoSpec, Candidate, StagePlan};
 use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
@@ -194,11 +195,14 @@ pub struct StageState {
     /// the healed model of the first try, healed again on top (attempt 1)
     #[serde(default)]
     pub retry_from: Option<HealRef>,
+    /// a heal in rounds (`spec.heal_rounds`): the `rounds` result of each heal of this stage (the latest has every round), for the report
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rounds: Vec<Value>,
 }
 
 impl StageState {
     pub fn new(plan: StagePlan) -> Self {
-        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, cut_loss: None, attempts: Vec::new(), retry_from: None }
+        StageState { plan, cut: None, heal: None, cut_check: None, heal_check: None, attempt: 0, extra_tokens_m: 0, passed: false, cut_loss: None, attempts: Vec::new(), retry_from: None, rounds: Vec::new() }
     }
 }
 
@@ -1069,11 +1073,50 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
         None => Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name),
     };
     let mut spec = st.stages[idx].plan.heal_spec(st.keep_thinking());
-    spec.tokens_m += st.stages[idx].extra_tokens_m;
+    let rounds = rounds_for(st, idx, fx.now_secs());
+    let student = if rounds.is_some() { Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name) } else { student };
+    match rounds {
+        // in rounds the stage goes on from its last round (the same run): the cap is higher, the student is still the cut
+        Some(r) => spec.rounds = Some(r),
+        None => spec.tokens_m += st.stages[idx].extra_tokens_m,
+    }
     let h = out!(fx.heal(&student, &teacher, &spec)?);
     made(st, "healed", &h.name, Some(h.model_id.clone()), idx as u32 + 1);
+    if let Some(r) = h.summary.as_ref().and_then(|s| s.get("rounds")).filter(|r| r.is_object()) {
+        st.stages[idx].rounds.push(r.clone());
+        if let Some(note) = r["notes"].as_array() {
+            for n in note.iter().filter_map(|n| n.as_str()) {
+                if !st.notes.iter().any(|x| x == n) {
+                    st.notes.push(format!("Stage {}: {n}", idx + 1));
+                }
+            }
+        }
+    }
     st.stages[idx].heal = Some(h);
     Ok(Flow::Done(None))
+}
+
+/// The settings of a heal in rounds for stage `idx` (None without `heal_rounds`): the cap is the stage's heal budget plus what an extension added, the original's numbers are passed in
+/// (it is checked once per run), the merged model is checked in the run's own mode, and with a time limit the heal must end early enough for the steps after it.
+fn rounds_for(st: &AutoState, idx: usize, now_secs: i64) -> Option<heal_rounds::RoundSpec> {
+    let o = st.spec.heal_rounds.as_ref()?;
+    let sg = &st.stages[idx];
+    let cap = sg.plan.tokens_m + sg.extra_tokens_m;
+    let mode = if st.spec.think_quick() { "quick" } else { "full" };
+    let baseline = st.baseline.as_ref().filter(|b| b["main"].is_object()).map(|b| json!({ mode: b["main"].clone() }));
+    let deadline = st.spec.max_hours.and_then(|max| {
+        let started = chrono::NaiveDateTime::parse_from_str(&st.created, "%Y-%m-%dT%H:%M:%SZ").ok()?.and_utc().timestamp();
+        let t = st.plan.as_ref()?.time.as_ref()?;
+        let heal = format!("s{}.heal", idx + 1);
+        // what has to run after this heal: the high end of the steps that are not done (this heal is the one in work)
+        let after: f64 = st.steps.iter().filter(|s| s.status != "done" && s.status != "skipped" && s.id != heal).filter_map(|s| t.steps.iter().find(|x| x.id == s.id)).map(|x| x.minutes.1).sum();
+        let _ = now_secs;
+        Some((started as f64 + max * 3600.0 - after * 60.0).max(0.0) as u64)
+    });
+    Some(heal_rounds::RoundSpec {
+        round_m: o.round_m, max_tokens_m: Some(cap), first_check_m: Some(o.first_check(sg.plan.tokens_m).min(cap)), check: if o.quick() { "quick".into() } else { "full".into() },
+        final_quick: Some(st.spec.think_quick()), stop: "pass".into(), plateau: true, baseline, deadline, extend: sg.extra_tokens_m > 0 && sg.attempt == 1, round_exact: None,
+    })
 }
 
 fn failed_names(chk: &Value) -> Vec<String> {
@@ -1109,11 +1152,24 @@ fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn E
     let n = idx + 1;
     let names = failed.join(", ");
     let ids = |what: &[&str]| -> Vec<String> { what.iter().map(|w| format!("s{n}.{w}")).collect() };
+    // a stage healed in rounds says why it ended: the cap (one more stretch of rounds), a plateau (more training would not help: back off), the time limit (the run ends)
+    let stop_reason = st.stages[idx].rounds.last().and_then(|r| r["stop"]["reason"].as_str().map(String::from));
+    let in_rounds = st.spec.heal_rounds.is_some() && stop_reason.is_some();
     // with the retry switched off the first failure goes straight to backing the cut off
     let attempt = match st.stages[idx].attempt {
         0 if !st.spec.retry_heal => 1,
+        0 if in_rounds && stop_reason.as_deref() == Some("plateau") => {
+            st.stages[idx].attempt = 1;
+            1
+        }
         a => a,
     };
+    if in_rounds && stop_reason.as_deref() == Some("time") {
+        let why = "The time limit left no room for more rounds, so the stage ended with what it had.";
+        st.notes.push(why.into());
+        st.error = Some(format!("The thinking check of the healed model of stage {n} failed ({names}); {why} The run stops here with its report."));
+        return Ok(Flow::Halt("gates_failed".into()));
+    }
     // "I have at most N hours": a retry or a stage made again that would end after the limit is not started
     if attempt <= 1 && (attempt == 0 || st.spec.back_off) {
         if let Some(why) = too_late(st, idx, attempt == 0, fx.now_secs()) {
@@ -1123,6 +1179,18 @@ fn gate_failed(st: &mut AutoState, idx: usize, failed: &[String], fx: &mut dyn E
         }
     }
     match attempt {
+        0 if in_rounds => {
+            // the stage reached its cap without a pass: ONE more stretch of rounds on the same run (the same student, the same answers of the original), not a second heal from scratch
+            let more = auto_plan::RETRY_TOKENS_M;
+            let sg = &mut st.stages[idx];
+            sg.heal = None;
+            sg.extra_tokens_m = more;
+            sg.attempt = 1;
+            let note = format!("Stage {n} missed its thinking check ({names}) after {} million tokens: healing goes on in rounds for {more} million more (the same run, with the same answers of the original).", sg.plan.tokens_m);
+            st.notes.push(note.clone());
+            reopen(st, &ids(&["heal", "check_heal"]));
+            return Ok(Flow::Retry(note));
+        }
         0 => {
             let stage_m = st.stages[idx].plan.tokens_m;
             let total_m = auto_plan::retry_total_m(stage_m);

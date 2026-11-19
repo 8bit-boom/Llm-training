@@ -2627,13 +2627,14 @@ function madeCard(m) {
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
-  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
-  {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"search_minutes": 30, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
-  {"id": "balanced", "label": "Balanced", "blurb": "Two stages, a lighter first stage (20 M tokens), the same sequence length in both stages so the original writes its answers only once, quick thinking checks (16 questions) and a quick Try first. The last stage keeps the recipe's tokens.", "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
-  {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"search_minutes": 10, "stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false}},
+  {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"search_minutes": 30, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null}},
+  {"id": "balanced", "label": "Balanced", "blurb": "Two stages, a lighter first stage (20 M tokens), the same sequence length in both stages so the original writes its answers only once, quick thinking checks (16 questions) and a quick Try first. The last stage keeps the recipe's tokens.", "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null}},
+  {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"search_minutes": 10, "stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false, "heal_rounds": null}},
+  {"id": "early", "label": "Stop early when good (periodic checks, experimental)", "blurb": "Balanced, but every stage heals in rounds of 5 M tokens with a quick thinking check after each round (not before 10 M) and stops at the first round that passes, then checks the merged model. The cap stays the recipe's tokens. Experimental: nobody has measured yet whether healing in rounds ends as good as one long heal.", "risk": "A quick check asks 16 questions, so one or two answers decide pass or fail; the merged model is checked again at the end and decides. Every round costs about 25 minutes of loading and checking, so a run that never passes takes a few hours longer than Balanced. Whether rounds reach the quality of one long heal is not known yet.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": {"round_m": 5, "check": "quick"}}},
   {"id": "custom", "label": "Custom", "blurb": "Your own choice in the advanced speed settings below.", "risk": "Whatever you set below the recipe is listed in the plan and the report.", "set": {}},
 ];
 const AC_CHIP = { pending: "waiting", running: "running", done: "done", skipped: "skipped", failed: "failed", stopped: "stopped" };
@@ -2653,7 +2654,7 @@ function acDefaults() {
 function acKnobs() {
   const sp = ac.sp;
   return { stages: ac.stages, stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, share_teacher_cache: !!sp.share, quick: !!ac.quick, think_quick: sp.tq == null ? !!ac.quick : !!sp.tq, think_gate: !!ac.gate, think_gate_n: ac.gateN,
-    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix };
+    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix, heal_rounds: sp.hr || null };
 }
 const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
 // the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
@@ -2661,6 +2662,7 @@ function acPresetNow() {
   const kn = acKnobs();
   const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
     if (k === "search_minutes" || (!ac.thinking && AC_THINK_KNOBS.includes(k))) return true;      // how long the search looks is not part of what makes a recipe
+    if (k === "heal_rounds") return JSON.stringify(kn[k]) === JSON.stringify(v);        // an object: compared by its content
     return kn[k] === (k === "think_quick" && v === null ? p.set.quick : v);
   }));
   return hit ? hit.id : "custom";
@@ -2676,6 +2678,7 @@ function acApplySet(set) {
     if (k === "stages") ac.stages = v; else if (k === "quick") ac.quick = !!v; else if (k === "think_gate") ac.gate = !!v; else if (k === "think_gate_n") ac.gateN = v;
     else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
     else if (k === "search_minutes") ac.sp.search = v;
+    else if (k === "heal_rounds") ac.sp.hr = v ? { ...v } : null;
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
@@ -2683,7 +2686,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }

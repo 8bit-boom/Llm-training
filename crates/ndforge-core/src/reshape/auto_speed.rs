@@ -44,7 +44,7 @@ pub fn default_preset(total_b: f64) -> &'static str {
 }
 
 /// The AutoSpec fields the presets set (the speed knobs).
-pub const KNOBS: [&str; 13] = ["search_minutes", "stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix"];
+pub const KNOBS: [&str; 14] = ["search_minutes", "stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix", "heal_rounds"];
 
 impl AutoSpec {
     /// The spec with the values of preset `id` on top of it (everything that is not a speed knob stays). "custom" only names the choice.
@@ -129,6 +129,9 @@ pub fn speed_warnings(spec: &AutoSpec, stages: &[StagePlan], natural_seq: &[u32]
     if !spec.imatrix {
         w.push("No importance matrix is measured for the export: the small sizes (Q4 and below) are made without it and are a little less exact.".into());
     }
+    if let Some(r) = &spec.heal_rounds {
+        w.push(format!("Experimental: every stage heals in rounds of {} M tokens and stops at the first round whose thinking check passes. Whether healing in rounds ends as good as one long heal is not known yet. {}", r.round_m, knob_risk("heal_rounds")));
+    }
     if n > 1 && spec.share_teacher_cache {
         let pin = stages.iter().map(|s| s.seq).min().unwrap_or(0);
         if stages.iter().all(|s| s.mode != "cache") {
@@ -164,6 +167,7 @@ pub fn knob_risk(knob: &str) -> &'static str {
         "last_tokens_m" => "Fewer tokens is linearly faster and learns less. Below the recipe a model that thinks has failed the thinking checks before; on 20 M tokens it will very likely fail them and the run may end without a model to keep.",
         "back_off" => "Without it the run ends with its report when a stage still fails; with it a stage is made again, larger.",
         "imatrix" => "The small sizes (Q4 and below) are made without it and are a little less exact.",
+        "heal_rounds" => "Experimental. A quick check asks 16 questions, so one or two answers decide pass or fail; that is why the merged model is checked again at the end, and if it fails there healing goes on and then needs two passed checks in a row. The checks during healing look at the model as it is trained (4-bit with the learning on top); the merged model can score a little differently, and the merged check decides. Every round adds about 25 minutes of loading and checking. Whether healing in rounds ends as good as one long heal is not known yet.",
         _ => "",
     }
 }
@@ -317,6 +321,18 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
         let saves = retry_h.map(|r| format!("Saves nothing unless a check fails; then it saves {} of the retry.", hours_text(r)));
         knobs.push(SpeedKnob { knob: "retry_heal".into(), label: "Retry heal after a failed check".into(), risk: knob_risk("retry_heal").into(), options:
             [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("retry_heal", Value::Bool(*on))]), &move |_, a| a.retry_heal == *on, if *on { None } else { saves.clone() })).collect() });
+    }
+    {
+        // heal in rounds: the time is a range (it stops early when a check passes), so the choice shows the best and the worst case
+        let hr = |m: u32| Value::from(serde_json::json!({"round_m": m, "check": "quick"}));
+        let now = spec.heal_rounds.as_ref().map(|r| (r.round_m, r.quick()));
+        let eq = move |m: Option<u32>| move |_: &AutoPlan, _: &AutoSpec| now == m.map(|x| (x, true));
+        let note = Some("Experimental. The range is: the first check passes (shortest) to every round to the cap (longest). A heal that stops at the first passed check saves the rest of its tokens.".to_string());
+        knobs.push(SpeedKnob { knob: "heal_rounds".into(), label: "Heal in rounds, stop when good (experimental)".into(), risk: knob_risk("heal_rounds").into(), options: vec![
+            option("Off: one heal on the whole budget (recipe)".into(), set_of(&[("heal_rounds", Value::Null)]), &eq(None), None),
+            option("5 M rounds, quick checks".into(), set_of(&[("heal_rounds", hr(5))]), &eq(Some(5)), note.clone()),
+            option("10 M rounds, quick checks".into(), set_of(&[("heal_rounds", hr(10))]), &eq(Some(10)), note),
+        ] });
     }
     knobs.push(SpeedKnob { knob: "back_off".into(), label: "Cut one step less after a second failed check".into(), risk: knob_risk("back_off").into(), options:
         [(true, "On (recipe)"), (false, "Off")].iter().map(|(on, l)| option(l.to_string(), set_of(&[("back_off", Value::Bool(*on))]), &move |_, a| a.back_off == *on, if *on { None } else { Some("Saves a whole stage only if the checks fail twice.".into()) })).collect() });
@@ -531,6 +547,9 @@ pub fn deviations(spec: &AutoSpec, stages: &[StagePlan], total_b: f64) -> Vec<De
     }
     if !spec.imatrix {
         add("imatrix", "Importance matrix for the export", "off".into(), "on".into());
+    }
+    if let Some(r) = &spec.heal_rounds {
+        add("heal_rounds", "Heal in rounds (experimental)", format!("rounds of {} M tokens, {} thinking checks, stop at the first pass", r.round_m, if r.quick() { "quick" } else { "full" }), "one heal on the whole budget".into());
     }
     v
 }

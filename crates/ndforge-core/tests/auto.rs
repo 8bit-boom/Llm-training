@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ndforge_core::error::{Error, Result};
 use ndforge_core::project::Project;
 use ndforge_core::reshape::auto::*;
-use ndforge_core::reshape::auto_plan::AutoSpec;
+use ndforge_core::reshape::auto_plan::{AutoSpec, HealRoundsOpt};
 use ndforge_core::reshape::plan::*;
 use ndforge_core::reshape::runs::{HealSpec, TrySpec};
 use serde_json::{json, Value};
@@ -84,13 +84,15 @@ struct Mock {
     /// the search requests the stand-in got, and whether its answer says the time was used up
     searches: Vec<Value>,
     search_budget_stop: bool,
+    /// why each heal in rounds ends (pass | plateau | cap | time), one per heal; "cap" when the list is used up
+    rounds_stops: std::collections::VecDeque<String>,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false,
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
         }
     }
 
@@ -249,7 +251,18 @@ impl Effects for Mock {
         };
         self.made.insert(name.clone());
         self.done.push(format!("heal {name} teacher={teacher_repo} tokens={} recipe={:?}", spec.tokens_m, spec.recipe));
-        Ok(Out::Done(HealRef { model_id: format!("id-{name}-healed"), dir: format!("models/{name}/healed"), tokens_m: spec.tokens_m, name, summary: Some(json!({"kd_first": 1.5, "kd_last": 0.5, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0})) }))
+        let mut summary = json!({"kd_first": 1.5, "kd_last": 0.5, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0});
+        let mut tokens_m = spec.tokens_m;
+        if let Some(r) = &spec.rounds {
+            let reason = self.rounds_stops.pop_front().unwrap_or_else(|| "cap".into());
+            let cap = r.max_tokens_m.unwrap_or(spec.tokens_m);
+            tokens_m = if reason == "cap" { cap } else { (cap / 2).max(r.round_m) };
+            summary["rounds"] = json!({"tokens_m": tokens_m as f64, "cap_m": cap as f64, "stop": {"reason": reason, "round": tokens_m / r.round_m.max(1), "tokens_m": tokens_m as f64}, "rows": [{"n": 1, "tokens_m": r.round_m as f64, "calib_loss": 2.5, "decision": "continue", "seconds": 1800.0,
+                                                 "check": {"mode": "quick", "verdict": "fail", "score": 0.3, "main": {"closed_rate": 0.5, "accuracy": 0.4, "loop_rate": 0.2}}}],
+                                       "final": {"verdict": "fail", "mode": "quick", "main": {"closed_rate": 0.9, "accuracy": 0.7, "loop_rate": 0.0}},
+                                       "merged_checks": [{"after_round": 2, "verdict": "fail", "failed": ["closed_rate"]}]});
+        }
+        Ok(Out::Done(HealRef { model_id: format!("id-{name}-healed"), dir: format!("models/{name}/healed"), tokens_m, name, summary: Some(summary) }))
     }
     fn remove(&mut self, what: &Made) -> Result<()> {
         assert!(self.made.contains(&what.name) || (what.kind == "export" && self.exports_made.contains(&what.name)), "only what Auto-cut made may be removed: {what:?}");
@@ -1765,4 +1778,119 @@ fn a_cut_chosen_before_the_run_skips_the_search_and_the_gate_and_cuts_those_bloc
     let bad = ndforge_core::reshape::auto_plan::PinnedCut { blocks: vec![2], intermediate: None, loss: None, search_id: None, think: None };
     let e = start(&p, &mut Mock::new(), AutoSpec { cut: Some(bad), ..gspec(21.1) }).unwrap_err();
     assert!(e.0.contains("not 21.1 B"), "{}", e.0);
+}
+
+
+// ----------------------------------------------------------------------------------------------------------------- healing in rounds
+
+fn rounds_spec(base: AutoSpec) -> AutoSpec {
+    AutoSpec { heal_rounds: Some(HealRoundsOpt { round_m: 5, check: None, first_check_m: None }), think_quick: Some(true), ..base }
+}
+
+#[test]
+fn a_run_with_heal_rounds_hands_every_heal_its_rounds_the_original_s_numbers_and_the_run_s_check_mode() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(!fx.heal_specs.is_empty());
+    for (i, h) in fx.heal_specs.iter().enumerate() {
+        let r = &h["rounds"];
+        assert!(r.is_object(), "heal {i}: {h}");
+        assert_eq!((r["round_m"].clone(), r["check"].clone(), r["final_quick"].clone(), r["stop"].clone(), r["plateau"].clone()), (json!(5), json!("quick"), json!(true), json!("pass"), json!(true)));
+        assert_eq!(r["max_tokens_m"], h["tokens_m"], "the cap is the stage's budget");
+        assert!(r["baseline"]["quick"]["closed_rate"].is_number(), "the original was checked before the first heal; its numbers go in: {r}");
+        assert!(r.get("extend").is_none() || r["extend"] == json!(false));
+    }
+    // the stage's own record has what the heal said, and the heal knows what it trained
+    assert!(st.stages.iter().all(|s| s.passed && s.rounds.len() == 1));
+    assert!(st.stages.iter().all(|s| s.heal.as_ref().unwrap().tokens_m as f64 == s.rounds[0]["tokens_m"].as_f64().unwrap()));
+    // no check of the healed model is asked for twice by the program: the heal did it, this step reads the saved one
+    assert!(fx.done.iter().any(|d| d.starts_with("check ") && d.contains(" healed quick=true")));
+}
+
+#[test]
+fn a_stage_that_reaches_its_cap_goes_on_in_the_same_run_once_then_backs_off() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    let st = start(&p, &mut fx, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    let kinds: Vec<&str> = st.stages[0].attempts.iter().map(|a| a["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["heal", "heal_again", "back_off"], "{:?}", st.stages[0].attempts);
+    let first: Vec<&Value> = fx.heal_specs.iter().filter(|h| h["rounds"]["max_tokens_m"] == json!(40)).collect();
+    let more: Vec<&Value> = fx.heal_specs.iter().filter(|h| h["rounds"]["extend"] == json!(true)).collect();
+    assert!(!first.is_empty() && !more.is_empty(), "{:?}", fx.heal_specs);
+    assert_eq!(more[0]["rounds"]["max_tokens_m"], json!(80), "cap + 40");
+    assert_eq!(more[0]["tokens_m"], json!(40), "the heal's own budget is not changed");
+    // the same student: the cut, not the healed model of the first try
+    assert!(fx.done.iter().all(|d| !d.starts_with("heal heal-")), "{:?}", fx.done);
+    assert!(st.notes.iter().any(|n| n.contains("goes on in rounds for 40 million more")), "{:?}", st.notes);
+    assert_eq!(fx.heal_specs.len(), 2 + fx.cuts as usize - 1, "one heal, one extension, and one heal for every cut that was backed off");
+}
+
+#[test]
+fn a_plateau_goes_straight_to_the_back_off_and_the_time_limit_ends_the_run() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    fx.rounds_stops = ["plateau".to_string(), "plateau".to_string()].into();
+    let st = start(&p, &mut fx, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(st.status, "gates_failed");
+    let kinds: Vec<&str> = st.stages[0].attempts.iter().map(|a| a["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["heal", "back_off"], "no extension after a plateau: more rounds would not help");
+    assert!(fx.heal_specs.iter().all(|h| h["rounds"]["extend"] != json!(true)), "{:?}", fx.heal_specs);
+    assert_eq!(fx.cuts, 2);
+    // the time limit: the run ends with its report, nothing is tried again
+    let d2 = tempdir().unwrap();
+    let mut f2 = Mock::new();
+    f2.checks.insert("healed".into(), bad());
+    f2.rounds_stops = ["time".to_string()].into();
+    let s2 = start(&project(d2.path()), &mut f2, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(s2.status, "gates_failed");
+    assert_eq!((f2.heal_specs.len(), f2.cuts), (1, 1));
+    assert!(s2.error.as_ref().unwrap().contains("time limit") && s2.notes.iter().any(|n| n.contains("time limit")), "{:?} {:?}", s2.error, s2.notes);
+}
+
+#[test]
+fn without_heal_rounds_the_run_is_what_it_was() {
+    let d = tempdir().unwrap();
+    let mut fx = Mock::new();
+    fx.checks.insert("healed".into(), bad());
+    let st = start(&project(d.path()), &mut fx, spec(21.1)).unwrap();
+    assert!(fx.heal_specs.iter().all(|h| h.get("rounds").is_none()), "{:?}", fx.heal_specs);
+    assert_eq!(st.status, "gates_failed");
+    assert!(st.stages.iter().all(|s| s.rounds.is_empty()));
+    let text = serde_json::to_string(&st).unwrap();
+    let at = text.find("\"rounds\"").map(|i| text[i.saturating_sub(60)..(i + 60).min(text.len())].to_string());
+    assert!(at.is_none() && serde_json::to_value(&st.spec).unwrap().get("heal_rounds").is_none(), "the saved state has no rounds key without rounds: {at:?}");
+    // an auto.json written before it loads and carries on
+    let back: AutoState = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, st);
+}
+
+#[test]
+fn the_report_of_a_run_with_rounds_has_the_table_the_stop_and_the_comparison_with_the_merged_check() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.rounds_stops = ["pass".to_string(), "pass".to_string()].into();
+    let st = start(&p, &mut fx, rounds_spec(spec(21.1))).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let dir = run_dir(&p, &st.id);
+    let r: Value = serde_json::from_slice(&std::fs::read(dir.join("auto_report.json")).unwrap()).unwrap();
+    assert!(r["stages"][0]["rounds"]["rows"].is_array() && r["stages"][0]["rounds_saved_m"].as_f64().unwrap() > 0.0, "{}", r["stages"][0]);
+    let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
+    assert!(md.contains("## Healing in rounds, stage 1 (experimental)") && md.contains("| Round | Tokens so far (M) |") && md.contains("a round passed the thinking check"), "{md}");
+    assert!(md.contains("tokens less than the budget") && md.contains("The merged model after round 2 did not pass (closed_rate)"), "{md}");
+    assert!(md.contains("The last round check in the same mode (the model as trained, base + adapter)") && md.contains("whether healing in rounds ends as good as one long heal"), "{md}");
+    // a run without rounds has none of it
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let st2 = start(&p2, &mut Mock::new(), spec(21.1)).unwrap();
+    let md2 = std::fs::read_to_string(run_dir(&p2, &st2.id).join("auto_report.md")).unwrap();
+    assert!(!md2.contains("Healing in rounds"));
 }

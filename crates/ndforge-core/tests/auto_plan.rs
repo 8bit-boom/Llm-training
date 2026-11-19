@@ -298,7 +298,7 @@ fn an_old_spec_without_the_speed_fields_loads_with_the_recipe_defaults() {
 #[test]
 fn the_presets_are_data_and_each_one_is_a_valid_spec() {
     let ps = ndforge_core::reshape::auto_speed::presets();
-    assert_eq!(ps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["thorough", "balanced", "fast", "custom"]);
+    assert_eq!(ps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["thorough", "balanced", "fast", "early", "custom"]);
     for p in &ps {
         assert!(!p.label.is_empty() && !p.blurb.is_empty() && !p.risk.is_empty(), "{p:?}");
         for k in p.set.keys() {

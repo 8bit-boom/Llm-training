@@ -251,7 +251,7 @@ test("the speed presets of the window are the table of auto_speed.json", async (
   const file = JSON.parse(readFileSync(new URL("../../crates/ndforge-core/src/reshape/auto_speed.json", import.meta.url), "utf8"));
   const b = browser();
   assert.deepEqual(plain(b.run("AC_SPEED_PRESETS")), file.presets);
-  assert.deepEqual(file.presets.map((p) => p.id), ["thorough", "balanced", "fast", "custom"]);
+  assert.deepEqual(file.presets.map((p) => p.id), ["thorough", "balanced", "fast", "early", "custom"]);
 });
 
 
