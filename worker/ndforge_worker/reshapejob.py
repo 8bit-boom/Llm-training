@@ -220,14 +220,15 @@ def _folder_bytes(folder) -> int:
         return 0
 
 
-def _load(folder, mode: str, stage: str = "load_model"):
+def _load(folder, mode: str, stage: str = "load_model", double_quant: bool = False):
     """The text model of a folder (AutoModelForCausalLM: vision tower and the multi-token head are left out), ready for measuring.
-    The time it takes is recorded as `stage` (load_model, load_teacher, load_student) with the load mode and the bytes."""
+    The time it takes is recorded as `stage` (load_model, load_teacher, load_student) with the load mode and the bytes.
+    `double_quant`: the 4-bit load also quantizes its scales (as the student is loaded for training); the default is the plain NF4 the other jobs use."""
     with protocol.timed(stage, load=mode, bytes=_folder_bytes(folder)):
-        return _load_model(folder, mode)
+        return _load_model(folder, mode, double_quant) if double_quant else _load_model(folder, mode)
 
 
-def _load_model(folder, mode: str):
+def _load_model(folder, mode: str, double_quant: bool = False):
     import torch
     from transformers import AutoModelForCausalLM
     kw: dict = {}
@@ -235,7 +236,8 @@ def _load_model(folder, mode: str):
     if torch.cuda.is_available():
         if mode == "4bit":
             from transformers import BitsAndBytesConfig
-            kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype)
+            extra = {"bnb_4bit_use_double_quant": True} if double_quant else {}
+            kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, **extra)
             kw["device_map"] = {"": 0}
         elif mode == "offload":
             vram = torch.cuda.mem_get_info()[0] / 2**30
