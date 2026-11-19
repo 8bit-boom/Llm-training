@@ -107,6 +107,10 @@ Where things are: `models/<name>/think_check/<target>.<full|quick>.json` (writte
 (the job, the saved results, the gates, tested against `worker/tests/data/think_gate_cases.json`); Tauri commands `think_check_results`, `think_check_plan`, `think_check_start` (events on `reshape-event`
 with `phase: "think"`; the Stop button is `reshape_stop`); page `ui/app.js` (`thinkCard`), smoke test `ui/smoke/thinkcheck.test.mjs`.
 
+## In the automatic search of Try first
+
+The search of the Try first card (docs/TRY_FIRST.md) can run this check on the best two cuts it found: each is written, checked (the original once) and deleted, one at a time; the result decides between the two (`rank_thinking`) and shows next to the recommendation. A low text-prediction error does not prove that a model thinks; without this check the search says "Thinking not checked".
+
 ## Stopping
 
 Stop asks the worker to end (a STOP file) and, after a grace period, ends the worker **and everything it started**, so `llama-server` does not stay behind holding the graphics card. On Linux and macOS the worker runs in its own process group and the whole group is killed; on Windows the worker is put into a Job Object that is terminated on Stop and also closed when this program ends, however it ends (`crates/ndforge-core/src/envmgr/process.rs`, `ProcessTree`). The tests start a program that starts another one and check that the second is gone after a stop. Not checked: a real `llama-server` with CUDA on Windows.
