@@ -248,3 +248,32 @@ def test_the_progress_and_the_events_of_a_run(tmp_path, base, measured, monkeypa
     assert [e["done"] for e in passes] == [1, 2, 3, 4, 5] and all(e["total"] == 5 and e["analysis"]["base"]["loss"] is not None for e in passes)
     assert ev[-1]["data"]["seconds_per_pass"] is not None and ev[-1]["data"]["load"] == "16bit" and ev[-1]["data"]["analysis"]["blocks_stability"]["n"] == 4
     assert json.loads((tmp_path / "models" / "_scores" / "t1" / "reshape_try.json").read_text())["seconds_per_pass"] == ev[-1]["data"]["seconds_per_pass"]
+
+
+# ------------------------------------------------------------------------------------------------------ the automatic search
+
+def test_the_automatic_search_measures_in_rounds_in_one_job_and_a_repeat_costs_nothing(tmp_path, base, measured, monkeypatch):
+    want = {"search": {"budget_min": 5, "groups": [{"label": "two blocks", "target_b": 0.001, "cuts": [{"k": 2, "width": None, "params": 1, "on_target": True}]}]}}
+    code, ev = do_try(monkeypatch, try_cfg(tmp_path, base, measured, want))
+    assert code == 0 and ev[-1]["type"] == "result"
+    data = ev[-1]["data"]
+    assert data["stop_reason"] == "done" and data["stopped"] is False
+    s = data["analysis"]["search"]
+    assert [r["name"] for r in s["rounds"]][:2] == ["singles", "sets_k"] and s["stop_reason"] == "done"
+    assert s["ranking"]["0"] and s["finalists"]["0"]
+    passes = passes_of(tmp_path)
+    assert all(rt.pass_key((b,)) in passes for b in range(1, 5)) and rt.BASE_KEY in passes
+    evs = [e for e in ev if e["type"] == "try_pass"]
+    assert evs and all("round" in e and "planned_total" in e and "budget_left_s" in e for e in evs)
+    assert evs[-1]["best"]["key"] == s["ranking"]["0"][0]
+    # the passes are the same questions as the manual card's: the best cut equals what a written model would give
+    best = s["ranking"]["0"][0]
+    predicted = passes[best]["loss"]
+    actual, _, _ = written_loss(tmp_path, base, measured, "s", drop_layers=reshape_layers(list(rt.parse_key(best)[0])))
+    close(predicted, actual)
+    # a repeat: nothing is run again
+    code, ev2 = do_try(monkeypatch, try_cfg(tmp_path, base, measured, want))
+    assert code == 0 and not [e for e in ev2 if e["type"] == "try_pass"] and ev2[-1]["data"]["stop_reason"] == "done"
+    # the plan alone says the rounds
+    code, ev3 = do_try(monkeypatch, try_cfg(tmp_path, base, measured, want, plan_only=True))
+    assert code == 0 and ev3[-1]["data"]["search"]["rounds"][0]["name"] == "singles" and ev3[-1]["data"]["search"]["passes_cached"] == len(passes)
