@@ -397,3 +397,7 @@ after healing with 20 to 40 million tokens** (NVIDIA used 94 billion for its mod
 - **Gemma 4**: slice `embed_tokens_per_layer` / `per_layer_model_projection` by layer and keep `num_kv_shared_layers` consistent. Refused with a reason until then.
 
 A practical guide with recommendations for Qwen3.8 27B: `docs/PRUNE_QWEN38_27B.md`.
+
+## Healing in rounds
+
+"Keep thinking" heals can also be done in rounds that stop at the first round that passes a thinking check (experimental): `docs/HEAL_ROUNDS.md`.
