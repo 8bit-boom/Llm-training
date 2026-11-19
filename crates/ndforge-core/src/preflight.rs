@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::envmgr::health::{Check, Light};
 use crate::project::Project;
 
-pub const KINDS: [&str; 9] = ["auto", "heal", "export", "think_check", "quantcheck", "quantfit", "imatrix_make", "cut", "train"];
+pub const KINDS: [&str; 10] = ["auto", "heal", "export", "think_check", "trace_gen", "quantcheck", "quantfit", "imatrix_make", "cut", "train"];
 
 /// How much a job needs llama.cpp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,5 +254,9 @@ pub fn check(p: Option<&Project>, kind: &str, spec: &Value) -> Vec<Check> {
     if !KINDS.contains(&kind) {
         return Vec::new();
     }
-    evaluate(&gather(p, kind, spec))
+    let mut checks = evaluate(&gather(p, kind, spec));
+    if matches!(kind, "think_check" | "trace_gen") && spec["backend"].as_str() == Some("vllm") && spec["target"].as_str() != Some("gguf") {
+        checks.extend(crate::vllm::preflight_now(&crate::settings::Settings::load().vllm));      // the experimental engine: it is there, the card is free
+    }
+    checks
 }

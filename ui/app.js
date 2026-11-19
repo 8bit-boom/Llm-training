@@ -1745,7 +1745,7 @@ const QU_ARGS = {
   export: () => usMakeArgs(),
   heal: () => ({ name: rs.hl.name, spec: rsHealSpec() }),
   quantcheck: () => ({ spec: qkSpec() }),
-  think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null } }; },
+  think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null, ...tkSpecExtra() } }; },
 };
 async function quAdd(kind, btn) {
   const make = QU_ARGS[kind];
@@ -1837,7 +1837,7 @@ function errDiv(text, tag) {
 function healUseSafer() {
   const s = rs.hl && rs.hl.opts && rs.hl.opts.safer, hs = rs.hlSpec;
   if (!s || !hs) return false;
-  hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null;
+  hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null; hs.head_checkpoint = s.head_checkpoint === "off" ? "off" : null;
   return true;
 }
 async function fixDo(act) {
@@ -2045,6 +2045,81 @@ function renderTimeCard() {
     <div class="row"><button class="secondary" id="tm-load" ${tm.loading ? "disabled" : ""}>${d ? "Look again" : "Show where the time went"}</button></div></div>`;
 }
 
+// ------------------------------------------------------------------------------------------------------- the vLLM engine (EXPERIMENTAL, off by default; docs/VLLM.md)
+// Built from a research report and not yet run on this PC. Nothing is installed by the program; the status says what was found and what to install yourself.
+const vl = { status: null, busy: false, err: null, saved: null, report: undefined, run: null, model: "", confirm: false, adapter: "" };
+const VL_KINDS = [["auto", "Find it myself"], ["docker", "Docker Desktop (docker.exe)"], ["docker_wsl", "Docker inside WSL"], ["wslc", "WSLc (WSL 3.x containers, templates)"], ["wsl", "vLLM installed in WSL"], ["url", "A server that already runs"]];
+function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {} }; }
+async function vllmDetect() {
+  vl.busy = true; vl.err = null; render();
+  try { vl.status = await invoke("vllm_status"); } catch (e) { vl.err = String(e); }
+  vl.busy = false; render();
+}
+function renderVllm() {
+  const v = vllmSettings(), st = vl.status;
+  if (vl.report === undefined) { vl.report = null; setTimeout(vllmLoadReport, 0); }
+  const lamp = { ok: "●", warn: "!", fail: "✕" };
+  const lines = st ? `<ul class="checks">${st.lines.map((l) => `<li class="check lt-${esc(l.light)}"><span class="lamp">${lamp[l.light] || "·"}</span><div><strong>${esc(l.label)}</strong><div class="detail">${esc(l.detail)}</div></div></li>`).join("")}</ul>${st.guide.length ? `<ul class="small dim">${st.guide.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}` : `<p class="dim small">Press “Look for the engine” to see what this computer has (it only asks small programs; nothing is started or installed).</p>`;
+  const f = (id, label, val, ph, w) => `<label>${label} <input type="text" id="${id}" value="${esc(val || "")}" placeholder="${esc(ph || "")}" style="min-width:${w || 220}px"></label>`;
+  return `<div class="card wide" id="vl-card"><h2>vLLM engine (experimental)</h2>
+    <p class="warn small">Built from a research report, not yet run on this PC. It is off unless you switch it on, and nothing here installs Docker, WSL or a driver for you. Run the vLLM self-test first; every speed in the app for it is an estimate.</p>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-enabled" ${v.enabled ? "checked" : ""}> Offer the vLLM engine in the thinking check</label></div>
+    <div class="row"><label>Way to run it <select id="vl-kind">${VL_KINDS.map(([k, n]) => `<option value="${k}" ${v.kind === k ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+      ${f("vl-image", "Docker image", v.image, "vllm/vllm-openai:v0.34.0", 280)}</div>
+    <div class="row">${f("vl-distro", "WSL distribution", v.distro, "(the default one)")}${f("vl-venv", "vLLM folder in WSL", v.venv, "~/.ndforge/vllm")}${f("vl-url", "Server address (way: url)", v.url, "http://127.0.0.1:8000")}</div>
+    <div class="row">${f("vl-volume", "Docker volume for models", v.model_volume, "ndforge-vllm-hf")}${f("vl-dir", "Model folder (optional, slow under /mnt/)", v.model_dir, "")}${f("vl-teacher", "Pre-quantized original (27 B)", v.teacher_repo, "", 300)}</div>
+    <div class="row"><label class="opt" title="Untested: LoRA on the linear-attention layers is reported garbled in some versions. The standard engine stays the exact way until an agreement run."><input type="checkbox" id="vl-adapter" ${v.adapter_rounds ? "checked" : ""}> Check the rounds of a heal (model + LoRA) with vLLM (untested, off)</label></div>
+    <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
+    <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
+    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+}
+// the self-test: the report's 1-hour experiment, run for you (docs/VLLM.md). Everything stoppable; the engine is always stopped again.
+function renderVllmTest(v) {
+  const r = vl.report, busy = !!vl.run || rs.running || env.running;
+  const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
+  const rep = r ? `<div class="${r.verdict === "pass" ? "ok" : r.verdict === "partial" ? "warn" : "err"}" id="vl-verdict"><strong>${esc(word[r.verdict] || r.verdict)}</strong>: ${esc(r.verdict_text)}
+      <ul class="small">${(r.criteria || []).map((c) => `<li>${c.ok ? "✓" : c.ok === false ? "✕" : "?"} ${esc(c.label)}: ${esc(typeof c.value === "object" ? JSON.stringify(c.value) : c.value == null ? "not measured" : String(c.value))}</li>`).join("")}</ul>
+      <p class="dim small">Report: ${esc(r.report || "")} (also in the problem-report bundle). ${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
+  return `<h3>vLLM self-test</h3><p class="dim small">Runs the research report's experiment for you: checks the driver and that a container can use the graphics card, starts the engine on a model, waits for it, asks the Quick thinking suite with 40 questions at once, measures start-up time and tokens per second, compares with your saved standard-engine numbers, stops the engine and writes a report with a plain verdict. A first run downloads the engine's image and the model.</p>
+    <div class="row"><label>Model folder or Hugging Face id <input type="text" id="vl-tmodel" value="${esc(vl.model)}" placeholder="${esc(v.teacher_repo || "")}" style="min-width:320px"></label>
+      <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
+    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
+    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}`;
+}
+async function vllmLoadReport() {
+  vl.report = null;
+  try { vl.report = await invoke("vllm_selftest_report"); } catch (_) { vl.report = null; }
+  try { render(); } catch (_) { /* a preview without a window */ }
+}
+function onVllmEvent(p) {
+  if (p.kind === "progress") { if (vl.run) { vl.run.text = p.text || p.step; vl.run.progress = p.value; } }
+  else if (p.kind === "error") { vl.run = null; vl.err = p.text; }
+  else if (p.kind === "done") { vl.run = null; vllmLoadReport(); return; }
+  if (page === "setup") render();
+}
+function wireVllm() {
+  const val = (id) => (($(id) || {}).value || "").trim();
+  const sv = $("vl-save"); if (sv) sv.onclick = async () => {
+    let wslc = {};
+    try { wslc = JSON.parse(val("vl-wslc") || "{}"); } catch (_) { vl.err = "The WSLc templates are not valid JSON."; render(); return; }
+    const v = { enabled: $("vl-enabled").checked, kind: val("vl-kind") || "auto", image: val("vl-image"), distro: val("vl-distro"), venv: val("vl-venv"), url: val("vl-url"), model_volume: val("vl-volume"), model_dir: val("vl-dir"),
+      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc };
+    try { setState(await invoke("vllm_set", { vllm: v })); vl.err = null; vl.saved = "Saved."; } catch (e) { vl.err = String(e); vl.saved = null; }
+    render();
+  };
+  const dt = $("vl-detect"); if (dt) dt.onclick = vllmDetect;
+  const tm = $("vl-tmodel"); if (tm) tm.onchange = () => { vl.model = tm.value.trim(); };
+  const ta = $("vl-tadapter"); if (ta) ta.onchange = () => { vl.adapter = ta.value.trim(); };
+  const tc = $("vl-tconfirm"); if (tc) tc.onchange = () => { vl.confirm = tc.checked; };
+  const tt = $("vl-test"); if (tt) tt.onclick = () => {
+    vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.adapter = (($("vl-tadapter") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
+    vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
+    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
+  };
+  const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -2068,6 +2143,7 @@ function renderSetup() {
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
     ${renderTimeCard()}
     ${renderLlamaSection()}
+    ${renderVllm()}
     ${renderUnsloth()}`;
 }
 
@@ -2183,13 +2259,13 @@ function wireTest() {
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
-const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null };
+const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
-  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
+  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, scoring: "activation", recon: false, meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
-  tr: { what: "blocks", se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
+  tr: { what: "blocks", scoring: false, recon: false, se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", rounds: false, roundM: 5, firstCheck: 10, roundCheck: "quick", stopRule: "pass", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
@@ -2243,11 +2319,24 @@ function patternText(ins) {
 
 function rsOption() { return rs.options && rs.options.options.find((o) => o.blocks === rs.blocks) || null; }
 
+// Where the parameters are: "text layers 19.00 B · embeddings 1.27 B · ... · file total 19.81 B" (the same words as `ParamsBreakdown::line` in the program).
+function breakdownLine(b) {
+  if (!b || b.total == null) return "";
+  const x = (n) => ((+n || 0) / 1e9).toFixed(2) + " B";
+  const parts = [`text layers ${x(b.text_layers)}`, `embeddings ${x(b.embeddings)}`];
+  if (b.output > 0) parts.push(`output ${x(b.output)}`);
+  if (b.vision > 0) parts.push(`vision ${x(b.vision)}`);
+  if (b.mtp > 0) parts.push(`multi-token head ${x(b.mtp)}`);
+  if (b.mtp_removed > 0) parts.push(`multi-token head removed ${x(b.mtp_removed)}`);
+  parts.push(`other ${x(b.other)}`);
+  return `${parts.join(" · ")} · file total ${x(b.total)}`;
+}
+
 function rsSizeInfo() {
   const o = rsOption(), op = rs.options, v = op && op.vram_gb;
   if (!o) return `<span class="dim">Nothing can be changed in whole blocks for this model.</span>`;
   const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
-  return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+  return `<strong>${o.layers} layers · ${o.params_b} B parameters</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}${o.breakdown ? `<br><span class="dim small" id="rs-breakdown">${esc(breakdownLine(o.breakdown))}</span>` : ""}`;
 }
 
 const thou = (n) => Number(n).toLocaleString("en-US");
@@ -2284,7 +2373,7 @@ function rsWidthInfo() {
   if (!o) return `<span class="dim">Choose how thin the layers become.</span>`;
   const tick = (fits) => fits === true ? "✓" : fits === false ? "✗" : "?";
   const cut = full ? Math.round(100 * (1 - o.intermediate / full)) : null;
-  return `MLP ${thou(o.intermediate)}${full ? " of " + thou(full) + " (−" + cut + " %)" : ""} · <strong>${o.layers} layers · ${o.params_b} B parameters${o.exact ? " (exact)" : ""}</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}`;
+  return `MLP ${thou(o.intermediate)}${full ? " of " + thou(full) + " (−" + cut + " %)" : ""} · <strong>${o.layers} layers · ${o.params_b} B parameters${o.exact ? " (exact)" : ""}</strong> · ${o.disk_gb} GB on disk · training: LoRA ≈ ${o.vram_lora_gb} GB ${tick(o.fits_lora)}, QLoRA ≈ ${o.vram_qlora_gb} GB ${tick(o.fits_qlora)}${v ? ` on this card (${v} GB)` : ""}${o.breakdown ? `<br><span class="dim small" id="rs-breakdown">${esc(breakdownLine(o.breakdown))}</span>` : ""}`;
 }
 
 // the part of "2 · What to do" for thinner layers: the way, the width slider(s), the Expert axes and the measuring
@@ -2312,7 +2401,22 @@ function rsWidthUi(op, st) {
       <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${bidx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
       <div id="rs-sizeinfo" class="dim small">${rsSizeInfo()}</div>` : ""}${warn}</div>
     <p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), ${expert ? `<select id="rs-wsamples">${[128, 256, 512, 1024].map((n) => `<option ${rs.wsamples === n ? "selected" : ""}>${n}</option>`).join("")}</select>` : rs.wsamples} samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
-    <p class="dim small" id="rs-measinfo">${meas}</p>${axes}`;
+    <p class="dim small" id="rs-measinfo">${meas}</p>${expert ? rsScoringHtml() : ""}${axes}`;
+}
+
+// Expert: how the neurons that stay are chosen. The default is how much they fire; "output" (experimental) also counts how much each one writes into the layer's output.
+function rsReconNumbers() {
+  const a = rs.tr && rs.tr.analysis, rows = ((a && a.variants) || []).filter((r) => r.tried && r.recon && r.intermediate === rs.wi);
+  if (!rows.length) return `<span class="dim small">Try first has not measured the refit for this width.</span>`;
+  const pc = (x) => x == null ? "–" : Math.round(100 * x) + " %";
+  return rows.map((r) => `<span class="dim small">Try first, ${esc(r.label)}: error ${(+r.loss).toFixed(3)} (${r.better_both_halves === true ? "better" : r.better_both_halves === false ? "not better" : "not compared"} than the plain cut in both halves); it gives back ${pc(r.recon.median_removed_share)} of what the cut took (median layer) on rows it was not fitted on.</span>`).join(" ");
+}
+
+function rsScoringHtml() {
+  return `<p id="rs-recon-row"><label class="opt"><input type="checkbox" id="rs-recon" ${rs.recon ? "checked" : ""} ${rs.running ? "disabled" : ""}> Refit the kept neurons without training (experimental, off)</label>
+    <span class="dim small">Changes the output weights of the kept neurons by least squares to make up for part of what the removed ones did. Needs about 10 to 20 minutes more (a formula, not a measurement) and about 6 GB of disk next to the measurement. Nobody has measured here that it keeps more quality; compare it in Try first, and a gain before healing may not survive healing.</span> ${rsReconNumbers()}</p>
+  <p id="rs-scoring-row">Rank the neurons by <select id="rs-scoring" ${rs.running ? "disabled" : ""}><option value="activation" ${rs.scoring !== "output" ? "selected" : ""}>how much they fire (the default)</option><option value="output" ${rs.scoring === "output" ? "selected" : ""}>their expected output (experimental)</option></select>
+    <span class="dim small">The second counts the mean square of what a neuron fires times the squared size of what it writes into the layer. Nobody has measured here that it keeps more quality; the “Try first” card below compares the two on your text and says whether both halves agree. A gain before healing may not survive healing.</span></p>`;
 }
 
 // a small line chart: the points as a line, the first and the last value written out
@@ -2344,13 +2448,35 @@ async function rsHealEstimate() {
 // the measured numbers of a healing run (saved ones, then the live ones of this session), as chart points
 function healSeries() {
   const ev = ((rs.hl && rs.hl.opts && rs.hl.opts.metrics) || []).concat((rs.hlRun && rs.hlRun.live) || []);
-  const seen = new Set(), kd = [], cal = [];
-  ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") cal.push([e.step, e.calib_loss]); });
-  return { kd, cal };
+  const seen = new Set(), kd = [], cal = [], hold = [];
+  ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") { cal.push([e.step, e.calib_loss]); if (e.holdout_loss != null) hold.push([e.step, e.holdout_loss]); } });
+  return { kd, cal, hold };
 }
 
 // the Expert "Healing settings" section of the Heal card; null in a field of the spec = the automatic value, shown here from `kn`
-function healSettings(sp, kn, plan, busy, upcastGb) {
+// "Find the fastest loss settings": short real steps of the healing loss with several settings on this computer (the loss is the same in all of them), one row per setting.
+function hbHtml(busy) {
+  const hb = rs.hb || {}, res = hb.result || hb.last, rows = hb.running ? (hb.rows || []) : (res && res.rows) || [];
+  const gb = (mb) => mb == null ? "–" : (mb / 1024).toFixed(1) + " GB";
+  const body = rows.map((r) => `<tr${res && res.best === r.id && !hb.running ? ` class="best"` : ""}><td>${esc(r.label)}</td><td>${r.ok ? Math.round(r.tokens_per_s).toLocaleString("en-US") : "–"}</td><td>${r.ok && r.vs_current != null ? "×" + r.vs_current.toFixed(2) : "–"}</td><td>${r.ok ? gb(r.peak_vram_mb) : "–"}</td><td>${r.ok ? (res && res.best === r.id && !hb.running ? "fastest" : "ok") : r.oom ? "ran out of memory" : "failed"}</td></tr>`).join("");
+  const best = res && res.best_settings && !hb.running ? res.best_settings : null;
+  return `<div id="hb-box"><h4>Find the fastest loss settings</h4>
+    <p class="dim small">Runs ${hb.steps || 12} real steps of the healing loss with the KL chunk 64 to 512 and, when it fits the card, with the output layer's logits kept (about a quarter of an hour in all). The loss is the same in every row; only speed and memory differ. Nothing is assumed: these numbers are this computer's. A real heal is a little slower (checkpoints, checks).</p>
+    <div class="row"><button class="secondary" id="hb-go" ${busy || hb.running || !rs.hl || !rs.hl.opts || rs.running ? "disabled" : ""}>Find the fastest</button> <button class="secondary" id="hb-stop" ${hb.running ? "" : "disabled"}>Stop</button>
+      <button class="secondary" id="hb-use" ${best && !busy ? "" : "disabled"}>Use the fastest${best ? ` (KL chunk ${best.kl_chunk}${best.head_checkpoint === "off" ? ", logits kept" : ""})` : ""}</button></div>
+    ${hb.running ? `<div class="stepline" aria-live="polite">${esc(hb.text || "Starting…")}</div>` : ""}${hb.err ? `<p class="err">${esc(hb.err)}</p>` : ""}
+    ${rows.length ? `<table class="tbl" id="hb-table"><tr><th>Setting</th><th>Tokens per second</th><th>Against yours</th><th>Peak memory</th><th></th></tr>${body}</table>` : ""}</div>`;
+}
+
+function onHealBenchEvent(p) {
+  const hb = rs.hb || (rs.hb = {});
+  if (p.kind === "heal_bench") { hb.text = `Setting ${p.index + 1} of ${p.total}: ${p.name}`; if (p.row) (hb.rows || (hb.rows = [])).push(p.row); }
+  else if (p.kind === "error") { hb.running = false; hb.err = p.text; }
+  else if (p.kind === "done") { hb.running = false; hb.err = null; if (p.data) { hb.result = p.data; hb.last = p.data; } }
+  if (page === "reshape") render();
+}
+
+function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
   const d = busy ? "disabled" : "", v = (x, auto) => (x ?? auto);
   const sel = (id, cur, opts) => `<select id="${id}" ${d}>${opts.map(([val, label]) => `<option value="${val}" ${String(cur) === String(val) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const pu = v(sp.per_update, (kn.batch || 1) * (kn.grad_accum || 1)), bt = v(sp.batch, kn.batch || 1);
@@ -2370,6 +2496,10 @@ function healSettings(sp, kn, plan, busy, upcastGb) {
     <label>Warm-up steps<br><input type="text" id="hl-warmup" value="${v(sp.warmup, 30)}" ${d}></label></div>
     <label class="opt"><input type="checkbox" id="hl-upcast" ${sp.kbit_upcast === true ? "checked" : ""} ${busy || kn.qlora === false ? "disabled" : ""}> Keep the embeddings and output layer in 32-bit (the old behaviour: about <span id="hl-upcast-gb">${upcastGb != null ? upcastGb : "4 to 5"}</span> GB more memory)${kn.qlora === false ? " - only for QLoRA" : ""}</label>
     <p class="dim small">By default the two big word tables stay in 16-bit while healing: they are not changed by the learning, so a 32-bit copy only costs memory. Changing this keeps the saved answers and the learning done so far. If healing runs out of memory with this on, the program turns it off first.</p>
+    ${(() => { const on = sp.head_checkpoint === "off", gb = headOff && headOff.head_off_gb != null ? headOff.head_off_gb : null, fits = headOff ? headOff.head_off_fits : null; const off = busy || (!on && fits === false);
+      return `<label class="opt"><input type="checkbox" id="hl-headkeep" ${on ? "checked" : ""} ${off ? "disabled" : ""}> Keep the output layer's logits for the backward pass (faster, the same learning; about <span id="hl-headkeep-gb">${gb != null ? gb : "several"}</span> GB more memory)${!on && fits === false ? " - does not fit this card" : ""}</label>
+    <p class="dim small">Normally the logits of every chunk are made again in the backward pass to save memory. Keeping them stores about tokens × 250,000 × 10 bytes (about 20 GB for 8,192 tokens), so it is offered only when the estimate says it fits. It changes nothing about what is learned and keeps the saved answers and the learning done so far; how much faster it is is measured by "Find the fastest loss settings", not assumed. If healing runs out of memory with it on, the program turns it off first.</p>`; })()}
+    ${hbHtml(busy)}
     <p class="dim small">A different sequence length, LoRA size or top-k means the original answers again or the learning starts again; the other settings keep what was saved.</p>
     <div class="row"><button class="secondary" id="hl-reset" ${d}>Reset to safe defaults</button></div></details>`;
 }
@@ -2442,6 +2572,21 @@ function hlMoreBox(h, busy) {
 
 // "Heal it": the original teaches the thinner model to answer like it did
 // `pair`: a model from elsewhere (or another original for a made one), chosen in the Heal section: the same card, bound to the pair
+// What the rows of a heal cover (`coverage` of the worker's teacher pass): how many conversations are whole, cut or left out, the same for reasoning rows, what the kept tokens are, and the lengths.
+function coverageHtml(c) {
+  if (!c || !c.rows) return "";
+  const r = c.rows, ch = c.chat_rows || {}, th = c.reasoning_rows || {}, sh = c.token_share || {};
+  const pc = (x) => Math.round(100 * (+x || 0)) + "%";
+  const rowsLine = `${r.project_text || 0} texts and ${r.project_chat || 0} conversations from your world` + (r.general_text || r.general_chat ? `, ${r.general_text || 0} texts and ${r.general_chat || 0} conversations of general text` : "");
+  const chats = `<span>Conversations: <strong>${ch.complete || 0}</strong> whole, <strong>${ch.cut || 0}</strong> cut at the sequence length, <strong>${ch.skipped || 0}</strong> left out as too long.</span>`;
+  const reasoning = th.known && (th.total || 0) > 0 ? `<span>Reasoning rows: <strong>${th.complete || 0}</strong> whole, <strong>${th.cut_answer || 0}</strong> lost part of the answer, <strong>${th.cut_reasoning || 0}</strong> cut inside the reasoning, <strong>${th.skipped || 0}</strong> left out.</span>` : "";
+  const shares = `<span>The kept tokens are ${pc(sh.prompt)} question, ${pc(sh.reasoning)} reasoning, ${pc(sh.answer)} answer, ${pc(sh.plain)} plain text.</span>`;
+  const lb = c.length_buckets || {};
+  const lens = Object.keys(lb).length ? `<span>Lengths before cutting: ${Object.keys(lb).map((k) => `${esc(k)} ${lb[k]}`).join(" · ")}.</span>` : "";
+  const notes = (c.notes || []).map((n) => `<p class="warn small">${esc(n)}</p>`).join("");
+  return `<div class="dim small" id="hl-coverage"><span>What healing learns from: ${esc(rowsLine)}.</span> ${chats} ${reasoning} ${shares} ${lens}</div>${notes}`;
+}
+
 function healCard(m, pair) {
   const sm = m.summary;
   if (!sm || sm.mode !== "prune") return "";
@@ -2471,9 +2616,12 @@ function healCard(m, pair) {
   const busy = rs.running || rs.testing || (run && run.running);
   const prog = run && run.running ? `<div class="stepline" aria-live="polite">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
   const series = healSeries();
-  const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true);
+  const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true) + lineChart(series.hold, "Error on general text the healing never learned from (held out)", true);
   const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : pair ? `<p class="dim small">Nothing is recorded about how well this model answered before. The error on your data is measured at the start of healing and shown in the chart.</p>` : "";
-  const used = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
+  const usedG = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
+  const hres = (h.heal && h.heal.result) || {};
+  const holdP = hres.holdout_loss_after != null ? `<p class="dim small" id="hl-holdout">Held out (${hres.holdout_rows || "some"} general rows the healing never learned from): error ${hres.holdout_loss_before != null ? (+hres.holdout_loss_before).toFixed(2) + " → " : ""}${(+hres.holdout_loss_after).toFixed(2)}${hres.teacher_holdout_loss != null ? `; the original has ${(+hres.teacher_holdout_loss).toFixed(2)}` : ""}. The error on your own data above is measured on text the healing also learns from, so it reads better than it is.</p>` : "";
+  const used = usedG + coverageHtml(h.heal && h.heal.coverage) + holdP;
   const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
   const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
   const resume = st === "stopped" || st === "failed";
@@ -2497,7 +2645,7 @@ function healCard(m, pair) {
       <label>Weight of copying the original (1 = only copy it)<input type="text" id="hl-alpha" value="${sp.alpha}"></label>
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
-    ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
+    ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb, est && est.head_off_gb != null ? est : h) : ""}${oomBlock}
     ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
     <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
@@ -2678,6 +2826,7 @@ function madeCard(m) {
   return `<div class="card wide"><h2>${esc(m.name)}</h2>
     ${slim && m.scores && m.scores.boundary_distance ? barChart(m.scores.boundary_distance, m.scores.chosen_blocks || []) : (sm.boundary_distance ? barChart(sm.boundary_distance, sm.chosen_blocks || []) : "")}${meanChart}
     <p><strong>${esc(what)}</strong> · ${sm.layers_before} → ${sm.layers_after} layers · ${gb(sm.params_before)} → ${gb(sm.params_after)} billion parameters · ${m.size_gb} GB on disk</p>
+    ${sm.params_breakdown ? `<p class="dim small" id="rs-made-breakdown">${esc(breakdownLine(sm.params_breakdown))}</p>` : ""}
     ${loss ? `<p>${esc(loss)}</p>` : ""}${stab}
     ${slim && sm.stable === false && !wide ? `<p class="warn">The measurement was not stable: two halves of your text chose different layers. Try 256 samples.</p>` : ""}
     ${(sm.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
@@ -2686,7 +2835,7 @@ function madeCard(m) {
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
       <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
-    ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}</div>`;
+    ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}${traceCard(m)}</div>`;
 }
 
 
@@ -2769,7 +2918,7 @@ function acRefresh() {
   if (sig === ac.planFor) return;
   ac.planFor = sig; ac.plan = null; ac.planErr = null;
   const token = ++ac.planTok;
-  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; if (page === "reshape") render(); } })
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (page === "reshape") render(); } })
     .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
 }
 
@@ -2783,22 +2932,42 @@ function acDelta(d) {
 }
 const acTotal = (t) => t ? `${acStepMin(t[0] * 60, t[1] * 60)}` : "";
 // the speed settings: the presets with their totals, the biggest levers with the change each choice makes, the rest under "More speed settings", and the time limit
+// The table of speed settings of the last plan that came, kept while the next one is on its way (`acRefresh` drops `ac.plan` at every change). The radios show the LOCAL state
+// (`acOptionOn`) and a click uses the `set` of this table, so neither depends on a plan being there at that moment.
+function acRememberSpeed(pl) {
+  if (pl && pl.speed && pl.speed.knobs && pl.speed.knobs.length) ac.speedCache = { model: rs.model, speed: pl.speed };
+}
+function acSpeedTable(pl) {
+  if (pl && pl.speed) return { sp: pl.speed, stale: false };
+  const c = ac.speedCache;
+  return c && c.model === rs.model ? { sp: c.speed, stale: true } : { sp: null, stale: false };
+}
+// does this choice of a knob match what the local state has now? (the same comparison as `acPresetNow`)
+function acOptionOn(o) {
+  const kn = acKnobs();
+  return Object.entries(o.set || {}).every(([k, v]) => {
+    if (k === "search_minutes") return (ac.sp.search || null) === (v || null);
+    if (k === "think_quick" && v === null) return ac.sp.tq == null;
+    if (k === "heal_rounds") return JSON.stringify(kn[k]) === JSON.stringify(v);
+    return k in kn ? kn[k] === v : true;
+  });
+}
 function acSpeedBlock(pl, live) {
-  const lock = live ? "disabled" : "", sp = pl && pl.speed, now = acPresetNow(), think = !!ac.thinking;
+  const tbl = acSpeedTable(pl), lock = live ? "disabled" : "", sp = tbl.sp, now = acPresetNow(), think = !!ac.thinking;
   const row = (p) => {
     const t = sp && sp.presets.find((x) => x.id === p.id), tt = p.id === "custom" ? sp && sp.total_h : t && t.total_h;
     const risk = p.id === "fast" && think ? `<div class="err" data-acspeed-warn="fast">${esc(p.risk)} A model that thinks will very likely lose its reasoning with these settings.</div>` : `<div class="dim small">${esc(p.risk)}</div>`;
     return `<label class="opt ac-preset" data-acpreset="${esc(p.id)}"><input type="radio" name="ac-preset" value="${esc(p.id)}" ${now === p.id ? "checked" : ""} ${lock}> <strong>${esc(p.label)}</strong>${tt ? ` <span class="ac-ptotal">about ${esc(acTotal(tt))}</span>` : ""}
       <div class="dim small">${esc(p.blurb)}</div>${now === p.id || p.id === "fast" ? risk : ""}${t && t.retry_h && p.id !== "custom" ? `<div class="dim small">If a thinking check fails, a retry adds ${esc(acTotal(t.retry_h))} (not counted).</div>` : ""}</label>`;
   };
-  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${o.current ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
-      <span class="dim small ac-delta">${o.current ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
+  const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${acOptionOn(o) ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
+      <span class="dim small ac-delta">${acOptionOn(o) ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
   const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
   const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
   const bud = pl && pl.budget;
   const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
       <ul>${bud.dropped.map((d) => `<li data-acdropped="${esc(d.knob)}"><strong>${esc(d.label)}</strong>: ${esc(d.to)} instead of ${esc(d.from)} (saves ${esc(acTotal(d.saves_h))}). <span class="dim small">${esc(d.risk)}</span></li>`).join("")}</ul></div>` : `<p class="dim small" id="ac-budget-ok">Your settings already fit.</p>`) : "";
-  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast</h3>
+  return `<div class="ac-speed" id="ac-speed"><h3>How careful, how fast${tbl.stale ? ` <span class="dim small" id="ac-updating">updating…</span>` : ""}</h3>
     <p class="dim small">Healing is most of the time. The recommended recipe is the safest; the others trade quality risk for hours, and every value that is not the recipe's is listed in the plan and in the report.</p>
     ${AC_SPEED_PRESETS.map(row).join("")}
     ${sp ? `<div class="ac-levers" id="ac-levers"><h4>What takes the time</h4><table class="tbl">${big.map(optRow).join("")}</table></div>` : ""}
@@ -3030,9 +3199,11 @@ function wireAuto() {
   set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
   document.querySelectorAll("input[name=ac-preset]").forEach((r) => r.onchange = () => { if (r.value === "custom") ac.advOpen = true; else acApplyPreset(r.value); render(); });
   document.querySelectorAll("input[data-acknob]").forEach((r) => r.onchange = () => {
-    const k = ac.plan && ac.plan.speed && ac.plan.speed.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
-    if (o) acApplySet(o.set);
+    const sp = acSpeedTable(ac.plan).sp, k = sp && sp.knobs.find((x) => x.knob === r.dataset.acknob), o = k && k.options[+r.dataset.acopt];
+    if (o) acApplySet(o.set);                          // never dropped: the table of the last plan is kept while a new one is on its way
+    const y = typeof window !== "undefined" && window ? window.scrollY : 0;
     render();
+    if (y && typeof window.scrollTo === "function") window.scrollTo(0, y);
   });
   const pr = $("ac-pin-remove"); if (pr) pr.onclick = () => { ac.pin = null; ac.err = null; render(); };
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
@@ -3067,6 +3238,16 @@ const TK_NUMBERS = [["think_rate", "Writes a reasoning trace", "rate"], ["closed
   ["garbage_rate", "Garbled text (lower is better)", "rate"], ["truncated_rate", "Cut off by the length limit", "rate"], ["median_think_tokens", "Typical length of the reasoning (tokens)", "n"]];
 const TK_GATE_WORD = { closed_rate: "finishing its reasoning", accuracy: "right answers", loop_rate: "loops", garbage_rate: "garbled text", median_think_tokens: "length of the reasoning" };
 
+const tkBackend = () => (rs.tk.backend === "vllm" && vllmSettings().enabled ? "vllm" : rs.tk.backend === "llama" ? "llama" : "hf");
+const tkSpecBackend = () => (tkBackend() === "vllm" ? "vllm" : null);
+const tkSpecExtra = () => (tkBackend() === "vllm" ? { backend: "vllm" } : {});          // nothing added for the standard way: its spec is as it always was
+function tkBackendRow() {
+  const be = tkBackend(), on = !!vllmSettings().enabled;
+  return `<div class="row"><label>Engine <select id="tk-backend"><option value="hf" ${be === "hf" ? "selected" : ""}>Transformers (default)</option><option value="llama" ${be === "llama" ? "selected" : ""}>llama-server (GGUF files)</option>`
+    + `<option value="vllm" ${be === "vllm" ? "selected" : ""} ${on ? "" : "disabled"}>vLLM (experimental${on ? "" : ": switched off in Training setup"})</option></select></label>`
+    + (be === "llama" ? ` <span class="dim small">llama-server runs GGUF files: choose one below.</span>` : "") + `</div>`;
+}
+
 function tkQuick(m) {
   if (rs.tk.quick != null) return rs.tk.quick;
   const b = m && m.summary ? (m.summary.params_after || 0) / 1e9 : 0;
@@ -3078,16 +3259,16 @@ function thinkCard(m) {
   const sm = m.summary;
   if (!sm || m.status !== "done") return "";
   const tk = rs.tk, d = tk.name === m.name ? tk.data : null;
-  const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
+  const quick = tkQuick(m), be = tkBackend(), set = (d && be === "vllm" ? d.vllm_modes : d && d.modes) || null, mode = set ? set[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
   const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
-  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
+  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : be !== "llama" && d.targets[t]);
   const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) || pfBlocked("think_check") ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>${quBtn("think_check", `data-target="${t}" ${!rs.state.env_ready || !can(t) ? "disabled" : ""}`)}`;
   const cols = TK_TARGETS.filter(([t]) => rows[t]);
   const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
       ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
       <tr><td>Thinking off (control): right answers</td>${cols.map(([t]) => `<td>${tkCell(rows[t].control && rows[t].control.n ? rows[t].control.accuracy : null, "rate")}</td>`).join("")}</tr>
       <tr><td><strong>Compared with the original</strong></td>${cols.map(([t]) => { const g = gates[t]; return `<td>${t === "original" ? "–" : g ? `<strong class="${g.verdict === "pass" ? "ok" : g.verdict === "warn" ? "warn" : "err"}" data-tkverdict="${t}">${g.verdict === "pass" ? "Pass" : g.verdict === "warn" ? "Close to the limit" : "Fail"}</strong>${g.failed.length ? `<br><span class="dim small">too weak: ${g.failed.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : g.warned.length ? `<br><span class="dim small">near the limit: ${g.warned.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : ""}` : "<span class=\"dim small\">check the original first</span>"}</td>`; }).join("")}</tr></table>
-      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
+      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : rows[t].backend === "vllm" ? " (vLLM, experimental)" : ""}`).join(" · ")}</p>` : "";
   const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
   const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
   // a cut that goes beyond what Auto-cut does by itself (the program names how): the thinking numbers of the cut when it was checked, else a pointer to the button
@@ -3100,7 +3281,8 @@ function thinkCard(m) {
   return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>${guard}
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
-    ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    ${tkBackendRow()}${be === "vllm" ? `<p class="warn small" id="tk-vllm-note">vLLM is experimental: built from a research report and not yet run on this PC (run the vLLM self-test in Training setup first). Its numbers are kept apart from the standard engine's: a model is compared with the original checked the same way.</p>` : ""}
+    ${pfBox("think_check", be === "vllm" ? { backend: "vllm" } : {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
     ${tk.run && tk.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
     ${tk.err ? errDiv(tk.err, "p") : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
@@ -3115,7 +3297,7 @@ async function tkLoad(name) {
 function tkStart(m, target) {
   const tk = rs.tk;
   tk.run = { name: m.name, target, text: "Starting…", progress: null, done: 0 }; tk.err = null; tk.ok = null; render();
-  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
+  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null, ...tkSpecExtra() } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
 }
 
 function onThinkEvent(p) {
@@ -3133,11 +3315,62 @@ function onThinkEvent(p) {
   if (page === "reshape") render();
 }
 
+// "Make thinking answers with the original model" (worker job trace_gen, docs/VLLM.md): the original writes thinking answers for prompts; they are filtered and kept in a jsonl file that a
+// heal can use as "My own file". The way (vLLM when it is switched on, else llama-server, else the standard engine) is chosen by the worker; speeds are estimates.
+const tg = { name: null, state: null, source: "", column: "", limit: 200, run: null, err: null, ok: null };
+function traceCard(m) {
+  if (!m.summary || m.status !== "done") return "";
+  const s = tg.name === m.name ? tg.state : null;
+  const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || rs.tk.run || tg.run;
+  const vOn = !!vllmSettings().enabled;
+  return `<div class="card-in" id="tg-card"><h3>Make thinking answers with the original model</h3>
+    <p class="dim small">The original model writes answers WITH its thinking for prompts you give (a file or a dataset), so a heal can learn from them. Each answer is checked: the thinking must be closed, the answer not empty, not cut by the length limit, no loops, no garbled text; the rest is thrown away and not asked again. A second run goes on where the first stopped; Stop keeps what was written. ${vOn ? "The experimental vLLM engine will be used when it works (estimated 5 to 10 times faster than the standard engine: an estimate from a research report, not measured on this PC); otherwise the standard engine." : "The standard engine is used (slow for a big original: the vLLM engine in Training setup is the experimental, faster way)."}</p>
+    <div class="row"><label>Prompts: a file or a Hugging Face dataset <input type="text" id="tg-source" value="${esc(tg.source)}" placeholder="C:\\prompts.jsonl or mlabonne/open-perfectblend" style="min-width:300px"></label>
+      <label>Column (optional) <input type="text" id="tg-column" value="${esc(tg.column)}" style="width:8em"></label>
+      <label>Prompts to try <input type="number" id="tg-limit" min="1" value="${esc(String(tg.limit))}" style="width:6em"></label></div>
+    ${pfBox("trace_gen", vOn ? { backend: "vllm" } : {})}
+    <div class="row"><button class="primary" id="tg-go" ${busy || !rs.state.env_ready || !tg.source.trim() ? "disabled" : ""}>Make the answers</button>${tg.run && tg.run.name === m.name ? `<button class="secondary" id="tg-stop">Stop</button>` : ""}</div>
+    ${tg.run && tg.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tg.run.text)}</div>${tg.run.progress != null ? `<progress max="1" value="${tg.run.progress}"></progress>` : ""}` : ""}
+    ${tg.err ? errDiv(tg.err, "p") : tg.ok ? `<p class="ok">${esc(tg.ok)}</p>` : ""}
+    ${s && s.count ? `<p class="small" id="tg-state">${s.count} answers are kept in <code>${esc(s.file)}</code> ${copyBtn(s.file)} (${s.rejected} prompts were rejected). Use the file as "My own file" in the general text of a heal.</p>` : ""}</div>`;
+}
+async function tgLoad(name) {
+  tg.name = name;
+  try { tg.state = await invoke("trace_gen_state", { name }); } catch (_) { tg.state = null; }
+  if (page === "reshape") render();
+}
+function onTraceEvent(p) {
+  if (p.kind === "progress") { if (tg.run) { tg.run.text = p.text || p.step; tg.run.progress = p.value; } }
+  else if (p.kind === "error") { tg.run = null; tg.err = p.text; }
+  else if (p.kind === "done") {
+    const d = p.data || {}, name = tg.run && tg.run.name;
+    tg.run = null;
+    tg.ok = `${d.stopped ? "Stopped. " : "Done. "}${d.kept || 0} of ${d.attempted || 0} answers kept${d.backend ? " (way: " + d.backend + ")" : ""}${(d.notes || []).length ? ". " + d.notes.join(" ") : ""}${d.note ? " " + d.note : ""}`;
+    if (name) { tgLoad(name); return; }
+  }
+  if (page === "reshape") render();
+}
+function wireTrace() {
+  const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
+  if (m && tg.name !== m.name && !tg.run) tgLoad(m.name);
+  const src = $("tg-source"); if (src) src.oninput = () => { tg.source = src.value; };
+  const col = $("tg-column"); if (col) col.oninput = () => { tg.column = col.value; };
+  const lim = $("tg-limit"); if (lim) lim.oninput = () => { tg.limit = Math.max(1, Math.floor(+lim.value) || 200); };
+  const go = $("tg-go"); if (go) go.onclick = () => {
+    if (!m) return;
+    tg.source = (($("tg-source") || {}).value || "").trim(); tg.column = (($("tg-column") || {}).value || "").trim(); tg.limit = Math.max(1, Math.floor(+(($("tg-limit") || {}).value) || 200));
+    tg.run = { name: m.name, text: "Starting…", progress: null }; tg.err = null; tg.ok = null; render();
+    invoke("trace_gen_start", { spec: { name: m.name, source: tg.source, column: tg.column || null, limit: tg.limit } }).catch((e) => { tg.run = null; tg.err = String(e); render(); });
+  };
+  const st = $("tg-stop"); if (st) st.onclick = () => { if (tg.run) tg.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
+}
+
 function wireThink() {
   const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
   const tk = rs.tk;
   document.querySelectorAll("input[name=tk-mode]").forEach((r) => r.onchange = () => { tk.quick = r.value === "quick"; render(); });
   document.querySelectorAll("[data-tkgo]").forEach((b) => b.onclick = () => { if (m) tkStart(m, b.dataset.tkgo); });
+  const bsel = $("tk-backend"); if (bsel) bsel.onchange = () => { tk.backend = bsel.value; pfReset(); render(); };
   const pick = $("tk-gguf-pick"); if (pick) pick.onchange = () => { tk.gguf = pick.value; render(); };
   const gf = $("tk-gguf"); if (gf) gf.onchange = () => { tk.gguf = gf.value.trim(); render(); };
   const st = $("tk-stop"); if (st) st.onclick = () => { if (tk.run) tk.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
@@ -3174,11 +3407,17 @@ function trySpec() {
   if (w === "search") return null;
   if (w === "blocks") { if (!tryDepthOn()) return null; spec.blocks = true; }
   else if (w === "runs") { if (!tryDepthOn() || !rs.blocks) return null; spec.runs = [rs.blocks]; }
-  else if (w === "widths") { const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws; }
+  else if (w === "widths") {
+    const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws;
+    if (rs.tr.scoring) spec.choices = ws.map((x) => ({ blocks: [], width: x, scoring: "output" }));          // the plain widths are tried as well: it is what they are compared with
+    if (rs.tr.recon) spec.choices = spec.choices.concat(ws.flatMap((x) => ["pruned", "original"].map((r) => ({ blocks: [], width: x, reconstruct: r }))));
+  }
   else {
     const c = tryChoice();
     if (!c.blocks.length && c.width == null) return null;
     spec.choices = [c.width == null ? { blocks: c.blocks } : { blocks: c.blocks, width: c.width }];
+    if (rs.tr.scoring && c.width != null) spec.choices.push({ ...spec.choices[0], scoring: "output" });
+    if (rs.tr.recon && c.width != null) for (const r of ["pruned", "original"]) spec.choices.push({ blocks: c.blocks, width: c.width, reconstruct: r });
   }
   return spec;
 }
@@ -3297,6 +3536,17 @@ function tryWidthTable(a) {
     `<tr data-trwidth="${r.intermediate}" style="cursor:pointer;${rs.wi === r.intermediate ? "background:var(--sel)" : ""}"><td>${thou(r.intermediate)}</td><td>−${Math.round(100 * (1 - r.intermediate / full))} %</td><td><span class="tr-chip" style="background:${bandCss(r.band)}"></span> ${pct(r.rel)}</td><td>${r.ppl}</td></tr>`).join("")}</table></details>`;
 }
 
+// The cuts that rank the neurons another way, next to the same cut without it. "Better in both halves" is the only thing called a gain: one half alone can be luck.
+function tryVariantsTable(a) {
+  const rows = ((a && a.variants) || []).filter((r) => r.tried);
+  if (!rows.length) return "";
+  const pct = (x) => x == null ? "–" : (x >= 0 ? "+" : "−") + Math.abs(100 * x).toFixed(1) + " %";
+  const both = (r) => r.better_both_halves === true ? "yes" : r.better_both_halves === false ? "no" : "–";
+  return `<h4>Another way of choosing the neurons</h4><table class="tbl" id="tr-variants"><tr><th>Cut</th><th>Error</th><th>Against the original</th><th>Against the same cut by activation</th><th>Better in both halves</th><th>Given back by the refit (median / worst layer)</th></tr>${rows.map((r) =>
+    `<tr><td>${esc(r.label)}</td><td>${(+r.loss).toFixed(3)}</td><td>${pct(r.rel)}</td><td>${pct(r.rel_vs_plain)}</td><td>${both(r)}</td><td>${r.recon && r.recon.median_removed_share != null ? `${pct(r.recon.median_removed_share).replace("+", "")} / ${pct(r.recon.worst_removed_share).replace("+", "")}${r.recon.overlap ? ` · ${r.recon.overlap} rows overlap Try first` : ""}` : "–"}</td></tr>`).join("")}</table>
+    <p class="dim small">Experimental, and measured here only before healing: a gain on both halves is a reason to try the same cut healed, not a promise. The citations behind these options (the output ranking and the refit) have not been checked by this program; the refit is algebra, not a result. A gain here may not survive healing.</p>`;
+}
+
 // the plain verdict for one answer, with the honest part that never changes
 function tryVerdict(a, r, what) {
   const [e1, e2] = a.bands.edges, band = r.band, base = a.base;
@@ -3339,6 +3589,7 @@ function tryCard() {
     else if (tryDepthOn() && (tr.what === "choice" || Object.keys(a.runs || {}).length)) parts.push(`<h4>Choose blocks</h4>${tryBlockChart(a, ins)}${tryLegend(a)}`);
     if (tryDepthOn() && rs.blocks && a.runs && a.runs[String(rs.blocks)]) parts.push(tryRunsTable(a, rs.blocks));
     if (tryWidthOnShape() && a.widths.some((w) => w.tried)) parts.push(`<h4>Thinner layers: quality against size</h4>${tryWidthChart(a, ins)}${tryLegend(a)}${tryWidthTable(a)}`);
+    if ((a.variants || []).length) parts.push(tryVariantsTable(a));
     const ch = tryChoice(), hit = tryLookup(a, ch);
     const label = (ch.blocks.length ? `blocks ${ranges(ch.blocks)}` : "") + (ch.blocks.length && ch.width != null ? " and " : "") + (ch.width != null ? `MLP ${thou(ch.width)}` : "");
     const verdict = hit ? tryVerdict(a, hit, "Your choice (" + label + ")") : (ch.blocks.length || ch.width != null) ? `<p class="dim">Your choice (${esc(label)}) has not been tried yet: choose “My choice” above and press Try.</p>` : "";
@@ -3351,6 +3602,8 @@ function tryCard() {
     <div class="row">${what}</div>
     <p>Text: <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="quick" ${q === 64 ? "checked" : ""} ${run ? "disabled" : ""}> Quick (64 samples)</label> <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="full" ${q === 128 ? "checked" : ""} ${run ? "disabled" : ""}> Full (128 samples)</label>
       <span class="dim small">${ins.total_params / 1e9 >= 15 ? "Quick is the default for models of 15 B or more." : "Full is the default for smaller models."}</span></p>
+    ${tryWidthOnShape() && state.settings.expert_mode && !searchOn ? `<label class="opt" id="tr-scoring-row"><input type="checkbox" id="tr-scoring" ${tr.scoring ? "checked" : ""} ${run ? "disabled" : ""}> Also try ranking the neurons by their expected output (experimental; the plain cut is tried too, to compare)</label>
+    <label class="opt" id="tr-recon-row"><input type="checkbox" id="tr-recon" ${tr.recon ? "checked" : ""} ${run ? "disabled" : ""}> Also try refitting the kept neurons without training (experimental; both ways: from the cut model's own activations and from the original's; the plain cut is tried too; about ${fmtDur(plan && plan.recon_seconds ? plan.recon_seconds : null).replace("about ", "")} on top, a formula and not a measurement)</label>` : ""}
     ${searchOn ? trySearchBlock(ins) : `<p id="tr-plan">${planLine}</p>
     <div class="row"><button class="primary" id="tr-go" ${disabled ? "disabled" : ""}>${tr.what === "choice" ? "Preview my choice" : "Try"}</button><button class="secondary" id="tr-stop" ${run ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps the cuts already tried.</span></div>
     ${progress}${body}`}</div>`;
@@ -3539,6 +3792,8 @@ function wireTry() {
   const tr = rs.tr;
   document.querySelectorAll("input[name=tr-what]").forEach((r) => r.onchange = () => { tr.what = r.value; render(); });
   document.querySelectorAll("input[name=tr-q]").forEach((r) => r.onchange = () => { tr.quick = r.value === "quick"; tr.analysis = null; render(); });
+  const trs = $("tr-scoring"); if (trs) trs.onchange = () => { tr.scoring = trs.checked; render(); };
+  const trr = $("tr-recon"); if (trr) trr.onchange = () => { tr.recon = trr.checked; render(); };
   document.querySelectorAll("[data-trblock]").forEach((g) => g.onclick = () => { tryToggle(+g.dataset.trblock); render(); });
   document.querySelectorAll("[data-trrun]").forEach((row) => row.onclick = () => {
     const w = (((tr.analysis || {}).runs || {})[String(rs.blocks)] || {}).windows || [], hit = w.find((x) => x.start === +row.dataset.trrun);
@@ -3682,6 +3937,7 @@ function rsAfterState() {
 async function rsLoadHeal(name) {
   rs.hl = { name, opts: null };
   try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
+  try { const last = await invoke("heal_bench_last", { name }); rs.hb = { ...(rs.hb || {}), last: last || null }; } catch (e) { /* no earlier speed test */ }
   if (page === "reshape") render();
   if (rs.hl && rs.hl.opts) rsHealEstimate();
 }
@@ -3705,7 +3961,10 @@ function onHealEvent(p) {
 function onReshapeEvent(p) {
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
+  if (p.phase === "vllm") return onVllmEvent(p);
+  if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
+  if (p.phase === "healbench") return onHealBenchEvent(p);
   if (p.phase === "try") return onTryEvent(p);
   if (p.phase === "search") return onSearchEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
@@ -3736,6 +3995,8 @@ function rsSpec() {
     spec.blocks = rs.shape === "width" ? 0 : rs.blocks;
     spec.width = { intermediate: rs.wi, lin_v_heads: rs.lv ? rsAxis("lin_v_heads") : null, heads: rs.hh || null };
     spec.width_samples = rs.wsamples;
+    if (rs.scoring === "output") spec.width_scoring = "output";          // only when chosen: the default sends nothing
+    if (rs.recon) spec.reconstruct = { variant: "pruned" };            // only when chosen (experimental)
     if (rs.shape === "width") spec.drop_layers = null;
   }
   return spec;
@@ -3750,7 +4011,7 @@ function rsHealSpec() {
   return { tokens_m: sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, general_share: sp.general ? +(rc && !sp.shareSet ? rc.general_share : sp.share) : 0, recipe: rc ? rc.id : null,
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
-    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null,
+    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null, head_checkpoint: sp.head_checkpoint === "off" ? "off" : null,
     ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}) };
 }
 
@@ -3800,6 +4061,8 @@ function wireReshape() {
   const lv = $("rs-lv"); if (lv) lv.onchange = () => { rs.lv = lv.checked; rs.options = null; rsOptions(); };
   const hh = $("rs-hh"); if (hh) hh.onchange = () => { rs.hh = hh.value ? +hh.value : null; rs.options = null; rsOptions(); };
   const wsm = $("rs-wsamples"); if (wsm) wsm.onchange = () => { rs.wsamples = +wsm.value; rsMeasInfo(); };
+  const wrc = $("rs-recon"); if (wrc) wrc.onchange = () => { rs.recon = wrc.checked; };
+  const wsc = $("rs-scoring"); if (wsc) wsc.onchange = () => { rs.scoring = wsc.value === "output" ? "output" : "activation"; };
   const measure = rsMeasure;
   on("rs-measure-now", () => measure(false));
   on("rs-measure-again", () => measure(true));
@@ -3836,6 +4099,19 @@ function wireReshape() {
   hv("hl-seq", (e) => { hs.seq = +e.value; }); hv("hl-batch", (e) => { hs.batch = +e.value; }); hv("hl-ckpt", (e) => { hs.checkpointing = e.value; }); hv("hl-method", (e) => { hs.method = e.value || null; });
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
+  hv("hl-headkeep", (e) => { hs.head_checkpoint = e.checked ? "off" : null; });
+  const hbGo = $("hb-go");
+  if (hbGo) hbGo.onclick = async () => {
+    rs.hb = { ...(rs.hb || {}), running: true, rows: [], text: "Starting…", err: null, result: null };
+    render();
+    try { await invoke("heal_bench_start", { name: rs.hl.name, spec: rsHealSpec() }); } catch (e) { rs.hb.running = false; rs.hb.err = String(e); render(); }
+  };
+  const hbStop = $("hb-stop"); if (hbStop) hbStop.onclick = () => { if (rs.hb) rs.hb.text = "Stopping…"; invoke("heal_stop"); render(); };
+  const hbUse = $("hb-use");
+  if (hbUse) hbUse.onclick = () => {
+    const b = rs.hb && (rs.hb.result || rs.hb.last) && (rs.hb.result || rs.hb.last).best_settings; if (!b) return;
+    hs.kl_chunk = b.kl_chunk; hs.head_checkpoint = b.head_checkpoint === "off" ? "off" : null; render(); rsHealEstimate();
+  };
   on("hl-reset", () => { Object.assign(hs, HEAL_AUTO); render(); rsHealEstimate(); });
   on("hl-safer", () => { if (!healUseSafer()) return; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
@@ -3863,6 +4139,7 @@ function wireReshape() {
   on("rs-cleardrop", () => { rs.dropText = ""; render(); });
   wireHealSection();
   wireThink();
+  wireTrace();
   wireAuto();
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
@@ -3944,6 +4221,7 @@ function wire() {
   wireRetrain();
   wireUnsloth();
   wireLlama();
+  wireVllm();
   on("recheck", refreshEnv);
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));

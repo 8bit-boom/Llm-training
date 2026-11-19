@@ -493,7 +493,7 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, recipe: null, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
-    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null });
+    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
   assert.equal(b.run("rsHealSpec().general_share"), 0);
@@ -911,4 +911,136 @@ test("the result card says what became of the multi-token head", () => {
   open(b, pageState({ made: [removed] }));
   assert.match(b.run("renderReshape()"), /The multi-token head \(speculative decoding\) was removed: it no longer fits the thinner layers\./);
   assert.equal(b.run(`mtpText(null)`), "The vision part and the multi-token head were copied unchanged.");
+});
+
+test("the Heal card shows what the rows cover and the advice when reasoning rows lose their answer", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  const cov = { v: 1, max_seq: 4096, rows: { project_text: 3, project_chat: 40, general_text: 0, general_chat: 20 },
+    chat_rows: { complete: 40, cut: 15, skipped: 5, skipped_by: { project_chat: 2, general_chat: 3 } },
+    reasoning_rows: { complete: 30, cut_reasoning: 4, cut_answer: 6, skipped: 5, total: 45, known: true },
+    token_share: { prompt: 0.1, reasoning: 0.6, answer: 0.25, plain: 0.05 }, length_buckets: { "<=512": 4, "<=1k": 9, ">16k": 1 },
+    notes: ["33% of the reasoning rows lost their answer or were left out because they are longer than 4096 tokens: choose 8192 in Heal settings if the plan says it fits."] };
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ heal: { status: "stopped", coverage: cov } }))} }`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="hl-coverage"/);
+  assert.match(html, /3 texts and 40 conversations from your world, 0 texts and 20 conversations of general text/);
+  assert.match(html, /<strong>40<\/strong> whole, <strong>15<\/strong> cut at the sequence length, <strong>5<\/strong> left out as too long/);
+  assert.match(html, /Reasoning rows: <strong>30<\/strong> whole, <strong>6<\/strong> lost part of the answer, <strong>4<\/strong> cut inside the reasoning, <strong>5<\/strong> left out/);
+  assert.match(html, /10% question, 60% reasoning, 25% answer, 5% plain text/);
+  assert.match(html, /&lt;=512 4 · &lt;=1k 9 · &gt;16k 1|<=512 4/);
+  assert.match(html, /choose 8192 in Heal settings if the plan says it fits/);
+  b.run("rs.hl.opts.heal = { status: 'stopped' }");
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hl-coverage"/);
+});
+
+test("the size lines and a made model say where the parameters are", () => {
+  const b = browser();
+  const bd = { text_layers: 19.0e9, embeddings: 1.27e9, output: 1.27e9, vision: 0.46e9, mtp: 0, other: 0.0001e9, total: 21.9e9, mtp_removed: 0.3e9 };
+  assert.equal(b.run(`breakdownLine(${JSON.stringify(bd)})`), "text layers 19.00 B · embeddings 1.27 B · output 1.27 B · vision 0.46 B · multi-token head removed 0.30 B · other 0.00 B · file total 21.90 B");
+  assert.equal(b.run("breakdownLine(null)"), "");
+  open(b, pageState());
+  b.run(`rs.options.options = rs.options.options.map((o) => ({ ...o, breakdown: ${JSON.stringify(bd)} }))`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="rs-breakdown">text layers 19.00 B · embeddings 1.27 B/);
+  const m = thinModel();
+  m.summary.params_breakdown = bd;
+  open(b, pageState({ made: [m] }));
+  assert.match(b.run("renderReshape()"), /id="rs-made-breakdown">text layers 19.00 B .* file total 21.90 B/);
+  open(b, pageState({ made: [thinModel()] }));
+  assert.doesNotMatch(b.run("renderReshape()"), /rs-made-breakdown/);
+});
+
+test("Healing settings: keeping the output logits is off by default, offered only when it fits, sent when ticked, and cleared by Reset and the safer step", async () => {
+  const asked = [];
+  const m = thinModel();
+  const b = browser({ heal_estimate: (a) => { asked.push(JSON.parse(JSON.stringify(a.spec))); return estOf({ head_off_gb: 5.6, head_off_fits: true }); } });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ head_off_gb: 5.6, head_off_fits: true }))} }`);
+  assert.doesNotMatch(b.run("renderReshape()"), /hl-headkeep/);                                                      // Expert only
+  b.run(`state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /<input type="checkbox" id="hl-headkeep" +>/);
+  assert.match(html, /about <span id="hl-headkeep-gb">5\.6<\/span> GB more memory/);
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), null);                                                         // nothing sent: the program's default (checkpointed)
+  b.run(`renderReshape(); wireReshape();`);
+  b.els["hl-headkeep"].checked = true;
+  await b.els["hl-headkeep"].onchange();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(asked.at(-1).head_checkpoint, "off");
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), "off");
+  b.run(`wireReshape()`);
+  await b.els["hl-reset"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.head_checkpoint"), null);
+  // not offered when the estimate says it does not fit
+  b.run(`state.settings.expert_mode = true; rs.hl.opts.head_off_fits = false; rs.hlEst = null`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-headkeep" +disabled>[\s\S]*?does not fit this card/);
+  // the safer step after an out-of-memory failure turns it back on
+  b.run(`rs.hl.opts.safer = { label: "the output layer's logits made again in the backward pass (checkpointed)", head_checkpoint: "on", kbit_upcast: false, checkpointing: "on", batch: 2, per_update: 32, kl_chunk: 128 }; rs.hlSpec.head_checkpoint = "off"; healUseSafer()`);
+  assert.equal(b.run("rs.hlSpec.head_checkpoint"), null);
+});
+
+test("the Slim form: refitting the kept neurons is Expert, off, sent only when ticked, and shows the Try numbers when there are some", () => {
+  const b = browser();
+  open(b, pageState());
+  b.run(`rs.options = ${JSON.stringify({ ...optionsFor("prune"), shape: "width", width: widthMeta(), width_options: [{ blocks: 0, options: widths.map((i) => widthOption(i)) }] })}; rs.shape = "width"; rs.wi = 12288`);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="rs-recon"/);
+  b.run(`state.settings.expert_mode = true`);
+  assert.match(b.run("renderReshape()"), /<input type="checkbox" id="rs-recon" +> Refit the kept neurons without training \(experimental, off\)/);
+  assert.equal(JSON.parse(b.run("JSON.stringify(rsSpec())")).reconstruct, undefined);
+  b.run(`rs.recon = true`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(rsSpec().reconstruct)")), { variant: "pruned" });
+  assert.match(b.run("renderReshape()"), /Try first has not measured the refit for this width/);
+  b.run(`rs.tr.analysis = ${JSON.stringify({ variants: [{ tried: true, intermediate: 12288, label: "MLP 12,288, kept neurons refitted", loss: 2.3, better_both_halves: true, recon: { median_removed_share: 0.2 } }] })}`);
+  assert.match(b.run("renderReshape()"), /error 2\.300 \(better than the plain cut in both halves\); it gives back 20 % of what the cut took/);
+});
+
+test("the Heal card: find the fastest loss settings runs, shows a row per setting with out-of-memory rows, and Use the fastest fills the settings", async () => {
+  const sent = [];
+  const m = thinModel();
+  const b = browser({ heal_bench_start: (a) => { sent.push(a); return null; }, heal_estimate: () => estOf() });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Find the fastest loss settings/); assert.match(html, /id="hb-go" >Find the fastest/); assert.match(html, /id="hb-use" disabled/);
+  assert.match(html, /Nothing is assumed: these numbers are this computer's/);
+  b.run(`renderReshape(); wireReshape();`);
+  await b.els["hb-go"].onclick();
+  assert.equal(sent.length, 1); assert.equal(sent[0].name, m.name); assert.equal(typeof sent[0].spec, "object");
+  const rows = [{ id: "current", label: "Your settings (KL chunk 128)", ok: true, tokens_per_s: 1200, vs_current: 1, peak_vram_mb: 20480, chunk: 128, head_checkpoint: true },
+    { id: "chunk_512", label: "KL chunk 512", ok: false, oom: true, chunk: 512, head_checkpoint: true },
+    { id: "keep_logits_chunk_256", label: "Keep the output layer's logits, KL chunk 256", ok: true, tokens_per_s: 1500, vs_current: 1.25, peak_vram_mb: 25600, chunk: 256, head_checkpoint: false }];
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "heal_bench", index: 0, total: 3, name: rows[0].label })})`);
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "heal_bench", index: 0, total: 3, name: rows[0].label, row: rows[0] })})`);
+  b.run("state.settings.expert_mode = true");
+  html = b.run("renderReshape()");
+  assert.match(html, /Setting 1 of 3: Your settings/); assert.match(html, /<td>Your settings \(KL chunk 128\)<\/td><td>1,200<\/td><td>×1\.00<\/td><td>20\.0 GB<\/td><td>ok<\/td>/);
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "done", data: { rows, best: "keep_logits_chunk_256", best_settings: { kl_chunk: 256, head_checkpoint: "off" } } })})`);
+  b.run("state.settings.expert_mode = true");
+  html = b.run("renderReshape()");
+  assert.match(html, /<td>KL chunk 512<\/td><td>–<\/td><td>–<\/td><td>–<\/td><td>ran out of memory<\/td>/);
+  assert.match(html, /<tr class="best"><td>Keep the output layer(?:'|&#39;)s logits, KL chunk 256<\/td><td>1,500<\/td><td>×1\.25<\/td><td>25\.0 GB<\/td><td>fastest<\/td>/);
+  assert.match(html, /id="hb-use" >Use the fastest \(KL chunk 256, logits kept\)/);
+  b.run(`wireReshape()`);
+  await b.els["hb-use"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.kl_chunk"), 256); assert.equal(b.run("rs.hlSpec.head_checkpoint"), "off");
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), "off");
+});
+
+test("the Heal card shows the held-out loss next to the one on your own data, and says why they differ", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  const metrics = [{ kind: "distill_eval", step: 0, calib_loss: 3.1, holdout_loss: 2.9 }, { kind: "distill_eval", step: 50, calib_loss: 2.4, holdout_loss: 2.6 }, { kind: "distill_eval", step: 60, calib_loss: 2.3 }];
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ metrics, heal: { status: "done", result: { holdout_rows: 64, holdout_loss_before: 2.9, holdout_loss_after: 2.6, teacher_holdout_loss: 2.1 } } }))} }`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(healSeries().hold)")), [[0, 2.9], [50, 2.6]]);
+  const html = b.run("renderReshape()");
+  assert.match(html, /Held out \(64 general rows the healing never learned from\): error 2\.90 → 2\.60; the original has 2\.10/);
+  assert.match(html, /reads better than it is/);
+  b.run(`rs.hl.opts.heal = { status: "done", result: { calib_loss_after: 2.3 } }; rs.hl.opts.metrics = []`);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hl-holdout"/);
 });

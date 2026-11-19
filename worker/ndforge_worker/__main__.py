@@ -224,6 +224,30 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error(_code(exc, "think_check_failed"), str(exc) if _code(exc, "") else _explain(exc))   # llama_cpp_missing: the page offers the installer
             return 1
+    if kind == "trace_gen":
+        from . import thinkcheck, tracegen
+        try:
+            return tracegen.run(job)
+        except thinkcheck.ThinkCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error("trace_gen_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("trace_gen_failed", _explain(exc))
+            return 1
+    if kind == "vllm_selftest":
+        from . import thinkcheck, vllmselftest
+        try:
+            return vllmselftest.run(job)
+        except thinkcheck.ThinkCheckError as exc:   # a plain-language refusal: no traceback text
+            protocol.error("vllm_selftest_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("vllm_selftest_failed", _explain(exc))
+            return 1
     if kind == "general_check":
         from . import generaltext
         return generaltext.run_check(job)

@@ -266,3 +266,93 @@ def test_the_plan_knows_what_is_saved_already_and_what_needs_a_measurement(tmp_p
     assert (r["passes_total"], r["passes_cached"], r["passes_todo"], r["guess"], r["seconds"]) == (2, 1, 1, False, 8.0)
     code, ev = run_job(tmp_path, {**job, "want": {"choices": [{"blocks": [], "width": 20}]}, "calibration": {**job["calibration"], "samples": 8}})
     assert ev[-1]["data"]["passes_cached"] == 0 and any("another number of samples" in e.get("text", "") for e in ev if e["type"] == "log")          # and says why
+
+
+# ------------------------------------------------------------------------------------------------------ ranking the neurons by their output
+
+def test_keys_without_a_scoring_are_exactly_the_old_keys_and_a_suffix_round_trips():
+    assert rt.pass_key((2,), 13312, None) == rt.pass_key((2,), 13312, "activation") == "d=2|w=13312"
+    assert rt.pass_key((), 12288, "output") == "d=|w=12288|s=output"
+    assert rt.parse_key("d=|w=12288|s=output") == ((), 12288) and rt.parse_key("d=2,3|w=13312|s=output") == ((2, 3), 13312)
+    assert rt.key_options("d=|w=12288|s=output") == {"s": "output"} and rt.key_options("d=2|w=13312") == {}
+    assert rt.plain_key("d=2|w=13312|s=output") == "d=2|w=13312" == rt.plain_key("d=2|w=13312")
+    assert rt.describe_key("d=2|w=13312|s=output") == "block 2 skipped, MLP 13,312, neurons ranked by their output"
+    assert rt.describe_key("d=2|w=13312") == "block 2 skipped, MLP 13,312"
+
+
+def test_a_choice_with_output_scoring_asks_for_the_plain_cut_too_and_nothing_twice():
+    keys = rt.expand_want({"choices": [{"blocks": [2], "width": 12288, "scoring": "output"}, {"blocks": [2], "width": 12288}]}, 16, 1, 1, dims=DIMS)
+    assert keys == [rt.BASE_KEY, "d=2|w=12288", "d=2|w=12288|s=output"]
+    both = rt.expand_want({"widths": [12288], "scoring": "output"}, 16, 1, 1, dims=DIMS)
+    assert both == [rt.BASE_KEY, "d=|w=12288", "d=|w=12288|s=output"]
+    assert rt.expand_want({"choices": [{"width": 12288, "scoring": "activation"}]}, 16, 1, 1, dims=DIMS) == [rt.BASE_KEY, "d=|w=12288"]
+    for bad in ({"choices": [{"blocks": [2], "scoring": "output"}]}, {"choices": [{"width": 12288, "scoring": "magic"}]}):
+        with pytest.raises(ReshapeError):
+            rt.expand_want(bad, 16, 1, 1, dims=DIMS)
+
+
+def result(loss, h1, h2):
+    return {"loss": loss, "loss_h1": h1, "loss_h2": h2, "tokens": 100, "seconds": 1.0}
+
+
+def test_the_analysis_lists_the_variants_next_to_the_plain_cut_and_calls_a_gain_only_when_both_halves_agree():
+    passes = {rt.BASE_KEY: result(2.0, 2.0, 2.0), "d=|w=12288": result(2.4, 2.4, 2.4), "d=|w=12288|s=output": result(2.3, 2.2, 2.4),
+              "d=|w=13312": result(2.2, 2.2, 2.2), "d=|w=13312|s=output": result(2.1, 2.1, 2.3)}
+    a = rt.analyse(passes, 16, 4, 1, 1)
+    assert [w["intermediate"] for w in a["widths"]] == [12288, 13312], "the plain widths only"
+    v = {r["key"]: r for r in a["variants"]}
+    one, two = v["d=|w=12288|s=output"], v["d=|w=13312|s=output"]
+    assert one["plain_loss"] == 2.4 and one["rel_vs_plain"] == pytest.approx(2.3 / 2.4 - 1) and one["rel"] == pytest.approx(0.15)
+    assert one["better_both_halves"] is False, "one half is the same as the plain cut: not a gain"
+    assert two["better_both_halves"] is False and v["d=|w=12288|s=output"]["intermediate"] == 12288
+    better = {**passes, "d=|w=12288|s=output": result(2.2, 2.3, 2.1)}
+    assert {r["key"]: r for r in rt.analyse(better, 16, 4, 1, 1)["variants"]}["d=|w=12288|s=output"]["better_both_halves"] is True
+    assert one["label"] == "MLP 12,288, neurons ranked by their output" and one["options"] == {"s": "output"}
+    only = rt.analyse({rt.BASE_KEY: result(2.0, 2.0, 2.0), "d=|w=12288|s=output": result(2.3, 2.3, 2.3)}, 16, 4, 1, 1)
+    assert only["variants"][0]["plain_loss"] is None and only["variants"][0]["better_both_halves"] is None, "the plain cut was not tried: nothing to compare"
+    assert "variants" not in rt.analyse({rt.BASE_KEY: result(2.0, 2.0, 2.0), "d=|w=12288": result(2.4, 2.4, 2.4)}, 16, 4, 1, 1), "no variants, no new key"
+
+
+def test_an_old_results_file_is_read_as_before():
+    old = {"format": 1, "key": rt.build_key("org/m", "dir:x", {"version": 1, "samples": 8, "max_len": 64}, "h", "auto"), "passes": {rt.BASE_KEY: result(2.0, 2.0, 2.0), "d=2|w=": result(2.1, 2.1, 2.1)}}
+    a = rt.analyse(old["passes"], 16, 4, 1, 1)
+    assert "variants" not in a and a["passes"] == 2 and [r["key"] for r in a["blocks"] if r["tried"]] == ["d=2|w="]
+
+
+# ------------------------------------------------------------------------------------------------------ refitting the kept neurons: keys, estimate, analysis
+
+def test_recon_keys_have_their_own_suffix_after_the_scoring_one_and_old_keys_are_unchanged():
+    assert rt.pass_key((), 12288, None, None) == "d=|w=12288" and rt.pass_key((), 12288, "output", "pruned") == "d=|w=12288|s=output|r=pruned"
+    assert rt.pass_key((2,), 13312, None, "original") == "d=2|w=13312|r=original"
+    assert rt.parse_key("d=2|w=13312|r=original") == ((2,), 13312) and rt.key_options("d=|w=12288|s=output|r=pruned") == {"s": "output", "r": "pruned"}
+    assert rt.plain_key("d=2|w=13312|r=original") == "d=2|w=13312"
+    assert rt.describe_key("d=|w=12288|r=pruned") == "MLP 12,288, kept neurons refitted (from the cut model's activations)"
+    assert rt.check_recon(None) is None and rt.check_recon(False) is None and rt.check_recon(True) == "pruned" and rt.check_recon("original") == "original"
+    with pytest.raises(ReshapeError):
+        rt.check_recon("both")
+
+
+def test_a_choice_that_refits_asks_for_the_plain_cut_too_and_needs_a_width():
+    keys = rt.expand_want({"choices": [{"width": 12288, "reconstruct": "pruned"}, {"width": 12288, "reconstruct": "original"}]}, 16, 1, 1, dims=DIMS)
+    assert keys == [rt.BASE_KEY, "d=|w=12288", "d=|w=12288|r=pruned", "d=|w=12288|r=original"]
+    both = rt.expand_want({"choices": [{"width": 12288, "scoring": "output", "reconstruct": "pruned"}]}, 16, 1, 1, dims=DIMS)
+    assert both == [rt.BASE_KEY, "d=|w=12288", "d=|w=12288|s=output", "d=|w=12288|s=output|r=pruned"]
+    assert rt.expand_want({"choices": [{"width": 12288}]}, 16, 1, 1, dims=DIMS) == [rt.BASE_KEY, "d=|w=12288"], "off: exactly the old keys"
+    with pytest.raises(ReshapeError, match="needs a width"):
+        rt.expand_want({"choices": [{"blocks": [2], "reconstruct": "pruned"}]}, 16, 1, 1, dims=DIMS)
+
+
+def test_the_estimate_adds_the_refits_as_a_guess_and_is_unchanged_without_them():
+    plain = rt.estimate(4, 10.0, 1000, 1000, 27.0, "4bit", 100)
+    assert plain == {"seconds_per_pass": 10.0, "seconds": 40.0, "guess": False}
+    with_r = rt.estimate(4, 10.0, 1000, 1000, 27.0, "4bit", 100, recon_passes=2)
+    extra = 2 * (rt.RECON_PASS_EQUIVALENTS * 10.0 + rt.RECON_SOLVE_SECONDS_PER_B * 27.0)
+    assert with_r["recon_passes"] == 2 and with_r["recon_seconds"] == pytest.approx(extra) and with_r["seconds"] == pytest.approx(40.0 + extra) and with_r["guess"] is True
+
+
+def test_the_variant_row_carries_the_refit_numbers_next_to_the_plain_cut():
+    passes = {rt.BASE_KEY: result(2.0, 2.0, 2.0), "d=|w=12288": result(2.4, 2.4, 2.4), "d=|w=12288|r=pruned": result(2.2, 2.2, 2.1)}
+    info = {"d=|w=12288|r=pruned": {"median_removed_share": 0.2, "worst_removed_share": -0.1, "layers": 60, "overlap": 0}}
+    v = rt.analyse(passes, 16, 4, 1, 1, None, "contiguous", info)["variants"][0]
+    assert v["recon"]["median_removed_share"] == 0.2 and v["better_both_halves"] is True and v["rel_vs_plain"] == pytest.approx(2.2 / 2.4 - 1)
+    assert "recon" not in rt.analyse(passes, 16, 4, 1, 1)["variants"][0]

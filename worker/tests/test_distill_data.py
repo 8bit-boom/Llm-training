@@ -196,7 +196,8 @@ def test_a_chat_conversation_is_one_row_cut_at_the_length_and_a_very_long_one_is
     rows, tokens = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
     lens = [len(r["input_ids"]) for r in rows]
     # 50 chars -> cut to 32 (no second window); 31 chars -> 31; 71 chars is more than twice 32 -> skipped; 12 chars -> too short; 201 -> skipped
-    assert lens == [32, 31] and tokens == 63 and stats == {"cut_rows": 1, "skipped_long": 2}
+    assert lens == [32, 31] and tokens == 63 and {k: stats[k] for k in ("cut_rows", "skipped_long")} == {"cut_rows": 1, "skipped_long": 2}
+    assert sum(stats["length_buckets"].values()) == 5, "the skipped and the too short ones are counted by length too"
     assert all(r["kind"] == "general" and r["completion_mask"] == [1] * len(r["input_ids"]) for r in rows)
 
 
@@ -204,7 +205,7 @@ def test_plain_text_is_still_windowed_and_a_text_column_of_turns_counts_as_text(
     f = jsonl(tmp_path / "t.jsonl", [{"text": "a" * 100}])
     stats: dict = {}
     rows, _ = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
-    assert [len(r["input_ids"]) for r in rows] == [32, 32, 32] and stats == {"cut_rows": 0, "skipped_long": 0}
+    assert [len(r["input_ids"]) for r in rows] == [32, 32, 32] and {k: stats[k] for k in ("cut_rows", "skipped_long")} == {"cut_rows": 0, "skipped_long": 0}
 
 
 def test_the_conversation_rule_does_not_need_a_stats_dict_or_a_report(tmp_path):
@@ -372,3 +373,38 @@ def test_rows_are_answered_longest_first_and_every_row_once():
     assert [len(window[j]["input_ids"]) for j in order] == [9, 9, 7, 5, 5, 2]
     assert order == [1, 4, 5, 0, 2, 3], "equal lengths keep their order"
     assert sorted(order) == list(range(6)) and dj.length_order([]) == []
+
+
+# ------------------------------------------------------------------------------------------------------------ held-out rows
+
+def test_the_held_out_rows_come_after_the_training_rows_and_never_share_a_text(tmp_path):
+    f = jsonl(tmp_path / "h.jsonl", [{"text": chr(97 + i % 26) * 40 + str(i)} for i in range(30)])
+    kw = {"file": f, "report": {}}
+    tok = lambda t: CharTok()(t)["input_ids"]          # noqa: E731
+    plain, ptok = dj.general_rows(dict(kw), tok, max_seq=16, budget=100, stats={})
+    stats: dict = {}
+    rows, tokens = dj.general_rows(dict(kw), tok, max_seq=16, budget=100, stats=stats, holdout=5)
+    assert [r["input_ids"] for r in rows][:len(plain) - 0] == [r["input_ids"] for r in plain][:len(rows)] and tokens >= 100
+    held = stats["holdout_rows"]
+    assert len(held) == 5
+    h = lambda rs: {dj.hashlib.sha1(json.dumps(r["input_ids"]).encode()).hexdigest() for r in rs}          # noqa: E731
+    assert not h(rows) & h(held), "no held-out row is a training row"
+    # a text of several windows gives its training windows only: its later windows are not held out (they sit next to rows that were trained on)
+    assert all(r["kind"] == "general" and r["completion_mask"] == [1] * len(r["input_ids"]) for r in held)
+    # without the option nothing changes: no key, the same rows
+    none: dict = {}
+    again, atok = dj.general_rows(dict(kw), tok, max_seq=16, budget=100, stats=none)
+    assert "holdout_rows" not in none and [r["input_ids"] for r in again] == [r["input_ids"] for r in plain] and atok == ptok
+
+
+def test_the_held_out_rows_are_saved_and_read_back_under_their_own_name(tmp_path):
+    rows = [{"input_ids": [1, 2, 3], "completion_mask": [1, 1, 1], "kind": "general", "source": "general"}, {"input_ids": [4, 5], "completion_mask": [1, 1], "kind": "general", "source": "general"}]
+    dj.save_rows(tmp_path, rows, "holdout")
+    assert (tmp_path / "holdout.npz").is_file() and not (tmp_path / "rows.npz").exists()
+    back = dj.load_rows(tmp_path, "holdout")
+    assert [r["input_ids"] for r in back] == [[1, 2, 3], [4, 5]]
+    dj.save_rows(tmp_path, rows)
+    assert (tmp_path / "rows.npz").is_file() and dj.load_rows(tmp_path)[0]["input_ids"] == [1, 2, 3]
+    assert dj._read_holdout_meta(tmp_path) is None
+    (tmp_path / "holdout.json").write_text('{"rows": 2, "teacher_loss": null}')
+    assert dj._read_holdout_meta(tmp_path)["rows"] == 2

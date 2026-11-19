@@ -401,3 +401,16 @@ A practical guide with recommendations for Qwen3.8 27B: `docs/PRUNE_QWEN38_27B.m
 ## Healing in rounds
 
 "Keep thinking" heals can also be done in rounds that stop at the first round that passes a thinking check (experimental): `docs/HEAL_ROUNDS.md`.
+
+## Where the parameters are (`params_breakdown`)
+
+The worker's `reshape` result has an additive `params_breakdown` `{text_layers, embeddings, output, vision, mtp, other, total, mtp_removed}`; `total` is `params_after` and the parts add up to it (`mtp_removed` is what a width cut took out with the multi-token head and is not part of `total`). The program computes the same parts before anything is written (`plan::ParamsBreakdown`: `SizeOption.breakdown` for every layer and width option, `StagePlan.breakdown` for Auto-cut; both are absent from an older saved plan) from the terms of `width_params_dims`, and a test checks that they sum to the table `worker/tests/data/width_params.json` for every case. The Slim size lines, the made model's card and the Auto-cut report show them as "text layers · embeddings · output · vision · multi-token head removed · other · file total".
+
+## Ranking the neurons by their output (`width_scoring`)
+
+Job key of `reshape`: `"width_scoring": "activation"` (default) | `"output"` (experimental); `ReshapeSpec.width_scoring` in the program, an Expert select on the Slim page. See docs/TRY_FIRST.md ("Ranking the neurons by their output") for the formula, what is recorded by the measurement, and how Try first compares it. Not the default and not measured here to be better.
+
+## Refitting the kept neurons (`reconstruct`, experimental)
+
+`reshape_try` choices carry `reconstruct: "pruned" | "original"` (Rust `TryChoice.reconstruct`, needs a width); see docs/TRY_FIRST.md ("Refitting the kept neurons"). No new job, event or error code: the progress step is `recon` (`protocol.progress` with a `layers` detail) and the timing line `recon`. Off by default and not measured on a real model.
+

@@ -133,6 +133,16 @@ def group_params(tensors: dict, n_layers: int) -> dict:
     return {"layers": layers, **g, "total": total, "bytes_per_param": float(DTYPE_BYTES.get(dominant, 2))}
 
 
+def breakdown(groups: dict, src=None, before: dict | None = None) -> dict:
+    """Where the parameters are: {"text_layers", "embeddings", "output", "vision", "mtp", "other", "total", "mtp_removed"} from `group_params` numbers. `src` (the layers that make the new
+    model, as in `params_after`) picks which layers count; `before` (the original's groups) lets `mtp_removed` say how much of the multi-token head a cut took out.
+    The parts add up to `total`, which is `params_after(groups, src)`."""
+    layers = groups["layers"]
+    parts = {"text_layers": sum(layers) if src is None else sum(layers[s] for s in src), "embeddings": groups["embed"], "output": groups["lm_head"], "vision": groups["vision"],
+             "mtp": groups["mtp"], "other": groups["other"]}
+    return {**parts, "total": sum(parts.values()), "mtp_removed": max(0, before["mtp"] - groups["mtp"]) if before else 0}
+
+
 def params_after(groups: dict, src: list[int]) -> int:
     layers = groups["layers"]
     return groups["total"] - sum(layers) + sum(layers[s] for s in src)

@@ -60,13 +60,24 @@ def test_the_32_bit_embedding_copy_is_the_first_step_when_it_is_on_and_only_then
 
 def test_the_memory_estimate_matches_the_shared_cases_and_counts_the_32_bit_copy_only_when_it_is_on():
     for c in CASES["memory"]:
-        got = healmem.heal_memory_gb(c["student_b"], c["layers"], c["hidden"], c["vocab"], c["seq"], c["batch"], c["checkpointing"], c["rank"], c["kl_chunk"], c["qlora"], c["upcast"])
+        got = healmem.heal_memory_gb(c["student_b"], c["layers"], c["hidden"], c["vocab"], c["seq"], c["batch"], c["checkpointing"], c["rank"], c["kl_chunk"], c["qlora"], c["upcast"], c.get("head_ckpt", True))
         assert got == pytest.approx(c["gb"], rel=1e-3), c
     args = dict(student_b=16.0, layers=40, hidden=5120, vocab=248_320, seq=1024, batch=2, checkpointing=True, rank=32, kl_chunk=128)
     on, off = healmem.heal_memory_gb(qlora=True, upcast=True, **args), healmem.heal_memory_gb(qlora=True, upcast=False, **args)
     # both tables (2 x 248,320 x 5,120 values) are 2 bytes per value more when copied to 32-bit; the estimate adds 1 GB of overhead and then 10 %
     assert on - off == pytest.approx(2 * 248_320 * 5120 * 2 / 1e9 * 1.10, abs=0.02) and 5.0 < on - off < 6.0
     assert healmem.heal_memory_gb(qlora=False, upcast=True, **args) == healmem.heal_memory_gb(qlora=False, upcast=False, **args)    # 16-bit LoRA has no such copy
+
+
+def test_keeping_the_output_logits_costs_tokens_times_vocab_and_the_ladder_turns_it_back_on_first():
+    args = dict(student_b=16.0, layers=40, hidden=4096, vocab=248_320, seq=8192, batch=1, checkpointing=True, rank=32, kl_chunk=128, qlora=True)
+    on, off = healmem.heal_memory_gb(**args), healmem.heal_memory_gb(head_ckpt=False, **args)
+    assert off - on == pytest.approx(8192 * 248_320 * 10 / 1e9 * 1.10, abs=0.1) and 20.0 < off - on < 25.0       # about 20 GB for 8,192 tokens
+    s = {"checkpointing": False, "batch": 4, "grad_accum": 8, "chunk": 256, "upcast": True, "head_checkpoint": False}
+    first, label = healmem.next_safer(s)
+    assert first["head_checkpoint"] is True and first["upcast"] is True and "output layer" in label
+    assert healmem.next_safer(first)[1] == "the 32-bit embedding copy turned off"
+    assert "not checkpointed" in healmem.describe({**s, "max_seq": 1024, "rank": 32}) and "not checkpointed" not in healmem.describe({**first, "max_seq": 1024, "rank": 32})
 
 
 def test_the_activation_estimate_matches_the_shared_cases_and_checkpointing_lowers_it():

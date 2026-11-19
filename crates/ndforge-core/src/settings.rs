@@ -64,6 +64,41 @@ impl Default for TeacherSettings {
     }
 }
 
+/// The experimental vLLM engine (docs/VLLM.md): OFF by default, built from a research report and not yet run on this PC. Nothing is installed by the program.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VllmSettings {
+    /// offer "vLLM (experimental)" next to the standard engine and llama.cpp in the thinking check
+    pub enabled: bool,
+    /// "auto" | "docker" (Windows docker.exe / Docker Desktop) | "docker_wsl" (Docker inside WSL) | "wslc" (WSL 3.x containers) | "wsl" (vLLM installed in WSL) | "url" (a server that runs)
+    pub kind: String,
+    /// the pinned image of the docker kinds
+    pub image: String,
+    /// the WSL distribution (empty: the default one)
+    pub distro: String,
+    /// the vLLM environment inside WSL (kind "wsl")
+    pub venv: String,
+    /// kind "url": the address of a running server
+    pub url: String,
+    /// the NAMED Docker volume that keeps downloaded models (must start with `ndforge-vllm-`)
+    pub model_volume: String,
+    /// optional: a folder with a model the engine reads (a folder under /mnt/ is slow)
+    pub model_dir: String,
+    /// the pre-quantized checkpoint used for the 27 B original
+    pub teacher_repo: String,
+    /// check the rounds of a heal (model + LoRA) with vLLM; off until an agreement run showed it matches the standard engine
+    pub adapter_rounds: bool,
+    /// edits of the WSLc command templates (docs/VLLM.md); an object, empty = the defaults
+    pub wslc: serde_json::Value,
+}
+
+impl Default for VllmSettings {
+    fn default() -> Self {
+        VllmSettings { enabled: false, kind: "auto".into(), image: "vllm/vllm-openai:v0.34.0".into(), distro: String::new(), venv: "~/.ndforge/vllm".into(), url: String::new(),
+            model_volume: "ndforge-vllm-hf".into(), model_dir: String::new(), teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4".into(), adapter_rounds: false, wslc: serde_json::json!({}) }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -89,6 +124,8 @@ pub struct Settings {
     /// Unsloth Studio's share, where Auto-cut puts its GGUF files
     pub studio_share: Option<StudioShare>,
     pub teacher: TeacherSettings,
+    /// the experimental vLLM engine (off by default)
+    pub vllm: VllmSettings,
     pub recent_projects: Vec<String>,
     /// Set (for this run of the program only, never saved) when `settings.json` could not be read: where the damaged file was kept. The window shows it once.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,7 +135,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true, keep_display_on: false, auto_continue_interrupted: false, notifications: true, webhook_url: String::new(),
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), recent_projects: Vec::new(), load_note: None }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), vllm: VllmSettings::default(), recent_projects: Vec::new(), load_note: None }
     }
 }
 

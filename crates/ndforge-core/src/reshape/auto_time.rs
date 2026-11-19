@@ -161,6 +161,9 @@ fn fixed(lo: f64, hi: f64) -> R {
 }
 
 /// Work done at a measured speed (`key` is a rate of work per second, `work` the amount of it): this computer's own rate, else the formula range.
+/// The share of the speed test's rate a real heal reaches (it also saves checkpoints and measures the loss now and then): a rule of thumb, not a measurement.
+const TRAIN_BENCH_FACTOR: f64 = 0.9;
+
 fn at_rate(h: &History, key: &str, size: f64, work: f64, formula: (f64, f64)) -> R {
     match h.pick(key, size) {
         Some((v, _)) => from_history(work / v / 60.0),
@@ -285,7 +288,14 @@ fn heal_parts(h: &History, ins: &Inspect, plan: &AutoPlan, g: &StagePlan, tokens
     v.push(p("load", "load the student", load(h, gb16(g.params), if sb >= 15.0 { "4bit" } else { "16bit" })));
     let train_f = (TRAIN_H_PER_5M.0 * 60.0 * units * sb / TRAIN_REF_B, TRAIN_H_PER_5M.1 * 60.0 * units * sb / TRAIN_REF_B);
     let train = if cache {
-        at_rate(h, "train_tok_b_s", sb, tokens * sb, train_f)
+        match (h.pick("train_tok_b_s", sb), h.pick("train_bench_tok_b_s", sb)) {
+            // no earlier heal of this computer, but a speed test of the loss settings: its rate less a tenth for the checkpoints and the checks that a heal also does
+            (None, Some((v, _))) => {
+                note = note.or_else(|| Some("The training time comes from the speed test of the loss settings (a tenth less for saving and checking), not from an earlier heal.".to_string()));
+                from_history(tokens * sb / (v * TRAIN_BENCH_FACTOR) / 60.0)
+            }
+            _ => at_rate(h, "train_tok_b_s", sb, tokens * sb, train_f),
+        }
     } else {
         // online: the student learns at 60 % of the speed (the plan's own rule); no earlier cache-mode training applies
         fixed(train_f.0 / 0.6, train_f.1 / 0.6)

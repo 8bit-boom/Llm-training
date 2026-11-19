@@ -35,10 +35,11 @@ SUITE_FILE = Path(__file__).parent / "suites" / "think_suite.jsonl"
 QUICK_ITEMS = 16                                                  # the first 16 main questions: four of each topic
 SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 3407}
 MAX_NEW = {"full": 3072, "quick": 2048, "control": 512}
-BACKENDS = {"hf": "ndforge_worker.thinkcheck_hf", "llama": "ndforge_worker.thinkcheck_llama"}
+BACKENDS = {"hf": "ndforge_worker.thinkcheck_hf", "llama": "ndforge_worker.thinkcheck_llama", "vllm": "ndforge_worker.thinkcheck_vllm"}
 EST_TOKENS_PER_ITEM = 1500                                        # an average main answer with its trace (rough: about 50,000 tokens for the full suite)
 EST_TOKENS_PER_CONTROL = 60
-EST_TOKENS_PER_SECOND = {"hf": 55.0, "llama": 165.0}              # rough, for a 27B model on a 5090 (smaller models are faster)
+EST_TOKENS_PER_SECOND = {"hf": 55.0, "llama": 165.0, "vllm": 400.0}   # rough, for a 27B model on a 5090 (smaller models are faster); vllm: from a research report, not measured here
+EST_STARTUP_MINUTES = {"vllm": 3.5}                                # the vLLM engine needs 2-5 minutes to start (research report: an estimate); the other ways load inside their own time
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 LOOP_NGRAM, LOOP_WINDOW, LOOP_REPEATS, LOOP_RATIO = 32, 1024, 4, 0.15
@@ -305,13 +306,18 @@ def plan(job: dict) -> dict:
     backend = job.get("backend") or "hf"
     tokens = len(main) * EST_TOKENS_PER_ITEM * (settings["max_new"] / MAX_NEW["full"] if settings["quick"] else 1) + len(control) * EST_TOKENS_PER_CONTROL
     rate = EST_TOKENS_PER_SECOND.get(backend, EST_TOKENS_PER_SECOND["hf"])
-    return {"suite_version": suite["version"], "items": len(main), "control_items": len(control), "backend": backend, "settings": settings,
-            "est_tokens": int(tokens), "est_minutes": round(tokens / rate / 60, 1),
-            "note": "A rough guess for a 27B model on a fast card; a smaller model is quicker. Thinking can run to the limit of " + str(settings["max_new"]) + " new tokens per question."}
+    out = {"suite_version": suite["version"], "items": len(main), "control_items": len(control), "backend": backend, "settings": settings,
+           "est_tokens": int(tokens), "est_minutes": round(tokens / rate / 60, 1),
+           "note": "A rough guess for a 27B model on a fast card; a smaller model is quicker. Thinking can run to the limit of " + str(settings["max_new"]) + " new tokens per question."}
+    if backend in EST_STARTUP_MINUTES:                                 # additive keys, only for such a backend
+        out["startup_minutes"] = EST_STARTUP_MINUTES[backend]
+        out["est_minutes"] = round(out["est_minutes"] + EST_STARTUP_MINUTES[backend], 1)
+        out["note"] += " The vLLM engine is experimental: its speed (about " + str(int(rate)) + " tokens/s at 40 questions at once) and its start-up (2-5 minutes) are estimates from a research report, not measured on this PC."
+    return out
 
 
 def run_plan(job: dict) -> int:
-    """job think_check_plan: {"backend": "hf" | "llama", "quick": false}. Result: see `plan`. No model is loaded."""
+    """job think_check_plan: {"backend": "hf" | "llama" | "vllm", "quick": false}. Result: see `plan`. No model is loaded."""
     protocol.reserve_stdout()
     protocol.result(plan(job))
     return 0
@@ -320,7 +326,7 @@ def run_plan(job: dict) -> int:
 def load_backend(name: str):
     mod = BACKENDS.get(name)
     if not mod:
-        raise ThinkCheckError(f"Unknown way to run the check: {name!r}. Use 'hf' or 'llama'.")
+        raise ThinkCheckError(f"Unknown way to run the check: {name!r}. Use 'hf', 'llama' or 'vllm'.")
     try:
         return importlib.import_module(mod)
     except ImportError as exc:
@@ -393,7 +399,26 @@ def cache_key(job: dict, backend: str, settings: dict) -> dict:
     if job.get("adapter"):
         key["adapter"] = adapter_fingerprint(str(job["adapter"]))
         key["double_quant"] = bool(job.get("double_quant"))
+    if backend == "vllm":                                              # only this backend: the keys of the others stay byte-identical
+        from . import thinkcheck_vllm, vllmengine
+        try:
+            key["engine"] = vllmengine.engine_identity(job, thinkcheck_vllm.quant_of(job), bool(job.get("adapter")))
+        except vllmengine.EngineError as exc:
+            raise ThinkCheckError(str(exc)) from exc
     return key
+
+
+def vllm_adapter_problem(folder: str) -> str:
+    """"" when the vLLM engine can serve this LoRA folder; else a plain sentence (DoRA and LoftQ adapters are not served by vLLM: from the research report, untested)."""
+    try:
+        cfg = json.loads((Path(folder) / "adapter_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if cfg.get("use_dora"):
+        return "This LoRA uses DoRA, which the vLLM engine cannot serve; check it with the standard engine (Transformers)."
+    if cfg.get("loftq_config") or str(cfg.get("init_lora_weights") or "").lower() == "loftq":
+        return "This LoRA was made with LoftQ, which the vLLM engine cannot serve; check it with the standard engine (Transformers)."
+    return ""
 
 
 def _cached(path: Path, key: dict):
@@ -413,7 +438,23 @@ def _save_cache(path: Path, key: dict, res: dict) -> None:
 
 
 def run(job: dict) -> int:
-    """job think_check: {"model": folder, GGUF file or Hub id, "backend": "hf" | "llama", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path,
+    """job think_check (the experimental vLLM way with `fallback_hf` true and an adapter: a vLLM problem or an adapter vLLM cannot serve (DoRA, LoftQ) is answered by the standard engine with a plain
+    note, `fallback` in the result: a check of a round never fails because of the experiment); see `_run_one` for the job:"""
+    if job.get("backend") == "vllm" and job.get("adapter") and job.get("fallback_hf"):
+        why = vllm_adapter_problem(str(job["adapter"])) if Path(str(job["adapter"])).is_dir() else ""
+        if not why:
+            try:
+                return _run_one(job)
+            except Exception as exc:                       # noqa: BLE001 - whatever went wrong with the experiment, the standard engine answers
+                why = f"The vLLM engine could not check this round ({protocol.scrub(str(exc))[:200]})."
+        note = why + " The standard engine (Transformers) was used instead."
+        protocol.log(note)
+        return _run_one({**{k: v for k, v in job.items() if k not in ("engine", "_engine_report", "fallback_hf")}, "backend": "hf"}, note)
+    return _run_one(job)
+
+
+def _run_one(job: dict, fallback_note: str | None = None) -> int:
+    """job think_check: {"model": folder, GGUF file or Hub id, "backend": "hf" | "llama" | "vllm", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path,
     "cache_file": path (optional), "adapter": LoRA folder (optional, backend hf: the model is the base plus this adapter, NOT merged; "double_quant": bool loads a 4-bit base the way
     the student is loaded for training)}. With a cache_file, a finished check of the same model, backend, load, suite and settings is answered from it ("cached": true) and a new
     one is saved there (the original model is checked once, however often it is compared). Result: see `result_of` (the numbers of `summarize` for the questions and for the
@@ -421,10 +462,14 @@ def run(job: dict) -> int:
     protocol.reserve_stdout()
     started = time.monotonic()
     name = job.get("backend") or "hf"
-    if job.get("adapter") and name != "hf":
-        raise ThinkCheckError("A model with a LoRA on top can only be checked with the standard engine (Transformers), not with llama.cpp.")
+    if job.get("adapter") and name not in ("hf", "vllm"):
+        raise ThinkCheckError("A model with a LoRA on top can only be checked with the standard engine (Transformers) or the experimental vLLM engine, not with llama.cpp.")
     if job.get("adapter") and not Path(str(job["adapter"])).is_dir():
         raise ThinkCheckError(f"The LoRA folder to check is missing: {job['adapter']}")
+    if job.get("adapter") and name == "vllm":
+        why = vllm_adapter_problem(str(job["adapter"]))
+        if why:
+            raise ThinkCheckError(why)
     backend = load_backend(name)
     suite = load_suite()
     settings = settings_of(job)
@@ -432,13 +477,17 @@ def run(job: dict) -> int:
     key = cache_key(job, name, settings) if cache else None
     if cache and (hit := _cached(cache, key)) is not None:
         protocol.log("This model was checked before with the same settings; the saved numbers are used.")
-        protocol.result({**hit, "cached": True})
+        protocol.result({**hit, "cached": True, **({"fallback": fallback_note} if fallback_note else {})})
         return 0
     main, control = questions(suite, settings)
     stop_file = Path(job["stop_file"]) if job.get("stop_file") else None
     should_stop = (lambda: stop_file.exists()) if stop_file else (lambda: False)
     run_ = run_items(backend, main, control, settings, should_stop, job)
     res = {**result_of(str(job.get("model") or ""), name, settings, run_, time.monotonic() - started), "cached": False}
+    if fallback_note:
+        res["fallback"] = fallback_note
+    if name == "vllm":                                                 # additive: what the engine was and how it ran (the numbers are estimates until the self-test ran)
+        res["engine"] = {**(key or cache_key(job, name, settings))["engine"], **(job.get("_engine_report") or {})}
     if cache and not res["stopped"]:
         _save_cache(cache, key, res)
     protocol.result(res)

@@ -159,6 +159,42 @@
    },
    "to": null,
    "label": null
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 128,
+    "head_checkpoint": false
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 2,
+    "grad_accum": 16,
+    "chunk": 128,
+    "head_checkpoint": true
+   },
+   "label": "the output layer's logits made again in the backward pass (checkpointed)"
+  },
+  {
+   "from": {
+    "checkpointing": false,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256,
+    "upcast": true,
+    "head_checkpoint": false
+   },
+   "to": {
+    "checkpointing": false,
+    "batch": 4,
+    "grad_accum": 8,
+    "chunk": 256,
+    "upcast": true,
+    "head_checkpoint": true
+   },
+   "label": "the output layer's logits made again in the backward pass (checkpointed)"
   }
  ],
  "activation": [
@@ -380,6 +416,38 @@
    "qlora": true,
    "upcast": false,
    "gb": 20.64
+  },
+  {
+   "name": "16 B student, QLoRA, defaults, output-layer logits kept (head checkpoint off)",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 1024,
+   "batch": 2,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "head_ckpt": false,
+   "gb": 23.08
+  },
+  {
+   "name": "16 B student, QLoRA, 8192 tokens, output-layer logits kept (about 20 GB more)",
+   "student_b": 16.0,
+   "layers": 40,
+   "hidden": 4096,
+   "vocab": 248320,
+   "seq": 8192,
+   "batch": 1,
+   "checkpointing": true,
+   "rank": 32,
+   "kl_chunk": 128,
+   "qlora": true,
+   "upcast": false,
+   "head_ckpt": false,
+   "gb": 43.01
   }
  ]
 }

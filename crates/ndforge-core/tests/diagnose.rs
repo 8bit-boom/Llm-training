@@ -76,3 +76,21 @@ fn the_bundle_has_the_timings_of_the_latest_logs_as_data() {
     assert!(r["summary"].is_object() && r["advice"].is_array());
     assert!(r["summary"]["logs"].is_u64());
 }
+
+#[test]
+fn the_bundle_holds_the_vllm_self_test_report_when_there_is_one() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let dir = ndforge_core::vllm::selftest_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vllm_selftest.json"), "{\"verdict\": \"partial\"}").unwrap();
+    std::fs::write(dir.join("vllm_selftest.md"), "# vLLM self-test").unwrap();
+    let zip = bundle(None, &Settings::default(), &d.path().join("out.zip")).unwrap();
+    let names: Vec<String> = read_zip(&zip).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&"vllm_selftest.json".to_string()) && names.contains(&"vllm_selftest.md".to_string()));
+    std::fs::remove_dir_all(&dir).unwrap();
+    let zip2 = bundle(None, &Settings::default(), &d.path().join("out2.zip")).unwrap();
+    assert!(!read_zip(&zip2).iter().any(|(n, _)| n.starts_with("vllm_selftest")));
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}

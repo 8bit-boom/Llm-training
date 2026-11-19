@@ -48,7 +48,7 @@ test("the buttons do what they say", async () => {
   // safer settings: taken from what the program offers for the model
   b.run(`rs.hl = { name: "m", opts: { safer: { checkpointing: "on", batch: 1, per_update: 32, kl_chunk: 64, kbit_upcast: false } } }; rs.hlSpec = {}`);
   assert.equal(b.run(`healUseSafer()`), true);
-  assert.deepEqual(plain(b.run(`rs.hlSpec`)), { checkpointing: "on", batch: 1, per_update: 32, kl_chunk: 64, kbit_upcast: null });
+  assert.deepEqual(plain(b.run(`rs.hlSpec`)), { checkpointing: "on", batch: 1, per_update: 32, kl_chunk: 64, kbit_upcast: null, head_checkpoint: null });
   b.run(`rs.hl = { name: "m", opts: { safer: null } }`);
   assert.equal(b.run(`healUseSafer()`), false, "nothing safer is left");
 });

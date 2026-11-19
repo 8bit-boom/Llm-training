@@ -20,7 +20,7 @@ import os
 import time
 from pathlib import Path
 
-from . import protocol, reshape, reshape_width, speed
+from . import protocol, reshape, reshape_recon, reshape_width, safetensors_io, speed
 from .reshape import ReshapeError
 
 TRY_FORMAT = 1
@@ -39,17 +39,38 @@ GUESS_TOKENS_PER_SAMPLE = 256
 
 # ------------------------------------------------------------------------------------------------------------ pass keys
 
-def pass_key(blocks, width=None) -> str:
-    """The name of one question: which blocks are skipped and which MLP width is kept ("d=" and "w=" empty = the original). Sorted, so the same set is the same key."""
+def pass_key(blocks, width=None, scoring=None, recon=None) -> str:
+    """The name of one question: which blocks are skipped and which MLP width is kept ("d=" and "w=" empty = the original). Sorted, so the same set is the same key.
+    A cut that ranks the neurons by their output (`scoring` "output") has the suffix "|s=output"; with the default ranking (activation) the key is exactly the old one."""
     b = ",".join(str(int(x)) for x in sorted(set(blocks or ())))
-    return f"d={b}|w={int(width) if width else ''}"
+    key = f"d={b}|w={int(width) if width else ''}"
+    if scoring and scoring != "activation":
+        key += f"|s={scoring}"
+    if recon:
+        key += f"|r={recon}"                   # the kept neurons are refitted ("pruned": from the cut model's own activations, "original": from the original's)
+    return key
 
 
 def parse_key(key: str):
-    """(blocks tuple, width or None) of a pass key."""
-    d, w = key.split("|")
+    """(blocks tuple, width or None) of a pass key (optional suffix segments such as "s=output" are ignored: see `key_options`)."""
+    parts = key.split("|")
+    d, w = parts[0], parts[1]
     blocks = tuple(int(x) for x in d[2:].split(",") if x)
     return blocks, (int(w[2:]) if w[2:] else None)
+
+
+def key_options(key: str) -> dict:
+    """The optional segments of a pass key as {name: value}, e.g. {"s": "output"}; empty for a key without them."""
+    out = {}
+    for seg in key.split("|")[2:]:
+        name, _, value = seg.partition("=")
+        out[name] = value
+    return out
+
+
+def plain_key(key: str) -> str:
+    """The key of the same cut without the optional segments (what a variant is compared with)."""
+    return "|".join(key.split("|")[:2])
 
 
 BASE_KEY = pass_key(())
@@ -82,6 +103,18 @@ def check_choice(blocks, nb: int, pf: int = 1, pl: int = 1) -> tuple:
     return out
 
 
+def check_recon(value):
+    """The `reconstruct` of a choice: None / "" / False (off), True or "pruned" (the cut model's own activations: the default variant), or "original"."""
+    if value in (None, "", False, "off"):
+        return None
+    if value is True:
+        return "pruned"
+    from . import reshape_recon
+    if value in reshape_recon.VARIANTS:
+        return value
+    raise ReshapeError("Refitting the kept neurons takes its activations from the cut model (\"pruned\") or from the original (\"original\").")
+
+
 def check_widths(dims: dict, widths, divisor: int = reshape_width.FFN_DIVISOR) -> list[int]:
     """The MLP widths asked for -> ascending, without duplicates; ReshapeError unless each is a size the page offers."""
     out = []
@@ -103,7 +136,17 @@ def expand_want(want: dict, nb: int, pf: int, pl: int, strategy: str = "contiguo
         width = check_widths(dims, [ch["width"]], divisor)[0] if ch.get("width") else None
         if not blocks and width is None:
             raise ReshapeError("Choose at least one block or a width to try.")
-        keys.append(pass_key(blocks, width))
+        scoring = reshape_width.check_scoring(ch.get("scoring"))
+        recon = check_recon(ch.get("reconstruct"))
+        if scoring != "activation" and width is None:
+            raise ReshapeError("Ranking the neurons by their output needs a width to try.")
+        if recon and width is None:
+            raise ReshapeError("Refitting the kept neurons needs a width to try.")
+        if scoring != "activation" or recon:
+            keys.append(pass_key(blocks, width))               # the same cut without the options: what a variant is compared with
+            if recon and scoring != "activation":
+                keys.append(pass_key(blocks, width, scoring))
+        keys.append(pass_key(blocks, width, scoring, recon))
     if want.get("blocks"):
         keys += [pass_key((b,)) for b in candidates(nb, pf, pl)]
     lo, hi = reshape.limits(nb, "prune", pf, pl)
@@ -113,8 +156,11 @@ def expand_want(want: dict, nb: int, pf: int, pl: int, strategy: str = "contiguo
         keys += [pass_key(w) for w in windows(nb, k, pf, pl)]
         if strategy == "separate" and matrix:
             keys.append(pass_key(reshape.choose_drop(matrix, k, "separate", pf, pl)))
+    compare = reshape_width.check_scoring(want.get("scoring")) if want.get("widths") else "activation"
     for w in check_widths(dims, want.get("widths"), divisor) if want.get("widths") else ():
         keys.append(pass_key((), w))
+        if compare != "activation":
+            keys.append(pass_key((), w, compare))
     return list(dict.fromkeys(keys))
 
 
@@ -190,14 +236,23 @@ def guess_seconds_per_pass(params_b: float, tokens: float, load: str) -> float:
     return max(1.0, 2.0 * params_b * 1e9 * tokens / GUESS_FLOPS.get(load, GUESS_FLOPS["16bit"]))
 
 
-def estimate(todo: int, known, tokens, known_tokens, params_b, load: str, guess_tokens: float) -> dict:
-    """The time of `todo` passes: {"seconds_per_pass", "seconds", "guess"}. A timed pass (`known` seconds over `known_tokens`) is scaled to `tokens`."""
+RECON_PASS_EQUIVALENTS = 3          # layer-forward passes over the text that a refit costs: capture, statistics, the corrected layer (a formula, not a measurement)
+RECON_SOLVE_SECONDS_PER_B = 2.0     # the statistics and solves of one refit per billion parameters (a guess: GPU Cholesky; much more on the CPU fallback)
+
+
+def estimate(todo: int, known, tokens, known_tokens, params_b, load: str, guess_tokens: float, recon_passes: int = 0) -> dict:
+    """The time of `todo` passes: {"seconds_per_pass", "seconds", "guess"}. A timed pass (`known` seconds over `known_tokens`) is scaled to `tokens`. `recon_passes` refits
+    (of the `todo` passes) take RECON_PASS_EQUIVALENTS extra passes of the model plus the statistics and solves; their share is in "recon_seconds" (always a guess)."""
     if known:
         s = known * (tokens / known_tokens if tokens and known_tokens else 1.0)
         guess = False
     else:
         s, guess = guess_seconds_per_pass(params_b, tokens or guess_tokens, load), True
-    return {"seconds_per_pass": s, "seconds": s * todo, "guess": guess}
+    out = {"seconds_per_pass": s, "seconds": s * todo, "guess": guess}
+    if recon_passes:
+        extra = recon_passes * (RECON_PASS_EQUIVALENTS * s + RECON_SOLVE_SECONDS_PER_B * float(params_b))
+        out.update(seconds=out["seconds"] + extra, recon_passes=int(recon_passes), recon_seconds=extra, guess=True)
+    return out
 
 
 # ----------------------------------------------------------------------------------------------------- the cache key
@@ -226,16 +281,20 @@ def weights_fingerprint(folder) -> str:
     return "dir:" + h.hexdigest()[:16]
 
 
-def build_key(repo: str, weights: str | None, calib: dict, train_hash: str | None, load: str) -> dict:
-    """Everything the answers depend on. The same key is the same question; another key is another set of answers."""
+def build_key(repo: str, weights: str | None, calib: dict, train_hash: str | None, load: str, weights_sample: str | None = None) -> dict:
+    """Everything the answers depend on. The same key is the same question; another key is another set of answers.
+    `weights_sample` (safetensors_io.weights_manifest) is part of it only when given; saved answers without it are accepted (see key_diff)."""
     from . import reshapejob
-    return {"format": TRY_FORMAT, "source": repo, "weights": weights, "data_version": calib.get("version"), "data_hash": train_hash, "samples": calib.get("samples"),
-            "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": load, "reasoning": reshapejob.reasoning_key(calib)}
+    key = {"format": TRY_FORMAT, "source": repo, "weights": weights, "data_version": calib.get("version"), "data_hash": train_hash, "samples": calib.get("samples"),
+           "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": load, "reasoning": reshapejob.reasoning_key(calib)}
+    if weights_sample:
+        key["weights_sample"] = weights_sample
+    return key
 
 
 KEY_WORDS = {"format": "an older file format", "source": "another model", "weights": "other weights of the model", "data_version": "another version of the training data",
              "data_hash": "other training text", "samples": "another number of samples", "max_len": "another text length", "seed": "another seed",
-             "load": "another way of loading the model", "reasoning": "another reasoning text"}
+             "load": "another way of loading the model", "reasoning": "another reasoning text", "weights_sample": "other weights of the model"}
 
 
 def key_diff(old, new: dict):
@@ -243,6 +302,8 @@ def key_diff(old, new: dict):
     if not isinstance(old, dict):
         return "the saved answers could not be read"
     for k in new:
+        if k == "weights_sample" and k not in old:
+            continue                                    # answers saved before the weights were sampled count as matching
         if old.get(k) != new[k]:
             return KEY_WORDS.get(k, k)
     return None
@@ -294,7 +355,7 @@ def merge_pass(data: dict, key: str, result: dict) -> dict:
 
 # ---------------------------------------------------------------------------------------------------------- the analysis
 
-def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, strategy: str = "contiguous") -> dict:
+def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, strategy: str = "contiguous", recon_info: dict | None = None) -> dict:
     """What the page shows, from the answers so far: the original's loss, one row per block, per run length every run with the cheapest next to the program's own
     default choice, the width curve, and every other choice. `matrix`: the block-boundary distances of the measurement (the "influence"), when there is one."""
     base = passes.get(BASE_KEY)
@@ -307,9 +368,13 @@ def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, s
     runs: dict = {}
     singles, widths, others = set(pass_key((b,)) for b in candidates(nb, pf, pl)), [], []
     by_k: dict = {}
+    variant_keys = []
     for key in passes:
         blocks, width = parse_key(key)
         if key == BASE_KEY:
+            continue
+        if key_options(key):
+            variant_keys.append(key)                        # a cut with another ranking of the neurons: shown on its own, next to the plain cut
             continue
         if not blocks and width:
             widths.append(row_of(passes, key, base_loss) | {"intermediate": width})
@@ -349,10 +414,40 @@ def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, s
     for key in others:
         blocks, width = parse_key(key)
         choices.append(row_of(passes, key, base_loss) | {"blocks": list(blocks), "layers": reshape.blocks_to_layers(list(blocks), period), "intermediate": width})
-    return {"base": {"loss": base_loss, "ppl": ppl_of(base_loss), "tokens": base.get("tokens") if base else None},
-            "bands": {"edges": list(BAND_EDGES), "names": list(BAND_NAMES), "agree_pairs": AGREE_PAIRS},
-            "blocks": blocks_rows, "blocks_stability": stability(blocks_rows), "runs": runs, "widths": widths, "widths_stability": stability(widths), "choices": choices,
-            "passes": len(passes)}
+    out = {"base": {"loss": base_loss, "ppl": ppl_of(base_loss), "tokens": base.get("tokens") if base else None},
+           "bands": {"edges": list(BAND_EDGES), "names": list(BAND_NAMES), "agree_pairs": AGREE_PAIRS},
+           "blocks": blocks_rows, "blocks_stability": stability(blocks_rows), "runs": runs, "widths": widths, "widths_stability": stability(widths), "choices": choices,
+           "passes": len(passes)}
+    if variant_keys:
+        out["variants"] = variant_rows(passes, variant_keys, base_loss, period, recon_info)
+    return out
+
+
+OPTION_WORDS = {"s": {"output": "neurons ranked by their output"},
+                "r": {"pruned": "kept neurons refitted (from the cut model's activations)", "original": "kept neurons refitted (from the original's activations)"}}
+
+
+def key_label(key: str) -> str:
+    """"MLP 13,312, neurons ranked by their output": what a pass with options does, in words."""
+    return describe_key(key)
+
+
+def variant_rows(passes: dict, keys: list, base_loss, period: int, recon_info: dict | None = None) -> list:
+    """One row per pass with options: its loss, the change against the original and against the same cut without the options (when that was tried), and whether it is better
+    in BOTH halves of the text (the only comparison the program calls a gain: one half alone can be luck)."""
+    rows = []
+    for key in sorted(keys):
+        blocks, width = parse_key(key)
+        r = row_of(passes, key, base_loss)
+        plain = passes.get(plain_key(key))
+        p_loss = plain["loss"] if plain else None
+        both = None
+        if plain and None not in (r["loss_h1"], r["loss_h2"], plain.get("loss_h1"), plain.get("loss_h2")):
+            both = bool(r["loss_h1"] < plain["loss_h1"] and r["loss_h2"] < plain["loss_h2"])
+        rows.append({**r, "label": key_label(key), "options": key_options(key), "plain_key": plain_key(key), "plain_loss": p_loss, "rel_vs_plain": rel_increase(r["loss"], p_loss),
+                     "better_both_halves": both, "blocks": list(blocks), "layers": reshape.blocks_to_layers(list(blocks), period), "intermediate": width,
+                     **({"recon": recon_info[key]} if recon_info and key in recon_info else {})})
+    return rows
 
 
 # ------------------------------------------------------------------------------------------------ running the model (needs torch)
@@ -362,7 +457,7 @@ class _Stopped(Exception):
 
 
 def describe_key(key: str) -> str:
-    """"block 5 skipped", "blocks 9-12 skipped, MLP 13,312": what a pass does, for the progress line."""
+    """"block 5 skipped", "blocks 9-12 skipped, MLP 13,312, neurons ranked by their output": what a pass does, for the progress line."""
     blocks, width = parse_key(key)
     parts = []
     if blocks:
@@ -370,6 +465,7 @@ def describe_key(key: str) -> str:
                                                                                   else ", ".join(map(str, blocks)))) + " skipped")
     if width:
         parts.append(f"MLP {width:,}")
+    parts += [OPTION_WORDS.get(n, {}).get(v, f"{n}={v}") for n, v in key_options(key).items()]
     return ", ".join(parts) or "the original"
 
 
@@ -415,8 +511,10 @@ def _masks_for(mlp_scores, layer_ids, width: int, size: int) -> dict:
     return out
 
 
-def _one_pass(model, layers, batches, period, key: str, mlp_scores, size: int, stop) -> dict:
-    """One pass over the batches with the cut of `key` imitated. The two halves are the batches of even and odd position (as in the measurement)."""
+def _one_pass(model, layers, batches, period, key: str, mlp_scores, size: int, stop, fit=None) -> dict:
+    """One pass over the batches with the cut of `key` imitated. The two halves are the batches of even and odd position (as in the measurement). `fit` (a refitted cut):
+    {layer: (kept index tensor, refitted down_proj W_K)}, applied on top of the cut."""
+    import contextlib
     import torch
     from . import reshapejob
     blocks, width = parse_key(key)
@@ -425,7 +523,7 @@ def _one_pass(model, layers, batches, period, key: str, mlp_scores, size: int, s
     dev = next(model.parameters()).device
     sums, counts = [0.0, 0.0], [0, 0]
     started = time.monotonic()
-    with torch.no_grad(), _Cut(layers, skip, masks):
+    with torch.no_grad(), _Cut(layers, skip, masks), (reshape_recon.Corrected(layers, fit) if fit else contextlib.nullcontext()):
         for bi, b in enumerate(batches):
             if stop():
                 raise _Stopped()
@@ -604,12 +702,16 @@ def run_try(cfg: dict) -> int:
     meas = None
     if dims and cfg.get("measure_dir"):
         meas = reshapejob._read_scores(cfg["measure_dir"], {"source": cfg["source"], "calibration": {"version": calib.get("version"), "samples": cfg.get("measure_samples"),
-                                                                                                    "max_len": calib.get("max_len"), "reasoning": calib.get("reasoning")}}, n_layers, dims, types)
-    needs_measurement = wants_width and meas is None
+                                                                                                    "max_len": calib.get("max_len"), "reasoning": calib.get("reasoning")}}, n_layers, dims, types,
+                                      weights=safetensors_io.weights_manifest(src_dir) if src_dir else None)
+    keys = expand_want(want, nb, pf, pl, strategy, (meas["meta"].get("matrix") or None) if meas else None, dims, divisor)
+    wants_ms = any(key_options(k).get("s") == "output" for k in keys)
+    needs_measurement = wants_width and (meas is None or (wants_ms and "mlp_ms" not in meas))
     if needs_measurement and not plan_only:
+        if wants_ms and meas is not None:
+            raise ReshapeError("Ranking the neurons by their output needs a measurement that recorded the mean square of the neurons, and the earlier one did not. Measure the model again.")
         raise ReshapeError("Trying a width needs the measurement of the neurons. Measure the model first.")
     matrix = (meas["meta"].get("matrix") or None) if meas else None
-    keys = expand_want(want, nb, pf, pl, strategy, matrix, dims, divisor)
     search = want.get("search") if isinstance(want.get("search"), dict) else None
     sctx = None
     if search is not None:
@@ -617,7 +719,8 @@ def run_try(cfg: dict) -> int:
     folder = Path(cfg["out_dir"])
     if cfg.get("force") and (folder / TRY_FILE).is_file():
         (folder / TRY_FILE).unlink()
-    key = build_key(repo, weights_fingerprint(src_dir) if src_dir else None, calib, data_hash(calib["train"]), cfg.get("load", "auto"))
+    key = build_key(repo, weights_fingerprint(src_dir) if src_dir else None, calib, data_hash(calib["train"]), cfg.get("load", "auto"),
+                    safetensors_io.weights_manifest(src_dir) if src_dir else None)
     data = read_results(folder, key if src_dir else None, protocol.log) if src_dir else None
     if data is None:
         data = empty_results(key)
@@ -630,7 +733,7 @@ def run_try(cfg: dict) -> int:
         known, known_tokens = mm["seconds_per_pass"], mm.get("tokens")
     tokens = data["tokens"] or (mm["tokens"] * calib["samples"] / cfg["measure_samples"] if mm.get("tokens") and cfg.get("measure_samples") and calib.get("samples") else None)
     est = estimate(len(todo), known, tokens, known_tokens, float(cfg.get("params_b") or 10.0), cfg.get("load", "auto"),
-                   int(calib.get("samples", 64)) * min(int(calib.get("max_len", 512)), GUESS_TOKENS_PER_SAMPLE))
+                   int(calib.get("samples", 64)) * min(int(calib.get("max_len", 512)), GUESS_TOKENS_PER_SAMPLE), sum(1 for k in todo if key_options(k).get("r")))
     plan = {"passes_total": len(keys), "passes_cached": len(keys) - len(todo), "passes_todo": len(todo), "needs_measurement": needs_measurement, **est}
     if sctx is not None:
         from . import reshapesearch
@@ -643,7 +746,7 @@ def run_try(cfg: dict) -> int:
         return 0
 
     def finish(stopped: bool) -> int:
-        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy, data.get("recon"))
         if sctx is not None:
             data["analysis"]["search"] = search_summary(data, sctx)
         write_results(folder, data)
@@ -688,23 +791,92 @@ def run_try(cfg: dict) -> int:
     speed.report_kernels(model)
     layers = reshapejob._find_layers(model, n_layers)
     mlp = meas["mlp"] if meas else None
+    mlp_out = None
+    if wants_ms:                    # the scores of the neurons by their output: mean square of the activation x the squared size of the neuron's down_proj column
+        mlp_out = reshape_width.output_scores(meas["mlp_ms"], reshapejob._down_norms(cfg.get("measure_dir"), src_dir, n_layers))
     size = dims["intermediate"] if dims else 0
     stopped = False
     t_pass0 = time.monotonic()
     state = {"batches": batches, "model": model, "layers": layers}
 
+    recon_state: dict = {}
+    alpha = float(cfg.get("recon_alpha") or reshape_recon.DEFAULT_ALPHA)
+    r_samples, r_len = int(cfg.get("recon_samples") or reshape_recon.DEFAULT_SAMPLES), int(cfg.get("recon_len") or reshape_recon.DEFAULT_LEN)
+    measure_n = int(cfg.get("measure_samples") or calib.get("samples") or 0)
+    head_n = max(measure_n, int(calib.get("samples") or 0))
+    rows_key = reshape_recon.rows_key(reshapejob.reasoning_key(calib), r_samples, r_len, head_n, data_hash(calib["train"]), calib.get("seed", 3407))
+
+    def batch_rows(bs):
+        return [b["input_ids"][i, : int(b["attention_mask"][i].sum())].tolist() for b in bs for i in range(len(b["input_ids"]))]
+
+    def recon_batches():
+        """the rows of the refit: from the END of the shuffled rows, never those Try first and the measurement use; the reasoning rows skip the ones the measurement used"""
+        if "b" not in recon_state:
+            rkey = reshapejob.reasoning_key(calib)
+            used = max(1, min(measure_n - 1, round(measure_n * rkey["share"]))) if rkey and measure_n > 1 else 0
+            rc = {**calib, "samples": r_samples, "max_len": r_len}
+            recon_state["b"] = reshapejob._calibration(AutoTokenizer.from_pretrained(str(src_dir)), rc, cfg["source"].get("family", "generic"), tail=True, head=head_n, skip_reasoning=used)
+            recon_state["overlap"] = reshape_recon.overlap(batch_rows(recon_state["b"]), batch_rows(state["batches"]))
+            if recon_state["overlap"]:
+                protocol.log(f"Warning: {recon_state['overlap']} rows of the refit are also in the text of Try first; its held-out numbers are optimistic.")
+        return recon_state["b"]
+
+    def run_recon(k):
+        """One refitted cut: the refit (kept as a sidecar next to the measurement, found again by its tag), then the same pass as every other cut with the refitted weights."""
+        import torch
+        blocks, width = parse_key(k)
+        opts = key_options(k)
+        variant, scoring = opts["r"], opts.get("s", "activation")
+        skip = reshape.blocks_to_layers(list(blocks), period)
+        scores = scores_of(k)
+        keep = {l: reshape_width.keep_top([float(x) for x in scores[l]], width) for l in range(n_layers) if l not in set(skip)}
+        tag = reshape_recon.recon_tag(safetensors_io.weights_manifest(src_dir), width, scoring, blocks, variant, alpha, rows_key)
+        scores_dir = cfg.get("measure_dir") or str(folder)
+        found = reshape_recon.read_sidecar(scores_dir, tag)
+        t0 = time.monotonic()
+        if found is None:
+            rb = recon_batches()
+            refs = reshape_recon.down_refs(reshapejob.safetensors_io.list_tensors(src_dir), n_layers)
+            try:
+                out = reshape_recon.fit_layers(state["model"], state["layers"], rb, types, skip, keep, reshape_recon.w0_reader(refs), dims["hidden"], alpha, variant, stop, reshapejob._ram_bytes())
+            except RuntimeError as exc:
+                if reshapejob._is_oom(exc):
+                    raise ReshapeError("The graphics card ran out of memory while refitting the neurons. Use fewer samples or 4-bit loading (Expert mode).") from None
+                raise
+            secs = round(time.monotonic() - t0, 1)
+            protocol.timing("recon", secs, tokens=out["tokens"], layers=len(out["w_k"]), variant=variant)
+            reshape_recon.write_sidecar(scores_dir, tag, out["w_k"], keep, {"tag": tag, "variant": variant, "alpha": alpha, "width": width, "scoring": scoring, "skipped": list(blocks),
+                                                                          "weights": safetensors_io.weights_manifest(src_dir), "rows": rows_key, "tokens": out["tokens"], "overlap": recon_state.get("overlap"), "seconds": secs,
+                                                                          "summary": out["summary"], "shares": {str(l): v for l, v in out["shares"].items()}})
+            found = reshape_recon.read_sidecar(scores_dir, tag)
+        refs, meta = found
+        dev = next(state["model"].parameters()).device
+        need = sum(r.nbytes for r in refs.values())
+        on_card = bool(torch.cuda.is_available() and torch.cuda.mem_get_info()[0] > 1.5 * need)
+        fit = {l: (torch.as_tensor(meta["kept"][str(l)], dtype=torch.long, device=dev), reshape_recon.sidecar_tensor(ref, dev, on_card)) for l, ref in refs.items()}
+        data.setdefault("recon", {})[k] = {"tag": tag, "variant": variant, "alpha": meta.get("alpha"), "median_removed_share": (meta.get("summary") or {}).get("median"),
+                                           "worst_removed_share": (meta.get("summary") or {}).get("worst"), "layers": len(refs), "tokens": meta.get("tokens"), "overlap": meta.get("overlap"),
+                                           "seconds": meta.get("seconds"), "rows": meta.get("rows")}
+        res = _one_pass(state["model"], state["layers"], state["batches"], period, k, scores, size, stop, fit)
+        del fit
+        return res
+
+    def scores_of(k):
+        """the neuron scores the cut of pass key `k` keeps by: the activation scores, or the output scores for a key with "|s=output" """
+        return mlp_out if key_options(k).get("s") == "output" else mlp
+
     def run_pass(k):
         """One pass; a graphics card that runs out of memory is asked again with one text at a time."""
         try:
             try:
-                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, scores_of(k), size, stop)
             except RuntimeError as exc:
                 if not reshapejob._is_oom(exc):
                     raise
                 protocol.log("Out of memory; trying again with one text at a time.")
                 reshapejob._free()
                 state["batches"] = reshapejob._split_single(state["batches"])
-                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, scores_of(k), size, stop)
         except RuntimeError as exc:
             if reshapejob._is_oom(exc):
                 raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None
@@ -713,7 +885,7 @@ def run_try(cfg: dict) -> int:
     def on_search_pass(info: dict) -> None:
         res = info["result"]
         protocol.timing("try_pass", res["seconds"], key=info["key"], tokens=data["tokens"])
-        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+        data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy, data.get("recon"))
         data["analysis"]["search"] = search_summary(data, sctx)
         write_results(folder, data)
         best = _best_so_far(data["passes"], sctx)
@@ -725,19 +897,20 @@ def run_try(cfg: dict) -> int:
                       best={"key": best[0], "loss": best[1]} if best else None)
 
     try:
+        todo = [k for k in todo if not key_options(k).get("r")] + [k for k in todo if key_options(k).get("r")]          # the refits come after the plain cuts
         for i, k in enumerate(todo):
             if stop():
                 stopped = True
                 break
             protocol.progress("try", i / len(todo), f"Cut {i + 1} of {len(todo)}: {describe_key(k)}", protocol.make_detail("passes", i, len(todo), t_pass0, rate_unit="passes/s"))
             try:
-                res = run_pass(k)
-            except _Stopped:
+                res = run_recon(k) if key_options(k).get("r") else run_pass(k)
+            except (_Stopped, reshape_recon.Stopped):
                 stopped = True
                 break
             protocol.timing("try_pass", res["seconds"], key=k, tokens=data["tokens"])
             merge_pass(data, k, res)
-            data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy)
+            data["analysis"] = analyse(data["passes"], nb, period, pf, pl, matrix, strategy, data.get("recon"))
             write_results(folder, data)
             protocol.emit("try_pass", key=k, loss=res["loss"], seconds=res["seconds"], done=i + 1, total=len(todo), seconds_per_pass=data["seconds_per_pass"],
                           analysis=data["analysis"])

@@ -191,6 +191,33 @@ pub struct ReshapeSpec {
     /// do not measure the new model's loss after the cut (its loss was measured already, for instance by Try first): saves loading it once more
     #[serde(default)]
     pub skip_check: bool,
+    /// how the MLP neurons are ranked when the width is cut: None / "activation" (the default: the mean of the absolute activation) or "output" (experimental: the mean square
+    /// of the activation times the squared size of the neuron's output column, the expected squared contribution to the layer's output). Try first compares them; nothing here
+    /// says "output" is better. Not sent to the worker unless "output".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_scoring: Option<String>,
+    /// Refit the kept neurons of the width cut (experimental, off): the output weights of the kept neurons are changed by least squares to make up for part of what the removed ones
+    /// did. Needs a width. Try first measures it first; nothing here says it keeps more quality. None = as it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruct: Option<ReconSpec>,
+}
+
+/// How the kept neurons are refitted: `variant` "pruned" (fit on what the cut model feeds each layer) or "original" (on the uncut model's activations), `alpha` the ridge strength
+/// relative to the mean eigenvalue (0 to 1, default 0.01).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconSpec {
+    #[serde(default = "pruned")]
+    pub variant: String,
+    #[serde(default = "recon_alpha")]
+    pub alpha: f64,
+}
+
+fn pruned() -> String {
+    "pruned".into()
+}
+
+fn recon_alpha() -> f64 {
+    0.01
 }
 
 fn r_share() -> f64 {
@@ -268,6 +295,44 @@ pub fn shape_of(spec: &ReshapeSpec) -> Shape {
     }
 }
 
+/// Where the parameters of a model are: the decoder layers of the text model, the input embeddings, the output layer (0 when it is tied to the embeddings), the vision tower, the
+/// multi-token head, and the rest (final norm and small things). `total` is the sum and equals `params_after` / `width_params`; `mtp_removed` is what a cut took out with the
+/// multi-token head (not part of `total`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParamsBreakdown {
+    pub text_layers: u64,
+    pub embeddings: u64,
+    pub output: u64,
+    pub vision: u64,
+    pub mtp: u64,
+    pub other: u64,
+    pub total: u64,
+    pub mtp_removed: u64,
+}
+
+impl ParamsBreakdown {
+    /// The one line of the page: "text layers 19.0 B · embeddings 1.3 B · ...".
+    pub fn line(&self) -> String {
+        let b = |x: u64| format!("{:.2} B", x as f64 / 1e9);
+        let mut parts = vec![format!("text layers {}", b(self.text_layers)), format!("embeddings {}", b(self.embeddings))];
+        if self.output > 0 {
+            parts.push(format!("output {}", b(self.output)));
+        }
+        if self.vision > 0 {
+            parts.push(format!("vision {}", b(self.vision)));
+        }
+        if self.mtp > 0 {
+            parts.push(format!("multi-token head {}", b(self.mtp)));
+        }
+        if self.mtp_removed > 0 {
+            parts.push(format!("multi-token head removed {}", b(self.mtp_removed)));
+        }
+        parts.push(format!("other {}", b(self.other)));
+        format!("{} · file total {}", parts.join(" · "), b(self.total))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SizeOption {
     pub blocks: u32,
@@ -282,6 +347,9 @@ pub struct SizeOption {
     pub intermediate: Option<u32>,
     /// the size is known exactly before anything is measured (width: from the dimensions; layers: the layers are all alike, so also; "about" is for odd models)
     pub exact: bool,
+    /// where the parameters are (additive; absent when the model's parts are not known)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<ParamsBreakdown>,
 }
 
 /// (min, max) blocks that can be dropped / added; max is 0 when nothing is feasible. Same rule as `reshape.limits` in the worker.
@@ -349,7 +417,7 @@ pub fn options(ins: &Inspect, mode: Mode, vram_gb: Option<f64>) -> Vec<SizeOptio
             blocks, layers: layers_after(ins, mode, blocks), params_b: (params_b * 100.0).round() / 100.0,
             disk_gb: ((params as f64 * bytes_per_param(ins)) / 1e9 * 10.0).round() / 10.0,
             vram_lora_gb: lora, vram_qlora_gb: qlora, fits_lora: vram_gb.map(|v| lora <= v), fits_qlora: vram_gb.map(|v| qlora <= v),
-            intermediate: None, exact: mode == Mode::Grow,
+            intermediate: None, exact: mode == Mode::Grow, breakdown: depth_breakdown(ins, mode, blocks),
         }
     }).collect()
 }
@@ -410,6 +478,17 @@ pub fn validate(spec: &ReshapeSpec, ins: &Inspect) -> Result<()> {
     }
     if let Some(r) = &spec.reasoning {
         r.validate()?;
+    }
+    if let Some(r) = &spec.reconstruct {
+        if !["pruned", "original"].contains(&r.variant.as_str()) || !(r.alpha > 0.0 && r.alpha <= 1.0) {
+            return Err(Error::new("Refitting the kept neurons: the variant is pruned or original, and the strength is above 0 and at most 1."));
+        }
+        if spec.width.is_none() {
+            return Err(Error::new("Refitting the kept neurons needs a thinner-layers cut (a width)."));
+        }
+    }
+    if spec.width_scoring.as_deref().is_some_and(|s| !["activation", "output"].contains(&s)) {
+        return Err(Error::new("The way the neurons are ranked is activation (the default) or output."));
     }
     if let Some(w) = &spec.width {
         validate_width(spec, ins, w)?;
@@ -534,6 +613,11 @@ pub fn resolve_width(d: &WidthDims, w: &Width) -> WidthSizes {
 /// embeddings + output layer + final norm + multi-token head (not counted when the cut thins the MLP or the attention heads) + `vision` + `other`). The mirror of `reshape_width.params_for` in the worker;
 /// `worker/tests/data/width_params.json` is read by both test suites.
 pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> u64 {
+    width_breakdown_dims(d, n_lin, n_full, w, vision, other).total
+}
+
+/// The same count as `width_params_dims`, in its parts (the sum of the parts is the total, by construction).
+pub fn width_breakdown_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes, vision: u64, other: u64) -> ParamsBreakdown {
     let (h, hd, kv) = (d.hidden as u64, d.head_dim as u64, d.kv_heads as u64);
     let (i, nh) = (w.intermediate as u64, w.heads as u64);
     let (nk, nv, dk, dv) = (d.lin_k_heads as u64, w.lin_v_heads as u64, d.lin_k_dim as u64, d.lin_v_dim as u64);
@@ -544,9 +628,34 @@ pub fn width_params_dims(d: &WidthDims, n_lin: u64, n_full: u64, w: &WidthSizes,
     let att = h * nh * hd * 2 + 2 * h * kv * hd + nh * hd * h + 2 * hd;
     let layers = n_lin * (gdn + mlp + norms) + n_full * (att + mlp + norms);
     // a cut that thins the MLP or the attention heads removes the multi-token head (the mirror of `mtp_removed` in the worker)
-    let mtp = if w.intermediate != d.intermediate || w.heads != d.heads { 0 } else { d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h) };
+    let mtp_full = d.mtp_layers as u64 * (2 * h * h + att + mlp + norms + 3 * h);
+    let removed = w.intermediate != d.intermediate || w.heads != d.heads;
+    let mtp = if removed { 0 } else { mtp_full };
     let head = if d.tied { 0 } else { d.vocab as u64 * h };
-    layers + d.vocab as u64 * h + head + h + mtp + vision + other
+    let embeddings = d.vocab as u64 * h;
+    let rest = h + other;
+    ParamsBreakdown { text_layers: layers, embeddings, output: head, vision, mtp, other: rest, total: layers + embeddings + head + rest + mtp + vision,
+                      mtp_removed: if removed { mtp_full } else { 0 } }
+}
+
+/// The breakdown of a thinned model with the layers `layers_kept` (see `width_params`); None when the model cannot be thinned.
+pub fn width_breakdown(ins: &Inspect, layers_kept: &[usize], w: &Width) -> Option<ParamsBreakdown> {
+    let d = ins.width_dims.as_ref()?;
+    let n_full = layers_kept.iter().filter(|i| layer_is_full(ins, **i)).count() as u64;
+    let n_lin = layers_kept.len() as u64 - n_full;
+    Some(width_breakdown_dims(d, n_lin, n_full, &resolve_width(d, w), ins.vision_params, ins.other_params.saturating_sub(d.hidden as u64)))
+}
+
+/// The breakdown of a model with whole blocks removed or added (`params_after`): the layers are what is left after the other parts, so the parts add up to the total. None when
+/// the inspection does not know the other parts (their sum is more than the total).
+pub fn depth_breakdown(ins: &Inspect, mode: Mode, blocks: u32) -> Option<ParamsBreakdown> {
+    let total = params_after(ins, mode, blocks);
+    let fixed = ins.embed_params + ins.lm_head_params + ins.vision_params + ins.mtp_params + ins.other_params;
+    if fixed > total {
+        return None;
+    }
+    Some(ParamsBreakdown { text_layers: total - fixed, embeddings: ins.embed_params, output: ins.lm_head_params, vision: ins.vision_params, mtp: ins.mtp_params, other: ins.other_params,
+                           total, mtp_removed: 0 })
 }
 
 fn layer_is_full(ins: &Inspect, i: usize) -> bool {
@@ -565,10 +674,7 @@ pub fn kept_layers(ins: &Inspect, blocks: u32) -> Vec<usize> {
 
 /// Exact parameters of the model after thinning, with the layers `layers_kept` (indices into the original) left. 0 when the model cannot be thinned.
 pub fn width_params(ins: &Inspect, layers_kept: &[usize], w: &Width) -> u64 {
-    let Some(d) = &ins.width_dims else { return 0 };
-    let n_full = layers_kept.iter().filter(|i| layer_is_full(ins, **i)).count() as u64;
-    let n_lin = layers_kept.len() as u64 - n_full;
-    width_params_dims(d, n_lin, n_full, &resolve_width(d, w), ins.vision_params, ins.other_params.saturating_sub(d.hidden as u64))
+    width_breakdown(ins, layers_kept, w).map(|b| b.total).unwrap_or(0)
 }
 
 /// The MLP width nearest to `num / den` of the original, among the offered sizes.
@@ -603,6 +709,7 @@ pub fn width_options(ins: &Inspect, depth_blocks: u32, vram_gb: Option<f64>, lin
             disk_gb: ((params as f64 * bytes_per_param(ins)) / 1e9 * 10.0).round() / 10.0,
             vram_lora_gb: lora, vram_qlora_gb: qlora, fits_lora: vram_gb.map(|v| lora <= v), fits_qlora: vram_gb.map(|v| qlora <= v),
             intermediate: Some(i), exact: i <= d.intermediate,
+            breakdown: width_breakdown(ins, &kept, &Width { intermediate: i, lin_v_heads, heads }),
         }
     }).collect()
 }
@@ -720,6 +827,14 @@ pub struct HealKnobs {
     /// the training key and not in the teacher's cache key, so changing it keeps both. Older saved settings have none: off.
     #[serde(default)]
     pub upcast: bool,
+    /// The output layer's logits are made again in the backward pass (checkpointed; the default). Off keeps the logits of every chunk: faster, the same loss, about
+    /// tokens x vocabulary x 10 bytes more graphics memory. Student-side only: not in the training key and not in the teacher's cache key. Older saved settings have none: on.
+    #[serde(default = "yes")]
+    pub head_ckpt: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The activations kept for the backward pass in GB. Per token and layer about 34 x hidden bytes without checkpointing (bf16; Korthikanti et al. for attention
@@ -761,7 +876,11 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
     let weights = if k.qlora { body * 0.55 + ends * if k.upcast { 4.0 } else { 2.0 } } else { params * 2.0 } / 1e9;
     let lora = k.rank as f64 * d.layers as f64 * 20.0 * d.hidden as f64 * 16.0 / 1e9;
     let act = heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, k.checkpointing);
-    let kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
+    let mut kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
+    if !k.head_ckpt {
+        // every token of a step keeps its logits and log-probabilities (32-bit, about 10 bytes per vocabulary entry)
+        kl += k.seq.max(1) as f64 * k.batch.max(1) as f64 * d.vocab as f64 * 10.0 / 1e9;
+    }
     let overhead = 1.0;
     let total = (weights + lora + act + kl + overhead) * 1.10;
     let r = |x: f64| (x * 100.0).round() / 100.0;
@@ -771,6 +890,12 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
 /// `heal_memory(..).total_gb`
 pub fn heal_memory_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
     heal_memory(student_b, d, k).total_gb
+}
+
+/// The graphics memory (GB, with the estimate's 10 % margin) that keeping the output layer's logits (`head_ckpt` off) costs on top of the checkpointed head, for these settings.
+pub fn heal_head_off_extra_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
+    let m = |head_ckpt: bool| heal_memory_gb(student_b, d, &HealKnobs { head_ckpt, ..k.clone() });
+    ((m(false) - m(true)) * 10.0).round() / 10.0
 }
 
 /// The graphics memory (GB, with the estimate's 10 % margin) that the 32-bit copy of the embedding and the output layer costs on top of the 16-bit tables in QLoRA,
@@ -806,7 +931,7 @@ pub fn heal_verdict_text(est_gb: f64, vram_gb: Option<f64>) -> String {
 pub fn heal_defaults(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> HealKnobs {
     let big = student_b >= 15.0;
     let batch = if student_b >= 25.0 { 1 } else if big { 2 } else { 4 };
-    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false };
+    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false, head_ckpt: true };
     if !big && vram_gb.is_some_and(|v| heal_memory_gb(student_b, d, &HealKnobs { qlora: false, ..k.clone() }) > v * 0.85) {
         k.qlora = true;
     }
@@ -830,6 +955,10 @@ pub fn heal_checkpointing_auto(student_b: f64, d: &HealDims, k: &HealKnobs, vram
 /// label, or None when the ladder is used up. Changes that alter the maths (sequence length, rank) are never made here.
 pub fn heal_next_safer(k: &HealKnobs) -> Option<(HealKnobs, String)> {
     let mut s = k.clone();
+    if !s.head_ckpt {
+        s.head_ckpt = true;
+        return Some((s, "the output layer's logits made again in the backward pass (checkpointed)".to_string()));
+    }
     if s.upcast {
         s.upcast = false;
         return Some((s, "the 32-bit embedding copy turned off".to_string()));

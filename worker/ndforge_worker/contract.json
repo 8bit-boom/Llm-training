@@ -27,7 +27,9 @@
   "selftest",
   "think_check",
   "think_check_plan",
-  "train"
+  "trace_gen",
+  "train",
+  "vllm_selftest"
  ],
  "events": [
   "distill_eval",
@@ -72,8 +74,10 @@
   "reshape_refused",
   "think_check_failed",
   "torch_missing",
+  "trace_gen_failed",
   "train_failed",
   "unknown_job",
-  "usage"
+  "usage",
+  "vllm_selftest_failed"
  ]
 }

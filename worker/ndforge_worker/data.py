@@ -110,11 +110,25 @@ def _without_empty_block(messages: list, fam: dict) -> list:
     return messages
 
 
-def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 3407):
-    """[{input_ids, completion_mask, kind: "text"|"chat"}] and counts. Rows whose prompt alone does not fit are skipped; longer rows are cut at max_len."""
+LENGTH_EDGES = (512, 1024, 2048, 4096, 8192, 16384)
+LENGTH_LABELS = ("<=512", "<=1k", "<=2k", "<=4k", "<=8k", "<=16k", ">16k")
+
+
+def length_bucket(n: int) -> str:
+    """The label of the length bucket of a row of `n` tokens (before any cutting)."""
+    for edge, label in zip(LENGTH_EDGES, LENGTH_LABELS):
+        if n <= edge:
+            return label
+    return LENGTH_LABELS[-1]
+
+
+def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 3407, probe=None):
+    """[{input_ids, completion_mask, kind: "text"|"chat"}] and counts. Rows whose prompt alone does not fit are skipped; longer rows are cut at max_len.
+    `stats["length_buckets"]` counts every row by its length before cutting (skipped rows included); `probe(ids) -> bool` (optional) says whether a skipped row was a reasoning row
+    (`stats["skipped_reasoning"]`)."""
     tok = _inner(tokenizer)
     bos = getattr(tok, "bos_token", None)
-    out, stats = [], {"text": 0, "chat": 0, "skipped_too_long": 0, "cut": 0, "empty": 0}
+    out, stats = [], {"text": 0, "chat": 0, "skipped_too_long": 0, "cut": 0, "empty": 0, "length_buckets": {label: 0 for label in LENGTH_LABELS}, "skipped_reasoning": 0}
     for r in rows:
         if r.get("type") == "text":
             text = (r.get("text") or "").strip()
@@ -136,9 +150,14 @@ def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 
                     p_ids = p_ids[: max(0, len(p_ids) - 1)]
             mask = [0] * len(p_ids) + [1] * (len(ids) - len(p_ids))
             kind = "chat"
+            stats["length_buckets"][length_bucket(len(ids))] += 1
             if len(p_ids) >= max_len - 1:
                 stats["skipped_too_long"] += 1
+                if probe is not None and probe(ids):
+                    stats["skipped_reasoning"] += 1
                 continue
+        if kind == "text":
+            stats["length_buckets"][length_bucket(len(ids))] += 1
         if len(ids) > max_len:
             ids, mask = ids[:max_len], mask[:max_len]
             stats["cut"] += 1
@@ -150,11 +169,11 @@ def encode_rows(tokenizer, rows: list, fam_name: str, max_len: int, seed: int = 
     return out, stats
 
 
-def load_training_rows(tokenizer, path: str, fam_name: str, max_len: int, seed: int):
+def load_training_rows(tokenizer, path: str, fam_name: str, max_len: int, seed: int, probe=None):
     rows = read_jsonl(path)
     if not rows:
         raise ValueError("The training file is empty. Save a version in Step 2 first.")
-    enc, stats = encode_rows(tokenizer, rows, fam_name, max_len, seed)
+    enc, stats = encode_rows(tokenizer, rows, fam_name, max_len, seed, probe)
     if not enc:
         raise ValueError("Nothing in the training file fits the chosen sequence length. Raise the length or shorten the examples.")
     protocol.log(f"Training data: {stats['text']} world-book texts and {stats['chat']} practice conversations, {stats['tokens']:,} tokens "

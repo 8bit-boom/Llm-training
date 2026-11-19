@@ -178,6 +178,51 @@ def test_the_scores_agree_with_the_hand_computed_aggregation(tmp_path, base8, mo
     assert np.allclose(got, total.sqrt().numpy(), rtol=1e-4, atol=1e-6)
 
 
+def test_the_recorded_mean_square_equals_a_direct_computation_and_the_old_scores_are_unchanged(tmp_path, base8, monkeypatch):
+    """mlp_ms[layer, c] = the mean over ALL real tokens of (input of down_proj)^2: not the square of the score above (that averages |a| per text first)"""
+    from transformers import AutoTokenizer
+    cfg = measure_cfg(tmp_path, base8, tmp_path / "s1", calibration={"train": str(tmp_path / "train.jsonl"), "samples": 4, "max_len": 64, "batch": 2, "version": 1})
+    code, _ = run_measure(monkeypatch, cfg)
+    assert code == 0
+    z = np.load(tmp_path / "s1" / "scores.npz")
+    assert {"mlp_ms", "mlp_ms_h1", "mlp_ms_h2"} <= set(z.files) and z["mlp_ms"].shape == z["mlp"].shape
+    assert json.loads((tmp_path / "s1" / "scores.json").read_text())["mean_square"] is True
+    tok = AutoTokenizer.from_pretrained(str(base8))
+    batches = reshapejob._calibration(tok, cfg["calibration"], "qwen3_5")
+    model = load(base8)
+    for layer in (0, 5):
+        seen = []
+        h = model.model.layers[layer].mlp.down_proj.register_forward_pre_hook(lambda m, a: seen.append(a[0].detach().float()))
+        total, count = torch.zeros(z["mlp"].shape[1], dtype=torch.float64), 0.0
+        half = [torch.zeros(z["mlp"].shape[1], dtype=torch.float64) for _ in range(2)]
+        n_half = [0.0, 0.0]
+        with torch.no_grad():
+            for bi, b in enumerate(batches):
+                seen.clear()
+                model(input_ids=b["input_ids"], attention_mask=b["attention_mask"], use_cache=False)
+                m = b["attention_mask"].float()
+                sq = ((seen[0] ** 2) * m[..., None]).sum((0, 1)).double()
+                total += sq
+                count += float(m.sum())
+                half[bi % 2] += sq
+                n_half[bi % 2] += float(m.sum())
+        h.remove()
+        assert np.allclose(z["mlp_ms"][layer], (total / count).numpy(), rtol=1e-4, atol=1e-9)
+        assert np.allclose(z["mlp_ms_h1"][layer], (half[0] / n_half[0]).numpy(), rtol=1e-4, atol=1e-9)
+        if n_half[1]:
+            assert np.allclose(z["mlp_ms_h2"][layer], (half[1] / n_half[1]).numpy(), rtol=1e-4, atol=1e-9)
+    # an old measurement (no mean squares) is measured again by reshape_measure and kept as it was by the plain cut
+    old = tmp_path / "old"
+    old.mkdir()
+    np.savez(old / "scores.npz", **{k: z[k] for k in z.files if "_ms" not in k})
+    meta = json.loads((tmp_path / "s1" / "scores.json").read_text())
+    meta.pop("mean_square")
+    (old / "scores.json").write_text(json.dumps(meta))
+    code, ev = run_measure(monkeypatch, {**cfg, "out_dir": str(old)})
+    assert code == 0 and any("did not record the mean square" in e.get("text", "") for e in ev if e["type"] == "log")
+    assert "mlp_ms" in np.load(old / "scores.npz").files
+
+
 def test_the_job_measures_when_nothing_is_cached_and_reuses_it_next_time(tmp_path, monkeypatch):
     src = build_arch_dir(tmp_path / "b12", "qwen3_5", num_layers=12, heads=HEADS, kv_heads=KV, lin_v_heads=NV)
     train = tmp_path / "train.jsonl"

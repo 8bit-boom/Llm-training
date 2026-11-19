@@ -130,7 +130,7 @@ def run_measure(cfg: dict) -> int:
     folder = Path(cfg["out_dir"])
     if cfg.get("force") and folder.is_dir():
         shutil.rmtree(folder)
-    sc = _scores_for({**cfg, "scores_dir": str(folder)}, src_dir, period, config, dims, types, True)
+    sc = _scores_for({**cfg, "scores_dir": str(folder)}, src_dir, period, config, dims, types, True, need_ms=True)      # a measurement without the mean squares is made again
     m = sc["meta"]
     stable = None
     try:
@@ -344,11 +344,13 @@ def _pad_batches(enc: list, bs: int, pad: int) -> list:
     return batches
 
 
-def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
+def _calibration(tokenizer, calib_cfg: dict, fam_name: str, tail: bool = False, head: int = 0, skip_reasoning: int = 0) -> list:
     """Deterministic batches [{"input_ids": LongTensor[b,t], "attention_mask": LongTensor[b,t]}]: half world-book text, half practice conversations
     (whatever the training file has), right-padded. Without a training file a few built-in sentences are used (enough for the exact-copy self-check).
     With calib_cfg["reasoning"] ({"source": {"id" | "file", ...}, "share": 0.5, "max_len": 2048}) that share of the samples are conversations with thinking,
-    written the way the model thinks (data.render_chat_full), measured in batches of their own after the project's batches; the others are the project's rows."""
+    written the way the model thinks (data.render_chat_full), measured in batches of their own after the project's batches; the others are the project's rows.
+    `tail=True` (the refit of the kept neurons): the project's rows come from the END of the shuffled rows, never from the first `head` samples' worth (the rows Try first, the
+    measurement and the cut check use), and the reasoning rows skip the first `skip_reasoning` ones the measuring used."""
     import random
     from . import data
     samples = max(2, int(calib_cfg.get("samples", 128)))
@@ -369,7 +371,16 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     want_t = min(len(texts), samples // 2)
     want_c = min(len(chats), samples - want_t)
     want_t = min(len(texts), samples - want_c)
-    enc, _ = data.encode_rows(tokenizer, texts[:want_t] + chats[:want_c], fam_name, max_len, seed)
+    if tail:
+        from . import reshape_recon
+        pick_t = reshape_recon.tail_rows(len(texts), min(len(texts), head // 2), want_t) or list(range(max(0, len(texts) - want_t), len(texts)))
+        pick_c = reshape_recon.tail_rows(len(chats), min(len(chats), head - head // 2), want_c) or list(range(max(0, len(chats) - want_c), len(chats)))
+        if len(pick_t) < want_t or len(pick_c) < want_c:
+            protocol.log("There are not enough rows of your data that the measuring did not use; the refit gets fewer or overlapping rows.")
+        chosen = [texts[i] for i in pick_t] + [chats[i] for i in pick_c]
+    else:
+        chosen = texts[:want_t] + chats[:want_c]
+    enc, _ = data.encode_rows(tokenizer, chosen, fam_name, max_len, seed)
     if not enc:
         raise ReshapeError("Nothing in the training data could be used for measuring. Save a training-data version in Step 2 first.")
     inner = data.text_tokenizer(tokenizer)
@@ -377,7 +388,7 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     bs = max(1, min(int(calib_cfg.get("batch", 4)), len(enc) // 2))
     batches = _pad_batches(enc, bs, pad)
     if rkey:
-        reasoning = _reasoning_rows(tokenizer, rkey, fam_name, n_reason, seed)
+        reasoning = _reasoning_rows(tokenizer, rkey, fam_name, n_reason + skip_reasoning, seed)[skip_reasoning:] if skip_reasoning else _reasoning_rows(tokenizer, rkey, fam_name, n_reason, seed)
         rbs = max(1, min(bs, bs * max_len // max(1, rkey["max_len"])))        # long rows go in smaller batches: about as many tokens per batch as the project's
         batches += _pad_batches(reasoning, rbs, pad)
     return batches
@@ -513,9 +524,11 @@ SCORES_FORMAT = 1
 SCORE_ARRAYS = ("mlp", "attn", "gdn")
 
 
-def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
+def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list, weights: str | None = None, need_ms: bool = False):
     """The measurement cached in `scores_dir` (scores.json + scores.npz), or None when there is none or it does not belong to this model and data.
-    Returns {"meta": scores.json, "mlp"/"attn"/"gdn": float32 arrays [layers, structures], and the same with "_h1" / "_h2" for the two halves}."""
+    Returns {"meta": scores.json, "mlp"/"attn"/"gdn": float32 arrays [layers, structures], and the same with "_h1" / "_h2" for the two halves}.
+    A measurement made since the mean squares were recorded also has "mlp_ms" (+ "_h1", "_h2"), the mean square of every neuron's activation, and `"mean_square": true` in its
+    scores.json; with `need_ms` one without them is None (the caller measures again)."""
     if not scores_dir:
         return None
     folder = Path(scores_dir)
@@ -543,6 +556,9 @@ def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
     if meta.get("reasoning") != reasoning_key(cal):
         protocol.log("The earlier measurement used another reasoning text; measuring again.")
         return None
+    if weights and meta.get("weights") and meta["weights"] != weights:          # a measurement made before the weights were recorded is accepted
+        protocol.log("The earlier measurement was made on other weight files of the model; measuring again.")
+        return None
     n_full = sum(1 for t in types if t == "full_attention")
     want = {"mlp": (n_layers, dims["intermediate"]), "attn": (n_full, dims["heads"]), "gdn": (n_layers - n_full, dims["lin_v_heads"])}
     for name, shape in want.items():
@@ -550,6 +566,12 @@ def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
             a = arrays.get(name + suffix)
             if a is None or tuple(a.shape) != shape:
                 protocol.log("The earlier measurement does not fit this model's layers; measuring again.")
+                return None
+    if need_ms:
+        for suffix in ("", "_h1", "_h2"):
+            a = arrays.get("mlp_ms" + suffix)
+            if not meta.get("mean_square") or a is None or tuple(a.shape) != want["mlp"]:
+                protocol.log("The earlier measurement did not record the mean square of the neurons, which ranking them by their output needs; measuring again.")
                 return None
     return {"meta": meta, **arrays}
 
@@ -562,9 +584,9 @@ def _depth_from_scores(sc: dict):
     return m["matrix"], m.get("matrix_h1") or m["matrix"], m.get("matrix_h2") or m["matrix"], m.get("loss_before"), {"load": m.get("load"), "tokens": m.get("tokens")}
 
 
-def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list, need_depth: bool):
-    """The cached measurement when it covers what is needed; otherwise the model is measured (needs torch)."""
-    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types)
+def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list, need_depth: bool, need_ms: bool = False):
+    """The cached measurement when it covers what is needed (`need_ms`: it also recorded the mean squares of the neurons); otherwise the model is measured (needs torch)."""
+    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types, weights=safetensors_io.weights_manifest(src_dir), need_ms=need_ms)
     if sc is not None and (not need_depth or sc["meta"].get("matrix")):
         protocol.log("Using the earlier measurement of this model on your data.")
         return sc
@@ -572,9 +594,20 @@ def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict,
     return _measure_and_save(cfg, src_dir, period, config, dims, types)
 
 
-def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
+def with_output_scores(sc: dict, norms) -> dict:
+    """`sc` with the MLP scores (and those of the two halves) replaced by the output-contribution score: the mean square of the neuron's activation times the squared norm of its
+    down_proj column. Everything else (the attention heads, the layer distances) is as measured."""
+    out = dict(sc)
+    for suffix in ("", "_h1", "_h2"):
+        out["mlp" + suffix] = reshape_width.output_scores(sc["mlp_ms" + suffix], norms)
+    return out
+
+
+def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict, scoring: str = "activation", norms=None):
     """(keep, overlap): per kept old layer the structures that stay, and the mean Jaccard overlap of the choices made from the two halves of the
-    measuring text (1.0 = the same choice from either half)."""
+    measuring text (1.0 = the same choice from either half). With `scoring` "output" the neurons are ranked by `with_output_scores(sc, norms)` instead of the activation."""
+    if scoring == "output":
+        sc = with_output_scores(sc, norms)
     keep: dict = {"mlp": {}, "heads": {}, "gdn": {}}
     ov: list = []
     ordinal = {"full_attention": [], "linear_attention": []}
@@ -596,6 +629,71 @@ def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
             keep["gdn"][s] = g(sc["gdn"])
             ov.append(reshape_width.overlap(g(sc["gdn_h1"]), g(sc["gdn_h2"])))
     return keep, (sum(ov) / len(ov) if ov else 1.0)
+
+
+def _recon_refs(cfg: dict, src_dir: Path, tensors: dict, types: list, dims: dict, width: dict, keep: dict, src: list, chosen: list, scoring: str, period: int, n_layers: int,
+                calibration: dict, stop):
+    """({old layer: TensorRef of the refitted down_proj}, info) for a cut that refits the kept neurons (job key `reconstruct` {"variant", "alpha"}): the sidecar Try first (or an
+    earlier cut) made for exactly this cut, else the refit is made now (needs torch, the model loaded again, and room for the sidecar). Experimental and off by default."""
+    from . import reshape_recon as rr
+    rc = cfg["reconstruct"]
+    variant, alpha = rc.get("variant", "pruned"), float(rc.get("alpha", rr.DEFAULT_ALPHA))
+    if variant not in rr.VARIANTS or not 0 < alpha <= 1:
+        raise ReshapeError("Refitting the kept neurons: the variant is \"pruned\" or \"original\" and the strength 0 to 1.")
+    scores_dir = cfg.get("scores_dir")
+    if not scores_dir:
+        raise ReshapeError("Refitting the kept neurons needs the folder of the measurement.")
+    weights = safetensors_io.weights_manifest(src_dir)
+    found = rr.find_sidecar(scores_dir, weights, width["intermediate"], scoring, chosen, variant, alpha)
+    made = False
+    if found is None:
+        _require_torch()
+        hidden, k = int(dims["hidden"]), int(width["intermediate"])
+        need = int(len(set(src)) * hidden * k * 2 * 1.1)
+        Path(scores_dir).mkdir(parents=True, exist_ok=True)
+        free = fsutil.free_bytes(Path(scores_dir))
+        if free < need:
+            raise ReshapeError(f"The refit is saved next to the measurement and needs about {need / 1e9:.1f} GB; {free / 1e9:.1f} GB are free there.")
+        from transformers import AutoTokenizer
+        est = sum(r.nbytes for r in tensors.values())
+        mode = _choose_load(cfg.get("load", "auto"), est)
+        fam = (cfg.get("source") or {}).get("family", "generic")
+        n_head = int(calibration.get("samples", 256))
+        rkey = reasoning_key(calibration)
+        used = max(1, min(n_head - 1, round(n_head * rkey["share"]))) if rkey and n_head > 1 else 0
+        r_samples, r_len = rr.DEFAULT_SAMPLES, rr.DEFAULT_LEN
+        protocol.progress("recon", 0.0, "Preparing the text for the refit")
+        batches = _calibration(AutoTokenizer.from_pretrained(str(src_dir)), {**calibration, "samples": r_samples, "max_len": r_len}, fam, tail=True, head=n_head, skip_reasoning=used)
+        protocol.progress("recon", 0.0, f"Loading the model ({mode})")
+        model = _load(src_dir, mode)
+        layers = _find_layers(model, n_layers)
+        skip = reshape.blocks_to_layers(list(chosen), period) if chosen else []
+        t0 = time.monotonic()
+        try:
+            out = rr.fit_layers(model, layers, batches, types, skip, {s: keep["mlp"][s] for s in keep["mlp"]}, rr.w0_reader(rr.down_refs(tensors, n_layers)), hidden, alpha, variant, stop, _ram_bytes())
+        except rr.Stopped:
+            raise ReshapeError("Stopped.") from None
+        finally:
+            del layers
+            del model
+            _free()
+        secs = round(time.monotonic() - t0, 1)
+        protocol.timing("recon", secs, tokens=out["tokens"], layers=len(out["w_k"]), variant=variant)
+        rows = rr.rows_key(rkey, r_samples, r_len, n_head, None, calibration.get("seed", 3407))
+        tag = rr.recon_tag(weights, width["intermediate"], scoring, chosen, variant, alpha, rows)
+        rr.write_sidecar(scores_dir, tag, out["w_k"], {s: keep["mlp"][s] for s in out["w_k"]},
+                         {"tag": tag, "variant": variant, "alpha": alpha, "width": width["intermediate"], "scoring": scoring, "skipped": list(chosen), "weights": weights, "rows": rows,
+                          "tokens": out["tokens"], "seconds": secs, "summary": out["summary"], "shares": {str(l): v for l, v in out["shares"].items()}})
+        found = rr.read_sidecar(scores_dir, tag)
+        made = True
+    refs, meta = found
+    for s in set(src):
+        if s not in refs or [int(i) for i in meta["kept"][str(s)]] != [int(i) for i in keep["mlp"][s]]:
+            raise ReshapeError(f"The saved refit does not belong to these neurons (layer {s}); delete the folder {Path(scores_dir) / 'recon'} and make it again.")
+    summary = meta.get("summary") or {}
+    return refs, {"variant": variant, "alpha": alpha, "tag": meta.get("tag"), "made_now": made, "median_removed_share": summary.get("median"), "worst_removed_share": summary.get("worst"),
+                  "layers": len(set(src)), "tokens": meta.get("tokens"), "overlap": meta.get("overlap"), "seconds": meta.get("seconds"),
+                  "note": "Experimental: the share is what the refit gives back on rows it was not fitted on; the loss gain before healing may not survive healing."}
 
 
 MTP_REMOVED = "removed (no longer fits)"
@@ -646,12 +744,15 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
     Width importance (NVIDIA Model-Optimizer's aggregation): a hook on the INPUT of each output projection (mlp.down_proj, self_attn.o_proj,
     linear_attn.out_proj) takes |activation|, averages it over the real tokens of every text, squares it, and sums over the texts; the score of a channel is the
     square root of that sum. A head's score is the L2 norm of its channels' scores. Kept for all texts and separately for the two halves (by batch parity).
-    Returns ((D, D1, D2, loss, tokens), scores) with scores = {"mlp": [L, I], "attn": [n_full, nh], "gdn": [n_lin, nv]} (+ "_h1", "_h2") as float32 numpy arrays."""
+    The same pass also records `mlp_ms` [L, I] (+ "_h1", "_h2"): the mean over the real tokens of the SQUARED activation of every MLP neuron. That is not the square of the score above
+    (which averages |a| per text first), so the output-contribution score needs it on its own: `reshape_width.output_scores(mlp_ms, down-column norms)`.
+    Returns ((D, D1, D2, loss, tokens), scores) with scores = {"mlp": [L, I], "attn": [n_full, nh], "gdn": [n_lin, nv], "mlp_ms": [L, I]} (+ "_h1", "_h2") as float32 numpy arrays."""
     import numpy as np
     import torch
     sizes = {"mlp": dims["intermediate"], "attn": dims["heads"] * dims["head_dim"], "gdn": dims["lin_v_heads"] * dims["lin_v_dim"]}
     state = {"mask": None, "batch": 0}
     acc: dict = {}            # (kind, ordinal, part) -> float32 [C], part 0 = all texts, 1 / 2 = the halves
+    msq: dict = {}            # (ordinal, part) -> [sum over real tokens of a^2 (float64 [I]), number of real tokens] for the MLP neurons (the output-contribution score)
     ordinals = {"mlp": {}, "attn": {}, "gdn": {}}
     handles = []
 
@@ -669,6 +770,12 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
             for part in (0, 1 + state["batch"] % 2):
                 key = (kind, k, part)
                 acc[key] = sq.clone() if key not in acc else acc[key] + sq
+            if kind == "mlp":
+                sq_tok = ((a * a) * m[..., None]).sum((0, 1)).double()
+                n_tok = float(m.sum())
+                for part in (0, 1 + state["batch"] % 2):
+                    cur = msq.get((k, part))
+                    msq[(k, part)] = [sq_tok.clone(), n_tok] if cur is None else [cur[0] + sq_tok, cur[1] + n_tok]
         return hook
 
     for i, layer in enumerate(layers):
@@ -706,6 +813,14 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
                     s = s.reshape(-1, per_head[kind]).pow(2).sum(1).sqrt()
                 rows.append(s.cpu().numpy().astype(np.float32))
             scores[kind + suffix] = np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
+    for part, suffix in ((0, ""), (1, "_h1"), (2, "_h2")):
+        rows = []
+        for k in range(len(ordinals["mlp"])):
+            v = msq.get((k, part)) or (msq.get((k, 1)) if part == 2 else None)
+            if v is None:
+                raise ReshapeError("Nothing was measured; the measuring text is empty.")
+            rows.append((v[0] / max(v[1], 1.0)).cpu().numpy().astype(np.float32))
+        scores["mlp_ms" + suffix] = np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
     return depth, scores
 
 
@@ -720,6 +835,33 @@ def _write_scores(folder: Path, meta: dict, scores: dict) -> None:
     tmp_json = folder / "scores.partial.json"
     tmp_json.write_text(json.dumps(meta), encoding="utf-8")
     os.replace(tmp_json, folder / "scores.json")
+
+
+DOWN_NORMS_FILE = "down_norms.npz"
+
+
+def _down_norms(scores_dir, src_dir: Path, n_layers: int, tensors: dict | None = None):
+    """float32 [layers, neurons]: the squared column norms of every layer's down_proj, from the weight files (no torch). Kept next to the measurement in `down_norms.npz` with the
+    identity of the weight files, so the next job reads 1 file instead of every down_proj again; a file for other weights is made again."""
+    np = slice_io.np()
+    weights = safetensors_io.weights_manifest(src_dir)
+    folder = Path(scores_dir) if scores_dir else None
+    f = folder / DOWN_NORMS_FILE if folder else None
+    if f is not None and f.is_file():
+        try:
+            with np.load(f) as z:
+                if str(z["weights"]) == weights and z["norms"].shape[0] == n_layers:
+                    return np.array(z["norms"], dtype=np.float32)
+        except (OSError, ValueError, KeyError):
+            pass
+    norms = slice_io.down_col_sq_norms(tensors if tensors is not None else safetensors_io.list_tensors(src_dir), n_layers)
+    if f is not None:
+        import os
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / "down_norms.partial.npz"
+        np.savez(tmp, norms=norms, weights=np.array(weights))
+        os.replace(tmp, f)
+    return norms
 
 
 def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list) -> dict:
@@ -764,7 +906,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     protocol.timing("score", time.monotonic() - timer, tokens=tokens, load=mode)
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
-            "reasoning": reasoning_key(calib), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
+            "reasoning": reasoning_key(calib), "weights": safetensors_io.weights_manifest(src_dir), "mean_square": True, "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
             "loss_before": loss, "seconds_per_pass": round(time.monotonic() - timer, 1), "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     if cfg.get("scores_dir"):
         _write_scores(Path(cfg["scores_dir"]), meta, scores)
@@ -881,6 +1023,7 @@ def run(cfg: dict) -> int:
     nb = reshape.block_count(n_layers, period)
     protocol.progress("inspect", 1.0, f"{n_layers} layers in blocks of {period}")
     width = dims = keep = mtp_keep = sc = None
+    recon_refs = recon_info = None
     mtp_drop = False                    # a width cut that thins the MLP or the heads removes the multi-token head (job key keep_mtp: true keeps the old slicing)
     overlap = None
     if width_req:
@@ -889,6 +1032,9 @@ def run(cfg: dict) -> int:
             raise ReshapeError(why)
         dims = reshape_width.width_dims(config)
         width = reshape_width.check_width(dims, width_req, divisor)
+    scoring = reshape_width.check_scoring(cfg.get("width_scoring"))
+    if scoring == "output" and not (width and width["intermediate"] != dims["intermediate"]):
+        scoring = "activation"                  # only the MLP neurons are ranked this way: nothing to rank without an MLP cut
 
     scores, loss_before, loss_after, stable, strategy, chosen = None, None, None, None, cfg.get("strategy", "contiguous"), []
     load_used, tokens = cfg.get("load", "auto"), None
@@ -906,7 +1052,7 @@ def run(cfg: dict) -> int:
             if not lo <= blocks <= hi:
                 raise ReshapeError("Slim at most half of the layers, and never the first or last block.")
             if width:
-                sc = _scores_for(cfg, src_dir, period, config, dims, types, True)
+                sc = _scores_for(cfg, src_dir, period, config, dims, types, True, scoring == "output")
                 D, D1, D2, loss_before, info = _depth_from_scores(sc)
             else:
                 _require_torch()
@@ -925,13 +1071,19 @@ def run(cfg: dict) -> int:
             src = list(range(n_layers))
         if width:
             if sc is None:
-                sc = _scores_for(cfg, src_dir, period, config, dims, types, False)
+                sc = _scores_for(cfg, src_dir, period, config, dims, types, False, scoring == "output")
                 load_used, tokens = sc["meta"].get("load", load_used), sc["meta"].get("tokens")
                 loss_before = sc["meta"].get("loss_before")
-            keep, overlap = _keep_sets(sc, src, types, dims, width)
+            norms = _down_norms(cfg.get("scores_dir"), src_dir, n_layers, tensors) if scoring == "output" else None
+            if scoring == "output":
+                protocol.log("Ranking the MLP neurons by their expected output: the mean square of the activation times the squared size of the neuron's output column.")
+            keep, overlap = _keep_sets(sc, src, types, dims, width, scoring, norms)
             mtp_drop = bool(groups["mtp"]) and not cfg.get("keep_mtp") and reshape_width.mtp_removed(dims, width)
             mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] and not mtp_drop else None
-            protocol.emit("width_scores", **_width_event(sc, keep, src, overlap))
+            if isinstance(cfg.get("reconstruct"), dict) and width["intermediate"] != dims["intermediate"]:
+                recon_refs, recon_info = _recon_refs(cfg, src_dir, tensors, types, dims, width, keep, src, chosen, scoring, period, n_layers, calibration, lambda: stop_file.exists())
+                notes.append("The kept neurons were refitted (experimental): the output weights of the kept neurons were changed to make up for part of what the removed ones did.")
+            protocol.emit("width_scores", **_width_event(with_output_scores(sc, norms) if scoring == "output" else sc, keep, src, overlap))
             protocol.log(f"Thinning every layer: MLP {dims['intermediate']:,} to {width['intermediate']:,}"
                          + (f", linear-attention value heads {dims['lin_v_heads']} to {width['lin_v_heads']}" if width["lin_v_heads"] != dims["lin_v_heads"] else "")
                          + (f", attention heads {dims['heads']} to {width['heads']}" if width["heads"] != dims["heads"] else "") + ".")
@@ -952,6 +1104,8 @@ def run(cfg: dict) -> int:
     if width:
         new_cfg = reshape_width.fix_config_width(new_cfg, dims, width)
         plan = reshape_width.plan_width(plan, src, types, dims, width, keep, mtp_keep)
+        if recon_refs:
+            plan = reshape_width.apply_recon(plan, src, recon_refs)
         if mtp_drop:
             plan = [t for t in plan if not t.name.startswith("mtp.")]
             tc_new = reshape.text_config(new_cfg)
@@ -1005,6 +1159,10 @@ def run(cfg: dict) -> int:
             wmeta = {"intermediate_size": [dims["intermediate"], width["intermediate"]], "linear_num_value_heads": [dims["lin_v_heads"], width["lin_v_heads"]],
                      "num_attention_heads": [dims["heads"], width["heads"]], "kept": "width_kept.npz", "scores_key": Path(cfg.get("scores_dir") or "").name or None,
                      "stable_overlap": round(overlap, 4), "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
+            if recon_info:
+                wmeta["recon"] = recon_info
+            if scoring == "output":
+                wmeta["scoring"] = "output"             # only written when asked for: a cut as before has the file as before
             _save_kept(out / "width_kept.npz", src, keep, mtp_keep)
         shape_word = ("both" if chosen else "width") if width else ("depth" if mode == "prune" else None)
         meta = {"format": 2 if width else 1, "tool": "ND Lore Forge", "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1039,6 +1197,7 @@ def run(cfg: dict) -> int:
     protocol.progress("done", 1.0, "")
     protocol.result({"model_dir": str(final), "mode": mode, "layers_before": n_layers, "layers_after": len(src), "src_layers": src, "dropped": info["dropped"],
                      "duplicated": info["duplicated"], "zero_init": zero_init, "params_before": groups["total"], "params_after": info["params_after"],
+                     "params_breakdown": reshape.breakdown(new_groups, None, groups) if width else reshape.breakdown(groups, src),
                      "bytes_written": need, "loss_before": loss_before, "loss_after": loss_after, "ppl_before": _ppl(loss_before), "ppl_after": _ppl(loss_after), "stable": stable,
                      "boundary_distance": (scores or {}).get("boundary_distance"), "chosen_blocks": chosen if mode == "prune" else None, "load": load_used,
                      "seconds": round(time.monotonic() - started, 1), "notes": notes, "stopped": False,
@@ -1046,6 +1205,7 @@ def run(cfg: dict) -> int:
                                                                 "num_attention_heads": dims["heads"]},
                                                       "after": {"intermediate_size": width["intermediate"], "linear_num_value_heads": width["lin_v_heads"],
                                                                 "num_attention_heads": width["heads"]},
-                                                      "stable_overlap": wmeta["stable_overlap"], "scores_key": wmeta["scores_key"], "mtp": wmeta["mtp"]}
+                                                      "stable_overlap": wmeta["stable_overlap"], "scores_key": wmeta["scores_key"], "mtp": wmeta["mtp"],
+                                                      **({"scoring": "output"} if wmeta.get("scoring") else {}), **({"recon": wmeta["recon"]} if wmeta.get("recon") else {})}
                                                      if width else None)})
     return 0

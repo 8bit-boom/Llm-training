@@ -148,6 +148,29 @@ def params_for(dims: dict, layer_types: list[str], width: dict, vision: int, oth
     return layers + dims["vocab"] * H + head + H + mtp + vision + other
 
 
+# --------------------------------------------------------------------------------------------------------- output-contribution scores
+
+SCORINGS = ("activation", "output")
+
+
+def check_scoring(value) -> str:
+    """The `width_scoring` of a job: "activation" (default, None) or "output"."""
+    if value in (None, "", "activation"):
+        return "activation"
+    if value == "output":
+        return "output"
+    raise ReshapeError("The way the neurons are ranked is \"activation\" (the default) or \"output\".")
+
+
+def output_scores(ms, norms):
+    """The output-contribution score of the MLP neurons: the mean square of the neuron's activation (over the real tokens of the measuring text) times the squared
+    norm of its column of `down_proj`, the expected squared size of what the neuron adds to the layer's output when the neurons are treated as independent. `ms` and `norms`
+    are arrays (or nested lists) of the same shape, e.g. [layers, neurons]; the result has that shape. Elementwise, so the halves of the text are scored the same way."""
+    if hasattr(ms, "shape") and hasattr(norms, "shape"):
+        return ms * norms
+    return [output_scores(a, b) if isinstance(a, (list, tuple)) else float(a) * float(b) for a, b in zip(ms, norms)]
+
+
 # --------------------------------------------------------------------------------------------------------- choosing what stays
 
 def head_rows(h: int, size: int) -> list[int]:
@@ -279,6 +302,48 @@ def plan_width(out: list, src: list[int], types: list[str], dims: dict, width: d
             continue
         result.append(t)
     return result
+
+
+def _bf16_as(ref, dtype: str):
+    """A function that returns the values of the bf16 tensor `ref` as `dtype` (F32 or F16) bytes, one tensor at a time (every bf16 value is exact in F32)."""
+    def make():
+        from . import slice_io
+        n = slice_io.np()
+        f32 = slice_io.bf16_to_f32(slice_io.read_array(ref))
+        if dtype == "F32":
+            return n.ascontiguousarray(f32, dtype="<f4")
+        if dtype == "F16":
+            return n.ascontiguousarray(f32.astype("<f2"))
+        raise ReshapeError(f"The refit of the kept neurons cannot be written into {dtype} weights.")
+    return make
+
+
+def apply_recon(plan: list, src: list[int], refs: dict) -> list:
+    """Replaces the sliced `down_proj` of every layer that has a refit by a plain copy of the refitted weights (`refs`: {old layer: TensorRef of W_K, BF16 [hidden, kept]}, the
+    sidecar of reshape_recon). Layer j of the new model is old layer src[j]; nothing else changes and no new writer path is needed: the OutTensor just has another source.
+    ReshapeError when a refit does not have the shape of the cut's tensor. A model stored in F32 / F16 gets the refit converted (bf16 values are exact in F32)."""
+    from .safetensors_io import OutTensor
+    out = []
+    used = set()
+    for t in plan:
+        sp = split_key(t.name)
+        if sp is not None and sp[2] == "mlp.down_proj.weight" and sp[1] < len(src) and src[sp[1]] in refs:
+            ref = refs[src[sp[1]]]
+            if ref.dtype != "BF16":
+                raise ReshapeError("The saved refit is not in bf16; make it again.")
+            if tuple(ref.shape) != tuple(t.shape):
+                raise ReshapeError(f"The saved refit of layer {src[sp[1]]} has the shape {tuple(ref.shape)}, but the cut needs {tuple(t.shape)}. It was made for another width.")
+            if t.dtype == "BF16":
+                out.append(OutTensor(t.name, "BF16", tuple(t.shape), ref))                    # a plain copy of the sidecar's bytes
+            else:
+                out.append(OutTensor(t.name, t.dtype, tuple(t.shape), None, data=_bf16_as(ref, t.dtype)))      # a model stored in 16 / 32 bit floats: the same values, converted exactly
+            used.add(src[sp[1]])
+            continue
+        out.append(t)
+    missing = [s for s in set(src) if s not in used]
+    if missing and refs:
+        raise ReshapeError(f"The saved refit has no weights for layer {min(missing)}; make it again.")
+    return out
 
 
 def _have(keep: dict, s: int, lt: str, dims: dict, width: dict) -> bool:

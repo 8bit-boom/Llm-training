@@ -82,6 +82,26 @@ def _as_f64(ref: TensorRef):
     return a.astype(n.float64)
 
 
+def down_col_sq_norms(tensors: dict, n_layers: int):
+    """float32 [n_layers, intermediate]: the squared L2 norm of every column of each decoder layer's `mlp.down_proj.weight` ([hidden, intermediate]), read from the weight
+    files one tensor at a time (bf16 / f16 / f32; no torch). The squared size of what a neuron adds to the layer's output per unit of its activation."""
+    from .reshape import split_key       # (imported here only to keep the module's top as it was)
+    n = np()
+    found: dict = {}
+    for name, ref in tensors.items():
+        sp = split_key(name)
+        if sp is not None and sp[2] == "mlp.down_proj.weight":
+            found[sp[1]] = ref
+    missing = [i for i in range(n_layers) if i not in found]
+    if missing:
+        raise ReshapeError(f"Layer {missing[0]} has no plain MLP output projection, so its neurons cannot be ranked by their output.")
+    rows = []
+    for i in range(n_layers):
+        w = _as_f64(found[i])
+        rows.append((w ** 2).sum(axis=0).astype(n.float32))
+    return n.stack(rows)
+
+
 def weight_norm_scores(tensors: dict, dims: dict) -> dict:
     """Importance of the structures of the multi-token head from the weights alone (it is never run, so nothing can be measured):
     neuron i -> ||down[:, i]|| * ||up[i, :]||, query head h -> ||o_proj[:, rows(h)]||. {layer: {"mlp": [I floats], "heads": [nh floats] or None}} per

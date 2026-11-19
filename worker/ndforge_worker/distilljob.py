@@ -54,10 +54,11 @@ def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask):
     return kd, (ce * label_mask.float()).sum()
 
 
-def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None):
+def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None, checkpoint_head: bool = True):
     """hidden [n, C] (the student's last hidden states), weight [V, C] (its output layer), targets = the teacher's (ids [n, k], logp [n, k], resid [n]),
     mask [n]. The logits are made `chunk` tokens at a time inside torch.utils.checkpoint, so at most chunk x V floats exist (the backward pass makes them again).
     With labels [n] (the next token, any value where label_mask is 0) the cross-entropy over label_mask is returned as well.
+    `checkpoint_head=False` keeps every chunk's logits for the backward pass instead of making them again: faster, and the same numbers, but about tokens x V x 10 bytes of memory.
     Returns (kd_sum, n_tokens, ce_sum, n_label_tokens); divide to get means."""
     import torch
     from torch.utils.checkpoint import checkpoint
@@ -67,7 +68,7 @@ def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None
     for a in range(0, n, max(1, int(chunk))):
         b = min(n, a + chunk)
         args = (hidden[a:b], weight, ids[a:b], logp[a:b], resid[a:b], mask[a:b], None if labels is None else labels[a:b], None if label_mask is None else label_mask[a:b])
-        kd, ce = checkpoint(_chunk_losses, *args, use_reentrant=False)
+        kd, ce = checkpoint(_chunk_losses, *args, use_reentrant=False) if checkpoint_head else _chunk_losses(*args)
         kd_total = kd_total + kd
         ce_total = ce_total + ce
     n_label = label_mask.float().sum() if label_mask is not None else hidden.new_zeros(())
@@ -190,15 +191,31 @@ def _general_texts(source: dict):
     yield from generaltext.texts(source)
 
 
-def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407, stats: dict | None = None):
+def data_length_labels():
+    from . import data
+    return data.LENGTH_LABELS
+
+
+def data_length_bucket(n: int) -> str:
+    from . import data
+    return data.length_bucket(n)
+
+
+def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407, stats: dict | None = None, probe=None, holdout: int = 0):
     """General text cut into rows of at most max_seq tokens, about `budget` tokens in all. tok_fn(text) -> list of token ids.
     A plain-text source is windowed: a long text gives several rows. A chat-shaped source (messages, conversations, prompt + answer) gives ONE row per conversation, its first
     max_seq tokens (a later window would have neither the question nor the chat frame); a conversation longer than twice max_seq is skipped. `stats` (a dict, optional)
-    receives {"cut_rows": conversations cut to max_seq, "skipped_long": conversations skipped as too long}.
+    receives {"cut_rows": conversations cut to max_seq, "skipped_long": conversations skipped as too long, "length_buckets": every text or conversation counted by its length
+    before cutting (the ones left out included), "skipped_reasoning": skipped conversations for which `probe(ids)` (optional) says they were reasoning rows,
+    "holdout_rows": with `holdout` > 0, that many rows read PAST the ones returned (rendered and cut the same way, never a later window of a text a returned row came from)}.
     The order is the dataset's own, or mixed by source["seed"] when it has one (the same seed gives the same sample); returns (rows, tokens). Raises whatever the source raises (the caller explains it)."""
     stats = stats if stats is not None else {}
     stats.setdefault("cut_rows", 0)
     stats.setdefault("skipped_long", 0)
+    stats.setdefault("skipped_reasoning", 0)
+    if holdout > 0:
+        stats.setdefault("holdout_rows", [])
+    buckets = stats.setdefault("length_buckets", {label: 0 for label in data_length_labels()})
     report = source.get("report")
     if not isinstance(report, dict):
         report = {}
@@ -206,9 +223,12 @@ def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 34
     rows, tokens = [], 0
     for text in _general_texts(source):
         ids = tok_fn(text)
+        buckets[data_length_bucket(len(ids))] += 1
         if (report.get("detected") or {}).get("kind", "text") != "text":
             if len(ids) > 2 * max_seq:
                 stats["skipped_long"] += 1
+                if probe is not None and probe(ids):
+                    stats["skipped_reasoning"] += 1
                 continue
             if len(ids) > max_seq:
                 stats["cut_rows"] += 1
@@ -218,21 +238,170 @@ def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 34
         for w in windows:
             if len(w) < MIN_GENERAL_ROW:
                 continue
-            rows.append({"input_ids": w, "completion_mask": [1] * len(w), "kind": "general", "source": "general"})
+            row = {"input_ids": w, "completion_mask": [1] * len(w), "kind": "general", "source": "general"}
+            if tokens >= budget:                                         # past the budget: only with a held-out set to fill
+                held = stats.setdefault("holdout_rows", [])
+                held.append(row)
+                if len(held) >= holdout:
+                    return rows, tokens
+                break                                                    # one row of a text: its other windows would be next to a row that was trained on
+            rows.append(row)
             tokens += len(w)
             if tokens >= budget:
-                return rows, tokens
+                if holdout <= 0:
+                    return rows, tokens
+                break                                                    # the rest of this text is not held out
     return rows, tokens
 
 
-def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int = 3407):
+# ------------------------------------------------------------------------------------------------------------ what the heal's rows cover
+
+def marker_ids(tokenizer, fam_name: str) -> dict:
+    """The token ids that mark a chat: {"assistant": ids of the start of an assistant turn ("<|im_start|>assistant\\n") or None, "end": the end-of-turn id or None,
+    "think_open", "think_close": the reasoning markers or None}. A marker the tokenizer does not know as one token is None (the row statistics then say less, never more)."""
+    from . import data
+    from .families import family
+    tok = data.text_tokenizer(tokenizer)
+    unk = getattr(tok, "unk_token_id", None)
+
+    def one(text):
+        try:
+            i = tok.convert_tokens_to_ids(text)
+        except Exception:                                   # noqa: BLE001 - a tokenizer without the call
+            return None
+        return None if i is None or i == unk or not isinstance(i, int) or i < 0 else i
+
+    out = {"assistant": None, "end": None, "think_open": one("<think>"), "think_close": one("</think>")}
+    end = (family(fam_name).get("end") or "").strip()
+    out["end"] = one(end) if end else (tok.eos_token_id if isinstance(getattr(tok, "eos_token_id", None), int) else None)
+    if one("<|im_start|>") is not None:
+        try:
+            out["assistant"] = list(tok("<|im_start|>assistant\n", add_special_tokens=False)["input_ids"])
+        except Exception:                                   # noqa: BLE001
+            pass
+    return out
+
+
+def _find_last(ids: list, pat: list) -> int:
+    """The index just after the last occurrence of the id list `pat` in `ids`, or -1."""
+    n = len(pat)
+    for a in range(len(ids) - n, -1, -1):
+        if ids[a:a + n] == pat:
+            return a + n
+    return -1
+
+
+BLANK_THINK = 2                 # a reasoning block of this many tokens or fewer (the newlines of an empty one) is not reasoning
+
+
+def reasoning_probe(markers: dict):
+    """A function ids -> True when the row holds a non-empty reasoning block (or a reasoning block that was cut), None when the tokenizer has no such markers."""
+    o, c = markers.get("think_open"), markers.get("think_close")
+    if o is None or c is None:
+        return None
+
+    def probe(ids: list) -> bool:
+        try:
+            a = ids.index(o)
+        except ValueError:
+            return False
+        try:
+            b = ids.index(c, a)
+        except ValueError:
+            return True
+        return b - a - 1 > BLANK_THINK
+    return probe
+
+
+def classify_row(row: dict, markers: dict, max_seq: int, chat: bool) -> dict:
+    """How one kept row splits: {"chat", "complete", "think": "none"|"complete"|"cut_reasoning"|"cut_answer", "prompt", "reasoning", "answer", "plain"} in tokens.
+    A text row is all `plain`. A chat row is split at the start of the assistant turn (the marker ids, else the project's completion mask); with the reasoning markers the block
+    from <think> to </think> is `reasoning` and what follows is `answer`. `complete`: the end-of-turn token closes the row (families without one: the row is shorter than max_seq)."""
+    ids = row["input_ids"]
+    n = len(ids)
+    end = markers.get("end")
+    closed = (end is not None and end in ids[-3:]) if end is not None else n < max_seq
+    if not chat:
+        return {"chat": False, "complete": n < max_seq, "think": "none", "prompt": 0, "reasoning": 0, "answer": 0, "plain": n}
+    start = _find_last(ids, markers["assistant"]) if markers.get("assistant") else -1
+    if start < 0:
+        mask = row.get("completion_mask") or []
+        first = next((i for i, m in enumerate(mask) if m), None) if len(mask) == n else None
+        if first is None or first == 0:
+            return {"chat": True, "complete": closed, "think": "none", "prompt": 0, "reasoning": 0, "answer": 0, "plain": n}
+        start = first
+    tail = ids[start:]
+    prompt, reasoning, think = start, 0, "none"
+    o, c = markers.get("think_open"), markers.get("think_close")
+    if o is not None and c is not None and o in tail:
+        a = tail.index(o)
+        if c in tail[a:]:
+            b = tail.index(c, a)
+            if b - a - 1 > BLANK_THINK:
+                prompt, reasoning, think = start + a, b - a + 1, "complete" if closed else "cut_answer"
+            else:
+                prompt = start + b + 1                      # the empty block of a template that switched thinking off belongs to the prompt
+        else:
+            prompt, reasoning, think = start + a, len(tail) - a, "cut_reasoning"
+    answer = n - prompt - reasoning
+    return {"chat": True, "complete": closed, "think": think, "prompt": prompt, "reasoning": reasoning, "answer": answer, "plain": 0}
+
+
+def coverage(rows: list, markers: dict, max_seq: int, stats: dict | None = None, general_chat: bool = False) -> dict:
+    """What the rows of a heal cover (docs/HEAL_SETTINGS.md): the row counts by kind, how many chat rows are complete, cut or left out, the same for reasoning rows, the share of the
+    kept tokens that is prompt / reasoning / answer / plain text, and the lengths of all rows before cutting (the ones left out included). `stats` is build_rows' (the left-out
+    counts and `length_buckets`); `general_chat`: the general rows are conversations. Pure: no tokenizer, no files."""
+    stats = stats or {}
+    kinds = {"project_text": 0, "project_chat": 0, "general_text": 0, "general_chat": 0}
+    chat = {"complete": 0, "cut": 0}
+    think = {"complete": 0, "cut_reasoning": 0, "cut_answer": 0}
+    tokens = {"prompt": 0, "reasoning": 0, "answer": 0, "plain": 0}
+    for r in rows:
+        is_general = r.get("source") == "general"
+        is_chat = general_chat if is_general else r.get("kind") == "chat"
+        c = classify_row(r, markers, max_seq, is_chat)
+        kinds[("general_" if is_general else "project_") + ("chat" if is_chat else "text")] += 1
+        if is_chat:
+            chat["complete" if c["complete"] else "cut"] += 1
+            if c["think"] != "none":
+                think[c["think"]] += 1
+        for key in tokens:
+            tokens[key] += c[key]
+    total = sum(tokens.values())
+    skipped = {"project_chat": int(stats.get("skipped_too_long", 0)), "general_chat": int(stats.get("general_skipped_long", 0))}
+    skipped_reasoning = int(stats.get("skipped_reasoning", 0)) + int(stats.get("general_skipped_reasoning", 0))
+    reasoning_rows = sum(think.values())
+    out = {"v": 1, "max_seq": int(max_seq), "rows": kinds, "chat_rows": {**chat, "skipped": skipped["project_chat"] + skipped["general_chat"], "skipped_by": skipped},
+           "reasoning_rows": {**think, "skipped": skipped_reasoning, "total": reasoning_rows + skipped_reasoning, "known": markers.get("think_open") is not None and markers.get("think_close") is not None},
+           "token_share": {k: (round(v / total, 4) if total else 0.0) for k, v in tokens.items()}, "tokens": tokens,
+           "length_buckets": dict(stats.get("length_buckets") or {}), "notes": []}
+    gb = stats.get("general_length_buckets") or {}
+    if gb:
+        out["length_buckets"] = {k: out["length_buckets"].get(k, 0) + gb.get(k, 0) for k in set(out["length_buckets"]) | set(gb)}
+        out["length_buckets"] = {k: out["length_buckets"][k] for k in data_length_labels() if k in out["length_buckets"]}
+    lost = think["cut_reasoning"] + think["cut_answer"] + skipped_reasoning
+    total_reasoning = out["reasoning_rows"]["total"]
+    if total_reasoning and lost / total_reasoning > 0.10:
+        pct = round(100 * lost / total_reasoning)
+        if max_seq < 8192:
+            out["notes"].append(f"{pct}% of the reasoning rows lost their answer or were left out because they are longer than {max_seq} tokens: choose 8192 in Heal settings if the plan says it fits.")
+        else:
+            out["notes"].append(f"{pct}% of the reasoning rows lost their answer or were left out: these traces are longer than {max_seq} tokens, and a longer bucket is not available yet.")
+    if total_reasoning and out["token_share"]["reasoning"] < 0.75 and think["complete"] + think["cut_answer"] + think["cut_reasoning"]:
+        out["notes"].append(f"Reasoning is {round(100 * out['token_share']['reasoning'])}% of the kept tokens; Unsloth's guidance for keeping thinking is 75% or more (a guide, not a rule).")
+    return out
+
+
+def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int = 3407, holdout: int = 0):
     """The unique rows the teacher answers and the student learns from: the project's saved training data (as in training) followed by general text.
     data_cfg: {"train": path, "tokens": total heal tokens, "general": {"share": 0.5, "id" | "file", "column", "config", "split"} | None}.
     The general text is cut to its share of the heal budget (project data repeats when it is smaller than its share; see training_order). When the general
     text cannot be read (offline ...), healing goes on with the project's data only and stats["general_error"] says why.
     Returns (rows, stats)."""
     from . import data
-    proj, pstats = data.load_training_rows(tokenizer, data_cfg["train"], fam_name, max_seq, seed)
+    markers = marker_ids(tokenizer, fam_name)
+    probe = reasoning_probe(markers)
+    proj, pstats = data.load_training_rows(tokenizer, data_cfg["train"], fam_name, max_seq, seed, **({"probe": probe} if probe else {}))
     for r in proj:
         r["source"] = "project"
     stats = {"project_rows": len(proj), "project_tokens": pstats["tokens"], "general_rows": 0, "general_tokens": 0, "general_error": None, "general_error_code": None,
@@ -253,14 +422,17 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
         long_rows: dict = {}
         try:
-            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed, long_rows)
+            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed, long_rows, probe, **({"holdout": holdout} if holdout > 0 else {}))
+            if holdout > 0:
+                stats["holdout_rows"] = long_rows.pop("holdout_rows", [])
         except Exception as exc:      # noqa: BLE001 - offline, gated, wrong id or column: all end the same plain way
             grows, gtok = [], 0
             stats["general_error"], stats["general_error_code"] = generaltext.failure_note(
                 exc, g, "downloaded", "Healing goes on with your world's text only; try again later or choose another dataset.", DEFAULT_GENERAL)
             protocol.log(stats["general_error"])
         stats.update(general_detected=report.get("detected"), general_texts_skipped=report.get("skipped", 0), general_cut_rows=long_rows.get("cut_rows", 0),
-                     general_skipped_long=long_rows.get("skipped_long", 0))
+                     general_skipped_long=long_rows.get("skipped_long", 0), general_skipped_reasoning=long_rows.get("skipped_reasoning", 0),
+                     general_length_buckets=long_rows.get("length_buckets") or {})
         rows += grows
         stats.update(general_rows=len(grows), general_tokens=gtok)
         if grows:
@@ -268,6 +440,9 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
             if stats["general_cut_rows"] or stats["general_skipped_long"]:
                 protocol.log(f"Long conversations: {stats['general_cut_rows']} were cut to {max_seq} tokens, {stats['general_skipped_long']} were longer than {2 * max_seq} tokens and left out.")
         protocol.progress("data", 1.0, "")
+    stats["length_buckets"] = pstats.get("length_buckets") or {}
+    stats["skipped_too_long"], stats["skipped_reasoning"] = pstats.get("skipped_too_long", 0), pstats.get("skipped_reasoning", 0)
+    stats["coverage"] = coverage(rows, markers, max_seq, stats, (stats.get("general_detected") or {}).get("kind", "text") != "text")
     return rows, stats
 
 
@@ -477,9 +652,10 @@ def _file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int) -> str:
+def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, version: int = 2) -> str:
     """The folder name of the shared cache these rows belong to: the teacher (its folder and config), the tokenizer, k, the length, how the teacher is loaded, the general text
-    WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file."""
+    WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file.
+    Version 2 adds the identity of the teacher's weight files (`safetensors_io.weights_manifest`); version 1 is the id older caches were saved under."""
     data_cfg = cfg.get("data") or {}
     g = data_cfg.get("general")
     used = bool(g) and float(g.get("share", 0) or 0) > 0
@@ -488,7 +664,34 @@ def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed:
     ident = {"v": 1, "teacher": str(Path(teacher_dir).resolve()), "teacher_config": _file_sha256(Path(teacher_dir) / "config.json"), "tokenizer": tokenizer_hash(student), "k": int(k),
              "max_len": int(max_seq), "load": (cfg.get("teacher") or {}).get("load", "auto"), "general": gen, "seed": int(seed),
              "family": (cfg.get("model") or {}).get("family", "generic"), "train": _file_sha256(data_cfg.get("train") or "")}
+    if int(version) >= 2:
+        ident["v"] = 2
+        ident["teacher_weights"] = safetensors_io.weights_manifest(teacher_dir)
     return hashlib.sha256(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+
+
+ADOPT_NOTE = ("These answers were made before the program checked the original's weight files; if you replaced them in place, delete the saved answers.")
+
+
+def choose_store(base, cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, meta: dict, hashes: list):
+    """(folder, note) of the shared cache for these rows. The id of the current version first; when no store of that id exists yet but one made under the old id (before the
+    weights were part of it) does, that store is adopted once: it gets `teacher_weights` in its index and a note says so. An old store whose index already names other weights is
+    not used."""
+    base = Path(base)
+    new_id = shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 2)
+    if read_cache_index(base / new_id) is None:
+        old_dir = base / shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 1)
+        idx = read_cache_index(old_dir)
+        if idx is not None and idx.get("teacher_weights") in (None, meta.get("teacher_weights")) and store_extends(old_dir, {**meta, "teacher_weights": None}, hashes):
+            note = None
+            if idx.get("teacher_weights") is None:
+                idx["teacher_weights"] = meta.get("teacher_weights")
+                tmp = old_dir / "index.partial.json"
+                tmp.write_text(json.dumps(idx), encoding="utf-8")
+                os.replace(tmp, old_dir / "index.json")
+                note = ADOPT_NOTE
+            return old_dir, note
+    return pick_store(base, new_id, meta, hashes), None
 
 
 def _read_hashes(folder):
@@ -508,6 +711,8 @@ def store_extends(folder, meta: dict, hashes: list) -> bool:
     if old is None:
         return True
     if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len")):
+        return False
+    if old.get("teacher_weights") and meta.get("teacher_weights") and old["teacher_weights"] != meta["teacher_weights"]:
         return False
     done = int(old.get("done_rows", 0))
     if done == 0:
@@ -591,25 +796,25 @@ class SharedCacheWriter(CacheWriter):
             self._write_view()
 
 
-def save_rows(folder, rows: list) -> None:
+def save_rows(folder, rows: list, name: str = "rows") -> None:
     """rows.npz next to the cache: the token ids of the rows the teacher answered, so the student learns from exactly these rows without making them again
     (and without a second download of the general text). Needs numpy."""
     from . import slice_io
     np = slice_io.np()
     lens = np.array([len(r["input_ids"]) for r in rows], dtype=np.int64)
     kinds = sorted({str(r.get("kind", "")) for r in rows})
-    np.savez(Path(folder) / "rows.partial.npz", ids=np.array([x for r in rows for x in r["input_ids"]], dtype=np.int32),
+    np.savez(Path(folder) / f"{name}.partial.npz", ids=np.array([x for r in rows for x in r["input_ids"]], dtype=np.int32),
              mask=np.array([x for r in rows for x in r["completion_mask"]], dtype=np.uint8), offsets=np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
              general=np.array([r.get("source") == "general" for r in rows], dtype=np.uint8), kind=np.array([kinds.index(str(r.get("kind", ""))) for r in rows], dtype=np.int16),
              kinds=np.array(kinds))
-    os.replace(Path(folder) / "rows.partial.npz", Path(folder) / "rows.npz")
+    os.replace(Path(folder) / f"{name}.partial.npz", Path(folder) / f"{name}.npz")
 
 
-def load_rows(folder) -> list:
+def load_rows(folder, name: str = "rows") -> list:
     from . import slice_io
     np = slice_io.np()
     try:
-        with np.load(Path(folder) / "rows.npz") as z:
+        with np.load(Path(folder) / f"{name}.npz") as z:
             ids, mask, off, gen, kind, kinds = (z[k] for k in ("ids", "mask", "offsets", "general", "kind", "kinds"))
     except (OSError, ValueError, KeyError):
         raise ReshapeError("The teacher's saved answers are missing or unreadable; they will be made again.") from None
@@ -627,6 +832,8 @@ def read_cache_index(folder):
 
 def cache_matches(index: dict, expect: dict) -> bool:
     """True when the saved teacher answers belong to this data, tokenizer, length, k and teacher"""
+    if index.get("teacher_weights") and expect.get("teacher_weights") and index["teacher_weights"] != expect["teacher_weights"]:
+        return False                                    # an older cache without the field is accepted as before
     return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len", "general_key", "general_rows"))
 
 
@@ -698,10 +905,11 @@ def length_order(window: list) -> list:
     return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
 
 
-def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int) -> dict:
+def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int, teacher_dir=None) -> dict:
     """What index.json says about a teacher cache (the first eight keys decide `cache_matches`)."""
     gen = (cfg.get("data") or {}).get("general")
-    return {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
+    extra = {"teacher_weights": safetensors_io.weights_manifest(teacher_dir)} if teacher_dir else {}
+    return {**extra, "teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
             "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
             "general_key": generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407))),
             "general_source": stats["general_source"],
@@ -746,6 +954,28 @@ def _reusable_rows(out, cfg: dict, k: int, max_seq: int, student):
     return rows, stats
 
 
+def _read_holdout_meta(folder):
+    try:
+        m = json.loads((Path(folder) / "holdout.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def _read_coverage(folder):
+    try:
+        c = json.loads((Path(folder) / "coverage.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return c if isinstance(c, dict) and c.get("v") == 1 else None
+
+
+def _write_coverage(folder, cov: dict) -> None:
+    tmp = Path(folder) / "coverage.partial.json"
+    tmp.write_text(json.dumps(cov, indent=2), encoding="utf-8")
+    os.replace(tmp, Path(folder) / "coverage.json")
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
@@ -770,24 +1000,39 @@ def run_cache(cfg: dict) -> int:
         rows, stats = again
         protocol.log(f"The rows of this run are taken from the saved ones ({len(rows)} rows); the general text is not read again.")
     else:
-        rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
-    meta = cache_meta(cfg, rows, stats, student, k, max_seq)
+        hold_n = int((cfg.get("holdout") or {}).get("rows", 0) or 0) if isinstance(cfg.get("holdout"), dict) else 0
+        rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)), hold_n)
+    hold = stats.pop("holdout_rows", None) or []
+    meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir)
     upto = cfg.get("upto_general_tokens")
     target = len(rows) if upto is None else rows_upto(rows, upto)
     legacy = read_cache_index(out)
+    adopt_note = None
     if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
         # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
         hashes = row_hashes(rows)
-        store = pick_store(cfg["shared_dir"], shared_store_id(cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407))), meta, hashes)
+        store, adopt_note = choose_store(cfg["shared_dir"], cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407)), meta, hashes)
+        if adopt_note:
+            protocol.log(adopt_note)
         writer = SharedCacheWriter(store, out, meta, hashes, int(cfg.get("part_tokens", 262144)))
         protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
     else:
         writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
     if not again:
         save_rows(out, rows)
+        if hold:
+            save_rows(out, hold, "holdout")                 # general rows read past the ones the heal learns from: only the loss is measured on them, never trained on
+            (out / "holdout.json").write_text(json.dumps({"rows": len(hold), "tokens": sum(len(r["input_ids"]) for r in hold), "teacher_loss": None}), encoding="utf-8")
+    cov = stats.get("coverage") or _read_coverage(out) or coverage(rows, marker_ids(tok, cfg["model"].get("family", "generic")), max_seq, stats,
+                                                                   ((stats.get("general_detected") or {}).get("kind", "text") != "text"))
+    _write_coverage(out, cov)
     notes = [stats["general_error"]] if stats["general_error"] else []
+    if adopt_note:
+        notes.append(adopt_note)
     total_tokens = sum(len(r["input_ids"]) for r in rows)
-    result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
+    result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False, "coverage": cov}
+    if hold:
+        result["holdout"] = {"rows": len(hold), "tokens": sum(len(r["input_ids"]) for r in hold)}
     rows_before = writer.done_rows
     target_tokens = sum(len(r["input_ids"]) for r in rows[:target]) if target < len(rows) else total_tokens
 
@@ -817,6 +1062,16 @@ def run_cache(cfg: dict) -> int:
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
     window_rows = max(WINDOW_ROWS, batch)
+    held = _read_holdout_meta(out)
+    if held is not None and held.get("teacher_loss") is None and (out / "holdout.npz").is_file():
+        # the original's own error on the held-out text, measured while it is loaded: what the student's number is compared with
+        try:
+            hb = reshapejob._pad_batches([{"input_ids": r["input_ids"]} for r in load_rows(out, "holdout")], 4, pad_id)
+            held["teacher_loss"] = calib_loss(model, hb, chunk)
+            (out / "holdout.json").write_text(json.dumps(held), encoding="utf-8")
+            protocol.log(f"The original's error on {held['rows']} held-out general rows: {held['teacher_loss']:.3f}.")
+        except Exception as exc:             # noqa: BLE001 - a measurement on the side must never stop the teacher pass
+            protocol.log(f"The original's error on the held-out rows was not measured: {type(exc).__name__}: {exc}")
     t0 = last_log = time.monotonic()
     seen_tokens = 0
     tokens_before = writer.tokens
@@ -1004,7 +1259,7 @@ def _teacher_targets(teacher, ids, att, k: int, chunk: int):
     return tuple(torch.cat([p[j] for p in parts]).to(ids.device) for j in range(3))
 
 
-def student_loss(model, inputs, targets_fn, alpha: float, chunk: int):
+def student_loss(model, inputs, targets_fn, alpha: float, chunk: int, checkpoint_head: bool = True):
     """(loss, kd mean, ce mean) of a batch. The student's hidden states of the real positions go through the output layer in chunks; the teacher's answers
     come from targets_fn(inputs) -> (ids, logp, resid) for those positions. alpha = 1: only the KL term."""
     import torch
@@ -1018,7 +1273,7 @@ def student_loss(model, inputs, targets_fn, alpha: float, chunk: int):
     if alpha < 1.0:
         nxt = torch.cat([inputs["labels"][:, 1:], torch.full_like(inputs["labels"][:, :1], -100)], dim=1).to(h.device)[sel]
         lab_mask, labels = nxt != -100, nxt.clamp(min=0)
-    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask)
+    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask, checkpoint_head)
     kd_mean = kd / n.clamp(min=1)
     ce_mean = ce / n_lab.clamp(min=1) if labels is not None else kd_mean.new_zeros(())
     loss = alpha * kd_mean + (1.0 - alpha) * ce_mean if alpha < 1.0 else kd_mean
@@ -1049,7 +1304,7 @@ def _trainer_class(base):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             import torch
             d = self.distill
-            loss, kd, ce = student_loss(model, inputs, d["targets"], d["alpha"], d["chunk"])
+            loss, kd, ce = student_loss(model, inputs, d["targets"], d["alpha"], d["chunk"], d.get("head_checkpoint", True))
             if not torch.isfinite(loss):
                 raise ReshapeError(UNSTABLE)
             d["kd"].append(float(kd))
@@ -1057,6 +1312,17 @@ def _trainer_class(base):
             d["tokens"] += int(inputs["attention_mask"].sum())
             return (loss, None) if return_outputs else loss
     return DistillTrainer
+
+
+def _held_loss(fn):
+    """The loss on the held-out rows (None without them, or when the measurement fails: it never stops the healing)."""
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception as exc:             # noqa: BLE001
+        protocol.log(f"The check on the held-out text was skipped: {type(exc).__name__}: {exc}")
+        return None
 
 
 def calib_loss(model, batches: list, chunk: int = 256):
@@ -1095,9 +1361,10 @@ def _callback_class():
     class HealCallback(LiveCallback):
         """LiveCallback (metrics, stop file) plus the distillation numbers and the calibration loss every `eval_every` steps."""
 
-        def __init__(self, *args, eval_fn=None, eval_every: int = 0, distill=None, lr_at=None, save_at: int = 0, **kw):
+        def __init__(self, *args, eval_fn=None, eval_every: int = 0, distill=None, lr_at=None, save_at: int = 0, hold_fn=None, **kw):
             super().__init__(*args, **kw)
             self.eval_fn, self.eval_every, self.distill = eval_fn, eval_every, distill
+            self.hold_fn, self.hold = hold_fn, []
             self.lr_at, self.save_at = lr_at, save_at       # rounds: the rate for a step (set at the start of a resumed round) and the last step of the round (always saved)
             self.history: list = []          # (step, kd, ce)
             self.calib: list = []            # (step, loss)
@@ -1129,7 +1396,10 @@ def _callback_class():
             _trim()
             if v is not None:
                 self.calib.append((step, v))
-                protocol.emit("distill_eval", step=step, calib_loss=v)
+                hv = _held_loss(self.hold_fn)
+                if hv is not None:
+                    self.hold.append((step, hv))
+                protocol.emit("distill_eval", step=step, calib_loss=v, **({"holdout_loss": hv} if hv is not None else {}))
 
         def on_save(self, args, state, control, **kw):
             _trim()                                     # a checkpoint was just written: give the unused cached memory back
@@ -1152,12 +1422,119 @@ def _callback_class():
     return HealCallback
 
 
+BENCH_STEPS, BENCH_WARMUP = 12, 3
+
+
+def _bench_targets(k: int, vocab: int, seed: int):
+    """Seeded synthetic teacher answers with the shapes (and so the cost) of real ones: targets_fn(inputs) -> (ids [n, k], logp [n, k], resid [n]) for the real positions."""
+    import torch
+    gen = torch.Generator().manual_seed(seed)
+
+    def targets(inputs):
+        n = int(inputs["attention_mask"].sum())
+        ids = torch.randint(0, vocab, (n, k), generator=gen)
+        logp = torch.log_softmax(torch.randn(n, k, generator=gen), dim=-1) + math.log(0.9)
+        return ids, logp, torch.full((n,), 0.1)
+    return targets
+
+
+def run_bench(cfg: dict) -> int:
+    """job distill with "bench": {"steps": 12, "warmup": 3, "targets": "cache" | "synthetic"}: the speed of the healing step at the chosen settings, nothing is saved (no checkpoint,
+    no adapter, no evaluation, no output folder). Real rows of the project at the chosen sequence length; the teacher's answers from the complete cache when it is there and asked
+    for, else seeded synthetic ones with the same shapes (no teacher is loaded). Plain training steps (forward, the KL loss, backward, the optimizer): the first `warmup` are not
+    timed. Emits timing `heal_bench` {tokens_per_s, peak_vram_mb, chunk, head_checkpoint, student_b} and the same numbers as the result. A card that runs out of memory ends the
+    job with the error distill_oom (the caller reports that setting as failed and goes on with the next)."""
+    protocol.reserve_stdout()
+    healmem.set_alloc_conf()
+    from . import backends
+    backends.prepare("hf")
+    import torch
+    from transformers import set_seed
+    from . import data
+    b = cfg["bench"] if isinstance(cfg.get("bench"), dict) else {}
+    steps, warm = max(1, int(b.get("steps", BENCH_STEPS))), max(0, int(b.get("warmup", BENCH_WARMUP)))
+    d = cfg.get("distill") or {}
+    student_dir = cfg["model"]["repo"]
+    h = resolve_hyper(cfg, student_dir)
+    k, chunk = int(d.get("k", 32)), int(d.get("chunk") or h["chunk"])
+    head_ckpt = str(d.get("head_checkpoint", "on")).lower() not in ("off", "false", "0")
+    set_seed(h["seed"])
+    method = cfg.get("method", "lora")
+    lcfg = {"model": cfg["model"], "method": method, "hyper": h, "kbit_upcast": method == "qlora" and bool(d.get("kbit_upcast", False))}
+    protocol.progress("bench", 0.0, "Loading the model")
+    model, tokenizer, _ = backends.load(lcfg, "hf")
+    cuda = torch.cuda.is_available()
+    free_gb = torch.cuda.mem_get_info()[0] / 1e9 if cuda else None
+    _apply_checkpointing(model, _decide_checkpointing(h, student_dir, free_gb))
+    reader, use = None, "synthetic"
+    cache = d.get("cache")
+    if b.get("targets", "cache") == "cache" and cache:
+        idx = read_cache_index(cache)
+        if idx and idx.get("complete") and idx.get("max_len") == int(h["max_seq"]):
+            try:
+                rows, reader, use = load_rows(cache), CacheReader(cache), "cache"
+            except ReshapeError:
+                reader = None
+    if reader is None:
+        rows, _ = build_rows(tokenizer, {"train": cfg["dataset"]["train"], "tokens": int(h["max_seq"]) * int(h["batch"]) * (steps + warm), "general": None},
+                             cfg["model"].get("family", "generic"), int(h["max_seq"]), int(h["seed"]))
+    if not rows:
+        raise ReshapeError("There is nothing to measure the speed on: the training data is empty.")
+    inner = data.text_tokenizer(tokenizer)
+    pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
+    collate = _distill_collator(pad_id, reader)
+    batch = max(1, int(h["batch"]))
+    vocab = int(model.get_output_embeddings().weight.shape[0])
+    synth = _bench_targets(k, vocab, int(h["seed"]))
+    targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if reader is not None else synth
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ReshapeError("The student has no trainable weights, so its speed cannot be measured.")
+    opt = torch.optim.AdamW(params, lr=1e-6)
+    model.train()
+    dev = next(model.parameters()).device
+    tokens, started = 0, None
+    try:
+        for step in range(warm + steps):
+            if step == warm:
+                if cuda:
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                started = time.monotonic()
+            sel = [{**rows[(step * batch + j) % len(rows)], "row": (step * batch + j) % len(rows)} for j in range(batch)]
+            inputs = {kk: v.to(dev) for kk, v in collate(sel).items()}
+            loss, _, _ = student_loss(model, inputs, targets, 1.0, chunk, head_ckpt)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            if step >= warm:
+                tokens += int(inputs["attention_mask"].sum())
+            protocol.progress("bench", (step + 1) / (warm + steps), f"Step {step + 1} of {warm + steps}")
+        if cuda:
+            torch.cuda.synchronize()
+    except RuntimeError as exc:
+        if healmem.is_oom(exc):
+            protocol.error("distill_oom", f"The graphics card ran out of memory at sequence length {h['max_seq']}, batch {batch}, KL chunk {chunk}, output-layer checkpointing {'on' if head_ckpt else 'off'}.")
+            return 1
+        raise
+    secs = max(time.monotonic() - started, 1e-6)
+    peak = round(torch.cuda.max_memory_allocated() / 1e6) if cuda else None
+    res = {"tokens_per_s": round(tokens / secs, 2), "peak_vram_mb": peak, "chunk": chunk, "head_checkpoint": head_ckpt, "student_b": h["student_b"], "steps": steps, "warmup": warm,
+           "tokens": tokens, "seconds": round(secs, 2), "targets": use, "max_seq": int(h["max_seq"]), "batch": batch, "stopped": False}
+    protocol.timing("heal_bench", secs, tokens=tokens, tokens_per_s=res["tokens_per_s"], peak_vram_mb=peak, chunk=chunk, head_checkpoint=head_ckpt, student_b=h["student_b"])
+    protocol.progress("bench", 1.0, "")
+    protocol.result(res)
+    return 0
+
+
 def run(cfg: dict) -> int:
     """job distill: {"model": {"repo": the thinned model's folder, "family"}, "method": "lora|qlora", "backend": "hf", "dataset": {"train", "general": {...}},
     "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?,
               checkpointing: "auto|on|off", optimizer: "auto|adamw_8bit|adamw", student_b?},
     "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50,
-                "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key)},
+                "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key),
+                 "head_checkpoint": "on" (default) | "off" (the output layer's logits of every chunk are kept for the backward pass instead of being made again: faster, the same loss,
+                 about tokens x vocab x 10 bytes more memory; student-side only, not part of any cache key; the out-of-memory ladder turns it back on first)},
     "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path,
     "rounds": {"index", "round_tokens", "general_from", "general_to", "s_start", "schedule": {...}} (optional: this job trains ONE round of a heal that is trained in rounds,
                see docs/HEAL_ROUNDS.md; cache mode only)}.
@@ -1165,6 +1542,8 @@ def run(cfg: dict) -> int:
     most healmem.MAX_RETRIES times, from the last checkpoint with the next safer setting (healmem.next_safer); the final failure is a plain message.
     Writes the LoRA to out/adapter (a round also to out/rounds/r<n>/adapter). Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss,
     adapter_dir, stopped, settings, oom_retries (and `round` with rounds)."""
+    if cfg.get("bench"):
+        return run_bench(cfg)                 # the speed test: nothing is saved, no folder is made
     protocol.reserve_stdout()
     healmem.set_alloc_conf()
     from . import backends
@@ -1283,17 +1662,29 @@ def run(cfg: dict) -> int:
     fields = getattr(SFTConfig, "__dataclass_fields__", {})
     ev = cfg.get("eval") or None
     batches = reshapejob._calibration(tokenizer, ev["calibration"], cfg["model"].get("family", "generic")) if ev and ev.get("calibration") else None
+    hold_batches, hold_meta = None, None
+    if ev and isinstance(ev.get("holdout"), dict) and mode == "cache" and (Path(d["cache"]) / "holdout.npz").is_file():
+        # general rows that were read past the ones the heal learns from (the teacher pass saved them): only their loss is measured, they are never trained on
+        try:
+            hold_meta = _read_holdout_meta(d["cache"]) or {}
+            hold_batches = reshapejob._pad_batches([{"input_ids": r["input_ids"]} for r in load_rows(d["cache"], "holdout")], 4, pad_id) or None
+        except ReshapeError:
+            hold_batches = None
     holder = {"model": model}
     del model                                                # only the holder keeps the model, so that a retry can really free it
     Heal = _callback_class()
     hist_all: list = []
     calib_all: list = []
-    done = {"before": ev.get("slim_loss") if ev else None, "t0": time.time(), "tokens": 0}
+    done = {"before": ev.get("slim_loss") if ev else None, "t0": time.time(), "tokens": 0, "hbefore": None}
+    hold_all: list = []
     free_gb = None
     if cuda:
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
     settings = {"checkpointing": _decide_checkpointing(h, student_dir, free_gb), "batch": int(h["batch"]), "grad_accum": int(h["grad_accum"]), "chunk": chunk,
                 "max_seq": int(h["max_seq"]), "rank": int(h["rank"]), "method": method, "upcast": upcast}
+    head_ckpt = str(d.get("head_checkpoint", "on")).lower() not in ("off", "false", "0")        # job key distill.head_checkpoint "on" (default) | "off"
+    if not head_ckpt:
+        settings["head_checkpoint"] = False                  # only an explicit "off" is part of the settings: a default job's settings are unchanged
     protocol.log("Healing settings: " + healmem.describe(settings) + f", optimizer {optim}.")
     protocol.emit("heal_settings", settings=settings, optimizer=optim)
 
@@ -1334,9 +1725,10 @@ def run(cfg: dict) -> int:
             kwargs["packing"] = False
         args = SFTConfig(**kwargs)
         eval_fn = (lambda: calib_loss(holder["model"], batches, int(s["chunk"]))) if batches else None        # noqa: E731
+        hold_fn = (lambda: calib_loss(holder["model"], hold_batches, int(s["chunk"]))) if hold_batches else None        # noqa: E731
         state = {"kd": [], "ce": [], "tokens": 0}
         lr_at = (lambda st: float(h["lr"]) * round_lr_factor(st + shift, r_start, steps, r_index, int(h["warmup"]), sch)) if rd else None   # noqa: E731
-        live = Heal(str(stop_file), None, [], 0, offset=shift if rd else 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state, lr_at=lr_at, save_at=max_steps if rd else 0)
+        live = Heal(str(stop_file), None, [], 0, offset=shift if rd else 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state, lr_at=lr_at, save_at=max_steps if rd else 0, hold_fn=hold_fn)
         trainer_kw = {"model": mdl, "args": args, "train_dataset": make_ds(round_slice(order, done_steps, per_step)) if rd else ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
         trainer = _trainer_class(SFTTrainer)(**trainer_kw)
@@ -1344,13 +1736,15 @@ def run(cfg: dict) -> int:
         if rd:
             trainer.round_lr = {"shift": shift, "s_start": r_start, "steps": steps, "index": r_index, "warmup": int(h["warmup"]), "sch": sch}
         targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, int(s["chunk"])))
-        trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"])}
+        trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"]), "head_checkpoint": s.get("head_checkpoint", True) is not False}
         live.distill = trainer.distill
         if done["before"] is None and eval_fn is not None and not (rd and r_index > 1):
             with protocol.timed("eval", when="before"):
                 done["before"] = eval_fn()
             if done["before"] is not None:
-                protocol.emit("distill_eval", step=0, calib_loss=done["before"])
+                if done["hbefore"] is None:
+                    done["hbefore"] = _held_loss(hold_fn)
+                protocol.emit("distill_eval", step=0, calib_loss=done["before"], **({"holdout_loss": done["hbefore"]} if done["hbefore"] is not None else {}))
         if cfg.get("resume") and not ckpts and n == 0:
             protocol.log("No checkpoint to continue from; starting from the beginning.")
         if n > 0:
@@ -1372,7 +1766,10 @@ def run(cfg: dict) -> int:
                 with protocol.timed("eval", when="after"):
                     after = eval_fn()
                 if after is not None:
-                    protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
+                    hafter = _held_loss(hold_fn)
+                    if hafter is not None:
+                        live.hold.append((trainer.state.global_step, hafter))
+                    protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after, **({"holdout_loss": hafter} if hafter is not None else {}))
             target = out / "adapter"
             trainer.model.save_pretrained(str(target))
             if rd and not live.stopped:
@@ -1381,6 +1778,7 @@ def run(cfg: dict) -> int:
         finally:
             hist_all.extend(live.history)               # also of a failed attempt: the steps up to its last checkpoint count
             calib_all.extend(live.calib)
+            hold_all.extend(live.hold)
             del trainer, live
 
     def free_memory():
@@ -1395,11 +1793,18 @@ def run(cfg: dict) -> int:
     hist = hist_all
     gen_info = {k: stats.get(k) for k in ("general_source", "general_rows", "general_tokens", "general_error", "general_error_code", "general_detected")} if mode == "online" else \
         {"general_source": idx.get("general_source"), "general_rows": idx.get("general_rows")}
+    cov = stats.get("coverage") if mode == "online" else _read_coverage(d["cache"])
     summary = {"general": gen_info, "backend": "hf", "method": method, "mode": mode, "steps": r["steps"], "total_steps": steps, "tokens_seen": r["tokens"],
                "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": done["before"],
                "calib_loss_after": r["after"] if r["after"] is not None else (calib_all[-1][1] if calib_all else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
                "train_seconds": round(time.time() - done["t0"], 1), "peak_vram_mb": r["vram"], "adapter_dir": str(r["target"]), "stopped": r["stopped"],
                "rows": len(order), "tokens_planned": tokens_planned, "settings": used, "optimizer": optim, "oom_retries": tried}
+    if hold_batches:
+        # the loss on rows the heal never learned from (the "calibration" loss above is measured on text the heal also trains on, so it reads better than it should)
+        summary.update(holdout_rows=(hold_meta or {}).get("rows"), holdout_loss_before=done["hbefore"], holdout_loss_after=hold_all[-1][1] if hold_all else None,
+                       teacher_holdout_loss=(hold_meta or {}).get("teacher_loss"))
+    if cov:
+        summary["coverage"] = cov
     if rd:
         # r["steps"] is HF's step counter: the round's own steps are what it counted since the round began
         done_in_round = max(0, r["steps"] - gs_start)

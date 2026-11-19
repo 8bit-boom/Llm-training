@@ -5,6 +5,8 @@ Pure Python (no torch import), so it is tested without a graphics card. The ladd
 worker/tests/data/heal_cases.json, so the page ("Try again with safer settings") and the worker (the automatic retries) agree.
 
 The order of the ladder (none of these steps changes what the model learns):
+    0b. the output layer's logits checkpointed again (only when the person turned `head_checkpoint` off to go faster: the logits of every chunk are then kept for the
+       backward pass, about tokens x vocab x 10 bytes)
     0. the 32-bit copy of the embeddings and the output layer off (only when it is on: QLoRA with `kbit_upcast`; the old PEFT behaviour. Frozen weights, so the
        maths hardly changes, and the trainer's checkpoint resumes)
     1. gradient checkpointing on        (the layers' activations are made again in the backward pass: about a third slower, far less memory)
@@ -67,6 +69,9 @@ def next_safer(s: dict):
     """The next safer setting that keeps the maths, from {"checkpointing": bool, "batch": int, "grad_accum": int, "chunk": int, "upcast": bool (optional, default off)}.
     Returns (new settings, short label) or None when the ladder is used up. The sequences per update (batch x grad_accum) never change."""
     s = dict(s)
+    if s.get("head_checkpoint") is False:
+        s["head_checkpoint"] = True
+        return s, "the output layer's logits made again in the backward pass (checkpointed)"
     if s.get("upcast"):
         s["upcast"] = False
         return s, "the 32-bit embedding copy turned off"
@@ -89,7 +94,8 @@ def describe(s: dict) -> str:
     """The settings in one plain line for logs and messages."""
     return (f"sequence length {s.get('max_seq')}, batch {s.get('batch')} x {s.get('grad_accum')} steps added up, "
             f"gradient checkpointing {'on' if s.get('checkpointing') else 'off'}, LoRA rank {s.get('rank')}, KL chunk {s.get('chunk')}, {s.get('method', 'lora').upper()}"
-            + (", embeddings and output layer in 32-bit" if s.get("upcast") else ""))
+            + (", embeddings and output layer in 32-bit" if s.get("upcast") else "")
+            + (", output-layer logits kept (not checkpointed)" if s.get("head_checkpoint") is False else ""))
 
 
 def advice(s: dict, tried: list) -> str:
@@ -146,11 +152,12 @@ def run_with_oom_retry(attempt, settings: dict, on_retry=None, free=None, max_re
 
 
 def heal_memory_gb(student_b: float, layers: int, hidden: int, vocab: int, seq: int, batch: int, checkpointing: bool, rank: int, kl_chunk: int, qlora: bool,
-                   upcast: bool = False) -> float:
+                   upcast: bool = False, head_ckpt: bool = True) -> float:
     """The estimate of the graphics memory of the student's training step in GB, the same arithmetic as `plan::heal_memory` in Rust (tested against the shared
     "memory" cases): weights (QLoRA: 0.55 bytes per parameter for the 4-bit layers; the embedding and the output layer, 2 x vocab x hidden values, at 2 bytes, or at
     4 bytes when `upcast` is on = PEFT's 32-bit copy; 16-bit LoRA: 2 bytes per parameter) + LoRA and optimizer (rank x layers x 20 x hidden x 16 bytes) + activations
-    + the KL chunk (chunk x vocab x 16 bytes) + 1 GB, then x 1.10. `upcast` changes nothing for 16-bit LoRA."""
+    + the KL chunk (chunk x vocab x 16 bytes) + 1 GB, then x 1.10. `upcast` changes nothing for 16-bit LoRA. With `head_ckpt` off (the output layer's
+    logits are kept for the backward pass) every token of a step keeps its logits and log-probabilities: + seq x batch x vocab x 10 bytes."""
     params = student_b * 1e9
     ends = 2.0 * vocab * hidden
     body = max(params - ends, 0.0)
@@ -158,4 +165,6 @@ def heal_memory_gb(student_b: float, layers: int, hidden: int, vocab: int, seq: 
     lora = rank * layers * 20.0 * hidden * 16.0 / 1e9
     act = activation_gb(layers, hidden, seq, batch, checkpointing)
     kl = kl_chunk * vocab * 16.0 / 1e9
+    if not head_ckpt:
+        kl += max(seq, 1) * max(batch, 1) * vocab * 10.0 / 1e9
     return round((weights + lora + act + kl + 1.0) * 1.10, 2)

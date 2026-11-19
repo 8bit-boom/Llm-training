@@ -373,6 +373,88 @@ def test_the_first_step_loss_is_the_same_with_and_without_gradient_checkpointing
     assert first["off"] > 0 and first["on"] == pytest.approx(first["off"], rel=1e-4)
 
 
+def test_held_out_general_rows_are_saved_measured_by_the_teacher_and_reported_while_healing(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    cfg = cache_cfg(tmp_path, teacher, student=str(student), k=16, holdout={"rows": 2})
+    cfg["data"]["tokens"] = 1500
+    Path(cfg["data"]["general"]["file"]).write_text("".join(json.dumps({"text": f"General text number {i}. " * 30}) + "\n" for i in range(16)), encoding="utf-8")     # enough texts to read past the budget
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg)
+    assert code == 0, ev[-1]
+    out = Path(cfg["out"])
+    assert (out / "holdout.npz").is_file() and ev[-1]["data"]["holdout"]["rows"] == 2
+    meta = json.loads((out / "holdout.json").read_text())
+    assert meta["rows"] == 2 and meta["teacher_loss"] is not None and meta["teacher_loss"] > 0
+    train_ids = {tuple(r["input_ids"]) for r in dj.load_rows(out)}
+    assert not train_ids & {tuple(r["input_ids"]) for r in dj.load_rows(out, "holdout")}, "the held-out rows are not training rows"
+    dcfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 4})
+    dcfg["eval"]["holdout"] = {"rows": 2}
+    code, ev = run_in_process(monkeypatch, dj.run, dcfg)
+    assert code == 0, ev[-1]
+    evals = [e for e in ev if e["type"] == "distill_eval"]
+    assert evals and all(e.get("holdout_loss") is not None for e in evals), evals
+    r = [e for e in ev if e["type"] == "result"][0]["data"]
+    assert r["holdout_rows"] == 2 and r["holdout_loss_before"] is not None and r["holdout_loss_after"] is not None and r["teacher_holdout_loss"] == meta["teacher_loss"]
+    # without the option the events and the summary are as before
+    dcfg2 = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 2}, out=str(tmp_path / "plain"))
+    code, ev = run_in_process(monkeypatch, dj.run, dcfg2)
+    assert code == 0 and all("holdout_loss" not in e for e in ev if e["type"] == "distill_eval") and "holdout_loss_after" not in [e for e in ev if e["type"] == "result"][0]["data"]
+
+
+def bench_run(monkeypatch, cfg):
+    code, ev = run_in_process(monkeypatch, dj.run, cfg)
+    return code, ev, [e for e in ev if e["type"] == "result"]
+
+
+def test_the_speed_test_runs_warm_up_and_steps_saves_nothing_and_reports_the_rate(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "no-output"))
+    cfg["bench"] = {"steps": 3, "warmup": 1, "targets": "synthetic"}
+    cfg["distill"]["chunk"] = 32
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res, ev[-1]
+    r = res[0]["data"]
+    assert r["targets"] == "synthetic" and r["steps"] == 3 and r["warmup"] == 1 and r["tokens"] > 0 and r["tokens_per_s"] > 0 and r["chunk"] == 32 and r["head_checkpoint"] is True
+    assert not (tmp_path / "no-output").exists(), "no output folder, no checkpoint, no adapter"
+    line = [e["text"] for e in ev if e["type"] == "log" and e["text"].startswith("timing: ") and "heal_bench" in e["text"]]
+    assert len(line) == 1 and json.loads(line[0][len("timing: "):])["tokens_per_s"] == r["tokens_per_s"]
+    assert len([e for e in ev if e["type"] == "heal_settings"]) == 0 and not [e for e in ev if e["type"] == "distill_metric"]
+    # the head switch is a setting of the test; the same rows, the other setting
+    cfg["distill"]["head_checkpoint"] = "off"
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res[0]["data"]["head_checkpoint"] is False
+
+
+def test_the_speed_test_takes_the_answers_of_a_complete_cache_when_it_is_there(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "no-output"))
+    cfg["bench"] = {"steps": 2, "warmup": 1, "targets": "cache"}
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res[0]["data"]["targets"] == "cache" and not (tmp_path / "no-output").exists()
+    cfg["bench"]["targets"] = "synthetic"
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res[0]["data"]["targets"] == "synthetic"
+
+
+def test_keeping_the_output_logits_reaches_the_trainer_and_gives_the_same_first_loss(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    got = captured_trainer(monkeypatch)
+    first = {}
+    for key in ("on", "off"):
+        cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 1}, out=str(tmp_path / f"head-{key}"))
+        cfg["distill"]["eval_every"] = 0
+        cfg["eval"] = None
+        if key == "off":
+            cfg["distill"]["head_checkpoint"] = "off"
+        code, ev = run_in_process(monkeypatch, dj.run, cfg)
+        assert code == 0, ev[-1]
+        settings = [e for e in ev if e["type"] == "heal_settings"][0]["settings"]
+        assert ("head_checkpoint" in settings) == (key == "off") and got[-1].distill["head_checkpoint"] == (key == "on")
+        first[key] = metrics(ev)[0]["kd"]
+    assert first["on"] > 0 and first["off"] == pytest.approx(first["on"], rel=1e-4)
+
+
 def test_the_settings_follow_the_students_size_unless_the_job_names_them(tmp_path, base):
     cfg = {"hyper": {"student_b": 21.0}}
     h = dj.resolve_hyper(cfg, base)

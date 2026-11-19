@@ -442,3 +442,20 @@ fn the_search_minutes_and_a_chosen_cut_are_checked_and_a_chosen_cut_is_the_plans
     assert_eq!(step(&s30).label, "Find the best cut");
     assert!(step(&s30).minutes.1 > step(&s10).minutes.1 && step(&s30).minutes.1 <= 31.0);
 }
+
+#[test]
+fn a_stage_knows_where_its_parameters_are_and_an_old_saved_plan_loads_without() {
+    let ins = qwen27();
+    let p = plan(&ins, &spec(21.1), Some(32.0), Some(900.0));
+    for s in &p.stages {
+        let b = s.breakdown.as_ref().expect("the stage has its parts");
+        assert_eq!(b.total, s.params, "the parts add up to the stage's size: {s:?}");
+        assert_eq!(b.text_layers + b.embeddings + b.output + b.vision + b.mtp + b.other, b.total);
+    }
+    let mut v = serde_json::to_value(&p.stages[0]).unwrap();
+    assert!(v["breakdown"]["text_layers"].as_u64().unwrap() > 0);
+    v.as_object_mut().unwrap().remove("breakdown");
+    let old: StagePlan = serde_json::from_value(v).unwrap();
+    assert!(old.breakdown.is_none(), "a plan saved before the parts were known loads as it was");
+    assert_eq!(json!(old).get("breakdown"), None, "and is written without the key");
+}

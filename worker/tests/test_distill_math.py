@@ -77,6 +77,28 @@ def test_the_torch_loss_equals_the_numpy_twin_and_chunking_changes_nothing():
     assert abs(float(same)) < 1e-5
 
 
+def test_keeping_the_output_logits_gives_the_same_loss_and_gradients():
+    """checkpoint_head=False (the speed setting) only changes what is kept for the backward pass, never a number"""
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(2)
+    n, V, C, k = 11, 40, 6, 5
+    teacher = torch.randn(n, V, generator=g, dtype=torch.float32)
+    ids, lp, resid = dj.topk_from_logits(teacher, k)
+    labels = torch.randint(0, V, (n,), generator=g)
+    lmask = torch.tensor([1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1])
+    mask = torch.ones(n)
+    w = torch.randn(V, C, generator=g)
+    out = {}
+    for on in (True, False):
+        h = torch.randn(n, C, generator=torch.Generator().manual_seed(3), requires_grad=True)
+        w_ = w.clone().requires_grad_(True)
+        kd, cnt, ce, nl = dj.chunked_kd_loss(h, w_, (ids, lp, resid), mask, chunk=4, labels=labels, label_mask=lmask, checkpoint_head=on)
+        (kd / cnt + ce / nl).backward()
+        out[on] = (float(kd), float(ce), h.grad.clone(), w_.grad.clone())
+    assert out[True][0] == pytest.approx(out[False][0], abs=1e-6) and out[True][1] == pytest.approx(out[False][1], abs=1e-6)
+    assert torch.allclose(out[True][2], out[False][2], atol=1e-6) and torch.allclose(out[True][3], out[False][3], atol=1e-6)
+
+
 def test_chunked_cross_entropy_term():
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F

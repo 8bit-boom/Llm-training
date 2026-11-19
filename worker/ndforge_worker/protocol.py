@@ -28,11 +28,22 @@ def reserve_stdout() -> None:
 _HF_TOKEN = re.compile(r"hf_[A-Za-z0-9]{20,}")
 
 
+_SECRETS: list = []
+
+
+def add_secret(value: str) -> None:
+    """Registers a secret of this run (the vLLM engine's per-run API key): `scrub` takes it out of every log line, error and report from now on."""
+    if value and len(value) >= 8 and value not in _SECRETS:
+        _SECRETS.append(value)
+
+
 def scrub(text):
-    """Takes Hugging Face tokens (hf_...) and the token in HF_TOKEN out of a text, so that they never reach a log, an error or a problem report."""
+    """Takes Hugging Face tokens (hf_...), the token in HF_TOKEN and registered secrets (`add_secret`) out of a text, so that they never reach a log, an error or a problem report."""
     if not isinstance(text, str):
         return text
     text = _HF_TOKEN.sub("[token]", text)
+    for sec in _SECRETS:
+        text = text.replace(sec, "[token]")
     tok = (os.environ.get("HF_TOKEN") or "").strip()
     return text.replace(tok, "[token]") if len(tok) >= 8 else text
 

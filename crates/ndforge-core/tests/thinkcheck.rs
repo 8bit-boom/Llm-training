@@ -358,3 +358,115 @@ fn the_other_targets_are_as_they_were() {
     let s: ThinkSpec = serde_json::from_value(json!({"name": "slim-a"})).unwrap();
     assert_eq!((s.target.as_str(), s.round), ("cut", None));
 }
+
+#[test]
+fn the_vllm_way_is_its_own_backend_with_its_own_result_files() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let mut s = spec("slim-a", "cut");
+    s.quick = true;
+    let plain = build_job(&p, &s).unwrap();
+    assert_eq!(plain["backend"], json!("hf"));
+    assert!(plain.get("engine").is_none(), "the standard way is as it was");
+    s.backend = Some("vllm".into());
+    s.engine = Some(json!({"kind": "docker", "image": "x"}));
+    let j = build_job(&p, &s).unwrap();
+    let t = p.folder.join("models").join("slim-a").join("think_check");
+    assert_eq!((j["backend"].clone(), j["engine"]["kind"].clone()), (json!("vllm"), json!("docker")));
+    assert_eq!(j["cache_file"], json!(t.join("cut.quick.vllm.json")), "kept apart: the gates compare a model with the original of the SAME way");
+    s.engine = None;
+    assert_eq!(build_job(&p, &s).unwrap()["engine"], json!({"kind": "auto"}));
+    let mut o = spec("slim-a", "original");
+    o.backend = Some("vllm".into());
+    assert_eq!(build_job(&p, &o).unwrap()["engine"]["original"], json!(true), "the original may be replaced by its pre-quantized checkpoint");
+    let mut g = spec("slim-a", "gguf");
+    g.backend = Some("vllm".into());
+    assert!(!ndforge_core::reshape::thinkcheck::uses_vllm(&g), "a GGUF file always uses llama.cpp");
+    assert_eq!(cache_name(&s), "cut.quick.vllm.json");
+}
+
+#[test]
+fn the_results_keep_the_vllm_numbers_in_their_own_table() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let dir = p.folder.join("models").join("slim-a").join("think_check");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, closed) in [("original.full.vllm.json", 1.0), ("cut.full.vllm.json", 0.5), ("original.full.json", 0.9)] {
+        std::fs::write(dir.join(file), serde_json::to_vec(&json!({"key": {}, "result": {"suite_version": 1, "backend": "x", "main": m(closed, 0.8, 0.0, 800), "control": {"n": 0}}})).unwrap()).unwrap();
+    }
+    let r = results(&p, "slim-a").unwrap();
+    assert_eq!(r["modes"]["full"]["rows"]["original"]["main"]["closed_rate"], json!(0.9));
+    assert!(r["modes"]["full"]["rows"].get("cut").is_none());
+    assert_eq!(r["vllm_modes"]["full"]["rows"]["original"]["main"]["closed_rate"], json!(1.0));
+    assert_eq!(r["vllm_modes"]["full"]["gates"]["cut"]["verdict"], json!("fail"));
+}
+
+#[test]
+fn a_round_goes_through_vllm_only_when_both_switches_are_on_and_may_fall_back() {
+    use ndforge_core::settings::VllmSettings;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-a", 1, "qlora", "org/student");
+    let mut r = spec("slim-a", "round");
+    r.round = Some(1);
+    r.quick = true;
+    let on = VllmSettings { enabled: true, adapter_rounds: true, ..VllmSettings::default() };
+    assert!(round_via_vllm(&VllmSettings::default(), &r).is_none());
+    assert!(round_via_vllm(&VllmSettings { enabled: true, ..VllmSettings::default() }, &r).is_none(), "the engine alone does not change the rounds");
+    assert!(round_via_vllm(&VllmSettings { adapter_rounds: true, ..VllmSettings::default() }, &r).is_none());
+    assert!(round_via_vllm(&on, &spec("slim-a", "cut")).is_none(), "only rounds");
+    let v = round_via_vllm(&on, &r).unwrap();
+    let j = build_job(&p, &v).unwrap();
+    assert_eq!((j["backend"].clone(), j["fallback_hf"].clone(), j["double_quant"].clone()), (json!("vllm"), json!(true), json!(true)));
+    assert!(j["adapter"].as_str().is_some() && j["engine"]["kind"] == json!("auto"));
+    assert!(j["cache_file"].as_str().unwrap().ends_with("round-r1.quick.vllm.json"));
+    let plain = build_job(&p, &r).unwrap();
+    assert!(plain.get("fallback_hf").is_none() && plain["backend"] == json!("hf"), "the round check of the standard engine is as it was");
+}
+
+mod tracegen_tests {
+    use super::{made, project};
+    use ndforge_core::reshape::tracegen::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn the_job_asks_the_original_for_answers_to_a_file_of_prompts() {
+        let d = tempdir().unwrap();
+        let p = project(d.path());
+        made(&p, "slim-a", false);
+        let prompts = d.path().join("prompts.jsonl");
+        std::fs::write(&prompts, "{}").unwrap();
+        let spec = TraceSpec { name: "slim-a".into(), source: prompts.to_string_lossy().to_string(), limit: Some(50), max_new: Some(4096), ..Default::default() };
+        let j = build_job(&p, &spec).unwrap();
+        let t = p.folder.join("models").join("slim-a").join("trace_gen");
+        assert_eq!((j["job"].clone(), j["model"].clone(), j["backend"].clone(), j["limit"].clone(), j["max_new"].clone()), (json!("trace_gen"), json!("unsloth/Qwen3.5-27B"), json!("auto"), json!(50), json!(4096)));
+        assert_eq!((j["out_file"].clone(), j["stop_file"].clone(), j["source"].clone()), (json!(t.join("answers.jsonl")), json!(t.join("STOP")), json!({"file": prompts})));
+        assert!(j.get("engine").is_none() && j.get("column").is_none());
+        let hub = build_job(&p, &TraceSpec { name: "slim-a".into(), source: "mlabonne/open-perfectblend".into(), model: Some(" my/other ".into()), column: Some("conversations".into()), engine: Some(json!({"kind": "docker"})), ..Default::default() }).unwrap();
+        assert_eq!((hub["source"].clone(), hub["model"].clone(), hub["column"].clone(), hub["limit"].clone()), (json!({"id": "mlabonne/open-perfectblend"}), json!("my/other"), json!("conversations"), json!(200)));
+        assert_eq!(hub["engine"]["original"], json!(false), "a model of your own is not replaced by a pre-quantized checkpoint");
+        let orig = build_job(&p, &TraceSpec { name: "slim-a".into(), source: "x/y".into(), engine: Some(json!({"kind": "docker"})), ..Default::default() }).unwrap();
+        assert_eq!(orig["engine"]["original"], json!(true));
+        let hf = build_job(&p, &TraceSpec { name: "slim-a".into(), source: "x/y".into(), backend: Some("hf".into()), engine: Some(json!({})), ..Default::default() }).unwrap();
+        assert!(hf.get("engine").is_none());
+    }
+
+    #[test]
+    fn mistakes_are_plain_messages_and_the_state_counts_the_lines() {
+        let d = tempdir().unwrap();
+        let p = project(d.path());
+        made(&p, "slim-a", false);
+        assert!(build_job(&p, &TraceSpec { name: "slim-a".into(), ..Default::default() }).unwrap_err().0.contains("Choose the prompts"));
+        assert!(build_job(&p, &TraceSpec { name: "slim-a".into(), source: d.path().join("none.jsonl").to_string_lossy().to_string(), ..Default::default() }).unwrap_err().0.contains("was not found"));
+        assert!(build_job(&p, &TraceSpec { name: "nope".into(), source: "a/b".into(), ..Default::default() }).unwrap_err().0.contains("not in this project"));
+        assert_eq!(state(&p, "slim-a").unwrap()["count"], json!(0));
+        std::fs::create_dir_all(out_file(&p, "slim-a").parent().unwrap()).unwrap();
+        std::fs::write(out_file(&p, "slim-a"), "{\"a\":1}\n{\"a\":2}\n\n").unwrap();
+        std::fs::write(out_file(&p, "slim-a").with_file_name("answers.jsonl.rejected.jsonl"), "{\"a\":1}\n").unwrap();
+        let s = state(&p, "slim-a").unwrap();
+        assert_eq!((s["count"].clone(), s["rejected"].clone()), (json!(2), json!(1)));
+    }
+}

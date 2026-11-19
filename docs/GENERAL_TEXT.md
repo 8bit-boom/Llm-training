@@ -191,3 +191,6 @@ The next job reads them first and goes to the Hub only for rows beyond them (ski
 ignored and mended). A Hub that cannot be reached after the saved rows are used up ends the reading quietly with the log line "the saved copy (N rows) is used"; without a copy the error is the same as before.
 At most 300,000 rows are kept per dataset. The copy is not checked against a newer version of the dataset: delete the file to read it again. A folder that cannot be written never stops a job.
 
+## Coverage of the rows
+
+The numbers of long conversations (`general_cut_rows`, `general_skipped_long`) are part of a fuller report, `coverage` (whole, cut and left-out conversations, reasoning rows, token shares, lengths before cutting): see "What the rows cover" in `docs/HEAL_SETTINGS.md`.

@@ -322,6 +322,14 @@ pub fn size_of(ins: &Inspect, blocks: u32, intermediate: Option<u32>) -> u64 {
     }
 }
 
+/// Where the parameters of that model are (`size_of`'s parts); None when not known.
+pub fn breakdown_of(ins: &Inspect, blocks: u32, intermediate: Option<u32>) -> Option<plan::ParamsBreakdown> {
+    match (intermediate, full_width(ins)) {
+        (Some(i), Some(_)) => plan::width_breakdown(ins, &plan::kept_layers(ins, blocks), &Width { intermediate: i, lin_v_heads: None, heads: None }),
+        _ => plan::depth_breakdown(ins, Mode::Prune, blocks),
+    }
+}
+
 /// The MLP widths of the model, ascending, the original's included.
 fn widths(ins: &Inspect) -> Vec<u32> {
     let mut v: Vec<u32> = ins.width_choices.as_ref().map(|c| c.intermediate.clone()).unwrap_or_default();
@@ -535,6 +543,9 @@ pub struct StagePlan {
     /// the sequence length is fixed for the heal (`share_teacher_cache`: every stage uses the same one, so the next stage reuses the original's answers)
     #[serde(default)]
     pub seq_pinned: bool,
+    /// where this stage's parameters are (text layers, embeddings, output, vision, multi-token head); absent in an older saved plan
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<plan::ParamsBreakdown>,
 }
 
 impl StagePlan {
@@ -617,6 +628,7 @@ fn stage_with_seq(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u
         heal_gb: hp.est_gb, verdict: hp.verdict.to_string(), mode: hp.mode.to_string(),
         hours: (((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0),
         teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), seq_pinned: pin.is_some(),
+        breakdown: breakdown_of(ins, st.blocks, st.intermediate),
     }
 }
 

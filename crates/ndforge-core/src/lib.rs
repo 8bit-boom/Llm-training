@@ -28,6 +28,7 @@ pub mod sample;
 pub mod teacher;
 pub mod timing;
 pub mod unsloth;
+pub mod vllm;
 pub mod settings;
 
 pub use error::{Error, Result};
