@@ -461,6 +461,7 @@ def _config_and_dir(repo: str, download: bool):
 
 SEARCH_MAX_PASSES = 400
 SEARCH_MAX_GROUPS = 8
+SEARCH_ROWS_KEPT = 40
 SEARCH_BUDGET_MIN = (5, 240)
 
 
@@ -558,6 +559,9 @@ def search_summary(data: dict, ctx: dict) -> dict:
     s["ranking"] = reshapesearch.ranking(data["passes"], ctx)
     s["finalists"] = reshapesearch.finalists(data["passes"], ctx)
     s["groups"] = [{"label": g.get("label"), "target_b": g.get("target_b")} for g in ctx.get("groups") or ()]
+    # the numbers of the best cuts of every group (the program ranks and explains them): loss and the two halves
+    keep = {k for keys in s["ranking"].values() for k in keys[:SEARCH_ROWS_KEPT]} | {k for keys in s["finalists"].values() for k in keys}
+    s["rows"] = {k: {"loss": data["passes"][k]["loss"], "loss_h1": data["passes"][k].get("loss_h1"), "loss_h2": data["passes"][k].get("loss_h2")} for k in sorted(keep) if k in data["passes"]}
     s["rounds"] = [{"name": r["name"], "keys": r["keys"], "done": r.get("done", False)} for r in s.get("rounds") or ()]
     return s
 

@@ -114,6 +114,8 @@ def test_the_summary_has_the_ranking_the_finalists_and_the_rounds():
     assert s["stop_reason"] == "done" and s["ranking"]["0"] and len(s["finalists"]["0"]) == 3
     assert s["groups"] == [{"label": "20 B", "target_b": 20.0}] and s["rounds"][0]["name"] == "singles"
     assert rt._best_so_far(data["passes"], c)[0] == s["ranking"]["0"][0]
+    top = s["ranking"]["0"][0]
+    assert s["rows"][top]["loss"] == data["passes"][top]["loss"] and set(s["finalists"]["0"]) <= set(s["rows"])
 
 
 def test_the_request_is_checked():

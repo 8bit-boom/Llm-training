@@ -336,12 +336,30 @@ fn candidate(ins: &Inspect, blocks: u32, intermediate: Option<u32>, target_param
 /// The ways to reach `target_b`, best first: for every number of blocks, the MLP width that comes nearest (never thinner than `width_floor`); the ones on target before
 /// the others, fewer blocks before more (width first), then the nearer. A model that cannot be thinned gets block counts only.
 pub fn candidates(ins: &Inspect, target_b: f64) -> Vec<Candidate> {
+    candidates_from(ins, target_b, width_floor(ins))
+}
+
+/// `candidates` without the width-first floor: every width the model offers (the search's Expert option "beyond the floor"; such a cut is flagged by `beyond_guardrails`).
+pub fn candidates_free(ins: &Inspect, target_b: f64) -> Vec<Candidate> {
+    candidates_from(ins, target_b, widths(ins).first().copied())
+}
+
+/// One way to reach `target_b` with `blocks` removed and the MLP at `intermediate` (None: not thinned).
+pub fn candidate_at(ins: &Inspect, blocks: u32, intermediate: Option<u32>, target_b: f64) -> Candidate {
+    candidate(ins, blocks, intermediate, target_b * 1e9)
+}
+
+/// The most blocks the model allows to be removed.
+pub fn max_blocks(ins: &Inspect) -> u32 {
+    block_limit(ins)
+}
+
+fn candidates_from(ins: &Inspect, target_b: f64, floor: Option<u32>) -> Vec<Candidate> {
     if !ins.supported || ins.blocks == 0 {
         return Vec::new();
     }
     let target = target_b * 1e9;
     let hi = block_limit(ins);
-    let floor = width_floor(ins);
     let ws: Vec<u32> = match floor {
         Some(f) => widths(ins).into_iter().filter(|w| *w >= f).collect(),
         None => Vec::new(),

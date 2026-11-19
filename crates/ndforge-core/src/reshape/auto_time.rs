@@ -162,6 +162,18 @@ fn forward_pass(h: &History, b: f64, samples: f64, mode: &str) -> R {
     at_rate(h, "try_tok_b_s", b, work, (work / PASS_TOK_B_S.0 / 60.0 * f, work / PASS_TOK_B_S.1 / 60.0 * f))
 }
 
+/// Minutes (low, high) of one Try-first pass over `samples` texts of a model of `b` billion parameters loaded as `mode` (this computer's own passes when it has measured some).
+pub fn try_pass_minutes(h: &History, b: f64, samples: u32, mode: &str) -> (f64, f64) {
+    let r = forward_pass(h, b, samples as f64, mode);
+    (r.lo, r.hi)
+}
+
+/// Minutes (low, high) to load a model of `gb` gigabytes as `mode`.
+pub fn load_minutes(h: &History, gb: f64, mode: &str) -> (f64, f64) {
+    let r = load(h, gb, mode);
+    (r.lo, r.hi)
+}
+
 /// One thinking check of a model of `b` billion parameters (the check itself; writing and loading are other parts).
 fn think_check(h: &History, b: f64, quick: bool) -> R {
     let key = if quick { "think_s_per_b:quick" } else { "think_s_per_b:full" };

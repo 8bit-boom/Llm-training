@@ -1238,10 +1238,15 @@ pub struct TrySpec {
     /// a measuring text with a reasoning part (the answers and the measurement of the neurons are kept per reasoning text)
     #[serde(default)]
     pub reasoning: Option<ReasoningCalib>,
+    /// the automatic search of the best cut (reshape::search): `{groups, budget_min, thorough, ...}`; the worker plans the rounds itself and measures in one job
+    #[serde(default)]
+    pub search: Option<Value>,
 }
 
 /// The most cuts one request may ask for (a safety net; the page asks for far fewer).
 pub const TRY_MAX_PASSES: usize = 400;
+/// The most target sizes one search may look at (the trade-off mode uses five).
+pub const TRY_SEARCH_MAX_GROUPS: usize = 8;
 
 impl TrySpec {
     pub fn validate(&self) -> Result<()> {
@@ -1269,12 +1274,29 @@ impl TrySpec {
         if self.choices.len() + self.widths.len() + self.runs.len() * 64 > TRY_MAX_PASSES {
             return Err(Error::new("That asks for too many cuts at once."));
         }
+        if let Some(s) = &self.search {
+            let groups = s["groups"].as_array().map(|g| g.len()).unwrap_or(0);
+            if groups == 0 || groups > TRY_SEARCH_MAX_GROUPS {
+                return Err(Error::new(format!("The search needs 1 to {TRY_SEARCH_MAX_GROUPS} target sizes.")));
+            }
+            let minutes = s["budget_min"].as_f64().unwrap_or(20.0);
+            if !(5.0..=240.0).contains(&minutes) {
+                return Err(Error::new("The search may take 5 to 240 minutes."));
+            }
+            if s["max_passes"].as_u64().is_some_and(|n| n as usize > TRY_MAX_PASSES) {
+                return Err(Error::new("The search may measure at most 400 cuts."));
+            }
+        }
         Ok(())
     }
 
     /// The `want` of the worker job.
     pub fn want(&self) -> Value {
-        json!({"blocks": self.blocks, "runs": self.runs, "widths": self.widths, "choices": self.choices})
+        let mut w = json!({"blocks": self.blocks, "runs": self.runs, "widths": self.widths, "choices": self.choices});
+        if let Some(s) = &self.search {
+            w["search"] = s.clone();
+        }
+        w
     }
 }
 
