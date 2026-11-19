@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::auto_plan::{self, AutoPlan, AutoSpec, StagePlan};
+use crate::vllm_plan::{self, Decision, Min, Numbers, VllmPlan};
 use super::plan::Inspect;
 use crate::timing::History;
 
@@ -139,6 +140,9 @@ pub struct TimeEstimate {
     /// what is not in the total (a retry after a failed thinking check)
     #[serde(default)]
     pub extra: Vec<ExtraTime>,
+    /// experimental vLLM (`spec.vllm`): the numbers measured on this PC, and for every step that could use it the time with and without vLLM and what was decided and why; None when vLLM is not asked for
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm: Option<VllmPlan>,
 }
 
 #[derive(Clone, Copy)]
@@ -261,6 +265,85 @@ fn step(id: &str, label: impl Into<String>, parts: Vec<P>, note: Option<String>)
     StepTime {
         id: id.into(), label: label.into(), minutes: (r1(lo), r1(hi)), basis: basis.into(), note, rounds: None,
         parts: parts.into_iter().map(|x| StepPart { id: x.id.into(), label: x.label, minutes: (r1(x.r.lo), r1(x.r.hi)), basis: if x.r.hist { "your_history" } else { "formula" }.into() }).collect(),
+    }
+}
+
+/// What the vLLM options do to the parts of a step (docs/AUTO_CUT.md, "vLLM (experimental)"): the decisions are collected in `dec`, keyed `<step>:<what>` (`s1.heal:cache`,
+/// `think_gate:cut`, `s1.check_cut:original` ...), and the parts are replaced where vLLM is chosen.
+struct Vx<'a> {
+    spec: &'a AutoSpec,
+    n: Numbers,
+    dec: Vec<Decision>,
+    /// ONE choice for every thinking check of the run (key `checks`): the gates compare a model's check with the original's, and a result is only comparable to one made by the same
+    /// engine, so all the checks of a run use the same one (decided on the original's check, the yardstick).
+    checks_vllm: bool,
+}
+
+fn min_of(m: Min) -> R {
+    R { lo: m.lo, hi: m.hi, hist: m.measured }
+}
+
+impl Vx<'_> {
+    fn check_times(&self, hf: R, b: f64, quick: bool) -> (Min, Min, Min) {
+        let ratio = auto_plan::think_check_only_minutes(b, false) / auto_plan::think_check_only_minutes(b, true).max(1e-9);
+        let (gen, st) = (vllm_plan::check_generation(&self.n, quick, ratio), vllm_plan::startup(&self.n));
+        let _ = hf;
+        (st, gen, Min { lo: st.lo + gen.lo, hi: st.hi + gen.hi, measured: st.measured && gen.measured })
+    }
+
+    /// The run's one choice for the thinking checks, decided on the original's check (the yardstick); recorded under the key `checks`.
+    fn decide_checks(&mut self, hf: R, b: f64, quick: bool) {
+        let mode = vllm_plan::mode_of(self.spec.vllm.as_ref(), "checks");
+        if mode == "off" {
+            return;
+        }
+        let (_, _, v) = self.check_times(hf, b, quick);
+        let mut d = vllm_plan::decide("checks", "checks", mode, (hf.lo, hf.hi), v, None);
+        d.reason = format!("{} All the checks of a run use the same engine, so that a check can be compared with the original's.", d.reason);
+        self.checks_vllm = d.use_vllm;
+        self.dec.push(d);
+    }
+
+    /// One thinking check of a model of `b` billion parameters: the standard engine's part, or vLLM's start-up and generation when the run uses vLLM for its checks. `key` is `<step>:<target>`.
+    fn check(&mut self, out: &mut Vec<P>, key: &str, label: String, hf: R, b: f64, quick: bool) {
+        if !self.checks_vllm {
+            out.push(p("check", label, hf));
+            return;
+        }
+        let (st, gen, v) = self.check_times(hf, b, quick);
+        out.push(p("vllm_start", format!("{label}: start the vLLM engine"), min_of(st)));
+        out.push(p("check", format!("{label} (vLLM)"), min_of(gen)));
+        self.dec.push(Decision { step: key.into(), kind: "checks".into(), mode: "on".into(), use_vllm: true, standard_min: (hf.lo, hf.hi), vllm_min: (v.lo, v.hi), measured: v.measured,
+                                 reason: "Same engine as the run's other checks.".into() });
+    }
+
+    /// The original's answers of a heal: `parts` is `heal_parts`' list. vLLM replaces the original's load and the answers by its own start-up and scoring when it is chosen.
+    fn heal(&mut self, key: &str, parts: Vec<P>, tokens_m: u32, rounds: bool) -> Vec<P> {
+        let mode = vllm_plan::mode_of(self.spec.vllm.as_ref(), "teacher_cache");
+        let Some(i) = parts.iter().position(|x| x.id == "cache" && x.r.hi > 0.0) else { return parts };
+        if mode == "off" {
+            return parts;
+        }
+        let std_min = parts.iter().filter(|x| x.id == "cache" || (x.id == "load" && x.label.starts_with("load the original"))).fold((0.0, 0.0), |a, x| (a.0 + x.r.lo, a.1 + x.r.hi));
+        let (st, sc) = (vllm_plan::startup(&self.n), vllm_plan::scoring(&self.n, tokens_m as f64));
+        let v = Min { lo: st.lo + sc.lo, hi: st.hi + sc.hi, measured: st.measured && sc.measured };
+        let blocked = rounds.then_some("a heal in rounds starts the engine again for every round's chunk, so Auto-cut keeps the standard engine there.");
+        let d = vllm_plan::decide(key, "teacher_cache", mode, std_min, v, blocked);
+        let mut out = Vec::new();
+        for (j, x) in parts.into_iter().enumerate() {
+            let is_load = x.id == "load" && x.label.starts_with("load the original");
+            if d.use_vllm && is_load {
+                continue;
+            }
+            if j == i && d.use_vllm {
+                out.push(p("vllm_start", "start the vLLM engine (it loads the original itself)", min_of(st)));
+                out.push(p("cache", format!("vLLM scores the original's answers ({tokens_m} M tokens)"), min_of(sc)));
+                continue;
+            }
+            out.push(x);
+        }
+        self.dec.push(d);
+        out
     }
 }
 
@@ -439,6 +522,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     let thinking = spec.keep_thinking;
     let mut steps: Vec<StepTime> = Vec::new();
     let mut extra: Vec<ExtraTime> = Vec::new();
+    let mut vx = Vx { spec, n: Numbers::from_history(h), dec: Vec::new(), checks_vllm: false };
+    if thinking {
+        vx.decide_checks(think_check(h, ob, spec.think_quick()), ob, spec.think_quick());
+    }
 
     steps.push(step("plan", "Check the model, the card and the disk", vec![p("check", "read the model's description", fixed(0.2, 0.5))], None));
     steps.push(step("measure", "Measure the model", vec![
@@ -474,10 +561,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
                 let gb = gb16(c.params);
                 parts.push(p("write", format!("write the cut of {:.1} B", c.params_b), at_rate(h, "write_gb_s", gb, gb, (gb / WRITE_GB_S.0 / 60.0, gb / WRITE_GB_S.1 / 60.0))));
                 parts.push(p("load", format!("load the cut of {:.1} B", c.params_b), load(h, gb, "16bit")));
-                parts.push(p("check", format!("thinking check of the cut of {:.1} B", c.params_b), think_check(h, c.params as f64 / 1e9, spec.think_quick())));
+                vx.check(&mut parts, "think_gate:cut", format!("thinking check of the cut of {:.1} B", c.params_b), think_check(h, c.params as f64 / 1e9, spec.think_quick()), c.params as f64 / 1e9, spec.think_quick());
             }
             parts.push(p("load", "load the original", load(h, orig_gb, mode)));
-            parts.push(p("check", "thinking check of the original (the yardstick)", think_check(h, ob, spec.think_quick())));
+            vx.check(&mut parts, "think_gate:original", "thinking check of the original (the yardstick)".into(), think_check(h, ob, spec.think_quick()), ob, spec.think_quick());
             steps.push(step("think_gate", "Check the thinking of the best cuts before healing", parts, None));
         }
     }
@@ -511,10 +598,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             let mut note = None;
             if baseline_here {
                 parts.push(p("load", "load the original", load(h, orig_gb, mode)));
-                parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.think_quick())));
+                vx.check(&mut parts, &format!("s{n}.check_cut:original"), "thinking check of the original (the yardstick, once)".into(), think_check(h, ob, spec.think_quick()), ob, spec.think_quick());
                 note = Some("The original is checked once, here, because the check before healing is off.".to_string());
             }
-            parts.push(p("check", "thinking check of the cut", think_check(h, sb, spec.think_quick())));
+            vx.check(&mut parts, &format!("s{n}.check_cut:cut"), "thinking check of the cut".into(), think_check(h, sb, spec.think_quick()), sb, spec.think_quick());
             steps.push(step(&format!("s{n}.check_cut"), format!("{t}thinking check of the cut"), parts, note));
         }
 
@@ -526,6 +613,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             first_check_m: ro.first_check(g.tokens_m), check_quick: ro.quick(), final_quick: spec.think_quick(), thinking,
         });
         let (parts, mut note) = heal_parts(h, ins, plan, g, g.tokens_m, g.tokens_m - reuse);
+        let parts = if g.mode == "cache" && g.tokens_m > reuse { vx.heal(&format!("s{n}.heal:cache"), parts, g.tokens_m - reuse, rin.is_some()) } else { parts };
         if reuse > 0 {
             let from = saved.iter().find(|(_, sq, ld, tk)| *sq == g.seq && *ld == g.teacher_load && *tk == same).map(|x| x.0 + 1).unwrap_or(1);
             note = Some(format!("The original's answers for the first {reuse} M tokens were written by stage {from} on the same sequence length ({}): they are not written again.", g.seq));
@@ -556,11 +644,11 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             let mut note = None;
             if baseline_here && !spec.check_cut {
                 parts.push(p("load", "load the original", load(h, orig_gb, mode)));
-                parts.push(p("check", "thinking check of the original (the yardstick, once)", think_check(h, ob, spec.think_quick())));
+                vx.check(&mut parts, &format!("s{n}.check_heal:original"), "thinking check of the original (the yardstick, once)".into(), think_check(h, ob, spec.think_quick()), ob, spec.think_quick());
                 note = Some("The original is checked once, here, because neither the cut nor the check before healing was checked.".to_string());
             }
             parts.push(p("load", "load the healed model", load(h, gb, "16bit")));
-            parts.push(p("check", "thinking check of the healed model", think_check(h, sb, spec.think_quick())));
+            vx.check(&mut parts, &format!("s{n}.check_heal:healed"), "thinking check of the healed model".into(), think_check(h, sb, spec.think_quick()), sb, spec.think_quick());
             steps.push(step(&format!("s{n}.check_heal"), format!("{t}thinking check of the healed model"), parts, note));
         }
         prev_params = g.params;
@@ -649,5 +737,13 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     if plan.stages.iter().any(|s| s.mode == "online") {
         notes.push("The card holds the original and the student together in a stage: no saved answers, the original answers while the student learns.".to_string());
     }
-    TimeEstimate { steps, total_h: (((lo / 60.0) * 100.0).round() / 100.0, ((hi / 60.0) * 100.0).round() / 100.0), history_steps, step_count, basis, lever_h: (r1(lever.0 / 60.0), r1(lever.1 / 60.0)), notes, extra }
+    let vllm = spec.vllm.as_ref().filter(|a| a.any()).map(|_| {
+        let mut notes = vllm_plan::basis_notes(&vx.n);
+        notes.push("Experimental: built from a research report. A step that cannot use vLLM (it is missing, the card is busy, the teacher check says \"different\") falls back to the standard engine and the run goes on.".into());
+        if spec.keep_thinking && !vx.dec.iter().any(|d| d.kind == "checks") {
+            notes.push("This run has no thinking check that could use vLLM.".into());
+        }
+        VllmPlan { numbers: vx.n.clone(), decisions: std::mem::take(&mut vx.dec), notes }
+    });
+    TimeEstimate { vllm, steps, total_h: (((lo / 60.0) * 100.0).round() / 100.0, ((hi / 60.0) * 100.0).round() / 100.0), history_steps, step_count, basis, lever_h: (r1(lever.0 / 60.0), r1(lever.1 / 60.0)), notes, extra }
 }

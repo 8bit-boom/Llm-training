@@ -132,6 +132,9 @@ pub struct AutoSpec {
     /// heal every stage in rounds with a thinking check after each (experimental, docs/HEAL_ROUNDS.md); None = the heal as it always was (the key is then not written)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heal_rounds: Option<HealRoundsOpt>,
+    /// experimental vLLM for the original's answers and/or the thinking checks (docs/AUTO_CUT.md, "vLLM (experimental)"); None = the run as it always was (the key is then not written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm: Option<crate::vllm_plan::AutoVllm>,
 }
 
 /// Auto-cut's settings of a heal in rounds; the rest (the cap = the stage's recipe, baseline, final check mode, deadline) is filled in by the run.
@@ -178,7 +181,7 @@ impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None, vllm: None,
         }
     }
 

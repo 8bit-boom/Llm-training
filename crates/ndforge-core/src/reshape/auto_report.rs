@@ -131,7 +131,46 @@ pub fn build(st: &AutoState) -> Value {
         "think_gate": st.think_gate, "guardrails": guardrails(st),
         "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget, "speed": speed_json(st),
         "estimate": estimate_json(st, active),
+        "vllm": vllm_json(st),
     })
+}
+
+/// The experimental vLLM engine in this run (`spec.vllm`): what was asked, what the plan decided for every step and why, and what each step that used it (or fell back from it) measured.
+/// Null for a run without it (the key then says nothing about vLLM).
+fn vllm_json(st: &AutoState) -> Value {
+    let Some(v) = st.spec.vllm.as_ref().filter(|v| v.any()) else { return Value::Null };
+    let plan = st.plan.as_ref().and_then(|p| p.time.as_ref()).and_then(|t| t.vllm.as_ref());
+    json!({"asked": v, "numbers": plan.map(|p| json!(p.numbers)), "decisions": plan.map(|p| json!(p.decisions)), "steps": st.engines,
+           "used": st.engines.iter().filter(|e| e["engine"] == "vllm").count(), "fallbacks": st.engines.iter().filter(|e| e["fallback"] == true).count()})
+}
+
+/// "Steps that used vLLM": for every step the plan chose vLLM for, the engine that really ran, the teacher's quantization and identity (for the original's answers), the start-up and the speed
+/// measured against what was estimated, and a fallback in plain words. Empty text when the run did not ask for vLLM.
+fn vllm_markdown(r: &Value) -> String {
+    let v = &r["vllm"];
+    if !v.is_object() {
+        return String::new();
+    }
+    let mut s = String::from("\n## Steps that used vLLM (experimental)\n\n");
+    let steps = v["steps"].as_array().cloned().unwrap_or_default();
+    if steps.is_empty() {
+        s.push_str("vLLM was switched on for this run, but no step used it");
+        let why: Vec<String> = v["decisions"].as_array().cloned().unwrap_or_default().iter().filter(|d| d["use_vllm"] == false).filter_map(|d| d["reason"].as_str().filter(|x| !x.is_empty()).map(String::from)).collect();
+        s.push_str(if why.is_empty() { ".\n" } else { ":\n\n" });
+        for w in why {
+            s.push_str(&format!("- {w}\n"));
+        }
+        return s;
+    }
+    s.push_str("| Step | Engine | Teacher | Start-up (measured / estimated) | Speed | Note |\n|---|---|---|---|---|---|\n");
+    for e in &steps {
+        let est = e["estimated_min"]["vllm"].as_array().map(|a| format!("{:.0} to {:.0} min in all", a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))).unwrap_or_else(|| "-".into());
+        let startup = e["startup_seconds"].as_f64().map(|x| format!("{:.1} min", x / 60.0)).unwrap_or_else(|| "-".into());
+        s.push_str(&format!("| {} | {}{} | {} | {} ({est}) | {} | {} |\n", e["step"].as_str().unwrap_or(""), e["engine_version"].as_str().or(e["engine"].as_str()).unwrap_or("?"), if e["fallback"] == true { " (fell back to the standard engine)" } else { "" },
+                             e["teacher_quant"].as_str().unwrap_or("-"), startup, e["tokens_per_s"].as_f64().map(|x| format!("{x:.0} tokens/s")).unwrap_or_else(|| "-".into()), e["note"].as_str().or(e["problem"].as_str()).unwrap_or("")));
+    }
+    s.push_str("\nExperimental: built from a research report. The estimates use the numbers of your own self-test and teacher check where you have run them; the others are the report's.\n");
+    s
 }
 
 /// The speed settings of the run: the preset, and every value that is not the recommended recipe's with its risk (the plan warns about the same ones before the run starts).
@@ -291,6 +330,7 @@ pub fn markdown(r: &Value) -> String {
     for st in r["stages"].as_array().cloned().unwrap_or_default().iter().filter(|st| st["rounds"].is_object()) {
         s.push_str(&rounds_markdown(st));
     }
+    s.push_str(&vllm_markdown(r));
     if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
         s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");
         for x in g.iter().filter_map(|x| x.as_str()) {
