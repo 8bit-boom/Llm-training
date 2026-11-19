@@ -2,6 +2,10 @@
 use ndforge_core::envmgr::health::Light;
 use ndforge_core::settings::{Settings, VllmSettings};
 use ndforge_core::vllm::*;
+use serde_json::json;
+use std::sync::Mutex;
+
+static ENV: Mutex<()> = Mutex::new(());
 
 fn runner<'a>(answers: &'a [(&'a str, bool, &'a str)]) -> impl Fn(&[&str]) -> Option<(bool, String)> + 'a {
     move |args: &[&str]| {
@@ -103,4 +107,40 @@ fn the_engine_object_for_the_worker_leaves_out_empty_settings() {
     let e = engine_job(&s);
     assert_eq!(e["distro"], "U");
     assert_eq!(e["wslc"]["shm"], "8g");
+}
+
+#[test]
+fn the_self_test_job_uses_the_configured_original_and_needs_the_confirmation_flag_from_the_page() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let s = VllmSettings::default();
+    let j = selftest_job(&s, &json!({}), None).unwrap();
+    assert_eq!(j["job"], "vllm_selftest");
+    assert_eq!(j["model"], "cyankiwi/Qwen3.8-27B-AWQ-INT4");
+    assert_eq!(j["confirm_download"], false);
+    assert_eq!(j["quick"], true);
+    assert_eq!(j["engine"]["kind"], "auto");
+    assert_eq!(j["stop_file"], json!(selftest_dir().join("STOP")));
+    assert!(j.get("adapter").is_none());
+    let j = selftest_job(&s, &json!({"model": " C:\\models\\q ", "confirm_download": true, "adapter": "/a"}), None).unwrap();
+    assert_eq!((j["model"].clone(), j["confirm_download"].clone(), j["adapter"].clone()), (json!("C:\\models\\q"), json!(true), json!("/a")));
+    assert!(selftest_job(&VllmSettings { teacher_repo: String::new(), ..s }, &json!({}), None).is_err());
+    assert_eq!(selftest_report(), serde_json::Value::Null);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
+
+#[test]
+fn the_self_test_compares_with_the_saved_standard_results_of_the_project() {
+    let d = tempfile::tempdir().unwrap();
+    let p = ndforge_core::project::Project::create(d.path(), "P").unwrap();
+    assert_eq!(compare_files(Some(&p)), json!({}));
+    let t = ndforge_core::reshape::runs::models_dir(&p).join("slim-1").join("think_check");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("original.quick.json"), "{}").unwrap();
+    std::fs::write(t.join("original.quick.vllm.json"), "{}").unwrap();
+    let c = compare_files(Some(&p));
+    assert_eq!(c["hf"], json!(t.join("original.quick.json")), "never the vLLM file");
+    assert!(c.get("llama").is_none());
+    assert_eq!(compare_files(None), json!({}));
 }

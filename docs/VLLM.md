@@ -41,6 +41,23 @@ Models: prefer a NAMED volume (`ndforge-vllm-hf`, the default for a Hub id) or a
 - **Thinking check card**: the engine choice and the separate vLLM table (see docs/THINKING_CHECK.md).
 - **Before a vLLM check** the checklist asks: an engine is there, the card is free (nothing else above 2 GB), driver and WSL not too old (versions are compared as numbers; unreadable = "unknown, continuing").
 
+## The vLLM self-test (Training setup, vLLM engine card)
+
+The research report's 1-hour experiment, run for you as far as the app can. You choose a model (a folder or a Hugging Face id; the default is the configured pre-quantized original, about 21 GB:
+the card asks you to confirm the download) and press **Run the vLLM self-test**. It:
+
+1. checks the NVIDIA driver (580 or newer), the WSL version, that nothing else uses more than 2 GB of the card, that the model folder is not on a slow `/mnt/` share, and that a throw-away
+   container can see the card (`nvidia-smi` in `nvidia/cuda:13.0.0-base-ubuntu24.04`; the way it is run depends on the engine kind). When `wslc` is on the PATH its help is captured verbatim.
+2. starts the engine, waits for `/health`, records the start-up time, the attention / GDN kernel and cache log lines, and checks that `/health` answers from the Windows side (if not: the WSL
+   address workaround `wsl.exe hostname -I` as a hint; mirrored networking may matter, unverified).
+3. asks the Quick thinking suite with 40 requests at once: wall time, completion tokens per second, closed / accuracy / loop rates, five sample answers to look at.
+4. compares with your saved standard-engine (and llama.cpp) numbers (note: those may be of the original, not of the quantized model you test with). With a LoRA folder it serves the adapter and
+   compares with a saved check of the same adapter on the standard engine ("agreement check").
+5. stops the engine (always: also after an error and on Stop), writes `vllm_selftest.json` and `vllm_selftest.md` (also in the problem-report bundle) with a plain verdict.
+
+Success criteria (from the report): engine ready in under 5 minutes; at least 300 tokens per second; numbers within the noise of +-2 questions. **Pass** = all, **Partly** = some, **Fail** =
+none or the engine could not run. The report says which; nothing in it is a promise for other models or other PCs.
+
 ## WSLc (WSL 3.x containers)
 
 What we know, from the owner's `wslc --help` and `wslc run --help` (3.0.x): the global option `--session`; top-level commands `container image network registry settings system volume attach build cp create exec events export images import info inspect kill list load login logout logs pull push remove restart rmi run save start stats stop tag version`. `wslc run [options] <image> [<command>] [<arguments>...]` has `-d/--detach`, `--gpus` ("Add GPU devices to the container ('all' to pass all GPUs)"), `-v/--volume`, `--mount`, `-p/--publish`, `--name`, `--rm`, `-e/--env`, `--shm-size`, `--pull (always|missing|never)`, `--entrypoint`, `--network`, and more. **There is no `--ipc` option** (docker's `--ipc=host` does not exist here): the shared memory vLLM needs is `--shm-size` (default 16g).

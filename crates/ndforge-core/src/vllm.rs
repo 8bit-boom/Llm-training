@@ -235,3 +235,59 @@ pub fn engine_job(s: &VllmSettings) -> Value {
     }
     Value::Object(o)
 }
+
+// ------------------------------------------------------------------------------------------------------------------ the self-test
+
+/// Where the self-test writes `vllm_selftest.json` / `.md` (one report, replaced by the next run; it is part of the diagnostics bundle).
+pub fn selftest_dir() -> std::path::PathBuf {
+    crate::paths::config_dir().join("vllm_selftest")
+}
+
+/// The newest saved result `<file>` of the made models of a project (the original checked the standard way, a GGUF checked with llama.cpp): what the self-test compares with.
+pub fn compare_files(p: Option<&crate::project::Project>) -> Value {
+    let mut out = serde_json::Map::new();
+    let Some(p) = p else { return Value::Object(out) };
+    let newest = |file: &str| -> Option<std::path::PathBuf> {
+        std::fs::read_dir(crate::reshape::runs::models_dir(p)).ok()?.flatten().filter_map(|e| {
+            let f = e.path().join("think_check").join(file);
+            Some((std::fs::metadata(&f).ok()?.modified().ok()?, f))
+        }).max_by_key(|(t, _)| *t).map(|(_, f)| f)
+    };
+    if let Some(f) = newest("original.quick.json") {
+        out.insert("hf".into(), json!(f));
+    }
+    if let Some(f) = newest("gguf.quick.json") {
+        out.insert("llama".into(), json!(f));
+    }
+    Value::Object(out)
+}
+
+/// The worker job `vllm_selftest` (docs/VLLM.md). `spec`: `{"model": "" (the configured pre-quantized original), "confirm_download": bool, "adapter": folder (optional: the agreement check)}`.
+pub fn selftest_job(s: &VllmSettings, spec: &Value, p: Option<&crate::project::Project>) -> crate::Result<Value> {
+    let dir = selftest_dir();
+    let model = spec["model"].as_str().map(str::trim).filter(|m| !m.is_empty()).map(String::from).unwrap_or_else(|| s.teacher_repo.clone());
+    if model.is_empty() {
+        return Err(crate::Error::new("Choose a model folder or a Hugging Face id for the self-test."));
+    }
+    let mut job = json!({"job": "vllm_selftest", "model": model, "confirm_download": spec["confirm_download"].as_bool().unwrap_or(false), "engine": engine_job(s), "out_dir": dir,
+                         "stop_file": dir.join("STOP"), "quick": true, "gpu_test": true, "compare": compare_files(p)});
+    if let Some(a) = spec["adapter"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
+        job["adapter"] = json!(a);
+    }
+    Ok(job)
+}
+
+/// Runs the self-test to the end (events as JSON `{"kind": ...}`); the worker stops the engine in every end, and Stop writes the STOP file.
+pub fn selftest_run(job: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>, on_event: &mut dyn FnMut(Value)) -> crate::Result<Value> {
+    let py = crate::envmgr::python_path(&crate::envmgr::env_dir());
+    if !py.is_file() {
+        return Err(crate::Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+    }
+    let _ = std::fs::remove_file(selftest_dir().join("STOP"));
+    crate::train::runs::drive(&py, &selftest_dir(), job, stop, Duration::from_secs(120), &mut |e| on_event(crate::reshape::runs::event_json(e)))
+}
+
+/// The last report, `Value::Null` when there is none.
+pub fn selftest_report() -> Value {
+    std::fs::read(selftest_dir().join("vllm_selftest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+}

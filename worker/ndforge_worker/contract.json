@@ -27,7 +27,8 @@
   "selftest",
   "think_check",
   "think_check_plan",
-  "train"
+  "train",
+  "vllm_selftest"
  ],
  "events": [
   "distill_eval",
@@ -74,6 +75,7 @@
   "torch_missing",
   "train_failed",
   "unknown_job",
-  "usage"
+  "usage",
+  "vllm_selftest_failed"
  ]
 }

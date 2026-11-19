@@ -121,6 +121,11 @@ pub fn bundle(project: Option<&Project>, settings: &Settings, dest: &std::path::
             if let Some(t) = read(&f) { add("export.json", format!("// export folder: {name}\n{t}")); }
         }
     }
+    for f in ["vllm_selftest.json", "vllm_selftest.md"] {           // the report of the experimental vLLM self-test, when it was run
+        if let Ok(t) = std::fs::read_to_string(crate::vllm::selftest_dir().join(f)) {
+            add(f, t);
+        }
+    }
     add("timings.json", serde_json::to_string_pretty(&crate::timing::report_of_latest(10)).unwrap_or_default());
     add("graphics_card.txt", match crate::envmgr::gpu::detect_gpus() { Ok(g) => format!("{g:#?}"), Err(e) => e });
     let mut w = zip::ZipWriter::new(std::fs::File::create(&file)?);

@@ -2047,7 +2047,7 @@ function renderTimeCard() {
 
 // ------------------------------------------------------------------------------------------------------- the vLLM engine (EXPERIMENTAL, off by default; docs/VLLM.md)
 // Built from a research report and not yet run on this PC. Nothing is installed by the program; the status says what was found and what to install yourself.
-const vl = { status: null, busy: false, err: null, saved: null };
+const vl = { status: null, busy: false, err: null, saved: null, report: undefined, run: null, model: "", confirm: false, adapter: "" };
 const VL_KINDS = [["auto", "Find it myself"], ["docker", "Docker Desktop (docker.exe)"], ["docker_wsl", "Docker inside WSL"], ["wslc", "WSLc (WSL 3.x containers, templates)"], ["wsl", "vLLM installed in WSL"], ["url", "A server that already runs"]];
 function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {} }; }
 async function vllmDetect() {
@@ -2057,6 +2057,7 @@ async function vllmDetect() {
 }
 function renderVllm() {
   const v = vllmSettings(), st = vl.status;
+  if (vl.report === undefined) { vl.report = null; setTimeout(vllmLoadReport, 0); }
   const lamp = { ok: "●", warn: "!", fail: "✕" };
   const lines = st ? `<ul class="checks">${st.lines.map((l) => `<li class="check lt-${esc(l.light)}"><span class="lamp">${lamp[l.light] || "·"}</span><div><strong>${esc(l.label)}</strong><div class="detail">${esc(l.detail)}</div></div></li>`).join("")}</ul>${st.guide.length ? `<ul class="small dim">${st.guide.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}` : `<p class="dim small">Press “Look for the engine” to see what this computer has (it only asks small programs; nothing is started or installed).</p>`;
   const f = (id, label, val, ph, w) => `<label>${label} <input type="text" id="${id}" value="${esc(val || "")}" placeholder="${esc(ph || "")}" style="min-width:${w || 220}px"></label>`;
@@ -2070,7 +2071,32 @@ function renderVllm() {
     <div class="row"><label class="opt" title="Untested: LoRA on the linear-attention layers is reported garbled in some versions. The standard engine stays the exact way until an agreement run."><input type="checkbox" id="vl-adapter" ${v.adapter_rounds ? "checked" : ""}> Check the rounds of a heal (model + LoRA) with vLLM (untested, off)</label></div>
     <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
     <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
-    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}</div>`;
+    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+}
+// the self-test: the report's 1-hour experiment, run for you (docs/VLLM.md). Everything stoppable; the engine is always stopped again.
+function renderVllmTest(v) {
+  const r = vl.report, busy = !!vl.run || rs.running || env.running;
+  const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
+  const rep = r ? `<div class="${r.verdict === "pass" ? "ok" : r.verdict === "partial" ? "warn" : "err"}" id="vl-verdict"><strong>${esc(word[r.verdict] || r.verdict)}</strong>: ${esc(r.verdict_text)}
+      <ul class="small">${(r.criteria || []).map((c) => `<li>${c.ok ? "✓" : c.ok === false ? "✕" : "?"} ${esc(c.label)}: ${esc(typeof c.value === "object" ? JSON.stringify(c.value) : c.value == null ? "not measured" : String(c.value))}</li>`).join("")}</ul>
+      <p class="dim small">Report: ${esc(r.report || "")} (also in the problem-report bundle). ${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
+  return `<h3>vLLM self-test</h3><p class="dim small">Runs the research report's experiment for you: checks the driver and that a container can use the graphics card, starts the engine on a model, waits for it, asks the Quick thinking suite with 40 questions at once, measures start-up time and tokens per second, compares with your saved standard-engine numbers, stops the engine and writes a report with a plain verdict. A first run downloads the engine's image and the model.</p>
+    <div class="row"><label>Model folder or Hugging Face id <input type="text" id="vl-tmodel" value="${esc(vl.model)}" placeholder="${esc(v.teacher_repo || "")}" style="min-width:320px"></label>
+      <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
+    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
+    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}`;
+}
+async function vllmLoadReport() {
+  vl.report = null;
+  try { vl.report = await invoke("vllm_selftest_report"); } catch (_) { vl.report = null; }
+  try { render(); } catch (_) { /* a preview without a window */ }
+}
+function onVllmEvent(p) {
+  if (p.kind === "progress") { if (vl.run) { vl.run.text = p.text || p.step; vl.run.progress = p.value; } }
+  else if (p.kind === "error") { vl.run = null; vl.err = p.text; }
+  else if (p.kind === "done") { vl.run = null; vllmLoadReport(); return; }
+  if (page === "setup") render();
 }
 function wireVllm() {
   const val = (id) => (($(id) || {}).value || "").trim();
@@ -2083,6 +2109,15 @@ function wireVllm() {
     render();
   };
   const dt = $("vl-detect"); if (dt) dt.onclick = vllmDetect;
+  const tm = $("vl-tmodel"); if (tm) tm.onchange = () => { vl.model = tm.value.trim(); };
+  const ta = $("vl-tadapter"); if (ta) ta.onchange = () => { vl.adapter = ta.value.trim(); };
+  const tc = $("vl-tconfirm"); if (tc) tc.onchange = () => { vl.confirm = tc.checked; };
+  const tt = $("vl-test"); if (tt) tt.onclick = () => {
+    vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.adapter = (($("vl-tadapter") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
+    vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
+    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
+  };
+  const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
 
 function renderSetup() {
@@ -3876,6 +3911,7 @@ function onHealEvent(p) {
 function onReshapeEvent(p) {
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
+  if (p.phase === "vllm") return onVllmEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "healbench") return onHealBenchEvent(p);
   if (p.phase === "try") return onTryEvent(p);

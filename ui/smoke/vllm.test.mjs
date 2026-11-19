@@ -56,3 +56,21 @@ test("with the engine on, the vLLM table is shown with its warning and the job s
   b.run(`rs.tk.backend = "llama"`);
   assert.match(b.run("renderReshape()"), /data-tkgo="cut"[^>]*disabled/);
 });
+
+test("the self-test card warns about the download, is disabled while the engine is off, and shows the plain verdict of the last report", () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState() });
+  b.run(`state = ${JSON.stringify(baseState())}; vl.report = null`);
+  let html = b.run("renderVllm()");
+  assert.match(html, /vLLM self-test/); assert.match(html, /about 21 GB/); assert.match(html, /id="vl-test"[^>]*disabled/);
+  assert.doesNotMatch(html, /id="vl-tconfirm"[^>]*checked/);
+  b.run(`state = ${JSON.stringify(baseState({ enabled: true, kind: "auto" }))}; vl.report = ${JSON.stringify({ verdict: "partial", verdict_text: "Some criteria were not met: speed.", report: "/c/vllm_selftest.json", tokens_per_s: 250, wall_seconds: 120, startup_seconds: 90,
+    criteria: [{ id: "ready", label: "engine ready in under 5 minutes", value: 90, ok: true }, { id: "speed", label: "at least 300 tokens/s", value: 250, ok: false }] })}`);
+  html = b.run("renderVllm()");
+  assert.doesNotMatch(html, /id="vl-test"[^>]*disabled/);
+  assert.match(html, /id="vl-verdict"/); assert.match(html, /<strong>Partly<\/strong>: Some criteria were not met: speed\./); assert.match(html, /✕ at least 300 tokens\/s: 250/);
+  b.run(`vl.run = { text: "Asking the thinking questions, 40 at once", progress: 0.5 }`);
+  html = b.run("renderVllm()");
+  assert.match(html, /id="vl-teststop"/); assert.match(html, /<progress max="1" value="0.5">/);
+  b.run(`onVllmEvent({ kind: "done" })`);
+  assert.equal(b.run("vl.run"), null);
+});
