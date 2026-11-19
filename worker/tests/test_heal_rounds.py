@@ -218,3 +218,51 @@ def test_the_normal_order_is_unchanged_by_the_shared_helpers():
     assert a == dj.training_order(rows, 300, 0.5, 3407)
     gen = sum(len(rows[i]["input_ids"]) for i in a if rows[i]["source"] == "general")
     assert 150 <= gen < 160
+
+
+# ------------------------------------------------------------------------------------------------------------ W3: where a round starts from
+
+def fake_checkpoint(ckdir, step):
+    d = ckdir / f"checkpoint-{step}"
+    d.mkdir(parents=True)
+    (d / "trainer_state.json").write_text("{}")
+    (d / "adapter_model.safetensors").write_bytes(b"x")
+    (d / "optimizer.pt").write_bytes(b"x")
+    return d
+
+
+def test_round_one_starts_from_scratch_or_its_own_checkpoints(tmp_path):
+    r = dj.round_start(tmp_path / "ck", 1, 0, tmp_path)
+    assert r == {"mode": "continue", "gs_start": 0, "init_adapter": None, "note": None}
+
+
+def test_a_later_round_continues_from_the_checkpoint_of_the_end_of_the_previous_round(tmp_path):
+    ck = tmp_path / "checkpoints"
+    fake_checkpoint(ck, 38)
+    r = dj.round_start(ck, 2, 38, tmp_path)
+    assert r["mode"] == "continue" and r["gs_start"] == 38 and r["init_adapter"] is None
+    fake_checkpoint(ck, 50)                                      # one from inside the round
+    assert dj.round_start(ck, 2, 38, tmp_path)["mode"] == "continue"
+    assert (ck / "checkpoint-38").is_dir() and (ck / "checkpoint-50").is_dir()
+
+
+def test_without_a_checkpoint_of_this_round_the_previous_adapter_is_the_start_and_the_old_checkpoints_go(tmp_path):
+    ck = tmp_path / "checkpoints"
+    fake_checkpoint(ck, 20)                                      # from before the round: too old to continue the optimizer of round 1's end
+    (tmp_path / "rounds" / "r1" / "adapter").mkdir(parents=True)
+    r = dj.round_start(ck, 2, 38, tmp_path)
+    assert r["mode"] == "fresh" and r["gs_start"] == 0 and r["init_adapter"] == str(tmp_path / "rounds" / "r1" / "adapter") and "fresh optimizer" in r["note"]
+    assert not (ck / "checkpoint-20").exists() and (ck / "FRESH_ROUND").read_text() == "2"
+    # a restart inside that round trusts its own (locally counted) checkpoints and does not delete them
+    fake_checkpoint(ck, 5)
+    again = dj.round_start(ck, 2, 38, tmp_path)
+    assert again["mode"] == "fresh" and again["note"] is None and (ck / "checkpoint-5").is_dir()
+    # the next round is not "fresh" because of an old marker
+    fake_checkpoint(ck, 60)
+    assert dj.round_start(ck, 3, 55, tmp_path)["mode"] == "continue"
+
+
+def test_a_later_round_with_neither_checkpoint_nor_previous_adapter_is_refused_plainly(tmp_path):
+    from ndforge_worker.reshape import ReshapeError
+    with pytest.raises(ReshapeError, match="Heal again from the start"):
+        dj.round_start(tmp_path / "checkpoints", 3, 80, tmp_path)
