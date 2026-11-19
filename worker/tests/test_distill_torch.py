@@ -465,3 +465,192 @@ def test_every_row_of_the_cache_is_the_answer_for_that_row_whatever_the_order_it
         ids, lp, rs = reader.get(i)
         ref_ids, ref_lp, ref_rs = _answers_before_the_speed_up(model, [r], 8, 16, 0)[0]
         assert ids.shape[0] == len(r["input_ids"]) and np.allclose(lp.astype(np.float32), ref_lp, atol=2e-2) and np.allclose(rs, ref_rs, atol=2e-2), i
+
+
+def test_a_cache_job_answers_up_to_a_point_and_goes_on_with_the_new_rows_only(tmp_path, base, monkeypatch):
+    """healing in rounds: the teacher answers the project rows and the general rows up to a number of general tokens; later calls add the next rows from the saved rows"""
+    from ndforge_worker import reshapejob
+    cfg = cache_cfg(tmp_path, base, rows_key="rk-1")
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(str(base))
+    rows, _ = dj.build_rows(tok, cfg["data"], "qwen3_5", 128)
+    n1, n2 = dj.rows_upto(rows, 300), dj.rows_upto(rows, 600)
+    assert 16 < n1 < n2 <= len(rows)
+    calls = []
+    real = dj._teacher_answers
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: calls.append(len(part)) or real(model, part, *a))
+    cache = tmp_path / "distill" / "cache"
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 300})
+    r = ev[-1]["data"]
+    idx = json.loads((cache / "index.json").read_text())
+    assert code == 0 and sum(calls) == n1 and r["done_rows"] == n1 == idx["done_rows"] and idx["complete"] is False and r["rows"] == len(rows)
+    assert r["rows_before"] == 0 and r["general_rows_done"] == n1 - 16 and r["general_tokens_done"] >= 300 and r["reused"] is False
+    # the second round: the general file is gone and the rows come from the saved ones; only the new rows are answered
+    Path(cfg["data"]["general"]["file"]).unlink()
+    monkeypatch.setattr(dj, "build_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("the rows must be reused")))
+    calls.clear()
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 600, "reuse_rows": True})
+    r2 = ev[-1]["data"]
+    assert code == 0 and sum(calls) == n2 - n1 and r2["done_rows"] == n2 and r2["rows_before"] == n1
+    assert json.loads((cache / "index.json").read_text())["data_hash"] == idx["data_hash"]
+    # the same call again changes nothing and does not load the teacher
+    monkeypatch.setattr(reshapejob, "_load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no teacher")))
+    calls.clear()
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 600, "reuse_rows": True})
+    assert code == 0 and not calls and ev[-1]["data"]["reused"] is True and ev[-1]["data"]["done_rows"] == n2
+    # a call without a limit afterwards answers the rest only (and then a complete cache is reused)
+    monkeypatch.undo()
+    calls.clear()
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: calls.append(len(part)) or real(model, part, *a))
+    monkeypatch.setattr(dj, "build_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("the rows must be reused")))
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "reuse_rows": True})
+    assert code == 0 and sum(calls) == len(rows) - n2 and ev[-1]["data"]["done_rows"] == len(rows)
+    assert json.loads((cache / "index.json").read_text())["complete"] is True
+
+
+# ------------------------------------------------------------------------------------------------------------ healing in rounds (W3)
+
+def round_cfg(tmp_path, student, teacher, rows, index, s_start, g_from, g_to, out="run-rounds", round_tokens=400, **over):
+    hyper = {"batch": 1, "grad_accum": 1, "max_steps": None, "lr": 3e-3, "warmup": 3}
+    hyper.update(over.pop("hyper", {}))
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper=hyper, out=str(tmp_path / out), **over)
+    cfg["distill"]["eval_every"] = 0
+    cfg["rounds"] = {"index": index, "round_tokens": round_tokens, "general_from": g_from, "general_to": g_to, "s_start": s_start}
+    return cfg
+
+
+def first_general(rows):
+    return next(i for i, r in enumerate(rows) if r.get("source") == "general")
+
+
+def two_round_setup(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    rows = dj.load_rows(tmp_path / "distill" / "cache")
+    g0 = first_general(rows)
+    mid = g0 + (len(rows) - g0) // 2
+    return student, rows, g0, mid
+
+
+def test_two_rounds_continue_the_global_step_with_the_optimizer_and_save_a_checkpoint_each(tmp_path, teacher, monkeypatch):
+    student, rows, g0, mid = two_round_setup(tmp_path, teacher, monkeypatch)
+    code, ev1 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, mid))
+    assert code == 0 and ev1[-1]["type"] == "result", ev1[-1]
+    r1 = ev1[-1]["data"]["round"]
+    assert r1["index"] == 1 and r1["s_start"] == 0 and r1["s_end"] == r1["steps"] >= 4 and r1["complete"] is True
+    run = tmp_path / "run-rounds"
+    assert (run / "rounds" / "r1" / "adapter" / "adapter_config.json").is_file() and (run / "rounds" / "r1" / "summary.json").is_file() and (run / "adapter" / "adapter_config.json").is_file()
+    assert (run / "checkpoints" / f"checkpoint-{r1['s_end']}").is_dir()                       # the forced save at the end of the round
+    code, ev2 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 2, r1["s_end"], mid, len(rows)))
+    assert code == 0 and ev2[-1]["type"] == "result", ev2[-1]
+    r2 = ev2[-1]["data"]["round"]
+    assert r2["s_start"] == r1["s_end"] and r2["s_end"] == r2["s_start"] + r2["steps"] and ev2[-1]["data"]["steps"] == r2["s_end"]
+    assert [e for e in ev2 if e["type"] == "start"][0]["resumed_from"] == r1["s_end"]
+    steps2 = [e["step"] for e in metrics(ev2)]
+    assert steps2 and min(steps2) == r1["s_end"] + 1 and max(steps2) == r2["s_end"]           # the loss chart continues
+    assert (run / "rounds" / "r2" / "adapter" / "adapter_config.json").is_file() and (run / "checkpoints" / f"checkpoint-{r2['s_end']}").is_dir()
+    assert ev2[-1]["data"]["stopped"] is False and ev2[-1]["data"]["calib_loss_after"] is not None
+
+
+def test_the_logged_learning_rate_follows_the_round_schedule(tmp_path, teacher, monkeypatch):
+    student, rows, g0, mid = two_round_setup(tmp_path, teacher, monkeypatch)
+    sch = dj.DEFAULT_ROUND_SCHEDULE
+    lr0, warm = 3e-3, 3
+    code, ev1 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, mid))
+    r1 = ev1[-1]["data"]["round"]
+    code, ev2 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 2, r1["s_end"], mid, len(rows)))
+    r2 = ev2[-1]["data"]["round"]
+    for ev, r in ((ev1, r1), (ev2, r2)):
+        for e in [x for x in ev if x["type"] == "metric"]:
+            g = e["step"]
+            # the Trainer logs the rate for the NEXT step: the factor of step g (or of g - 1, depending on the version's order of logging and stepping)
+            want = [lr0 * dj.round_lr_factor(s, r["s_start"], r["steps"], r["index"], warm, sch) for s in (g, g - 1)]
+            assert any(e["lr"] == pytest.approx(w, rel=1e-4, abs=1e-9) for w in want), (r["index"], g, e["lr"], want)
+
+
+def test_a_round_stopped_in_the_middle_goes_on_exactly_where_it_was(tmp_path, teacher, monkeypatch):
+    from ndforge_worker import callbacks
+    student, rows, g0, mid = two_round_setup(tmp_path, teacher, monkeypatch)
+    code, ev1 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, mid, out="run-a"))
+    s_end = ev1[-1]["data"]["round"]["s_end"]
+    shutil_copy_tree(tmp_path / "run-a", tmp_path / "run-b")
+    seen: list = []
+    real_get = dj.CacheReader.get
+    monkeypatch.setattr(dj.CacheReader, "get", lambda self, i: seen.append(int(i)) or real_get(self, i))
+
+    # uninterrupted round 2
+    seen.clear()
+    code, evA = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 2, s_end, mid, len(rows), out="run-a"))
+    assert code == 0, evA[-1]
+    rows_a, ra = list(seen), evA[-1]["data"]
+    # the same round, stopped after two steps and continued
+    stop = tmp_path / "run-b" / "STOP"
+    real = callbacks.LiveCallback.on_step_end
+
+    def stop_after_two(self, args, state, control, **kw):
+        if state.global_step == s_end + 2:
+            stop.write_text("")
+        return real(self, args, state, control, **kw)
+    monkeypatch.setattr(callbacks.LiveCallback, "on_step_end", stop_after_two)
+    seen.clear()
+    cfg_b = round_cfg(tmp_path, student, teacher, rows, 2, s_end, mid, len(rows), out="run-b", stop_file=str(stop))
+    code, evB1 = run_in_process(monkeypatch, dj.run, cfg_b)
+    rb1 = evB1[-1]["data"]
+    assert code == 0 and rb1["stopped"] is True and rb1["steps"] == s_end + 2 and rb1["round"]["complete"] is False
+    assert not (tmp_path / "run-b" / "rounds" / "r2").exists()                                 # an unfinished round has no round adapter
+    rows_b1 = list(seen)
+    monkeypatch.setattr(callbacks.LiveCallback, "on_step_end", real)
+    seen.clear()
+    code, evB2 = run_in_process(monkeypatch, dj.run, {**cfg_b, "resume": True})
+    rb2 = evB2[-1]["data"]
+    assert code == 0 and rb2["stopped"] is False and rb2["round"]["s_end"] == ra["round"]["s_end"] and rb2["round"]["complete"] is True
+    assert rows_b1[:2] + list(seen) == rows_a                                # not one row twice, none skipped
+    import safetensors.torch as st
+    a = st.load_file(str(tmp_path / "run-a" / "rounds" / "r2" / "adapter" / "adapter_model.safetensors"))
+    b = st.load_file(str(tmp_path / "run-b" / "rounds" / "r2" / "adapter" / "adapter_model.safetensors"))
+    assert set(a) == set(b) and all(torch.allclose(a[k], b[k], atol=1e-3) for k in a)           # the optimizer state went on, too
+
+
+def shutil_copy_tree(src, dst):
+    import shutil
+    shutil.copytree(src, dst)
+
+
+def test_a_round_needs_the_teacher_answers_of_its_rows_and_a_partial_cache_is_enough_for_the_first_round(tmp_path, teacher, monkeypatch):
+    from ndforge_worker.reshape import ReshapeError
+    student = thin_student(tmp_path, teacher)
+    cfg = cache_cfg(tmp_path, teacher, student=str(student), k=16, rows_key="rk")
+    cfg["data"]["tokens"] = 1500
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 200})
+    assert code == 0
+    done = ev[-1]["data"]["done_rows"]
+    rows = dj.load_rows(tmp_path / "distill" / "cache")
+    g0 = first_general(rows)
+    assert g0 < done < len(rows)
+    with pytest.raises(ReshapeError, match="has answered"):
+        run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, len(rows)))
+    code, ev = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, done))
+    assert code == 0 and ev[-1]["data"]["round"]["complete"] is True
+    with pytest.raises(ReshapeError, match="do not exist"):
+        run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, len(rows) + 5))
+
+
+def test_a_round_without_its_checkpoint_starts_from_the_previous_adapter_and_a_finished_round_without_its_adapter_is_recovered(tmp_path, teacher, monkeypatch):
+    import shutil
+    student, rows, g0, mid = two_round_setup(tmp_path, teacher, monkeypatch)
+    code, ev1 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, mid))
+    r1 = ev1[-1]["data"]["round"]
+    run = tmp_path / "run-rounds"
+    # the adapter of a round that was trained and checkpointed is rebuilt from the checkpoint without training again
+    shutil.rmtree(run / "rounds" / "r1")
+    shutil.rmtree(run / "adapter")
+    code, ev = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 1, 0, g0, mid, resume=True))
+    assert code == 0 and ev[-1]["data"]["round"]["s_end"] == r1["s_end"] and not metrics(ev)
+    assert (run / "rounds" / "r1" / "adapter" / "adapter_config.json").is_file() and (run / "adapter" / "adapter_model.safetensors").is_file()
+    # no checkpoint: round 2 starts from round 1's adapter with a fresh optimizer, and the global steps still go on
+    shutil.rmtree(run / "checkpoints")
+    code, ev2 = run_in_process(monkeypatch, dj.run, round_cfg(tmp_path, student, teacher, rows, 2, r1["s_end"], mid, len(rows)))
+    assert code == 0, ev2[-1]
+    r2 = ev2[-1]["data"]["round"]
+    assert r2["s_start"] == r1["s_end"] and r2["s_end"] == r2["s_start"] + r2["steps"] and min(e["step"] for e in metrics(ev2)) == r1["s_end"] + 1
+    assert (run / "rounds" / "r2" / "adapter" / "adapter_config.json").is_file()

@@ -225,3 +225,86 @@ fn the_owners_run_has_a_plausible_total() {
     assert!(t.total_h.0 > 15.0 && t.total_h.1 < 160.0 && t.total_h.0 < t.total_h.1, "{:?}", t.total_h);
     assert!(t.lever_h.1 > 0.7 * t.total_h.1, "the teacher's answers and the training are most of it: {:?} of {:?}", t.lever_h, t.total_h);
 }
+
+// ----------------------------------------------------------------------------------------------------------------- healing in rounds
+
+use ndforge_core::reshape::auto_time::{rounds_estimate, RoundsIn};
+
+fn rounds_spec(round_m: u32) -> AutoSpec {
+    AutoSpec { heal_rounds: Some(HealRoundsOpt { round_m, check: None, first_check_m: None }), ..owner_spec() }
+}
+
+#[test]
+fn rounds_have_a_best_case_below_the_normal_heal_and_a_worst_case_above_it() {
+    let normal = est(&owner_spec(), &History::default()).1;
+    let (_, t) = est(&rounds_spec(5), &History::default());
+    for id in ["s1.heal", "s2.heal"] {
+        let (n, r) = (find(&normal, id).unwrap(), find(&t, id).unwrap());
+        let rt = r.rounds.as_ref().expect("a heal in rounds says what its two ends are");
+        assert!(rt.best.1 < n.minutes.1 && n.minutes.1 < rt.worst.1, "{id}: best {:?} normal {:?} worst {:?}", rt.best, n.minutes, rt.worst);
+        assert_eq!(r.minutes, (rt.best.0, rt.worst.1), "the step is (best case low, worst case high)");
+        assert!(rt.best.0 <= rt.best.1 && rt.worst.0 <= rt.worst.1 && rt.per_round.0 <= rt.per_round.1);
+        assert_eq!((rt.round_m, rt.first_check_m), (5, 10));
+        assert_eq!(rt.rounds.0, 2);
+        assert_eq!(rt.rounds.1 * 5, rt.cap_m.div_ceil(5) * 5);
+        assert!(r.note.as_ref().unwrap().contains("Experimental"));
+    }
+    // stage 1 heals 40 M, the last stage 80 M (the owner's recipe)
+    assert_eq!(find(&t, "s1.heal").unwrap().rounds.as_ref().unwrap().rounds, (2, 8));
+    assert_eq!(find(&t, "s2.heal").unwrap().rounds.as_ref().unwrap().rounds, (2, 16));
+    assert!(t.total_h.1 > normal.total_h.1 && t.total_h.0 < normal.total_h.0, "the total spans both: {:?} {:?}", t.total_h, normal.total_h);
+}
+
+#[test]
+fn the_check_after_the_heal_only_reads_what_the_heal_saved() {
+    let (_, t) = est(&rounds_spec(5), &History::default());
+    for id in ["s1.check_heal", "s2.check_heal"] {
+        let s = find(&t, id).unwrap();
+        assert_eq!(s.parts.len(), 1);
+        assert!(s.minutes.1 <= 1.0 && s.note.as_ref().unwrap().contains("inside the heal"), "{s:?}");
+    }
+    // the merged model's check (in the quick or full mode of the run) is in the heal's own parts
+    let heal = find(&t, "s2.heal").unwrap();
+    assert!(heal.parts.iter().any(|x| x.id == "check") && heal.parts.iter().any(|x| x.id == "merge"));
+    // a retry in rounds is "more rounds", not a second heal
+    let extra = t.extra.iter().find(|e| e.id == "retry_heal").unwrap();
+    assert!(extra.label.contains("40 M more tokens in rounds") && extra.minutes.1 > 0.0);
+}
+
+#[test]
+fn the_overhead_share_falls_with_the_round_size_and_a_round_is_the_same_work() {
+    let rin = |round_m: u32| RoundsIn {
+        teacher_b: 27.8, student_b: 17.4, teacher_gb: 55.6, student_gb: 34.8, teacher_load: "4bit".into(), reuse_m: 0, cap_m: 40, round_m, first_check_m: 10.max(round_m), check_quick: true, final_quick: true, thinking: true,
+    };
+    let h = History::default();
+    let shares: Vec<f64> = [1, 2, 5, 10].iter().map(|r| rounds_estimate(&h, &rin(*r)).1.overhead_share.1).collect();
+    assert!(shares.windows(2).all(|w| w[0] > w[1]), "{shares:?}");
+    assert!(shares[0] > 0.2 && shares[2] < 0.25, "{shares:?}");
+    // the work (the original's answers and the training) is the same whatever the size of a round; only the overhead differs
+    let work = |r: u32| -> f64 { let (parts, _) = rounds_estimate(&h, &rin(r)); parts.iter().filter(|x| x.id == "cache" || x.id == "train").map(|x| x.minutes.1).sum() };
+    assert!((work(1) - work(10)).abs() < 1.0, "{} {}", work(1), work(10));
+    // earlier answers that are saved make the original's part smaller
+    let reuse = RoundsIn { reuse_m: 20, ..rin(5) };
+    assert!(rounds_estimate(&h, &reuse).1.worst.1 < rounds_estimate(&h, &rin(5)).1.worst.1);
+    // without thinking there are no checks and the first stop is the plateau, after half the cap
+    let plain = RoundsIn { thinking: false, ..rin(5) };
+    let (parts, t) = rounds_estimate(&h, &plain);
+    assert!(!parts.iter().any(|x| x.id == "check") && t.rounds == (4, 8));
+}
+
+#[test]
+fn without_rounds_nothing_changes_in_the_estimate_or_the_spec() {
+    let (_, t) = est(&owner_spec(), &History::default());
+    let text = serde_json::to_string(&t).unwrap();
+    assert!(!text.contains("rounds"), "the legacy estimate has no rounds key at all");
+    assert!(t.steps.iter().all(|s| s.rounds.is_none()));
+    let spec = serde_json::to_string(&owner_spec()).unwrap();
+    assert!(!spec.contains("heal_rounds"));
+    let back: AutoSpec = serde_json::from_str(&spec).unwrap();
+    assert!(back.heal_rounds.is_none());
+    // a spec with rounds writes and reads its setting
+    let with = serde_json::to_string(&rounds_spec(5)).unwrap();
+    assert!(with.contains("heal_rounds"));
+    assert_eq!(serde_json::from_str::<AutoSpec>(&with).unwrap().heal_rounds, rounds_spec(5).heal_rounds);
+    assert!(rounds_spec(3).validate().is_err() && rounds_spec(5).validate().is_ok());
+}

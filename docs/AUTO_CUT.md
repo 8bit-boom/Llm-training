@@ -311,3 +311,10 @@ numbers are there):
 It appears in the diagnostics bundle (`timings.json`), in the Auto-cut report (the jobs whose logs started while the run lasted; the section "Where the time went") and on the setup page ("Where the
 time went", a button that adds up the latest 30 logs). The numbers decide whether the two things the advice mentions are worth building (a saved 4-bit teacher, reusing the 16-bit GGUF): send the
 diagnostics bundle after the next real run.
+
+## Healing in rounds (experimental, `heal_rounds`)
+
+The preset **Stop early when good (periodic checks, experimental)** is Balanced with `heal_rounds {round_m: 5, check: quick}`; the knob "Heal in rounds, stop when good" is in the speed settings (its time
+is a range: the first check passes ... every round to the cap). Every stage heals in rounds with its recipe tokens as the cap and the original's numbers passed in. Rounds **replace the fixed-budget retry**:
+a stage that ends at its cap goes on for 40 M more tokens on the same run, a plateau goes straight to the back-off, the time limit ends the run. The estimate of a heal in rounds is (best case low, worst case
+high) with `StepTime.rounds`; the heal's weight in the progress bar is its worst case, so an early stop makes the bar jump forward. The report has a "Healing in rounds" table per stage. Details: `docs/HEAL_ROUNDS.md`.

@@ -217,7 +217,7 @@ fn the_plan_carries_the_speed_settings_with_the_history_it_was_given() {
     let p = with_speed(p0, &ins, &owner(), Some(32.0), &History::default());
     let s = p.speed.as_ref().unwrap();
     assert_eq!(s.total_h, p.time.as_ref().unwrap().total_h);
-    assert!(s.presets.len() == 4 && s.knobs.len() >= 8, "{} {}", s.presets.len(), s.knobs.len());
+    assert!(s.presets.len() == 5 && s.knobs.len() >= 8, "{} {}", s.presets.len(), s.knobs.len());
     // a plan that cannot be made has none
     let bad = with_speed(plan(&ins, &AutoSpec::new("qwen3.8-27b", 27.5), Some(32.0), None), &ins, &AutoSpec::new("qwen3.8-27b", 27.5), Some(32.0), &History::default());
     assert!(!bad.ok && bad.speed.is_none());
@@ -320,4 +320,55 @@ fn the_window_gets_the_list_of_what_was_given_up_or_the_refusal() {
     // without a limit there is no budget
     let none: AutoPlan = serde_json::from_value(ndforge_core::reshape::auto::preview(&ins, &AutoSpec { allow_many_blocks: true, ..AutoSpec::new("qwen3.8-27b", 19.5) }, Some(36.0), Some(2000.0), true)["plan"].clone()).unwrap();
     assert!(none.budget.is_none());
+}
+
+// ----------------------------------------------------------------------------------------------------------------- the "early" preset and the heal_rounds knob
+
+#[test]
+fn the_early_preset_is_balanced_with_rounds_and_the_other_presets_turn_rounds_off() {
+    let early = owner().with_preset("early").unwrap();
+    let balanced = owner().with_preset("balanced").unwrap();
+    assert_eq!(early.heal_rounds, Some(HealRoundsOpt { round_m: 5, check: Some("quick".into()), first_check_m: None }));
+    assert_eq!(AutoSpec { heal_rounds: None, stage_a_tokens_m: Some(20), preset: Some("balanced".into()), ..early.clone() }, balanced, "everything else is Balanced's");
+    assert_eq!(early.matching_preset().as_deref(), Some("early"));
+    assert_eq!(balanced.matching_preset().as_deref(), Some("balanced"));
+    // rounds are an experiment: choosing any other preset on top of a spec with rounds turns them off again
+    for id in ["thorough", "balanced", "fast"] {
+        assert!(early.with_preset(id).unwrap().heal_rounds.is_none(), "{id}");
+    }
+    assert_eq!(owner().matching_preset().as_deref(), Some("thorough"), "a legacy spec is still the recommended recipe");
+    // the stage budget stays the recipe's: a stop at the first passed check replaces the fixed 20 M of Balanced
+    assert_eq!(early.stage_a_tokens_m, None);
+    // the plan and the report say what was chosen
+    let p = plan(&qwen27(), &early, Some(32.0), Some(2000.0));
+    assert!(p.ok, "{:?}", p.blockers);
+    assert!(p.warnings.iter().any(|w| w.contains("Experimental") && w.contains("rounds of 5 M tokens") && w.contains("16 questions")), "{:?}", p.warnings);
+    let t = p.time.as_ref().unwrap();
+    assert!(t.steps.iter().filter(|s| s.id.ends_with(".heal")).all(|s| s.rounds.is_some()));
+    let devs = deviations(&early, &p.stages, 27.8);
+    assert!(devs.iter().any(|d| d.knob == "heal_rounds" && d.value.contains("rounds of 5 M tokens") && d.risk.contains("Experimental")));
+    assert!(!deviations(&balanced, &plan(&qwen27(), &balanced, Some(32.0), Some(2000.0)).stages, 27.8).iter().any(|d| d.knob == "heal_rounds"));
+}
+
+#[test]
+fn the_heal_rounds_knob_shows_the_range_as_a_best_and_a_worst_delta() {
+    let si = info(&owner().with_preset("balanced").unwrap(), 32.0);
+    let k = si.knobs.iter().find(|k| k.knob == "heal_rounds").expect("the knob is there");
+    assert!(k.label.contains("experimental") && k.risk.contains("merged check decides") && k.risk.contains("16 questions"));
+    assert_eq!(k.options.len(), 3);
+    assert!(k.options[0].current && !k.options[1].current && !k.options[2].current);
+    assert_eq!(k.options[0].delta_min, Some((0.0, 0.0)));
+    for o in &k.options[1..] {
+        let d = o.delta_min.expect("it can be planned");
+        assert!(d.0 < 0.0 && d.1 > 0.0, "the range reaches below and above the recipe: {d:?}");
+        assert_eq!(o.set["heal_rounds"]["check"], "quick");
+    }
+    // a spec that has rounds shows its choice as current
+    let on = info(&owner().with_preset("early").unwrap(), 32.0);
+    let k = on.knobs.iter().find(|k| k.knob == "heal_rounds").unwrap();
+    assert_eq!(k.options.iter().position(|o| o.current), Some(1));
+    // fit_budget still counts the high end of the estimate and never drops the rounds by itself
+    let early = owner().with_preset("early").unwrap();
+    let fit = fit_budget(&qwen27(), &early, Some(32.0), &History::default(), 100.0);
+    assert!(fit.spec.heal_rounds.is_some());
 }

@@ -163,7 +163,7 @@ impl Effects for RealEffects<'_> {
     }
 
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>> {
-        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None };
+        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None, round: None };
         let stop = self.stop.clone();
         let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
         done(r, Ok)
@@ -180,8 +180,16 @@ impl Effects for RealEffects<'_> {
         done(r, |v| match (v["name"].as_str(), v["model_id"].as_str(), v["healed_dir"].as_str()) {
             (Some(name), Some(id), Some(dir)) => {
                 let keys = ["kd_first", "kd_last", "calib_loss_before", "calib_loss_after", "teacher_calib_loss", "tokens_seen", "steps"];
-                let summary: serde_json::Map<String, Value> = keys.iter().filter(|k| !v[**k].is_null()).map(|k| (k.to_string(), v[*k].clone())).collect();
-                Ok(HealRef { name: name.into(), model_id: id.into(), dir: dir.into(), tokens_m: spec.tokens_m, summary: Some(Value::Object(summary)) })
+                let mut summary: serde_json::Map<String, Value> = keys.iter().filter(|k| !v[**k].is_null()).map(|k| (k.to_string(), v[*k].clone())).collect();
+                // a heal in rounds says how many tokens it really trained (it may have stopped early) and keeps its rounds for the report
+                let tokens_m = match v["rounds"]["tokens_m"].as_f64().filter(|_| v["rounds"].is_object()) {
+                    Some(t) => {
+                        summary.insert("rounds".into(), v["rounds"].clone());
+                        t.ceil() as u32
+                    }
+                    None => spec.tokens_m,
+                };
+                Ok(HealRef { name: name.into(), model_id: id.into(), dir: dir.into(), tokens_m, summary: Some(Value::Object(summary)) })
             }
             _ => Err(Error::new("The heal did not give a model.")),
         })

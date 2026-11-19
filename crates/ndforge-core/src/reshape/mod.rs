@@ -8,6 +8,7 @@ pub mod auto_progress;
 pub mod auto_report;
 pub mod auto_speed;
 pub mod auto_time;
+pub mod heal_rounds;
 pub mod heal_source;
 pub mod plan;
 pub mod runs;

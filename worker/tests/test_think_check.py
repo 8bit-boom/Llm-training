@@ -330,3 +330,65 @@ def test_the_check_always_samples_it_is_never_greedy():
         kw = {k.arg: k.value for k in call.keywords if k.arg}
         assert isinstance(kw.get("do_sample"), ast.Constant) and kw["do_sample"].value is True, "do_sample=True"
         assert {"temperature", "top_p", "top_k"} <= set(kw)
+
+
+# ------------------------------------------------------------------------------------------------------------ a model with a LoRA on top (healing in rounds)
+
+def test_the_cache_key_without_an_adapter_is_what_it_always_was(tmp_path):
+    model = tmp_path / "m"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"x" * 10)
+    settings = {"quick": True}
+    key = tc.cache_key({"model": str(model), "load": "4bit"}, "hf", settings)
+    assert key == {"format": 1, "model": tc.fingerprint(str(model)), "backend": "hf", "load": "4bit", "suite_version": tc.SUITE_VERSION, "settings": settings}
+    assert tc.cache_key({"model": str(model), "load": "4bit", "adapter": None, "double_quant": True}, "hf", settings) == key
+    assert list(key) == ["format", "model", "backend", "load", "suite_version", "settings"]
+
+
+def test_two_adapters_of_the_same_size_give_two_keys_and_the_double_quant_flag_counts(tmp_path):
+    model = tmp_path / "m"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    adapters = []
+    for n in (1, 2):
+        a = tmp_path / f"r{n}"
+        a.mkdir()
+        (a / "adapter_config.json").write_text('{"r": 8}')
+        (a / "adapter_model.safetensors").write_bytes(bytes([n]) * 100)         # the same names and sizes, other weights
+        adapters.append(str(a))
+    base = {"model": str(model), "load": "4bit"}
+    k1 = tc.cache_key({**base, "adapter": adapters[0]}, "hf", {})
+    k2 = tc.cache_key({**base, "adapter": adapters[1]}, "hf", {})
+    assert k1["adapter"].startswith("adapter:") and k1 != k2 and k1 != tc.cache_key(base, "hf", {})
+    assert k1 == tc.cache_key({**base, "adapter": adapters[0]}, "hf", {})
+    assert tc.cache_key({**base, "adapter": adapters[0], "double_quant": True}, "hf", {}) != k1
+
+
+def test_a_checked_adapter_is_never_taken_from_the_cache_of_another_one(tmp_path, monkeypatch):
+    be = FakeBackend()
+    monkeypatch.setattr(tc, "load_backend", lambda name: be)
+    model = tmp_path / "m"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"x" * 10)
+    a1, a2 = tmp_path / "a1", tmp_path / "a2"
+    for a, b in ((a1, b"1"), (a2, b"2")):
+        a.mkdir()
+        (a / "adapter_config.json").write_text("{}")
+        (a / "adapter_model.safetensors").write_bytes(b * 8)
+    cache = str(tmp_path / "round.json")
+    job = {"job": "think_check", "model": str(model), "backend": "hf", "quick": True, "cache_file": cache}
+    assert tc.run({**job, "adapter": str(a1)}) == 0
+    be.asked = []
+    assert tc.run({**job, "adapter": str(a1)}) == 0 and be.asked == []            # the same adapter: cached
+    assert tc.run({**job, "adapter": str(a2)}) == 0 and be.asked                  # another adapter: asked again
+
+
+def test_an_adapter_needs_the_standard_engine_and_an_existing_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc, "load_backend", lambda name: FakeBackend())
+    (tmp_path / "a").mkdir()
+    with pytest.raises(tc.ThinkCheckError, match="standard engine"):
+        tc.run({"job": "think_check", "model": "org/x", "backend": "llama", "adapter": str(tmp_path / "a")})
+    with pytest.raises(tc.ThinkCheckError, match="missing"):
+        tc.run({"job": "think_check", "model": "org/x", "backend": "hf", "adapter": str(tmp_path / "nothing")})

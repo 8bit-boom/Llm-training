@@ -1152,6 +1152,36 @@ if kind == "heal_check":
             f["folder"] = f["fetch_folder"]
         res[side] = f
     out(type="result", data=res); sys.exit(0)
+if kind == "think_check":
+    cf = job["cache_file"]
+    os.makedirs(os.path.dirname(cf), exist_ok=True)
+    name = os.path.basename(cf)
+    if marker("stop-check"):
+        out(type="result", data={{"stopped": True}}); sys.exit(0)
+    good = {{"closed_rate": 0.97, "accuracy": 0.8, "loop_rate": 0.0, "garbage_rate": 0.0, "median_think_tokens": 800}}
+    bad = {{"closed_rate": 0.4, "accuracy": 0.2, "loop_rate": 0.5, "garbage_rate": 0.0, "median_think_tokens": 800}}
+    if name.startswith("original"):
+        main = good
+    elif name.startswith("round"):
+        main = good if marker("pass-" + name.split(".")[0]) else bad
+    else:
+        main = good if marker("merged-pass") else bad
+    res = {{"main": main, "control": {{}}, "stopped": False, "cached": False, "suite_version": 1}}
+    json.dump({{"key": {{}}, "result": res}}, open(cf, "w"))
+    out(type="result", data=res); sys.exit(0)
+if kind == "distill_cache" and job.get("upto_general_tokens") is not None:
+    os.makedirs(job["out"], exist_ok=True)
+    ip = os.path.join(job["out"], "index.json")
+    prev = json.load(open(ip))["done_rows"] if os.path.exists(ip) else 0
+    if marker("stop-cache"):
+        out(type="result", data={{"stopped": True, "done_rows": prev}}); sys.exit(0)
+    g = job["data"].get("general")
+    key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"], "render": 2}}
+    gr = min(40, -(-job["upto_general_tokens"] // 500))
+    done = max(prev, 4 + gr)
+    json.dump({{"complete": done >= 44, "rows": 44, "done_rows": done, "general_key": key, "k": job["k"], "max_len": job["max_seq"], "rows_key": job.get("rows_key")}}, open(ip, "w"))
+    out(type="result", data={{"rows": 44, "tokens": 20000, "stopped": False, "notes": [], "done_rows": done, "rows_before": prev, "general_rows_done": gr, "general_tokens_done": gr * 500,
+                             "stats": {{"project_rows": 4, "general_rows": 40, "general_error": None}}}}); sys.exit(0)
 if kind == "distill_cache":
     if marker("stop-cache"):
         out(type="result", data={{"stopped": True, "rows": 10, "done_rows": 3}}); sys.exit(0)
@@ -1176,6 +1206,15 @@ elif kind == "distill":
     os.makedirs(os.path.join(job["out"], "adapter"), exist_ok=True)
     open(os.path.join(job["out"], "adapter", "adapter_config.json"), "w").write("{{}}")
     res = {{"steps": 2, "tokens_seen": 200, "kd_first": 0.9, "kd_last": 0.4, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0, "mode": job["distill"]["mode"], "stopped": False}}
+    if job.get("rounds"):
+        rd = job["rounds"]
+        steps = 4
+        loss = 3.0 - 0.2 * rd["index"]
+        res.update(steps=rd["s_start"] + steps, calib_loss_after=loss, round={{"index": rd["index"], "s_start": rd["s_start"], "s_end": rd["s_start"] + steps, "steps": steps, "tokens": rd["round_tokens"], "calib_loss_after": loss, "complete": True}})
+        rdir = os.path.join(job["out"], "rounds", "r%d" % rd["index"])
+        os.makedirs(os.path.join(rdir, "adapter"), exist_ok=True)
+        open(os.path.join(rdir, "adapter", "adapter_config.json"), "w").write("{{}}")
+        json.dump(res, open(os.path.join(rdir, "summary.json"), "w"))
     json.dump(res, open(os.path.join(job["out"], "summary.json"), "w"))
     out(type="result", data=res)
 elif kind == "distill_merge":
@@ -2604,4 +2643,137 @@ fn the_manual_slim_page_warns_about_the_guardrails_and_the_thinking_of_a_model_t
     plain.model_type = "llama".into();
     assert!(!warnings(&wspec(3, 10240), &plain, None).iter().any(|x| x.contains("Check its thinking")));
     assert!(!warnings(&spec(Mode::Grow, 2), &ins, None).iter().any(|x| x.contains("Check its thinking")));
+}
+
+// ----------------------------------------------------------------------------------------------------------------- healing in rounds with the stand-in worker
+
+#[cfg(unix)]
+fn rounds_spec(tokens: u64, extra: serde_json::Value) -> rruns::HealSpec {
+    let mut rounds = json!({"round_exact": 10_000});
+    for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+        rounds[k] = v;
+    }
+    serde_json::from_value(json!({"tokens_m": 10, "tokens_exact": tokens, "recipe": "thinking", "general_share": 0.5, "rounds": rounds})).unwrap()
+}
+
+#[cfg(unix)]
+fn heal_events(p: &Project, spec: &rruns::HealSpec) -> (ndforge_core::error::Result<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut events = vec![];
+    let r = rruns::heal(p, "slim", spec, Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |e| events.push(e));
+    (r, events)
+}
+
+#[cfg(unix)]
+fn job_names(root: &std::path::Path) -> Vec<String> {
+    jobs_seen(root).iter().map(|j| {
+        let k = j["job"].as_str().unwrap().to_string();
+        match k.as_str() {
+            "think_check" => format!("think_check:{}", std::path::Path::new(j["cache_file"].as_str().unwrap()).file_name().unwrap().to_string_lossy()),
+            _ => k,
+        }
+    }).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_heal_in_rounds_stops_at_the_first_passed_check_merges_and_checks_the_merged_model() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let dir = p.folder.join("models").join("slim");
+    std::fs::write(d.path().join("pass-round-r2"), "").unwrap();
+    std::fs::write(d.path().join("merged-pass"), "").unwrap();
+    let (r, events) = heal_events(&p, &rounds_spec(40_000, json!({})));
+    let r = r.unwrap();
+    assert_eq!(job_names(d.path()), ["distill_cache", "distill", "think_check:original.quick.json", "think_check:round-r1.quick.json", "distill_cache", "distill", "think_check:round-r2.quick.json",
+                                     "distill_merge", "think_check:healed.quick.json"]);
+    assert_eq!(r["model_id"], "custom-local-slim-healed");
+    assert_eq!((r["rounds"]["stop"]["reason"].clone(), r["rounds"]["stop"]["round"].clone(), r["rounds"]["final"]["verdict"].clone()), (json!("pass"), json!(2), json!("pass")));
+    // the cache job asks for the rows of the round only (cap 40,000 tokens, half of them general): 10,000 tokens -> 5,000 general ones after round 1
+    let jobs = jobs_seen(d.path());
+    let caches: Vec<_> = jobs.iter().filter(|j| j["job"] == "distill_cache").collect();
+    assert_eq!((caches[0]["upto_general_tokens"].clone(), caches[1]["upto_general_tokens"].clone(), caches[0]["data"]["tokens"].clone(), caches[0]["reuse_rows"].clone()), (json!(5_000), json!(10_000), json!(40_000), json!(true)));
+    let trains: Vec<_> = jobs.iter().filter(|j| j["job"] == "distill").collect();
+    assert_eq!((trains[0]["rounds"]["index"].clone(), trains[0]["rounds"]["s_start"].clone(), trains[1]["rounds"]["index"].clone(), trains[1]["rounds"]["s_start"].clone()), (json!(1), json!(0), json!(2), json!(4)));
+    assert_eq!((trains[0]["rounds"]["general_from"].clone(), trains[0]["rounds"]["general_to"].clone(), trains[1]["rounds"]["general_from"].clone(), trains[1]["rounds"]["general_to"].clone()), (json!(4), json!(14), json!(14), json!(24)));
+    // the round check looks at the student with the adapter on top, not merged
+    let rc = jobs.iter().find(|j| j["job"] == "think_check" && j["cache_file"].as_str().unwrap().contains("round-r1")).unwrap();
+    assert!(rc["adapter"].as_str().unwrap().ends_with("adapter") && rc["double_quant"] == true && rc["load"] == "4bit");
+    // heal.json keeps the rows; the events carry the round
+    let h: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("heal.json")).unwrap()).unwrap();
+    assert_eq!((h["rounds"]["state"].clone(), h["rounds"]["rows"].as_array().unwrap().len(), h["rounds"]["rows"][1]["decision"].clone()), (json!("ended"), 2, json!("stop_pass")));
+    assert!(h["rounds"]["rows"][0]["check"]["verdict"] == "fail" && h["rounds"]["rows"][1]["check"]["verdict"] == "pass");
+    assert!(events.iter().any(|e| e["kind"] == "heal_round" && e["decision"] == "stop_pass"));
+    assert!(events.iter().any(|e| e["round"] == 2 && e["heal_step"] == "train"));
+    // the heal passed: its checkpoints are gone, the model is listed, nothing half-made is left
+    assert!(!dir.join("distill/run/checkpoints").exists() && dir.join("healed/config.json").is_file() && !dir.join("healed.partial").exists());
+    // calling it again does not heal again
+    assert!(rruns::heal(&p, "slim", &rounds_spec(40_000, json!({})), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).unwrap_err().0.contains("already been healed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_heal_in_rounds_that_reaches_the_cap_without_a_pass_can_be_taken_further() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let dir = p.folder.join("models").join("slim");
+    let (r, _) = heal_events(&p, &rounds_spec(40_000, json!({"plateau": false})));
+    let r = r.unwrap();
+    assert_eq!((r["rounds"]["stop"]["reason"].clone(), r["rounds"]["final"]["verdict"].clone()), (json!("cap"), json!("fail")));
+    assert_eq!(job_names(d.path()).iter().filter(|n| *n == "distill").count(), 4);
+    assert!(dir.join("distill/run/checkpoints").exists(), "kept: a failed heal may go on");
+    assert!(dir.join("healed/config.json").is_file());
+    // another heal with the same cap does not start (the model is healed)
+    assert!(rruns::heal(&p, "slim", &rounds_spec(40_000, json!({})), Some(32.0), Arc::new(AtomicBool::new(false)), Duration::from_secs(5), &mut |_| {}).is_err());
+    // more tokens and `extend`: the merged model is forgotten and rounds 5 and 6 follow the fourth
+    std::fs::write(d.path().join("merged-pass"), "").unwrap();
+    let before = jobs_seen(d.path()).len();
+    let (r, _) = heal_events(&p, &rounds_spec(60_000, json!({"plateau": false, "extend": true})));
+    let r = r.unwrap();
+    let new: Vec<_> = jobs_seen(d.path())[before..].to_vec();
+    let kinds: Vec<_> = new.iter().map(|j| j["job"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["distill_cache", "distill", "think_check", "distill_cache", "distill", "distill_merge", "think_check"], "{kinds:?}");
+    assert_eq!(new.iter().filter(|j| j["job"] == "distill").map(|j| j["rounds"]["index"].as_u64().unwrap()).collect::<Vec<_>>(), [5, 6]);
+    assert_eq!(new.iter().find(|j| j["job"] == "distill").unwrap()["rounds"]["s_start"], 16);
+    assert_eq!((r["rounds"]["stop"]["reason"].clone(), r["rounds"]["final"]["verdict"].clone(), r["rounds"]["rows"].as_array().unwrap().len()), (json!("cap"), json!("pass"), 6));
+    assert_eq!(r["model_id"], "custom-local-slim-healed");
+    assert!(!dir.join("distill/run/checkpoints").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_heal_in_rounds_that_is_stopped_goes_on_without_repeating_a_job() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let dir = p.folder.join("models").join("slim");
+    std::fs::write(d.path().join("pass-round-r2"), "").unwrap();
+    std::fs::write(d.path().join("merged-pass"), "").unwrap();
+    let spec = rounds_spec(40_000, json!({}));
+    std::fs::write(d.path().join("stop-check"), "").unwrap();
+    let (r, _) = heal_events(&p, &spec);
+    assert_eq!(r.unwrap()["stopped"], true);
+    let h: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("heal.json")).unwrap()).unwrap();
+    assert_eq!((h["status"].as_str(), h["step"].as_str()), (Some("stopped"), Some("check")));
+    assert_eq!(h["rounds"]["rows"].as_array().unwrap().len(), 1);
+    std::fs::remove_file(d.path().join("stop-check")).unwrap();
+    let (r, _) = heal_events(&p, &spec);
+    assert_eq!(r.unwrap()["rounds"]["stop"]["round"], 2);
+    let names = job_names(d.path());
+    assert_eq!(names.iter().filter(|n| n.starts_with("distill_cache")).count(), 2, "{names:?}");
+    assert_eq!(names.iter().filter(|n| *n == "distill").count(), 2, "{names:?}");
+    // the check that was stopped (the original's, which comes first) is asked again; every check that finished is asked once
+    assert_eq!(names.iter().filter(|n| n.contains("original")).count(), 2, "{names:?}");
+    assert_eq!(names.iter().filter(|n| n.contains("round-r1")).count(), 1, "{names:?}");
+    assert_eq!(names.iter().filter(|n| n.contains("round-r2")).count(), 1, "{names:?}");
 }

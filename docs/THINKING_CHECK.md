@@ -126,3 +126,9 @@ Stop asks the worker to end (a STOP file) and, after a grace period, ends the wo
 * Batched sampling of a model with linear-attention layers and left padding: the tiny test model (the real architecture, random weights) runs it, but whether the real 27B answers the same batched as
   one at a time is not checked (use `batch: 1` or the llama backend if the numbers look odd).
 * The loop test on word lists (the llama backend has no token ids) is a rough stand-in for the token version.
+
+## A round of a heal in rounds (target `round`)
+
+`ThinkSpec.target = "round"` with `round: n` checks the student of the heal (`heal_config.json`'s model) with `distill/run/rounds/r<n>/adapter` put on top and **not merged**: the job carries `adapter` and `double_quant`
+(and a `load` that follows how the student was trained). The result is kept in `think_check/round-r<n>.<quick|full>.json`; the cache key has a content hash of the adapter, and only when there is one (the keys of every other check
+are unchanged). It looks at the model as it is trained; the merged model can score a little differently (`docs/HEAL_ROUNDS.md`).

@@ -271,6 +271,32 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
     return rows, stats
 
 
+def _cycle(rows: list, idx: list, want: int, rng, block: int) -> list[int]:
+    """Row indices from `idx` (cycled in a fresh shuffled order, shuffled in blocks) until their tokens reach `want`."""
+    chosen: list[int] = []
+    got = 0
+    while idx and got < want:
+        blocks = [idx[a:a + block] for a in range(0, len(idx), block)]
+        rng.shuffle(blocks)
+        for b in blocks:
+            b = list(b)
+            rng.shuffle(b)
+            for i in b:
+                if got >= want:
+                    break
+                chosen.append(i)
+                got += len(rows[i]["input_ids"])
+    return chosen
+
+
+def _interleave(chosen: list[int], seed: int, block: int) -> list[int]:
+    """the two kinds are interleaved by block so that every stretch of the run has both"""
+    rng2 = random.Random(seed + 1)
+    chunks = [chosen[a:a + block] for a in range(0, len(chosen), block)]
+    rng2.shuffle(chunks)
+    return [i for c in chunks for i in c]
+
+
 def training_order(rows: list, tokens: int, general_share: float, seed: int = 3407, block: int = 64) -> list[int]:
     """Row indices (repeated as needed) for a run of about `tokens` tokens: the share `general_share` of them from the rows with source "general", the rest
     from "project" rows, each group cycled through in a fresh shuffled order. Locality: the order is shuffled in blocks of `block` consecutive rows, so
@@ -285,23 +311,86 @@ def training_order(rows: list, tokens: int, general_share: float, seed: int = 34
     rng = random.Random(seed)
     chosen: list[int] = []
     for kind in ("project", "general"):
-        idx, want, got = by[kind], int(tokens * share[kind]), 0
-        while idx and got < want:
-            blocks = [idx[a:a + block] for a in range(0, len(idx), block)]
-            rng.shuffle(blocks)
-            for b in blocks:
-                b = list(b)
-                rng.shuffle(b)
-                for i in b:
-                    if got >= want:
-                        break
-                    chosen.append(i)
-                    got += len(rows[i]["input_ids"])
-    # the two kinds are interleaved by block so that every stretch of the run has both
-    rng2 = random.Random(seed + 1)
-    chunks = [chosen[a:a + block] for a in range(0, len(chosen), block)]
-    rng2.shuffle(chunks)
-    return [i for c in chunks for i in c]
+        chosen += _cycle(rows, by[kind], int(tokens * share[kind]), rng, block)
+    return _interleave(chosen, seed, block)
+
+
+# ------------------------------------------------------------------------------------------------------------ healing in rounds
+# One heal is trained in rounds (docs/HEAL_ROUNDS.md): each round learns from all project rows (cycled as in a normal run) and the general rows the teacher answered FOR THIS
+# ROUND (rows general_from .. general_to-1 of the run's row list), so no general row is repeated across rounds. The optimizer and the scheduler position go on from round
+# to round; the learning rate of a round has its own warm-up, plateau and cool-down, so that every round ends with an annealed adapter that can be checked.
+
+DEFAULT_ROUND_SCHEDULE = {"v": 1, "gamma": 0.85, "floor": 0.35, "cooldown": 0.2, "min_ratio": 0.05, "rewarm_share": 0.1, "rewarm_max": 10}
+
+
+def round_lr_factor(step: int, s_start: int, steps: int, index: int, warmup: int, sch: dict) -> float:
+    """The learning-rate factor (times the base rate) at global optimizer step `step` for round `index` (1, 2, ...), which has `steps` steps and starts at global step
+    `s_start`. Round 1 warms up from 0 (over the job's warm-up, at most a quarter of the round); a later round re-warms from `min_ratio` x its peak over `rewarm_share`
+    of the round (at most `rewarm_max` steps). The peak falls by `gamma` per round down to `floor`. The last `cooldown` share of every round decays as 1 - sqrt(u) to
+    `min_ratio` x the peak. Pure (no torch): the trainer wraps it in a LambdaLR."""
+    t = min(max(int(step) - int(s_start), 0), max(int(steps) - 1, 0))
+    peak = max(sch["floor"], sch["gamma"] ** (index - 1))
+    if index == 1:
+        w, lo = min(int(warmup), math.ceil(0.25 * steps)), 0.0
+    else:
+        w, lo = min(sch["rewarm_max"], math.ceil(sch["rewarm_share"] * steps)), sch["min_ratio"] * peak
+    w = max(w, 1)
+    c = max(1, math.ceil(sch["cooldown"] * steps))
+    if t < w:
+        return lo + (peak - lo) * (t + 1) / w
+    if t >= steps - c:
+        u = (t - (steps - c) + 1) / c
+        return peak * (sch["min_ratio"] + (1 - sch["min_ratio"]) * (1 - math.sqrt(min(u, 1.0))))
+    return peak
+
+
+def round_order(rows: list, general_from: int, general_to: int, round_tokens: int, general_share: float, seed: int, block: int = 64) -> list[int]:
+    """The row indices of one round: every project row (cycled in a fresh shuffled order, as in training_order) and the general rows `general_from` .. `general_to - 1`
+    (each once, never more than they hold), about `round_tokens` tokens in all, the general part at most `general_share` of them. Interleaved in blocks like training_order."""
+    proj = [i for i, r in enumerate(rows) if r.get("source") != "general"]
+    gen = [i for i in range(max(0, general_from), min(general_to, len(rows))) if rows[i].get("source") == "general"]
+    gen_tokens = sum(len(rows[i]["input_ids"]) for i in gen)
+    want_g = min(int(round_tokens * general_share), gen_tokens) if proj else min(round_tokens, gen_tokens)
+    want_p = round_tokens - want_g if proj else 0
+    rng = random.Random(seed)
+    chosen = _cycle(rows, proj, want_p, rng, block) + _cycle(rows, gen, want_g, rng, block)
+    return _interleave(chosen, seed, block)
+
+
+def round_slice(order: list, steps_done: int, per_step: int) -> list:
+    """What is left of a round's order after `steps_done` optimizer steps of `per_step` rows: a crash in the middle of a round continues exactly here."""
+    return list(order[max(0, int(steps_done)) * max(1, int(per_step)):])
+
+
+def round_start(ckdir, index: int, s_start: int, out) -> dict:
+    """Where training round `index` (global steps s_start ..) starts from, decided from the checkpoints of the run (torch-free):
+    "continue": a usable checkpoint at or after the round's first step exists (the forced save at the end of the previous round, or one from inside this round): training
+    resumes from the newest one with the optimizer and scheduler as they were, HF's global step continues (gs_start = s_start for a round that has not begun);
+    "fresh": no such checkpoint (they were deleted): the checkpoints that are left are removed, the previous round's adapter is the start and the optimizer begins anew
+    (HF's step counts from 0: gs_start = 0, the round's steps are shifted by the caller). A marker file lets a restart inside such a fresh round resume from its own checkpoints.
+    Returns {"mode", "gs_start", "init_adapter", "note"}."""
+    ckdir, out = Path(ckdir), Path(out)
+    ck = ckpt.usable(ckdir)
+    marker = ckdir / "FRESH_ROUND"
+    try:
+        marked = int(marker.read_text(encoding="utf-8").strip()) == int(index)
+    except (OSError, ValueError):
+        marked = False
+    prev = out / "rounds" / f"r{int(index) - 1}" / "adapter"
+    if int(index) <= 1:
+        return {"mode": "continue", "gs_start": 0, "init_adapter": None, "note": None}
+    if marked:
+        return {"mode": "fresh", "gs_start": 0, "init_adapter": str(prev) if prev.is_dir() else None, "note": None}
+    if any(ckpt.step_of(c) >= int(s_start) for c in ck):
+        return {"mode": "continue", "gs_start": int(s_start), "init_adapter": None, "note": None}
+    if not prev.is_dir():
+        raise ReshapeError("The previous round's adapter and its checkpoint are both missing, so healing cannot go on from the end of the previous round. Heal again from the start.")
+    import shutil as _sh
+    for c in ckdir.glob("checkpoint-*"):
+        _sh.rmtree(c, ignore_errors=True)
+    ckdir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(int(index)), encoding="utf-8")
+    return {"mode": "fresh", "gs_start": 0, "init_adapter": str(prev), "note": f"No checkpoint of the end of round {int(index) - 1} was found: round {int(index)} starts from that round's adapter with a fresh optimizer."}
 
 
 # ============================================================================================================ the cache
@@ -620,10 +709,49 @@ def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int
             "teacher_load": cfg["teacher"].get("load", "auto"), "rows_key": cfg.get("rows_key")}
 
 
+def rows_upto(rows: list, general_tokens) -> int:
+    """How many leading rows a partial teacher pass answers (healing in rounds): every project row, then general rows until their tokens reach `general_tokens`
+    (the row that reaches it is included). `rows` are the project rows followed by the general rows, as build_rows makes them. 0 or less = the project rows only."""
+    want, got = int(general_tokens or 0), 0
+    for i, r in enumerate(rows):
+        if r.get("source") == "general":
+            if got >= want:
+                return i
+            got += len(r["input_ids"])
+    return len(rows)
+
+
+def _reusable_rows(out, cfg: dict, k: int, max_seq: int, student):
+    """The rows an earlier call of this run saved next to the cache (rows.npz), when they are exactly the rows this call would build: the cache's own index says for which
+    data they were made (rows_key, general text, k, length, tokenizer, teacher) and the rows' hash must match. None otherwise (the caller then builds the rows)."""
+    idx = read_cache_index(out)
+    if not idx or not cfg.get("rows_key") or idx.get("rows_key") != cfg.get("rows_key"):
+        return None
+    gen = (cfg.get("data") or {}).get("general")
+    want_key = generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407)))
+    if (idx.get("k") != k or idx.get("max_len") != max_seq or idx.get("teacher") != cfg["teacher"]["repo"] or idx.get("general_key") != want_key
+            or idx.get("tokenizer_hash") != tokenizer_hash(student)):
+        return None
+    try:
+        rows = load_rows(out)
+    except ReshapeError:
+        return None
+    if len(rows) != idx.get("rows") or data_hash(rows) != idx.get("data_hash"):
+        return None
+    proj = [r for r in rows if r.get("source") != "general"]
+    gen_rows = [r for r in rows if r.get("source") == "general"]
+    stats = {"project_rows": len(proj), "project_tokens": sum(len(r["input_ids"]) for r in proj), "general_rows": len(gen_rows),
+             "general_tokens": sum(len(r["input_ids"]) for r in gen_rows), "general_error": None, "general_error_code": None, "general_source": idx.get("general_source"),
+             "general_detected": None, "general_texts_skipped": 0, "general_cut_rows": 0, "general_skipped_long": 0}
+    return rows, stats
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
-    "out": cache folder, "stop_file": path}. Saves the teacher's top-k answers for every row (resumable). Result: rows, tokens, bytes, reused, stopped, notes."""
+    "out": cache folder, "stop_file": path, "upto_general_tokens": N (optional: answer the project rows and the general rows up to N general tokens only, then stop; healing in
+    rounds), "reuse_rows": bool (optional: take the rows from out/rows.npz when they are the rows of this run, instead of reading the general text again)}.
+    Saves the teacher's top-k answers for every row (resumable). Result: rows, tokens, bytes, reused, stopped, notes, done_rows, general_rows_done, general_tokens_done, rows_before."""
     protocol.reserve_stdout()
     healmem.set_alloc_conf()
     started = time.monotonic()
@@ -637,8 +765,15 @@ def run_cache(cfg: dict) -> int:
     _require_same_ids(teacher_dir, student)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(student))
-    rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
+    again = _reusable_rows(out, cfg, k, max_seq, student) if cfg.get("reuse_rows") else None
+    if again:
+        rows, stats = again
+        protocol.log(f"The rows of this run are taken from the saved ones ({len(rows)} rows); the general text is not read again.")
+    else:
+        rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
     meta = cache_meta(cfg, rows, stats, student, k, max_seq)
+    upto = cfg.get("upto_general_tokens")
+    target = len(rows) if upto is None else rows_upto(rows, upto)
     legacy = read_cache_index(out)
     if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
         # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
@@ -648,16 +783,25 @@ def run_cache(cfg: dict) -> int:
         protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
     else:
         writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
-    save_rows(out, rows)
+    if not again:
+        save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
     total_tokens = sum(len(r["input_ids"]) for r in rows)
     result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
-    if writer.done_rows >= len(rows):
-        protocol.log("The teacher's saved answers are already complete for this data.")
-        result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1))
+    rows_before = writer.done_rows
+    target_tokens = sum(len(r["input_ids"]) for r in rows[:target]) if target < len(rows) else total_tokens
+
+    def counts() -> dict:
+        got = rows[:min(writer.done_rows, len(rows))]
+        gen = [r for r in got if r.get("source") == "general"]
+        return {"done_rows": writer.done_rows, "general_rows_done": len(gen), "general_tokens_done": sum(len(r["input_ids"]) for r in gen), "rows_before": rows_before}
+
+    if writer.done_rows >= target:
+        protocol.log("The teacher's saved answers are already complete for this data." if target >= len(rows) else "The teacher has already answered the rows of this round.")
+        result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), **counts())
         protocol.result(result)
         return 0
-    need = (total_tokens - writer.tokens) * (k * 6 + 4)
+    need = (sum(len(r["input_ids"]) for r in rows[:target]) - writer.tokens) * (k * 6 + 4)
     free = shutil.disk_usage(writer.dir)[2]
     if free < need * 1.05:
         protocol.error("disk_full", f"The teacher's answers need {need / 1e9:.1f} GB in {out}; {free / 1e9:.1f} GB free.")
@@ -676,17 +820,16 @@ def run_cache(cfg: dict) -> int:
     t0 = last_log = time.monotonic()
     seen_tokens = 0
     tokens_before = writer.tokens
-    rows_before = writer.done_rows
     try:
         i = writer.done_rows
         if i:
             protocol.log(f"Continuing the teacher's answers after row {i} of {len(rows)}.")
-        while i < len(rows):
+        while i < target:
             if stop_file.exists():
                 result["stopped"] = True
                 break
             # a window of rows is answered longest first (batches of similar length waste little on padding) and written in the order of the rows
-            window = rows[i:i + window_rows]
+            window = rows[i:min(i + window_rows, target)]
             answers: dict = {}
             order = length_order(window)
             pos, cut_short = 0, False
@@ -708,8 +851,8 @@ def run_cache(cfg: dict) -> int:
                     answers[j] = a
                     seen_tokens += len(window[j]["input_ids"])
                 pos += len(idx)
-                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}",
-                                  protocol.make_detail("tokens", min(tokens_before + seen_tokens, total_tokens), total_tokens, t0, rate_unit="tokens/s", done_at_start=tokens_before))
+                protocol.progress("cache", (i + len(answers)) / target, f"The original model answers your texts: {i + len(answers)} of {target}",
+                                  protocol.make_detail("tokens", min(tokens_before + seen_tokens, target_tokens), target_tokens, t0, rate_unit="tokens/s", done_at_start=tokens_before))
                 if time.monotonic() - last_log >= SPEED_LOG_EVERY:
                     last_log = time.monotonic()
                     protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far; this row: {len(window[idx[0]]['input_ids']):,} tokens)")
@@ -733,7 +876,7 @@ def run_cache(cfg: dict) -> int:
         protocol.log(f"cache_speed: {tps:,.0f} tokens/s ({seen_tokens:,} tokens answered in {time.monotonic() - t0:,.0f} s)")
         answered = max(1, writer.done_rows - rows_before)
         protocol.timing("teacher_pass", time.monotonic() - t0, tokens=seen_tokens, tokens_per_s=round(tps, 1), mean_row_tokens=round(seen_tokens / answered, 1), rows=answered)
-    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows, tokens_per_s=round(tps, 1))
+    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), tokens_per_s=round(tps, 1), **counts())
     protocol.result(result)
     return 0
 
@@ -893,6 +1036,16 @@ def _trainer_class(base):
             from torch.utils.data import SequentialSampler
             return SequentialSampler(self.train_dataset)       # the order was made by training_order (shuffled in blocks, close rows share a cache file)
 
+        def create_scheduler(self, num_training_steps, optimizer=None):
+            rl = getattr(self, "round_lr", None)
+            if not rl:
+                return super().create_scheduler(num_training_steps, optimizer)
+            from torch.optim.lr_scheduler import LambdaLR
+            if self.lr_scheduler is None:       # LambdaLR saves only its step counter, so a resumed round gets the same rates (the function is rebuilt from the job)
+                self.lr_scheduler = LambdaLR(optimizer if optimizer is not None else self.optimizer, lambda st: round_lr_factor(st + rl["shift"], rl["s_start"], rl["steps"], rl["index"], rl["warmup"], rl["sch"]))
+                self._created_lr_scheduler = True
+            return self.lr_scheduler
+
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             import torch
             d = self.distill
@@ -942,14 +1095,18 @@ def _callback_class():
     class HealCallback(LiveCallback):
         """LiveCallback (metrics, stop file) plus the distillation numbers and the calibration loss every `eval_every` steps."""
 
-        def __init__(self, *args, eval_fn=None, eval_every: int = 0, distill=None, **kw):
+        def __init__(self, *args, eval_fn=None, eval_every: int = 0, distill=None, lr_at=None, save_at: int = 0, **kw):
             super().__init__(*args, **kw)
             self.eval_fn, self.eval_every, self.distill = eval_fn, eval_every, distill
+            self.lr_at, self.save_at = lr_at, save_at       # rounds: the rate for a step (set at the start of a resumed round) and the last step of the round (always saved)
             self.history: list = []          # (step, kd, ce)
             self.calib: list = []            # (step, loss)
             self._seen = 0
 
         def on_log(self, args, state, control, logs=None, **kw):
+            opt = kw.get("optimizer")
+            if self.lr_at is not None and opt is not None and logs and "loss" in logs:
+                logs["learning_rate"] = float(opt.param_groups[0]["lr"])     # a round: the rate the step really used
             super().on_log(args, state, control, logs=logs, **kw)
             d = self.distill
             if d is None or not logs or "loss" not in logs:
@@ -977,8 +1134,19 @@ def _callback_class():
         def on_save(self, args, state, control, **kw):
             _trim()                                     # a checkpoint was just written: give the unused cached memory back
 
+        def on_step_begin(self, args, state, control, **kw):
+            super().on_step_begin(args, state, control, **kw)
+            opt = kw.get("optimizer")
+            if self.lr_at is not None and opt is not None:
+                # a round sets the rate of EVERY step itself (the function of the global step): whatever the scheduler or a resumed optimizer state says, the step uses this one
+                lr = self.lr_at(state.global_step)
+                for g in opt.param_groups:
+                    g["lr"] = lr
+
         def on_step_end(self, args, state, control, **kw):
             super().on_step_end(args, state, control, **kw)
+            if self.save_at and state.global_step >= self.save_at:
+                control.should_save = True
             if self.eval_every and not self.stopped and state.global_step % self.eval_every == 0:
                 self._evaluate(self.offset + state.global_step)
     return HealCallback
@@ -990,10 +1158,13 @@ def run(cfg: dict) -> int:
               checkpointing: "auto|on|off", optimizer: "auto|adamw_8bit|adamw", student_b?},
     "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50,
                 "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key)},
-    "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path}.
+    "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path,
+    "rounds": {"index", "round_tokens", "general_from", "general_to", "s_start", "schedule": {...}} (optional: this job trains ONE round of a heal that is trained in rounds,
+               see docs/HEAL_ROUNDS.md; cache mode only)}.
     Settings the job leaves out are chosen by the student's size (resolve_hyper). When the graphics card runs out of memory the training is tried again, at
     most healmem.MAX_RETRIES times, from the last checkpoint with the next safer setting (healmem.next_safer); the final failure is a plain message.
-    Writes the LoRA to out/adapter. Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss, adapter_dir, stopped, settings, oom_retries."""
+    Writes the LoRA to out/adapter (a round also to out/rounds/r<n>/adapter). Result: steps, tokens_seen, kd_first, kd_last, calib_loss_before / _after, teacher_calib_loss,
+    adapter_dir, stopped, settings, oom_retries (and `round` with rounds)."""
     protocol.reserve_stdout()
     healmem.set_alloc_conf()
     from . import backends
@@ -1021,12 +1192,22 @@ def run(cfg: dict) -> int:
     set_seed(h["seed"])
     protocol.log(f"Healing: {mode} mode, precision {backends.precision_name()}, LoRA rank {h['rank']}, learning rate {h['lr']}, KL loss weight {alpha}.")
     reader = teacher = None
+    rd = cfg.get("rounds") if isinstance(cfg.get("rounds"), dict) else None
+    if rd and mode != "cache":
+        raise ReshapeError("Healing in rounds needs the teacher's saved answers (cache mode).")
     if mode == "cache":
         reader = CacheReader(d["cache"])
         idx = reader.index
         rows = load_rows(d["cache"])
         if (idx["tokenizer_hash"] != tokenizer_hash(student_dir) or idx["max_len"] != h["max_seq"] or idx["rows"] != len(rows)
-                or data_hash(rows) != idx["data_hash"] or reader.done_rows < idx["rows"]):
+                or data_hash(rows) != idx["data_hash"]):
+            raise ReshapeError("The saved teacher answers belong to other data; they will be made again.")
+        if rd:
+            if not 0 <= int(rd["general_from"]) <= int(rd["general_to"]) <= len(rows):
+                raise ReshapeError("The rows of this round do not exist in the saved teacher answers; they will be made again.")
+            if reader.done_rows < int(rd["general_to"]):
+                raise ReshapeError(f"The teacher has answered {reader.done_rows} rows, but this round needs the first {int(rd['general_to'])}. The answers for this round are made first.")
+        elif reader.done_rows < idx["rows"]:
             raise ReshapeError("The saved teacher answers belong to other data; they will be made again.")
         share = float(((cfg.get("dataset") or {}).get("general") or {}).get("share", 0.0))
         g_cfg = (cfg.get("dataset") or {}).get("general")
@@ -1038,6 +1219,16 @@ def run(cfg: dict) -> int:
     method = cfg["method"]
     upcast = method == "qlora" and bool(d.get("kbit_upcast", False))     # the old 32-bit copy of the embeddings and the output layer (QLoRA only); off for healing
     lcfg = {"model": cfg["model"], "method": method, "hyper": h, "kbit_upcast": upcast}
+    ckdir = out / "checkpoints"
+    start = {"mode": "continue", "gs_start": 0, "init_adapter": None, "note": None}
+    r_index = r_start = 0
+    if rd:
+        r_index, r_start = int(rd["index"]), int(rd["s_start"])
+        start = round_start(ckdir, r_index, r_start, out)
+        if start["note"]:
+            protocol.log(start["note"])
+        if start["init_adapter"]:
+            lcfg["init_adapter"] = start["init_adapter"]
     with protocol.timed("load_student", method=method):
         model, tokenizer, _ = backends.load(lcfg, "hf")
     from . import speed
@@ -1055,14 +1246,26 @@ def run(cfg: dict) -> int:
             p.requires_grad_(False)
     elif not any(r.get("source") == "general" for r in rows):
         share = 0.0
-    order = training_order(rows, int(h["tokens"]), share, int(h["seed"]))
+    sch = {**DEFAULT_ROUND_SCHEDULE, **((rd or {}).get("schedule") or {})}
+    if rd:
+        order = round_order(rows, int(rd["general_from"]), int(rd["general_to"]), int(rd["round_tokens"]), share, int(h["seed"]) + r_index)
+    else:
+        order = training_order(rows, int(h["tokens"]), share, int(h["seed"]))
     if not order:
         raise ReshapeError("There is nothing to learn from: the training data is empty.")
-    ds = Dataset.from_list([{"input_ids": rows[i]["input_ids"], "completion_mask": rows[i]["completion_mask"], "row": i} for i in order])
+
+    def make_ds(sel: list):
+        return Dataset.from_list([{"input_ids": rows[i]["input_ids"], "completion_mask": rows[i]["completion_mask"], "row": i} for i in sel])
+
+    ds = None if rd else make_ds(order)
     per_step = max(1, int(h["batch"]) * int(h["grad_accum"]))               # the sequences per update: it stays the same when a retry halves the batch
-    steps = int(h["max_steps"]) if h.get("max_steps") else max(1, -(-len(order) // per_step))
+    steps = int(h["max_steps"]) if h.get("max_steps") else max(1, -(-len(order) // per_step))       # a round: the steps of this round
     tokens_planned = sum(len(rows[i]["input_ids"]) for i in order)
-    protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text).")
+    gs_start = int(start["gs_start"])
+    shift = r_start - gs_start                                              # HF's step counter of a fresh round starts at 0; the round's rates and the reports use global steps
+    max_steps = gs_start + steps if rd else steps
+    protocol.log(f"{len(order)} rows, {tokens_planned:,} tokens in {steps} steps ({sum(1 for i in order if rows[i].get('source') == 'general')} rows of general text)"
+                 + (f"; round {r_index}, global steps {r_start} to {r_start + steps}." if rd else "."))
 
     inner = data.text_tokenizer(tokenizer)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else inner.eos_token_id
@@ -1078,7 +1281,6 @@ def run(cfg: dict) -> int:
             if want in ("adamw_8bit", "8bit"):
                 protocol.log("The 8-bit optimizer (bitsandbytes) is not available here; using the standard AdamW (it needs more memory).")
     fields = getattr(SFTConfig, "__dataclass_fields__", {})
-    ckdir = out / "checkpoints"
     ev = cfg.get("eval") or None
     batches = reshapejob._calibration(tokenizer, ev["calibration"], cfg["model"].get("family", "generic")) if ev and ev.get("calibration") else None
     holder = {"model": model}
@@ -1101,12 +1303,28 @@ def run(cfg: dict) -> int:
             with protocol.timed("load_student", method=method, retry=True):
                 holder["model"] = backends.load(lcfg, "hf")[0]
         mdl = holder["model"]
+        ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
+        if rd:
+            ckpts = [c for c in ckpts if ckpt.step_of(c) <= max_steps]
+        resume = (bool(cfg.get("resume")) or n > 0 or (bool(rd) and r_index > 1)) and bool(ckpts)
+        done_steps = max(0, ckpt.step_of(ckpts[-1]) - gs_start) if (rd and resume) else 0
+        if rd and resume and done_steps >= steps:
+            # the round was trained and its checkpoint saved, but the job ended before the adapter was written: the checkpoint's adapter IS the round's adapter
+            protocol.log(f"Round {r_index} was already trained (checkpoint {ckpts[-1].name}); its adapter is taken from there.")
+            for target_dir in (out / "adapter", out / "rounds" / f"r{r_index}" / "adapter"):
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for name in ("adapter_model.safetensors", "adapter_model.bin", "adapter_config.json"):
+                    if (ckpts[-1] / name).is_file():
+                        shutil.copy2(ckpts[-1] / name, target_dir / name)
+            return {"after": None, "steps": ckpt.step_of(ckpts[-1]), "tokens": 0, "stopped": False, "vram": 0, "target": out / "adapter"}
         _apply_checkpointing(mdl, bool(s["checkpointing"]))
         kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(s["batch"]), gradient_accumulation_steps=int(s["grad_accum"]), learning_rate=float(h["lr"]),
                       warmup_steps=int(h["warmup"]), weight_decay=float(h["weight_decay"]), lr_scheduler_type=h["scheduler"], logging_steps=int(h["logging_steps"]),
                       save_strategy="steps", save_steps=int(h["save_steps"]), save_total_limit=2, optim=optim, seed=int(h["seed"]), report_to="none", disable_tqdm=True,
                       bf16=bf16, fp16=cuda and not bf16, remove_unused_columns=False, gradient_checkpointing=bool(s["checkpointing"]), dataloader_num_workers=0,
-                      use_cpu=not cuda, max_steps=steps)
+                      use_cpu=not cuda, max_steps=max_steps)
+        if rd:
+            kwargs["ignore_data_skip"] = True               # the round's rows are sliced by this job, not skipped by the trainer
         if s["checkpointing"]:
             kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
         kwargs["max_length" if "max_length" in fields else "max_seq_length"] = int(h["max_seq"])
@@ -1117,21 +1335,22 @@ def run(cfg: dict) -> int:
         args = SFTConfig(**kwargs)
         eval_fn = (lambda: calib_loss(holder["model"], batches, int(s["chunk"]))) if batches else None        # noqa: E731
         state = {"kd": [], "ce": [], "tokens": 0}
-        live = Heal(str(stop_file), None, [], 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state)
-        trainer_kw = {"model": mdl, "args": args, "train_dataset": ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
+        lr_at = (lambda st: float(h["lr"]) * round_lr_factor(st + shift, r_start, steps, r_index, int(h["warmup"]), sch)) if rd else None   # noqa: E731
+        live = Heal(str(stop_file), None, [], 0, offset=shift if rd else 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state, lr_at=lr_at, save_at=max_steps if rd else 0)
+        trainer_kw = {"model": mdl, "args": args, "train_dataset": make_ds(round_slice(order, done_steps, per_step)) if rd else ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
         trainer = _trainer_class(SFTTrainer)(**trainer_kw)
         trainer.model_accepts_loss_kwargs = False           # the trainer then divides the loss by the gradient accumulation itself
+        if rd:
+            trainer.round_lr = {"shift": shift, "s_start": r_start, "steps": steps, "index": r_index, "warmup": int(h["warmup"]), "sch": sch}
         targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, int(s["chunk"])))
         trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"])}
         live.distill = trainer.distill
-        if done["before"] is None and eval_fn is not None:
+        if done["before"] is None and eval_fn is not None and not (rd and r_index > 1):
             with protocol.timed("eval", when="before"):
                 done["before"] = eval_fn()
             if done["before"] is not None:
                 protocol.emit("distill_eval", step=0, calib_loss=done["before"])
-        ckpts = ckpt.usable(ckdir)       # a checkpoint cut short by a crash is renamed *.broken and left out
-        resume = (bool(cfg.get("resume")) or n > 0) and bool(ckpts)
         if cfg.get("resume") and not ckpts and n == 0:
             protocol.log("No checkpoint to continue from; starting from the beginning.")
         if n > 0:
@@ -1156,6 +1375,8 @@ def run(cfg: dict) -> int:
                     protocol.emit("distill_eval", step=trainer.state.global_step, calib_loss=after)
             target = out / "adapter"
             trainer.model.save_pretrained(str(target))
+            if rd and not live.stopped:
+                trainer.model.save_pretrained(str(out / "rounds" / f"r{r_index}" / "adapter"))
             return {"after": after, "steps": trainer.state.global_step, "tokens": trainer.distill["tokens"], "stopped": live.stopped, "vram": live._vram(), "target": target}
         finally:
             hist_all.extend(live.history)               # also of a failed attempt: the steps up to its last checkpoint count
@@ -1179,6 +1400,16 @@ def run(cfg: dict) -> int:
                "calib_loss_after": r["after"] if r["after"] is not None else (calib_all[-1][1] if calib_all else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
                "train_seconds": round(time.time() - done["t0"], 1), "peak_vram_mb": r["vram"], "adapter_dir": str(r["target"]), "stopped": r["stopped"],
                "rows": len(order), "tokens_planned": tokens_planned, "settings": used, "optimizer": optim, "oom_retries": tried}
+    if rd:
+        # r["steps"] is HF's step counter: the round's own steps are what it counted since the round began
+        done_in_round = max(0, r["steps"] - gs_start)
+        summary["steps"] = r_start + done_in_round
+        summary["round"] = {"index": r_index, "s_start": r_start, "s_end": r_start + done_in_round, "steps": steps, "tokens": tokens_planned,
+                            "calib_loss_after": summary["calib_loss_after"], "complete": done_in_round >= steps and not r["stopped"]}
+        if summary["round"]["complete"]:
+            rdir = out / "rounds" / f"r{r_index}"
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
     return 0

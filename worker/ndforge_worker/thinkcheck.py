@@ -369,10 +369,31 @@ def fingerprint(model: str) -> str:
     return f"repo:{model}"
 
 
+def adapter_fingerprint(folder: str) -> str:
+    """What identifies a LoRA folder: a hash of its config and of the CONTENT of its weights (rounds of one heal have the same file names and sizes)."""
+    import hashlib
+    p = Path(folder)
+    h = hashlib.sha1()
+    for name in ("adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"):
+        f = p / name
+        if f.is_file():
+            h.update(name.encode() + b"\0")
+            with open(f, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(block)
+    return "adapter:" + h.hexdigest()[:16]
+
+
 def cache_key(job: dict, backend: str, settings: dict) -> dict:
-    """What the numbers depend on: the model, the way it is run and loaded, the suite and every setting. The same key is the same question."""
-    return {"format": CACHE_FORMAT, "model": fingerprint(str(job.get("model") or "")), "backend": backend, "load": job.get("load") or "auto", "suite_version": SUITE_VERSION,
-            "settings": settings}
+    """What the numbers depend on: the model, the way it is run and loaded, the suite and every setting. The same key is the same question.
+    A check of a model WITH a LoRA on top (job key `adapter`, transformers backend: the model as it is while it is trained) adds the LoRA's fingerprint and the double-quant
+    flag; without an adapter the key is exactly what it always was."""
+    key = {"format": CACHE_FORMAT, "model": fingerprint(str(job.get("model") or "")), "backend": backend, "load": job.get("load") or "auto", "suite_version": SUITE_VERSION,
+           "settings": settings}
+    if job.get("adapter"):
+        key["adapter"] = adapter_fingerprint(str(job["adapter"]))
+        key["double_quant"] = bool(job.get("double_quant"))
+    return key
 
 
 def _cached(path: Path, key: dict):
@@ -393,12 +414,17 @@ def _save_cache(path: Path, key: dict, res: dict) -> None:
 
 def run(job: dict) -> int:
     """job think_check: {"model": folder, GGUF file or Hub id, "backend": "hf" | "llama", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path,
-    "cache_file": path (optional)}. With a cache_file, a finished check of the same model, backend, load, suite and settings is answered from it ("cached": true) and a new
+    "cache_file": path (optional), "adapter": LoRA folder (optional, backend hf: the model is the base plus this adapter, NOT merged; "double_quant": bool loads a 4-bit base the way
+    the student is loaded for training)}. With a cache_file, a finished check of the same model, backend, load, suite and settings is answered from it ("cached": true) and a new
     one is saved there (the original model is checked once, however often it is compared). Result: see `result_of` (the numbers of `summarize` for the questions and for the
     thinking-off control, and one entry per question)."""
     protocol.reserve_stdout()
     started = time.monotonic()
     name = job.get("backend") or "hf"
+    if job.get("adapter") and name != "hf":
+        raise ThinkCheckError("A model with a LoRA on top can only be checked with the standard engine (Transformers), not with llama.cpp.")
+    if job.get("adapter") and not Path(str(job["adapter"])).is_dir():
+        raise ThinkCheckError(f"The LoRA folder to check is missing: {job['adapter']}")
     backend = load_backend(name)
     suite = load_suite()
     settings = settings_of(job)

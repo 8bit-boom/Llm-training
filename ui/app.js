@@ -2191,7 +2191,7 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
-  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
+  hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", rounds: false, roundM: 5, firstCheck: 10, roundCheck: "quick", stopRule: "pass", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
   tk: { name: null, data: null, quick: null, gguf: "", run: null, err: null, ok: null } };
 
@@ -2374,6 +2374,72 @@ function healSettings(sp, kn, plan, busy, upcastGb) {
     <div class="row"><button class="secondary" id="hl-reset" ${d}>Reset to safe defaults</button></div></details>`;
 }
 
+// ---- healing in rounds (experimental, docs/HEAL_ROUNDS.md): the settings, the estimate line, the live table of rounds
+const HL_ROUND_SIZES = [1, 2, 5, 10, 20];
+const HL_MIN_STEPS = 8;
+const HL_QUICK_NOISE = "A Quick check asks 16 questions: one or two answers decide pass or fail. That is why the merged model is checked again at the end; if it fails there, healing goes on and then needs two passed checks in a row.";
+const HL_ADAPTER_NOTE = "The checks during healing look at the model as it is trained (4-bit with the learning on top); the merged model can score a little differently. The merged check decides.";
+const HL_EXPERIMENTAL = "Experimental: whether healing in rounds ends as good as one long heal is not known yet.";
+// the optimizer steps of a round, estimated the way the program does: a step reads about half of seq x sequences per update tokens
+function hlRoundSteps(roundM, kn) { const seq = kn.seq || 2048, pu = (kn.batch || 1) * (kn.grad_accum || 1) || 32; return roundM * 1e6 / (0.5 * seq * pu); }
+// the rounds part of what the Heal card sends (null when it is off); `cap` is the most tokens in million
+function hlRoundsSpec(cap, extra) {
+  const sp = rs.hlSpec; if (!sp.rounds) return null;
+  const round = Math.min(sp.roundM, cap), first = Math.max(round, Math.min(sp.firstCheck, cap));
+  return { round_m: round, max_tokens_m: cap, first_check_m: first, check: sp.roundCheck, stop: sp.stopRule, ...(extra || {}) };
+}
+function hlHours(m) { return m ? `${(m[0] / 60).toFixed(0)}-${(m[1] / 60).toFixed(0)}` : ""; }
+// the rows of the table: the saved ones, and the decisions the live events brought after them
+function hlRoundRows(h, run) {
+  const saved = ((h && h.heal && h.heal.rounds && h.heal.rounds.rows) || []).map((r) => ({ n: r.n, tokens_m: r.tokens_m, calib_loss: r.calib_loss, check: r.check, decision: r.decision, seconds: (r.cache_s || 0) + (r.train_s || 0) + (r.check_s || 0) }));
+  ((run && run.rounds) || []).filter((e) => e.decision && !["baseline", "final", "merged_fail"].includes(e.decision)).forEach((e) => {
+    const i = saved.findIndex((r) => r.n === e.round), row = { n: e.round, tokens_m: e.tokens_m, calib_loss: e.calib_loss, check: e.check, decision: e.decision, seconds: null };
+    if (i >= 0) saved[i] = { ...saved[i], ...row, seconds: saved[i].seconds }; else saved.push(row);
+  });
+  return saved.sort((a, b) => a.n - b.n);
+}
+function hlRoundsTable(h, run) {
+  const rows = hlRoundRows(h, run), pct = (x) => (x == null ? "-" : Math.round(x * 100) + " %");
+  if (!rows.length) return "";
+  const dec = { continue: "goes on", stop_pass: "passed: stop", stop_plateau: "no progress: stop", stop_cap: "most tokens: stop", stop_time: "time limit: stop", stop_never: "most tokens: stop" };
+  const body = rows.map((r) => { const m = (r.check && r.check.main) || null;
+    return `<tr><td>${r.n}</td><td>${r.tokens_m}</td><td>${m ? pct(m.closed_rate) : "-"}</td><td>${m ? pct(m.accuracy) : "-"}</td><td>${m ? pct(m.loop_rate) : "-"}</td><td>${r.check && r.check.score != null ? (+r.check.score).toFixed(2) : "-"}</td><td>${r.calib_loss != null ? (+r.calib_loss).toFixed(3) : "-"}</td><td>${esc(dec[r.decision] || r.decision || "running")}</td><td>${r.seconds ? Math.round(r.seconds / 60) + " min" : "-"}</td></tr>`; }).join("");
+  const merged = ((h && h.heal && h.heal.rounds && h.heal.rounds.merged_checks) || []).map((c) => `<p class="warn small">The merged model after round ${c.after_round} did not pass (${esc((c.failed || []).join(", "))}); healing went on.</p>`).join("");
+  const fin = h && h.heal && h.heal.rounds && h.heal.rounds.final ? `<p class="small">The merged model's check (${esc(h.heal.rounds.final.mode || "")}): <strong>${esc(h.heal.rounds.final.verdict)}</strong>.</p>` : "";
+  return `<table id="hl-rounds-table" class="small"><thead><tr><th>Round</th><th>Tokens so far (M)</th><th>Finishes reasoning</th><th>Right</th><th>Loops</th><th>Score</th><th>Loss on your text</th><th>Decision</th><th>Time</th></tr></thead><tbody>${body}</tbody></table>${merged}${fin}`;
+}
+// the controls of the card
+function hlRoundsBox(h, sp, kn, est, busy, thinks, cap) {
+  const d = busy ? "disabled" : "", rt = est && est.rounds ? est.rounds : null, tm = rt && rt.time;
+  const label = thinks ? "Heal in rounds and check after each (stop early when it is good enough) — experimental" : "Heal in rounds and stop when the error stops falling — experimental";
+  let html = `<label class="opt"><input type="checkbox" id="hl-rounds" ${sp.rounds ? "checked" : ""} ${d}> <strong>${label}</strong></label>`;
+  if (!sp.rounds) return html;
+  const steps = (m) => hlRoundSteps(m, kn);
+  const opts = HL_ROUND_SIZES.map((m) => { const few = steps(m) < HL_MIN_STEPS;
+    return `<option value="${m}" ${m === sp.roundM ? "selected" : ""} ${few || m > cap ? "disabled" : ""}>${m} million${m === 5 ? " (recommended)" : ""}${few ? ` — only about ${Math.floor(steps(m))} steps, at least ${HL_MIN_STEPS} are needed` : ""}</option>`; }).join("");
+  const share = tm ? ` loading the models${thinks ? " and the check" : ""} add about ${Math.round(tm.per_round[0] - 0)}-${Math.round(tm.per_round[1])} min of work per round, ${Math.round(tm.overhead_share[0] * 100)}-${Math.round(tm.overhead_share[1] * 100)} % of it overhead` : "";
+  const warnOver = rt && rt.warn_overhead ? ` <span class="warn">More than a fifth of every round is overhead: a longer round is cheaper.</span>` : "";
+  html += `<div class="grid" id="hl-rounds-box">
+    <label>Train before each check<br><select id="hl-round" ${d}>${opts}</select></label>
+    ${thinks ? `<label>No check before<br><select id="hl-firstcheck" ${d}>${[5, 10, 20].map((m) => `<option value="${m}" ${m === sp.firstCheck ? "selected" : ""}>${m} million tokens</option>`).join("")}</select></label>
+    <label>Check<br><select id="hl-roundcheck" ${d}><option value="quick" ${sp.roundCheck === "quick" ? "selected" : ""}>Quick (16 questions, about 10-15 min)</option><option value="full" ${sp.roundCheck === "full" ? "selected" : ""}>Full (32 questions, about 15-25 min)</option></select></label>` : ""}
+    <label>Stop rule<br><select id="hl-stoprule" ${d}><option value="pass" ${sp.stopRule === "pass" ? "selected" : ""}>${thinks ? "Stop at the first passed check" : "Stop when the error stops falling"}</option><option value="never" ${sp.stopRule === "never" ? "selected" : ""}>Never stop early (record the checks; to compare with a normal heal)</option></select></label></div>
+    <p class="dim small" id="hl-round-line">About ${Math.floor(steps(sp.roundM))} training steps per round;${share}.${warnOver} The original's answers are always saved first, round by round.</p>`;
+  if (tm) {
+    html += `<p class="small" id="hl-rounds-est">${thinks ? `If the first check passes: about ${hlHours(tm.best)} h. ` : ""}If it runs to the most tokens: about ${hlHours([tm.worst[0], tm.worst[1]])} h${rt.normal_heal ? ` (a normal heal: ${hlHours(rt.normal_heal)} h)` : ""}. <span class="dim">Formulas, not measurements.</span></p>`;
+  }
+  if (thinks) html += `<p class="warn small" id="hl-quick-noise">${esc(HL_QUICK_NOISE)}</p><p class="warn small" id="hl-adapter-note">${esc(HL_ADAPTER_NOTE)}</p>`;
+  html += `<p class="warn small" id="hl-experimental">${esc(HL_EXPERIMENTAL)}</p>`;
+  return html;
+}
+// after the most tokens without a pass: more rounds on the same run
+function hlMoreBox(h, busy) {
+  const r = h && h.heal && h.heal.rounds;
+  if (!r || r.state !== "ended" || !r.final || ["pass", "warn"].includes(r.final.verdict)) return "";
+  const cap = Math.round(r.cap_m || 0);
+  return `<p class="warn small">The merged model did not pass its thinking check after ${cap} million tokens.</p><div class="row"><button class="secondary" id="hl-more" ${busy ? "disabled" : ""}>Heal 10 M more</button></div>`;
+}
+
 // "Heal it": the original teaches the thinner model to answer like it did
 // `pair`: a model from elsewhere (or another original for a made one), chosen in the Heal section: the same card, bound to the pair
 function healCard(m, pair) {
@@ -2386,7 +2452,7 @@ function healCard(m, pair) {
   const thin = pair ? "the model" : "the thinner model";
   if (m.healed && pair) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3.The original's saved answers stay until you delete this heal.</p>
     <div class="row">${m.healed_model_id ? `<button class="primary" data-rstrain="${esc(m.healed_model_id)}">Train the healed model on your world (Step 3)</button>` : ""}</div></div>`;
-  if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p></div>`;
+  if (m.healed) return `<div class="card-in">${head}<p>Healed: <strong>${esc((rs.state.models.find((x) => x.id === m.healed_model_id) || {}).name || m.healed_model_id || "")}</strong> is in the model list of Step 3 (${m.healed_size_gb} GB). ${m.cache_gb ? `The original's saved answers (${m.cache_gb} GB) stay until you delete this model.` : ""}</p>${rs.hl && rs.hl.name === m.name ? hlRoundsTable(rs.hl.opts, run) + hlMoreBox(rs.hl.opts, rs.running || (run && run.running)) : ""}</div>`;
   if (!h) return `<div class="card-in">${head}<p class="dim">Loading…</p></div>`;
   const sp = rs.hlSpec, st = (h.heal && h.heal.status) || null;
   const recipeOn = hlRecipeOn(h), tk = sp.tokens_m || (recipeOn ? h.recipe.tokens_m : h.default_tokens_m);
@@ -2422,8 +2488,9 @@ function healCard(m, pair) {
     ${h.recipe ? `<label class="opt"><input type="checkbox" id="hl-recipe" ${recipeOn ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Keep thinking</strong> (recommended for reasoning models). ${recipeOn ? `The healing text is ${Math.round(h.recipe.general_share * 100)} % reasoning traces that Qwen3.8-27B itself wrote (${esc(h.recipe.general)}, downloaded from Hugging Face) and the rest your world's text; texts up to ${h.recipe.seq} tokens long, LoRA size ${h.recipe.rank}, ${h.recipe.tokens_m} million tokens${h.recipe.tokens_m > 40 ? " (more, because more than 30 % was cut)" : ""}. It takes longer and needs more memory than the plain recipe. Without this the model learns to answer without thinking, and the exported file's chat template then answers without thinking too.` : `Off: the model is healed on answers without thinking, and the exported file answers without thinking unless asked.`}</label>` : ""}
     <label class="opt"><input type="checkbox" id="hl-general" ${sp.general ? "checked" : ""} ${busy ? "disabled" : ""}> Also use general text (about half of the healing text). <strong>It is downloaded from Hugging Face</strong> (or read from a file you choose) while the original answers; you need an internet connection for that. Without it, or with this box unticked, healing uses your world's text only (general ability comes back less).</label>
     ${sp.general ? gcHtml("heal") : ""}
-    <div class="row">Healing text: <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
+    <div class="row">${sp.rounds ? "At most" : "Healing text:"} <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
       <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
+    ${hlRoundsBox(h, sp, kn, est, busy, recipeOn, tk)}${sp.rounds ? hlRoundsTable(h, run) : ""}
     ${mem}${loss}${note}
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
@@ -2627,13 +2694,14 @@ function madeCard(m) {
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
-  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
-  {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"search_minutes": 30, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
-  {"id": "balanced", "label": "Balanced", "blurb": "Two stages, a lighter first stage (20 M tokens), the same sequence length in both stages so the original writes its answers only once, quick thinking checks (16 questions) and a quick Try first. The last stage keeps the recipe's tokens.", "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
-  {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"search_minutes": 10, "stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false}},
+  {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"search_minutes": 30, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null}},
+  {"id": "balanced", "label": "Balanced", "blurb": "Two stages, a lighter first stage (20 M tokens), the same sequence length in both stages so the original writes its answers only once, quick thinking checks (16 questions) and a quick Try first. The last stage keeps the recipe's tokens.", "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null}},
+  {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"search_minutes": 10, "stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false, "heal_rounds": null}},
+  {"id": "early", "label": "Stop early when good (periodic checks, experimental)", "blurb": "Balanced, but every stage heals in rounds of 5 M tokens with a quick thinking check after each round (not before 10 M) and stops at the first round that passes, then checks the merged model. The cap stays the recipe's tokens. Experimental: nobody has measured yet whether healing in rounds ends as good as one long heal.", "risk": "A quick check asks 16 questions, so one or two answers decide pass or fail; the merged model is checked again at the end and decides. Every round costs about 25 minutes of loading and checking, so a run that never passes takes a few hours longer than Balanced. Whether rounds reach the quality of one long heal is not known yet.", "set": {"search_minutes": 20, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": {"round_m": 5, "check": "quick"}}},
   {"id": "custom", "label": "Custom", "blurb": "Your own choice in the advanced speed settings below.", "risk": "Whatever you set below the recipe is listed in the plan and the report.", "set": {}},
 ];
 const AC_CHIP = { pending: "waiting", running: "running", done: "done", skipped: "skipped", failed: "failed", stopped: "stopped" };
@@ -2653,7 +2721,7 @@ function acDefaults() {
 function acKnobs() {
   const sp = ac.sp;
   return { stages: ac.stages, stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, share_teacher_cache: !!sp.share, quick: !!ac.quick, think_quick: sp.tq == null ? !!ac.quick : !!sp.tq, think_gate: !!ac.gate, think_gate_n: ac.gateN,
-    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix };
+    check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off, imatrix: !!sp.imatrix, heal_rounds: sp.hr || null };
 }
 const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
 // the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
@@ -2661,6 +2729,7 @@ function acPresetNow() {
   const kn = acKnobs();
   const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
     if (k === "search_minutes" || (!ac.thinking && AC_THINK_KNOBS.includes(k))) return true;      // how long the search looks is not part of what makes a recipe
+    if (k === "heal_rounds") return JSON.stringify(kn[k]) === JSON.stringify(v);        // an object: compared by its content
     return kn[k] === (k === "think_quick" && v === null ? p.set.quick : v);
   }));
   return hit ? hit.id : "custom";
@@ -2676,6 +2745,7 @@ function acApplySet(set) {
     if (k === "stages") ac.stages = v; else if (k === "quick") ac.quick = !!v; else if (k === "think_gate") ac.gate = !!v; else if (k === "think_gate_n") ac.gateN = v;
     else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
     else if (k === "search_minutes") ac.sp.search = v;
+    else if (k === "heal_rounds") ac.sp.hr = v ? { ...v } : null;
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
@@ -2683,7 +2753,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2745,6 +2815,23 @@ function acKnobDelta(pl, knob, labelStart) {
   return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
+// "Healing in 5 M rounds: about A-B h if the first check passes, up to C-D h." for every stage, and the warnings once (the plan's own words)
+function acRoundsPlan(pl) {
+  if (!pl || !pl.time || !ac.sp.hr) return "";
+  const rows = (pl.time.steps || []).filter((x) => x.rounds && /\.heal$/.test(x.id));
+  if (!rows.length) return "";
+  const h = (m) => (m / 60).toFixed(0);
+  const lines = rows.map((x) => { const r = x.rounds; return `<li data-acrounds="${esc(x.id)}">${rows.length > 1 ? `Stage ${esc(x.id.slice(1, x.id.indexOf(".")))}: ` : ""}Healing in ${r.round_m} M rounds: about ${h(r.best[0])}-${h(r.best[1])} h if the first check passes, up to ${h(r.worst[0])}-${h(r.worst[1])} h.</li>`; }).join("");
+  const warn = (id, t) => `<div class="warn small" id="${id}">${esc(t)}</div>`;
+  return `<div id="ac-rounds-plan"><ul class="small">${lines}</ul>${ac.thinking ? warn("ac-quick-noise", HL_QUICK_NOISE) + warn("ac-adapter-note", HL_ADAPTER_NOTE) : ""}${warn("ac-rounds-experimental", HL_EXPERIMENTAL)}</div>`;
+}
+// the chips of the rounds of the heal that runs: done, in work, to come
+function acRoundChips(st) {
+  const r = st && st.rounds; if (!r || !r.max) return "";
+  const chips = Array.from({ length: r.max }, (_, i) => { const state = r.stopped || i < r.n - 1 ? "done" : i === r.n - 1 ? "now" : "next"; return `<span class="tag ac-rchip ac-rchip-${state}" title="Round ${i + 1}">${i + 1}</span>`; }).join(" ");
+  return `<div class="ac-rchips small" id="ac-rchips">${chips}</div>`;
+}
+
 function autoCard() {
   const ins = acIns();
   if (!rs.state) return "";
@@ -2756,7 +2843,7 @@ function autoCard() {
   const lock = live ? "disabled" : "";
   const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
     ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
-  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") : "";
+  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") + acRoundsPlan(pl) : "";
   const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)} <span class="tag ac-chip ac-chip-${esc(x.status)}">${esc(AC_CHIP[x.status] || x.status)}</span>${acStepFig(x) ? ` <span class="dim small ac-fig">${esc(acStepFig(x))}</span>` : ""}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
   const status = run ? `<p><strong id="ac-status">${esc(AC_STATUS[run.status] || run.status)}</strong>${run.error ? `: ${esc(run.error)}` : ""} <span class="dim small">${esc(run.id)}</span></p>` : "";
   const ended = run && ["done", "gates_failed", "failed"].includes(run.status);
@@ -2911,7 +2998,7 @@ function acProgressBlock(run, live, nowMs) {
   const pct = Math.round(pr.pct), st = pr.step && pr.step.id ? pr.step : null;
   const head = live ? `${pct} % · ${acDuration((pr.elapsed_s || 0) / 3600)} so far · ${acProgLeft(pr, nowMs)}` : `${run.status === "done" ? "Finished" : "Stopped at " + pct + " %"} · ${acDuration((pr.elapsed_s || 0) / 3600)} spent`;
   const chip = pr.stage && pr.stage.of > 1 ? `<span class="tag ac-stage" id="ac-stagechip">Stage ${pr.stage.n} of ${pr.stage.of}</span> ` : "";
-  const sub = live && st ? `<div class="ac-substep">${st.sub ? `<div class="stepline" aria-live="polite" id="ac-sub">${esc(st.sub)}</div>` : ""}<progress max="100" value="${st.pct}" id="ac-stepbar"></progress> <span class="dim small">${esc(st.label)} (step ${st.index} of ${st.count})</span></div>` : "";
+  const sub = live && st ? `<div class="ac-substep">${st.sub ? `<div class="stepline" aria-live="polite" id="ac-sub">${esc(st.sub)}</div>` : ""}<progress max="100" value="${st.pct}" id="ac-stepbar"></progress> <span class="dim small">${esc(st.label)} (step ${st.index} of ${st.count})</span>${acRoundChips(st)}</div>` : "";
   const back = pr.retry_added_min ? `<p class="dim small" id="ac-retrynote">The bar stepped back once: a thinking check failed and the stage is healed again (about ${acDuration(pr.retry_added_min / 60)} more).</p>` : "";
   const cal = live && pr.calibration && Math.abs(pr.calibration - 1) >= 0.15 ? `<p class="dim small" id="ac-calnote">This computer is running ${pr.calibration > 1 ? "slower" : "faster"} than the plan so far (${pr.calibration.toFixed(2)} times); the steps still to come are counted that way.</p>` : "";
   return `<div class="ac-progress" id="ac-progress"><div class="ac-head">${chip}<strong id="ac-overall-text">${esc(head)}</strong></div>
@@ -3604,6 +3691,7 @@ function onHealEvent(p) {
   if (p.kind === "progress") { run.step = p.heal_step || run.step; run.text = p.text || ""; run.progress = p.value; }
   else if (p.kind === "log") rs.log.push(p.text);
   else if (p.kind === "distill_metric" || p.kind === "distill_eval") { run.step = p.heal_step || run.step; run.live.push(p); }
+  else if (p.kind === "heal_round") { (run.rounds || (run.rounds = [])).push(p); if (p.note) run.text = p.note; }
   else if (p.kind === "error") { run.running = false; rs.error = p.text; rsRefresh(true); return; }
   else if (p.kind === "done") {
     run.running = false;
@@ -3662,7 +3750,8 @@ function rsHealSpec() {
   return { tokens_m: sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, general_share: sp.general ? +(rc && !sp.shareSet ? rc.general_share : sp.share) : 0, recipe: rc ? rc.id : null,
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
-    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null };
+    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null,
+    ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}) };
 }
 
 async function rsMeasure(force) {
@@ -3751,6 +3840,16 @@ function wireReshape() {
   on("hl-safer", () => { if (!healUseSafer()) return; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
   hv("hl-mode", (e) => { hs.mode = e.value; });
+  hv("hl-rounds", (e) => { hs.rounds = e.checked; });
+  hv("hl-round", (e) => { hs.roundM = +e.value; if (hs.firstCheck < hs.roundM) hs.firstCheck = hs.roundM; });
+  hv("hl-firstcheck", (e) => { hs.firstCheck = +e.value; }); hv("hl-roundcheck", (e) => { hs.roundCheck = e.value; }); hv("hl-stoprule", (e) => { hs.stopRule = e.value; });
+  on("hl-more", async () => {
+    const r = rs.hl && rs.hl.opts && rs.hl.opts.heal && rs.hl.opts.heal.rounds; if (!r) return;
+    const cap = Math.round(r.cap_m) + 10, spec = rsHealSpec();
+    spec.rounds = { ...(r.spec || {}), round_m: (r.spec && r.spec.round_m) || hs.roundM, max_tokens_m: cap, extend: true };
+    rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }; rs.ok = null; rs.error = null; rs.log = []; render();
+    try { await invoke("heal_start", { name: rs.hl.name, spec }); } catch (e) { rs.hlRun.running = false; rs.error = String(e); render(); }
+  });
   on("hl-go", async () => {
     rs.hlRun = { running: true, step: "cache", text: "", progress: null, live: [] }; rs.ok = null; rs.error = null; rs.log = []; render();
     try {

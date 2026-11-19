@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use serde::{Deserialize, Serialize};
 
+use super::heal_rounds;
 use super::heal_source;
 use super::plan::{self, Inspect, Mode, ReasoningCalib, ReshapeSpec, Width};
 use crate::envmgr::jobs::{run_job, WorkerEvent};
@@ -771,6 +772,9 @@ pub struct HealSpec {
     /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
     #[serde(default)]
     pub recipe: Option<String>,
+    /// Heal in rounds with a thinking check after each (experimental, docs/HEAL_ROUNDS.md). None = exactly the heal as it always was (the key is then not even written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<super::heal_rounds::RoundSpec>,
 }
 
 impl HealSpec {
@@ -817,6 +821,12 @@ impl HealSpec {
         }
         if self.kl_chunk.is_some_and(|c| !(32..=1024).contains(&c)) || self.k.is_some_and(|k| !(8..=128).contains(&k)) || self.warmup.is_some_and(|w| w > 1000) {
             return bad("KL chunk 32 to 1024, top-k 8 to 128, warm-up 0 to 1000");
+        }
+        if let Some(r) = &self.rounds {
+            r.validate(self)?;
+            if self.mode.as_deref() == Some("online") {
+                return bad("healing in rounds uses the saved answers of the original (not the online way)");
+            }
         }
         Ok(())
     }
@@ -871,9 +881,16 @@ pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &pl
 /// The settings that change the maths of the training step: when one of them differs from the stopped run, its checkpoints cannot be continued.
 /// (Batch, accumulation, gradient checkpointing, the optimizer's 8 bits, the KL chunk, how the original is loaded and the 32-bit embedding copy (`upcast`) are not
 /// in it: they only change the memory, or the numerics of frozen weights, and the checkpoints of the LoRA resume.)
-fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
-    json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr, "tokens": tokens,
-           "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup})
+///
+/// A heal in rounds has no `tokens` (nor the cap) in its key, so that a higher cap (one more stretch after a failed check) continues the same run; the round size and the
+/// version of the round schedule are in it instead (another round size changes where the rounds begin and end).
+pub fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
+    match &spec.rounds {
+        Some(r) => json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr,
+                          "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup, "rounds": {"round": r.round_tokens(), "schedule_v": 1}}),
+        None => json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr, "tokens": tokens,
+                       "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup}),
+    }
 }
 
 /// The settings the worker reports ("heal_settings" / "heal_retry" events) as knobs again.
@@ -967,7 +984,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     spec.validate()?;
     let dir = models_dir(p).join(name);
     let mut model = heal_source::student_folder(&dir)?;     // None: a Hugging Face model that is downloaded first (below)
-    if dir.join("healed").join("config.json").is_file() {
+    if dir.join("healed").join("config.json").is_file() && !rounds_can_extend(&dir, spec) {
         return Err(Error::new("This model has already been healed."));
     }
     let o = heal_source::read_origin(&dir)?;
@@ -987,9 +1004,14 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     if !hp.fits {
         return Err(Error::new(hp.why.clone().unwrap_or_else(|| "Healing does not fit this card.".into())));
     }
-    let train_key = heal_train_key(spec, &ch, spec.tokens());
-    let mode = spec.mode.clone().unwrap_or_else(|| hp.mode.to_string());
-    let tokens = spec.tokens();
+    let rspec = spec.rounds.as_ref();
+    if let Some(r) = rspec.filter(|r| r.round_exact.is_none()) {
+        heal_rounds::check_round_size(ch.knobs.seq, ch.knobs.batch * ch.knobs.grad_accum, r.round_tokens())?;
+    }
+    let tokens = rspec.map(|r| r.cap_tokens(spec)).unwrap_or_else(|| spec.tokens());       // a heal in rounds reads at most the cap
+    let train_key = heal_train_key(spec, &ch, tokens);
+    // healing in rounds always works from the teacher's saved answers: the answers of a round are asked for one chunk at a time
+    let mode = if rspec.is_some() { "cache".to_string() } else { spec.mode.clone().unwrap_or_else(|| hp.mode.to_string()) };
     let source = spec.general_source()?;
     let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
     let general_key = crate::general::key(&general, crate::general::SEED);
@@ -997,7 +1019,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let teacher_load = ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string());
     let rows_key = rows_key(&train, tokens, &origin, &teacher_load);
     if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
-        let need = tokens as f64 * 196.0 / 1e9;
+        let need = tokens as f64 * 196.0 / 1e9 + if rspec.is_some() { 4.0 } else { 0.0 };       // rounds keep two adapters and two checkpoints besides
         if let Some(free) = crate::envmgr::health::free_disk_gb(&dir).filter(|f| *f < need * 1.05) {
             return Err(Error::new(format!("The teacher's answers need {need:.1} GB in {}; {free:.1} GB free.", cache_dir.display())));
         }
@@ -1008,8 +1030,13 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     // (and likewise one that goes on with other settings that change the maths: sequence length, rank, top-k, learning rate, sequences per update ...; a run
     // from before the key was kept cannot be checked, so it starts again too). The teacher's answers are judged by `cache_complete` and are not deleted here.
     let old = read_json(&dir.join("heal.json"));
-    if (old.as_ref().map(|h| h["general_key"].clone()).as_ref() != Some(&general_key) || old.as_ref().map(|h| h["train_key"].clone()).as_ref() != Some(&train_key)) && run_dir.exists() {
-        let _ = std::fs::remove_dir_all(&run_dir);
+    if old.as_ref().map(|h| h["general_key"].clone()).as_ref() != Some(&general_key) || old.as_ref().map(|h| h["train_key"].clone()).as_ref() != Some(&train_key) {
+        if run_dir.exists() {
+            let _ = std::fs::remove_dir_all(&run_dir);
+        }
+        if old.as_ref().is_some_and(|h| !h["rounds"].is_null()) {
+            set_heal(&dir, json!({"rounds": Value::Null}));          // the rounds of another run are not this run's
+        }
     }
     let cal = &o.calibration;
     let mut calibration = json!({"train": train, "samples": cal["samples"].as_u64().unwrap_or(128), "max_len": cal["max_len"].as_u64().unwrap_or(512), "batch": 4, "seed": 3407, "version": version});
@@ -1039,6 +1066,21 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             heal_source::fetch_student(&dir, &stop, on_event).map_err(failed)?
         }
     };
+    if let Some(rs) = rspec {
+        let ctx = RoundsCtx {
+            p, name, dir: dir.clone(), py: py.clone(), model: model.clone(), origin: origin.clone(), family: family.clone(), spec, ch: ch.clone(), method: hp.student_method.to_string(),
+            teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), train: train.clone(), tokens, general: general.clone(), rows_key: rows_key.clone(),
+            cache_dir: cache_dir.clone(), run_dir: run_dir.clone(), stop: stop.clone(), grace, stop_file: stop_file.clone(), calibration: calibration.clone(),
+            student_b, o: &o,
+        };
+        let share = if source.is_some() { spec.general_share } else { 0.0 };
+        let plan = heal_rounds::Plan { spec: rs.clone(), cap: tokens, round: rs.round_tokens(), first_check: rs.first_check_tokens(spec), share, thinking: spec.thinking(), tail_secs: heal_rounds::TAIL_SECS_DEFAULT };
+        return match heal_in_rounds(&ctx, &plan, on_event) {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => Ok(json!({"stopped": true, "name": name})),
+            Err(e) => Err(failed(e)),
+        };
+    }
     if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let job = json!({
             "job": "distill_cache", "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "student": model, "model": {"family": family},
@@ -1106,6 +1148,242 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     write_json(&dir.join("heal_result.json"), &result)?;
     set_heal(&dir, json!({"status": "done", "step": "done", "result": result.clone(), "error": null}));
     Ok(result)
+}
+
+// ----------------------------------------------------------------------------------------------------------------- healing in rounds (docs/HEAL_ROUNDS.md)
+
+/// A heal that ended without a passed check of the merged model may be taken further: `rounds.extend` with a higher cap opens it again.
+fn rounds_can_extend(dir: &Path, spec: &HealSpec) -> bool {
+    let Some(r) = spec.rounds.as_ref().filter(|r| r.extend) else { return false };
+    let Some(st) = read_json(&dir.join("heal.json")).map(|h| h["rounds"].clone()) else { return false };
+    let tokens = st["rows"].as_array().and_then(|a| a.last()).and_then(|x| x["tokens"].as_u64()).unwrap_or(0);
+    st["state"] == "ended" && !matches!(st["final"]["verdict"].as_str(), Some("pass" | "warn")) && r.cap_tokens(spec) > tokens
+}
+
+/// Everything the jobs of a heal in rounds need that `heal()` has worked out.
+struct RoundsCtx<'a> {
+    p: &'a Project,
+    name: &'a str,
+    dir: PathBuf,
+    py: PathBuf,
+    model: PathBuf,
+    origin: String,
+    family: String,
+    spec: &'a HealSpec,
+    ch: HealChoice,
+    method: String,
+    teacher_load: String,
+    train: PathBuf,
+    /// the cap in tokens: the rows of the whole run
+    tokens: u64,
+    general: Value,
+    rows_key: String,
+    cache_dir: PathBuf,
+    run_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    grace: Duration,
+    stop_file: PathBuf,
+    calibration: Value,
+    student_b: f64,
+    o: &'a heal_source::Origin,
+}
+
+struct RealRoundJobs<'a, 'b> {
+    c: &'a RoundsCtx<'a>,
+    events: &'a std::cell::RefCell<&'b mut dyn FnMut(Value)>,
+    round: u32,
+}
+
+impl RealRoundJobs<'_, '_> {
+    /// The settings the worker really used last (an out-of-memory retry may have made them safer): the next round starts there, so the ladder is not climbed again.
+    fn knobs(&self) -> plan::HealKnobs {
+        let per_update = self.c.ch.knobs.batch * self.c.ch.knobs.grad_accum;
+        read_json(&self.c.dir.join("heal.json")).and_then(|h| knobs_from_worker(&h["knobs_now"])).filter(|k| k.batch * k.grad_accum == per_update && k.seq == self.c.ch.knobs.seq).unwrap_or_else(|| self.c.ch.knobs.clone())
+    }
+
+    fn job(&mut self, job: &Value, step: &str) -> Result<Value> {
+        let events = self.events;
+        let round = self.round;
+        let mut f = |mut ev: Value| {
+            ev["round"] = json!(round);
+            (events.borrow_mut())(ev);
+        };
+        heal_job(&self.c.py, &self.c.dir, job, step, &self.c.stop, self.c.grace, &mut f)
+    }
+
+    fn think(&mut self, target: &str, quick: bool, round: Option<u32>) -> Result<Value> {
+        let spec = super::thinkcheck::ThinkSpec { name: self.c.name.to_string(), target: target.into(), quick, round, ..Default::default() };
+        let events = self.events;
+        let n = self.round;
+        let mut f = |mut ev: Value| {
+            ev["phase"] = json!("heal");
+            ev["heal_step"] = json!("check");
+            ev["round"] = json!(n);
+            (events.borrow_mut())(ev);
+        };
+        set_heal(&self.c.dir, json!({"step": "check"}));
+        super::thinkcheck::run(self.c.p, &spec, self.c.stop.clone(), &mut f)
+    }
+
+    fn last_round(&self) -> u32 {
+        read_json(&self.c.dir.join("heal.json")).and_then(|h| h["rounds"]["rows"].as_array().and_then(|r| r.last().and_then(|x| x["n"].as_u64()))).unwrap_or(1) as u32
+    }
+}
+
+impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
+    fn load(&mut self) -> Option<Value> {
+        read_json(&self.c.dir.join("heal.json")).map(|h| h["rounds"].clone()).filter(|r| r.is_object())
+    }
+
+    fn save(&mut self, state: &Value) {
+        set_heal(&self.c.dir, json!({"rounds": state}));
+    }
+
+    fn cache(&mut self, n: u32, upto_general_tokens: u64) -> Result<Value> {
+        self.round = n;
+        let c = self.c;
+        let job = json!({
+            "job": "distill_cache", "teacher": {"repo": c.origin, "load": c.teacher_load}, "student": c.model, "model": {"family": c.family},
+            "data": {"train": c.train, "tokens": c.tokens, "general": c.general}, "k": c.ch.k, "max_seq": c.ch.knobs.seq, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
+            "out": c.cache_dir, "stop_file": c.stop_file, "rows_key": c.rows_key, "shared_cache": true, "shared_dir": teacher_cache_dir(c.p),
+            "upto_general_tokens": upto_general_tokens, "reuse_rows": true,
+        });
+        let r = self.job(&job, "cache")?;
+        if !r["stopped"].as_bool().unwrap_or(false) && n == 1 {
+            let note = r["notes"].as_array().and_then(|a| a.first()).and_then(|x| x.as_str());
+            set_heal(&c.dir, json!({"note": note, "note_code": r["stats"]["general_error_code"], "general_used": {"source": r["stats"]["general_source"], "rows": r["stats"]["general_rows"],
+                                    "tokens": r["stats"]["general_tokens"], "detected": r["stats"]["general_detected"], "skipped": note.is_some()}}));
+        }
+        Ok(r)
+    }
+
+    fn train(&mut self, t: &heal_rounds::TrainRound) -> Result<Value> {
+        self.round = t.n;
+        let c = self.c;
+        let k = self.knobs();
+        let resume = std::fs::read_dir(c.run_dir.join("checkpoints")).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))).unwrap_or(false);
+        let job = json!({
+            "job": "distill", "model": {"repo": c.model, "family": c.family}, "method": c.method, "backend": c.spec.backend.clone().unwrap_or_else(|| "hf".into()),
+            "dataset": {"train": c.train, "general": c.general},
+            "hyper": {"rank": k.rank, "alpha": k.rank, "lr": c.spec.lr, "max_seq": k.seq, "batch": k.batch, "grad_accum": k.grad_accum, "warmup": c.ch.warmup,
+                      "weight_decay": 0.0, "scheduler": "cosine", "seed": 3407, "save_steps": 50, "logging_steps": 1, "tokens": c.tokens,
+                      "checkpointing": if k.checkpointing { "on" } else { "off" }, "optimizer": c.ch.optimizer, "student_b": c.student_b},
+            "distill": {"mode": "cache", "cache": c.cache_dir, "teacher": {"repo": c.origin, "load": c.teacher_load}, "alpha": c.spec.alpha, "k": c.ch.k,
+                        "chunk": k.kl_chunk, "eval_every": 50, "kbit_upcast": k.upcast},
+            "eval": {"calibration": c.calibration, "teacher_loss": c.o.loss_before, "slim_loss": c.o.loss_after},
+            "rounds": {"index": t.n, "round_tokens": t.round_tokens, "general_from": t.general_from, "general_to": t.general_to, "s_start": t.s_start},
+            "out": c.run_dir, "resume": resume, "stop_file": c.stop_file,
+        });
+        std::fs::create_dir_all(&c.run_dir)?;
+        write_json(&c.dir.join("heal_config.json"), &job)?;
+        let r = self.job(&job, "train")?;
+        if !r["stopped"].as_bool().unwrap_or(false) {
+            if let Some(e) = r["general"]["general_error"].as_str() {
+                set_heal(&c.dir, json!({"note": e, "note_code": r["general"]["general_error_code"]}));
+            }
+            if t.n > 2 {
+                let _ = std::fs::remove_dir_all(c.run_dir.join("rounds").join(format!("r{}", t.n - 2)));        // two round adapters are kept
+            }
+        }
+        Ok(r)
+    }
+
+    fn check_round(&mut self, n: u32, quick: bool) -> Result<Value> {
+        self.round = n;
+        self.think("round", quick, Some(n))
+    }
+
+    fn check_original(&mut self, quick: bool) -> Result<Value> {
+        self.think("original", quick, None)
+    }
+
+    fn merge(&mut self) -> Result<Value> {
+        let c = self.c;
+        if c.dir.join("healed").join("config.json").is_file() {
+            return Ok(json!({"stopped": false, "already": true}));
+        }
+        let n = self.last_round();
+        self.round = n;
+        let adapter = [c.run_dir.join("rounds").join(format!("r{n}")).join("adapter"), c.run_dir.join("adapter")].into_iter().find(|a| a.join("adapter_config.json").is_file()).unwrap_or_else(|| c.run_dir.join("adapter"));
+        let summary = read_json(&c.run_dir.join("rounds").join(format!("r{n}")).join("summary.json")).or_else(|| read_json(&c.run_dir.join("summary.json"))).unwrap_or(Value::Null);
+        let mut job = json!({"job": "distill_merge", "base": c.model, "adapter": adapter, "out": c.dir.join("healed.partial"), "final": c.dir.join("healed"), "summary": summary, "stop_file": c.stop_file});
+        if let Some(r) = &c.spec.recipe {
+            job["recipe"] = json!(r);
+        }
+        if c.o.external || c.o.teacher_chosen {
+            job["origin"] = json!({"repo": c.origin, "family": c.family, "params": (c.o.teacher_b * 1e9).round()});
+            job["student_label"] = json!(c.o.student_label);
+        }
+        let outcome = self.job(&job, "merge");
+        let _ = std::fs::remove_dir_all(c.dir.join("healed.partial"));
+        let r = outcome?;
+        if !r["stopped"].as_bool().unwrap_or(false) && !c.dir.join("healed").join("config.json").is_file() {
+            return Err(Error::new("The worker finished but the healed model is missing."));
+        }
+        Ok(r)
+    }
+
+    fn check_merged(&mut self, quick: bool) -> Result<Value> {
+        self.round = self.last_round();
+        self.think("healed", quick, None)
+    }
+
+    fn unmerge(&mut self) -> Result<()> {
+        let c = self.c;
+        let healed = c.dir.join("healed");
+        let repo = healed.canonicalize().unwrap_or(healed.clone()).to_string_lossy().to_string();
+        if let Some(id) = catalog::models().into_iter().find(|m| m.repo == repo).map(|m| m.id) {
+            catalog::remove_custom(&id)?;
+        }
+        let _ = std::fs::remove_dir_all(&healed);
+        // the saved checks of the merged model are of the old weights; the worker's cache key (file names and sizes) would take them for the new ones
+        for mode in ["quick", "full"] {
+            let _ = std::fs::remove_file(super::thinkcheck::think_dir(c.p, c.name).join(format!("healed.{mode}.json")));
+        }
+        set_state(&c.dir, json!({"healed_model_id": Value::Null}));
+        Ok(())
+    }
+
+    fn register(&mut self) -> Result<Value> {
+        let id = register_healed(self.c.p, self.c.name)?;
+        Ok(json!({"model_id": id, "healed_dir": self.c.dir.join("healed")}))
+    }
+
+    fn now_secs(&self) -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+}
+
+/// The heal in rounds; `Ok(None)` when Stop was pressed. The result is the one of a normal heal (the numbers of the last round's training, the model's name and id) with `rounds`.
+fn heal_in_rounds(c: &RoundsCtx, plan: &heal_rounds::Plan, on_event: &mut dyn FnMut(Value)) -> Result<Option<Value>> {
+    let cell = std::cell::RefCell::new(on_event);
+    let mut jobs = RealRoundJobs { c, events: &cell, round: 1 };
+    let mut tell = |e: Value| (cell.borrow_mut())(e);
+    match heal_rounds::run(plan, &mut jobs, &mut tell)? {
+        heal_rounds::Outcome::Stopped(step) => {
+            set_heal(&c.dir, json!({"status": "stopped", "step": step}));
+            Ok(None)
+        }
+        heal_rounds::Outcome::Done(rounds) => {
+            let passed = c.spec.thinking().then(|| matches!(rounds["final"]["verdict"].as_str(), Some("pass" | "warn"))).unwrap_or(true);
+            let last = rounds["rows"].as_array().and_then(|r| r.last()).and_then(|r| r["n"].as_u64()).unwrap_or(1);
+            let mut result = read_json(&c.run_dir.join("rounds").join(format!("r{last}")).join("summary.json")).or_else(|| read_json(&c.run_dir.join("summary.json"))).unwrap_or_else(|| json!({}));
+            result["name"] = json!(c.name);
+            result["model_id"] = jobs_registered(c);
+            result["healed_dir"] = json!(c.dir.join("healed"));
+            result["rounds"] = rounds;
+            if passed {
+                let _ = std::fs::remove_dir_all(c.run_dir.join("checkpoints"));       // kept otherwise: "Heal more" goes on from the last round
+            }
+            write_json(&c.dir.join("heal_result.json"), &result)?;
+            set_heal(&c.dir, json!({"status": "done", "step": "done", "result": result.clone(), "error": null}));
+            Ok(Some(result))
+        }
+    }
+}
+
+fn jobs_registered(c: &RoundsCtx) -> Value {
+    read_json(&c.dir.join("state.json")).map(|s| s["healed_model_id"].clone()).unwrap_or(Value::Null)
 }
 
 /// The chart numbers of a healing run (KL, calibration loss), oldest first, for the page after a restart.
@@ -1420,5 +1698,31 @@ pub fn heal_estimate_with(o: &heal_source::Origin, spec: &HealSpec, vram_gb: Opt
     let dims = plan::HealDims::from_config(&o.config, student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
-    json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum})
+    let mut out = json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum});
+    if let Some(r) = &spec.rounds {
+        out["rounds"] = rounds_estimate_json(o, spec, r, &ch);
+    }
+    out
+}
+
+/// What the Heal card shows for a heal in rounds, additive to the estimate: the steps of a round, the overhead, and the time if the first check passes and if it runs to the cap
+/// (formulas on the reference run: this computer's own timings are not read here).
+fn rounds_estimate_json(o: &heal_source::Origin, spec: &HealSpec, r: &heal_rounds::RoundSpec, ch: &HealChoice) -> Value {
+    use super::auto_time::{rounds_estimate, RoundsIn};
+    let (seq, per_update) = (ch.knobs.seq, ch.knobs.batch * ch.knobs.grad_accum);
+    let cap = r.cap_tokens(spec);
+    let steps = heal_rounds::est_steps(seq, per_update, r.round_tokens());
+    let cap_m = (cap as f64 / 1e6).ceil() as u32;
+    let round_m = ((r.round_tokens() as f64 / 1e6).ceil() as u32).max(1);
+    let rin = RoundsIn {
+        teacher_b: o.teacher_b, student_b: o.student_b, teacher_gb: o.teacher_b * 2.0, student_gb: o.student_b * 2.0, teacher_load: ch.teacher_load.clone().unwrap_or_else(|| "4bit".into()), reuse_m: 0, cap_m,
+        round_m, first_check_m: (r.first_check_tokens(spec) as f64 / 1e6).ceil() as u32, check_quick: r.quick(), final_quick: r.final_is_quick(), thinking: spec.thinking(),
+    };
+    let (parts, t) = rounds_estimate(&crate::timing::History::default(), &rin);
+    let normal = {
+        let n = RoundsIn { round_m: cap_m, first_check_m: cap_m, thinking: false, ..rin.clone() };
+        rounds_estimate(&crate::timing::History::default(), &n).1.worst
+    };
+    json!({"steps_per_round": (steps * 10.0).round() / 10.0, "min_steps": heal_rounds::MIN_ROUND_STEPS, "too_few_steps": r.round_exact.is_none() && steps < heal_rounds::MIN_ROUND_STEPS as f64,
+           "time": t, "parts": parts, "normal_heal": normal, "warn_overhead": t.overhead_share.1 > 0.2, "basis": "formula"})
 }

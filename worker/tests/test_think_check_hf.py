@@ -105,3 +105,45 @@ def test_the_whole_job_through_the_worker_entry(tiny, monkeypatch, tmp_path):
     assert res["main"]["n"] == 16 and res["control"]["n"] == 8 and res["cached"] is False and res["settings"]["max_new"] == 4
     assert sum(1 for x in lines if x["type"] == "think_item") == 24
     assert tc.run({"job": "think_check", "model": str(tiny), "backend": "hf", "load": "16bit", "quick": True, "cache_file": str(tmp_path / "o.json")}) == 0
+
+
+# ------------------------------------------------------------------------------------------------------------ a model with a LoRA on top, not merged
+
+def save_adapter(tiny, folder, b_scale):
+    from peft import LoraConfig, get_peft_model
+    from test_reshape_torch import load
+    pm = get_peft_model(load(tiny), LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules="all-linear"))
+    if b_scale:
+        gen = torch.Generator().manual_seed(5)
+        for name, p in pm.named_parameters():
+            if "lora_B" in name:
+                p.data.copy_(torch.randn(p.shape, generator=gen) * b_scale)
+    pm.save_pretrained(str(folder))
+    return str(folder)
+
+
+def tokens_of(got):
+    return {g["id"]: g["tokens"] for g in got}
+
+
+def test_an_adapter_with_zero_b_gives_the_bases_answers_and_a_trained_one_changes_them(tiny, tmp_path):
+    base = tokens_of(run(tiny, reqs(), {"batch": 8}))
+    zero = save_adapter(tiny, tmp_path / "zero", 0)
+    assert tokens_of(run(tiny, reqs(), {"batch": 8, "adapter": zero})) == base          # PEFT starts with B = 0: the same model, the same seed, the same tokens
+    big = save_adapter(tiny, tmp_path / "big", 1.0)
+    assert tokens_of(run(tiny, reqs(), {"batch": 8, "adapter": big})) != base
+
+
+def test_the_job_with_an_adapter_runs_through_the_worker_entry(tiny, monkeypatch, tmp_path):
+    import io
+    buf = io.StringIO()
+    monkeypatch.setattr(protocol, "_out", buf)
+    monkeypatch.setattr(tc, "MAX_NEW", {"full": 4, "quick": 4, "control": 3})
+    adapter = save_adapter(tiny, tmp_path / "a", 0.5)
+    assert tc.run({"job": "think_check", "model": str(tiny), "backend": "hf", "load": "16bit", "quick": True, "adapter": adapter, "double_quant": True,
+                   "cache_file": str(tmp_path / "round.json")}) == 0
+    lines = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+    res = lines[-1]["data"]
+    assert res["main"]["n"] == 16 and res["cached"] is False
+    saved = json.loads((tmp_path / "round.json").read_text())
+    assert saved["key"]["adapter"].startswith("adapter:") and saved["key"]["double_quant"] is True

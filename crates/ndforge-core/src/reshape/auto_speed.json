@@ -8,7 +8,7 @@
       "risk": "No shortcut. The only risk is the cut itself.",
       "set": {
         "search_minutes": 30, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null,
-        "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true
+        "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null
       }
     },
     {
@@ -18,7 +18,7 @@
       "risk": "The first stage learns half as much and the quick checks are noisier. Runs that healed below the recipe have failed the thinking checks before; the checks will tell, and a failed check costs a retry.",
       "set": {
         "search_minutes": 20, "stages": 2, "stage_a_tokens_m": 20, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true,
-        "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true
+        "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": null
       }
     },
     {
@@ -28,7 +28,17 @@
       "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.",
       "set": {
         "search_minutes": 10, "stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true,
-        "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false
+        "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false, "heal_rounds": null
+      }
+    },
+    {
+      "id": "early",
+      "label": "Stop early when good (periodic checks, experimental)",
+      "blurb": "Balanced, but every stage heals in rounds of 5 M tokens with a quick thinking check after each round (not before 10 M) and stops at the first round that passes, then checks the merged model. The cap stays the recipe's tokens. Experimental: nobody has measured yet whether healing in rounds ends as good as one long heal.",
+      "risk": "A quick check asks 16 questions, so one or two answers decide pass or fail; the merged model is checked again at the end and decides. Every round costs about 25 minutes of loading and checking, so a run that never passes takes a few hours longer than Balanced. Whether rounds reach the quality of one long heal is not known yet.",
+      "set": {
+        "search_minutes": 20, "stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": true, "quick": true, "think_quick": true,
+        "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true, "heal_rounds": {"round_m": 5, "check": "quick"}
       }
     },
     {

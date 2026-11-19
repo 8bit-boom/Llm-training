@@ -162,3 +162,10 @@ both stages", sends the shortest sequence length of the stages to every heal (`H
 original (`distilljob.shared_store_id`: `max_len` and `load` are in it). Then the second stage writes only the tokens it has more. A retry after a failed thinking check heals the healed model again on a budget the
 heal takes (the stage's tokens plus 40 M, rounded up to 10 / 20 / 40 / 80: 40 gives 80): the student learns on all of them, only the original's answers are extended. Not changed by any speed setting: the LoRA size, the
 batch and accumulation, gradient checkpointing, the top-k of the teacher's answers (it is in the key of the saved answers), the general-text share.
+
+## Healing in rounds (experimental)
+
+The Heal card has **Heal in rounds and check after each (stop early when it is good enough)**: the heal is trained in rounds of 1, 2, 5 (recommended), 10 or 20 M tokens, the token choice then
+reads "At most N million tokens" (the cap), the first check comes after 5, 10 or 20 M, the check is Quick or Full, and the stop rule is "the first passed check" or "never" (record the checks, to compare
+with a normal heal). A round with fewer than 8 estimated steps is not offered. The card shows the steps and the overhead of a round, the best and the worst time next to a normal heal's, and a live table
+of the rounds. After the cap without a pass it offers **Heal 10 M more** (the same run goes on). The rules, the schedule, the costs and what is not verified: `docs/HEAL_ROUNDS.md`.

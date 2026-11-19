@@ -2,6 +2,8 @@
 questions in batches with sampling, left padding and the model's own chat template (thinking on: the prompt ends with `<think>\\n`; off: with the empty block).
 
     job: {"model": folder or Hub id, "load": "auto" | "16bit" | "4bit" | "offload", "batch": 8, ...}
+         optional "adapter": a LoRA folder put on top of the loaded model WITHOUT merging it (the model as it is while it is trained; a merged 4-bit model is a different model),
+         "double_quant": true loads a 4-bit base like the student is loaded for training (NF4 with double quantization).
 
 Batched generation of a model with linear-attention layers and left padding is not proven to give the same answers as one question at a time (see docs/THINKING_CHECK.md);
 `"batch": 1` asks one at a time. An out-of-memory error halves the batch and goes on.
@@ -72,7 +74,13 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     est = sum(r.nbytes for r in safetensors_io.list_tensors(folder).values())
     mode = reshapejob._choose_load(job.get("load", "auto"), est)
     protocol.progress("load", 0.0, f"Loading the model ({mode})")
-    model = reshapejob._load(folder, mode)
+    adapter = job.get("adapter")
+    model = reshapejob._load(folder, mode, "load_model", True) if (adapter and job.get("double_quant")) else reshapejob._load(folder, mode)
+    if adapter:
+        from peft import PeftModel
+        protocol.progress("load", 0.8, "Putting the LoRA on the model")
+        model = PeftModel.from_pretrained(model, str(adapter), is_trainable=False)
+        model.eval()
     kernels = speed.report_kernels(model)
     model.config.use_cache = True
     protocol.progress("load", 1.0, "")
