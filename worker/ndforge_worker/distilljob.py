@@ -1102,9 +1102,11 @@ def _callback_class():
             self.history: list = []          # (step, kd, ce)
             self.calib: list = []            # (step, loss)
             self._seen = 0
-            self._lr_set = False
 
         def on_log(self, args, state, control, logs=None, **kw):
+            opt = kw.get("optimizer")
+            if self.lr_at is not None and opt is not None and logs and "loss" in logs:
+                logs["learning_rate"] = float(opt.param_groups[0]["lr"])     # a round: the rate the step really used
             super().on_log(args, state, control, logs=logs, **kw)
             d = self.distill
             if d is None or not logs or "loss" not in logs:
@@ -1135,11 +1137,11 @@ def _callback_class():
         def on_step_begin(self, args, state, control, **kw):
             super().on_step_begin(args, state, control, **kw)
             opt = kw.get("optimizer")
-            if self.lr_at is not None and opt is not None and not self._lr_set:
-                # the optimizer's saved state holds the rate of the END of the last round (and is loaded after the training begins): the first step of this round needs its own
-                self._lr_set = True
+            if self.lr_at is not None and opt is not None:
+                # a round sets the rate of EVERY step itself (the function of the global step): whatever the scheduler or a resumed optimizer state says, the step uses this one
+                lr = self.lr_at(state.global_step)
                 for g in opt.param_groups:
-                    g["lr"] = self.lr_at(state.global_step)
+                    g["lr"] = lr
 
         def on_step_end(self, args, state, control, **kw):
             super().on_step_end(args, state, control, **kw)
