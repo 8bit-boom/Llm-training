@@ -1023,10 +1023,7 @@ fn with_vllm(s: &State<App>, mut spec: ndforge_core::reshape::thinkcheck::ThinkS
         if !v.enabled {
             return Err("The vLLM engine (experimental) is switched off. Switch it on in Settings, vLLM engine, or choose the standard engine.".into());
         }
-        let mut e = ndforge_core::vllm::engine_job(&v);
-        if let Some(g) = ndforge_core::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())) {
-            e["vram_gb"] = serde_json::json!((g * 10.0).round() / 10.0);        // the pick of the weights (16-bit, 8-bit, pre-quantized) depends on the card
-        }
+        let e = ndforge_core::vllm::engine_job_with_card(&v);          // the pick of the weights (16-bit, 8-bit, pre-quantized) depends on the card
         spec.engine = Some(e);
     } else {
         spec.engine = None;

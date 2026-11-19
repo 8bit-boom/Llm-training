@@ -438,6 +438,22 @@ def _save_cache(path: Path, key: dict, res: dict) -> None:
 
 
 def run(job: dict) -> int:
+    """job think_check (the experimental vLLM way with `fallback_hf` true and an adapter: a vLLM problem or an adapter vLLM cannot serve (DoRA, LoftQ) is answered by the standard engine with a plain
+    note, `fallback` in the result: a check of a round never fails because of the experiment); see `_run_one` for the job:"""
+    if job.get("backend") == "vllm" and job.get("adapter") and job.get("fallback_hf"):
+        why = vllm_adapter_problem(str(job["adapter"])) if Path(str(job["adapter"])).is_dir() else ""
+        if not why:
+            try:
+                return _run_one(job)
+            except Exception as exc:                       # noqa: BLE001 - whatever went wrong with the experiment, the standard engine answers
+                why = f"The vLLM engine could not check this round ({protocol.scrub(str(exc))[:200]})."
+        note = why + " The standard engine (Transformers) was used instead."
+        protocol.log(note)
+        return _run_one({**{k: v for k, v in job.items() if k not in ("engine", "_engine_report", "fallback_hf")}, "backend": "hf"}, note)
+    return _run_one(job)
+
+
+def _run_one(job: dict, fallback_note: str | None = None) -> int:
     """job think_check: {"model": folder, GGUF file or Hub id, "backend": "hf" | "llama" | "vllm", "quick": false, "control": true, "load": "auto|4bit|16bit", "stop_file": path,
     "cache_file": path (optional), "adapter": LoRA folder (optional, backend hf: the model is the base plus this adapter, NOT merged; "double_quant": bool loads a 4-bit base the way
     the student is loaded for training)}. With a cache_file, a finished check of the same model, backend, load, suite and settings is answered from it ("cached": true) and a new
@@ -461,13 +477,15 @@ def run(job: dict) -> int:
     key = cache_key(job, name, settings) if cache else None
     if cache and (hit := _cached(cache, key)) is not None:
         protocol.log("This model was checked before with the same settings; the saved numbers are used.")
-        protocol.result({**hit, "cached": True})
+        protocol.result({**hit, "cached": True, **({"fallback": fallback_note} if fallback_note else {})})
         return 0
     main, control = questions(suite, settings)
     stop_file = Path(job["stop_file"]) if job.get("stop_file") else None
     should_stop = (lambda: stop_file.exists()) if stop_file else (lambda: False)
     run_ = run_items(backend, main, control, settings, should_stop, job)
     res = {**result_of(str(job.get("model") or ""), name, settings, run_, time.monotonic() - started), "cached": False}
+    if fallback_note:
+        res["fallback"] = fallback_note
     if name == "vllm":                                                 # additive: what the engine was and how it ran (the numbers are estimates until the self-test ran)
         res["engine"] = {**(key or cache_key(job, name, settings))["engine"], **(job.get("_engine_report") or {})}
     if cache and not res["stopped"]:

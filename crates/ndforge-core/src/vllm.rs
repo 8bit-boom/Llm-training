@@ -236,6 +236,15 @@ pub fn engine_job(s: &VllmSettings) -> Value {
     Value::Object(o)
 }
 
+/// `engine_job` plus the card's memory (the pick of the weights depends on it); asks `nvidia-smi` (remembered for a minute).
+pub fn engine_job_with_card(s: &VllmSettings) -> Value {
+    let mut e = engine_job(s);
+    if let Some(g) = crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())) {
+        e["vram_gb"] = json!((g * 10.0).round() / 10.0);
+    }
+    e
+}
+
 // ------------------------------------------------------------------------------------------------------------------ the self-test
 
 /// Where the self-test writes `vllm_selftest.json` / `.md` (one report, replaced by the next run; it is part of the diagnostics bundle).

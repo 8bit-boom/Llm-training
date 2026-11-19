@@ -402,3 +402,26 @@ fn the_results_keep_the_vllm_numbers_in_their_own_table() {
     assert_eq!(r["vllm_modes"]["full"]["rows"]["original"]["main"]["closed_rate"], json!(1.0));
     assert_eq!(r["vllm_modes"]["full"]["gates"]["cut"]["verdict"], json!("fail"));
 }
+
+#[test]
+fn a_round_goes_through_vllm_only_when_both_switches_are_on_and_may_fall_back() {
+    use ndforge_core::settings::VllmSettings;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-a", 1, "qlora", "org/student");
+    let mut r = spec("slim-a", "round");
+    r.round = Some(1);
+    r.quick = true;
+    let on = VllmSettings { enabled: true, adapter_rounds: true, ..VllmSettings::default() };
+    assert!(round_via_vllm(&VllmSettings::default(), &r).is_none());
+    assert!(round_via_vllm(&VllmSettings { enabled: true, ..VllmSettings::default() }, &r).is_none(), "the engine alone does not change the rounds");
+    assert!(round_via_vllm(&VllmSettings { adapter_rounds: true, ..VllmSettings::default() }, &r).is_none());
+    assert!(round_via_vllm(&on, &spec("slim-a", "cut")).is_none(), "only rounds");
+    let v = round_via_vllm(&on, &r).unwrap();
+    let j = build_job(&p, &v).unwrap();
+    assert_eq!((j["backend"].clone(), j["fallback_hf"].clone(), j["double_quant"].clone()), (json!("vllm"), json!(true), json!(true)));
+    assert!(j["adapter"].as_str().is_some() && j["engine"]["kind"] == json!("auto"));
+    assert!(j["cache_file"].as_str().unwrap().ends_with("round-r1.quick.vllm.json"));
+    let plain = build_job(&p, &r).unwrap();
+    assert!(plain.get("fallback_hf").is_none() && plain["backend"] == json!("hf"), "the round check of the standard engine is as it was");
+}

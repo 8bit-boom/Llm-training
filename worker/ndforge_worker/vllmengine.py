@@ -246,10 +246,22 @@ def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, m
     if api_key:
         args += ["--api-key", api_key]                      # the port may not be loopback-only (WSLc): every request must carry `Authorization: Bearer <key>`
     if quant == "fp8":
-        args += ["--quantization", "fp8"]
+        args += ["--quantization", "fp8"]            # any other value ("none", "prequant:<repo>", "stored:<method>"): nothing is added, vLLM reads the checkpoint's own configuration
     if adapter:
         args += ["--enable-lora", "--max-lora-rank", str(int(lora_rank)), "--lora-modules", f"{ADAPTER_NAME}={adapter}"]
     return args + [str(x) for x in (extra or [])]
+
+
+LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)       # the ranks `--max-lora-rank` accepts (research report)
+
+
+def lora_rank_for(adapter_dir: str) -> int:
+    """The smallest allowed `--max-lora-rank` that holds the adapter's rank `r` (64 when it cannot be read)."""
+    try:
+        r = int(json.loads((__import__("pathlib").Path(adapter_dir) / "adapter_config.json").read_text(encoding="utf-8")).get("r") or 0)
+    except (OSError, ValueError, TypeError):
+        return DEFAULT_LORA_RANK
+    return next((x for x in LORA_RANKS if x >= r), LORA_RANKS[-1]) if r > 0 else DEFAULT_LORA_RANK
 
 
 def container_name(port: int) -> str:
@@ -370,7 +382,8 @@ class Engine:
                 raise EngineError("A LoRA on top is not set up for the wslc way yet (use docker or the url way).")
             args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key)
             return render_template(wslc_templates(self.cfg)["run"], wslc_values(self.cfg, self.port, model_dir, args))
-        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key)
+        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key,
+                          lora_rank=lora_rank_for(self.adapter) if self.adapter else DEFAULT_LORA_RANK)
         return docker_command(self.cfg, self.port, args, mounts=mounts) if self.kind in ("docker", "docker_wsl") else wsl_command(self.cfg, self.port, args)
 
     def start(self) -> None:

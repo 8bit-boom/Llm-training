@@ -41,6 +41,21 @@ Models: prefer a NAMED volume (`ndforge-vllm-hf`, the default for a Hub id) or a
 - **Thinking check card**: the engine choice and the separate vLLM table (see docs/THINKING_CHECK.md).
 - **Before a vLLM check** the checklist asks: an engine is there, the card is free (nothing else above 2 GB), driver and WSL not too old (versions are compared as numbers; unreadable = "unknown, continuing").
 
+## Choosing the weights (step 4)
+
+`vllmquant.pick` decides what the engine loads, from the report's estimates (usable memory = card x 0.88 minus about 6 GB for the cache): the 16-bit weights when they fit; for the 27 B
+ORIGINAL the configured pre-quantized checkpoint (default `cyankiwi/Qwen3.8-27B-AWQ-INT4`: its answers differ a little from the original's, and the result says which weights ran);
+for a cut that does not fit `--quantization fp8` at load (no tools needed); a folder that is already quantized is loaded as stored; if even 8 bits do not fit, a plain message says so.
+`--language-model-only` is always passed. Whether it really fits is for your card: the self-test shows it.
+
+## Rounds of a heal with vLLM (step 5, off by default)
+
+"Check the rounds of a heal (model + LoRA) with vLLM" (Training setup, only with the engine on) serves the base model with `--enable-lora --max-lora-rank <rank> --lora-modules round=<folder>`.
+**Untested and risky**: the report found a forum report of garbled output for LoRA on the linear-attention layers, and our 4-bit double-quantized base cannot be reproduced in vLLM (an 8-bit base
+plus the adapter is "closer to what ships", not "as trained"). Round numbers from vLLM are judged against the original checked the standard way, so keep this OFF until the agreement check of
+the self-test (LoRA folder field) shows the same numbers and sensible answers on 2-3 rounds. DoRA and LoftQ adapters are not served by vLLM: a round with one falls back to the standard
+engine; so does any vLLM problem; the result carries a plain `fallback` note and the log says it. A round check never fails because of the experiment.
+
 ## The vLLM self-test (Training setup, vLLM engine card)
 
 The research report's 1-hour experiment, run for you as far as the app can. You choose a model (a folder or a Hugging Face id; the default is the configured pre-quantized original, about 21 GB:
