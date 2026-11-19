@@ -771,6 +771,9 @@ pub struct HealSpec {
     /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
     #[serde(default)]
     pub recipe: Option<String>,
+    /// Heal in rounds with a thinking check after each (experimental, docs/HEAL_ROUNDS.md). None = exactly the heal as it always was (the key is then not even written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<super::heal_rounds::RoundSpec>,
 }
 
 impl HealSpec {
@@ -817,6 +820,12 @@ impl HealSpec {
         }
         if self.kl_chunk.is_some_and(|c| !(32..=1024).contains(&c)) || self.k.is_some_and(|k| !(8..=128).contains(&k)) || self.warmup.is_some_and(|w| w > 1000) {
             return bad("KL chunk 32 to 1024, top-k 8 to 128, warm-up 0 to 1000");
+        }
+        if let Some(r) = &self.rounds {
+            r.validate(self)?;
+            if self.mode.as_deref() == Some("online") {
+                return bad("healing in rounds uses the saved answers of the original (not the online way)");
+            }
         }
         Ok(())
     }
@@ -871,9 +880,16 @@ pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &pl
 /// The settings that change the maths of the training step: when one of them differs from the stopped run, its checkpoints cannot be continued.
 /// (Batch, accumulation, gradient checkpointing, the optimizer's 8 bits, the KL chunk, how the original is loaded and the 32-bit embedding copy (`upcast`) are not
 /// in it: they only change the memory, or the numerics of frozen weights, and the checkpoints of the LoRA resume.)
-fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
-    json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr, "tokens": tokens,
-           "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup})
+///
+/// A heal in rounds has no `tokens` (nor the cap) in its key, so that a higher cap (one more stretch after a failed check) continues the same run; the round size and the
+/// version of the round schedule are in it instead (another round size changes where the rounds begin and end).
+pub fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
+    match &spec.rounds {
+        Some(r) => json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr,
+                          "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup, "rounds": {"round": r.round_tokens(), "schedule_v": 1}}),
+        None => json!({"seq": c.knobs.seq, "rank": c.knobs.rank, "qlora": c.knobs.qlora, "k": c.k, "alpha": spec.alpha, "lr": spec.lr, "tokens": tokens,
+                       "per_update": c.knobs.batch * c.knobs.grad_accum, "warmup": c.warmup}),
+    }
 }
 
 /// The settings the worker reports ("heal_settings" / "heal_retry" events) as knobs again.
@@ -988,7 +1004,8 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         return Err(Error::new(hp.why.clone().unwrap_or_else(|| "Healing does not fit this card.".into())));
     }
     let train_key = heal_train_key(spec, &ch, spec.tokens());
-    let mode = spec.mode.clone().unwrap_or_else(|| hp.mode.to_string());
+    // healing in rounds always works from the teacher's saved answers: the answers of a round are asked for one chunk at a time
+    let mode = if spec.rounds.is_some() { "cache".to_string() } else { spec.mode.clone().unwrap_or_else(|| hp.mode.to_string()) };
     let tokens = spec.tokens();
     let source = spec.general_source()?;
     let general = source.as_ref().map(|s| crate::general::job_block(s, spec.general_share)).unwrap_or(Value::Null);
