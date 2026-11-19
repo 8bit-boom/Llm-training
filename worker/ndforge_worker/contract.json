@@ -29,7 +29,8 @@
   "think_check_plan",
   "trace_gen",
   "train",
-  "vllm_selftest"
+  "vllm_selftest",
+  "vllm_teacher_check"
  ],
  "events": [
   "distill_eval",
@@ -78,6 +79,7 @@
   "train_failed",
   "unknown_job",
   "usage",
-  "vllm_selftest_failed"
+  "vllm_selftest_failed",
+  "vllm_teacher_check_failed"
  ]
 }
