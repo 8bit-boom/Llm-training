@@ -983,17 +983,86 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
     let m = lock(&s);
     let p = m.project_clone().map_err(|e| e.to_string())?;
     let keep_awake = m.settings.keep_awake;
+    let toasts = m.settings.notifications;
     drop(m);
+    // what the stage notifications need to know: the setting of the run (a continued run keeps its own) and whether it thinks
+    let (notify_stages, thinking) = match (&spec, &resume) {
+        (Some(sp), _) => (sp.notify_stages, sp.keep_thinking),
+        (None, Some(id)) => ndforge_core::reshape::auto::load(&ndforge_core::reshape::auto::run_dir(&p, id)).map(|st| (st.spec.notify_stages, st.spec.keep_thinking)).unwrap_or((true, true)),
+        _ => (true, true),
+    };
     let opts = JobOpts { phase: Some("auto"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "auto", ..JobOpts::new("reshape-event") };
+    let handle = app.clone();
     spawn_job(app, &tasks, opts, move |stop, emit| {
-        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), emit);
-        match (&resume, spec) {
+        let mut bar = AutoBar::new(&handle, toasts && notify_stages, thinking);
+        let mut wrapped = |v: Value| {
+            bar.see(&v);
+            emit(v);
+        };
+        let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), &mut wrapped);
+        let r = match (&resume, spec) {
             (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
             (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
             _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
-        }
-        .map(|st| serde_json::json!(st)).map_err(|e| e.to_string())
+        };
+        drop(fx);
+        bar.reset();
+        r.map(|st| serde_json::json!(st)).map_err(|e| e.to_string())
     })
+}
+
+/// What an Auto-cut shows outside the page: the window title and the taskbar progress (Windows; the other systems ignore the bar), refreshed every 5 seconds, and the
+/// notification at the end of a stage. Both are put back when the run ends.
+struct AutoBar {
+    app: tauri::AppHandle,
+    title0: Option<String>,
+    last: Option<std::time::Instant>,
+    snap: Value,
+    notify: bool,
+    thinking: bool,
+    shown: bool,
+}
+
+impl AutoBar {
+    fn new(app: &tauri::AppHandle, notify: bool, thinking: bool) -> Self {
+        let title0 = app.get_webview_window("main").and_then(|w| w.title().ok());
+        AutoBar { app: app.clone(), title0, last: None, snap: Value::Null, notify, thinking, shown: false }
+    }
+
+    fn see(&mut self, v: &Value) {
+        use tauri::window::{ProgressBarState, ProgressBarStatus};
+        if v["kind"] == "auto_progress" {
+            self.snap = v.clone();
+            if self.last.map(|t| t.elapsed().as_secs() >= 5).unwrap_or(true) {
+                self.last = Some(std::time::Instant::now());
+                if let Some(w) = self.app.get_webview_window("main") {
+                    let _ = w.set_title(&ndforge_core::reshape::auto_progress::title_of(v));
+                    let _ = w.set_progress_bar(ProgressBarState { status: Some(ProgressBarStatus::Normal), progress: Some(v["pct"].as_f64().unwrap_or(0.0).clamp(0.0, 100.0).round() as u64) });
+                    self.shown = true;
+                }
+            }
+        } else if self.notify && v["kind"] == "auto" && v["status"] == "done" {
+            let id = v["auto_step"].as_str().unwrap_or("");
+            if let (Some(n), Some(of)) = (ndforge_core::notify::auto_stage_end(id, self.thinking), self.snap["stage"]["of"].as_u64()) {
+                if (n as u64) < of {
+                    let left = (self.snap["state"] == "live").then(|| self.snap["left_s"][0].as_f64().zip(self.snap["left_s"][1].as_f64()).map(|(a, b)| (a + b) / 120.0)).flatten();
+                    let (t, b) = ndforge_core::notify::stage_toast(n, of as u32, self.snap["pct"].as_f64().unwrap_or(0.0), left);
+                    Toast(self.app.clone()).show(&t, &b);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        use tauri::window::{ProgressBarState, ProgressBarStatus};
+        if !self.shown {
+            return;
+        }
+        if let Some(w) = self.app.get_webview_window("main") {
+            let _ = w.set_title(self.title0.as_deref().unwrap_or("ND Lore Forge"));
+            let _ = w.set_progress_bar(ProgressBarState { status: Some(ProgressBarStatus::None), progress: None });
+        }
+    }
 }
 
 /// Stop: the running job ends at its next safe point, the run keeps its state and can be continued.

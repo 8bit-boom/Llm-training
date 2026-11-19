@@ -2627,7 +2627,7 @@ function madeCard(m) {
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
-  sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+  sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
@@ -2682,7 +2682,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, notify_stages: ac.notifyStages !== false, ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2777,6 +2777,7 @@ function autoCard() {
     ${acSpeedBlock(pl, live)}
     <div class="row"><label><input type="radio" name="ac-stages" value="2" ${ac.stages === 2 ? "checked" : ""} ${lock}> Two stages (recommended)${acKnobDelta(pl, "stages", "Two")}</label> <label><input type="radio" name="ac-stages" value="1" ${ac.stages === 1 ? "checked" : ""} ${lock}> One stage${acKnobDelta(pl, "stages", "One")}</label>
       <label><input type="radio" name="ac-quick" value="full" ${ac.quick ? "" : "checked"} ${lock}> Full${acKnobDelta(pl, "quick", "Full")}</label> <label><input type="radio" name="ac-quick" value="quick" ${ac.quick ? "checked" : ""} ${lock}> Quick${acKnobDelta(pl, "quick", "Quick")} <span class="dim small">(Try first)</span></label></div>
+    <label class="opt"><input type="checkbox" id="ac-notify" ${ac.notifyStages !== false ? "checked" : ""} ${lock}> Tell me when a stage has been healed <span class="dim small">a message from the system with the percentage and the time left (needs “Tell me when a job has finished” on the Home page)</span></label>
     <label class="opt"><input type="checkbox" id="ac-keep" ${ac.keep ? "checked" : ""} ${lock}> Keep the intermediate files (needs much more disk)</label>
     ${pl && pl.candidates && pl.candidates.some((c) => c.needs_confirmation) ? `<label class="opt"><input type="checkbox" id="ac-many" ${ac.many ? "checked" : ""} ${lock}> I confirm that more than 4 whole blocks may be removed (reasoning suffers first)</label>` : ""}
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
@@ -2933,7 +2934,7 @@ function wireAuto() {
   const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
   set("ac-target", (e) => { ac.target = +e.value; });
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
-  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
+  set("ac-think", (e) => { ac.thinking = e.checked; }); set("ac-gate", (e) => { ac.gate = e.checked; }); set("ac-keep", (e) => { ac.keep = e.checked; }); set("ac-notify", (e) => { ac.notifyStages = e.checked; }); set("ac-many", (e) => { ac.many = e.checked; });
   set("ac-publish", (e) => { ac.publish = e.checked; });
   set("ac-gbon", (e) => { ac.gbOn = e.checked; }); set("ac-gb", (e) => { ac.gb = e.value.trim(); });
   document.querySelectorAll("input[name=ac-preset]").forEach((r) => r.onchange = () => { if (r.value === "custom") ac.advOpen = true; else acApplyPreset(r.value); render(); });

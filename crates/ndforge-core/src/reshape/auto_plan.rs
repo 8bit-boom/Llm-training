@@ -120,13 +120,16 @@ pub struct AutoSpec {
     /// "I have at most this many hours": the planner drops the least harmful settings until the estimate fits (1 to 336); None = no limit
     #[serde(default)]
     pub max_hours: Option<f64>,
+    /// a desktop notification when a stage has been healed (and checked): "stage 1 of 2 healed, 48 %, about 14 h left"
+    #[serde(default = "yes")]
+    pub notify_stages: bool,
 }
 
 impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true,
         }
     }
 

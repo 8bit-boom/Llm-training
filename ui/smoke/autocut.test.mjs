@@ -59,7 +59,7 @@ test("the spec follows the choices, the plan is asked with the model's descripti
   await tick();
   const c = b.calls.find((x) => x[0] === "auto_plan");
   // Balanced was chosen for the big model; one stage instead of two makes it Custom. The speed fields are all sent.
-  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true,
+  assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", notify_stages: true, target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true,
     preset: "custom", stage_a_tokens_m: 20, last_tokens_m: null, think_quick: true, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: true, imatrix: true });
   assert.equal(c[1].inspect.total_params, 27.78e9);
   assert.equal(b.run("ac.plan.ok"), true);
@@ -405,4 +405,14 @@ test("a stopped run shows where it stopped and every step its status, estimate a
   assert.match(html, /ac-chip-pending">waiting</);
   assert.match(html, /est\. 3 h to 5 h/);
   assert.match(html, /took 5 min/);
+});
+
+test("the stage notification is on by default, can be switched off and goes into the spec", () => {
+  const b = browser();
+  open(b);
+  assert.match(card(b), /id="ac-notify" checked/);
+  assert.equal(b.run("acSpec().notify_stages"), true);
+  b.run("ac.notifyStages = false");
+  assert.equal(b.run("acSpec().notify_stages"), false);
+  assert.doesNotMatch(card(b), /id="ac-notify" checked/);
 });

@@ -73,3 +73,32 @@ fn a_webhook_gets_one_plain_text_post() {
     let req = t.join().unwrap();
     assert!(req.starts_with("POST /topic ") && req.ends_with("ND Lore Forge: the export finished"), "{req}");
 }
+
+#[test]
+fn the_stage_and_end_texts_of_an_auto_cut() {
+    use ndforge_core::notify::*;
+    use serde_json::json;
+    assert_eq!(auto_stage_end("s1.check_heal", true), Some(1));
+    assert_eq!(auto_stage_end("s2.heal", true), None);
+    assert_eq!(auto_stage_end("s2.heal", false), Some(2));
+    assert_eq!(auto_stage_end("export", true), None);
+    assert_eq!(stage_toast(1, 2, 47.6, Some(840.0)), ("Auto-cut: stage 1 of 2 healed".to_string(), "48 % done, about 14 h left.".to_string()));
+    assert_eq!(stage_toast(1, 2, 47.6, None).1, "48 % done.");
+    let done = json!({"progress": {"elapsed_s": 111600.0}, "plan": {"time": {"total_h": [28.0, 40.2]}}});
+    assert_eq!(auto_done_body(&done), "It is done. It took 31 h (estimated 28-40 h).");
+    assert_eq!(auto_done_body(&json!({})), "It is done.");
+    assert_eq!(toast("auto", &Ok(done)).1, "It is done. It took 31 h (estimated 28-40 h).");
+    assert_eq!(toast("export", &Ok(json!({}))).1, "It is done.");
+    // the webhook still names the kind and the result only
+    assert_eq!(webhook_text("auto", "finished"), "ND Lore Forge: auto-cut finished");
+}
+
+#[test]
+fn the_window_title_comes_from_the_snapshot() {
+    use ndforge_core::reshape::auto_progress::title_of;
+    use serde_json::json;
+    let snap = json!({"pct": 42.3, "state": "live", "left_s": [50400.0, 61200.0], "stage": {"n": 1, "of": 2}, "step": {"label": "Stage 1 of 2: heal"}});
+    assert_eq!(title_of(&snap), "Auto-cut 42 % · stage 1 of 2: heal · about 15 h 30 min left");
+    let est = json!({"pct": 3.0, "state": "estimating", "left_s": [1.0, 2.0], "stage": null, "step": {"label": "Measure the model"}});
+    assert_eq!(title_of(&est), "Auto-cut 3 % · Measure the model");
+}

@@ -333,6 +333,15 @@ pub fn title_text(pct: f64, stage: Option<(u32, u32)>, step_label: &str, left_mi
     t
 }
 
+/// The window title for an `auto_progress` snapshot: "Auto-cut 42 % · stage 1 of 2: heal · about 14 h left" (none while the time left is still being estimated).
+pub fn title_of(snap: &Value) -> String {
+    let stage = snap["stage"]["n"].as_u64().zip(snap["stage"]["of"].as_u64()).map(|(n, of)| (n as u32, of as u32));
+    let label = snap["step"]["label"].as_str().unwrap_or("working");
+    let label = label.split_once(": ").map(|x| x.1).unwrap_or(label);
+    let left = (snap["state"] == "live").then(|| snap["left_s"][0].as_f64().zip(snap["left_s"][1].as_f64()).map(|(a, b)| (a + b) / 120.0)).flatten();
+    title_text(snap["pct"].as_f64().unwrap_or(0.0), stage, label, left)
+}
+
 // ------------------------------------------------------------------------------------------------------------------ the tracker
 
 use serde_json::json;
