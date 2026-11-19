@@ -46,9 +46,9 @@ def body_of(request: dict, settings: dict, model: str = vllmengine.SERVED_NAME) 
             "seed": settings["seed"], "max_tokens": request["max_new"], "stream": False, "chat_template_kwargs": {"enable_thinking": bool(request["thinking"])}}
 
 
-def ask(url: str, request: dict, settings: dict, model: str = vllmengine.SERVED_NAME) -> dict:
+def ask(url: str, request: dict, settings: dict, model: str = vllmengine.SERVED_NAME, api_key: str = "") -> dict:
     data = json.dumps(body_of(request, settings, model)).encode("utf-8")
-    req = urllib.request.Request(url + "/v1/chat/completions", data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url + "/v1/chat/completions", data=data, headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {api_key}"} if api_key else {})})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             out = json.loads(r.read().decode("utf-8"))
@@ -96,7 +96,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
         t_gen[0] = time.monotonic()
         pool = ThreadPoolExecutor(max_workers=int(job.get("parallel") or DEFAULT_PARALLEL))
         model = served_model(job)
-        pending = {pool.submit(ask, engine.url, r, settings, model) for r in requests}
+        pending = {pool.submit(ask, engine.url, r, settings, model, engine.api_key) for r in requests}
         while pending and not should_stop():                    # looks at the Stop file twice a second while the questions run
             done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
             for f in done:

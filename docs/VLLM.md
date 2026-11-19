@@ -34,18 +34,27 @@ Models: prefer a NAMED volume (`ndforge-vllm-hf`, the default for a Hub id) or a
 
 ## WSLc (WSL 3.x containers)
 
-What we know: only release-note titles of WSL 3.0.x (3.0.1 is "generally available", 29 September 2026): a built-in Linux container CLI/SDK with its own `wslc` command; titles mention
-`wslc run`, `wslc create`, `--cap-add/--cap-drop`, `wslc network create --ipv6`, "WSLC GPU containers", "Fix WSLC GPU hook execution and library discovery", "Expose VGEM DRM nodes to
-WSLC GPU containers". We could not read the `wslc` reference. **We do not know** its option names, the GPU option, registry support, bind-mount syntax, port forwarding, or whether it
-accepts an unmodified Docker Hub image such as `vllm/vllm-openai`.
+What we know, from the owner's `wslc --help` and `wslc run --help` (3.0.x): the global option `--session`; top-level commands `container image network registry settings system volume attach build cp create exec events export images import info inspect kill list load login logout logs pull push remove restart rmi run save start stats stop tag version`. `wslc run [options] <image> [<command>] [<arguments>...]` has `-d/--detach`, `--gpus` ("Add GPU devices to the container ('all' to pass all GPUs)"), `-v/--volume`, `--mount`, `-p/--publish`, `--name`, `--rm`, `-e/--env`, `--shm-size`, `--pull (always|missing|never)`, `--entrypoint`, `--network`, and more. **There is no `--ipc` option** (docker's `--ipc=host` does not exist here): the shared memory vLLM needs is `--shm-size` (default 16g).
 
-So the command lines are TEMPLATES (a guess modelled on docker; `{gpu_flag}` is empty because we do not know the GPU option):
+What we have NOT seen: the options of `wslc stop`, `wslc remove`, `wslc volume ...`. **Every command is a template you can edit** in Settings (the combination is untested):
 
-    run     wslc run -d --name {name} -p 127.0.0.1:{port}:8000 -v {model_dir}:/models {gpu_flag} {image} {args}
-    stop    wslc stop {name}
-    remove  wslc rm -f {name}
-    logs    wslc logs {name}
+    run      wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}
+    stop     wslc stop {name}
+    remove   wslc remove {name}        (in a finally; "no such container" is fine because of --rm)
+    logs     wslc logs {name}          list: wslc list      pull: wslc pull {image}
+    gputest  wslc run --rm {gpu_flag} {test_image} nvidia-smi
 
-Placeholders: `{name} {port} {image} {model_dir} {args} {gpu_flag}`. Edit them in Settings (engine "wslc" templates) after reading `wslc run --help`. The self-test saves the verbatim
-output of `wslc --version`, `--help`, `run --help`, `pull --help`, `volume --help`, `network --help` into `vllm_selftest.json/.md` ("wslc help (for adapting the templates)").
-Please paste `wslc run --help` into an issue so the real defaults can be set. The report says "wslc syntax unverified".
+Placeholders: `{name} {port} {image} {model_dir} {args} {gpu_flag} {shm} {publish} {env} {test_image}`; defaults `gpu_flag` = `--gpus all`, `shm` = `16g`, `publish` = `{port}:8000`
+(`publish_loopback` = `127.0.0.1:{port}:8000`), `test_image` = `nvidia/cuda:13.0.0-base-ubuntu24.04`.
+
+**Security note.** Whether `-p 127.0.0.1:<port>:8000` is accepted (loopback only) is unknown, so the default publishes `<port>:8000`, which may be reachable from your network. For that
+reason the engine ALWAYS starts vLLM with a fresh random `--api-key` per run (every engine kind) and the worker sends `Authorization: Bearer <key>`; the key is never logged (it is on
+the scrub list and removed from recorded command lines). The self-test tries the loopback form once and records which works.
+
+Unknowns the self-test is meant to answer: whether Docker Hub images (`vllm/vllm-openai`) pull unmodified (`--pull missing` suggests registries work; `wslc registry` and `wslc login`
+exist), whether `-v C:\path:/models` bind mounts work and how slow they are (`wslc volume` would be the fast way, its syntax is unseen), whether `--gpus all` exposes CUDA to
+PyTorch and vLLM inside WSLc (release notes mention "WSLC GPU containers" and "enable inbox gpu libs"), and whether the images' CUDA 13 userspace works with the WSLc GPU libraries.
+
+The self-test saves the verbatim output of `wslc --version`, `info`, `--help`, `run --help`, `system --help`, `container --help`, `stop --help`, `remove --help`, `list --help`,
+`logs --help`, `pull --help`, `volume --help`, `volume create --help`, `network --help` and `registry --help` into `vllm_selftest.json/.md` ("wslc help (for adapting the templates)"),
+runs the GPU test image first, and says "wslc syntax unverified". Please paste the report into an issue so the real defaults can be set.

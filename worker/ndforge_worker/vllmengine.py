@@ -8,7 +8,7 @@ Five ways to have a server (`engine["kind"]`; "auto" tries docker, docker_wsl, w
     docker      `docker run --rm --gpus all --ipc=host -p 127.0.0.1:<port>:8000 --name ndforge-vllm-<port> <image> <vllm flags>` (Windows docker.exe / Docker Desktop)
     docker_wsl  the same `docker ...` commands, each run as `wsl.exe [-d <distro>] -- docker ...` (a Docker engine installed INSIDE WSL; Linux paths, `C:` drive paths -> `/mnt/c/...`)
     wsl         `wsl.exe -d <distro> -- <venv>/bin/vllm serve <model> <vllm flags>` (Windows paths become /mnt/<drive>/...)
-    wslc        WSLc, the container command of WSL 3.x (`wslc run ...`): its syntax is UNVERIFIED, the command lines are TEMPLATES the owner can edit (see WSLC_TEMPLATES)
+    wslc        WSLc, the container command of WSL 3.x (`wslc run ...`): options from the owner's `wslc --help`, the combination untested, the command lines are TEMPLATES the owner can edit (WSLC_TEMPLATES)
     url         an already running server (`engine["url"]`): nothing is started and nothing is stopped.
 What WSL 3.x changes is untested by us (the report only covered WSL 2.7.x): versions are compared as numbers, 2.7.3 and newer (3.x too) are fine, an unreadable version is "unknown".
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import secrets
 import shutil
 import socket
 import subprocess
@@ -49,11 +50,17 @@ DEFAULT_LORA_RANK = 64
 DEFAULT_START_TIMEOUT = 1500                            # seconds: image pull + model load + graph capture; the report expects 2-5 minutes
 STOP_TIMEOUT = 60
 KINDS = ("docker", "docker_wsl", "wslc", "wsl", "url")
-# WSLc (WSL 3.x containers): NOTHING below is verified. These are GUESSES modelled on docker's syntax. `{gpu_flag}` is EMPTY by default because we do not know the GPU option:
-# the owner reads `wslc run --help` (the self-test saves it in its report) and edits the templates in the settings (engine["wslc"] = {"run": ..., "stop": ..., "remove": ..., "logs": ..., "gpu_flag": ...}).
-WSLC_TEMPLATES = {"run": "wslc run -d --name {name} -p 127.0.0.1:{port}:8000 -v {model_dir}:/models {gpu_flag} {image} {args}", "stop": "wslc stop {name}", "remove": "wslc rm -f {name}",
-                  "logs": "wslc logs {name}", "gpu_flag": ""}
-WSLC_HELP_COMMANDS = (["wslc", "--version"], ["wslc", "--help"], ["wslc", "run", "--help"], ["wslc", "pull", "--help"], ["wslc", "volume", "--help"], ["wslc", "network", "--help"])
+# WSLc (WSL 3.x containers). The options below are "from the owner's `wslc --help` / `wslc run --help` (3.0.x)"; the COMBINATION is UNTESTED, and the syntax of `wslc stop`, `wslc remove`,
+# `wslc volume ...` is not yet seen. So every command line is a TEMPLATE the owner can edit (engine["wslc"] = {"run": ..., "stop": ..., ...}). wslc has no `--ipc`: the shared memory
+# vLLM needs is `--shm-size`. Whether `-p 127.0.0.1:<port>:8000` is accepted (loopback only) is UNKNOWN: the default publishes `<port>:8000`, which may be reachable from the network,
+# which is one reason the engine always starts vLLM with a per-run API key (`--api-key`).
+WSLC_TEMPLATES = {"run": "wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}",
+                  "stop": "wslc stop {name}", "remove": "wslc remove {name}", "logs": "wslc logs {name}", "list": "wslc list", "pull": "wslc pull {image}",
+                  "gputest": "wslc run --rm {gpu_flag} {test_image} nvidia-smi",
+                  "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04"}
+WSLC_HELP_COMMANDS = (["wslc", "--version"], ["wslc", "info"], ["wslc", "--help"], ["wslc", "run", "--help"], ["wslc", "system", "--help"], ["wslc", "container", "--help"],
+                      ["wslc", "stop", "--help"], ["wslc", "remove", "--help"], ["wslc", "list", "--help"], ["wslc", "logs", "--help"], ["wslc", "pull", "--help"],
+                      ["wslc", "volume", "--help"], ["wslc", "volume", "create", "--help"], ["wslc", "network", "--help"], ["wslc", "registry", "--help"])
 HELP_LIMIT = 8000
 KIND_NAMES = {"docker": "Docker Desktop", "docker_wsl": "Docker inside WSL", "wslc": "WSLc (WSL 3.x containers)"}
 MIN_WSL = (2, 7, 3)                                     # from the research report (the CUDA-graph crash fix); newer, 3.x included, is assumed fine
@@ -153,6 +160,11 @@ def render_template(template: str, values: dict) -> list:
     return out
 
 
+def redact(cmd: list, secret: str) -> list:
+    """The command line without the API key (it is kept in `Engine.commands` and shown in reports)."""
+    return [str(x).replace(secret, "[key]") if secret else str(x) for x in cmd]
+
+
 def wslc_templates(cfg: dict) -> dict:
     return {**WSLC_TEMPLATES, **{k: v for k, v in (cfg.get("wslc") or {}).items() if k in WSLC_TEMPLATES}}
 
@@ -225,12 +237,14 @@ def engine_config(job: dict) -> dict:
 
 
 def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, max_len: int = DEFAULT_MAX_MODEL_LEN, max_seqs: int = DEFAULT_MAX_SEQS,
-               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None) -> list:
+               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None, api_key: str | None = None) -> list:
     """The vLLM flags (all from the research report, untested): no reasoning parser (the template ends the prompt with `<think>\\n`), model defaults off
     (`--generation-config vllm`), vision tower off, the served name `model`. `quant`: "none" | "fp8" (`--quantization fp8`) | anything else is a pre-quantized checkpoint (nothing added:
     vLLM reads its own quantization config). `adapter`: the path (as the server sees it) of a LoRA folder, served as `round`."""
     args = ["--model", model, "--served-model-name", SERVED_NAME, "--language-model-only", "--generation-config", "vllm", "--max-model-len", str(int(max_len)),
             "--max-num-seqs", str(int(max_seqs)), "--gpu-memory-utilization", f"{float(gpu_util):g}"]
+    if api_key:
+        args += ["--api-key", api_key]                      # the port may not be loopback-only (WSLc): every request must carry `Authorization: Bearer <key>`
     if quant == "fp8":
         args += ["--quantization", "fp8"]
     if adapter:
@@ -260,9 +274,14 @@ def wsl_command(cfg: dict, port: int, args: list, *, exe: str = "wsl.exe") -> li
     return cmd + rest + ["--host", "127.0.0.1", "--port", str(int(port))]
 
 
-def wslc_values(cfg: dict, port: int, model_dir: str, args: list) -> dict:
+def wslc_values(cfg: dict, port: int, model_dir: str, args: list, loopback: bool = False) -> dict:
     t = wslc_templates(cfg)
-    return {"name": container_name(port), "port": int(port), "image": cfg["image"], "model_dir": model_dir, "args": list(args), "gpu_flag": t["gpu_flag"]}
+    env: list = []
+    for item in t["env"] if isinstance(t["env"], list) else []:      # ["-e", "K=V"] words or "K=V" strings
+        env.append(str(item))
+    publish = str(t["publish_loopback"] if loopback else t["publish"]).replace("{port}", str(int(port)))
+    return {"name": container_name(port), "port": int(port), "image": cfg["image"], "model_dir": model_dir, "args": list(args), "gpu_flag": t["gpu_flag"], "shm": t["shm"],
+            "publish": publish, "env": env, "test_image": t["test_image"]}
 
 
 def stop_commands(cfg: dict, port: int, *, wsl: str = "wsl.exe") -> list:
@@ -316,6 +335,8 @@ class Engine:
         self.ready_seconds = None
         self.stopped = False
         self.commands: list = []
+        self.api_key = str(cfg.get("api_key") or "") if self.kind == "url" else secrets.token_urlsafe(24)   # a started server gets a fresh key every run
+        protocol.add_secret(self.api_key)
 
     # --- what to run
     def build(self) -> list:
@@ -335,7 +356,7 @@ class Engine:
             if adapter:
                 mounts.append((host(adapter), "/models/adapter", "ro"))
                 adapter = "/models/adapter"
-        else:
+        elif self.kind == "wsl":
             model = wsl_path(model) if is_local_path(model) else model
             adapter = wsl_path(adapter) if adapter else adapter
         if self.kind == "wslc":                                # the folder is mounted at /models; a Hub id downloads into the named volume mounted there (UNVERIFIED)
@@ -347,9 +368,9 @@ class Engine:
                 extra += ["--download-dir", "/models"]
             if adapter:
                 raise EngineError("A LoRA on top is not set up for the wslc way yet (use docker or the url way).")
-            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra)
+            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key)
             return render_template(wslc_templates(self.cfg)["run"], wslc_values(self.cfg, self.port, model_dir, args))
-        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args)
+        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key)
         return docker_command(self.cfg, self.port, args, mounts=mounts) if self.kind in ("docker", "docker_wsl") else wsl_command(self.cfg, self.port, args)
 
     def start(self) -> None:
@@ -357,13 +378,16 @@ class Engine:
         if self.kind == "url":
             return
         cmd = self.build()
-        self.commands.append(cmd)
+        self.commands.append(redact(cmd, self.api_key))
         self.url = f"http://127.0.0.1:{self.port}"
         self.log = tempfile.TemporaryFile()
         try:
             self.proc = _popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **_win_kw())
         except OSError as exc:
             raise EngineError(f"The vLLM engine could not be started ({cmd[0]}: {exc}). Is {KIND_NAMES.get(self.kind, 'WSL')} installed and running?") from exc
+
+    def headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
     def log_text(self) -> str:
         if self.kind == "wslc" and self.proc is not None:                  # detached: ask for the container's log
@@ -391,7 +415,7 @@ class Engine:
             if should_stop():
                 return
             try:
-                with urllib.request.urlopen(self.url + "/health", timeout=5) as r:
+                with urllib.request.urlopen(urllib.request.Request(self.url + "/health", headers=self.headers()), timeout=5) as r:
                     if r.status == 200:
                         self.ready_seconds = round(time.monotonic() - (self.started_at or time.monotonic()), 1)
                         return
@@ -404,7 +428,7 @@ class Engine:
     def server_version(self) -> str:
         """The version the running server reports (`GET /version`, from the research report; "" when it does not answer)."""
         try:
-            with urllib.request.urlopen(self.url + "/version", timeout=5) as r:
+            with urllib.request.urlopen(urllib.request.Request(self.url + "/version", headers=self.headers()), timeout=5) as r:
                 return str(json.loads(r.read().decode("utf-8")).get("version") or "")
         except (urllib.error.URLError, OSError, ValueError, AttributeError):
             return ""
@@ -414,7 +438,7 @@ class Engine:
         self.stopped = True
         if self.kind != "url":
             for cmd in stop_commands(self.cfg, self.port):
-                self.commands.append(cmd)
+                self.commands.append(redact(cmd, self.api_key))
                 try:
                     _run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=STOP_TIMEOUT, **_win_kw())
                 except (OSError, subprocess.SubprocessError):
