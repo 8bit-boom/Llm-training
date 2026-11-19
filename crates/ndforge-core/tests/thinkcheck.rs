@@ -377,6 +377,9 @@ fn the_vllm_way_is_its_own_backend_with_its_own_result_files() {
     assert_eq!(j["cache_file"], json!(t.join("cut.quick.vllm.json")), "kept apart: the gates compare a model with the original of the SAME way");
     s.engine = None;
     assert_eq!(build_job(&p, &s).unwrap()["engine"], json!({"kind": "auto"}));
+    let mut o = spec("slim-a", "original");
+    o.backend = Some("vllm".into());
+    assert_eq!(build_job(&p, &o).unwrap()["engine"]["original"], json!(true), "the original may be replaced by its pre-quantized checkpoint");
     let mut g = spec("slim-a", "gguf");
     g.backend = Some("vllm".into());
     assert!(!ndforge_core::reshape::thinkcheck::uses_vllm(&g), "a GGUF file always uses llama.cpp");

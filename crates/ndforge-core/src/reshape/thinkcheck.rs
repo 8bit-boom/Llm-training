@@ -245,6 +245,9 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
     if uses_vllm(spec) {
         job["backend"] = json!("vllm");
         job["engine"] = spec.engine.clone().unwrap_or_else(|| json!({"kind": "auto"}));
+        if spec.target == "original" {
+            job["engine"]["original"] = json!(true);          // the worker serves the configured pre-quantized checkpoint when the original does not fit (vllmquant.pick)
+        }
     }
     if let Some(b) = spec.batch.filter(|b| (1..=64).contains(b)) {
         job["batch"] = json!(b);

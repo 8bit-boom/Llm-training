@@ -24,7 +24,7 @@ import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import protocol, vllmengine
+from . import protocol, vllmengine, vllmquant
 from .thinkcheck import ThinkCheckError
 from .thinkcheck_llama import REQUEST_TIMEOUT, text_of
 
@@ -32,9 +32,14 @@ DEFAULT_PARALLEL = 40
 EXTRA_SAMPLING = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "min_p": 0.0}
 
 
+def pick_of(job: dict) -> dict:
+    """What the server loads and how (`vllmquant.pick`): the model (the original's pre-quantized checkpoint when the original does not fit), "none" | "fp8" | "prequant:<repo>" | "stored:<m>"."""
+    return vllmquant.pick(str(job.get("model") or ""), job.get("engine") or {})
+
+
 def quant_of(job: dict) -> str:
-    """How the weights are loaded in the server: "none" (as they are), "fp8" (`--quantization fp8`), or a pre-quantized checkpoint id."""
-    return str((job.get("engine") or {}).get("quant") or "none")
+    """How the weights are loaded in the server (the cache key and the result say it): "none", "fp8", "prequant:<repo>" or "stored:<method>"."""
+    return pick_of(job)["quant"]
 
 
 def served_model(job: dict) -> str:
@@ -71,7 +76,11 @@ def make_engine(job: dict) -> "vllmengine.Engine":
     except vllmengine.EngineError as exc:
         raise ThinkCheckError(str(exc)) from exc
     e = job.get("engine") or {}
-    return vllmengine.Engine(cfg, model, adapter=str(job["adapter"]) if job.get("adapter") else None, quant=quant_of(job), extra_args=e.get("extra_args"),
+    pick = pick_of(job)
+    if pick["fits"] is False:
+        raise ThinkCheckError(pick["reason"])
+    job.setdefault("_engine_report", {})["pick"] = {k: pick[k] for k in ("quant", "reason", "weights_gb", "usable_gb")}
+    return vllmengine.Engine(cfg, pick["model"], adapter=str(job["adapter"]) if job.get("adapter") else None, quant=pick["quant"], extra_args=e.get("extra_args"),
                              max_len=int(e.get("max_model_len") or vllmengine.DEFAULT_MAX_MODEL_LEN), max_seqs=int(e.get("max_num_seqs") or vllmengine.DEFAULT_MAX_SEQS),
                              gpu_util=float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
 

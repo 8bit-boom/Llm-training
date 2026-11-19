@@ -102,6 +102,7 @@ fn the_engine_object_for_the_worker_leaves_out_empty_settings() {
     assert_eq!(e["kind"], "auto");
     assert_eq!(e["image"], "vllm/vllm-openai:v0.34.0");
     assert_eq!(e["hf_volume"], "ndforge-vllm-hf");
+    assert_eq!(e["teacher_repo"], "cyankiwi/Qwen3.8-27B-AWQ-INT4");
     assert!(e.get("distro").is_none() && e.get("url").is_none() && e.get("wslc").is_none());
     let s = VllmSettings { kind: "wslc".into(), distro: "U".into(), wslc: serde_json::json!({"shm": "8g"}), ..VllmSettings::default() };
     let e = engine_job(&s);

@@ -225,7 +225,7 @@ pub fn preflight_now(s: &VllmSettings) -> Vec<Check> {
 pub fn engine_job(s: &VllmSettings) -> Value {
     let mut o = serde_json::Map::new();
     o.insert("kind".into(), json!(if s.kind.is_empty() { "auto" } else { s.kind.as_str() }));
-    for (k, v) in [("image", &s.image), ("distro", &s.distro), ("venv", &s.venv), ("url", &s.url), ("hf_volume", &s.model_volume)] {
+    for (k, v) in [("image", &s.image), ("distro", &s.distro), ("venv", &s.venv), ("url", &s.url), ("hf_volume", &s.model_volume), ("teacher_repo", &s.teacher_repo)] {
         if !v.trim().is_empty() {
             o.insert(k.into(), json!(v.trim()));
         }
