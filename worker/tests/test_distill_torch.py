@@ -465,3 +465,44 @@ def test_every_row_of_the_cache_is_the_answer_for_that_row_whatever_the_order_it
         ids, lp, rs = reader.get(i)
         ref_ids, ref_lp, ref_rs = _answers_before_the_speed_up(model, [r], 8, 16, 0)[0]
         assert ids.shape[0] == len(r["input_ids"]) and np.allclose(lp.astype(np.float32), ref_lp, atol=2e-2) and np.allclose(rs, ref_rs, atol=2e-2), i
+
+
+def test_a_cache_job_answers_up_to_a_point_and_goes_on_with_the_new_rows_only(tmp_path, base, monkeypatch):
+    """healing in rounds: the teacher answers the project rows and the general rows up to a number of general tokens; later calls add the next rows from the saved rows"""
+    from ndforge_worker import reshapejob
+    cfg = cache_cfg(tmp_path, base, rows_key="rk-1")
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(str(base))
+    rows, _ = dj.build_rows(tok, cfg["data"], "qwen3_5", 128)
+    n1, n2 = dj.rows_upto(rows, 300), dj.rows_upto(rows, 600)
+    assert 16 < n1 < n2 <= len(rows)
+    calls = []
+    real = dj._teacher_answers
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: calls.append(len(part)) or real(model, part, *a))
+    cache = tmp_path / "distill" / "cache"
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 300})
+    r = ev[-1]["data"]
+    idx = json.loads((cache / "index.json").read_text())
+    assert code == 0 and sum(calls) == n1 and r["done_rows"] == n1 == idx["done_rows"] and idx["complete"] is False and r["rows"] == len(rows)
+    assert r["rows_before"] == 0 and r["general_rows_done"] == n1 - 16 and r["general_tokens_done"] >= 300 and r["reused"] is False
+    # the second round: the general file is gone and the rows come from the saved ones; only the new rows are answered
+    Path(cfg["data"]["general"]["file"]).unlink()
+    monkeypatch.setattr(dj, "build_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("the rows must be reused")))
+    calls.clear()
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 600, "reuse_rows": True})
+    r2 = ev[-1]["data"]
+    assert code == 0 and sum(calls) == n2 - n1 and r2["done_rows"] == n2 and r2["rows_before"] == n1
+    assert json.loads((cache / "index.json").read_text())["data_hash"] == idx["data_hash"]
+    # the same call again changes nothing and does not load the teacher
+    monkeypatch.setattr(reshapejob, "_load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no teacher")))
+    calls.clear()
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "upto_general_tokens": 600, "reuse_rows": True})
+    assert code == 0 and not calls and ev[-1]["data"]["reused"] is True and ev[-1]["data"]["done_rows"] == n2
+    # a call without a limit afterwards answers the rest only (and then a complete cache is reused)
+    monkeypatch.undo()
+    calls.clear()
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: calls.append(len(part)) or real(model, part, *a))
+    monkeypatch.setattr(dj, "build_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("the rows must be reused")))
+    code, ev = run_in_process(monkeypatch, dj.run_cache, {**cfg, "reuse_rows": True})
+    assert code == 0 and sum(calls) == len(rows) - n2 and ev[-1]["data"]["done_rows"] == len(rows)
+    assert json.loads((cache / "index.json").read_text())["complete"] is True

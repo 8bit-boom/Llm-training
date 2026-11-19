@@ -620,10 +620,49 @@ def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int
             "teacher_load": cfg["teacher"].get("load", "auto"), "rows_key": cfg.get("rows_key")}
 
 
+def rows_upto(rows: list, general_tokens) -> int:
+    """How many leading rows a partial teacher pass answers (healing in rounds): every project row, then general rows until their tokens reach `general_tokens`
+    (the row that reaches it is included). `rows` are the project rows followed by the general rows, as build_rows makes them. 0 or less = the project rows only."""
+    want, got = int(general_tokens or 0), 0
+    for i, r in enumerate(rows):
+        if r.get("source") == "general":
+            if got >= want:
+                return i
+            got += len(r["input_ids"])
+    return len(rows)
+
+
+def _reusable_rows(out, cfg: dict, k: int, max_seq: int, student):
+    """The rows an earlier call of this run saved next to the cache (rows.npz), when they are exactly the rows this call would build: the cache's own index says for which
+    data they were made (rows_key, general text, k, length, tokenizer, teacher) and the rows' hash must match. None otherwise (the caller then builds the rows)."""
+    idx = read_cache_index(out)
+    if not idx or not cfg.get("rows_key") or idx.get("rows_key") != cfg.get("rows_key"):
+        return None
+    gen = (cfg.get("data") or {}).get("general")
+    want_key = generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407)))
+    if (idx.get("k") != k or idx.get("max_len") != max_seq or idx.get("teacher") != cfg["teacher"]["repo"] or idx.get("general_key") != want_key
+            or idx.get("tokenizer_hash") != tokenizer_hash(student)):
+        return None
+    try:
+        rows = load_rows(out)
+    except ReshapeError:
+        return None
+    if len(rows) != idx.get("rows") or data_hash(rows) != idx.get("data_hash"):
+        return None
+    proj = [r for r in rows if r.get("source") != "general"]
+    gen_rows = [r for r in rows if r.get("source") == "general"]
+    stats = {"project_rows": len(proj), "project_tokens": sum(len(r["input_ids"]) for r in proj), "general_rows": len(gen_rows),
+             "general_tokens": sum(len(r["input_ids"]) for r in gen_rows), "general_error": None, "general_error_code": None, "general_source": idx.get("general_source"),
+             "general_detected": None, "general_texts_skipped": 0, "general_cut_rows": 0, "general_skipped_long": 0}
+    return rows, stats
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
-    "out": cache folder, "stop_file": path}. Saves the teacher's top-k answers for every row (resumable). Result: rows, tokens, bytes, reused, stopped, notes."""
+    "out": cache folder, "stop_file": path, "upto_general_tokens": N (optional: answer the project rows and the general rows up to N general tokens only, then stop; healing in
+    rounds), "reuse_rows": bool (optional: take the rows from out/rows.npz when they are the rows of this run, instead of reading the general text again)}.
+    Saves the teacher's top-k answers for every row (resumable). Result: rows, tokens, bytes, reused, stopped, notes, done_rows, general_rows_done, general_tokens_done, rows_before."""
     protocol.reserve_stdout()
     healmem.set_alloc_conf()
     started = time.monotonic()
@@ -637,8 +676,15 @@ def run_cache(cfg: dict) -> int:
     _require_same_ids(teacher_dir, student)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(student))
-    rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
+    again = _reusable_rows(out, cfg, k, max_seq, student) if cfg.get("reuse_rows") else None
+    if again:
+        rows, stats = again
+        protocol.log(f"The rows of this run are taken from the saved ones ({len(rows)} rows); the general text is not read again.")
+    else:
+        rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
     meta = cache_meta(cfg, rows, stats, student, k, max_seq)
+    upto = cfg.get("upto_general_tokens")
+    target = len(rows) if upto is None else rows_upto(rows, upto)
     legacy = read_cache_index(out)
     if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
         # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
@@ -648,16 +694,25 @@ def run_cache(cfg: dict) -> int:
         protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
     else:
         writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
-    save_rows(out, rows)
+    if not again:
+        save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
     total_tokens = sum(len(r["input_ids"]) for r in rows)
     result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
-    if writer.done_rows >= len(rows):
-        protocol.log("The teacher's saved answers are already complete for this data.")
-        result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1))
+    rows_before = writer.done_rows
+    target_tokens = sum(len(r["input_ids"]) for r in rows[:target]) if target < len(rows) else total_tokens
+
+    def counts() -> dict:
+        got = rows[:min(writer.done_rows, len(rows))]
+        gen = [r for r in got if r.get("source") == "general"]
+        return {"done_rows": writer.done_rows, "general_rows_done": len(gen), "general_tokens_done": sum(len(r["input_ids"]) for r in gen), "rows_before": rows_before}
+
+    if writer.done_rows >= target:
+        protocol.log("The teacher's saved answers are already complete for this data." if target >= len(rows) else "The teacher has already answered the rows of this round.")
+        result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), **counts())
         protocol.result(result)
         return 0
-    need = (total_tokens - writer.tokens) * (k * 6 + 4)
+    need = (sum(len(r["input_ids"]) for r in rows[:target]) - writer.tokens) * (k * 6 + 4)
     free = shutil.disk_usage(writer.dir)[2]
     if free < need * 1.05:
         protocol.error("disk_full", f"The teacher's answers need {need / 1e9:.1f} GB in {out}; {free / 1e9:.1f} GB free.")
@@ -676,17 +731,16 @@ def run_cache(cfg: dict) -> int:
     t0 = last_log = time.monotonic()
     seen_tokens = 0
     tokens_before = writer.tokens
-    rows_before = writer.done_rows
     try:
         i = writer.done_rows
         if i:
             protocol.log(f"Continuing the teacher's answers after row {i} of {len(rows)}.")
-        while i < len(rows):
+        while i < target:
             if stop_file.exists():
                 result["stopped"] = True
                 break
             # a window of rows is answered longest first (batches of similar length waste little on padding) and written in the order of the rows
-            window = rows[i:i + window_rows]
+            window = rows[i:min(i + window_rows, target)]
             answers: dict = {}
             order = length_order(window)
             pos, cut_short = 0, False
@@ -708,8 +762,8 @@ def run_cache(cfg: dict) -> int:
                     answers[j] = a
                     seen_tokens += len(window[j]["input_ids"])
                 pos += len(idx)
-                protocol.progress("cache", (i + len(answers)) / len(rows), f"The original model answers your texts: {i + len(answers)} of {len(rows)}",
-                                  protocol.make_detail("tokens", min(tokens_before + seen_tokens, total_tokens), total_tokens, t0, rate_unit="tokens/s", done_at_start=tokens_before))
+                protocol.progress("cache", (i + len(answers)) / target, f"The original model answers your texts: {i + len(answers)} of {target}",
+                                  protocol.make_detail("tokens", min(tokens_before + seen_tokens, target_tokens), target_tokens, t0, rate_unit="tokens/s", done_at_start=tokens_before))
                 if time.monotonic() - last_log >= SPEED_LOG_EVERY:
                     last_log = time.monotonic()
                     protocol.log(f"cache_speed: {seen_tokens / max(last_log - t0, 1e-9):,.0f} tokens/s ({seen_tokens:,} tokens so far; this row: {len(window[idx[0]]['input_ids']):,} tokens)")
@@ -733,7 +787,7 @@ def run_cache(cfg: dict) -> int:
         protocol.log(f"cache_speed: {tps:,.0f} tokens/s ({seen_tokens:,} tokens answered in {time.monotonic() - t0:,.0f} s)")
         answered = max(1, writer.done_rows - rows_before)
         protocol.timing("teacher_pass", time.monotonic() - t0, tokens=seen_tokens, tokens_per_s=round(tps, 1), mean_row_tokens=round(seen_tokens / answered, 1), rows=answered)
-    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), done_rows=writer.done_rows, tokens_per_s=round(tps, 1))
+    result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), tokens_per_s=round(tps, 1), **counts())
     protocol.result(result)
     return 0
 
