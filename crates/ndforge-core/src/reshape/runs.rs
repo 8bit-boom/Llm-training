@@ -785,9 +785,25 @@ pub struct HealSpec {
     /// Heal in rounds with a thinking check after each (experimental, docs/HEAL_ROUNDS.md). None = exactly the heal as it always was (the key is then not even written).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<super::heal_rounds::RoundSpec>,
+    /// Make the original's answers with vLLM (experimental, docs/VLLM.md; needs the settings' switches too). None = the heal as it always was (the key is then not even written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm: Option<HealVllm>,
+}
+
+/// The Heal card's vLLM option.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealVllm {
+    /// the original's answers (the teacher cache) are made by vLLM
+    #[serde(default)]
+    pub teacher_cache: bool,
 }
 
 impl HealSpec {
+    /// vLLM is asked for the original's answers.
+    pub fn vllm_teacher(&self) -> bool {
+        self.vllm.as_ref().is_some_and(|v| v.teacher_cache)
+    }
+
     pub fn thinking(&self) -> bool {
         self.recipe.as_deref() == Some(plan::THINKING_RECIPE)
     }
@@ -970,6 +986,82 @@ fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBoo
     })
 }
 
+/// The vLLM teacher of a heal (docs/VLLM.md, "Teacher cache"): None for the heal as it always was; else `(the worker's engine object, the identity {engine, teacher_quant, route})`.
+/// Refuses, in plain words, when vLLM is asked for but not switched on, when the heal does not save the original's answers, when the route would not teach the person's original
+/// (a pre-quantized copy of another model) or when the saved check of the vLLM teacher says it is a different teacher. An unchecked teacher only warns (the worker logs it).
+pub fn vllm_teacher_gate(dir: &Path, spec: &HealSpec, origin: &str, mode: &str) -> Result<Option<(Value, Value)>> {
+    if !spec.vllm_teacher() {
+        return Ok(None);
+    }
+    let s = crate::settings::Settings::load().vllm;
+    if !s.enabled || !s.teacher.enabled {
+        return Err(Error::new("vLLM for the original's answers is not switched on: open Settings, vLLM engine, and tick \"use vLLM for the original's answers\" (experimental)."));
+    }
+    if mode != "cache" {
+        return Err(Error::new("vLLM makes the original's SAVED answers: this card heals with the original next to the student (no saved answers), so vLLM cannot be used here."));
+    }
+    let route = crate::vllm::teacher_route(&s.teacher, origin);
+    if route["route"] == "refused" {
+        return Err(Error::new(route["reason"].as_str().unwrap_or("The vLLM teacher route is refused.")));
+    }
+    let check = crate::vllm::read_teacher_check(dir, &s, origin);
+    if check["verdict"] == "different" && check["current"] == true {
+        return Err(Error::new("The check of the vLLM teacher says it gives different answers than the standard teacher, so it is not used for healing. See \"Check the vLLM teacher\" on the Heal card."));
+    }
+    Ok(Some((crate::vllm::teacher_engine_job(&s, Some(&check).filter(|c| c["current"] == true)), crate::vllm::teacher_identity(&s, origin))))
+}
+
+/// "Check the vLLM teacher" (docs/VLLM.md): the worker job `vllm_teacher_check` compares the vLLM teacher's top answers with the standard 4-bit teacher's on 100 real rows of the heal's data at
+/// the heal's sequence length (an existing complete standard cache of this original is the reference when there is one; else the standard teacher runs first, never both on the card at once)
+/// and writes `models/<name>/vllm_teacher_check.json`. Returns the worker's result (verdict, metrics, start-up phases, speed).
+pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    valid_name(name)?;
+    spec.validate()?;
+    let dir = models_dir(p).join(name);
+    let s = crate::settings::Settings::load().vllm;
+    if !s.enabled || !s.teacher.enabled {
+        return Err(Error::new("vLLM for the original's answers is not switched on: open Settings, vLLM engine, and tick \"use vLLM for the original's answers\" (experimental)."));
+    }
+    let o = heal_source::read_origin(&dir)?;
+    let model = heal_source::student_folder(&dir)?.ok_or_else(|| Error::new("The model's folder is missing."))?;
+    let route = crate::vllm::teacher_route(&s.teacher, &o.teacher);
+    if route["route"] == "refused" {
+        return Err(Error::new(route["reason"].as_str().unwrap_or("The vLLM teacher route is refused.")));
+    }
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the check uses your world's text."))?;
+    let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
+    let dims = plan::HealDims::from_config(&o.config, o.student_b);
+    let ch = heal_choice(spec, o.student_b, vram_gb, &dims);
+    let source = spec.general_source()?;
+    let general = source.as_ref().map(|g| crate::general::job_block(g, spec.general_share)).unwrap_or(Value::Null);
+    let common = json!({"teacher": {"repo": o.teacher, "load": ch.teacher_load.clone().unwrap_or_else(|| "4bit".into())}, "student": model, "model": {"family": o.family},
+                        "data": {"train": train, "tokens": spec.tokens(), "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "seed": crate::general::SEED});
+    let cache = dir.join("distill").join("cache");
+    let reference = read_json(&cache.join("index.json")).filter(|i| i["complete"] == true && i["engine"].is_null()).map(|_| cache);
+    let job = crate::vllm::teacher_check_job(&s, &common, &dir, reference.as_deref());
+    let py = python()?;
+    let _active = Active::begin(&dir)?;
+    let _ = std::fs::remove_file(dir.join("STOP"));
+    let r = crate::train::runs::drive(&py, &dir, &job, stop, grace, &mut |e| {
+        let mut ev = event_json(e);
+        ev["phase"] = json!("vllm_teacher_check");
+        on_event(ev);
+    });
+    // never leave the engine running: the next job (training, a check) needs the card
+    let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);
+    r
+}
+
+/// Keeps what the worker says about the vLLM teacher (`teacher_engine` of the cache result: engine, quantization, start-up, speed, fallback) in heal.json for the card and the report.
+fn record_teacher_engine(dir: &Path, r: &Value) {
+    let t = r["teacher_engine"].clone();
+    if t.is_object() {
+        let mut rec = t;
+        rec["requested"] = json!(true);
+        set_heal(dir, json!({"teacher_engine": rec}));
+    }
+}
+
 /// How many general rows are kept back from the heal and only measured (the held-out loss of the Heal card).
 pub const HOLDOUT_ROWS: u32 = 64;
 
@@ -1049,10 +1141,19 @@ fn cache_complete(cache: &Path, want: &Value, k: u32, seq: u32, rows_key: &str) 
 /// A fingerprint of what decides the teacher's rows besides the general text: the training file (path, size, modification time), the amount of text in tokens, the
 /// teacher and how it is loaded. The worker stores it as `rows_key` in the cache's index.json; the program compares it before skipping the teacher pass.
 pub fn rows_key(train: &Path, tokens: u64, teacher_repo: &str, teacher_load: &str) -> String {
+    rows_key_with(train, tokens, teacher_repo, teacher_load, None)
+}
+
+/// `rows_key` for answers made by another engine (`engine`: the vLLM identity `{"engine", "teacher_quant"}`): a cache of the standard teacher and one of the vLLM teacher are never
+/// taken for each other. With None the key is exactly what it always was.
+pub fn rows_key_with(train: &Path, tokens: u64, teacher_repo: &str, teacher_load: &str, engine: Option<&Value>) -> String {
     use sha2::{Digest, Sha256};
     let meta = std::fs::metadata(train).ok();
     let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
     let mut text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load});
+    if let Some(e) = engine {
+        text["engine"] = json!({"engine": e["engine"], "teacher_quant": e["teacher_quant"]});
+    }
     // a teacher that is a local folder also counts by its weight files (a replaced checkpoint must not reuse the old answers); a Hub id keeps the key it always had
     if let Some(files) = local_teacher_files(Path::new(teacher_repo)) {
         text["files"] = Value::String(files);
@@ -1126,7 +1227,8 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let general_key = crate::general::key(&general, crate::general::SEED);
     let (cache_dir, run_dir) = (dir.join("distill").join("cache"), dir.join("distill").join("run"));
     let teacher_load = ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string());
-    let rows_key = rows_key(&train, tokens, &origin, &teacher_load);
+    let vllm_engine = vllm_teacher_gate(&dir, spec, &origin, &mode)?;
+    let rows_key = rows_key_with(&train, tokens, &origin, &teacher_load, vllm_engine.as_ref().map(|e| e.1.clone()).as_ref());
     if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
         let need = tokens as f64 * 196.0 / 1e9 + if rspec.is_some() { 4.0 } else { 0.0 };       // rounds keep two adapters and two checkpoints besides
         if let Some(free) = crate::envmgr::health::free_disk_gb(&dir).filter(|f| *f < need * 1.05) {
@@ -1179,6 +1281,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         let ctx = RoundsCtx {
             p, name, dir: dir.clone(), py: py.clone(), model: model.clone(), origin: origin.clone(), family: family.clone(), spec, ch: ch.clone(), method: hp.student_method.to_string(),
             teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), train: train.clone(), tokens, general: general.clone(), rows_key: rows_key.clone(),
+            vllm: vllm_engine.as_ref().map(|e| e.0.clone()),
             cache_dir: cache_dir.clone(), run_dir: run_dir.clone(), stop: stop.clone(), grace, stop_file: stop_file.clone(), calibration: calibration.clone(),
             student_b, o: &o,
         };
@@ -1199,9 +1302,16 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         if !general.is_null() {
             job["holdout"] = json!({"rows": HOLDOUT_ROWS});          // general rows read past the ones the heal learns from: the loss on them is not optimistic
         }
+        if let Some((e, ident)) = &vllm_engine {
+            job["engine"] = e.clone();
+            set_heal(&dir, json!({"teacher_engine": {"requested": true, "identity": ident}}));
+        }
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));
+        }
+        if vllm_engine.is_some() {
+            record_teacher_engine(&dir, &r);
         }
         let note = r["notes"].as_array().and_then(|n| n.first()).and_then(|n| n.as_str());
         // the page shows which general text was used or skipped, and why
@@ -1294,6 +1404,8 @@ struct RoundsCtx<'a> {
     tokens: u64,
     general: Value,
     rows_key: String,
+    /// the vLLM teacher's engine object (`vllm_teacher_gate`); None = the standard teacher
+    vllm: Option<Value>,
     cache_dir: PathBuf,
     run_dir: PathBuf,
     stop: Arc<AtomicBool>,
@@ -1367,7 +1479,13 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
         if !c.general.is_null() {
             job["holdout"] = json!({"rows": HOLDOUT_ROWS});
         }
+        if let Some(e) = &c.vllm {
+            job["engine"] = e.clone();          // every round's chunk starts the engine again (its start-up is paid each time: the card warns)
+        }
         let r = self.job(&job, "cache")?;
+        if c.vllm.is_some() {
+            record_teacher_engine(&c.dir, &r);
+        }
         if !r["stopped"].as_bool().unwrap_or(false) && n == 1 {
             let note = r["notes"].as_array().and_then(|a| a.first()).and_then(|x| x.as_str());
             set_heal(&c.dir, json!({"note": note, "note_code": r["stats"]["general_error_code"], "general_used": {"source": r["stats"]["general_source"], "rows": r["stats"]["general_rows"],
@@ -1825,8 +1943,14 @@ fn thinking_recipe_json(o: &heal_source::Origin, dims: &plan::HealDims, vram_gb:
 pub fn heal_estimate(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>) -> Result<Value> {
     valid_name(name)?;
     spec.validate()?;
-    let o = heal_source::read_origin(&models_dir(p).join(name))?;
-    Ok(heal_estimate_with(&o, spec, vram_gb))
+    let dir = models_dir(p).join(name);
+    let o = heal_source::read_origin(&dir)?;
+    let mut out = heal_estimate_with(&o, spec, vram_gb);
+    // the project's own files: the saved check of the vLLM teacher and the speed its scoring measured
+    let st = crate::settings::Settings::load().vllm;
+    let check = crate::vllm::read_teacher_check(&dir, &st, &o.teacher);
+    out["vllm_teacher"] = vllm_teacher_estimate(&o, spec, &crate::vllm::history_with_measured(crate::timing::History::default(), Some(p)), &st, Some(&check));
+    Ok(out)
 }
 
 /// The estimate for a pair (`heal_source::origin_from_check`) that may have no folder yet.
@@ -1841,7 +1965,51 @@ pub fn heal_estimate_with(o: &heal_source::Origin, spec: &HealSpec, vram_gb: Opt
     if let Some(r) = &spec.rounds {
         out["rounds"] = rounds_estimate_json(o, spec, r, &ch);
     }
+    out["vllm_teacher"] = vllm_teacher_estimate(o, spec, &crate::vllm::history_with_measured(crate::timing::History::default(), None), &crate::settings::Settings::load().vllm, None);
     out
+}
+
+/// What the Heal card shows about making the original's answers with vLLM (experimental): the route (which weights, and why), the time with the standard engine and with vLLM from the
+/// numbers measured on THIS PC (the self-test's start-up, the teacher check's scoring speed) or, where there are none, the report's estimates (said so), the warning that a heal in rounds
+/// starts the engine every round, and the saved check of the vLLM teacher. `check`: the saved `vllm_teacher_check.json` of the model (None for a pair that has no folder yet).
+pub fn vllm_teacher_estimate(o: &heal_source::Origin, spec: &HealSpec, h: &crate::timing::History, s: &crate::settings::VllmSettings, check: Option<&Value>) -> Value {
+    use crate::vllm_plan as vp;
+    let n = vp::Numbers::from_history(h);
+    let tokens_m = match &spec.rounds {
+        Some(r) => r.cap_tokens(spec) as f64 / 1e6,
+        None => spec.tokens() as f64 / 1e6,
+    };
+    let std_min = super::auto_time::cache_minutes(&crate::timing::History::default(), o.teacher_b, tokens_m);
+    let start = vp::startup(&n);
+    let score = vp::scoring(&n, tokens_m);
+    let starts = spec.rounds.as_ref().map(|r| (r.cap_tokens(spec) as f64 / r.round_tokens().max(1) as f64).ceil().max(1.0)).unwrap_or(1.0);
+    let vllm = (start.lo * starts + score.lo, start.hi * starts + score.hi);
+    let route = crate::vllm::teacher_route(&s.teacher, &o.teacher);
+    let better = (vllm.0 + vllm.1) < (std_min.0 + std_min.1) * vp::AUTO_MARGIN;
+    let text = if route["route"] == "refused" {
+        route["reason"].as_str().unwrap_or("").to_string()
+    } else {
+        format!("The original's answers: about {:.1} to {:.1} hours with the standard engine, about {:.1} to {:.1} hours with vLLM ({}start-up {:.1} to {:.1} minutes{}, scoring {}).{}",
+                std_min.0 / 60.0, std_min.1 / 60.0, vllm.0 / 60.0, vllm.1 / 60.0, if starts > 1.0 { format!("{starts:.0} engine starts, ") } else { String::new() }, start.lo, start.hi,
+                if start.measured { " measured by your self-test" } else { ", not measured on this PC" }, if score.measured { "measured by your teacher check" } else { "the research report's estimate, not measured here" },
+                if better { "" } else { " vLLM is not faster than the standard engine by this estimate." })
+    };
+    let mut warnings = Vec::new();
+    if starts > 1.0 {
+        warnings.push(format!("A heal in rounds asks the original for one chunk of answers per round, and every chunk starts the engine again: about {:.0} to {:.0} minutes of start-up per round, {starts:.0} rounds at most. Keep the standard engine for rounds unless a round is long.", start.lo, start.hi));
+    }
+    if matches!(route["route"].as_str(), Some("bnb")) {
+        warnings.push("The in-flight 4-bit route has never been run: how vLLM does it and how fast it is are unknown (the research report says only that it is much slower than the pre-quantized weights).".into());
+    }
+    if check.is_none_or(|c| c.is_null()) {
+        warnings.push("The vLLM teacher has not been checked against the standard teacher yet: use \"Check the vLLM teacher\" first (about 100 rows).".into());
+    } else if check.is_some_and(|c| c["current"] == false) {
+        warnings.push("The saved check of the vLLM teacher was made for other settings (another engine version or teacher route): check it again.".into());
+    }
+    json!({"asked": spec.vllm_teacher(), "settings_on": s.enabled && s.teacher.enabled, "route": route, "identity": crate::vllm::teacher_identity(s, &o.teacher), "tokens_m": tokens_m,
+           "standard_min": [std_min.0.round(), std_min.1.round()], "vllm_min": [vllm.0.round(), vllm.1.round()], "startup_min": [(start.lo * 10.0).round() / 10.0, (start.hi * 10.0).round() / 10.0],
+           "startup_measured": start.measured, "scoring_measured": score.measured, "engine_starts": starts, "faster": better, "text": text, "warnings": warnings, "basis": vp::basis_notes(&n),
+           "check": check.cloned().unwrap_or(Value::Null), "required": s.teacher.required})
 }
 
 /// What the Heal card shows for a heal in rounds, additive to the estimate: the steps of a round, the overhead, and the time if the first check passes and if it runs to the cap

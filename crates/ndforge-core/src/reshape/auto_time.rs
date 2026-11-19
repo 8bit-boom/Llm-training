@@ -216,6 +216,15 @@ pub fn try_pass_minutes(h: &History, b: f64, samples: u32, mode: &str) -> (f64, 
     (r.lo, r.hi)
 }
 
+/// Minutes (low, high) for the original (`teacher_b` billion parameters) to write its answers for `tokens_m` million tokens with the standard engine: this computer's own earlier heals when
+/// it has some, else the formula of the reference run (the same rate `heal_parts` uses).
+pub fn cache_minutes(h: &History, teacher_b: f64, tokens_m: f64) -> (f64, f64) {
+    let units = tokens_m / 5.0;
+    let f = (CACHE_H_PER_5M.0 * 60.0 * units * teacher_b / CACHE_REF_B, CACHE_H_PER_5M.1 * 60.0 * units * teacher_b / CACHE_REF_B);
+    let r = at_rate(h, "teacher_tok_b_s", teacher_b, tokens_m * 1e6 * teacher_b, f);
+    (r.lo, r.hi)
+}
+
 /// Minutes (low, high) to load a model of `gb` gigabytes as `mode`.
 pub fn load_minutes(h: &History, gb: f64, mode: &str) -> (f64, f64) {
     let r = load(h, gb, mode);

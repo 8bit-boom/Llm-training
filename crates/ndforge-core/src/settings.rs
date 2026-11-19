@@ -64,6 +64,30 @@ impl Default for TeacherSettings {
     }
 }
 
+/// "Make the original's answers with vLLM" (docs/VLLM.md, "Teacher cache"): OFF by default. The teacher must be the person's ORIGINAL model: a pre-quantized checkpoint is a quantization of
+/// ONE repo, so it is used only for the original it was made from (`pairs`: original repo id -> quantized repo id) or one the person confirmed (`confirmed`); every other original goes through
+/// the in-flight 4-bit route on the original's own folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VllmTeacherSettings {
+    /// use vLLM for the teacher's answers (the Heal card still has its own switch)
+    pub enabled: bool,
+    /// "auto" (a confirmed copy, else the in-flight 4-bit route) | "bnb" (always in-flight) | "prequant" (only a confirmed copy; refuses otherwise)
+    pub route: String,
+    /// the confirmed pairs {original repo id: quantized repo id}; the default table has the one the research report names and nothing else
+    pub pairs: std::collections::BTreeMap<String, String>,
+    /// copies the person confirmed ("this repo is a quantized copy of my original model"), stored per original
+    pub confirmed: std::collections::BTreeMap<String, String>,
+    /// true: a heal stops when vLLM does not work; false: it goes on with the standard teacher and says so
+    pub required: bool,
+}
+
+impl Default for VllmTeacherSettings {
+    fn default() -> Self {
+        VllmTeacherSettings { enabled: false, route: "auto".into(), pairs: [("Qwen/Qwen3.8-27B".to_string(), "cyankiwi/Qwen3.8-27B-AWQ-INT4".to_string())].into(), confirmed: Default::default(), required: false }
+    }
+}
+
 /// The experimental vLLM engine (docs/VLLM.md): OFF by default, built from a research report and not yet run on this PC. Nothing is installed by the program.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -90,12 +114,14 @@ pub struct VllmSettings {
     pub adapter_rounds: bool,
     /// edits of the WSLc command templates (docs/VLLM.md); an object, empty = the defaults
     pub wslc: serde_json::Value,
+    /// the teacher's answers through vLLM (off by default)
+    pub teacher: VllmTeacherSettings,
 }
 
 impl Default for VllmSettings {
     fn default() -> Self {
         VllmSettings { enabled: false, kind: "auto".into(), image: "vllm/vllm-openai:v0.34.0".into(), distro: String::new(), venv: "~/.ndforge/vllm".into(), url: String::new(),
-            model_volume: "ndforge-vllm-hf".into(), model_dir: String::new(), teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4".into(), adapter_rounds: false, wslc: serde_json::json!({}) }
+            model_volume: "ndforge-vllm-hf".into(), model_dir: String::new(), teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4".into(), adapter_rounds: false, wslc: serde_json::json!({}), teacher: VllmTeacherSettings::default() }
     }
 }
 

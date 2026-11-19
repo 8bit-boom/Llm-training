@@ -300,3 +300,130 @@ pub fn selftest_run(job: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicB
 pub fn selftest_report() -> Value {
     std::fs::read(selftest_dir().join("vllm_selftest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
 }
+
+
+// ------------------------------------------------------------------------------------------------------------- the teacher's answers (docs/VLLM.md, "Teacher cache")
+
+/// The image tag's version (`vllm/vllm-openai:v0.34.0` -> `0.34.0`), as the worker's `image_version` reads it.
+pub fn image_version(image: &str) -> String {
+    let tag = image.rsplit('/').next().and_then(|last| last.split_once(':')).map(|x| x.1).unwrap_or("");
+    match Regex::new(r"^v?(\d+\.\d+(?:\.\d+)?)").ok().and_then(|re| re.captures(tag).map(|c| c[1].to_string())) {
+        Some(v) => v,
+        None if tag.is_empty() => "unknown".into(),
+        None => tag.to_string(),
+    }
+}
+
+fn norm_id(x: &str) -> String {
+    x.trim().trim_end_matches('/').to_lowercase()
+}
+
+/// Which weights the engine scores with for the original `origin` (a Hub id or a folder). THE TEACHER MUST BE THE PERSON'S ORIGINAL MODEL: a pre-quantized checkpoint is a quantization of
+/// ONE repo, so it is used only for that original (`pairs`) or one the person confirmed (`confirmed`); every other original goes through the in-flight 4-bit route on its own folder. This is
+/// the same rule as the worker's `vllmcache.select_teacher`, which decides for real; this one shows the person what will happen and is checked against the same cases.
+/// `{"route": "prequant" | "bnb" | "refused", "quant": "awq:<repo>@unpinned" | "bnb-nf4" | "", "quantized_repo", "reason"}`.
+pub fn teacher_route(t: &crate::settings::VllmTeacherSettings, origin: &str) -> Value {
+    let key = norm_id(origin);
+    let find = |m: &std::collections::BTreeMap<String, String>| m.iter().find(|(k, _)| norm_id(k) == key).map(|(_, v)| v.clone());
+    let paired = find(&t.pairs).or_else(|| find(&t.confirmed));
+    match (t.route.as_str(), paired) {
+        ("prequant", None) => json!({"route": "refused", "quant": "", "quantized_repo": "",
+                                     "reason": format!("There is no confirmed quantized copy of {origin}: the pre-quantized checkpoint of another model would teach the wrong model. Use the in-flight 4-bit route, or confirm a copy in the settings.")}),
+        ("auto" | "prequant", Some(q)) => json!({"route": "prequant", "quant": format!("awq:{q}@unpinned"), "quantized_repo": q, "reason": format!("{q} is the confirmed quantized copy of {origin}.")}),
+        _ => json!({"route": "bnb", "quant": "bnb-nf4", "quantized_repo": "",
+                    "reason": format!("No confirmed quantized copy of {origin}: the original's own folder is loaded and quantized to 4 bits while loading (the in-flight bitsandbytes route; how vLLM does it is unverified and its speed is not known).")}),
+    }
+}
+
+/// The worker's `engine` object of a `distill_cache` job that makes the original's answers with vLLM: `{"kind": "vllm", "teacher": {...}, "container": {...}, "required", "teacher_check"}`.
+/// `check` is the saved `vllm_teacher_check.json` of this model (its verdict travels with the job; the worker refuses a teacher the check called "different").
+pub fn teacher_engine_job(s: &VllmSettings, check: Option<&Value>) -> Value {
+    let t = &s.teacher;
+    let mut e = json!({"kind": "vllm", "teacher": {"route": t.route, "pairs": t.pairs, "confirmed": t.confirmed}, "container": engine_job_with_card(s), "required": t.required});
+    if let Some(v) = check.and_then(|c| c["verdict"].as_str()) {
+        e["teacher_check"] = json!({"verdict": v});
+    }
+    e
+}
+
+/// The identity a vLLM cache has (`engine`, `teacher_quant`), as far as the program can know it before the worker runs.
+pub fn teacher_identity(s: &VllmSettings, origin: &str) -> Value {
+    let r = teacher_route(&s.teacher, origin);
+    json!({"engine": format!("vllm-{}", image_version(&s.image)), "teacher_quant": r["quant"], "route": r["route"]})
+}
+
+/// Where the fidelity check of a made model is saved.
+pub fn teacher_check_file(model_dir: &std::path::Path) -> std::path::PathBuf {
+    model_dir.join("vllm_teacher_check.json")
+}
+
+/// The saved check of a made model: the file's JSON, with `current` (does it belong to the teacher the settings would use now: the same engine version and teacher quantization).
+pub fn read_teacher_check(model_dir: &std::path::Path, s: &VllmSettings, origin: &str) -> Value {
+    let Some(mut c) = std::fs::read(teacher_check_file(model_dir)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return Value::Null };
+    let now = teacher_identity(s, origin);
+    c["current"] = json!(c["identity"]["teacher_quant"] == now["teacher_quant"] && c["identity"]["engine"] == now["engine"]);
+    c
+}
+
+/// The worker job `vllm_teacher_check` for a made model (docs/WORKER_CONTRACT.md): `common` holds what the heal's cache job has (teacher, student, model, data, k, max_seq, seed).
+pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path::Path, reference_cache: Option<&std::path::Path>) -> Value {
+    let mut job = json!({"job": "vllm_teacher_check", "rows": 100, "out": teacher_check_file(model_dir), "work": model_dir.join("vllm_teacher_check_work"), "stop_file": model_dir.join("STOP"),
+                         "engine": teacher_engine_job(s, None)});
+    for k in ["teacher", "student", "model", "data", "k", "max_seq", "seed"] {
+        job[k] = common[k].clone();
+    }
+    if let Some(r) = reference_cache {
+        job["reference_cache"] = json!(r);
+    }
+    job
+}
+
+/// The numbers the person's own files hold: the self-test's start-up, Quick-suite time and generation speed, the teacher check's scoring speed (docs/VLLM.md).
+pub fn measured_numbers(selftest: &Value, checks: &[Value]) -> crate::vllm_plan::Numbers {
+    let f = |v: &Value| v.as_f64().filter(|x| x.is_finite() && *x > 0.0);
+    let ok = !matches!(selftest["verdict"].as_str(), Some("fail" | "stopped")) || f(&selftest["startup_seconds"]).is_some();
+    crate::vllm_plan::Numbers {
+        startup_s: ok.then(|| f(&selftest["startup_seconds"])).flatten(),
+        quick_wall_s: ok.then(|| f(&selftest["wall_seconds"])).flatten(),
+        gen_tps: ok.then(|| f(&selftest["tokens_per_s"])).flatten(),
+        score_tps: checks.iter().find_map(|c| f(&c["vllm"]["tokens_per_s"])),
+    }
+}
+
+/// `history` with the numbers of the person's own vLLM files added (`vllm_plan::Numbers::push_into`): the self-test report and the newest teacher check of the project's models.
+pub fn history_with_measured(mut h: crate::timing::History, p: Option<&crate::project::Project>) -> crate::timing::History {
+    let mut checks: Vec<Value> = Vec::new();
+    if let Some(p) = p {
+        if let Ok(rd) = std::fs::read_dir(crate::reshape::runs::models_dir(p)) {
+            let mut found: Vec<(std::time::SystemTime, Value)> = rd.flatten().filter_map(|e| {
+                let f = teacher_check_file(&e.path());
+                let t = std::fs::metadata(&f).ok()?.modified().ok()?;
+                Some((t, serde_json::from_slice::<Value>(&std::fs::read(&f).ok()?).ok()?))
+            }).collect();
+            found.sort_by_key(|x| std::cmp::Reverse(x.0));
+            checks = found.into_iter().map(|x| x.1).collect();
+        }
+    }
+    measured_numbers(&selftest_report(), &checks).push_into(&mut h);
+    h
+}
+
+/// Stops and removes any container this program started and left behind (named `ndforge-vllm-*`): the engine must not be running when a training or another job takes the card. Docker kinds
+/// only (the WSLc listing syntax is not known); returns the names it removed. Nothing else is touched.
+pub fn stop_leftovers(s: &VllmSettings, run: Runner) -> Vec<String> {
+    let pre: Vec<String> = match s.kind.as_str() {
+        "docker_wsl" => wsl_prefix(&s.distro).into_iter().chain(["docker".to_string()]).collect(),
+        "docker" | "auto" | "" => vec!["docker".to_string()],
+        _ => return Vec::new(),
+    };
+    let call = |tail: &[&str]| -> Option<(bool, String)> {
+        let v: Vec<&str> = pre.iter().map(String::as_str).chain(tail.iter().copied()).collect();
+        run(&v)
+    };
+    let Some((true, names)) = call(&["ps", "-a", "--filter", "name=ndforge-vllm-", "--format", "{{.Names}}"]) else { return Vec::new() };
+    let found: Vec<String> = names.lines().map(str::trim).filter(|n| n.starts_with("ndforge-vllm-") && !n.is_empty()).map(String::from).collect();
+    for n in &found {
+        let _ = call(&["rm", "-f", n]);
+    }
+    found
+}

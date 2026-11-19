@@ -225,6 +225,16 @@ impl AppModel {
         if !v.wslc.is_object() {
             v.wslc = serde_json::json!({});
         }
+        v.teacher.route = v.teacher.route.trim().to_lowercase();
+        if v.teacher.route.is_empty() {
+            v.teacher.route = "auto".into();
+        }
+        if !["auto", "bnb", "prequant"].contains(&v.teacher.route.as_str()) {
+            return Err(Error::new("The teacher route must be auto, bnb (4-bit while loading) or prequant (a confirmed quantized copy only)."));
+        }
+        for m in [&mut v.teacher.pairs, &mut v.teacher.confirmed] {
+            *m = std::mem::take(m).into_iter().map(|(a, b)| (a.trim().to_string(), b.trim().to_string())).filter(|(a, b)| !a.is_empty() && !b.is_empty()).collect();
+        }
         self.settings.vllm = v;
         self.settings.save();
         Ok(())

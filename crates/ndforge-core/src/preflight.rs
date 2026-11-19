@@ -258,5 +258,46 @@ pub fn check(p: Option<&Project>, kind: &str, spec: &Value) -> Vec<Check> {
     if matches!(kind, "think_check" | "trace_gen") && spec["backend"].as_str() == Some("vllm") && spec["target"].as_str() != Some("gguf") {
         checks.extend(crate::vllm::preflight_now(&crate::settings::Settings::load().vllm));      // the experimental engine: it is there, the card is free
     }
+    if kind == "heal" && spec["vllm_teacher"].as_bool() == Some(true) {
+        checks.extend(vllm_teacher_checks(&crate::settings::Settings::load().vllm, p, spec));          // vLLM makes the original's answers: the engine, the card, the disk
+    }
     checks
+}
+
+/// The checks before a heal whose original's answers are made by vLLM (experimental): the engine is there and the card is free (`vllm::preflight_now`), the settings' switches are on, and
+/// the disk holds the model the engine downloads (about 21 GB for the pre-quantized copy; the in-flight 4-bit route reads the original's own folder and downloads nothing).
+pub fn vllm_teacher_checks(s: &crate::settings::VllmSettings, p: Option<&Project>, spec: &Value) -> Vec<Check> {
+    let c = |id, label, light, detail: String, fix: &str| Check { id, label, light, detail, fix: fix.to_string(), action: None };
+    let mut out = crate::vllm::preflight_now(s);
+    if !(s.enabled && s.teacher.enabled) {
+        out.push(c("vllm_teacher_on", "vLLM for the original's answers", crate::envmgr::health::Light::Fail, "It is not switched on in Settings.".into(), "Open Settings, vLLM engine, and tick \"use vLLM for the original's answers\"."));
+        return out;
+    }
+    if let Some(name) = spec["name"].as_str() {
+        if let Some(p) = p {
+            let dir = crate::reshape::runs::models_dir(p).join(name);
+            if let Ok(o) = crate::reshape::heal_source::read_origin(&dir) {
+                let route = crate::vllm::teacher_route(&s.teacher, &o.teacher);
+                if route["route"] == "refused" {
+                    out.push(c("vllm_teacher_route", "Which weights vLLM uses", crate::envmgr::health::Light::Fail, route["reason"].as_str().unwrap_or("").to_string(), "Choose the automatic route or the in-flight 4-bit route in Settings."));
+                } else {
+                    out.push(c("vllm_teacher_route", "Which weights vLLM uses", crate::envmgr::health::Light::Ok, route["reason"].as_str().unwrap_or("").to_string(), ""));
+                }
+                let chk = crate::vllm::read_teacher_check(&dir, s, &o.teacher);
+                out.push(match (chk["verdict"].as_str(), chk["current"] == true) {
+                    (Some("different"), true) => c("vllm_teacher_check", "Check of the vLLM teacher", crate::envmgr::health::Light::Fail, "The check says the vLLM teacher gives different answers than the standard teacher.".into(), "Heal with the standard engine, or change the route and check again."),
+                    (Some(v), true) => c("vllm_teacher_check", "Check of the vLLM teacher", crate::envmgr::health::Light::Ok, format!("Your check says: {v}."), ""),
+                    (Some(_), false) => c("vllm_teacher_check", "Check of the vLLM teacher", crate::envmgr::health::Light::Warn, "The saved check was made for other settings.".into(), "Run \"Check the vLLM teacher\" again."),
+                    _ => c("vllm_teacher_check", "Check of the vLLM teacher", crate::envmgr::health::Light::Warn, "Not checked yet: nobody knows whether the vLLM teacher gives the same answers as the standard one.".into(), "Run \"Check the vLLM teacher\" first (about 100 rows)."),
+                });
+                if route["route"] == "prequant" {
+                    if let Some(free) = crate::envmgr::health::free_disk_gb(&dir) {
+                        out.push(if free >= 40.0 { c("vllm_disk", "Disk for the engine's model", crate::envmgr::health::Light::Ok, format!("{free:.0} GB free (the pre-quantized copy is about 21 GB, the image and the engine's cache more)."), "") }
+                                 else { c("vllm_disk", "Disk for the engine's model", crate::envmgr::health::Light::Warn, format!("Only {free:.0} GB free; the pre-quantized copy is about 21 GB and the image about 10 GB."), "Free some disk space.") });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
