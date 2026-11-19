@@ -2038,6 +2038,15 @@ fn a_try_spec_has_the_owner_defaults_and_refuses_nonsense() {
     let with: rruns::TrySpec = serde_json::from_value(json!({"model_id": "m", "choices": [{"width": 12288, "scoring": "output"}]})).unwrap();
     assert!(with.validate().is_ok());
     assert_eq!(with.want()["choices"], json!([{"blocks": [], "width": 12288, "scoring": "output"}]));
+    // refitting the kept neurons: serialised only when asked for, only with a width and a known variant
+    let rec: rruns::TrySpec = serde_json::from_value(json!({"model_id": "m", "choices": [{"width": 12288, "reconstruct": "pruned"}, {"width": 12288}]})).unwrap();
+    assert!(rec.validate().is_ok());
+    assert_eq!(rec.want()["choices"], json!([{"blocks": [], "width": 12288, "reconstruct": "pruned"}, {"blocks": [], "width": 12288}]));
+    for bad in [json!({"choices": [{"blocks": [3], "reconstruct": "pruned"}]}), json!({"choices": [{"width": 12288, "reconstruct": "yes"}]})] {
+        let mut v = json!({"model_id": "m"});
+        v.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<rruns::TrySpec>(v).unwrap().validate().is_err());
+    }
     for bad in [json!({"choices": [{"blocks": [3], "scoring": "output"}]}), json!({"choices": [{"width": 12288, "scoring": "magic"}]})] {
         let mut v = json!({"model_id": "m"});
         v.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());

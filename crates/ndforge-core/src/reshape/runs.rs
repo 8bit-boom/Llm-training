@@ -1526,6 +1526,10 @@ pub struct TryChoice {
     /// "activation" (None: the default) or "output": how the neurons of the width are ranked (needs a width). The worker then also tries the plain cut, to compare the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring: Option<String>,
+    /// Refit the kept neurons after the width cut (experimental): "pruned" (from the cut model's own activations) or "original" (from the original's); needs a width. The worker
+    /// then also tries the plain cut, to compare. None = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruct: Option<String>,
 }
 
 /// What "Try first" is asked to find out: which cuts, on how much text. Nothing is written but `reshape_try.json` in the measurement's folder.
@@ -1604,6 +1608,9 @@ impl TrySpec {
         }
         if self.choices.iter().any(|c| c.scoring.as_deref().is_some_and(|s| !["activation", "output"].contains(&s)) || (c.scoring.as_deref() == Some("output") && c.width.is_none())) {
             return Err(Error::new("Ranking the neurons by their output (or by their activation) needs a width to try."));
+        }
+        if self.choices.iter().any(|c| c.reconstruct.as_deref().is_some_and(|r| !["pruned", "original"].contains(&r) || c.width.is_none())) {
+            return Err(Error::new("Refitting the kept neurons (pruned or original) needs a width to try."));
         }
         if self.choices.len() + self.widths.len() + self.runs.len() * 64 > TRY_MAX_PASSES {
             return Err(Error::new("That asks for too many cuts at once."));

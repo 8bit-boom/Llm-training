@@ -344,11 +344,13 @@ def _pad_batches(enc: list, bs: int, pad: int) -> list:
     return batches
 
 
-def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
+def _calibration(tokenizer, calib_cfg: dict, fam_name: str, tail: bool = False, head: int = 0, skip_reasoning: int = 0) -> list:
     """Deterministic batches [{"input_ids": LongTensor[b,t], "attention_mask": LongTensor[b,t]}]: half world-book text, half practice conversations
     (whatever the training file has), right-padded. Without a training file a few built-in sentences are used (enough for the exact-copy self-check).
     With calib_cfg["reasoning"] ({"source": {"id" | "file", ...}, "share": 0.5, "max_len": 2048}) that share of the samples are conversations with thinking,
-    written the way the model thinks (data.render_chat_full), measured in batches of their own after the project's batches; the others are the project's rows."""
+    written the way the model thinks (data.render_chat_full), measured in batches of their own after the project's batches; the others are the project's rows.
+    `tail=True` (the refit of the kept neurons): the project's rows come from the END of the shuffled rows, never from the first `head` samples' worth (the rows Try first, the
+    measurement and the cut check use), and the reasoning rows skip the first `skip_reasoning` ones the measuring used."""
     import random
     from . import data
     samples = max(2, int(calib_cfg.get("samples", 128)))
@@ -369,7 +371,16 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     want_t = min(len(texts), samples // 2)
     want_c = min(len(chats), samples - want_t)
     want_t = min(len(texts), samples - want_c)
-    enc, _ = data.encode_rows(tokenizer, texts[:want_t] + chats[:want_c], fam_name, max_len, seed)
+    if tail:
+        from . import reshape_recon
+        pick_t = reshape_recon.tail_rows(len(texts), min(len(texts), head // 2), want_t) or list(range(max(0, len(texts) - want_t), len(texts)))
+        pick_c = reshape_recon.tail_rows(len(chats), min(len(chats), head - head // 2), want_c) or list(range(max(0, len(chats) - want_c), len(chats)))
+        if len(pick_t) < want_t or len(pick_c) < want_c:
+            protocol.log("There are not enough rows of your data that the measuring did not use; the refit gets fewer or overlapping rows.")
+        chosen = [texts[i] for i in pick_t] + [chats[i] for i in pick_c]
+    else:
+        chosen = texts[:want_t] + chats[:want_c]
+    enc, _ = data.encode_rows(tokenizer, chosen, fam_name, max_len, seed)
     if not enc:
         raise ReshapeError("Nothing in the training data could be used for measuring. Save a training-data version in Step 2 first.")
     inner = data.text_tokenizer(tokenizer)
@@ -377,7 +388,7 @@ def _calibration(tokenizer, calib_cfg: dict, fam_name: str) -> list:
     bs = max(1, min(int(calib_cfg.get("batch", 4)), len(enc) // 2))
     batches = _pad_batches(enc, bs, pad)
     if rkey:
-        reasoning = _reasoning_rows(tokenizer, rkey, fam_name, n_reason, seed)
+        reasoning = _reasoning_rows(tokenizer, rkey, fam_name, n_reason + skip_reasoning, seed)[skip_reasoning:] if skip_reasoning else _reasoning_rows(tokenizer, rkey, fam_name, n_reason, seed)
         rbs = max(1, min(bs, bs * max_len // max(1, rkey["max_len"])))        # long rows go in smaller batches: about as many tokens per batch as the project's
         batches += _pad_batches(reasoning, rbs, pad)
     return batches

@@ -383,3 +383,23 @@ test("ranking the neurons by their output: Expert only, sent only when ticked, a
   b.run(`rs.tr.analysis.variants = []`);
   assert.doesNotMatch(b.run("tryCard()"), /tr-variants/);
 });
+
+test("refitting the kept neurons: Expert only, both ways are asked for, and the table shows what the refit gives back on rows it was not fitted on", () => {
+  const b = browser();
+  openWidth(b, pageState(), "width", `rs.tr.what = "choice"; rs.meas = { exists: true }; rs.wi = 12288; state.settings.expert_mode = true;`);
+  const spec = () => JSON.parse(b.run("JSON.stringify(trySpec())"));
+  assert.match(b.run("tryCard()"), /<input type="checkbox" id="tr-recon" +>/);
+  assert.deepEqual(spec().choices, [{ blocks: [], width: 12288 }]);                                       // off: nothing new is sent
+  b.run(`rs.tr.recon = true`);
+  assert.deepEqual(spec().choices, [{ blocks: [], width: 12288 }, { blocks: [], width: 12288, reconstruct: "pruned" }, { blocks: [], width: 12288, reconstruct: "original" }]);
+  b.run(`rs.tr.what = "widths"`);
+  const s = spec(); assert.equal(s.choices.length, 68);
+  const v = (key, label, loss, both, recon) => ({ key, tried: true, loss, rel: loss / 2 - 1, label, rel_vs_plain: loss / 2.4 - 1, better_both_halves: both, recon });
+  b.run(`rs.tr.analysis = ${JSON.stringify(analysis({ widths: [wrow(12288, 2.4)], blocks: [], runs: {}, variants: [
+    v("d=|w=12288|r=pruned", "MLP 12,288, kept neurons refitted (from the cut model's activations)", 2.3, true, { median_removed_share: 0.21, worst_removed_share: -0.04, overlap: 0 }),
+    v("d=|w=12288|r=original", "MLP 12,288, kept neurons refitted (from the original's activations)", 2.35, false, { median_removed_share: 0.15, worst_removed_share: -0.2, overlap: 3 })] }))}`);
+  const html = b.run("tryCard()");
+  assert.match(html, /kept neurons refitted \(from the cut model(?:'|&#39;)s activations\)<\/td><td>2\.300<\/td>[\s\S]*?<td>yes<\/td><td>21\.0 % \/ −4\.0 %<\/td>/);
+  assert.match(html, /<td>15\.0 % \/ −20\.0 % · 3 rows overlap Try first<\/td>/);
+  assert.match(html, /the refit is algebra, not a result/);
+});

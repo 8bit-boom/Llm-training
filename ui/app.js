@@ -2189,7 +2189,7 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
   shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, scoring: "activation", meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
-  tr: { what: "blocks", scoring: false, se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
+  tr: { what: "blocks", scoring: false, recon: false, se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", rounds: false, roundM: 5, firstCheck: 10, roundCheck: "quick", stopRule: "pass", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
@@ -3216,12 +3216,14 @@ function trySpec() {
   else if (w === "widths") {
     const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws;
     if (rs.tr.scoring) spec.choices = ws.map((x) => ({ blocks: [], width: x, scoring: "output" }));          // the plain widths are tried as well: it is what they are compared with
+    if (rs.tr.recon) spec.choices = spec.choices.concat(ws.flatMap((x) => ["pruned", "original"].map((r) => ({ blocks: [], width: x, reconstruct: r }))));
   }
   else {
     const c = tryChoice();
     if (!c.blocks.length && c.width == null) return null;
     spec.choices = [c.width == null ? { blocks: c.blocks } : { blocks: c.blocks, width: c.width }];
     if (rs.tr.scoring && c.width != null) spec.choices.push({ ...spec.choices[0], scoring: "output" });
+    if (rs.tr.recon && c.width != null) for (const r of ["pruned", "original"]) spec.choices.push({ blocks: c.blocks, width: c.width, reconstruct: r });
   }
   return spec;
 }
@@ -3346,9 +3348,9 @@ function tryVariantsTable(a) {
   if (!rows.length) return "";
   const pct = (x) => x == null ? "–" : (x >= 0 ? "+" : "−") + Math.abs(100 * x).toFixed(1) + " %";
   const both = (r) => r.better_both_halves === true ? "yes" : r.better_both_halves === false ? "no" : "–";
-  return `<h4>Another way of choosing the neurons</h4><table class="tbl" id="tr-variants"><tr><th>Cut</th><th>Error</th><th>Against the original</th><th>Against the same cut by activation</th><th>Better in both halves</th></tr>${rows.map((r) =>
-    `<tr><td>${esc(r.label)}</td><td>${(+r.loss).toFixed(3)}</td><td>${pct(r.rel)}</td><td>${pct(r.rel_vs_plain)}</td><td>${both(r)}</td></tr>`).join("")}</table>
-    <p class="dim small">Experimental, and measured here only before healing: a gain on both halves is a reason to try the same cut healed, not a promise. The citations that motivate this ranking have not been checked by this program.</p>`;
+  return `<h4>Another way of choosing the neurons</h4><table class="tbl" id="tr-variants"><tr><th>Cut</th><th>Error</th><th>Against the original</th><th>Against the same cut by activation</th><th>Better in both halves</th><th>Given back by the refit (median / worst layer)</th></tr>${rows.map((r) =>
+    `<tr><td>${esc(r.label)}</td><td>${(+r.loss).toFixed(3)}</td><td>${pct(r.rel)}</td><td>${pct(r.rel_vs_plain)}</td><td>${both(r)}</td><td>${r.recon && r.recon.median_removed_share != null ? `${pct(r.recon.median_removed_share).replace("+", "")} / ${pct(r.recon.worst_removed_share).replace("+", "")}${r.recon.overlap ? ` · ${r.recon.overlap} rows overlap Try first` : ""}` : "–"}</td></tr>`).join("")}</table>
+    <p class="dim small">Experimental, and measured here only before healing: a gain on both halves is a reason to try the same cut healed, not a promise. The citations behind these options (the output ranking and the refit) have not been checked by this program; the refit is algebra, not a result. A gain here may not survive healing.</p>`;
 }
 
 // the plain verdict for one answer, with the honest part that never changes
@@ -3406,7 +3408,8 @@ function tryCard() {
     <div class="row">${what}</div>
     <p>Text: <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="quick" ${q === 64 ? "checked" : ""} ${run ? "disabled" : ""}> Quick (64 samples)</label> <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="full" ${q === 128 ? "checked" : ""} ${run ? "disabled" : ""}> Full (128 samples)</label>
       <span class="dim small">${ins.total_params / 1e9 >= 15 ? "Quick is the default for models of 15 B or more." : "Full is the default for smaller models."}</span></p>
-    ${tryWidthOnShape() && state.settings.expert_mode && !searchOn ? `<label class="opt" id="tr-scoring-row"><input type="checkbox" id="tr-scoring" ${tr.scoring ? "checked" : ""} ${run ? "disabled" : ""}> Also try ranking the neurons by their expected output (experimental; the plain cut is tried too, to compare)</label>` : ""}
+    ${tryWidthOnShape() && state.settings.expert_mode && !searchOn ? `<label class="opt" id="tr-scoring-row"><input type="checkbox" id="tr-scoring" ${tr.scoring ? "checked" : ""} ${run ? "disabled" : ""}> Also try ranking the neurons by their expected output (experimental; the plain cut is tried too, to compare)</label>
+    <label class="opt" id="tr-recon-row"><input type="checkbox" id="tr-recon" ${tr.recon ? "checked" : ""} ${run ? "disabled" : ""}> Also try refitting the kept neurons without training (experimental; both ways: from the cut model's own activations and from the original's; the plain cut is tried too; about ${fmtDur(plan && plan.recon_seconds ? plan.recon_seconds : null).replace("about ", "")} on top, a formula and not a measurement)</label>` : ""}
     ${searchOn ? trySearchBlock(ins) : `<p id="tr-plan">${planLine}</p>
     <div class="row"><button class="primary" id="tr-go" ${disabled ? "disabled" : ""}>${tr.what === "choice" ? "Preview my choice" : "Try"}</button><button class="secondary" id="tr-stop" ${run ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps the cuts already tried.</span></div>
     ${progress}${body}`}</div>`;
@@ -3596,6 +3599,7 @@ function wireTry() {
   document.querySelectorAll("input[name=tr-what]").forEach((r) => r.onchange = () => { tr.what = r.value; render(); });
   document.querySelectorAll("input[name=tr-q]").forEach((r) => r.onchange = () => { tr.quick = r.value === "quick"; tr.analysis = null; render(); });
   const trs = $("tr-scoring"); if (trs) trs.onchange = () => { tr.scoring = trs.checked; render(); };
+  const trr = $("tr-recon"); if (trr) trr.onchange = () => { tr.recon = trr.checked; render(); };
   document.querySelectorAll("[data-trblock]").forEach((g) => g.onclick = () => { tryToggle(+g.dataset.trblock); render(); });
   document.querySelectorAll("[data-trrun]").forEach((row) => row.onclick = () => {
     const w = (((tr.analysis || {}).runs || {})[String(rs.blocks)] || {}).windows || [], hit = w.find((x) => x.start === +row.dataset.trrun);
