@@ -513,7 +513,7 @@ SCORES_FORMAT = 1
 SCORE_ARRAYS = ("mlp", "attn", "gdn")
 
 
-def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
+def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list, weights: str | None = None):
     """The measurement cached in `scores_dir` (scores.json + scores.npz), or None when there is none or it does not belong to this model and data.
     Returns {"meta": scores.json, "mlp"/"attn"/"gdn": float32 arrays [layers, structures], and the same with "_h1" / "_h2" for the two halves}."""
     if not scores_dir:
@@ -543,6 +543,9 @@ def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list):
     if meta.get("reasoning") != reasoning_key(cal):
         protocol.log("The earlier measurement used another reasoning text; measuring again.")
         return None
+    if weights and meta.get("weights") and meta["weights"] != weights:          # a measurement made before the weights were recorded is accepted
+        protocol.log("The earlier measurement was made on other weight files of the model; measuring again.")
+        return None
     n_full = sum(1 for t in types if t == "full_attention")
     want = {"mlp": (n_layers, dims["intermediate"]), "attn": (n_full, dims["heads"]), "gdn": (n_layers - n_full, dims["lin_v_heads"])}
     for name, shape in want.items():
@@ -564,7 +567,7 @@ def _depth_from_scores(sc: dict):
 
 def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list, need_depth: bool):
     """The cached measurement when it covers what is needed; otherwise the model is measured (needs torch)."""
-    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types)
+    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types, weights=safetensors_io.weights_manifest(src_dir))
     if sc is not None and (not need_depth or sc["meta"].get("matrix")):
         protocol.log("Using the earlier measurement of this model on your data.")
         return sc
@@ -764,7 +767,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     protocol.timing("score", time.monotonic() - timer, tokens=tokens, load=mode)
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
-            "reasoning": reasoning_key(calib), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
+            "reasoning": reasoning_key(calib), "weights": safetensors_io.weights_manifest(src_dir), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
             "loss_before": loss, "seconds_per_pass": round(time.monotonic() - timer, 1), "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     if cfg.get("scores_dir"):
         _write_scores(Path(cfg["scores_dir"]), meta, scores)

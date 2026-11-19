@@ -477,9 +477,10 @@ def _file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int) -> str:
+def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, version: int = 2) -> str:
     """The folder name of the shared cache these rows belong to: the teacher (its folder and config), the tokenizer, k, the length, how the teacher is loaded, the general text
-    WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file."""
+    WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file.
+    Version 2 adds the identity of the teacher's weight files (`safetensors_io.weights_manifest`); version 1 is the id older caches were saved under."""
     data_cfg = cfg.get("data") or {}
     g = data_cfg.get("general")
     used = bool(g) and float(g.get("share", 0) or 0) > 0
@@ -488,7 +489,34 @@ def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed:
     ident = {"v": 1, "teacher": str(Path(teacher_dir).resolve()), "teacher_config": _file_sha256(Path(teacher_dir) / "config.json"), "tokenizer": tokenizer_hash(student), "k": int(k),
              "max_len": int(max_seq), "load": (cfg.get("teacher") or {}).get("load", "auto"), "general": gen, "seed": int(seed),
              "family": (cfg.get("model") or {}).get("family", "generic"), "train": _file_sha256(data_cfg.get("train") or "")}
+    if int(version) >= 2:
+        ident["v"] = 2
+        ident["teacher_weights"] = safetensors_io.weights_manifest(teacher_dir)
     return hashlib.sha256(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+
+
+ADOPT_NOTE = ("These answers were made before the program checked the original's weight files; if you replaced them in place, delete the saved answers.")
+
+
+def choose_store(base, cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, meta: dict, hashes: list):
+    """(folder, note) of the shared cache for these rows. The id of the current version first; when no store of that id exists yet but one made under the old id (before the
+    weights were part of it) does, that store is adopted once: it gets `teacher_weights` in its index and a note says so. An old store whose index already names other weights is
+    not used."""
+    base = Path(base)
+    new_id = shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 2)
+    if read_cache_index(base / new_id) is None:
+        old_dir = base / shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 1)
+        idx = read_cache_index(old_dir)
+        if idx is not None and idx.get("teacher_weights") in (None, meta.get("teacher_weights")) and store_extends(old_dir, {**meta, "teacher_weights": None}, hashes):
+            note = None
+            if idx.get("teacher_weights") is None:
+                idx["teacher_weights"] = meta.get("teacher_weights")
+                tmp = old_dir / "index.partial.json"
+                tmp.write_text(json.dumps(idx), encoding="utf-8")
+                os.replace(tmp, old_dir / "index.json")
+                note = ADOPT_NOTE
+            return old_dir, note
+    return pick_store(base, new_id, meta, hashes), None
 
 
 def _read_hashes(folder):
@@ -508,6 +536,8 @@ def store_extends(folder, meta: dict, hashes: list) -> bool:
     if old is None:
         return True
     if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len")):
+        return False
+    if old.get("teacher_weights") and meta.get("teacher_weights") and old["teacher_weights"] != meta["teacher_weights"]:
         return False
     done = int(old.get("done_rows", 0))
     if done == 0:
@@ -627,6 +657,8 @@ def read_cache_index(folder):
 
 def cache_matches(index: dict, expect: dict) -> bool:
     """True when the saved teacher answers belong to this data, tokenizer, length, k and teacher"""
+    if index.get("teacher_weights") and expect.get("teacher_weights") and index["teacher_weights"] != expect["teacher_weights"]:
+        return False                                    # an older cache without the field is accepted as before
     return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len", "general_key", "general_rows"))
 
 
@@ -698,10 +730,11 @@ def length_order(window: list) -> list:
     return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
 
 
-def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int) -> dict:
+def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int, teacher_dir=None) -> dict:
     """What index.json says about a teacher cache (the first eight keys decide `cache_matches`)."""
     gen = (cfg.get("data") or {}).get("general")
-    return {"teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
+    extra = {"teacher_weights": safetensors_io.weights_manifest(teacher_dir)} if teacher_dir else {}
+    return {**extra, "teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
             "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
             "general_key": generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407))),
             "general_source": stats["general_source"],
@@ -771,14 +804,17 @@ def run_cache(cfg: dict) -> int:
         protocol.log(f"The rows of this run are taken from the saved ones ({len(rows)} rows); the general text is not read again.")
     else:
         rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)))
-    meta = cache_meta(cfg, rows, stats, student, k, max_seq)
+    meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir)
     upto = cfg.get("upto_general_tokens")
     target = len(rows) if upto is None else rows_upto(rows, upto)
     legacy = read_cache_index(out)
+    adopt_note = None
     if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
         # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
         hashes = row_hashes(rows)
-        store = pick_store(cfg["shared_dir"], shared_store_id(cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407))), meta, hashes)
+        store, adopt_note = choose_store(cfg["shared_dir"], cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407)), meta, hashes)
+        if adopt_note:
+            protocol.log(adopt_note)
         writer = SharedCacheWriter(store, out, meta, hashes, int(cfg.get("part_tokens", 262144)))
         protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
     else:
@@ -786,6 +822,8 @@ def run_cache(cfg: dict) -> int:
     if not again:
         save_rows(out, rows)
     notes = [stats["general_error"]] if stats["general_error"] else []
+    if adopt_note:
+        notes.append(adopt_note)
     total_tokens = sum(len(r["input_ids"]) for r in rows)
     result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
     rows_before = writer.done_rows

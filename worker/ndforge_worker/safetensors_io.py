@@ -7,6 +7,7 @@ File layout: 8 bytes little-endian header length N, N bytes of JSON (name -> {dt
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import struct
@@ -254,3 +255,41 @@ def write_shards(tensors: list[OutTensor], out_dir, shard_bytes: int = 5 * 2**30
     if n > 1:
         (out_dir / INDEX_NAME).write_text(json.dumps(index, indent=2), encoding="utf-8")
     return index
+
+
+MANIFEST_BLOCKS = 16
+MANIFEST_BLOCK_BYTES = 64 * 1024
+
+
+def _sample_offsets(base: int, size: int) -> list:
+    """Where the sampled blocks of a weight file start: evenly spaced over the data area (the whole area when it is smaller than the blocks)."""
+    room = size - base
+    if room <= MANIFEST_BLOCK_BYTES * MANIFEST_BLOCKS:
+        return [base]
+    last = size - MANIFEST_BLOCK_BYTES
+    return [base + (last - base) * i // (MANIFEST_BLOCKS - 1) for i in range(MANIFEST_BLOCKS)]
+
+
+def weights_manifest(folder) -> str:
+    """A short identity of the weights in a model folder, cheap enough to read for a 27 B model (about 11 MB): `hub:<commit>` for a Hub snapshot; else the sha256 of config.json
+    and, for every *.safetensors file in name order, its name, size, the hash of its header and of 16 blocks of 64 KiB spread over its data. File times are NOT used (copying a
+    folder must not throw saved teacher answers away). It catches a replaced checkpoint, not a single edited byte."""
+    folder = Path(folder)
+    if folder.parent.name == "snapshots":
+        return "hub:" + folder.name
+    h = hashlib.sha256()
+    cfg = folder / "config.json"
+    h.update(b"config:" + (hashlib.sha256(cfg.read_bytes()).digest() if cfg.is_file() else b"-") + b";")
+    for f in sorted(folder.glob("*.safetensors")):
+        size = f.stat().st_size
+        h.update(f"{f.name}:{size};".encode())
+        with open(f, "rb") as fh:
+            raw = fh.read(8)
+            n = int.from_bytes(raw, "little") if len(raw) == 8 else 0
+            n = min(n, max(0, size - 8))
+            h.update(hashlib.sha256(raw + fh.read(n)).digest())
+            base = 8 + n
+            for off in _sample_offsets(base, size):
+                fh.seek(off)
+                h.update(hashlib.sha256(fh.read(MANIFEST_BLOCK_BYTES)).digest())
+    return "dir:" + h.hexdigest()[:32]

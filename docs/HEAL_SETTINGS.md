@@ -134,6 +134,7 @@ a LoRA on the light-prepared model gets non-zero gradients from the KL loss; `lo
 ## The key of the teacher's rows (`rows_key`)
 
 `cache_complete` also compares `rows_key`: a fingerprint of the training file (path, size, modification time), the amount of text (tokens), the teacher and how it is loaded. The worker stores it, with `teacher_load`, in the cache's `index.json`; it is not part of `distilljob.cache_matches` (the rows' own hash is). Changing the amount of text, the file or the teacher load therefore makes the teacher answer again instead of reusing answers for other rows. A cache made before the key existed has none and is judged as before.
+When the teacher is a **local folder**, the key also counts its weight files (`files`: sorted name, size and modification time of `config.json` and every `*.safetensors`); the key of a Hub id is unchanged. A heal of a local teacher therefore sees one mismatch after the upgrade: `distill_cache` runs, finds the shared store complete by content, reports `reused` within minutes and rewrites the model's view with the new key.
 
 ## The shared teacher cache
 
@@ -141,6 +142,8 @@ The heavy part files of the teacher's answers live in `<project>/models/_teacher
 teacher (folder and config), the tokenizer, `k`, the length, how the teacher is loaded, the general text **without its share** (the share is the budget), the seed, the model family and the training
 file. Next to the parts the folder keeps `rowhashes.npy` (the sha1 of every answered row's token ids). A run whose rows start with the rows already answered (or are the start of them) uses that
 folder and only asks the teacher for the rows that are missing; when the first rows differ it gets `<id>-2` ... and the first folder is never touched, because another model may still read it.
+
+**Which weights (id version 2).** The id and the index also carry `teacher_weights` (`safetensors_io.weights_manifest`): `hub:<commit>` for a Hub snapshot, else a sha256 over `config.json` and, for every weight file, its name, size, the hash of its header and the hash of 16 blocks of 64 KiB spread over its data (about 11 MB read for a 27 B model, under a second on an SSD). File times are not used, so copying a folder keeps the saved answers. Limit: it catches a replaced checkpoint, not a single edited byte. `store_extends` and `cache_matches` compare it whenever both sides have it. Answers saved under the version 1 id (before the weights were recorded) are adopted once, with the note "These answers were made before the program checked the original's weight files; if you replaced them in place, delete the saved answers.", and from then on carry `teacher_weights`; a store whose index names other weights is not used. The Try results (`weights_sample` in their key) and the measurement of the neurons (`weights` in `scores.json`) use the same identity; files saved without the field are accepted.
 
 The model's own `distill/cache/` keeps `index.json` (the parts its rows need, `store` = the shared folder, relative to it), `rows.npz` and nothing heavy, so the student and the program's skip
 decision work as before. A cache an older version made in the model's own folder is still read; a partly made one is continued as before. The shared folder goes when no model points at it any more

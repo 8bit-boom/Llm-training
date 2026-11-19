@@ -2777,3 +2777,36 @@ fn a_heal_in_rounds_that_is_stopped_goes_on_without_repeating_a_job() {
     assert_eq!(names.iter().filter(|n| n.contains("round-r1")).count(), 1, "{names:?}");
     assert_eq!(names.iter().filter(|n| n.contains("round-r2")).count(), 1, "{names:?}");
 }
+
+#[test]
+fn rows_key_of_a_hub_teacher_is_the_old_formula() {
+    use ndforge_core::reshape::runs::rows_key;
+    let train = std::path::Path::new("nowhere").join("train.jsonl");
+    // the formula before local teachers counted by their files: sha256 of this exact JSON text, first 16 bytes
+    let old = {
+        use sha2::{Digest, Sha256};
+        let text = json!({"train": train.to_string_lossy(), "size": 0, "mtime": 0, "tokens": 1000, "teacher": "org/Teacher", "load": "auto"}).to_string();
+        Sha256::digest(text.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    assert_eq!(rows_key(&train, 1000, "org/Teacher", "auto"), old);
+    assert_eq!(old.len(), 32);
+}
+
+#[test]
+fn rows_key_of_a_local_teacher_follows_its_weight_files() {
+    use ndforge_core::reshape::runs::rows_key;
+    let d = tempfile::tempdir().unwrap();
+    let teacher = d.path().join("teacher");
+    std::fs::create_dir_all(&teacher).unwrap();
+    std::fs::write(teacher.join("config.json"), "{}").unwrap();
+    std::fs::write(teacher.join("model-00001.safetensors"), vec![0u8; 16]).unwrap();
+    let train = d.path().join("train.jsonl");
+    let repo = teacher.to_string_lossy().to_string();
+    let a = rows_key(&train, 1000, &repo, "auto");
+    assert_eq!(a, rows_key(&train, 1000, &repo, "auto"), "stable");
+    std::fs::write(teacher.join("model-00001.safetensors"), vec![0u8; 32]).unwrap();
+    let b = rows_key(&train, 1000, &repo, "auto");
+    assert_ne!(a, b, "a shard of another size is another key");
+    std::fs::write(teacher.join("model-00002.safetensors"), vec![0u8; 8]).unwrap();
+    assert_ne!(b, rows_key(&train, 1000, &repo, "auto"), "a new shard is another key");
+}

@@ -965,8 +965,30 @@ pub fn rows_key(train: &Path, tokens: u64, teacher_repo: &str, teacher_load: &st
     use sha2::{Digest, Sha256};
     let meta = std::fs::metadata(train).ok();
     let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-    let text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load}).to_string();
-    Sha256::digest(text.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
+    let mut text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load});
+    // a teacher that is a local folder also counts by its weight files (a replaced checkpoint must not reuse the old answers); a Hub id keeps the key it always had
+    if let Some(files) = local_teacher_files(Path::new(teacher_repo)) {
+        text["files"] = Value::String(files);
+    }
+    Sha256::digest(text.to_string().as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A fingerprint of the weight files and config of a local teacher folder (sorted name:size:mtime of `*.safetensors` and `config.json`); None for anything that is not a folder
+/// with such files (a Hub id).
+fn local_teacher_files(dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut names: Vec<String> = std::fs::read_dir(dir).ok()?.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n == "config.json" || n.ends_with(".safetensors")).collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    let mut text = String::new();
+    for n in names {
+        let m = std::fs::metadata(dir.join(&n)).ok();
+        let mtime = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+        text.push_str(&format!("{n}:{}:{mtime};", m.map(|m| m.len()).unwrap_or(0)));
+    }
+    Some(Sha256::digest(text.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect())
 }
 
 fn training_done(run: &Path) -> bool {
