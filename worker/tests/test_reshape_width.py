@@ -739,16 +739,16 @@ def test_the_default_cut_is_the_same_with_and_without_the_key_and_records_no_sco
     assert reshapejob  # imported: the module is the one under test
 
 
-def test_output_scoring_needs_a_measurement_with_mean_squares_and_says_so_without_torch(tmp_path, monkeypatch):
-    from ndforge_worker import reshapejob
+def test_output_scoring_needs_a_measurement_with_mean_squares_and_measures_again_when_it_has_none(tmp_path):
+    # the old measurement has no mean squares: the cut says so and goes to measure again (here that fails for want of torch or of training text, whichever the machine lacks)
     _, j = scoring_job(tmp_path, "output", ms=False)
-    monkeypatch.setattr(reshapejob, "_have_torch", lambda: False)
-    monkeypatch.setattr(reshapejob, "_require_torch", lambda: (_ for _ in ()).throw(ReshapeError("Measuring the layers needs the training software (Training setup).")))
     code, ev = run_job(tmp_path, j)
-    assert code != 0 and ev[-1]["type"] == "error" and "training software" in ev[-1]["message"], ev[-1]
-    # the plain cut from the same old measurement still works
+    assert code != 0 and ev[-1]["type"] == "error", ev[-1]
+    assert any("did not record the mean square" in e.get("text", "") for e in ev if e["type"] == "log")
+    # the plain cut from the same old measurement still works, and says nothing about it
     _, j2 = scoring_job(tmp_path / "plain", None, ms=False)
-    assert run_job(tmp_path / "plain", j2)[0] == 0
+    code2, ev2 = run_job(tmp_path / "plain", j2)
+    assert code2 == 0 and not any("mean square" in e.get("text", "") for e in ev2 if e["type"] == "log")
 
 
 def test_an_old_measurement_is_read_as_before_and_ms_is_asked_for_only_when_needed(tmp_path):
