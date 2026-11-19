@@ -238,3 +238,115 @@ test("a model that thinks is told that a lower error is not a thinking test, and
   b.run(`rs.options.inspect.model_type = "llama"`);
   assert.doesNotMatch(b.run("tryCard()"), /id="tr-think-note"/);
 });
+
+// ------------------------------------------------------------------------------------------------ the automatic search
+const SE_ANALYSIS = (n = 3) => ({ base: { loss: 2.0, ppl: 7.39 }, bands: BANDS, search: { stop_reason: null,
+  ranking: { 0: ["d=3,7,11|w=10752", "d=3,5,7|w=10752", "d=1,2,3|w=10752"].slice(0, n) },
+  rows: { "d=3,7,11|w=10752": { loss: 2.04, loss_h1: 2.04, loss_h2: 2.041 }, "d=3,5,7|w=10752": { loss: 2.2, loss_h1: 2.2, loss_h2: 2.21 }, "d=1,2,3|w=10752": { loss: 2.5, loss_h1: 2.6, loss_h2: 2.4 } } } });
+const SE_ROWS = [{ key: "d=3,7,11|w=10752", group: 0, blocks: [3, 7, 11], k: 3, intermediate: 10752, params_b: 21.1, loss: 2.04, rel: 0.02, loss_h1: 2.04, loss_h2: 2.041, noise: 0.001, guardrails: [], think: null }];
+const SE_RESULT = (over = {}) => ({ id: "20261119-s", status: "done", rows: SE_ROWS, recommendation: { key: "d=3,7,11|w=10752", group: 0, reason: "Blocks 3, 7, 11 out, MLP 10752, 21.1 B: the text-prediction error rises by 2.0 %. Thinking not checked: a low error does not prove that the model can still think.", confidence: "clear", thinking_checked: false, alternatives: [] }, ...over });
+
+test("the card offers the automatic search first and the request follows the choices", () => {
+  const b = browser();
+  open(b, pageState());
+  const html = b.run("tryCard()");
+  assert.ok(html.indexOf("Find the best cut for me (automatic)") < html.indexOf("Every block on its own"));
+  b.run(`rs.tr.what = "search"`);
+  const s = JSON.parse(b.run("JSON.stringify(seSpec())"));
+  assert.deepEqual([s.model_id, s.target, s.budget_min, s.keep_thinking, s.samples, s.axes, s.think_check, s.confirm_full], ["qwen3.5-27b", { b: 21 }, 20, true, 64, "both", "top2", true]);
+  b.run(`rs.tr.se.target = "gb"; rs.tr.se.gb = "12.5"; rs.tr.se.budget = 60; rs.tr.se.think = false`);
+  const g = JSON.parse(b.run("JSON.stringify(seSpec())"));
+  assert.deepEqual([g.target, g.budget_min, g.think_check], [{ gb: 12.5 }, 60, "off"]);
+  b.run(`rs.tr.se.target = "pct"`); assert.deepEqual(JSON.parse(b.run("JSON.stringify(seSpec().target)")), { kept_pct: 75 });
+  b.run(`rs.tr.se.target = "tradeoff"`); assert.equal(b.run("seSpec().target"), "tradeoff");
+  b.run(`rs.tr.se.target = "gb"; rs.tr.se.gb = ""`); assert.equal(b.run("seSpec()"), null);
+  const card = b.run("tryCard()");
+  assert.match(card, /id="se-card"/); assert.match(card, /name="se-target" value="tradeoff"/); assert.doesNotMatch(card, /id="tr-go"/, "the manual Try button is replaced");
+  assert.match(card, /does not measure the quality after healing|a low error does not prove|Keep it able to think/);
+});
+
+test("the plan line says passes, time and what fits; the request goes through reshape_search_plan", async () => {
+  const plan = { passes: 72, rounds: [{ name: "singles", count: 15 }, { name: "sets_k", count: 27 }, { name: "refine1", count: 6 }], pass_min: [0.2, 0.4], load_min: [3, 5], total_min: [20, 34], budget_min: 20, fit_passes: 40, fit_rounds: 2, complete: false, notes: ["A low error on text does not prove that a model can still think."] };
+  const b = browser({ reshape_search_plan: () => plan, reshape_try_results: () => ({ exists: false }), reshape_try_plan: () => null });
+  open(b, pageState());
+  b.run(`rs.tr.what = "search"; renderReshape(); wireReshape();`);
+  await new Promise((r) => setTimeout(r, 20));
+  const call = b.calls.find((c) => c[0] === "reshape_search_plan");
+  assert.ok(call && call[1].spec.target && call[1].inspect.supported);
+  const html = b.run("tryCard()");
+  assert.match(html, /About <strong>72<\/strong> measurements/);
+  assert.match(html, /40 fit the 20 minutes: rounds 1 to 2/);
+  assert.match(html, /does not prove that a model can still think/);
+});
+
+test("while it runs the card shows round, pass, time left and a live table of the best cuts", () => {
+  const b = browser();
+  open(b, pageState());
+  b.run(`rs.tr.what = "search"; rs.tr.se.running = true; rs.tr.se.plan = { rounds: [{ count: 15 }, { count: 9 }, { count: 6 }, { count: 6 }, { count: 6 }], passes: 42, pass_min: [0.2, 0.3], load_min: [2, 3], total_min: [10, 16], budget_min: 20, fit_passes: 42, fit_rounds: 5, complete: true, notes: [] }`);
+  b.run(`onSearchEvent(${JSON.stringify({ kind: "try_pass", phase: "search", done: 34, total: 72, planned_total: 72, round: "sets_k", round_label: "sets of blocks", round_index: 3, budget_left_s: 540, best: { key: "d=3,7,11|w=10752", loss: 2.04 }, analysis: SE_ANALYSIS() })})`);
+  const html = b.run("tryCard()");
+  assert.match(html, /Round 3 of 5 \(sets of blocks\) · pass 34 of about 72 · up to 10 min left/);
+  assert.match(html, /<progress max="1" value="0.47\d*" id="se-bar">/);
+  assert.match(html, /id="se-live-table"/);
+  assert.match(html, /data-serow="d=3,7,11\|w=10752"/);
+  assert.match(html, /<td>3, 7, 11<\/td><td>10,752<\/td>/);
+  assert.match(html, /\+2\.0 %|2\.0 %/);
+  assert.match(html, /id="se-stop"(?! disabled)/); assert.match(html, /id="se-go" disabled/);
+});
+
+test("the recommendation says how sure it is, whether thinking was checked, and offers the three buttons", () => {
+  const b = browser();
+  open(b, pageState());
+  b.run(`rs.tr.what = "search"; rs.tr.se.result = ${JSON.stringify(SE_RESULT())}; rs.tr.se.id = "20261119-s"`);
+  let html = b.run("tryCard()");
+  assert.match(html, /id="se-rec"/); assert.match(html, /Blocks 3, 7, 11 out, MLP 10,752/);
+  assert.match(html, /A clear winner\./);
+  assert.match(html, /Thinking not checked/); assert.match(html, /id="se-think-go"/);
+  assert.match(html, /does not measure the quality after healing; for a model that thinks only the thinking check decides/);
+  assert.match(html, /id="se-use-ac"[^>]*>Use this cut in Auto-cut/); assert.match(html, /id="se-cut-now"/); assert.match(html, /id="se-cut-heal"[^>]*>Cut and heal it \(Auto-cut, one stage\)/);
+  // a close call and a checked thinking result
+  const rows = [{ ...SE_ROWS[0], think: { verdict: "kept", score: 0.9, main: { closed_rate: 0.95, loop_rate: 0.0 }, original: { closed_rate: 0.97 } } }];
+  b.run(`rs.tr.se.result = ${JSON.stringify(SE_RESULT({ rows, recommendation: { ...SE_RESULT().recommendation, confidence: "close_call", thinking_checked: true } }))}`);
+  html = b.run("tryCard()");
+  assert.match(html, /A close call: the second best is within the noise/);
+  assert.match(html, /it kept its reasoning/); assert.match(html, /the original: closed 97 %/); assert.doesNotMatch(html, /id="se-think-go"/);
+});
+
+test("Stop keeps what was measured; the three buttons set the Make form, ac.pin and the stages", async () => {
+  const partial = { rows: SE_ROWS, recommendation: SE_RESULT().recommendation };
+  const b = browser({ reshape_search_status: () => ({ search: null, partial }) });
+  open(b, pageState());
+  b.run(`rs.tr.what = "search"; rs.tr.se.running = true`);
+  b.run(`onSearchEvent(${JSON.stringify({ kind: "done", phase: "search", data: { id: "x", status: "stopped", rows: [] } })})`);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(b.calls.some((c) => c[0] === "reshape_search_status"));
+  assert.equal(b.run("rs.tr.se.running"), false);
+  assert.match(b.run("tryCard()"), /id="se-rec"/, "the partial result is shown");
+  assert.match(b.run("rs.ok"), /Stopped\. What was measured is kept/);
+  // buttons
+  b.run(`rs.tr.se.id = "x"; sePin(null)`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(ac.pin)")), { blocks: [3, 7, 11], intermediate: 10752, loss: 2.04, search_id: "x", think: null });
+  b.run(`ac.pin = null; sePin(1)`); assert.equal(b.run("ac.stages"), 1); assert.ok(b.run("ac.pin"));
+  b.run(`seCutNow()`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(rs.tr.sel)")), [3, 7, 11]);
+  assert.match(b.run("rs.dropText"), /12-15|12–15/);
+  assert.equal(b.run("rs.wi"), 10752);
+  assert.match(b.run("rs.ok"), /cuts exactly what the search found: blocks 3, 7, 11/);
+});
+
+test("starting a search sends the spec, and the thinking check of the top 2 resumes the same search", async () => {
+  const b = browser({ reshape_search_start: () => null, reshape_search_plan: () => ({ passes: 10, rounds: [], pass_min: [1, 1], load_min: [1, 1], total_min: [1, 1], budget_min: 20, fit_passes: 10, fit_rounds: 1, complete: true, notes: [] }), reshape_try_plan: () => null, reshape_try_results: () => ({ exists: false }) });
+  open(b, pageState());
+  b.run(`rs.tr.what = "search"; renderReshape(); wireReshape();`);
+  await new Promise((r) => setTimeout(r, 20));
+  b.run(`document.getElementById("se-go").onclick()`);
+  await new Promise((r) => setTimeout(r, 10));
+  const start = b.calls.find((c) => c[0] === "reshape_search_start");
+  assert.ok(start && start[1].spec.target && start[1].resume === null);
+  b.run(`rs.tr.se.running = false; rs.tr.se.result = ${JSON.stringify(SE_RESULT())}; rs.tr.se.id = "20261119-s"; renderReshape(); wireReshape();`);
+  b.run(`document.getElementById("se-think-go").onclick()`);
+  await new Promise((r) => setTimeout(r, 10));
+  const again = b.calls.filter((c) => c[0] === "reshape_search_start")[1];
+  assert.equal(again[1].resume, "20261119-s");
+  assert.equal(again[1].spec.think_check, "top2");
+});

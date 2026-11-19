@@ -2189,7 +2189,7 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
   shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
-  tr: { what: "blocks", quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
+  tr: { what: "blocks", se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
@@ -2628,7 +2628,7 @@ function madeCard(m) {
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
   sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
-  prog: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
+  prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
   {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
@@ -3055,7 +3055,7 @@ function wireThink() {
 // same text-prediction error as the loss_before / loss_after of a made model. Colour bands and the stability check come from the worker (one constant there).
 
 const TRY_BAND_WORD = { small: "small", noticeable: "noticeable", large: "large" };
-const TRY_WHAT = [["blocks", "Every block on its own"], ["runs", "Every run of the blocks on the slider"], ["widths", "Every width of the slider"], ["choice", "My choice (click blocks in the chart)"]];
+const TRY_WHAT = [["search", "Find the best cut for me (automatic)"], ["blocks", "Every block on its own"], ["runs", "Every run of the blocks on the slider"], ["widths", "Every width of the slider"], ["choice", "My choice (click blocks in the chart)"]];
 
 function tryDepthOn() { return rs.mode === "prune" && rs.shape !== "width"; }
 function tryWidthOnShape() { return rs.mode === "prune" && rs.shape !== "depth" && !!(rs.options && rs.options.width_options); }
@@ -3078,6 +3078,7 @@ function trySpec() {
   const spec = { model_id: rs.model, samples: trySamples(), len: 512, load: rs.load, measure_samples: rs.wsamples, strategy: rs.strategy, protect_first: rs.pf, protect_last: rs.pl,
     params_b: ins.total_params / 1e9, blocks: false, runs: [], widths: [], choices: [], force: false };
   const w = rs.tr.what;
+  if (w === "search") return null;
   if (w === "blocks") { if (!tryDepthOn()) return null; spec.blocks = true; }
   else if (w === "runs") { if (!tryDepthOn() || !rs.blocks) return null; spec.runs = [rs.blocks]; }
   else if (w === "widths") { const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws; }
@@ -3225,8 +3226,9 @@ function tryCard() {
   if (!ins || !ins.supported || rs.mode !== "prune" || !(op.options.length > 0 || tryWidthOnShape())) return "";
   if (!st.dataset_version) return `<div class="card wide"><h2>Try first</h2><p class="dim">Save a training-data version in Step 2 first: the cuts are tried on your own text.</p></div>`;
   const a = tr.analysis, spec = trySpec(), needM = tryNeedsMeasure(spec), run = tr.running;
+  const se = tr.se, searchOn = tr.what === "search";
   const what = TRY_WHAT.filter(([k]) => (k === "blocks" || k === "runs") ? tryDepthOn() : k === "widths" ? tryWidthOnShape() : true)
-    .map(([k, l]) => `<label class="opt"><input type="radio" name="tr-what" value="${k}" ${tr.what === k ? "checked" : ""} ${run ? "disabled" : ""}> ${esc(l)}${k === "runs" && rs.blocks ? ` <span class="dim">(${rs.blocks} block${rs.blocks === 1 ? "" : "s"})</span>` : ""}</label>`).join("");
+    .map(([k, l]) => `<label class="opt"><input type="radio" name="tr-what" value="${k}" ${tr.what === k ? "checked" : ""} ${run || se.running ? "disabled" : ""}> ${esc(l)}${k === "runs" && rs.blocks ? ` <span class="dim">(${rs.blocks} block${rs.blocks === 1 ? "" : "s"})</span>` : ""}</label>`).join("");
   const q = trySamples();
   const plan = tr.plan;
   const planLine = !spec ? `<span class="dim">${tr.what === "choice" ? "Click blocks in the chart (or pick a width) to choose what to try." : "Nothing to try with the settings above."}</span>`
@@ -3256,9 +3258,152 @@ function tryCard() {
     <div class="row">${what}</div>
     <p>Text: <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="quick" ${q === 64 ? "checked" : ""} ${run ? "disabled" : ""}> Quick (64 samples)</label> <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="full" ${q === 128 ? "checked" : ""} ${run ? "disabled" : ""}> Full (128 samples)</label>
       <span class="dim small">${ins.total_params / 1e9 >= 15 ? "Quick is the default for models of 15 B or more." : "Full is the default for smaller models."}</span></p>
-    <p id="tr-plan">${planLine}</p>
+    ${searchOn ? trySearchBlock(ins) : `<p id="tr-plan">${planLine}</p>
     <div class="row"><button class="primary" id="tr-go" ${disabled ? "disabled" : ""}>${tr.what === "choice" ? "Preview my choice" : "Try"}</button><button class="secondary" id="tr-stop" ${run ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps the cuts already tried.</span></div>
-    ${progress}${body}</div>`;
+    ${progress}${body}`}</div>`;
+}
+
+
+// ---------------------------------------------------------------------------------------------------- the automatic search ("Find the best cut for me")
+// One job (reshape_try with want.search) measures many cuts in one model load, round by round; the program ranks them, says how sure the call is, and can check the thinking of
+// the best two. It measures the error on your own text, NOT the quality after healing, and for a model that thinks a low error is not enough: the thinking check decides.
+const SE_ROUNDS = { singles: "each block on its own", width_refs: "the widths", sets_k: "sets of blocks", combined: "the real cuts", refine1: "swapping a block", refine2: "swapping a block again" };
+function seKeep() { const se = rs.tr.se, ins = rs.options && rs.options.inspect; return se.keep == null ? !!ins && ins.model_type === "qwen3_5" : se.keep; }
+function seSpec() {
+  const se = rs.tr.se, ins = rs.options && rs.options.inspect;
+  if (!ins || !ins.supported || !rs.model) return null;
+  const total = ins.total_params / 1e9;
+  const target = se.target === "b" ? { b: +(se.b != null ? se.b : Math.round(total * 0.76 * 2) / 2) } : se.target === "gb" ? (+se.gb > 0 ? { gb: +se.gb } : null) : se.target === "pct" ? { kept_pct: +se.pct } : "tradeoff";
+  if (!target) return null;
+  const keep = seKeep();
+  return { model_id: rs.model, target, budget_min: +se.budget, keep_thinking: keep, samples: trySamples(), axes: se.axes, allow_many_blocks: !!se.many, beyond_floor: !!se.beyond, think_check: keep && se.think ? "top2" : "off", confirm_full: !!se.confirm, thorough: !!se.thorough };
+}
+function seBand(rel, edges) { return rel == null ? null : rel < edges[0] ? "small" : rel < edges[1] ? "noticeable" : "large"; }
+// the table of the best cuts so far, from the analysis the worker sends after every pass (`analysis.search`)
+function seLiveRows(a) {
+  if (!a || !a.search || !a.base || a.base.loss == null) return [];
+  const ranking = (a.search.ranking || {})["0"] || [], rows = a.search.rows || {}, edges = (a.bands && a.bands.edges) || [0.03, 0.1];
+  return ranking.slice(0, 10).map((k) => {
+    const [d, w] = k.split("|"), blocks = d.slice(2).split(",").filter(Boolean).map(Number), r = rows[k] || {}, rel = r.loss != null ? r.loss / a.base.loss - 1 : null;
+    const agree = r.loss_h1 != null && r.loss_h2 != null ? Math.abs(r.loss_h1 - r.loss_h2) < Math.max(0.002, 0.25 * Math.abs(r.loss - a.base.loss)) : null;
+    return { key: k, blocks, width: w.slice(2) ? +w.slice(2) : null, rel, band: seBand(rel, edges), agree };
+  });
+}
+function seRowHtml(r) {
+  return `<tr data-serow="${esc(r.key)}"><td>${r.blocks.length ? esc(ranges(r.blocks)) : "none"}</td><td>${r.width ? thou(r.width) : "unchanged"}</td><td>${r.rel != null ? `<span class="tr-chip" style="background:${bandCss(r.band)}"></span> ${pct(r.rel)}` : "–"}</td><td>${r.agree == null ? "–" : r.agree ? "yes" : "no"}</td></tr>`;
+}
+const SE_CONF = { clear: "A clear winner.", close_call: "A close call: the second best is within the noise of the two halves of your text.", uncertain: "Uncertain: the two halves of your text name different winners." };
+function seRecommendation(res) {
+  const rec = res && res.recommendation, rows = (res && res.rows) || [];
+  if (!rec) return `<p class="warn" id="se-none">The search measured no cut. Give it more time, or check that the model is measured (Measure first).</p>`;
+  const r = rows.find((x) => x.key === rec.key) || {};
+  const think = r.think ? `<p id="se-think">Thinking checked: ${r.think.verdict === "lost_much" ? "<strong class=\"err\">it lost much of its ability to finish its reasoning</strong>" : "<strong class=\"ok\">it kept its reasoning</strong>"} (closed ${Math.round(((r.think.main || {}).closed_rate || 0) * 100)} %, loops ${Math.round(((r.think.main || {}).loop_rate || 0) * 100)} %${r.think.original ? `; the original: closed ${Math.round((r.think.original.closed_rate || 0) * 100)} %` : ""}).</p>`
+    : seKeep() ? `<p class="warn" id="se-think">Thinking not checked: a low error does not prove that the model can still think. <button class="secondary" id="se-think-go" ${rs.tr.se.running || rs.running ? "disabled" : ""}>Check the thinking of the top 2</button> <span class="dim small">writes one cut at a time (about ${r.params_b ? Math.round(r.params_b * 2) : "?"} GB) and removes it again; nothing is kept</span></p>` : "";
+  const guard = (r.guardrails || []).length ? `<p class="warn small" id="se-guard">${esc(r.guardrails.join(" "))}</p>` : "";
+  return `<div class="tr-verdict" id="se-rec"><h4>The best cut found</h4>
+    <p><strong>${r.blocks && r.blocks.length ? `Blocks ${esc(ranges(r.blocks))} out` : "No blocks out"}, MLP ${r.intermediate ? thou(r.intermediate) : "unchanged"}</strong>${r.params_b ? ` (${r.params_b} B)` : ""}: ${r.rel != null ? `the text-prediction error rises by ${pct(r.rel)}` : ""}.</p>
+    <p id="se-reason">${esc(rec.reason)}</p><p class="${rec.confidence === "clear" ? "ok" : "warn"} small" id="se-conf">${esc(SE_CONF[rec.confidence] || "")}</p>${think}${guard}
+    <p class="dim small">This ranks cuts by how well they predict your text before healing. It does not measure the quality after healing${seKeep() ? "; for a model that thinks only the thinking check decides" : ""}.</p>
+    <div class="row"><button class="primary" id="se-use-ac">Use this cut in Auto-cut</button><button class="secondary" id="se-cut-now">Cut it now</button><button class="secondary" id="se-cut-heal">Cut and heal it (Auto-cut, one stage)</button></div></div>`;
+}
+function trySearchBlock(ins) {
+  const se = rs.tr.se, total = ins.total_params / 1e9, expert = state.settings && state.settings.expert_mode, lock = se.running ? "disabled" : "";
+  const bv = se.b != null ? se.b : Math.round(total * 0.76 * 2) / 2;
+  const tgt = (k, label, inner) => `<label class="opt"><input type="radio" name="se-target" value="${k}" ${se.target === k ? "checked" : ""} ${lock}> ${label} ${inner || ""}</label>`;
+  const spec = seSpec(), pl = se.plan;
+  const planLine = !spec ? `<span class="dim">Choose a size.</span>` : se.planErr ? `<span class="err" id="se-planerr">${esc(se.planErr)}</span>` : !pl ? `<span class="dim">Planning…</span>`
+    : `About <strong>${pl.passes}</strong> measurements (${pl.rounds.filter((r) => r.count).length} rounds) × ${acStepMin(pl.pass_min[0], pl.pass_min[1])} each, plus loading ${acStepMin(pl.load_min[0], pl.load_min[1])} = ${acStepMin(pl.total_min[0], pl.total_min[1])} in all (an estimate). ${pl.complete ? "All of it fits the time you gave." : `${pl.fit_passes} fit the ${pl.budget_min} minutes: rounds 1 to ${Math.max(1, pl.fit_rounds)}; the last rounds are cut when the time is up.`}`;
+  const live = se.running ? `<div class="stepline" aria-live="polite" id="se-live">${se.round ? `Round ${se.round.index} of ${(pl && pl.rounds.filter((r) => r.count).length) || 6} (${esc(se.round.label)}) · pass ${se.done} of about ${se.total}${se.left != null ? ` · up to ${acDuration(se.left / 3600)} left` : ""}` : esc(se.text || "Starting…")}</div>${se.total ? `<progress max="1" value="${Math.min(1, se.done / Math.max(1, se.total))}" id="se-bar"></progress>` : ""}` : "";
+  const rows = se.rows.length ? `<table class="tbl" id="se-live-table"><tr><th>Blocks out</th><th>MLP</th><th>Error change</th><th>Halves agree</th></tr>${se.rows.map(seRowHtml).join("")}</table>${se.best ? `<p class="dim small">Best so far: ${esc(se.best.key)}</p>` : ""}` : "";
+  const res = !se.running && (se.result || se.partial) ? seRecommendation(se.result || se.partial) : "";
+  return `<div id="se-card"><p>The program picks the cuts to try, round by round, in one go with the model loaded once: each block on its own, then sets of blocks, then the real cuts at the width the size needs, then small swaps. It ranks them on your own text and tells you how sure it is.</p>
+    <div class="grid">${tgt("b", "Aim for", `<input type="text" id="se-b" value="${esc(String(bv))}" style="width:70px;flex:0" ${lock}> B parameters`)}
+      ${tgt("gb", "A file of about", `<input type="text" id="se-gb" value="${esc(se.gb)}" placeholder="12.5" style="width:70px;flex:0" ${lock}> GB (Q4_K_M)`)}
+      ${tgt("pct", "Keep", `<input type="text" id="se-pct" value="${esc(String(se.pct))}" style="width:60px;flex:0" ${lock}> % of the model`)}
+      ${tgt("tradeoff", "The best trade-off", `<span class="dim small">the smallest size whose best cut still costs little (a rule of thumb)</span>`)}</div>
+    <p>Spend at most <select id="se-budget" ${lock}>${[10, 20, 60, 120].map((m) => `<option value="${m}" ${+se.budget === m ? "selected" : ""}>${m} min</option>`).join("")}</select> measuring
+      <label class="opt" style="display:inline"><input type="checkbox" id="se-confirm" ${se.confirm ? "checked" : ""} ${lock}> ask a close call again with more text</label></p>
+    <label class="opt"><input type="checkbox" id="se-keep" ${seKeep() ? "checked" : ""} ${lock || (ins.model_type === "qwen3_5" ? "" : "disabled")}> Keep it able to think: measure on reasoning text${seKeep() ? ` and <label class="opt" style="display:inline"><input type="checkbox" id="se-think-on" ${se.think ? "checked" : ""} ${lock}> check the thinking of the best 2 cuts afterwards (writes one cut at a time)</label>` : ""}</label>
+    ${expert ? `<p class="small">Expert: <select id="se-axes" ${lock}>${[["both", "blocks and width"], ["depth", "blocks only"], ["width", "width only"]].map(([v, l]) => `<option value="${v}" ${se.axes === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <label class="opt" style="display:inline"><input type="checkbox" id="se-many" ${se.many ? "checked" : ""} ${lock}> more than 4 blocks</label> <label class="opt" style="display:inline"><input type="checkbox" id="se-beyond" ${se.beyond ? "checked" : ""} ${lock}> thinner than the width-first floor</label> <label class="opt" style="display:inline"><input type="checkbox" id="se-thorough" ${se.thorough ? "checked" : ""} ${lock}> every neighbouring run too</label></p>` : ""}
+    <p id="se-plan">${planLine}</p>${pl ? (pl.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("") : ""}
+    <div class="row"><button class="primary" id="se-go" ${!spec || se.running || se.planErr || rs.running || rs.testing || rs.tr.running ? "disabled" : ""}>Find the best cut</button><button class="secondary" id="se-stop" ${se.running ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps everything measured; a repeated search costs nothing for the cuts it has.</span></div>
+    ${live}${se.err ? errDiv(se.err) : ""}${rows}${res}</div>`;
+}
+function seRefresh() {
+  if (page !== "reshape" || !rs.state || !rs.options || rs.tr.what !== "search") return;
+  const se = rs.tr.se, spec = seSpec(), sig = spec ? JSON.stringify(spec) : "";
+  if (sig === se.planFor || se.running) return;
+  se.planFor = sig; se.plan = null; se.planErr = null;
+  if (!spec) return;
+  const token = ++se.planTok;
+  invoke("reshape_search_plan", { spec, inspect: rs.options.inspect }).then((p) => { if (token === se.planTok) { se.plan = p; if (page === "reshape") render(); } })
+    .catch((e) => { if (token === se.planTok) { se.planErr = String(e); if (page === "reshape") render(); } });
+}
+function onSearchEvent(p) {
+  const se = rs.tr.se;
+  if (p.kind === "progress") { se.text = p.text || se.text; }
+  else if (p.kind === "log") rs.log.push(p.text);
+  else if (p.kind === "search") { se.text = ({ measuring: "Measuring the cuts…", confirming: "Asking the close call again with more text…", writing_cut: "Writing one cut to check its thinking…" })[p.status] || se.text; se.id = p.id || se.id; }
+  else if (p.kind === "try_pass") {
+    se.done = p.done; se.total = p.planned_total || p.total; se.left = p.budget_left_s; se.best = p.best || null;
+    se.round = p.round ? { name: p.round, label: p.round_label || SE_ROUNDS[p.round] || p.round, index: p.round_index || 1 } : se.round;
+    se.rows = seLiveRows(p.analysis);
+  } else if (p.kind === "error") { se.running = false; se.err = p.text; se.text = ""; }
+  else if (p.kind === "done") {
+    se.running = false; se.text = "";
+    if (p.data && p.data.rows) { se.result = p.data; se.partial = null; se.id = p.data.id; }
+    if (p.data && p.data.status === "stopped") {
+      rs.ok = "Stopped. What was measured is kept; Find the best cut goes on from there.";
+      const spec = seSpec();
+      if (spec) invoke("reshape_search_status", { spec, inspect: rs.options.inspect }).then((r) => { se.partial = r && r.partial && r.partial.rows && r.partial.rows.length ? r.partial : null; se.result = null; if (page === "reshape") render(); }).catch(() => {});
+    } else rs.ok = "The search is done. The answers are kept: another search over the same text costs nothing for the cuts it has.";
+  }
+  if (page === "reshape") render();
+}
+// what a recommended cut says to the rest of the program
+function seChosen() {
+  const se = rs.tr.se, res = se.result || se.partial, rec = res && res.recommendation, row = rec && (res.rows || []).find((r) => r.key === rec.key);
+  return row ? { blocks: row.blocks, intermediate: row.intermediate, loss: row.loss, search_id: se.id || (se.result && se.result.id) || null, think: row.think || null, key: row.key } : null;
+}
+function sePin(stages) {
+  const c = seChosen(); if (!c) return;
+  ac.pin = { blocks: c.blocks, intermediate: c.intermediate, loss: c.loss, search_id: c.search_id, think: c.think };
+  if (stages) ac.stages = stages;
+  rs.ok = `This cut is pinned for Auto-cut: ${c.blocks.length ? "blocks " + ranges(c.blocks) : "no blocks"}${c.intermediate ? `, MLP ${thou(c.intermediate)}` : ""}. Auto-cut will not search again.`;
+  const el = document.getElementById("ac-card"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
+}
+function seCutNow() {
+  const c = seChosen(), ins = rs.options.inspect; if (!c) return;
+  rs.tr.sel = [...c.blocks];
+  if (c.blocks.length) {
+    rs.dropText = ranges(c.blocks.flatMap((b) => Array.from({ length: ins.period }, (_, i) => b * ins.period + i)));
+    if (rs.options.options.some((o) => o.blocks === c.blocks.length)) rs.blocks = c.blocks.length;
+    if (c.intermediate != null && ins.width_dims && c.intermediate !== ins.width_dims.intermediate && rs.shape === "depth") rs.shape = "both";
+  }
+  if (c.intermediate != null && !(ins.width_dims && c.intermediate === ins.width_dims.intermediate)) rs.wi = c.intermediate;
+  rs.error = null;
+  rs.ok = `The Make form now cuts exactly what the search found${c.blocks.length ? `: blocks ${ranges(c.blocks)}` : ""}${c.intermediate ? `, MLP ${thou(c.intermediate)}` : ""}.`;
+}
+function wireSearch() {
+  const se = rs.tr.se, on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); render(); }; };
+  document.querySelectorAll("input[name=se-target]").forEach((r) => r.onchange = () => { se.target = r.value; render(); });
+  set("se-b", (e) => { se.b = +e.value; se.target = "b"; }); set("se-gb", (e) => { se.gb = e.value.trim(); se.target = "gb"; }); set("se-pct", (e) => { se.pct = +e.value; se.target = "pct"; });
+  set("se-budget", (e) => { se.budget = +e.value; }); set("se-confirm", (e) => { se.confirm = e.checked; }); set("se-keep", (e) => { se.keep = e.checked; }); set("se-think-on", (e) => { se.think = e.checked; });
+  set("se-axes", (e) => { se.axes = e.value; }); set("se-many", (e) => { se.many = e.checked; }); set("se-beyond", (e) => { se.beyond = e.checked; }); set("se-thorough", (e) => { se.thorough = e.checked; });
+  const start = async (resume) => {
+    const spec = seSpec(); if (!spec) return;
+    se.running = true; se.text = "Starting…"; se.err = null; se.done = 0; se.total = 0; se.round = null; se.left = null; se.best = null; se.rows = []; if (!resume) { se.result = null; se.partial = null; } rs.error = null; rs.ok = null; rs.log = []; render();
+    try { await invoke("reshape_search_start", { spec, resume: resume || null }); } catch (e) { se.running = false; se.err = String(e); render(); }
+  };
+  on("se-go", () => start(null));
+  on("se-think-go", () => start(se.id || (se.result && se.result.id) || null));
+  on("se-stop", () => { se.text = "Stopping…"; invoke("reshape_stop"); render(); });
+  on("se-use-ac", () => { sePin(null); render(); });
+  on("se-cut-now", () => { seCutNow(); render(); });
+  on("se-cut-heal", () => { sePin(1); render(); });
+  seRefresh();
 }
 
 function tryToggle(b) {
@@ -3315,6 +3460,7 @@ function wireTry() {
   on("tr-stop", () => { tr.text = "Stopping…"; invoke("reshape_stop"); render(); });
   on("tr-use", () => { tryUse(); render(); });
   on("tr-measure", () => rsMeasure(false));
+  wireSearch();
   tryRefresh();
 }
 
@@ -3467,6 +3613,7 @@ function onReshapeEvent(p) {
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "try") return onTryEvent(p);
+  if (p.phase === "search") return onSearchEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
     rs.running = false; rs.text = ""; rs.progress = null;
     if (p.kind === "error") rs.error = p.text; else rs.ok = "Measured. The result is kept for every size on this data.";
