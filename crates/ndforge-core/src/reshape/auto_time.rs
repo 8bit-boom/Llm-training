@@ -66,6 +66,48 @@ pub struct StepTime {
     pub basis: String,
     pub note: Option<String>,
     pub parts: Vec<StepPart>,
+    /// a heal in rounds (docs/HEAL_ROUNDS.md): `minutes` is then (best case low, worst case high) and this says what the two are
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<RoundsTime>,
+}
+
+/// The time of a heal in rounds, in minutes (low, high) unless said otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundsTime {
+    pub round_m: u32,
+    pub first_check_m: u32,
+    pub cap_m: u32,
+    /// the fewest rounds (the first check passes) and the most (the cap)
+    pub rounds: (u32, u32),
+    /// one round with its check: the original's answers, the training, the loads, the check
+    pub per_round: (f64, f64),
+    /// the share of a round that is not learning or answering: loading the models, the check, saving (0 to 1)
+    pub overhead_share: (f64, f64),
+    /// the first check passes: rounds up to it, the merge and the check of the merged model
+    pub best: (f64, f64),
+    /// no check passes: every round to the cap, their checks, the merge and the check of the merged model
+    pub worst: (f64, f64),
+    /// the heal reads the saved answers of a model that thinks (checks), or only watches the loss
+    pub thinking: bool,
+}
+
+/// What the time of a heal in rounds depends on.
+#[derive(Debug, Clone)]
+pub struct RoundsIn {
+    pub teacher_b: f64,
+    pub student_b: f64,
+    pub teacher_gb: f64,
+    pub student_gb: f64,
+    /// how the original is loaded: "16bit" | "4bit" | "offload"
+    pub teacher_load: String,
+    /// million tokens whose answers are saved already (a shared cache)
+    pub reuse_m: u32,
+    pub cap_m: u32,
+    pub round_m: u32,
+    pub first_check_m: u32,
+    pub check_quick: bool,
+    pub final_quick: bool,
+    pub thinking: bool,
 }
 
 /// Time that is not in the total: it happens only if something goes wrong.
@@ -202,7 +244,7 @@ fn step(id: &str, label: impl Into<String>, parts: Vec<P>, note: Option<String>)
     let hist: f64 = parts.iter().filter(|x| x.id != "start" && x.r.hist).map(|x| x.r.lo + x.r.hi).sum();
     let basis = if hist > 0.0 && hist * 2.0 >= work { "your_history" } else { "formula" };
     StepTime {
-        id: id.into(), label: label.into(), minutes: (r1(lo), r1(hi)), basis: basis.into(), note,
+        id: id.into(), label: label.into(), minutes: (r1(lo), r1(hi)), basis: basis.into(), note, rounds: None,
         parts: parts.into_iter().map(|x| StepPart { id: x.id.into(), label: x.label, minutes: (r1(x.r.lo), r1(x.r.hi)), basis: if x.r.hist { "your_history" } else { "formula" }.into() }).collect(),
     }
 }
@@ -248,6 +290,120 @@ fn heal_parts(h: &History, ins: &Inspect, plan: &AutoPlan, g: &StagePlan, tokens
     v.push(p("train", format!("the student learns ({tokens_m} M tokens)"), train));
     v.push(p("merge", "add the learning into the model", per_unit(h, "merge_s_per_gb", gb16(g.params), gb16(g.params), (MERGE_MIN_PER_GB.0 * gb16(g.params), MERGE_MIN_PER_GB.1 * gb16(g.params)))));
     (v, note)
+}
+
+/// The unmerged LoRA makes the check's generation a little slower (an estimate, not measured).
+const LORA_CHECK_SLOWDOWN: (f64, f64) = (1.1, 1.25);
+/// Evaluating the loss on the person's text after a round, and saving the checkpoint, minutes.
+const ROUND_EVAL: (f64, f64) = (1.0, 2.0);
+const ROUND_SAVE: (f64, f64) = (0.3, 1.0);
+
+struct RoundCost {
+    parts: Vec<P>,
+    /// (low, high) minutes of the time that is not learning or answering
+    overhead: (f64, f64),
+    work: (f64, f64),
+}
+
+fn sum_r(parts: &[P], f: impl Fn(&P) -> bool) -> (f64, f64) {
+    parts.iter().filter(|x| f(x)).fold((0.0, 0.0), |a, x| (a.0 + x.r.lo, a.1 + x.r.hi))
+}
+
+/// One round: `teacher_m` million tokens answered by the original, `train_m` learned, with or without the thinking check.
+fn round_cost(h: &History, i: &RoundsIn, teacher_m: f64, train_m: f64, checked: bool) -> RoundCost {
+    let mut v: Vec<P> = Vec::new();
+    v.push(start("start of the round's jobs", if teacher_m > 0.0 { 3.0 } else { 2.0 }));
+    if teacher_m > 0.0 {
+        v.push(p("load", "load the original", load(h, i.teacher_gb, &i.teacher_load)));
+        let f = (CACHE_H_PER_5M.0 * 60.0 * teacher_m / 5.0 * i.teacher_b / CACHE_REF_B, CACHE_H_PER_5M.1 * 60.0 * teacher_m / 5.0 * i.teacher_b / CACHE_REF_B);
+        v.push(p("cache", format!("the original writes its answers ({teacher_m:.1} M tokens)"), at_rate(h, "teacher_tok_b_s", i.teacher_b, teacher_m * 1e6 * i.teacher_b, f)));
+    }
+    let load_mode = if i.student_b >= 15.0 { "4bit" } else { "16bit" };
+    v.push(p("load", "load the student", load(h, i.student_gb, load_mode)));
+    let f = (TRAIN_H_PER_5M.0 * 60.0 * train_m / 5.0 * i.student_b / TRAIN_REF_B, TRAIN_H_PER_5M.1 * 60.0 * train_m / 5.0 * i.student_b / TRAIN_REF_B);
+    v.push(p("train", format!("the student learns ({train_m:.1} M tokens)"), at_rate(h, "train_tok_b_s", i.student_b, train_m * 1e6 * i.student_b, f)));
+    v.push(p("eval", "loss on your text, save the checkpoint", fixed(ROUND_EVAL.0 + ROUND_SAVE.0, ROUND_EVAL.1 + ROUND_SAVE.1)));
+    if checked {
+        v.push(start("start of the check", 1.0));
+        v.push(p("load", "load the student for the check", load(h, i.student_gb, load_mode)));
+        let c = think_check(h, i.student_b, i.check_quick);
+        v.push(p("check", "thinking check (the LoRA on top, not merged)", R { lo: c.lo * LORA_CHECK_SLOWDOWN.0, hi: c.hi * LORA_CHECK_SLOWDOWN.1, hist: c.hist }));
+    }
+    let work = sum_r(&v, |x| x.id == "cache" || x.id == "train");
+    let all = sum_r(&v, |_| true);
+    RoundCost { overhead: (all.0 - work.0, all.1 - work.1), work, parts: v }
+}
+
+/// The merge and the thinking check of the merged model (once, at the end of the heal).
+fn rounds_tail(h: &History, i: &RoundsIn) -> Vec<P> {
+    let mut v = vec![p("merge", "add the learning into the model", per_unit(h, "merge_s_per_gb", i.student_gb, i.student_gb, (MERGE_MIN_PER_GB.0 * i.student_gb, MERGE_MIN_PER_GB.1 * i.student_gb)))];
+    if i.thinking {
+        v.push(start("start of the check", 1.0));
+        v.push(p("load", "load the merged model", load(h, i.student_gb, "16bit")));
+        v.push(p("check", "thinking check of the merged model (the real gate)", think_check(h, i.student_b, i.final_quick)));
+    }
+    v
+}
+
+/// The time of a heal in rounds: its parts (the worst case, every round to the cap) and the numbers of `RoundsTime`. Formulas on the reference run unless this computer has
+/// its own earlier jobs; the cost of a round's loads and check is an estimate that nobody has measured on a real heal in rounds (docs/HEAL_ROUNDS.md).
+pub fn rounds_estimate(h: &History, i: &RoundsIn) -> (Vec<StepPart>, RoundsTime) {
+    let round = i.round_m.max(1) as f64;
+    let cap = i.cap_m.max(i.round_m) as f64;
+    let n_max = (cap / round).ceil() as u32;
+    let first = (i.first_check_m.max(i.round_m) as f64).min(cap);
+    // without a thinking check the first possible stop is the plateau, after half the cap
+    let stop_at = if i.thinking { first } else { cap * super::heal_rounds::PLATEAU_AFTER };
+    let n_min = ((stop_at / round).ceil() as u32).clamp(1, n_max);
+    let reuse = i.reuse_m as f64;
+    let at = |k: u32| -> (f64, f64, f64) {      // (start, end, tokens of the round) in M
+        let (a, b) = ((k - 1) as f64 * round, (k as f64 * round).min(cap));
+        (a, b, b - a)
+    };
+    let mut worst_parts: Vec<P> = Vec::new();
+    let (mut best, mut worst) = ((0.0, 0.0), (0.0, 0.0));
+    for k in 1..=n_max {
+        let (a, b, n) = at(k);
+        let teacher = (b - a.max(reuse)).clamp(0.0, n);
+        let checked = i.thinking && b < cap && b >= first;
+        let c = round_cost(h, i, teacher, n, checked);
+        let total = sum_r(&c.parts, |_| true);
+        worst = (worst.0 + total.0, worst.1 + total.1);
+        if k <= n_min {
+            // the best case: a check only after the round that reaches the first check
+            let only = if k == n_min && i.thinking && b < cap { round_cost(h, i, teacher, n, true) } else { round_cost(h, i, teacher, n, false) };
+            let t = sum_r(&only.parts, |_| true);
+            best = (best.0 + t.0, best.1 + t.1);
+        }
+        worst_parts.extend(c.parts);
+    }
+    let tail = rounds_tail(h, i);
+    let t = sum_r(&tail, |_| true);
+    best = (best.0 + t.0, best.1 + t.1);
+    worst = (worst.0 + t.0, worst.1 + t.1);
+    // one round of the middle with its check, the original answering all of it
+    let typ = round_cost(h, i, round, round, i.thinking);
+    let per = sum_r(&typ.parts, |_| true);
+    let share = |o: f64, w: f64| if o + w > 0.0 { o / (o + w) } else { 0.0 };
+    let overhead_share = (((share(typ.overhead.0, typ.work.1)) * 1000.0).round() / 1000.0, ((share(typ.overhead.1, typ.work.0)) * 1000.0).round() / 1000.0);
+    worst_parts.extend(tail);
+    // the parts of the worst case, added up by kind (every round has the same kinds)
+    let mut parts: Vec<StepPart> = Vec::new();
+    for (id, label) in [("start", "start of the jobs (three or four a round)"), ("load", "load the original and the student (for the round and for its check)"), ("cache", "the original writes its answers"), ("train", "the student learns"),
+                        ("eval", "loss on your text and saving, every round"), ("check", "thinking checks (the rounds' and the merged model's)"), ("merge", "add the learning into the model")] {
+        let of: Vec<&P> = worst_parts.iter().filter(|x| x.id == id).collect();
+        if of.is_empty() {
+            continue;
+        }
+        let (lo, hi) = of.iter().fold((0.0, 0.0), |a, x| (a.0 + x.r.lo, a.1 + x.r.hi));
+        let hist = of.iter().all(|x| x.r.hist);
+        parts.push(StepPart { id: id.into(), label: label.into(), minutes: (r1(lo), r1(hi)), basis: if hist { "your_history" } else { "formula" }.into() });
+    }
+    let t = RoundsTime {
+        round_m: i.round_m, first_check_m: first.round() as u32, cap_m: i.cap_m, rounds: (n_min, n_max), per_round: (r1(per.0), r1(per.1)), overhead_share, best: (r1(best.0), r1(best.1)), worst: (r1(worst.0), r1(worst.1)),
+        thinking: i.thinking,
+    };
+    (parts, t)
 }
 
 /// The time of the whole run for `plan` (an `ok` plan) and `spec`. `history` is what this computer's own saved job logs say (`History::default()`: nothing, every step is a formula).
@@ -342,6 +498,10 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
         let same: u32 = if g.mode == "cache" { saved.iter().filter(|(_, sq, ld, _)| *sq == g.seq && *ld == g.teacher_load).map(|x| x.3).max().unwrap_or(0) } else { 0 };
         let reuse = same.min(g.tokens_m);
         reuse_of.push(same);
+        let rin = spec.heal_rounds.as_ref().map(|ro| RoundsIn {
+            teacher_b: ob, student_b: sb, teacher_gb: orig_gb, student_gb: gb, teacher_load: plan.measure_load.clone(), reuse_m: reuse, cap_m: g.tokens_m, round_m: ro.round_m,
+            first_check_m: ro.first_check(g.tokens_m), check_quick: ro.quick(), final_quick: spec.think_quick(), thinking,
+        });
         let (parts, mut note) = heal_parts(h, ins, plan, g, g.tokens_m, g.tokens_m - reuse);
         if reuse > 0 {
             let from = saved.iter().find(|(_, sq, ld, tk)| *sq == g.seq && *ld == g.teacher_load && *tk == same).map(|x| x.0 + 1).unwrap_or(1);
@@ -353,9 +513,22 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
         if g.mode == "cache" {
             saved.push((i as u32, g.seq, g.teacher_load.clone(), g.tokens_m));
         }
-        steps.push(step(&format!("s{n}.heal"), format!("{t}heal"), parts, note));
+        if let Some(rin) = &rin {
+            let (rparts, rt) = rounds_estimate(h, rin);
+            let hist = !rparts.is_empty() && rparts.iter().filter(|x| x.id == "cache" || x.id == "train").all(|x| x.basis == "your_history");
+            let rnote = format!("Healing in rounds of {} M tokens{}: {:.0} to {:.0} hours if it stops early, {:.0} if it runs to the cap ({} M). Experimental: nobody has measured how long the loads and the checks of a round take on a real heal.",
+                                rt.round_m, if thinking { format!(", the first check after {} M", rt.first_check_m) } else { String::from(", stopping when the loss stops falling") }, rt.best.0 / 60.0, rt.best.1 / 60.0, rt.worst.1 / 60.0, rt.cap_m);
+            steps.push(StepTime { id: format!("s{n}.heal"), label: format!("{t}heal in rounds"), minutes: (rt.best.0, rt.worst.1), basis: if hist { "your_history" } else { "formula" }.into(), note: Some(rnote),
+                                  parts: rparts, rounds: Some(rt) });
+        } else {
+            steps.push(step(&format!("s{n}.heal"), format!("{t}heal"), parts, note));
+        }
 
-        if thinking {
+        if thinking && rin.is_some() {
+            // the merged model was checked inside the heal; this step reads the saved result
+            steps.push(step(&format!("s{n}.check_heal"), format!("{t}thinking check of the healed model"), vec![start("start of the job", 1.0)],
+                            Some("Done inside the heal in rounds (the check of the merged model is its last step); this only reads the saved result.".to_string())));
+        } else if thinking {
             let mut parts = vec![start("start of the job", 1.0)];
             let mut note = None;
             if baseline_here && !spec.check_cut {
@@ -409,7 +582,19 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     // what shortens the run most: the teacher's answers and the training
     let lever: (f64, f64) = steps.iter().filter(|s| s.id.ends_with(".heal")).flat_map(|s| s.parts.iter()).filter(|x| x.id == "cache" || x.id == "train").fold((0.0, 0.0), |a, x| (a.0 + x.minutes.0, a.1 + x.minutes.1));
 
-    if thinking && spec.retry_heal {
+    if thinking && spec.retry_heal && spec.heal_rounds.is_some() {
+        // in rounds a failed stage is not healed again from a new student: it goes on from the last round for one more stretch (the same run, `rounds.extend`)
+        if let (Some(g), Some(ro)) = (plan.stages.last(), spec.heal_rounds.as_ref()) {
+            let more = auto_plan::RETRY_TOKENS_M;
+            let rin = RoundsIn { teacher_b: ob, student_b: g.params as f64 / 1e9, teacher_gb: orig_gb, student_gb: gb16(g.params), teacher_load: plan.measure_load.clone(), reuse_m: 0, cap_m: more, round_m: ro.round_m.min(more),
+                                 first_check_m: ro.round_m.min(more), check_quick: ro.quick(), final_quick: spec.think_quick(), thinking };
+            let (_, rt) = rounds_estimate(h, &rin);
+            extra.push(ExtraTime {
+                id: "retry_heal".into(), label: format!("If the last stage reaches its cap without passing: {more} M more tokens in rounds after a failed check, then the merged model is checked again"), minutes: (rt.worst.0.min(rt.best.0), rt.worst.1),
+                note: "Only when a check fails, and only once per stage. It is not in the total.".into(),
+            });
+        }
+    } else if thinking && spec.retry_heal {
         if let (Some(g), Some(same)) = (plan.stages.last(), reuse_of.last()) {
             // the student of the retry is the healed model and learns on ALL the tokens of the second heal (40 + 40 = 80); the original adds only the rows it has not written
             let total = auto_plan::retry_total_m(g.tokens_m);

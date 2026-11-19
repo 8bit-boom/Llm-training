@@ -650,3 +650,36 @@ fn the_original_being_answered_again_and_a_lost_general_text_are_noticed() {
     assert_eq!(st["rows"].as_array().unwrap().len(), 3);          // round 3 was opened, nothing trained for it
     assert_eq!(st["rows"][2]["trained"], false);
 }
+
+// ----------------------------------------------------------------------------------------------------------------- the card's estimate
+
+fn origin() -> ndforge_core::reshape::heal_source::Origin {
+    ndforge_core::reshape::heal_source::Origin {
+        teacher: "org/teacher".into(), family: "qwen3_5".into(), student_b: 17.4, teacher_b: 27.8, config: json!({"num_hidden_layers": 48, "hidden_size": 5120, "vocab_size": 248320}),
+        calibration: json!({}), loss_before: json!(2.0), loss_after: json!(3.0), external: false, teacher_chosen: false, student_label: "cut".into(),
+    }
+}
+
+#[test]
+fn the_estimate_of_the_heal_card_carries_the_rounds_and_flags_a_round_with_too_few_steps() {
+    use ndforge_core::reshape::runs::heal_estimate_with;
+    let o = origin();
+    let est = |v: Value| heal_estimate_with(&o, &heal(v), Some(32.0));
+    // a normal heal has no rounds key
+    assert!(est(json!({"tokens_m": 40, "seq": 8192})).get("rounds").is_none());
+    let r = est(json!({"tokens_m": 40, "seq": 8192, "recipe": "thinking", "rounds": {"round_m": 1}}));
+    assert_eq!(r["rounds"]["too_few_steps"], true, "1 M at 8192 is about 7.6 steps");
+    assert!(r["rounds"]["steps_per_round"].as_f64().unwrap() < 8.0 && r["rounds"]["min_steps"] == 8);
+    assert!(r["rounds"]["warn_overhead"] == true, "a 1 M round is mostly overhead");
+    let r = est(json!({"tokens_m": 40, "seq": 8192, "recipe": "thinking", "rounds": {"round_m": 5}}));
+    assert_eq!(r["rounds"]["too_few_steps"], false);
+    assert!(r["rounds"]["warn_overhead"] == false);
+    let t = &r["rounds"]["time"];
+    let (best, worst) = (t["best"][1].as_f64().unwrap(), t["worst"][1].as_f64().unwrap());
+    let normal = r["rounds"]["normal_heal"][1].as_f64().unwrap();
+    assert!(best < normal && normal < worst, "{best} {normal} {worst}");
+    assert_eq!(r["rounds"]["basis"], "formula");
+    assert_eq!((t["round_m"].clone(), t["cap_m"].clone(), t["first_check_m"].clone()), (json!(5), json!(40), json!(10)));
+    // the memory estimate itself is the one of a normal heal
+    assert_eq!(r["plan"], est(json!({"tokens_m": 40, "seq": 8192, "recipe": "thinking"}))["plan"]);
+}

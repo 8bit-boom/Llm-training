@@ -1698,5 +1698,31 @@ pub fn heal_estimate_with(o: &heal_source::Origin, spec: &HealSpec, vram_gb: Opt
     let dims = plan::HealDims::from_config(&o.config, student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
     let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
-    json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum})
+    let mut out = json!({"plan": hp, "knobs": ch.knobs, "upcast_gb": plan::heal_upcast_extra_gb(student_b, &dims, &ch.knobs), "optimizer": ch.optimizer, "k": ch.k, "per_update": ch.knobs.batch * ch.knobs.grad_accum});
+    if let Some(r) = &spec.rounds {
+        out["rounds"] = rounds_estimate_json(o, spec, r, &ch);
+    }
+    out
+}
+
+/// What the Heal card shows for a heal in rounds, additive to the estimate: the steps of a round, the overhead, and the time if the first check passes and if it runs to the cap
+/// (formulas on the reference run: this computer's own timings are not read here).
+fn rounds_estimate_json(o: &heal_source::Origin, spec: &HealSpec, r: &heal_rounds::RoundSpec, ch: &HealChoice) -> Value {
+    use super::auto_time::{rounds_estimate, RoundsIn};
+    let (seq, per_update) = (ch.knobs.seq, ch.knobs.batch * ch.knobs.grad_accum);
+    let cap = r.cap_tokens(spec);
+    let steps = heal_rounds::est_steps(seq, per_update, r.round_tokens());
+    let cap_m = (cap as f64 / 1e6).ceil() as u32;
+    let round_m = ((r.round_tokens() as f64 / 1e6).ceil() as u32).max(1);
+    let rin = RoundsIn {
+        teacher_b: o.teacher_b, student_b: o.student_b, teacher_gb: o.teacher_b * 2.0, student_gb: o.student_b * 2.0, teacher_load: ch.teacher_load.clone().unwrap_or_else(|| "4bit".into()), reuse_m: 0, cap_m,
+        round_m, first_check_m: (r.first_check_tokens(spec) as f64 / 1e6).ceil() as u32, check_quick: r.quick(), final_quick: r.final_is_quick(), thinking: spec.thinking(),
+    };
+    let (parts, t) = rounds_estimate(&crate::timing::History::default(), &rin);
+    let normal = {
+        let n = RoundsIn { round_m: cap_m, first_check_m: cap_m, thinking: false, ..rin.clone() };
+        rounds_estimate(&crate::timing::History::default(), &n).1.worst
+    };
+    json!({"steps_per_round": (steps * 10.0).round() / 10.0, "min_steps": heal_rounds::MIN_ROUND_STEPS, "too_few_steps": r.round_exact.is_none() && steps < heal_rounds::MIN_ROUND_STEPS as f64,
+           "time": t, "parts": parts, "normal_heal": normal, "warn_overhead": t.overhead_share.1 > 0.2, "basis": "formula"})
 }

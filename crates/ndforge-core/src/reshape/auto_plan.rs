@@ -129,6 +129,33 @@ pub struct AutoSpec {
     /// a cut chosen earlier (Try first's search, "Use this cut in Auto-cut"): the run does not search or try again
     #[serde(default)]
     pub cut: Option<PinnedCut>,
+    /// heal every stage in rounds with a thinking check after each (experimental, docs/HEAL_ROUNDS.md); None = the heal as it always was (the key is then not written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_rounds: Option<HealRoundsOpt>,
+}
+
+/// Auto-cut's settings of a heal in rounds; the rest (the cap = the stage's recipe, baseline, final check mode, deadline) is filled in by the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealRoundsOpt {
+    /// million tokens before each check: 1, 2, 5, 10 or 20
+    pub round_m: u32,
+    /// "quick" | "full"; None = quick
+    #[serde(default)]
+    pub check: Option<String>,
+    /// no check before this many million tokens; None = 10
+    #[serde(default)]
+    pub first_check_m: Option<u32>,
+}
+
+impl HealRoundsOpt {
+    pub fn quick(&self) -> bool {
+        self.check.as_deref() != Some("full")
+    }
+
+    /// The first check, in million tokens, for a stage that heals `cap_m`.
+    pub fn first_check(&self, cap_m: u32) -> u32 {
+        self.first_check_m.unwrap_or(10).max(self.round_m).min(cap_m.max(self.round_m))
+    }
 }
 
 /// A cut that the person chose before the run (from the search of the Try first card). The blocks are the exact set to take out; `loss` and `think` are what was measured.
@@ -151,7 +178,7 @@ impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None,
         }
     }
 
@@ -178,6 +205,14 @@ impl AutoSpec {
         if let Some(h) = self.max_hours {
             if !h.is_finite() || !(1.0..=336.0).contains(&h) {
                 return Err(Error::new("The time you have must be between 1 and 336 hours."));
+            }
+        }
+        if let Some(r) = &self.heal_rounds {
+            if !super::heal_rounds::ROUND_M.contains(&r.round_m) {
+                return Err(Error::new("Healing in rounds: a round is 1, 2, 5, 10 or 20 million tokens."));
+            }
+            if r.check.as_deref().is_some_and(|c| !["quick", "full"].contains(&c)) || r.first_check_m.is_some_and(|f| !(1..=160).contains(&f)) {
+                return Err(Error::new("Healing in rounds: the check is quick or full, and the first check comes after 1 to 160 million tokens."));
             }
         }
         if self.search_minutes.is_some_and(|m| !(5..=240).contains(&m)) {
