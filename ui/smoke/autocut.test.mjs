@@ -358,3 +358,51 @@ test("a small model has the recipe chosen, and the time limit shows what was giv
   b.run(`ac.maxOn = true; ac.maxH = ""`);
   assert.match(card(b), /id="ac-maxwhy"/);
 });
+
+const prog = (over = {}) => ({ kind: "auto_progress", phase: "auto", run: "20261117-100000-qwen3-8-27b-21b", pct: 42.3, state: "live", elapsed_s: 76800, left_s: [50400, 61200], stage: { n: 1, of: 2 },
+  step: { id: "s1.heal", label: "Stage 1 of 2: heal", index: 7, count: 15, pct: 63, part: "cache", sub: "Teacher cache: 12.4 M of 30.0 M tokens · 3,100 tokens/s · 41 min left" }, steps: [], retry_added_min: null, calibration: null, ...over });
+
+test("an auto_progress event shows the overall bar, the stage chip, the time left and the sub-status line with the step's own bar", () => {
+  const b = browser();
+  open(b, {}, `ac.run = ${JSON.stringify(run("running"))}; ac.running = true; ac.plan = ${JSON.stringify(plan())}`);
+  b.run(`onAutoEvent(${JSON.stringify(prog())})`);
+  const html = card(b);
+  assert.match(html, /id="ac-overall" aria-label="Auto-cut overall"/);
+  assert.match(html, /value="42.3"/);
+  assert.match(html, /42 % · 21 h 30 min so far · about 14 h to 17 h left \(done around/);
+  assert.match(html, /Stage 1 of 2/);
+  assert.match(html, /Teacher cache: 12\.4 M of 30\.0 M tokens · 3,100 tokens\/s · 41 min left/);
+  assert.match(html, /id="ac-stepbar"[^>]*>|value="63" id="ac-stepbar"/);
+  assert.match(html, /step 7 of 15/);
+  assert.doesNotMatch(html, /id="ac-eta"/, "the older estimate is only the fallback");
+});
+
+test("while the speed is not known the card says estimating, a retry explains the step back", () => {
+  const b = browser();
+  open(b, {}, `ac.run = ${JSON.stringify(run("running"))}; ac.running = true; ac.plan = ${JSON.stringify(plan())}`);
+  b.run(`onAutoEvent(${JSON.stringify(prog({ state: "estimating", step: { id: "s1.heal", label: "heal", index: 1, count: 2, pct: 1, part: null, sub: null }, retry_added_min: 190 }))})`);
+  const html = card(b);
+  assert.match(html, /estimating the time left…/);
+  assert.match(html, /id="ac-retrynote"/);
+  assert.match(html, /stepped back once/);
+});
+
+test("a run without any auto_progress keeps the older hours estimate", () => {
+  const b = browser();
+  open(b, {}, `ac.run = ${JSON.stringify(run("running", { steps: [step("s1.heal", "heal", "running")] }))}; ac.running = true; ac.plan = ${JSON.stringify(plan())}; ac.eta = { s: 7200, step: "s1.heal", at: Date.now() }`);
+  const html = card(b);
+  assert.doesNotMatch(html, /id="ac-overall"/);
+  assert.match(html, /id="ac-eta"/);
+});
+
+test("a stopped run shows where it stopped and every step its status, estimate and time taken", () => {
+  const b = browser();
+  const r = run("stopped", { progress: prog({ pct: 42.3 }), steps: [{ ...step("plan", "Check", "done"), est: [1, 1], started: "2026-11-17T10:00:00Z", finished: "2026-11-17T10:05:00Z" }, { ...step("s1.heal", "heal", "pending"), est: [180, 300] }] });
+  open(b, {}, `ac.run = ${JSON.stringify(r)}; ac.running = false; ac.plan = ${JSON.stringify(plan())}`);
+  const html = card(b);
+  assert.match(html, /Stopped at 42 %/);
+  assert.match(html, /ac-chip-done">done</);
+  assert.match(html, /ac-chip-pending">waiting</);
+  assert.match(html, /est\. 3 h to 5 h/);
+  assert.match(html, /took 5 min/);
+});

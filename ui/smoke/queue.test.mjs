@@ -72,3 +72,13 @@ test("the Help page offers the diagnostics file and shows where it was saved", (
   assert.match(html, /id="gd-bundle"/);
   assert.match(html, /Saved: \/tmp\/ndforge-diagnostics-1\.zip/);
 });
+
+test("a running Auto-cut entry shows its percentage and the time left from the last auto_progress", () => {
+  const b = browser();
+  b.run(`state = ${JSON.stringify({ project: null, recent: [], settings: {} })}; qu.view = ${JSON.stringify(view([item("a", "running", { kind: "auto", label: "Auto-cut to 21 B" })]))}; ac.prog = ${JSON.stringify({ kind: "auto_progress", pct: 42.3, state: "live", left_s: [50400, 61200] })}`);
+  let html = b.run("renderWelcome()");
+  assert.match(html, /data-quprog="auto">42 % · about 14 h to 17 h left/);
+  b.run(`ac.prog.state = "estimating"`);
+  html = b.run("renderWelcome()");
+  assert.match(html, /data-quprog="auto">42 %<\/span>/);
+});

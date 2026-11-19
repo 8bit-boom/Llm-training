@@ -1757,7 +1757,7 @@ const QU_STATUS = { queued: "waiting", running: "running", done: "done", failed:
 function quCard() {
   const v = qu.view;
   if (!v || !v.items || !v.items.length) return qu.note ? `<p class="dim small">${esc(qu.note)}</p>` : "";
-  const rows = v.items.map((i, n) => `<li class="qu-${esc(i.status)}"><strong>${esc(i.label || i.kind)}</strong> · ${esc(QU_STATUS[i.status] || i.status)}${i.error ? ` <span class="dim">${esc(fixActions(i.error).text)}</span>` : ""}
+  const rows = v.items.map((i, n) => `<li class="qu-${esc(i.status)}"><strong>${esc(i.label || i.kind)}</strong> · ${esc(QU_STATUS[i.status] || i.status)}${i.kind === "auto" && i.status === "running" && ac.prog ? ` <span class="dim" data-quprog="auto">${Math.round(ac.prog.pct)} %${ac.prog.state !== "estimating" && ac.prog.left_s ? ` · ${esc(acProgLeft(ac.prog).replace(/ \(done around.*$/, ""))}` : ""}</span>` : ""}${i.error ? ` <span class="dim">${esc(fixActions(i.error).text)}</span>` : ""}
       ${i.status === "queued" ? `<button class="secondary" data-qumove="${esc(i.id)}" data-to="${n - 1}" aria-label="Move up">↑</button><button class="secondary" data-qumove="${esc(i.id)}" data-to="${n + 1}" aria-label="Move down">↓</button>` : ""}
       ${i.status !== "running" ? `<button class="secondary" data-quremove="${esc(i.id)}">Remove</button>` : ""}</li>`).join("");
   const waiting = v.queued || 0;
@@ -2628,7 +2628,7 @@ function madeCard(m) {
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
   sp: { stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
-  run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
+  prog: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
   {"id": "thorough", "label": "Thorough (recommended recipe)", "blurb": "The recipe that was tested: two stages, the first on 40 M tokens and the last on the recipe's 40 or 80 M, full thinking checks, a check of every cut, a retry and a back-off when a thinking check fails.", "risk": "No shortcut. The only risk is the cut itself.", "set": {"stages": 2, "stage_a_tokens_m": null, "last_tokens_m": null, "share_teacher_cache": false, "quick": false, "think_quick": null, "think_gate": true, "think_gate_n": 2, "check_cut": true, "retry_heal": true, "back_off": true, "imatrix": true}},
@@ -2636,6 +2636,7 @@ const AC_SPEED_PRESETS = [
   {"id": "fast", "label": "Fast (quick look)", "blurb": "One stage on 20 M tokens, quick checks, no check of the unhealed cut, no retry, no back-off and no importance matrix.", "risk": "Far below the recipe: a model that thinks will very likely lose its reasoning. Use it to see roughly how a cut behaves, not to keep the result.", "set": {"stages": 1, "stage_a_tokens_m": null, "last_tokens_m": 20, "share_teacher_cache": false, "quick": true, "think_quick": true, "think_gate": true, "think_gate_n": 1, "check_cut": false, "retry_heal": false, "back_off": false, "imatrix": false}},
   {"id": "custom", "label": "Custom", "blurb": "Your own choice in the advanced speed settings below.", "risk": "Whatever you set below the recipe is listed in the plan and the report.", "set": {}},
 ];
+const AC_CHIP = { pending: "waiting", running: "running", done: "done", skipped: "skipped", failed: "failed", stopped: "stopped" };
 const AC_ICON = { pending: "○", running: "▶", done: "✓", skipped: "–", failed: "✗", stopped: "■" };
 const AC_STATUS = { running: "Running", stopped: "Stopped", failed: "Stopped by an error", done: "Finished", gates_failed: "Stopped: the thinking checks failed" };
 
@@ -2753,7 +2754,7 @@ function autoCard() {
   const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
     ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
   const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") : "";
-  const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
+  const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)} <span class="tag ac-chip ac-chip-${esc(x.status)}">${esc(AC_CHIP[x.status] || x.status)}</span>${acStepFig(x) ? ` <span class="dim small ac-fig">${esc(acStepFig(x))}</span>` : ""}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
   const status = run ? `<p><strong id="ac-status">${esc(AC_STATUS[run.status] || run.status)}</strong>${run.error ? `: ${esc(run.error)}` : ""} <span class="dim small">${esc(run.id)}</span></p>` : "";
   const ended = run && ["done", "gates_failed", "failed"].includes(run.status);
   const sh = ac.share || {};
@@ -2788,7 +2789,8 @@ function autoCard() {
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
-    ${live && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
+    ${acProgressBlock(run, live)}
+    ${live && !acProg(run) && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
     ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
     ${ac.err ? errDiv(ac.err) : ""}${status}${steps}${rep}</div>`;
 }
@@ -2887,7 +2889,38 @@ function acTimeBlock(pl, nowMs) {
     ${lever}${extra}${(t.notes || []).slice(1).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}</div>`;
 }
 
+// How far the run is (the `auto_progress` event of the program: the share of the whole run weighted by the time estimate, the time spent, the time left from the live speed).
+// A run that sent none (an older one) keeps the older hours estimate above.
+function acProg(run) {
+  const p = ac.prog && run && ac.prog.run === run.id ? ac.prog : run && run.progress ? run.progress : null;
+  return p && p.kind === "auto_progress" ? p : null;
+}
+function acProgLeft(pr, nowMs) {
+  if (!pr || pr.state === "estimating" || !pr.left_s) return "estimating the time left…";
+  const s = acSpan({ lo: pr.left_s[0] / 3600, hi: pr.left_s[1] / 3600 }, nowMs || Date.now());
+  return `about ${s.left} left (done around ${s.when})`;
+}
+function acProgressBlock(run, live, nowMs) {
+  const pr = acProg(run);
+  if (!pr) return "";
+  const pct = Math.round(pr.pct), st = pr.step && pr.step.id ? pr.step : null;
+  const head = live ? `${pct} % · ${acDuration((pr.elapsed_s || 0) / 3600)} so far · ${acProgLeft(pr, nowMs)}` : `${run.status === "done" ? "Finished" : "Stopped at " + pct + " %"} · ${acDuration((pr.elapsed_s || 0) / 3600)} spent`;
+  const chip = pr.stage && pr.stage.of > 1 ? `<span class="tag ac-stage" id="ac-stagechip">Stage ${pr.stage.n} of ${pr.stage.of}</span> ` : "";
+  const sub = live && st ? `<div class="ac-substep">${st.sub ? `<div class="stepline" aria-live="polite" id="ac-sub">${esc(st.sub)}</div>` : ""}<progress max="100" value="${st.pct}" id="ac-stepbar"></progress> <span class="dim small">${esc(st.label)} (step ${st.index} of ${st.count})</span></div>` : "";
+  const back = pr.retry_added_min ? `<p class="dim small" id="ac-retrynote">The bar stepped back once: a thinking check failed and the stage is healed again (about ${acDuration(pr.retry_added_min / 60)} more).</p>` : "";
+  const cal = live && pr.calibration && Math.abs(pr.calibration - 1) >= 0.15 ? `<p class="dim small" id="ac-calnote">This computer is running ${pr.calibration > 1 ? "slower" : "faster"} than the plan so far (${pr.calibration.toFixed(2)} times); the steps still to come are counted that way.</p>` : "";
+  return `<div class="ac-progress" id="ac-progress"><div class="ac-head">${chip}<strong id="ac-overall-text">${esc(head)}</strong></div>
+    <progress max="100" value="${pr.pct}" id="ac-overall" aria-label="Auto-cut overall"></progress>${sub}${back}${cal}</div>`;
+}
+function acStepFig(x) {
+  const bits = [];
+  if (x.est) bits.push(`est. ${acStepMin(x.est[0], x.est[1])}`);
+  if (x.status === "done" && x.started && x.finished) { const m = (Date.parse(x.finished) - Date.parse(x.started)) / 60000; if (m > 0) bits.push(`took ${acDuration(m / 60)}`); }
+  return bits.join(" · ");
+}
+
 function onAutoEvent(p) {
+  if (p.kind === "auto_progress") { ac.prog = p; if (page === "reshape" || page === "welcome") render(); return; }
   if (p.eta_s != null && p.auto_step) ac.eta = { s: +p.eta_s, step: p.auto_step, at: Date.now() };
   if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
   if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
