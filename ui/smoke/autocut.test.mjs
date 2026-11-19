@@ -60,7 +60,7 @@ test("the spec follows the choices, the plan is asked with the model's descripti
   const c = b.calls.find((x) => x[0] === "auto_plan");
   // Balanced was chosen for the big model; one stage instead of two makes it Custom. The speed fields are all sent.
   assert.deepEqual(plain(c[1].spec), { model_id: "qwen3.8-27b", notify_stages: true, target_b: 18, keep_thinking: true, think_gate: true, think_gate_n: 2, stages: 1, quick: true, keep_intermediate: true, allow_many_blocks: true, quants: ["q4_k_m"], studio_publish: true,
-    preset: "custom", stage_a_tokens_m: 20, last_tokens_m: null, think_quick: true, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: true, imatrix: true });
+    preset: "custom", stage_a_tokens_m: 20, last_tokens_m: null, think_quick: true, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: true, imatrix: true, search_minutes: 20 });
   assert.equal(c[1].inspect.total_params, 27.78e9);
   assert.equal(b.run("ac.plan.ok"), true);
   const n = b.calls.filter((x) => x[0] === "auto_plan").length;
@@ -415,4 +415,33 @@ test("the stage notification is on by default, can be switched off and goes into
   b.run("ac.notifyStages = false");
   assert.equal(b.run("acSpec().notify_stages"), false);
   assert.doesNotMatch(card(b), /id="ac-notify" checked/);
+});
+
+test("the presets carry the minutes of the search; a preset still matches when the minutes are changed", () => {
+  const b = browser();
+  open(b);
+  b.run(`acDefaults()`);
+  assert.equal(b.run("acSpec().search_minutes"), 20);                       // Balanced
+  b.run(`acApplyPreset("thorough")`); assert.equal(b.run("acSpec().search_minutes"), 30);
+  b.run(`acApplyPreset("fast")`); assert.equal(b.run("acSpec().search_minutes"), 10);
+  b.run(`acApplyPreset("thorough"); ac.sp.search = 60`);
+  assert.equal(b.run("acPresetNow()"), "thorough", "the minutes of the search are not part of the recipe");
+  assert.equal(b.run("acSpec().search_minutes"), 60);
+  b.run(`ac.sp.search = null`);
+  assert.equal("search_minutes" in plain(b.run("acSpec()")), false, "no search: the classic Try first");
+  assert.match(card(b), /id="ac-search"/);
+});
+
+test("a cut chosen in Try first's search is shown, sent as the spec's cut, and removed with one click", () => {
+  const b = browser();
+  open(b, {}, `ac.pin = ${JSON.stringify({ blocks: [3, 7, 11], intermediate: 10752, loss: 2.04, search_id: "s1", think: null })}`);
+  const html = card(b);
+  assert.match(html, /id="ac-pin"/); assert.match(html, /blocks 3, 7, 11 out, MLP 10,752/); assert.match(html, /does not search or try again/);
+  assert.doesNotMatch(html, /id="ac-searchrow"/, "no search is offered while a cut is chosen");
+  assert.deepEqual(plain(b.run("acSpec().cut")), { blocks: [3, 7, 11], intermediate: 10752, loss: 2.04, search_id: "s1", think: null });
+  b.run("wireAuto()"); b.els["ac-pin-remove"].onclick();
+  assert.equal(b.run("ac.pin"), null);
+  assert.equal(b.run("'cut' in acSpec()"), false);
+  open(b, {}, `ac.pin = ${JSON.stringify({ blocks: [3], intermediate: 10752, loss: 2.0, search_id: "s1", think: { verdict: "kept" } })}`);
+  assert.match(card(b), /its thinking was checked/); assert.match(card(b), /skips the thinking check before healing/);
 });

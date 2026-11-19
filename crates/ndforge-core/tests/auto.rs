@@ -81,13 +81,16 @@ struct Mock {
     clock: Option<i64>,
     /// the progress of the run (`auto_progress` events); None = the stand-in has none, like most tests
     tracker: Option<ndforge_core::reshape::auto_progress::ProgressTracker>,
+    /// the search requests the stand-in got, and whether its answer says the time was used up
+    searches: Vec<Value>,
+    search_budget_stop: bool,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None,
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false,
         }
     }
 
@@ -152,6 +155,34 @@ impl Effects for Mock {
     fn try_run(&mut self, spec: &TrySpec) -> Result<Out<Value>> {
         if self.stop_here(format!("try {} {:?} {:?}", spec.samples, spec.runs, spec.widths)) {
             return Ok(Out::Stopped);
+        }
+        if let Some(sv) = &spec.search {
+            // the search: for every cut of the first group a neighbouring run and a set of every other block; the hidden best one is the separate set
+            self.done.push(format!("search samples={} minutes={}", spec.samples, sv["budget_min"]));
+            self.searches.push(sv.clone());
+            let mut rows = serde_json::Map::new();
+            let mut ranked: Vec<(f64, String)> = Vec::new();
+            for c in sv["groups"][0]["cuts"].as_array().cloned().unwrap_or_default() {
+                let (k, w) = (c["k"].as_u64().unwrap_or(0) as u32, c["width"].as_u64().map(|x| x as u32));
+                if k == 0 {
+                    continue;
+                }
+                let sets: Vec<Vec<u32>> = vec![(1..=k).collect(), (0..k).map(|i| 1 + 2 * i).collect(), (0..k).map(|i| 2 + 2 * i).collect()];
+                for blocks in sets {
+                    let (mut l, h1, h2) = self.loss_of(&blocks, w);
+                    if blocks.windows(2).any(|p| p[1] - p[0] == 2) {
+                        l -= 0.01;              // the separate set is the better one
+                    }
+                    let key = format!("d={}|w={}", blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","), w.map(|x| x.to_string()).unwrap_or_default());
+                    rows.insert(key.clone(), json!({"loss": l, "loss_h1": h1 - 0.01 * (l != h1) as u8 as f64, "loss_h2": h2 - 0.01 * (l != h2) as u8 as f64}));
+                    ranked.push((l, key));
+                }
+            }
+            ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+            let keys: Vec<String> = ranked.iter().map(|r| r.1.clone()).collect();
+            let fin: Vec<String> = keys.iter().step_by(2).take(3).cloned().collect();
+            let stop_reason = if self.search_budget_stop { "budget" } else { "done" };
+            return Ok(Out::Done(json!({"base": {"loss": 2.0}, "passes": keys.len() + 15, "search": {"ranking": {"0": keys}, "rows": rows, "finalists": {"0": fin}, "stop_reason": stop_reason}})));
         }
         self.done.push(format!("try samples={} runs={:?} widths={:?} choices={}", spec.samples, spec.runs, spec.widths, spec.choices.len()));
         let mut acc = self.try_acc.remove(&spec.samples).unwrap_or_default();
@@ -1259,7 +1290,8 @@ fn a_legacy_spec_and_the_thorough_preset_make_the_same_calls() {
     let (p1, p2) = (project(d1.path()), project(d2.path()));
     let (mut a, mut b) = (Mock::new(), Mock::new());
     let s1 = start(&p1, &mut a, gspec(21.1)).unwrap();
-    let s2 = start(&p2, &mut b, gspec(21.1).with_preset("thorough").unwrap()).unwrap();
+    // the preset also asks for the search for the best cut (Thorough: 30 minutes); the rest is the legacy run, so it is switched off here and tested on its own below
+    let s2 = start(&p2, &mut b, AutoSpec { search_minutes: None, ..gspec(21.1).with_preset("thorough").unwrap() }).unwrap();
     assert_eq!((s1.status.as_str(), s2.status.as_str()), ("done", "done"));
     assert_eq!(a.done, b.done);
     assert_eq!(a.heal_specs, b.heal_specs);
@@ -1603,4 +1635,134 @@ fn live_events_move_the_running_step_at_most_once_a_second_and_the_state_goes_li
     assert_eq!(last["state"], "live");
     assert!(last["left_s"][0].as_f64().unwrap() < last["left_s"][1].as_f64().unwrap());
     assert!(last["elapsed_s"].as_f64().unwrap() > 200.0);
+}
+
+// ---- Find the best cut inside Auto-cut (reshape::search), the cut chosen before the run
+
+fn searching(target: f64) -> AutoSpec {
+    AutoSpec { search_minutes: Some(20), ..gspec(target) }
+}
+
+#[test]
+fn the_try_step_can_be_the_search_and_its_best_cuts_feed_the_thinking_gate() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, searching(21.1)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(fx.searches.len(), 1);
+    assert_eq!(fx.searches[0]["budget_min"], 20);
+    assert!(fx.searches[0]["groups"][0]["cuts"].as_array().unwrap().len() >= 1);
+    // one request, no "every run" request: the search is a key of the same job
+    assert!(fx.done.iter().any(|c| c.starts_with("search samples=128")), "{:?}", fx.done);
+    assert!(!fx.done.iter().any(|c| c.starts_with("try samples=128 runs=[1, 2]")));
+    let cands = st.try_cands.clone().unwrap();
+    assert!(!cands.is_empty() && cands.len() <= 3);
+    let tr = st.try_result.clone().unwrap();
+    assert_eq!(tr["rows"].as_array().unwrap().len(), cands.len());
+    assert_eq!(tr["search"]["minutes"], 20);
+    assert!(tr["rows"][0]["cut_blocks"].as_array().is_some_and(|a| !a.is_empty()));
+    // the step keeps its id and gets the search's label
+    let try_step = st.steps.iter().find(|s| s.id == "try").unwrap();
+    assert_eq!(try_step.label, "Find the best cut");
+    // the thinking gate checked the search's cuts: at most think_gate_n of them, each written as a cut
+    let checked = fx.done.iter().filter(|c| c.starts_with("check cut-") && c.contains(" cut ")).count();
+    assert!(checked >= 1);
+    assert!(st.think_gate.is_some());
+    // the same blocks are cut in the stage that cuts them all (one stage)
+    let q = tempdir().unwrap();
+    let p1 = project(q.path());
+    let mut one = Mock::new();
+    let s1 = start(&p1, &mut one, AutoSpec { stages: 1, ..searching(21.1) }).unwrap();
+    assert_eq!(s1.status, "done", "{:?}", s1.error);
+    assert!(s1.stages[0].plan.blocks_cut == 0 || s1.drop_blocks.is_some());
+}
+
+#[test]
+fn a_run_without_search_minutes_and_one_saved_before_it_existed_use_the_classic_try() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, gspec(21.1)).unwrap();
+    assert_eq!(st.status, "done");
+    assert!(fx.searches.is_empty() && st.try_cands.is_none());
+    assert_eq!(st.steps.iter().find(|s| s.id == "try").unwrap().label, "Try the cuts");
+    // a state file from before the new fields resumes through the classic Try
+    let mut fx2 = Mock::new();
+    fx2.stop_at = Some(3);
+    let stopped = start(&p, &mut fx2, gspec(21.1)).unwrap();
+    assert_eq!(stopped.status, "stopped");
+    let file = run_dir(&p, &stopped.id).join("auto.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for k in ["try_cands"] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    for k in ["search_minutes", "cut"] {
+        v["spec"].as_object_mut().unwrap().remove(k);
+    }
+    std::fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let again = resume(&p, &mut fx2, &stopped.id).unwrap();
+    assert_eq!(again.status, "done", "{:?}", again.error);
+    assert!(fx2.searches.is_empty());
+}
+
+#[test]
+fn a_stop_at_every_call_of_a_run_with_the_search_continues_without_repeating_the_search() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut plain = Mock::new();
+    let full = start(&p, &mut plain, searching(21.1)).unwrap();
+    assert_eq!(full.status, "done", "{:?}", full.error);
+    for n in 1..=plain.n {
+        let dir = tempdir().unwrap();
+        let q = project(dir.path());
+        let mut fx = Mock::new();
+        fx.stop_at = Some(n);
+        let first = start(&q, &mut fx, searching(21.1)).unwrap();
+        assert_eq!(first.status, "stopped", "stop at call {n}: {:?}", fx.all.last());
+        let last = resume(&q, &mut fx, &first.id).unwrap();
+        assert_eq!(last.status, "done", "stop at call {n}: {:?}", last.error);
+        assert_eq!(fx.done, plain.done, "stop at call {n} ({:?})", fx.all[n - 1]);
+        assert_eq!(fx.searches.len(), 1, "stop at call {n}: the search is asked once");
+    }
+}
+
+#[test]
+fn a_search_that_ran_out_of_time_says_so_in_the_notes() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.search_budget_stop = true;
+    let st = start(&p, &mut fx, searching(21.1)).unwrap();
+    assert!(st.notes.iter().any(|n| n.contains("minutes were used")), "{:?}", st.notes);
+    assert_eq!(st.try_result.as_ref().unwrap()["search"]["stop_reason"], "budget");
+}
+
+#[test]
+fn a_cut_chosen_before_the_run_skips_the_search_and_the_gate_and_cuts_those_blocks() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    // one stage; the blocks and width of a cut that reaches 21.1 B (the planner's own first choice names them)
+    let probe = ndforge_core::reshape::auto_plan::plan(&qwen27(), &gspec(21.1), Some(32.0), Some(900.0));
+    let chosen = probe.chosen.clone().unwrap();
+    assert!(chosen.blocks >= 1 || chosen.intermediate.is_some());
+    let blocks: Vec<u32> = if chosen.blocks == 0 { vec![] } else { (0..chosen.blocks).map(|i| 3 + 2 * i).collect() };
+    let width = chosen.intermediate;
+    let cut = ndforge_core::reshape::auto_plan::PinnedCut { blocks: blocks.clone(), intermediate: width, loss: Some(2.05), search_id: Some("s1".into()), think: None };
+    let st = start(&p, &mut fx, AutoSpec { stages: 1, cut: Some(cut), search_minutes: Some(20), ..gspec(21.1) }).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(fx.searches.is_empty() && !fx.done.iter().any(|c| c.starts_with("try ")), "{:?}", fx.done);
+    let ids: Vec<&str> = st.steps.iter().map(|s| s.id.as_str()).collect();
+    assert!(!ids.contains(&"try") && !ids.contains(&"think_gate"), "{ids:?}");
+    assert_eq!(st.chosen.as_ref().unwrap().blocks, chosen.blocks);
+    if !blocks.is_empty() {
+        let layers: Vec<u32> = blocks.iter().flat_map(|b| (b * 4)..(b * 4 + 4)).collect();
+        assert!(fx.done.iter().any(|c| c.contains(&format!("drop={:?}", Some(layers.clone())))), "{:?}", fx.done);
+    }
+    assert!(st.notes.iter().any(|n| n.contains("chosen before the run")));
+    // a cut that does not make the size asked for is refused with the reason
+    let bad = ndforge_core::reshape::auto_plan::PinnedCut { blocks: vec![2], intermediate: None, loss: None, search_id: None, think: None };
+    let e = start(&p, &mut Mock::new(), AutoSpec { cut: Some(bad), ..gspec(21.1) }).unwrap_err();
+    assert!(e.0.contains("not 21.1 B"), "{}", e.0);
 }

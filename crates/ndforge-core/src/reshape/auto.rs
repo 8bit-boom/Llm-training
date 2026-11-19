@@ -17,6 +17,7 @@ use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
 use super::auto_progress::ProgressTracker;
 use super::auto_report;
+use super::search;
 use super::thinkcheck;
 use crate::error::{Error, Result};
 use crate::project::Project;
@@ -247,6 +248,9 @@ pub struct AutoState {
     /// the last `auto_progress` snapshot (saved at the boundaries of the steps: a stopped run says "stopped at 42 %"); None for a run saved before it existed
     #[serde(default)]
     pub progress: Option<Value>,
+    /// the cuts the search found best (aligned with the rows of `try_result`): the thinking gate and the check of the first stage's cut read them instead of the planner's own list; None for a classic Try first
+    #[serde(default)]
+    pub try_cands: Option<Vec<Candidate>>,
 }
 
 impl AutoState {
@@ -254,7 +258,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None, try_cands: None,
         }
     }
 
@@ -341,7 +345,7 @@ fn stage_steps(n: u32, of: u32, thinking: bool, check_cut: bool) -> Vec<StepRec>
 fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec> {
     let mut v = vec![StepRec::new("measure", "Measure the model")];
     if with_try {
-        v.push(StepRec::new("try", "Try the cuts"));
+        v.push(StepRec::new("try", if spec.search_minutes.is_some() { "Find the best cut" } else { "Try the cuts" }));
         if spec.keep_thinking && spec.think_gate {
             v.push(StepRec::new("think_gate", "Check the thinking of the best cuts before healing"));
         }
@@ -632,6 +636,13 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     st.stages = plan.stages.iter().cloned().map(StageState::new).collect();
     st.chosen = plan.chosen.clone();
     let try_list = plan.try_list.len();
+    if let Some(c) = st.spec.cut.clone() {
+        // chosen in Try first's search: the exact blocks are cut, nothing is tried
+        st.drop_blocks = (!c.blocks.is_empty()).then(|| c.blocks.clone());
+        st.notes.push(format!("The cut was chosen before the run{}: {}{}.", c.search_id.as_ref().map(|i| format!(" (search {i})")).unwrap_or_default(),
+                              if c.blocks.is_empty() { "no blocks out".to_string() } else { format!("blocks {} out", c.blocks.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")) },
+                              c.intermediate.map(|i| format!(", MLP {i}")).unwrap_or_default()));
+    }
     st.notes.extend(plan.warnings.iter().cloned());
     st.plan = Some(plan);
     st.inspect = Some(ins);
@@ -696,9 +707,76 @@ fn try_spec(st: &AutoState, samples: u32, runs: Vec<u32>, widths: Vec<u32>, choi
     Ok(spec)
 }
 
+/// The cuts Try first measured: what the search found best, else the planner's own list.
+fn cands_of(st: &AutoState) -> Vec<Candidate> {
+    st.try_cands.clone().or_else(|| st.plan.as_ref().map(|p| p.try_list.clone())).unwrap_or_default()
+}
+
+/// "Find the best cut": the search of the Try first card inside the run (docs/TRY_FIRST.md), for `search_minutes` minutes on the one target size. Its best cuts (diverse, at most
+/// `TRY_TOP`) become the candidates of the thinking gate; the lowest loss is chosen here, the gate may choose another by thinking. A stop keeps what the worker measured and the
+/// answer is asked again on Continue (every measured cut is kept, so nothing is measured twice).
+fn step_try_search(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
+    let ins = st.inspect.clone().ok_or_else(|| Error::new("The model's description is missing."))?;
+    let o = st.original.clone().ok_or_else(|| Error::new("The model of this run is missing."))?;
+    let minutes = st.spec.search_minutes.unwrap_or(20);
+    let mut sspec = search::SearchSpec::new(&o.id, search::Target::B(st.spec.target_b));
+    sspec.budget_min = minutes;
+    sspec.keep_thinking = st.spec.keep_thinking;
+    sspec.samples = Some(st.spec.try_samples());
+    sspec.allow_many_blocks = st.spec.allow_many_blocks;
+    sspec.think_check = "off".into();
+    sspec.confirm_full = false;
+    let sp = search::plan(&ins, &sspec, fx.vram_gb(), &fx.history())?;
+    let analysis = match st.try_scan.as_ref().filter(|s| s["search"] == json!(true) && s["samples"] == json!(sp.samples)) {
+        Some(s) => s["analysis"].clone(),
+        None => {
+            let mut t = search::try_spec(&ins, &sspec, &sp, fx.vram_gb())?;
+            t.load = plan.measure_load.clone();
+            let a = out!(fx.try_run(&t)?);
+            st.try_scan = Some(json!({"samples": sp.samples, "search": true, "analysis": a}));
+            a
+        }
+    };
+    let keys: Vec<String> = analysis["search"]["finalists"]["0"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).take(auto_plan::TRY_TOP).collect()).unwrap_or_default();
+    let found = search::rows_for_keys(&analysis, &ins, 0, &keys);
+    if found.is_empty() {
+        st.notes.push("The search measured no cut; the planner's first choice is cut.".into());
+        return Ok(Flow::Done(Some("no answer: the first choice".into())));
+    }
+    let cands: Vec<Candidate> = found.iter().map(|r| auto_plan::candidate_at(&ins, r.k, r.intermediate, st.spec.target_b)).collect();
+    let (h1, h2): (Vec<_>, Vec<_>) = (found.iter().map(|r| r.loss_h1).collect(), found.iter().map(|r| r.loss_h2).collect());
+    let agree = argmin(&h1).is_none() || argmin(&h1) == argmin(&h2);
+    let losses: Vec<Option<f64>> = found.iter().map(|r| Some(r.loss)).collect();
+    let winner = argmin(&losses);
+    let table: Vec<Value> = cands.iter().zip(&found).map(|(c, r)| json!({"blocks": c.blocks, "intermediate": c.intermediate, "params_b": c.params_b, "loss": r.loss, "loss_h1": r.loss_h1, "loss_h2": r.loss_h2, "cut_blocks": r.blocks})).collect();
+    let stop_reason = analysis["search"]["stop_reason"].clone();
+    st.try_result = Some(json!({"samples": sp.samples, "rows": table, "winner": winner, "halves_agree": agree,
+                                "search": {"minutes": minutes, "stop_reason": stop_reason, "passes": analysis["passes"], "planned": sp.passes, "finalists": keys}}));
+    if !agree {
+        st.notes.push("The two halves of the measuring text name different winners among the best cuts; the thinking check (when it runs) decides between them.".into());
+    }
+    if stop_reason == json!("budget") {
+        st.notes.push(format!("The search stopped when its {minutes} minutes were used (about {} cuts were planned); what it had measured was ranked.", sp.passes));
+    }
+    let w = winner.unwrap_or(0);
+    let chosen = cands[w].clone();
+    st.drop_blocks = (chosen.blocks > 0 && !found[w].blocks.is_empty()).then(|| found[w].blocks.clone());
+    st.try_cands = Some(cands);
+    choose(st, &ins, &chosen, fx.vram_gb());
+    let lower = st.measure.as_ref().and_then(|m| m["loss"].as_f64()).zip(Some(found[w].loss));
+    if let Some((orig, cut)) = lower.filter(|(o, c)| *c < *o * 0.98) {
+        st.notes.push(format!("The best cut's text-prediction error ({cut:.3}) is lower than the original's ({orig:.3}): check that both were measured the same way. A lower error does not mean the model can still think."));
+    }
+    Ok(Flow::Done(Some(format!("{} blocks out of {} candidates, MLP {}: loss {:.3}", chosen.blocks, found.len(), chosen.intermediate.map(|i| i.to_string()).unwrap_or_else(|| "unchanged".into()), found[w].loss))))
+}
+
 /// Tries the candidates and picks the cheapest. Two requests: the widths and the best run of every block count, then (for a candidate with blocks AND a thinner MLP) the
 /// combined cut with those blocks. When the two halves of the measuring text name different winners, everything is asked again with 256 samples.
 fn step_try(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    if st.spec.search_minutes.is_some() {
+        return step_try_search(st, fx);
+    }
     let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
     let ins = st.inspect.clone().ok_or_else(|| Error::new("The model's description is missing."))?;
     let cands = plan.try_list.clone();
@@ -785,8 +863,7 @@ fn made(st: &mut AutoState, kind: &str, name: &str, model_id: Option<String>, st
 /// adds a warning (the healed model's check decides). Every call is looked at the state first, so Stop and Continue repeat nothing.
 fn step_think_gate(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let ins = st.inspect.clone().ok_or_else(|| Error::new("The model's description is missing."))?;
-    let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
-    let cands = plan.try_list.clone();
+    let cands = cands_of(st);
     let Some(tr) = st.try_result.clone() else { return Ok(Flow::Skipped("Try first gave no answer".into())) };
     let try_rows = tr["rows"].as_array().cloned().unwrap_or_default();
     let period = ins.period.max(1);

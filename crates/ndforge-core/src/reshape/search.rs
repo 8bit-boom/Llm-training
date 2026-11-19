@@ -310,28 +310,33 @@ pub struct SearchRow {
     pub think: Option<Value>,
 }
 
+/// The rows of these keys (a group's) from the answer of the worker, in the order of the keys; a key without a measured loss is left out.
+pub fn rows_for_keys(analysis: &Value, ins: &Inspect, group: usize, keys: &[String]) -> Vec<SearchRow> {
+    let (Some(base), Some(rows)) = (analysis["base"]["loss"].as_f64(), analysis["search"]["rows"].as_object()) else { return Vec::new() };
+    let full = auto_plan::full_width(ins);
+    keys.iter().filter_map(|key| {
+        let r = rows.get(key)?;
+        let loss = r["loss"].as_f64()?;
+        let (blocks, width) = parse_key(key);
+        let inter = width.or(full);
+        let (h1, h2) = (r["loss_h1"].as_f64(), r["loss_h2"].as_f64());
+        let k = blocks.len() as u32;
+        Some(SearchRow {
+            key: key.clone(), group, k, params_b: (auto_plan::size_of(ins, k, inter) as f64 / 1e9 * 100.0).round() / 100.0, loss, rel: loss / base - 1.0, loss_h1: h1, loss_h2: h2,
+            noise: h1.zip(h2).map(|(a, b)| (a - b).abs()), guardrails: auto_plan::beyond_guardrails(ins, k, width.or(full)), blocks, intermediate: inter, think: None,
+        })
+    }).collect()
+}
+
 /// The measured cuts of the answer of the worker, per group best first (at most `ROWS_PER_GROUP` each). `analysis` is the `analysis` of the job's result.
 pub fn rank(analysis: &Value, ins: &Inspect) -> Vec<SearchRow> {
-    let base = analysis["base"]["loss"].as_f64();
-    let (Some(base), Some(ranking), Some(rows)) = (base, analysis["search"]["ranking"].as_object(), analysis["search"]["rows"].as_object()) else { return Vec::new() };
-    let full = auto_plan::full_width(ins);
+    let Some(ranking) = analysis["search"]["ranking"].as_object() else { return Vec::new() };
     let mut out = Vec::new();
     let mut groups: Vec<(&String, &Value)> = ranking.iter().collect();
     groups.sort_by_key(|(g, _)| g.parse::<usize>().unwrap_or(0));
     for (g, keys) in groups {
-        let gi = g.parse::<usize>().unwrap_or(0);
-        for key in keys.as_array().map(|a| a.iter().filter_map(|k| k.as_str()).take(ROWS_PER_GROUP).collect::<Vec<_>>()).unwrap_or_default() {
-            let Some(r) = rows.get(key) else { continue };
-            let Some(loss) = r["loss"].as_f64() else { continue };
-            let (blocks, width) = parse_key(key);
-            let inter = width.or(full);
-            let (h1, h2) = (r["loss_h1"].as_f64(), r["loss_h2"].as_f64());
-            let k = blocks.len() as u32;
-            out.push(SearchRow {
-                key: key.into(), group: gi, k, params_b: (auto_plan::size_of(ins, k, inter) as f64 / 1e9 * 100.0).round() / 100.0, loss, rel: loss / base - 1.0, loss_h1: h1, loss_h2: h2,
-                noise: h1.zip(h2).map(|(a, b)| (a - b).abs()), guardrails: auto_plan::beyond_guardrails(ins, k, width.or(full)), blocks, intermediate: inter, think: None,
-            });
-        }
+        let keys: Vec<String> = keys.as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).take(ROWS_PER_GROUP).collect()).unwrap_or_default();
+        out.extend(rows_for_keys(analysis, ins, g.parse::<usize>().unwrap_or(0), &keys));
     }
     out
 }
