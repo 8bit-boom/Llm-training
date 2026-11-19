@@ -493,7 +493,7 @@ test("the Heal buttons send the choice, and the measure events end quietly", asy
   await b.els["hl-go"].onclick();
   assert.equal(sent[0].name, m.name);
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0].spec)), { tokens_m: 20, general_share: 0.5, recipe: null, general: null, alpha: 1, lr: 0.0001, mode: null, rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null,
-    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null });
+    optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null });
   assert.equal(b.run("rs.hlRun.running"), true);
   b.run(`rs.hlSpec.general = false; rs.hlSpec.tokens_m = 40`);
   assert.equal(b.run("rsHealSpec().general_share"), 0);
@@ -950,4 +950,35 @@ test("the size lines and a made model say where the parameters are", () => {
   assert.match(b.run("renderReshape()"), /id="rs-made-breakdown">text layers 19.00 B .* file total 21.90 B/);
   open(b, pageState({ made: [thinModel()] }));
   assert.doesNotMatch(b.run("renderReshape()"), /rs-made-breakdown/);
+});
+
+test("Healing settings: keeping the output logits is off by default, offered only when it fits, sent when ticked, and cleared by Reset and the safer step", async () => {
+  const asked = [];
+  const m = thinModel();
+  const b = browser({ heal_estimate: (a) => { asked.push(JSON.parse(JSON.stringify(a.spec))); return estOf({ head_off_gb: 5.6, head_off_fits: true }); } });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ head_off_gb: 5.6, head_off_fits: true }))} }`);
+  assert.doesNotMatch(b.run("renderReshape()"), /hl-headkeep/);                                                      // Expert only
+  b.run(`state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /<input type="checkbox" id="hl-headkeep" +>/);
+  assert.match(html, /about <span id="hl-headkeep-gb">5\.6<\/span> GB more memory/);
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), null);                                                         // nothing sent: the program's default (checkpointed)
+  b.run(`renderReshape(); wireReshape();`);
+  b.els["hl-headkeep"].checked = true;
+  await b.els["hl-headkeep"].onchange();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(asked.at(-1).head_checkpoint, "off");
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), "off");
+  b.run(`wireReshape()`);
+  await b.els["hl-reset"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.head_checkpoint"), null);
+  // not offered when the estimate says it does not fit
+  b.run(`state.settings.expert_mode = true; rs.hl.opts.head_off_fits = false; rs.hlEst = null`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-headkeep" +disabled>[\s\S]*?does not fit this card/);
+  // the safer step after an out-of-memory failure turns it back on
+  b.run(`rs.hl.opts.safer = { label: "the output layer's logits made again in the backward pass (checkpointed)", head_checkpoint: "on", kbit_upcast: false, checkpointing: "on", batch: 2, per_update: 32, kl_chunk: 128 }; rs.hlSpec.head_checkpoint = "off"; healUseSafer()`);
+  assert.equal(b.run("rs.hlSpec.head_checkpoint"), null);
 });

@@ -54,10 +54,11 @@ def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask):
     return kd, (ce * label_mask.float()).sum()
 
 
-def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None):
+def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None, checkpoint_head: bool = True):
     """hidden [n, C] (the student's last hidden states), weight [V, C] (its output layer), targets = the teacher's (ids [n, k], logp [n, k], resid [n]),
     mask [n]. The logits are made `chunk` tokens at a time inside torch.utils.checkpoint, so at most chunk x V floats exist (the backward pass makes them again).
     With labels [n] (the next token, any value where label_mask is 0) the cross-entropy over label_mask is returned as well.
+    `checkpoint_head=False` keeps every chunk's logits for the backward pass instead of making them again: faster, and the same numbers, but about tokens x V x 10 bytes of memory.
     Returns (kd_sum, n_tokens, ce_sum, n_label_tokens); divide to get means."""
     import torch
     from torch.utils.checkpoint import checkpoint
@@ -67,7 +68,7 @@ def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None
     for a in range(0, n, max(1, int(chunk))):
         b = min(n, a + chunk)
         args = (hidden[a:b], weight, ids[a:b], logp[a:b], resid[a:b], mask[a:b], None if labels is None else labels[a:b], None if label_mask is None else label_mask[a:b])
-        kd, ce = checkpoint(_chunk_losses, *args, use_reentrant=False)
+        kd, ce = checkpoint(_chunk_losses, *args, use_reentrant=False) if checkpoint_head else _chunk_losses(*args)
         kd_total = kd_total + kd
         ce_total = ce_total + ce
     n_label = label_mask.float().sum() if label_mask is not None else hidden.new_zeros(())
@@ -1219,7 +1220,7 @@ def _teacher_targets(teacher, ids, att, k: int, chunk: int):
     return tuple(torch.cat([p[j] for p in parts]).to(ids.device) for j in range(3))
 
 
-def student_loss(model, inputs, targets_fn, alpha: float, chunk: int):
+def student_loss(model, inputs, targets_fn, alpha: float, chunk: int, checkpoint_head: bool = True):
     """(loss, kd mean, ce mean) of a batch. The student's hidden states of the real positions go through the output layer in chunks; the teacher's answers
     come from targets_fn(inputs) -> (ids, logp, resid) for those positions. alpha = 1: only the KL term."""
     import torch
@@ -1233,7 +1234,7 @@ def student_loss(model, inputs, targets_fn, alpha: float, chunk: int):
     if alpha < 1.0:
         nxt = torch.cat([inputs["labels"][:, 1:], torch.full_like(inputs["labels"][:, :1], -100)], dim=1).to(h.device)[sel]
         lab_mask, labels = nxt != -100, nxt.clamp(min=0)
-    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask)
+    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask, checkpoint_head)
     kd_mean = kd / n.clamp(min=1)
     ce_mean = ce / n_lab.clamp(min=1) if labels is not None else kd_mean.new_zeros(())
     loss = alpha * kd_mean + (1.0 - alpha) * ce_mean if alpha < 1.0 else kd_mean
@@ -1264,7 +1265,7 @@ def _trainer_class(base):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             import torch
             d = self.distill
-            loss, kd, ce = student_loss(model, inputs, d["targets"], d["alpha"], d["chunk"])
+            loss, kd, ce = student_loss(model, inputs, d["targets"], d["alpha"], d["chunk"], d.get("head_checkpoint", True))
             if not torch.isfinite(loss):
                 raise ReshapeError(UNSTABLE)
             d["kd"].append(float(kd))
@@ -1372,7 +1373,9 @@ def run(cfg: dict) -> int:
     "hyper": {rank, alpha, lr, max_seq, batch, grad_accum, warmup, weight_decay, scheduler, seed, save_steps, logging_steps, tokens, max_steps?,
               checkpointing: "auto|on|off", optimizer: "auto|adamw_8bit|adamw", student_b?},
     "distill": {"mode": "cache|online", "cache": folder, "teacher": {"repo", "load"}, "alpha": 1.0, "k": 32, "chunk": 256, "eval_every": 50,
-                "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key)},
+                "kbit_upcast": false (QLoRA only: true = PEFT's 32-bit copy of the embeddings and the output layer; student-side numerics, not part of any cache key),
+                 "head_checkpoint": "on" (default) | "off" (the output layer's logits of every chunk are kept for the backward pass instead of being made again: faster, the same loss,
+                 about tokens x vocab x 10 bytes more memory; student-side only, not part of any cache key; the out-of-memory ladder turns it back on first)},
     "eval": {"calibration": {...}, "teacher_loss", "slim_loss"} | None, "out": folder, "resume": bool, "stop_file": path,
     "rounds": {"index", "round_tokens", "general_from", "general_to", "s_start", "schedule": {...}} (optional: this job trains ONE round of a heal that is trained in rounds,
                see docs/HEAL_ROUNDS.md; cache mode only)}.
@@ -1509,6 +1512,9 @@ def run(cfg: dict) -> int:
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
     settings = {"checkpointing": _decide_checkpointing(h, student_dir, free_gb), "batch": int(h["batch"]), "grad_accum": int(h["grad_accum"]), "chunk": chunk,
                 "max_seq": int(h["max_seq"]), "rank": int(h["rank"]), "method": method, "upcast": upcast}
+    head_ckpt = str(d.get("head_checkpoint", "on")).lower() not in ("off", "false", "0")        # job key distill.head_checkpoint "on" (default) | "off"
+    if not head_ckpt:
+        settings["head_checkpoint"] = False                  # only an explicit "off" is part of the settings: a default job's settings are unchanged
     protocol.log("Healing settings: " + healmem.describe(settings) + f", optimizer {optim}.")
     protocol.emit("heal_settings", settings=settings, optimizer=optim)
 
@@ -1559,7 +1565,7 @@ def run(cfg: dict) -> int:
         if rd:
             trainer.round_lr = {"shift": shift, "s_start": r_start, "steps": steps, "index": r_index, "warmup": int(h["warmup"]), "sch": sch}
         targets = (lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])) if mode == "cache" else (lambda inp: _teacher_targets(teacher, inp["input_ids"], inp["attention_mask"], k, int(s["chunk"])))
-        trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"])}
+        trainer.distill = {**state, "targets": targets, "alpha": alpha, "chunk": int(s["chunk"]), "head_checkpoint": s.get("head_checkpoint", True) is not False}
         live.distill = trainer.distill
         if done["before"] is None and eval_fn is not None and not (rd and r_index > 1):
             with protocol.timed("eval", when="before"):

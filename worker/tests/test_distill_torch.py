@@ -373,6 +373,25 @@ def test_the_first_step_loss_is_the_same_with_and_without_gradient_checkpointing
     assert first["off"] > 0 and first["on"] == pytest.approx(first["off"], rel=1e-4)
 
 
+def test_keeping_the_output_logits_reaches_the_trainer_and_gives_the_same_first_loss(tmp_path, teacher, monkeypatch):
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    got = captured_trainer(monkeypatch)
+    first = {}
+    for key in ("on", "off"):
+        cfg = distill_cfg(tmp_path, student, teacher, "cache", hyper={"max_steps": 1}, out=str(tmp_path / f"head-{key}"))
+        cfg["distill"]["eval_every"] = 0
+        cfg["eval"] = None
+        if key == "off":
+            cfg["distill"]["head_checkpoint"] = "off"
+        code, ev = run_in_process(monkeypatch, dj.run, cfg)
+        assert code == 0, ev[-1]
+        settings = [e for e in ev if e["type"] == "heal_settings"][0]["settings"]
+        assert ("head_checkpoint" in settings) == (key == "off") and got[-1].distill["head_checkpoint"] == (key == "on")
+        first[key] = metrics(ev)[0]["kd"]
+    assert first["on"] > 0 and first["off"] == pytest.approx(first["on"], rel=1e-4)
+
+
 def test_the_settings_follow_the_students_size_unless_the_job_names_them(tmp_path, base):
     cfg = {"hyper": {"student_b": 21.0}}
     h = dj.resolve_hyper(cfg, base)

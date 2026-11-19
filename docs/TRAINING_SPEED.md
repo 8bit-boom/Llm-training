@@ -48,6 +48,10 @@ A **slimmed** model (whole blocks of layers removed on the *Slim or grow a model
 
 A model made **thinner** (width: the MLP of every layer is narrower, the layers stay) is smaller but not as much faster: it keeps all its layers, so a token still passes through every attention or recurrent layer; only the MLP part of the time shrinks (about the share of the MLP removed, 24 to 38 % of the MLP time for the page's suggestions). NVIDIA's own finding is the same: **width pruning gives better accuracy at a fixed size, depth pruning gives faster inference at a fixed size** (a model with fewer layers does fewer sequential steps). Choose layers when the speed of the finished model matters most, thinner layers when quality does, or both. Healing (distillation) costs hours once: the original answers (a prompt-processing speed, thousands of tokens per second in 4-bit) and the thinner model learns (QLoRA speed, about one to one and a half thousand tokens per second for a 21 B on one card, an estimate); the Heal card shows the estimate for your card. None of this is measured yet.
 
+## Healing's loss: what could be faster, and why it is not built
+
+The healing loss (docs/HEAL_SETTINGS.md) makes the student's logits over the whole vocabulary chunk by chunk. `head_checkpoint: "off"` keeps them instead of making them again (built, off by default, unmeasured). A fused or "cut" cross-entropy kernel is not a drop-in: those kernels compute the log-sum-exp minus the logit of ONE label per position, while this loss needs the log-probability of the student at the teacher's k ids, the student's tail mass `1 - sum_k p_S,k` and teacher-weighted terms. An exact tiled version (online log-sum-exp over vocabulary tiles, gather the k logits, a tiled backward) would be a custom kernel that needs float64 equivalence tests against `kd_topk_loss`. It is documented only, not built.
+
 ## Next
 1. Run a Quick test on the 5090 and read the `speed` line: how much padding, which attention backend, are the Qwen3.5 kernels active.
 2. Run the benchmark on the 5090 (also with the advanced options if the plain-libraries path is in use) and make the winning settings the defaults.

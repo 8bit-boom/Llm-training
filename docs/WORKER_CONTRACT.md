@@ -36,3 +36,5 @@ No job, event or error code was added for these; `contract.json` is unchanged. E
 - `distill_cache` result and `distill` summary: `coverage` (what the rows of the heal cover; docs/HEAL_SETTINGS.md), also written as `coverage.json` next to the cache's `index.json`. The cache `index.json` gains `teacher_weights` (the identity of the original's weight files); a store or index without it is accepted once and then carries it. The shared store id has a second version that includes it.
 - `reshape_try`: the result key (`key`) gains `weights_sample`; saved answers without it are accepted. `scores.json` gains `weights`; a measurement without it is accepted.
 - `reshape` result: `params_breakdown` `{text_layers, embeddings, output, vision, mtp, other, total, mtp_removed}`.
+- `distill`: `distill.head_checkpoint` `"on"` (default) | `"off"` (keep the output layer's logits for the backward pass; the `heal_settings` event then carries `settings.head_checkpoint: false`; the same loss, more memory, student-side only, in no cache key).
+

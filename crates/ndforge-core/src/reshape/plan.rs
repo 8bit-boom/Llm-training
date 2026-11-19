@@ -789,6 +789,14 @@ pub struct HealKnobs {
     /// the training key and not in the teacher's cache key, so changing it keeps both. Older saved settings have none: off.
     #[serde(default)]
     pub upcast: bool,
+    /// The output layer's logits are made again in the backward pass (checkpointed; the default). Off keeps the logits of every chunk: faster, the same loss, about
+    /// tokens x vocabulary x 10 bytes more graphics memory. Student-side only: not in the training key and not in the teacher's cache key. Older saved settings have none: on.
+    #[serde(default = "yes")]
+    pub head_ckpt: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The activations kept for the backward pass in GB. Per token and layer about 34 x hidden bytes without checkpointing (bf16; Korthikanti et al. for attention
@@ -830,7 +838,11 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
     let weights = if k.qlora { body * 0.55 + ends * if k.upcast { 4.0 } else { 2.0 } } else { params * 2.0 } / 1e9;
     let lora = k.rank as f64 * d.layers as f64 * 20.0 * d.hidden as f64 * 16.0 / 1e9;
     let act = heal_activation_gb(d.layers, d.hidden, k.seq, k.batch, k.checkpointing);
-    let kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
+    let mut kl = k.kl_chunk as f64 * d.vocab as f64 * 16.0 / 1e9;
+    if !k.head_ckpt {
+        // every token of a step keeps its logits and log-probabilities (32-bit, about 10 bytes per vocabulary entry)
+        kl += k.seq.max(1) as f64 * k.batch.max(1) as f64 * d.vocab as f64 * 10.0 / 1e9;
+    }
     let overhead = 1.0;
     let total = (weights + lora + act + kl + overhead) * 1.10;
     let r = |x: f64| (x * 100.0).round() / 100.0;
@@ -840,6 +852,12 @@ pub fn heal_memory(student_b: f64, d: &HealDims, k: &HealKnobs) -> HealMemory {
 /// `heal_memory(..).total_gb`
 pub fn heal_memory_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
     heal_memory(student_b, d, k).total_gb
+}
+
+/// The graphics memory (GB, with the estimate's 10 % margin) that keeping the output layer's logits (`head_ckpt` off) costs on top of the checkpointed head, for these settings.
+pub fn heal_head_off_extra_gb(student_b: f64, d: &HealDims, k: &HealKnobs) -> f64 {
+    let m = |head_ckpt: bool| heal_memory_gb(student_b, d, &HealKnobs { head_ckpt, ..k.clone() });
+    ((m(false) - m(true)) * 10.0).round() / 10.0
 }
 
 /// The graphics memory (GB, with the estimate's 10 % margin) that the 32-bit copy of the embedding and the output layer costs on top of the 16-bit tables in QLoRA,
@@ -875,7 +893,7 @@ pub fn heal_verdict_text(est_gb: f64, vram_gb: Option<f64>) -> String {
 pub fn heal_defaults(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> HealKnobs {
     let big = student_b >= 15.0;
     let batch = if student_b >= 25.0 { 1 } else if big { 2 } else { 4 };
-    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false };
+    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false, head_ckpt: true };
     if !big && vram_gb.is_some_and(|v| heal_memory_gb(student_b, d, &HealKnobs { qlora: false, ..k.clone() }) > v * 0.85) {
         k.qlora = true;
     }
@@ -899,6 +917,10 @@ pub fn heal_checkpointing_auto(student_b: f64, d: &HealDims, k: &HealKnobs, vram
 /// label, or None when the ladder is used up. Changes that alter the maths (sequence length, rank) are never made here.
 pub fn heal_next_safer(k: &HealKnobs) -> Option<(HealKnobs, String)> {
     let mut s = k.clone();
+    if !s.head_ckpt {
+        s.head_ckpt = true;
+        return Some((s, "the output layer's logits made again in the backward pass (checkpointed)".to_string()));
+    }
     if s.upcast {
         s.upcast = false;
         return Some((s, "the 32-bit embedding copy turned off".to_string()));

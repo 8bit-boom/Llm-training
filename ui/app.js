@@ -1837,7 +1837,7 @@ function errDiv(text, tag) {
 function healUseSafer() {
   const s = rs.hl && rs.hl.opts && rs.hl.opts.safer, hs = rs.hlSpec;
   if (!s || !hs) return false;
-  hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null;
+  hs.checkpointing = s.checkpointing; hs.batch = s.batch; hs.per_update = s.per_update; hs.kl_chunk = s.kl_chunk; hs.kbit_upcast = s.kbit_upcast === true ? true : null; hs.head_checkpoint = s.head_checkpoint === "off" ? "off" : null;
   return true;
 }
 async function fixDo(act) {
@@ -2183,7 +2183,7 @@ function wireTest() {
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
-const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null };
+const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -2363,7 +2363,7 @@ function healSeries() {
 }
 
 // the Expert "Healing settings" section of the Heal card; null in a field of the spec = the automatic value, shown here from `kn`
-function healSettings(sp, kn, plan, busy, upcastGb) {
+function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
   const d = busy ? "disabled" : "", v = (x, auto) => (x ?? auto);
   const sel = (id, cur, opts) => `<select id="${id}" ${d}>${opts.map(([val, label]) => `<option value="${val}" ${String(cur) === String(val) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const pu = v(sp.per_update, (kn.batch || 1) * (kn.grad_accum || 1)), bt = v(sp.batch, kn.batch || 1);
@@ -2383,6 +2383,9 @@ function healSettings(sp, kn, plan, busy, upcastGb) {
     <label>Warm-up steps<br><input type="text" id="hl-warmup" value="${v(sp.warmup, 30)}" ${d}></label></div>
     <label class="opt"><input type="checkbox" id="hl-upcast" ${sp.kbit_upcast === true ? "checked" : ""} ${busy || kn.qlora === false ? "disabled" : ""}> Keep the embeddings and output layer in 32-bit (the old behaviour: about <span id="hl-upcast-gb">${upcastGb != null ? upcastGb : "4 to 5"}</span> GB more memory)${kn.qlora === false ? " - only for QLoRA" : ""}</label>
     <p class="dim small">By default the two big word tables stay in 16-bit while healing: they are not changed by the learning, so a 32-bit copy only costs memory. Changing this keeps the saved answers and the learning done so far. If healing runs out of memory with this on, the program turns it off first.</p>
+    ${(() => { const on = sp.head_checkpoint === "off", gb = headOff && headOff.head_off_gb != null ? headOff.head_off_gb : null, fits = headOff ? headOff.head_off_fits : null; const off = busy || (!on && fits === false);
+      return `<label class="opt"><input type="checkbox" id="hl-headkeep" ${on ? "checked" : ""} ${off ? "disabled" : ""}> Keep the output layer's logits for the backward pass (faster, the same learning; about <span id="hl-headkeep-gb">${gb != null ? gb : "several"}</span> GB more memory)${!on && fits === false ? " - does not fit this card" : ""}</label>
+    <p class="dim small">Normally the logits of every chunk are made again in the backward pass to save memory. Keeping them stores about tokens × 250,000 × 10 bytes (about 20 GB for 8,192 tokens), so it is offered only when the estimate says it fits. It changes nothing about what is learned and keeps the saved answers and the learning done so far; how much faster it is is measured by "Find the fastest loss settings", not assumed. If healing runs out of memory with it on, the program turns it off first.</p>`; })()}
     <p class="dim small">A different sequence length, LoRA size or top-k means the original answers again or the learning starts again; the other settings keep what was saved.</p>
     <div class="row"><button class="secondary" id="hl-reset" ${d}>Reset to safe defaults</button></div></details>`;
 }
@@ -2526,7 +2529,7 @@ function healCard(m, pair) {
       <label>Weight of copying the original (1 = only copy it)<input type="text" id="hl-alpha" value="${sp.alpha}"></label>
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
-    ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb) : ""}${oomBlock}
+    ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb, est && est.head_off_gb != null ? est : h) : ""}${oomBlock}
     ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
     <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
@@ -3780,7 +3783,7 @@ function rsHealSpec() {
   return { tokens_m: sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, general_share: sp.general ? +(rc && !sp.shareSet ? rc.general_share : sp.share) : 0, recipe: rc ? rc.id : null,
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
-    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null,
+    kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null, head_checkpoint: sp.head_checkpoint === "off" ? "off" : null,
     ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}) };
 }
 
@@ -3866,6 +3869,7 @@ function wireReshape() {
   hv("hl-seq", (e) => { hs.seq = +e.value; }); hv("hl-batch", (e) => { hs.batch = +e.value; }); hv("hl-ckpt", (e) => { hs.checkpointing = e.value; }); hv("hl-method", (e) => { hs.method = e.value || null; });
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
+  hv("hl-headkeep", (e) => { hs.head_checkpoint = e.checked ? "off" : null; });
   on("hl-reset", () => { Object.assign(hs, HEAL_AUTO); render(); rsHealEstimate(); });
   on("hl-safer", () => { if (!healUseSafer()) return; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });

@@ -361,7 +361,7 @@ fn cases() -> serde_json::Value {
 
 fn knobs_of(v: &serde_json::Value) -> HealKnobs {
     HealKnobs { seq: 1024, batch: v["batch"].as_u64().unwrap() as u32, grad_accum: v["grad_accum"].as_u64().unwrap() as u32, checkpointing: v["checkpointing"].as_bool().unwrap(), rank: 32,
-                kl_chunk: v["chunk"].as_u64().unwrap() as u32, qlora: true, upcast: v["upcast"].as_bool().unwrap_or(false) }
+                kl_chunk: v["chunk"].as_u64().unwrap() as u32, qlora: true, upcast: v["upcast"].as_bool().unwrap_or(false), head_ckpt: v["head_checkpoint"].as_bool().unwrap_or(true) }
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn the_safer_settings_ladder_and_the_activation_estimate_equal_the_workers() {
         assert!((got - want).abs() <= want * 1e-3, "{a}: {got}");
     }
     // the ladder ends, keeps the sequences per update and never touches the maths
-    let mut k = HealKnobs { seq: 2048, batch: 4, grad_accum: 8, checkpointing: false, rank: 64, kl_chunk: 256, qlora: false, upcast: false };
+    let mut k = HealKnobs { seq: 2048, batch: 4, grad_accum: 8, checkpointing: false, rank: 64, kl_chunk: 256, qlora: false, upcast: false, head_ckpt: true };
     let mut n = 0;
     while let Some((next, _)) = heal_next_safer(&k) {
         assert_eq!((next.batch * next.grad_accum, next.seq, next.rank, next.qlora), (32, 2048, 64, false));
@@ -397,13 +397,13 @@ fn the_memory_estimate_equals_the_workers_and_counts_the_32_bit_embedding_copy_o
     for c in cases()["memory"].as_array().unwrap() {
         let d = HealDims { layers: c["layers"].as_u64().unwrap() as u32, hidden: c["hidden"].as_u64().unwrap() as u32, vocab: c["vocab"].as_u64().unwrap() as u32 };
         let k = HealKnobs { seq: c["seq"].as_u64().unwrap() as u32, batch: c["batch"].as_u64().unwrap() as u32, grad_accum: 16, checkpointing: c["checkpointing"].as_bool().unwrap(), rank: c["rank"].as_u64().unwrap() as u32,
-                            kl_chunk: c["kl_chunk"].as_u64().unwrap() as u32, qlora: c["qlora"].as_bool().unwrap(), upcast: c["upcast"].as_bool().unwrap() };
+                            kl_chunk: c["kl_chunk"].as_u64().unwrap() as u32, qlora: c["qlora"].as_bool().unwrap(), upcast: c["upcast"].as_bool().unwrap(), head_ckpt: c["head_ckpt"].as_bool().unwrap_or(true) };
         let got = heal_memory_gb(c["student_b"].as_f64().unwrap(), &d, &k);
         let want = c["gb"].as_f64().unwrap();
         assert!((got - want).abs() <= want * 1e-3, "{c}: {got}");
     }
     let d = HealDims { layers: 40, hidden: 5120, vocab: 248_320 };
-    let k = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: false };
+    let k = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: false, head_ckpt: true };
     let (off, on) = (heal_memory(16.0, &d, &k), heal_memory(16.0, &d, &HealKnobs { upcast: true, ..k.clone() }));
     // both tables, 2 x 248,320 x 5,120 values, 2 bytes more each in 32-bit: 5.09 GB of weights, 5.6 GB with the estimate's 10 % margin
     assert!((on.weights_gb - off.weights_gb - 5.09).abs() < 0.02, "{on:?} {off:?}");
@@ -417,7 +417,7 @@ fn the_memory_estimate_equals_the_workers_and_counts_the_32_bit_embedding_copy_o
 
 #[test]
 fn the_32_bit_embedding_copy_is_the_first_rung_of_the_ladder_and_old_saved_settings_load() {
-    let k = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: true };
+    let k = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: true, head_ckpt: true };
     let (next, label) = heal_next_safer(&k).unwrap();
     assert_eq!((label.as_str(), next.clone()), ("the 32-bit embedding copy turned off", HealKnobs { upcast: false, ..k.clone() }));
     assert_eq!(heal_next_safer(&next).unwrap().1, "a smaller batch (1 per step, 32 steps added up)");
@@ -458,7 +458,7 @@ fn mem(b: f64, k: &HealKnobs) -> f64 {
 
 #[test]
 fn the_memory_estimate_is_monotonic_and_checkpointing_and_qlora_lower_it() {
-    let base = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: false, rank: 32, kl_chunk: 128, qlora: true, upcast: false };
+    let base = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: false, rank: 32, kl_chunk: 128, qlora: true, upcast: false, head_ckpt: true };
     let m = |f: &dyn Fn(&mut HealKnobs)| { let mut k = base.clone(); f(&mut k); mem(16.0, &k) };
     let b = mem(16.0, &base);
     assert!(m(&|k| k.seq = 2048) > b && m(&|k| k.seq = 512) < b && m(&|k| k.batch = 4) > b && m(&|k| k.batch = 1) < b && m(&|k| k.rank = 64) > b && m(&|k| k.rank = 8) < b && m(&|k| k.kl_chunk = 512) > b);
@@ -1227,9 +1227,9 @@ if kind == "distill_cache":
                              "coverage": {{"v": 1, "max_seq": job["max_seq"], "rows": {{"project_text": 1, "project_chat": 9, "general_text": 0, "general_chat": 0}}, "chat_rows": {{"complete": 8, "cut": 1, "skipped": 0}}, "notes": ["a note"]}}}})
 elif kind == "distill":
     os.makedirs(os.path.join(job["out"], "checkpoints", "checkpoint-50"), exist_ok=True)
-    out(type="heal_settings", settings={{"checkpointing": job["hyper"]["checkpointing"] == "on", "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"], "upcast": job["distill"].get("kbit_upcast", False)}})
+    out(type="heal_settings", settings={{"checkpointing": job["hyper"]["checkpointing"] == "on", "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"], "upcast": job["distill"].get("kbit_upcast", False), **({{"head_checkpoint": False}} if job["distill"].get("head_checkpoint") == "off" else {{}})}})
     if marker("oom-train"):
-        out(type="heal_retry", attempt=1, change="gradient checkpointing", settings={{"checkpointing": True, "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"], "upcast": job["distill"].get("kbit_upcast", False)}})
+        out(type="heal_retry", attempt=1, change="gradient checkpointing", settings={{"checkpointing": True, "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"], "upcast": job["distill"].get("kbit_upcast", False), **({{"head_checkpoint": False}} if job["distill"].get("head_checkpoint") == "off" else {{}})}})
         out(type="error", code="distill_oom", message="The graphics card ran out of memory during step train. Settings used: x."); sys.exit(1)
     if marker("fail-train"):
         out(type="error", code="distill_unstable", message="Healing stopped: the training became unstable (the error went to infinity). Lower the learning rate (Expert) and continue."); sys.exit(1)
@@ -1474,6 +1474,52 @@ fn the_32_bit_embedding_copy_reaches_the_job_and_changing_it_keeps_the_teachers_
     assert_eq!((all[2]["distill"]["kbit_upcast"].clone(), all[2]["resume"].clone()), (json!(false), json!(true)));
     assert_eq!(heal_json()["train_key"], first["train_key"]);
     assert!(first["train_key"].as_object().unwrap().keys().all(|k| !k.contains("upcast")));
+}
+
+#[cfg(unix)]
+#[test]
+fn keeping_the_output_logits_reaches_the_job_is_not_in_any_key_and_the_ladder_turns_it_back_on_first() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let dir = p.folder.join("models").join("slim");
+    let heal_json = || -> serde_json::Value { serde_json::from_slice(&std::fs::read(dir.join("heal.json")).unwrap()).unwrap() };
+    // a default heal sends no key for it
+    std::fs::write(d.path().join("oom-train"), "").unwrap();
+    let _ = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0})).unwrap_err();
+    assert!(jobs_seen(d.path())[1]["distill"].get("head_checkpoint").is_none(), "a job without the setting is the job it always was");
+    let default_key = heal_json()["train_key"].clone();
+    // off: the job says so, the page's estimate says what it costs, and the next safer step turns it back on
+    let _ = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0, "head_checkpoint": "off"})).unwrap_err();
+    let jobs = jobs_seen(d.path());
+    assert_eq!(jobs.last().unwrap()["distill"]["head_checkpoint"], "off");
+    assert_eq!(heal_json()["train_key"], default_key, "student-side only: the key of the maths is the same, so the checkpoints and the answers stay");
+    let o = rruns::heal_options(&p, "slim", Some(32.0)).unwrap();
+    assert_eq!((o["safer"]["label"].as_str(), o["safer"]["head_checkpoint"].as_str()), (Some("the output layer's logits made again in the backward pass (checkpointed)"), Some("on")), "{o}");
+    assert!(o["head_off_gb"].as_f64().unwrap() > 1.0 && o["head_off_fits"].is_boolean(), "{o}");
+    let est = rruns::heal_estimate(&p, "slim", &serde_json::from_value(json!({"tokens_m": 10, "head_checkpoint": "off"})).unwrap(), Some(32.0)).unwrap();
+    let est_on = rruns::heal_estimate(&p, "slim", &serde_json::from_value(json!({"tokens_m": 10})).unwrap(), Some(32.0)).unwrap();
+    assert!(est["plan"]["est_gb"].as_f64().unwrap() > est_on["plan"]["est_gb"].as_f64().unwrap(), "{est} {est_on}");
+    assert_eq!(est["knobs"]["head_ckpt"], false);
+    // a spec with a wrong value is refused; an old spec has none
+    assert!(serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 10, "head_checkpoint": "maybe"})).unwrap().validate().is_err());
+    assert!(serde_json::to_value(serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 10})).unwrap()).unwrap().get("head_checkpoint").is_none());
+}
+
+#[test]
+fn old_saved_knobs_load_with_the_head_checkpointed_and_the_estimate_counts_the_kept_logits() {
+    let k: HealKnobs = serde_json::from_value(json!({"seq": 1024, "batch": 2, "grad_accum": 16, "checkpointing": true, "rank": 32, "kl_chunk": 128, "qlora": true})).unwrap();
+    assert!(k.head_ckpt && !k.upcast);
+    let d = HealDims { layers: 40, hidden: 5120, vocab: 248_320 };
+    let off = HealKnobs { head_ckpt: false, ..k.clone() };
+    // 1,024 x 2 tokens x 248,320 x 10 bytes = 5.09 GB, 5.6 GB with the estimate's 10 % margin
+    assert!((heal_memory_gb(16.0, &d, &off) - heal_memory_gb(16.0, &d, &k) - 5.6).abs() < 0.05);
+    assert_eq!(heal_head_off_extra_gb(16.0, &d, &k), 5.6);
+    let (next, label) = heal_next_safer(&HealKnobs { upcast: true, ..off }).unwrap();
+    assert!(next.head_ckpt && next.upcast, "the head comes before the 32-bit copy: {label}");
 }
 
 #[cfg(unix)]
