@@ -372,3 +372,35 @@ fn the_heal_rounds_knob_shows_the_range_as_a_best_and_a_worst_delta() {
     let fit = fit_budget(&qwen27(), &early, Some(32.0), &History::default(), 100.0);
     assert!(fit.spec.heal_rounds.is_some());
 }
+
+// ---- vLLM (experimental)
+
+#[test]
+fn vllm_is_a_knob_with_times_and_a_risk_and_every_preset_but_custom_switches_it_off() {
+    use ndforge_core::vllm_plan::{AutoVllm, Numbers};
+    let mut h = History::default();
+    Numbers { startup_s: Some(263.5), long_tps: Some(120.0), model_b: Some(27.0), ..Default::default() }.push_into(&mut h);
+    let ins = qwen27();
+    let s = owner();
+    let si = speed_info(&ins, &s, Some(32.0), &h);
+    let k = si.knobs.iter().find(|k| k.knob == "vllm").expect("the knob is there");
+    assert!(k.risk.contains("Experimental") && k.risk.contains("start"), "{}", k.risk);
+    let labels: Vec<&str> = k.options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(labels, ["Off (recipe)", "The original's answers with vLLM", "The thinking checks with vLLM", "Both", "Automatic: vLLM only where it is faster"]);
+    assert!(k.options[0].current && k.options[0].delta_min == Some((0.0, 0.0)));
+    let answers = k.options[1].delta_min.unwrap();
+    assert!(answers.1 < 0.0, "hours of the original's answers become a few: {answers:?}");
+    assert!(k.options[1..].iter().all(|o| o.note.as_deref().is_some_and(|n| n.contains("Experimental"))));
+    // a spec with vLLM is a Custom choice; a preset switches it off again; custom keeps it
+    let on = AutoSpec { vllm: Some(AutoVllm { teacher_cache: true, checks: false, automatic: false }), ..owner() };
+    assert_eq!(on.matching_preset(), None);
+    assert!(on.with_preset("balanced").unwrap().vllm.is_none() && on.with_preset("thorough").unwrap().vllm.is_none() && on.with_preset("fast").unwrap().vllm.is_none());
+    assert!(on.with_preset("custom").unwrap().vllm.is_some());
+    // legacy specs: the key is not written, the old ones load, and the recipe is still the recipe
+    let v = serde_json::to_value(owner()).unwrap();
+    assert!(v.get("vllm").is_none());
+    let back: AutoSpec = serde_json::from_value(v).unwrap();
+    assert_eq!(back, owner());
+    assert!(speed_warnings(&on, &[], &[], 27.8).iter().any(|w| w.contains("Experimental: vLLM makes the original's answers")));
+    assert!(!speed_warnings(&owner(), &[], &[], 27.8).iter().any(|w| w.contains("vLLM")));
+}

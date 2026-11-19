@@ -678,6 +678,7 @@ fn run_check(st: &mut AutoState, fx: &mut dyn Effects, step: &str, name: &str, t
         }
         return Ok(r);
     }
+    fx.engine_cleanup();          // a vLLM job starts on a free card
     let r = fx.think_check_with(name, target, quick, None, "vllm")?;
     let Out::Done(v) = r else { return Ok(Out::Stopped) };
     let used = v.get("engine_used").cloned();

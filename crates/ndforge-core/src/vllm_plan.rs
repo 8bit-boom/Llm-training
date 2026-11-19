@@ -180,7 +180,8 @@ fn fmt_min(m: (f64, f64)) -> String {
 
 /// Decides one step. `standard` is the part's time with the standard engine, `vllm` its time with vLLM (start-up included).
 pub fn decide(step: &str, kind: &str, mode: &str, standard: (f64, f64), vllm: Min, blocked: Option<&str>) -> Decision {
-    let v = (vllm.lo, vllm.hi);
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;          // one decimal: what is saved with a run reads back the same
+    let (standard, v) = ((r1(standard.0), r1(standard.1)), (r1(vllm.lo), r1(vllm.hi)));
     let src = if vllm.measured { "from your own measurement" } else { "from the research report's estimate, not measured on this PC" };
     let what = if kind == "teacher_cache" { "the original's answers" } else { "this thinking check" };
     let (use_vllm, reason) = if let Some(b) = blocked {

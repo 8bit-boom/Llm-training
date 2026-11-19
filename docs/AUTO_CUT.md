@@ -322,3 +322,15 @@ high) with `StepTime.rounds`; the heal's weight in the progress bar is its worst
 ## The speed-setting radios follow the click (fix)
 
 The choices of "How careful, how fast" (the levers and "More speed settings") are drawn from what is chosen NOW (`acOptionOn`, the same comparison as the preset check), not from the plan that is still on its way: the plan is asked again after every change (`acRefresh` drops `ac.plan`) and used to redraw the old choice until it arrived, and a click in that window was dropped. The table of the last plan is kept (`ac.speedCache`, for the model it was made for) and a click uses its `set` values, so it is never lost; while the new plan loads the old changes stay, marked "updating…", the preset reads Custom at once, and without any table yet the radios are not offered. `History::recent` keeps its parsed answer in memory while the saved logs are the same ones (name, size, modification time), and `speed_info` makes each distinct spec's plan and time estimate once; the numbers are the same as before (the existing tests). This was tested in the stand-in browser of `ui/smoke/autocut.test.mjs` only: nothing was verified in a real window, and how much faster the plan is has not been measured.
+
+
+## vLLM (experimental)
+
+`AutoSpec.vllm` (`teacher_cache`, `checks`, `automatic`; absent = the run as it always was, the key is not even written; every preset except Custom switches it off). The card section "vLLM (experimental)" has the two switches and "automatic", each with the change in time from the plan (your measured numbers, scaled by model size, or the report's estimates, said so), the prerequisites (self-test run and its verdict, the model it measured, the long-answer speed, the teacher check per made model) and the plan's reason for every decision.
+
+- **Time estimate** (`plan.time.vllm`): a heal's cache part becomes engine start-up + scoring; every check becomes start-up + generation (the engine starts for each check job: it pays only for long checks; with the 27 B numbers of one PC a Quick check is about as long as with the standard engine). "Automatic" picks vLLM for a step only when its middle estimate is under 90 % of the standard engine's.
+- **One engine for all checks of a run**: a check is judged against the original's, so the checks use the engine of the baseline; when a vLLM check falls back, the original is checked again with the standard engine.
+- **Order of GPU jobs**: before every step `engine_cleanup` stops leftover `ndforge-vllm-*` containers; no vLLM job overlaps a training (tested with the Mock effects).
+- **Heals in rounds** (`early` preset or a custom rounds setting) keep the standard teacher: the engine would start every round.
+- **Fallback**: a failing vLLM step goes on with the standard engine, with a note in the run's notes and the report.
+- **Report**: "Steps that used vLLM": per step the engine, teacher quantization and identity, measured start-up and speed against the estimate, fallbacks. `AutoState.engines` and `check_engine` are additive; old run files load.

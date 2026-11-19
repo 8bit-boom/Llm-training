@@ -313,7 +313,7 @@ impl Vx<'_> {
         let (st, gen, v) = self.check_times(hf, b, quick);
         out.push(p("vllm_start", format!("{label}: start the vLLM engine"), min_of(st)));
         out.push(p("check", format!("{label} (vLLM)"), min_of(gen)));
-        self.dec.push(Decision { step: key.into(), kind: "checks".into(), mode: "on".into(), use_vllm: true, standard_min: (hf.lo, hf.hi), vllm_min: (v.lo, v.hi), measured: v.measured,
+        self.dec.push(Decision { step: key.into(), kind: "checks".into(), mode: "on".into(), use_vllm: true, standard_min: ((hf.lo * 10.0).round() / 10.0, (hf.hi * 10.0).round() / 10.0), vllm_min: ((v.lo * 10.0).round() / 10.0, (v.hi * 10.0).round() / 10.0), measured: v.measured,
                                  reason: "Same engine as the run's other checks.".into() });
     }
 

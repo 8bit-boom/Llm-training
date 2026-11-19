@@ -2908,7 +2908,7 @@ function madeCard(m) {
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
-  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null, vl: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
@@ -2940,6 +2940,7 @@ function acKnobs() {
 const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
 // the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
 function acPresetNow() {
+  if (ac.sp.vl && (ac.sp.vl.teacher_cache || ac.sp.vl.checks || ac.sp.vl.automatic)) return "custom";
   const kn = acKnobs();
   const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
     if (k === "search_minutes" || (!ac.thinking && AC_THINK_KNOBS.includes(k))) return true;      // how long the search looks is not part of what makes a recipe
@@ -2952,6 +2953,7 @@ function acApplyPreset(id) {
   const p = AC_SPEED_PRESETS.find((x) => x.id === id);
   if (!p) return;
   acApplySet(p.set);
+  if (id !== "custom") ac.sp.vl = null;          // a preset is a recipe without the experimental engine (the program does the same)
 }
 // a choice of a knob (or a preset) sets these spec fields
 function acApplySet(set) {
@@ -2960,6 +2962,7 @@ function acApplySet(set) {
     else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
     else if (k === "search_minutes") ac.sp.search = v;
     else if (k === "heal_rounds") ac.sp.hr = v ? { ...v } : null;
+    else if (k === "vllm") ac.sp.vl = v ? { ...v } : null;
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
@@ -2967,7 +2970,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -3027,7 +3030,7 @@ function acSpeedBlock(pl, live) {
   };
   const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${acOptionOn(o) ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
       <span class="dim small ac-delta">${acOptionOn(o) ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
-  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
+  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick", "vllm"].includes(k.knob)) : [];
   const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
   const bud = pl && pl.budget;
   const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
@@ -3049,6 +3052,27 @@ function acKnobDelta(pl, knob, labelStart) {
   return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
+// vLLM (experimental) in Auto-cut: two switches and "automatic", each with the change in time from YOUR measured numbers (the plan's own words), the prerequisites, and the decision of every step
+function acVllmBox(pl, lock) {
+  if (!vllmSettings().enabled) return "";
+  const v = ac.sp.vl || {}, rep = vl.report, mi = rep && rep.model_info;
+  const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
+  const td = (label, on) => `<li class="${on ? "ok" : "warn"}">${on ? "✓" : "!"} ${label}</li>`;
+  const pre = [
+    td(rep ? `Self-test run: ${esc(word[rep.verdict] || rep.verdict)}${mi ? ` — measured on ${esc(mi.model)}${mi.params_b != null ? ` (${mi.params_b} B)` : ""}, ${esc(mi.quant || "")}; the plan scales its numbers by model size or does not use them when the size is more than 2 times different` : " (an older report: it does not say which model, so its numbers are not used)"}` : "The vLLM self-test has not been run: every vLLM time below is the research report's estimate", !!rep && !!mi),
+    td(rep && rep.long_tokens_per_s != null ? `Speed on long answers measured: ${rep.long_tokens_per_s} tokens per second` : "Speed on long (thinking-length) answers not measured: the Quick suite's short answers overstate it and are not used", !!rep && rep.long_tokens_per_s != null),
+    td("The check of the vLLM teacher (Heal card, \"Check the vLLM teacher\") is run for each made model: a teacher the check calls \"different\" is refused and the heal falls back to the standard teacher", false),
+  ].join("");
+  const dec = pl && pl.time && pl.time.vllm ? pl.time.vllm : null;
+  const reasons = dec ? `<ul class="small" id="ac-vllm-decisions">${dec.decisions.filter((d, i, a) => a.findIndex((x) => x.kind === d.kind && x.reason === d.reason) === i && d.reason).map((d) => `<li>${esc(d.reason)}</li>`).join("")}</ul><ul class="small dim">${dec.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  const delta = (l) => acKnobDelta(pl, "vllm", l);
+  return `<fieldset class="soft" id="ac-vllm"><legend>vLLM (experimental)</legend>
+    <p class="warn small">Built from a research report. It starts a container for every use: it pays for hours of the original's answers, and it does not pay for a short thinking check. A step that cannot use it goes on with the standard engine and the report says so.</p>
+    <label class="opt"><input type="checkbox" id="ac-vl-t" ${v.teacher_cache && !v.automatic ? "checked" : ""} ${lock}> The original's answers with vLLM${delta("The original's answers")}</label>
+    <label class="opt"><input type="checkbox" id="ac-vl-c" ${v.checks && !v.automatic ? "checked" : ""} ${lock}> The thinking checks with vLLM${delta("The thinking checks")}</label>
+    <label class="opt"><input type="checkbox" id="ac-vl-a" ${v.automatic ? "checked" : ""} ${lock}> Automatic: vLLM only for a step where its estimate is lower than the standard engine's (the plan says why)${delta("Automatic")}</label>
+    <ul class="small" id="ac-vllm-pre">${pre}</ul>${reasons}</fieldset>`;
+}
 // "Healing in 5 M rounds: about A-B h if the first check passes, up to C-D h." for every stage, and the warnings once (the plan's own words)
 function acRoundsPlan(pl) {
   if (!pl || !pl.time || !ac.sp.hr) return "";
@@ -3108,7 +3132,7 @@ function autoCard() {
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
     ${ac.gbOn ? `<p class="dim small" id="ac-gbnote">Each tensor gets the type that spends the bytes best (measured on the healed model's weights, weighted by its importance matrix), then <strong>Compare quants</strong> (KL divergence) checks the file against the plain sizes next to it. It is published only when it is clearly better than the plain file of its size.${pl && pl.measured_minutes ? ` About ${Math.round(pl.measured_minutes[0])} min to measure and ${Math.round(pl.measured_minutes[1])} min to compare (guesses). The 16-bit file is kept until the comparison is done, so this needs more disk.` : ""}${!(+ac.gb > 0) ? ` <span class="warn" id="ac-gbwhy">Give the size in GB.</span>` : ""}</p>` : ""}
     ${studio}
-    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}${live ? "" : acTimeBlock(pl)}`}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${acVllmBox(pl, lock)}${sizes}${live ? "" : acTimeBlock(pl)}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
@@ -3271,6 +3295,8 @@ function wireAuto() {
     if (y && typeof window.scrollTo === "function") window.scrollTo(0, y);
   });
   const pr = $("ac-pin-remove"); if (pr) pr.onclick = () => { ac.pin = null; ac.err = null; render(); };
+  const vlset = (k) => (e) => { const cur = ac.sp.vl || { teacher_cache: false, checks: false, automatic: false }; if (k === "automatic") { cur.automatic = e.checked; if (e.checked) { cur.teacher_cache = false; cur.checks = false; } } else { cur[k] = e.checked; if (e.checked) cur.automatic = false; } ac.sp.vl = cur.teacher_cache || cur.checks || cur.automatic ? cur : null; };
+  set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });

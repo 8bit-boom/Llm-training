@@ -114,3 +114,51 @@ test("the teacher check card shows its file path and text", () => {
   assert.match(html, /id="hl-vllm-files-text"[^>]*>[^<]*&quot;verdict&quot;: &quot;close&quot;/);
   assert.match(html, /Open the folder/);
 });
+
+// ---- Auto-cut
+
+const acBase = () => ({ project: { name: "P", folder: "/p" }, steps: [], bundle: { world: "W" }, settings: { theme: "light", expert_mode: false, show_help_panel: true, vllm: { enabled: true, kind: "auto" } }, worlds: [], recent: [] });
+const acStage = (i, b) => ({ index: i, of: 2, params_b: b, blocks_cut: 0, width: 14080, cut_pct: 12, tokens_m: 40, hours: [8, 14], heal_gb: 26, verdict: "fits" });
+const acPlan = (extra = {}) => ({ ok: true, blockers: [], warnings: [], candidates: [], stages: [acStage(1, 24.46), acStage(2, 21.14)], disk: { peak_gb: 196.8, peak_step: "x", final_gb: 86, free_gb: 500 }, time: { steps: [], total_h: [30, 40], notes: [], basis: "", extra: [], ...extra },
+  speed: { presets: [], knobs: [{ knob: "vllm", label: "vLLM", risk: "r", options: [{ label: "Off (recipe)", current: true, delta_min: [0, 0], set: { vllm: null } }, { label: "The original's answers with vLLM", current: false, delta_min: [-1500, -400], set: {} },
+    { label: "The thinking checks with vLLM", current: false, delta_min: [20, 60], set: {} }, { label: "Both", current: false, delta_min: [-1400, -300], set: {} }, { label: "Automatic: vLLM only where it is faster", current: false, delta_min: [-1500, -400], set: {} }] }], current_preset: "balanced", default_preset: "balanced", total_h: [30, 40] } });
+
+function acOpen(settings, planExtra) {
+  const b = makeBrowser({ answers: {}, state: () => acBase() });
+  const st = acBase();
+  st.settings.vllm = settings;
+  b.run(`state = ${JSON.stringify(st)}; page = "reshape"; rs.state = ${JSON.stringify({ models: [], made: [], dataset_version: 3, env_ready: true, vram_gb: 32, gpu: "RTX 5090", free_disk_gb: 500 })}; rs.model = "qwen3.8-27b";
+    rs.options = { inspect: { supported: true, model_type: "qwen3_5", total_params: 27.78e9 }, options: [], width: null }; ac.plan = ${JSON.stringify(acPlan(planExtra))};`);
+  return b;
+}
+
+test("the Auto-cut card has no vLLM section while Settings keep the engine off, and the spec never carries the key", () => {
+  const b = acOpen({ enabled: false });
+  assert.doesNotMatch(b.run("autoCard()"), /id="ac-vllm"/);
+  b.run("ac.sp.vl = { teacher_cache: true, checks: false, automatic: false }");
+  assert.equal("vllm" in JSON.parse(JSON.stringify(b.run("acSpec()"))), false);
+});
+
+test("the vLLM section shows the two switches and automatic with the time change, the prerequisites, and the plan's reasons", () => {
+  const b = acOpen({ enabled: true, kind: "auto" }, { vllm: { numbers: {}, decisions: [{ step: "s1.heal:cache", kind: "teacher_cache", mode: "automatic", use_vllm: true, reason: "Automatic: vLLM for the original's answers, about 3.0 to 3.8 hours instead of 8.2 to 20.6 hours (from the research report's estimate, not measured on this PC)." },
+    { step: "checks", kind: "checks", mode: "automatic", use_vllm: false, reason: "Automatic: the standard engine for this thinking check: vLLM would take about 9 to 14 minutes against 10 to 14 minutes; the engine's start-up eats the gain." }], notes: ["Scoring speed 3000 to 3800 tokens per second: the research report's estimate, NOT measured on this PC"] } });
+  b.run(`vl.report = { verdict: "partial", model_info: { model: "org/Model-9B", params_b: 9, quant: "quantized (awq)" }, long_tokens_per_s: 210 }`);
+  const html = b.run("autoCard()");
+  assert.match(html, /<legend>vLLM \(experimental\)<\/legend>/);
+  for (const id of ["ac-vl-t", "ac-vl-c", "ac-vl-a"]) assert.match(html, new RegExp(`id="${id}"`));
+  assert.match(html, /The original&#39;s answers with vLLM <span class="dim small ac-delta">|The original's answers with vLLM <span class="dim small ac-delta">/);
+  assert.match(html, /measured on org\/Model-9B \(9 B\), quantized \(awq\)/);
+  assert.match(html, /Speed on long answers measured: 210 tokens per second/);
+  assert.match(html, /Automatic: the standard engine for this thinking check/);
+  assert.match(html, /it does not pay for a short thinking check/);
+});
+
+test("ticking a switch puts the key in the spec (and makes the setting Custom); a preset switches it off again", () => {
+  const b = acOpen({ enabled: true, kind: "auto" });
+  b.run("ac.sp.vl = { teacher_cache: true, checks: false, automatic: false }");
+  assert.deepEqual(JSON.parse(JSON.stringify(b.run("acSpec().vllm"))), { teacher_cache: true, checks: false, automatic: false });
+  assert.equal(b.run("acPresetNow()"), "custom");
+  b.run(`acApplyPreset("balanced")`);
+  assert.equal(b.run("ac.sp.vl"), null);
+  assert.equal("vllm" in JSON.parse(JSON.stringify(b.run("acSpec()"))), false);
+});
