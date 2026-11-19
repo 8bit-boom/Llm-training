@@ -22,7 +22,8 @@ fn origin(teacher: &str) -> Origin {
 
 /// the numbers of the person's first self-test on a real PC (RTX 5090, Windows, WSLc): ready after 510.6 s, 659.2 tokens/s with 40 requests at once
 fn selftest() -> Value {
-    json!({"verdict": "partial", "startup_seconds": 510.6, "tokens_per_s": 659.2, "wall_seconds": 95.0, "completion_tokens": 62000})
+    json!({"verdict": "partial", "startup_seconds": 510.6, "tokens_per_s": 659.2, "wall_seconds": 95.0, "completion_tokens": 62000, "model_params_b": 27.0,
+           "answer_tokens": {"n": 16, "median": 1500, "mean": 1800, "p90": 3000}, "short_answers": false, "long_tokens_per_s": 120.0})
 }
 
 fn history(check: &[Value]) -> History {
@@ -135,10 +136,10 @@ fn the_estimate_uses_your_own_numbers_and_says_where_they_come_from() {
     assert_eq!(e["startup_measured"], true);
     assert_eq!(e["scoring_measured"], false, "the self-test's generation speed is not the scoring speed");
     let start = e["startup_min"].as_array().unwrap();
-    assert!((start[0].as_f64().unwrap() - 510.6 / 60.0 * 0.85).abs() < 0.2 && (start[1].as_f64().unwrap() - 510.6 / 60.0 * 1.25).abs() < 0.2);
+    assert!((start[0].as_f64().unwrap() - 510.6 / 60.0 * 0.85).abs() < 0.5 && (start[1].as_f64().unwrap() - 510.6 / 60.0 * 1.25).abs() < 0.8);
     assert!(e["text"].as_str().unwrap().contains("not measured here") && e["text"].as_str().unwrap().contains("measured by your self-test"));
     let basis = e["basis"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect::<Vec<_>>().join(" ");
-    assert!(basis.contains("510") == false && basis.contains("8.5 minutes") && basis.contains("659") && basis.contains("NOT measured"), "{basis}");
+    assert!(basis.contains("8.5 minutes") && basis.contains("27 B model") && basis.contains("659") && basis.contains("NOT measured"), "{basis}");
     assert_eq!(e["route"]["route"], "bnb");
     assert!(e["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("never been run")));
     assert!(e["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("not been checked")));
@@ -172,7 +173,7 @@ fn the_numbers_of_a_failed_or_empty_self_test_are_not_used() {
     let n = measured_numbers(&json!({"verdict": "fail", "error": "no gpu"}), &[]);
     assert_eq!(n.startup_s, None);
     let n = measured_numbers(&selftest(), &[json!({"vllm": {}}), json!({"vllm": {"tokens_per_s": 1800.0}})]);
-    assert_eq!((n.startup_s, n.quick_wall_s, n.gen_tps, n.score_tps), (Some(510.6), Some(95.0), Some(659.2), Some(1800.0)));
+    assert_eq!((n.startup_s, n.quick_wall_s, n.gen_tps, n.score_tps, n.model_b, n.long_tps), (Some(510.6), Some(95.0), Some(659.2), Some(1800.0), Some(27.0), Some(120.0)));
 }
 
 #[test]
@@ -222,4 +223,50 @@ fn leftover_containers_are_found_by_name_and_removed() {
     let in_wsl = stop_leftovers(&VllmSettings { kind: "docker_wsl".into(), distro: "Ubuntu".into(), ..Default::default() }, &|a: &[&str]| { assert_eq!(&a[..5], ["wsl.exe", "-d", "Ubuntu", "--", "docker"]); Some((true, String::new())) });
     assert!(in_wsl.is_empty());
     assert!(stop_leftovers(&VllmSettings { kind: "wslc".into(), ..Default::default() }, &|_: &[&str]| panic!("wslc has no known listing syntax: nothing is run")).is_empty());
+}
+
+#[test]
+fn numbers_of_a_9b_model_are_never_presented_as_those_of_a_27b_model() {
+    let nine = json!({"verdict": "partial", "startup_seconds": 510.6, "tokens_per_s": 659.2, "wall_seconds": 7.7, "model_params_b": 9.0, "answer_tokens": {"n": 16, "median": 80}, "short_answers": true});
+    let mut h = History::default();
+    measured_numbers(&nine, &[]).push_into(&mut h);
+    let n = Numbers::from_history(&h);
+    assert_eq!(n.model_b, Some(9.0));
+    assert_eq!(n.quick_wall_s, None, "short answers say nothing about a thinking check");
+    use ndforge_core::vllm_plan as vp;
+    assert!(!vp::startup(&n, 27.8).measured, "3 times the size: the report's formulas, not the 9 B number");
+    let s9 = vp::startup(&n, 9.0);
+    assert!(s9.measured && (s9.lo - 510.6 / 60.0 * 0.85).abs() < 0.01);
+    let s13 = vp::startup(&n, 13.5);
+    assert!(s13.measured && (s13.lo - 510.6 / 60.0 * 0.85 * 1.5).abs() < 0.01, "1.5 times the size: 1.5 times the start-up");
+    assert!(vp::basis_notes(&n, 27.8).iter().any(|t| t.contains("NOT used") && t.contains("9 B")));
+    // an older report that does not say its model: not used at all
+    let old = measured_numbers(&json!({"verdict": "partial", "startup_seconds": 510.6}), &[]);
+    assert!(!vp::startup(&old, 9.0).measured && vp::basis_notes(&old, 9.0).iter().any(|t| t.contains("does not say which model")));
+    // the long-answer speed gives a check's generation time, scaled by size
+    let long = Numbers { long_tps: Some(100.0), model_b: Some(27.0), ..Default::default() };
+    let g = vp::check_generation(&long, true, 1.5, 27.0);
+    assert!(g.measured && (g.lo - 30_000.0 / 100.0 / 60.0 * 0.85).abs() < 0.01);
+}
+
+#[test]
+fn the_selftest_files_say_where_they_are() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let f = selftest_files();
+    assert_eq!(f["exists"], false);
+    assert_eq!(f["dir"], json!(d.path().join("cfg").join("vllm_selftest").display().to_string()));
+    std::fs::create_dir_all(selftest_dir()).unwrap();
+    std::fs::write(selftest_dir().join("vllm_selftest.md"), "# vLLM self-test\n**FAIL**").unwrap();
+    let f = selftest_files();
+    assert_eq!((f["exists"].clone(), f["markdown"].clone()), (json!(true), json!("# vLLM self-test\n**FAIL**")));
+    assert!(f["md"].as_str().unwrap().ends_with("vllm_selftest.md"));
+    let m = d.path().join("m");
+    std::fs::create_dir_all(&m).unwrap();
+    assert_eq!(teacher_check_files(&m)["exists"], false);
+    std::fs::write(teacher_check_file(&m), "{\"verdict\": \"same\"}").unwrap();
+    let c = teacher_check_files(&m);
+    assert!(c["exists"] == true && c["text"].as_str().unwrap().contains("\"verdict\": \"same\""));
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
 }

@@ -146,7 +146,7 @@ def test_docker_lifecycle_starts_waits_asks_and_stops_explicitly(fake, docker_fa
     assert tc.run(job) == 0
     res = out()[-1]["data"]
     assert docker_fake["popen"][0][:2] == ["docker", "run"] and "ndforge-vllm-%d" % fake.port in docker_fake["popen"][0]
-    assert docker_fake["run"][0][:2] == ["docker", "stop"], "the explicit stop must run when the check is done"
+    assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]], "the explicit stop must run when the check is done"
     assert res["engine"]["vllm"] == "0.34.0" and res["engine"]["highlights"] == ["INFO attention backend: FLASH_ATTN"] and res["engine"]["ready_seconds"] is not None
 
 
@@ -161,7 +161,7 @@ def test_the_stop_file_stops_the_questions_and_the_engine(tmp_path, docker_fake,
         assert tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "stop_file": str(stop)}) == 0
         assert time.time() - t0 < 3.0
         assert out()[-1]["data"]["stopped"] is True
-        assert docker_fake["run"] and docker_fake["run"][0][:2] == ["docker", "stop"]
+        assert docker_fake["run"] and ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
     finally:
         f.close()
 
@@ -172,7 +172,7 @@ def test_health_timeout_is_plain_and_stops_the_engine(docker_fake):
         docker_fake["port"] = f.port
         with pytest.raises(tc.ThinkCheckError, match="did not become ready"):
             tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "start_timeout": 0.5})
-        assert docker_fake["run"][0][:2] == ["docker", "stop"]
+        assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
     finally:
         f.close()
 
@@ -185,7 +185,7 @@ def test_a_crash_shows_the_last_lines_and_stops_the_engine(docker_fake, monkeypa
     monkeypatch.setattr(ve, "_popen", lambda cmd, **kw: (kw["stdout"].write(b"CUDA out of memory\n"), proc)[1])
     with pytest.raises(tc.ThinkCheckError, match="exit code 2.*CUDA out of memory"):
         tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "start_timeout": 5})
-    assert docker_fake["run"][0][:2] == ["docker", "stop"]
+    assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
 
 
 def test_a_failing_question_stops_the_engine(docker_fake):

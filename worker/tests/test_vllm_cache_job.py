@@ -139,7 +139,7 @@ def cfg_of(kind="docker", **kw):
 def test_docker_templates_and_paths():
     box = vllmcache.Container(cfg_of("docker"), "C:\\models\\origin")
     cmd = box.start_command()
-    assert cmd[:5] == ["docker", "run", "-d", "--rm", "--gpus"] and "--entrypoint" in cmd and cmd[cmd.index("--entrypoint") + 1] == "sleep" and cmd[-2:] == ["vllm/vllm-openai:v0.34.0", "infinity"]
+    assert cmd[:4] == ["docker", "run", "-d", "--gpus"] and "--entrypoint" in cmd and cmd[cmd.index("--entrypoint") + 1] == "sleep" and cmd[-2:] == ["vllm/vllm-openai:v0.34.0", "infinity"]
     assert "C:\\models\\origin:/models/base:ro" in cmd and box.model_arg == "/models/base"
     assert box.cp_in_command("C:\\w\\rows.npz", "/work/data/rows.npz") == ["docker", "cp", "C:\\w\\rows.npz", f"{box.name}:/work/data/rows.npz"]
     assert box.cp_out_command("/work/out/index.json", "C:\\t\\index.json") == ["docker", "cp", f"{box.name}:/work/out/index.json", "C:\\t\\index.json"]

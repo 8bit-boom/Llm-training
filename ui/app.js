@@ -2097,17 +2097,32 @@ function renderVllmTest(v) {
   const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
   const rep = r ? `<div class="${r.verdict === "pass" ? "ok" : r.verdict === "partial" ? "warn" : "err"}" id="vl-verdict"><strong>${esc(word[r.verdict] || r.verdict)}</strong>: ${esc(r.verdict_text)}
       <ul class="small">${(r.criteria || []).map((c) => `<li>${c.ok ? "✓" : c.ok === false ? "✕" : "?"} ${esc(c.label)}: ${esc(typeof c.value === "object" ? JSON.stringify(c.value) : c.value == null ? "not measured" : String(c.value))}</li>`).join("")}</ul>
-      <p class="dim small">Report: ${esc(r.report || "")} (also in the problem-report bundle). ${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
+      <p class="dim small">(also in the problem-report bundle). ${r.answer_tokens ? `Answers: median ${r.answer_tokens.median} tokens. ` : ""}${r.long_tokens_per_s != null ? `Long answers: ${r.long_tokens_per_s} tokens/s. ` : ""}${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
   return `<h3>vLLM self-test</h3><p class="dim small">Runs the research report's experiment for you: checks the driver and that a container can use the graphics card, starts the engine on a model, waits for it, asks the Quick thinking suite with 40 questions at once, measures start-up time and tokens per second, compares with your saved standard-engine numbers, stops the engine and writes a report with a plain verdict. A first run downloads the engine's image and the model.</p>
     <div class="row"><label>Model folder or Hugging Face id <input type="text" id="vl-tmodel" value="${esc(vl.model)}" placeholder="${esc(v.teacher_repo || "")}" style="min-width:320px"></label>
+      <span class="dim small">Empty = the default, ${esc(v.teacher_repo || "the configured pre-quantized original")} (about 21 GB, 4-bit). A 16-bit model larger than the card is refused before anything starts.</span>
       <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
     <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
-    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}`;
+    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}${vllmFilesBox(vl.files, "vl-files", "The report is saved in:")}`;
+}
+// the report's folder as text, with Copy path / Open the folder / Copy the whole report, and the text inline (also after a failure): the owner must be able to paste it into an issue
+function vllmFilesBox(files, id, title) {
+  if (!files || !(files.exists || files.dir)) return "";
+  const dir = files.dir || "", text = files.markdown || files.text || "";
+  return `<div class="card-in" id="${id}"><p class="small">${esc(title)} <code class="vl-path" data-path>${esc(dir)}</code>
+    <button class="secondary" data-vlcopy="${esc(dir)}">Copy path</button><button class="secondary" data-vlopen="${esc(dir)}">Open the folder</button>${text ? `<button class="secondary" data-vlcopy-text="${id}">Copy the whole report</button>` : ""}</p>
+    ${text ? `<details ${files.open === false ? "" : "open"}><summary class="small">The report (text)</summary><pre class="vl-report small" id="${id}-text" style="white-space:pre-wrap;max-height:28em;overflow:auto">${esc(text)}</pre></details>` : `<p class="dim small">No report file yet.</p>`}</div>`;
+}
+function wireVllmFiles() {
+  document.querySelectorAll("[data-vlcopy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.vlcopy); b.textContent = "Copied"; } catch (_) { b.textContent = "Select the path and copy by hand"; } });
+  document.querySelectorAll("[data-vlcopy-text]").forEach((b) => b.onclick = async () => { const e = $(b.dataset.vlcopyText + "-text"); try { await navigator.clipboard.writeText(e ? e.textContent : ""); b.textContent = "Copied"; } catch (_) { b.textContent = "Select the text and copy by hand"; } });
+  document.querySelectorAll("[data-vlopen]").forEach((b) => b.onclick = async () => { try { await invoke("imatrix_open_folder", { path: b.dataset.vlopen }); } catch (e) { b.textContent = String(e).slice(0, 120); } });
 }
 async function vllmLoadReport() {
   vl.report = null;
   try { vl.report = await invoke("vllm_selftest_report"); } catch (_) { vl.report = null; }
+  try { vl.files = await invoke("vllm_selftest_files"); } catch (_) { vl.files = null; }
   try { render(); } catch (_) { /* a preview without a window */ }
 }
 function onVllmEvent(p) {
@@ -2127,6 +2142,7 @@ function wireVllm() {
     try { setState(await invoke("vllm_set", { vllm: v })); vl.err = null; vl.saved = "Saved."; } catch (e) { vl.err = String(e); vl.saved = null; }
     render();
   };
+  wireVllmFiles();
   const dt = $("vl-detect"); if (dt) dt.onclick = vllmDetect;
   const tm = $("vl-tmodel"); if (tm) tm.onchange = () => { vl.model = tm.value.trim(); };
   const ta = $("vl-tadapter"); if (ta) ta.onchange = () => { vl.adapter = ta.value.trim(); };
@@ -2574,7 +2590,7 @@ function hlVllmBox(sp, est, busy) {
     html += (v.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("");
     html += `<details><summary class="small">Where these numbers come from</summary><ul class="small dim">${(v.basis || []).map((b) => `<li>${esc(b)}</li>`).join("")}</ul></details>`;
   }
-  html += verdict;
+  html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
   const running = vch.run !== null;
   html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
@@ -4138,6 +4154,7 @@ function wireReshape() {
   // healing
   const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); rsHealEstimate(); }; };
   hv("hl-vllm", (e) => { hs.vllm = e.checked; });
+  wireVllmFiles();
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });

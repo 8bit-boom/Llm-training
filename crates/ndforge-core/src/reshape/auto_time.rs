@@ -286,7 +286,7 @@ fn min_of(m: Min) -> R {
 impl Vx<'_> {
     fn check_times(&self, hf: R, b: f64, quick: bool) -> (Min, Min, Min) {
         let ratio = auto_plan::think_check_only_minutes(b, false) / auto_plan::think_check_only_minutes(b, true).max(1e-9);
-        let (gen, st) = (vllm_plan::check_generation(&self.n, quick, ratio), vllm_plan::startup(&self.n));
+        let (gen, st) = (vllm_plan::check_generation(&self.n, quick, ratio, b), vllm_plan::startup(&self.n, b));
         let _ = hf;
         (st, gen, Min { lo: st.lo + gen.lo, hi: st.hi + gen.hi, measured: st.measured && gen.measured })
     }
@@ -318,14 +318,14 @@ impl Vx<'_> {
     }
 
     /// The original's answers of a heal: `parts` is `heal_parts`' list. vLLM replaces the original's load and the answers by its own start-up and scoring when it is chosen.
-    fn heal(&mut self, key: &str, parts: Vec<P>, tokens_m: u32, rounds: bool) -> Vec<P> {
+    fn heal(&mut self, key: &str, parts: Vec<P>, tokens_m: u32, rounds: bool, teacher_b: f64) -> Vec<P> {
         let mode = vllm_plan::mode_of(self.spec.vllm.as_ref(), "teacher_cache");
         let Some(i) = parts.iter().position(|x| x.id == "cache" && x.r.hi > 0.0) else { return parts };
         if mode == "off" {
             return parts;
         }
         let std_min = parts.iter().filter(|x| x.id == "cache" || (x.id == "load" && x.label.starts_with("load the original"))).fold((0.0, 0.0), |a, x| (a.0 + x.r.lo, a.1 + x.r.hi));
-        let (st, sc) = (vllm_plan::startup(&self.n), vllm_plan::scoring(&self.n, tokens_m as f64));
+        let (st, sc) = (vllm_plan::startup(&self.n, teacher_b), vllm_plan::scoring(&self.n, tokens_m as f64));
         let v = Min { lo: st.lo + sc.lo, hi: st.hi + sc.hi, measured: st.measured && sc.measured };
         let blocked = rounds.then_some("a heal in rounds starts the engine again for every round's chunk, so Auto-cut keeps the standard engine there.");
         let d = vllm_plan::decide(key, "teacher_cache", mode, std_min, v, blocked);
@@ -613,7 +613,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
             first_check_m: ro.first_check(g.tokens_m), check_quick: ro.quick(), final_quick: spec.think_quick(), thinking,
         });
         let (parts, mut note) = heal_parts(h, ins, plan, g, g.tokens_m, g.tokens_m - reuse);
-        let parts = if g.mode == "cache" && g.tokens_m > reuse { vx.heal(&format!("s{n}.heal:cache"), parts, g.tokens_m - reuse, rin.is_some()) } else { parts };
+        let parts = if g.mode == "cache" && g.tokens_m > reuse { vx.heal(&format!("s{n}.heal:cache"), parts, g.tokens_m - reuse, rin.is_some(), ob) } else { parts };
         if reuse > 0 {
             let from = saved.iter().find(|(_, sq, ld, tk)| *sq == g.seq && *ld == g.teacher_load && *tk == same).map(|x| x.0 + 1).unwrap_or(1);
             note = Some(format!("The original's answers for the first {reuse} M tokens were written by stage {from} on the same sequence length ({}): they are not written again.", g.seq));
@@ -738,7 +738,7 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
         notes.push("The card holds the original and the student together in a stage: no saved answers, the original answers while the student learns.".to_string());
     }
     let vllm = spec.vllm.as_ref().filter(|a| a.any()).map(|_| {
-        let mut notes = vllm_plan::basis_notes(&vx.n);
+        let mut notes = vllm_plan::basis_notes(&vx.n, ob);
         notes.push("Experimental: built from a research report. A step that cannot use vLLM (it is missing, the card is busy, the teacher check says \"different\") falls back to the standard engine and the run goes on.".into());
         if spec.keep_thinking && !vx.dec.iter().any(|d| d.kind == "checks") {
             notes.push("This run has no thinking check that could use vLLM.".into());

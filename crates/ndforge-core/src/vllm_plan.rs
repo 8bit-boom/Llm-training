@@ -15,6 +15,14 @@ pub const KEY_STARTUP: &str = "vllm_startup_s";
 pub const KEY_QUICK_WALL: &str = "vllm_quick_wall_s";
 pub const KEY_GEN_TPS: &str = "vllm_gen_tok_s";
 pub const KEY_SCORE_TPS: &str = "vllm_score_tok_s";
+/// the size (billions of parameters) of the model the self-test measured: its numbers are for THAT model
+pub const KEY_MODEL_B: &str = "vllm_model_b";
+/// decode speed measured on LONG answers (thinking-like length): the only generation speed the estimates use; the short-answer speed of the Quick suite is never used for a thinking check
+pub const KEY_LONG_TPS: &str = "vllm_long_tok_s";
+/// Tokens a Quick thinking check writes (16 thinking answers of about 1,800 tokens and the controls): an assumption, used with the long-answer speed when no suite wall time of long answers exists.
+pub const QUICK_CHECK_TOKENS: f64 = 30_000.0;
+/// Self-test numbers are used for another model only up to this size ratio (either way); beyond it the report's formulas are used and the plan says so.
+pub const MAX_SIZE_RATIO: f64 = 2.0;
 
 /// The research report's scoring speed of the teacher's answers on one RTX 5090 (tokens per second, low and high): an estimate, not measured here.
 pub const REPORT_SCORE_TPS: (f64, f64) = (3000.0, 3800.0);
@@ -58,17 +66,23 @@ pub struct Numbers {
     pub gen_tps: Option<f64>,
     /// scoring tokens per second (teacher check)
     pub score_tps: Option<f64>,
+    /// billions of parameters of the model the self-test ran (None: an older report that does not say: its numbers are then NOT used)
+    #[serde(default)]
+    pub model_b: Option<f64>,
+    /// decode tokens per second on long answers (self-test, 8 requests of 2,048 tokens)
+    #[serde(default)]
+    pub long_tps: Option<f64>,
 }
 
 impl Numbers {
     pub fn from_history(h: &History) -> Numbers {
         let pick = |k: &str| h.pick(k, 1.0).map(|x| x.0);
-        Numbers { startup_s: pick(KEY_STARTUP), quick_wall_s: pick(KEY_QUICK_WALL), gen_tps: pick(KEY_GEN_TPS), score_tps: pick(KEY_SCORE_TPS) }
+        Numbers { startup_s: pick(KEY_STARTUP), quick_wall_s: pick(KEY_QUICK_WALL), gen_tps: pick(KEY_GEN_TPS), score_tps: pick(KEY_SCORE_TPS), model_b: pick(KEY_MODEL_B), long_tps: pick(KEY_LONG_TPS) }
     }
 
     /// Writes the numbers into a History (the form `vllm::history_with_measured` uses).
     pub fn push_into(&self, h: &mut History) {
-        for (k, v) in [(KEY_STARTUP, self.startup_s), (KEY_QUICK_WALL, self.quick_wall_s), (KEY_GEN_TPS, self.gen_tps), (KEY_SCORE_TPS, self.score_tps)] {
+        for (k, v) in [(KEY_STARTUP, self.startup_s), (KEY_QUICK_WALL, self.quick_wall_s), (KEY_GEN_TPS, self.gen_tps), (KEY_SCORE_TPS, self.score_tps), (KEY_MODEL_B, self.model_b), (KEY_LONG_TPS, self.long_tps)] {
             if let Some(v) = v {
                 h.push(k, 1.0, v);
             }
@@ -89,11 +103,19 @@ fn measured(minutes: f64) -> Min {
     Min { lo: minutes * SPREAD.0, hi: minutes * SPREAD.1, measured: true }
 }
 
-/// Minutes for the engine to start (container, model load, graph capture), once.
-pub fn startup(n: &Numbers) -> Min {
-    match n.startup_s {
-        Some(s) => measured(s / 60.0),
-        None => Min { lo: REPORT_STARTUP_MIN.0, hi: REPORT_STARTUP_MIN.1, measured: false },
+/// How the self-test's numbers carry over to a model of `b` billion parameters: `Some(ratio)` (first-order rule: start-up follows the model's bytes, generation time follows the parameters),
+/// None when the self-test's model is unknown or differs by more than 2 times (the report's formulas are used then).
+pub fn size_ratio(n: &Numbers, b: f64) -> Option<f64> {
+    let m = n.model_b.filter(|m| *m > 0.0)?;
+    let r = b / m;
+    (b > 0.0 && (1.0 / MAX_SIZE_RATIO..=MAX_SIZE_RATIO).contains(&r)).then_some(r)
+}
+
+/// Minutes for the engine to start (container, model load, graph capture), once, for a model of `b` billion parameters.
+pub fn startup(n: &Numbers, b: f64) -> Min {
+    match (n.startup_s, size_ratio(n, b)) {
+        (Some(s), Some(r)) => measured(s / 60.0 * r),
+        _ => Min { lo: REPORT_STARTUP_MIN.0, hi: REPORT_STARTUP_MIN.1, measured: false },
     }
 }
 
@@ -107,14 +129,14 @@ pub fn scoring(n: &Numbers, tokens_m: f64) -> Min {
 }
 
 /// Minutes of the generation of one thinking check on the running engine (without its start-up). The self-test's Quick suite is the measurement; a Full check is `full_over_quick` times it.
-pub fn check_generation(n: &Numbers, quick: bool, full_over_quick: f64) -> Min {
+pub fn check_generation(n: &Numbers, quick: bool, full_over_quick: f64, b: f64) -> Min {
     let f = if quick { 1.0 } else { full_over_quick.max(1.0) };
-    match n.quick_wall_s {
-        Some(w) => {
-            let m = measured(w / 60.0 * f);
+    match (n.quick_wall_s.or(n.long_tps.filter(|t| *t > 0.0).map(|t| QUICK_CHECK_TOKENS / t)), size_ratio(n, b)) {
+        (Some(w), Some(r)) => {
+            let m = measured(w / 60.0 * f * r);
             Min { lo: m.lo, hi: m.hi, measured: true }
         }
-        None => Min { lo: REPORT_QUICK_GEN_MIN.0 * f, hi: REPORT_QUICK_GEN_MIN.1 * f, measured: false },
+        _ => Min { lo: REPORT_QUICK_GEN_MIN.0 * f, hi: REPORT_QUICK_GEN_MIN.1 * f, measured: false },
     }
 }
 
@@ -199,20 +221,24 @@ impl VllmPlan {
     }
 }
 
-/// The sentences about what the numbers are (the window shows them under the switches).
-pub fn basis_notes(n: &Numbers) -> Vec<String> {
+/// The sentences about what the numbers are (the window shows them under the switches). `b`: the size of the model the step would run.
+pub fn basis_notes(n: &Numbers, b: f64) -> Vec<String> {
     let mut v = Vec::new();
-    match n.startup_s {
-        Some(s) => v.push(format!("The engine's start-up is {:.1} minutes: measured by your own vLLM self-test.", s / 60.0)),
-        None => v.push("The engine's start-up was not measured on this PC (run the vLLM self-test): the report says 2 to 5 minutes, a real PC took 8.5, so the estimate is a wide range.".into()),
+    match (n.startup_s, n.model_b, size_ratio(n, b)) {
+        (Some(s), Some(m), Some(r)) => v.push(format!("Your vLLM self-test measured the engine's start-up at {:.1} minutes on a {m:.0} B model; for this {b:.0} B model that is scaled to about {:.1} minutes by size (a first-order estimate: start-up follows the model's size).", s / 60.0, s / 60.0 * r)),
+        (Some(s), Some(m), None) => v.push(format!("Your vLLM self-test measured {:.1} minutes of start-up on a {m:.0} B model, which is more than 2 times different from this {b:.0} B model: those numbers are NOT used here, the research report's estimates are.", s / 60.0)),
+        (Some(s), None, _) => v.push(format!("Your vLLM self-test measured {:.1} minutes of start-up, but its report does not say which model it ran (an older report): those numbers are NOT used. Run the self-test again.", s / 60.0)),
+        _ => v.push("The engine's start-up was not measured on this PC (run the vLLM self-test): the report says 2 to 5 minutes, a real PC took 8.5 for a 9 B model, so the estimate is a wide range.".into()),
     }
     match n.score_tps {
-        Some(s) => v.push(format!("Scoring speed {:.0} tokens per second: measured by your own teacher check.", s)),
+        Some(s) => v.push(format!("Scoring speed {s:.0} tokens per second: measured by your own teacher check.")),
         None => v.push(format!("Scoring speed {:.0} to {:.0} tokens per second: the research report's estimate, NOT measured on this PC (run \"Check the vLLM teacher\"). The self-test's generation speed{} is a different job and is not used for it.",
                                REPORT_SCORE_TPS.0, REPORT_SCORE_TPS.1, n.gen_tps.map(|g| format!(" ({g:.0} tokens per second)")).unwrap_or_default())),
     }
-    if n.quick_wall_s.is_none() {
-        v.push("A thinking check's time on vLLM was not measured on this PC either (the self-test's Quick suite is the measurement).".into());
+    match (n.quick_wall_s, n.long_tps) {
+        (Some(_), _) => {}
+        (None, Some(t)) => v.push(format!("A thinking check's generation time is estimated from your self-test's speed on LONG answers ({t:.0} tokens per second) and an assumed {QUICK_CHECK_TOKENS:.0} tokens for a Quick check: an estimate. The short-answer speed of the Quick suite is not used (short answers overstate it).")),
+        (None, None) => v.push("A thinking check's time on vLLM was not measured on this PC (the self-test's long-answer speed is the measurement; a self-test that only had short answers is not used for it).".into()),
     }
     v
 }

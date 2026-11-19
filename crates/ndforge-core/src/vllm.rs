@@ -382,9 +382,14 @@ pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path
 pub fn measured_numbers(selftest: &Value, checks: &[Value]) -> crate::vllm_plan::Numbers {
     let f = |v: &Value| v.as_f64().filter(|x| x.is_finite() && *x > 0.0);
     let ok = !matches!(selftest["verdict"].as_str(), Some("fail" | "stopped")) || f(&selftest["startup_seconds"]).is_some();
+    // the size of the model the self-test ran (the report's `model_params_b`, else `model_info.params_b`): the numbers are for that model
+    let model_b = f(&selftest["model_params_b"]).or_else(|| f(&selftest["model_info"]["params_b"]));
     crate::vllm_plan::Numbers {
+        model_b,
         startup_s: ok.then(|| f(&selftest["startup_seconds"])).flatten(),
-        quick_wall_s: ok.then(|| f(&selftest["wall_seconds"])).flatten(),
+        // the Quick suite's wall time only when its answers were thinking-long; short answers (a model that did not think) say nothing about a real check
+        quick_wall_s: ok.then(|| f(&selftest["wall_seconds"])).flatten().filter(|_| selftest["short_answers"] != true && !selftest["answer_tokens"].is_null()),
+        long_tps: ok.then(|| f(&selftest["long_tokens_per_s"])).flatten(),
         gen_tps: ok.then(|| f(&selftest["tokens_per_s"])).flatten(),
         score_tps: checks.iter().find_map(|c| f(&c["vllm"]["tokens_per_s"])),
     }
@@ -426,4 +431,21 @@ pub fn stop_leftovers(s: &VllmSettings, run: Runner) -> Vec<String> {
         let _ = call(&["rm", "-f", n]);
     }
     found
+}
+
+
+/// Where the self-test's report is and what it says, for the card: `{"dir": the exact folder as text, "json", "md", "markdown": the report text or null, "exists": bool}`. The folder is
+/// `<config folder>/vllm_selftest` (on Windows `%APPDATA%\\NDLoreForge\\vllm_selftest`: Roaming, which is not obvious, so the card shows the path and can open it).
+pub fn selftest_files() -> Value {
+    let dir = selftest_dir();
+    let md = dir.join("vllm_selftest.md");
+    let text = std::fs::read_to_string(&md).ok();
+    json!({"dir": dir.display().to_string(), "json": dir.join("vllm_selftest.json").display().to_string(), "md": md.display().to_string(), "markdown": text, "exists": text.is_some()})
+}
+
+/// The same for the saved check of the vLLM teacher of a made model: `{"dir", "file", "text": the file as pretty JSON or null, "exists"}`.
+pub fn teacher_check_files(model_dir: &std::path::Path) -> Value {
+    let f = teacher_check_file(model_dir);
+    let text = std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| serde_json::to_string_pretty(&v).ok());
+    json!({"dir": model_dir.display().to_string(), "file": f.display().to_string(), "text": text, "exists": text.is_some()})
 }

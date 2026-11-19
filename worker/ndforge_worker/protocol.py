@@ -48,6 +48,23 @@ def scrub(text):
     return text.replace(tok, "[token]") if len(tok) >= 8 else text
 
 
+_USER_DIR = re.compile(r"(?i)([A-Z]:[\\/]+Users[\\/]+)[^\\/\s\"']+|(/home/|/Users/)[^/\s\"']+")
+
+
+def redact_user(text):
+    """Takes the person's home folder and user name out of a text that leaves the program in a report (`C:\\Users\\<name>\\...` -> `C:\\Users\\<user>\\...`, the home folder -> `~`)."""
+    if not isinstance(text, str):
+        return text
+    home = os.path.expanduser("~")
+    if len(home) > 3 and home not in ("/", "/root"):
+        text = text.replace(home, "~").replace(home.replace("\\", "\\\\"), "~")
+    text = _USER_DIR.sub(lambda m: (m.group(1) or m.group(2)) + "<user>", text)
+    name = (os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
+    if len(name) >= 3 and name.lower() not in ("root", "user", "admin"):
+        text = re.sub(re.escape(name), "<user>", text, flags=re.I)
+    return text
+
+
 def emit(kind: str, **fields) -> None:
     if kind in ("log", "error"):
         fields = {k: scrub(v) if k in ("text", "message") else v for k, v in fields.items()}

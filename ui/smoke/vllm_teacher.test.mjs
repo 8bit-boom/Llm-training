@@ -89,3 +89,28 @@ test("the check button starts the worker job and a running check shows its progr
   assert.match(html, /<progress max="1" value="0.4">/);
   assert.match(html, /id="hl-vllm-check" disabled/);
 });
+
+test("the self-test card shows the report inline (also after a failure), the folder as text and the copy / open buttons", () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState(on) });
+  b.run(`state = ${JSON.stringify(baseState(on))}`);
+  b.run(`vl.report = { verdict: "fail", verdict_text: "The engine did not become ready.", criteria: [], answer_tokens: { median: 80 }, long_tokens_per_s: 210.5 };
+         vl.files = { exists: true, dir: "C:\\\\Users\\\\<user>\\\\AppData\\\\Roaming\\\\NDLoreForge\\\\vllm_selftest", markdown: "# vLLM self-test\\n**FAIL**: not ready\\nCUDA out of memory" }`);
+  const html = b.run("renderVllm()");
+  assert.match(html, /The report is saved in:/);
+  assert.match(html, /<code class="vl-path" data-path>C:\\Users\\&lt;user&gt;\\AppData\\Roaming\\NDLoreForge\\vllm_selftest<\/code>/);
+  assert.match(html, /data-vlcopy="C:/); assert.match(html, /Open the folder/); assert.match(html, /Copy the whole report/);
+  assert.match(html, /<details open><summary class="small">The report \(text\)<\/summary><pre class="vl-report small" id="vl-files-text"[^>]*>[^<]*CUDA out of memory/);
+  assert.match(html, /Answers: median 80 tokens\. Long answers: 210\.5 tokens\/s\./);
+  assert.match(html, /Empty = the default, the configured pre-quantized original \(about 21 GB, 4-bit\)/);
+});
+
+test("the teacher check card shows its file path and text", () => {
+  const files = { exists: true, dir: "/p/models/slim-w", file: "/p/models/slim-w/vllm_teacher_check.json", text: "{\n \"verdict\": \"close\"\n}" };
+  const b = open(on, vt({ files, check: { verdict: "close", current: true, text: "Close." } }));
+  b.run("rs.hlSpec.vllm = true");
+  const html = b.run("renderReshape()");
+  assert.match(html, /The check is saved in:/);
+  assert.match(html, /\/p\/models\/slim-w/);
+  assert.match(html, /id="hl-vllm-files-text"[^>]*>[^<]*&quot;verdict&quot;: &quot;close&quot;/);
+  assert.match(html, /Open the folder/);
+});

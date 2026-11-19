@@ -97,7 +97,7 @@ def wanted(job: dict) -> bool:
 # ------------------------------------------------------------------------------------------------------------------------ commands (cp_in, cp_out, exec)
 
 EXEC_DEFAULTS = {"cp_in": "{docker} cp {src} {name}:{dst}", "cp_out": "{docker} cp {name}:{src} {dst}", "exec": "{docker} exec {name} {args}",
-                 "run_idle": "{docker} run -d --rm --gpus all --ipc=host --name {name} {mounts} --entrypoint sleep {image} infinity"}
+                 "run_idle": "{docker} run -d --gpus all --ipc=host --name {name} {mounts} --entrypoint sleep {image} infinity"}
 WSL_DEFAULTS = {"cp_in": "{wsl} cp {src} {dst}", "cp_out": "{wsl} cp {src} {dst}", "exec": "{wsl} {args}"}       # kind "wsl": no container, plain commands in the distro
 
 

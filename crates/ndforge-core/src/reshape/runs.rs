@@ -1950,6 +1950,7 @@ pub fn heal_estimate(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f
     let st = crate::settings::Settings::load().vllm;
     let check = crate::vllm::read_teacher_check(&dir, &st, &o.teacher);
     out["vllm_teacher"] = vllm_teacher_estimate(&o, spec, &crate::vllm::history_with_measured(crate::timing::History::default(), Some(p)), &st, Some(&check));
+    out["vllm_teacher"]["files"] = crate::vllm::teacher_check_files(&dir);
     Ok(out)
 }
 
@@ -1980,7 +1981,7 @@ pub fn vllm_teacher_estimate(o: &heal_source::Origin, spec: &HealSpec, h: &crate
         None => spec.tokens() as f64 / 1e6,
     };
     let std_min = super::auto_time::cache_minutes(&crate::timing::History::default(), o.teacher_b, tokens_m);
-    let start = vp::startup(&n);
+    let start = vp::startup(&n, o.teacher_b);
     let score = vp::scoring(&n, tokens_m);
     let starts = spec.rounds.as_ref().map(|r| (r.cap_tokens(spec) as f64 / r.round_tokens().max(1) as f64).ceil().max(1.0)).unwrap_or(1.0);
     let vllm = (start.lo * starts + score.lo, start.hi * starts + score.hi);
@@ -2008,7 +2009,7 @@ pub fn vllm_teacher_estimate(o: &heal_source::Origin, spec: &HealSpec, h: &crate
     }
     json!({"asked": spec.vllm_teacher(), "settings_on": s.enabled && s.teacher.enabled, "route": route, "identity": crate::vllm::teacher_identity(s, &o.teacher), "tokens_m": tokens_m,
            "standard_min": [std_min.0.round(), std_min.1.round()], "vllm_min": [vllm.0.round(), vllm.1.round()], "startup_min": [(start.lo * 10.0).round() / 10.0, (start.hi * 10.0).round() / 10.0],
-           "startup_measured": start.measured, "scoring_measured": score.measured, "engine_starts": starts, "faster": better, "text": text, "warnings": warnings, "basis": vp::basis_notes(&n),
+           "startup_measured": start.measured, "scoring_measured": score.measured, "engine_starts": starts, "faster": better, "text": text, "warnings": warnings, "basis": vp::basis_notes(&n, o.teacher_b),
            "check": check.cloned().unwrap_or(Value::Null), "required": s.teacher.required})
 }
 

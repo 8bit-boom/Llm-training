@@ -5,7 +5,7 @@
     the self-test (job `think_check` with backend "vllm", or the Settings card "vLLM self-test") shows something different.
 
 Five ways to have a server (`engine["kind"]`; "auto" tries docker, docker_wsl, wslc, wsl in that order and takes the first that answers):
-    docker      `docker run --rm --gpus all --ipc=host -p 127.0.0.1:<port>:8000 --name ndforge-vllm-<port> <image> <vllm flags>` (Windows docker.exe / Docker Desktop)
+    docker      `docker run --gpus all --ipc=host -p 127.0.0.1:<port>:8000 --name ndforge-vllm-<port> <image> <vllm flags>` (Windows docker.exe / Docker Desktop)
     docker_wsl  the same `docker ...` commands, each run as `wsl.exe [-d <distro>] -- docker ...` (a Docker engine installed INSIDE WSL; Linux paths, `C:` drive paths -> `/mnt/c/...`)
     wsl         `wsl.exe -d <distro> -- <venv>/bin/vllm serve <model> <vllm flags>` (Windows paths become /mnt/<drive>/...)
     wslc        WSLc, the container command of WSL 3.x (`wslc run ...`): options from the owner's `wslc --help`, the combination untested, the command lines are TEMPLATES the owner can edit (WSLC_TEMPLATES)
@@ -49,22 +49,24 @@ DEFAULT_GPU_UTIL = 0.88
 DEFAULT_LORA_RANK = 64
 DEFAULT_START_TIMEOUT = 1500                            # seconds: image pull + model load + graph capture; the report expects 2-5 minutes
 STOP_TIMEOUT = 60
+STATE_EVERY = 3.0                                       # seconds between two looks at whether the container still runs while the engine starts
 KINDS = ("docker", "docker_wsl", "wslc", "wsl", "url")
 # WSLc (WSL 3.x containers). The options below are "from the owner's `wslc --help` / `wslc run --help` (3.0.x)"; the COMBINATION is UNTESTED, and the syntax of `wslc stop`, `wslc remove`,
 # `wslc volume ...` is not yet seen. So every command line is a TEMPLATE the owner can edit (engine["wslc"] = {"run": ..., "stop": ..., ...}). wslc has no `--ipc`: the shared memory
 # vLLM needs is `--shm-size`. Whether `-p 127.0.0.1:<port>:8000` is accepted (loopback only) is UNKNOWN: the default publishes `<port>:8000`, which may be reachable from the network,
 # which is one reason the engine always starts vLLM with a per-run API key (`--api-key`).
-WSLC_TEMPLATES = {"run": "wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}",
-                  "stop": "wslc stop {name}", "remove": "wslc remove {name}", "logs": "wslc logs {name}", "list": "wslc list", "pull": "wslc pull {image}",
+WSLC_TEMPLATES = {"run": "wslc run -d --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}",
+                  "stop": "wslc stop -t 30 {name}", "remove": "wslc remove -f {name}", "logs": "wslc logs -n 60 {name}", "inspect": "wslc list -a --format json",          # inspect: GUESS (docker-like), used to see that the container still runs
+                   "list": "wslc list", "pull": "wslc pull -q {image}",
                   "gputest": "wslc run --rm {gpu_flag} {test_image} nvidia-smi",
                   "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04",
                   # GUESS (docker-like; the syntax of `wslc cp` / `wslc exec` is NOT yet seen: the self-test captures `wslc cp --help` and `wslc exec --help`). Used by the teacher cache (vllmcache.py).
                   "cp_in": "wslc cp {src} {name}:{dst}", "cp_out": "wslc cp {name}:{src} {dst}", "exec": "wslc exec {name} {args}",
-                  "run_idle": "wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -v {model_dir}:/models {env} --entrypoint sleep {image} infinity"}
+                  "run_idle": "wslc run -d --name {name} {gpu_flag} --shm-size {shm} -v {model_dir}:/models {env} --entrypoint sleep {image} infinity"}
 WSLC_HELP_COMMANDS = (["wslc", "--version"], ["wslc", "info"], ["wslc", "--help"], ["wslc", "run", "--help"], ["wslc", "system", "--help"], ["wslc", "container", "--help"],
                       ["wslc", "stop", "--help"], ["wslc", "remove", "--help"], ["wslc", "list", "--help"], ["wslc", "logs", "--help"], ["wslc", "pull", "--help"],
                       ["wslc", "volume", "--help"], ["wslc", "volume", "create", "--help"], ["wslc", "network", "--help"], ["wslc", "registry", "--help"],
-                      ["wslc", "cp", "--help"], ["wslc", "exec", "--help"])
+                      ["wslc", "cp", "--help"], ["wslc", "exec", "--help"], ["wslc", "image", "--help"], ["wslc", "list", "-a", "--format", "json"])
 HELP_LIMIT = 8000
 KIND_NAMES = {"docker": "Docker Desktop", "docker_wsl": "Docker inside WSL", "wslc": "WSLc (WSL 3.x containers)"}
 MIN_WSL = (2, 7, 3)                                     # from the research report (the CUDA-graph crash fix); newer, 3.x included, is assumed fine
@@ -173,6 +175,31 @@ def wslc_templates(cfg: dict) -> dict:
     return {**WSLC_TEMPLATES, **{k: v for k, v in (cfg.get("wslc") or {}).items() if k in WSLC_TEMPLATES}}
 
 
+def wslc_running(text: str, name: str):
+    """True / False / None from the output of `wslc list -a --format json` (the field names are UNKNOWN: read defensively, the self-test report shows one real sample): the container is looked for by
+    name in every string of the list; found with a state word -> running or not; not in the list -> False; no list could be read -> None."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    name = name.lower()
+    for it in items:
+        flat = json.dumps(it).lower()
+        if name not in flat:
+            continue
+        states = []
+        if isinstance(it, dict):
+            states = [str(v).lower() for k, v in it.items() if str(k).lower() in ("state", "status", "running") and not isinstance(v, (dict, list))]
+        joined = " ".join(states)
+        if "running" in joined or joined.strip() == "true" or joined.startswith("up"):
+            return True
+        if any(w in joined for w in ("exited", "stopped", "dead", "created", "false", "terminated")):
+            return False
+        return None
+    return False if items or text.strip() in ("[]", "") else None
+
+
 def wslc_help(limit: int = HELP_LIMIT) -> dict:
     """Runs and CAPTURES (verbatim, size-limited) the help of `wslc` for the self-test report ("wslc help (for adapting the templates)"); {} when `wslc` is not on the PATH.
     {"<command line>": {"returncode": n, "output": "..."}}."""
@@ -274,7 +301,7 @@ def container_name(port: int) -> str:
 
 def docker_command(cfg: dict, port: int, args: list, *, mounts: list | None = None) -> list:
     """`docker run` for the pinned image. `mounts`: [(host path or named volume, container path, "ro"|"rw")]. The Hub cache is a NAMED volume (a Windows bind mount is slow)."""
-    cmd = docker_prefix(cfg) + ["run", "--rm", "--gpus", "all", "--ipc=host", "--name", container_name(port), "-p", f"127.0.0.1:{int(port)}:8000"]
+    cmd = docker_prefix(cfg) + ["run", "--gpus", "all", "--ipc=host", "--name", container_name(port), "-p", f"127.0.0.1:{int(port)}:8000"]
     for src, dst, mode in mounts or []:
         cmd += ["-v", f"{src}:{dst}:{mode}"]
     return cmd + [cfg["image"]] + list(args)
@@ -350,6 +377,7 @@ class Engine:
         self.started_at = None
         self.ready_seconds = None
         self.stopped = False
+        self.exit_logs = ""
         self.commands: list = []
         self.api_key = str(cfg.get("api_key") or "") if self.kind == "url" else secrets.token_urlsafe(24)   # a started server gets a fresh key every run
         protocol.add_secret(self.api_key)
@@ -421,14 +449,71 @@ class Engine:
         except (OSError, ValueError):
             return ""
 
+    # --- is the container still there? (no --rm: a container that crashed at start stays, so its logs can be read before it is removed explicitly in `stop`)
+    def state_command(self):
+        if self.kind in ("docker", "docker_wsl"):
+            return docker_prefix(self.cfg) + ["inspect", "-f", "{{.State.Running}}", container_name(self.port)]
+        if self.kind == "wslc":
+            return render_template(wslc_templates(self.cfg)["inspect"], wslc_values(self.cfg, self.port, "", []))
+        return None
+
+    def running(self):
+        """True / False / None (unknown): asks the container's state. "not found", "exited" and a false `Running` are False (WSLC_E_CONTAINER_NOT_FOUND included)."""
+        cmd = self.state_command()
+        if not cmd or not self.port:
+            return None
+        try:
+            r = _run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=20, **_win_kw())
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r is None:
+            return None
+        text = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace").replace("\x00", "").lower()
+        if self.kind == "wslc":
+            return wslc_running(text, container_name(self.port))
+        if "container_not_found" in text or "no such" in text or "not found" in text:
+            return False
+        if re.search(r'"running"\s*:\s*true|^\s*true\s*$|status"?\s*[:=]\s*"?running', text, re.M):
+            return True
+        if re.search(r'"running"\s*:\s*false|^\s*false\s*$|exited|"status"\s*:\s*"(exited|dead|created)"', text, re.M):
+            return False
+        return None
+
+    def logs_tail(self, n: int = 60) -> str:
+        """The last lines of the container's log, read BEFORE it is removed (the engine's own log for the other kinds)."""
+        cmd = None
+        if self.kind in ("docker", "docker_wsl") and self.port:
+            cmd = docker_prefix(self.cfg) + ["logs", "--tail", str(n), container_name(self.port)]
+        elif self.kind == "wslc" and self.port:
+            try:
+                cmd = render_template(wslc_templates(self.cfg)["logs"], wslc_values(self.cfg, self.port, "", []))
+            except EngineError:
+                cmd = None
+        if cmd:
+            try:
+                r = _run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=30, **_win_kw())
+                text = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace").replace("\x00", "")
+                if text.strip() and "container_not_found" not in text.lower():
+                    return protocol.scrub("\n".join(text.strip().splitlines()[-n:]))
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                pass
+        return self.tail(n)
+
     def tail(self, n: int = 12) -> str:
         return protocol.scrub("\n".join(self.log_text().strip().splitlines()[-n:]))
 
     def wait_ready(self, timeout: float, should_stop=lambda: False, sleep=time.sleep) -> None:
         deadline = time.monotonic() + timeout
+        next_state = time.monotonic() + STATE_EVERY
         while True:
+            if self.proc is not None and self.state_command() and time.monotonic() >= next_state:
+                next_state = time.monotonic() + STATE_EVERY
+                if self.running() is False:          # a crash at start (out of memory, a bad option): do not wait for the timeout
+                    self.exit_logs = self.logs_tail(60)
+                    raise EngineError(f"The vLLM engine's container is not running any more (it stopped while starting). Its last lines: {self.exit_logs}")
             if self.proc is not None and self.proc.poll() is not None and not (self.kind == "wslc" and self.proc.returncode == 0):     # `wslc run -d` ends at once, fine
-                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). Its last lines: {self.tail()}")
+                self.exit_logs = self.logs_tail(60)
+                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). Its last lines: {self.exit_logs}")
             if should_stop():
                 return
             try:
@@ -439,7 +524,8 @@ class Engine:
             except (urllib.error.URLError, OSError):
                 pass                                        # not listening yet
             if time.monotonic() > deadline:
-                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). Its last lines: {self.tail()}")
+                self.exit_logs = self.logs_tail(60)
+                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). Its last lines: {self.exit_logs}")
             sleep(0.25)
 
     def server_version(self) -> str:
