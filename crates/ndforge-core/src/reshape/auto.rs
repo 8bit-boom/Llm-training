@@ -15,6 +15,7 @@ use super::auto_speed;
 use super::auto_plan::{self, AutoPlan, AutoSpec, Candidate, StagePlan};
 use super::plan::{Inspect, ReasoningCalib, ReshapeSpec};
 use super::runs::{models_dir, now, read_json, write_json, HealSpec, TrySpec};
+use super::auto_progress::ProgressTracker;
 use super::auto_report;
 use super::thinkcheck;
 use crate::error::{Error, Result};
@@ -92,6 +93,10 @@ pub enum Student {
 pub trait Effects {
     /// A progress or state event for the window.
     fn emit(&mut self, event: Value);
+    /// The progress tracker of this run (`auto_progress`), if the effects keep one; the default has none (the stand-in of a test opts in).
+    fn tracker(&mut self) -> Option<&mut ProgressTracker> {
+        None
+    }
     /// The Stop button was pressed.
     fn stopped(&self) -> bool;
     fn model(&self, id: &str) -> Result<ModelRef>;
@@ -151,11 +156,17 @@ pub struct StepRec {
     pub note: Option<String>,
     pub started: Option<String>,
     pub finished: Option<String>,
+    /// the time estimate of the step in minutes (low, high), filled from the plan's `time_estimate`; None for a run saved before it existed
+    #[serde(default)]
+    pub est: Option<(f64, f64)>,
+    /// the estimated minutes (middle) of the parts of the step in the order they run (`start`, `load`, `cache`, `train`, `merge` ...)
+    #[serde(default)]
+    pub est_parts: Vec<(String, f64)>,
 }
 
 impl StepRec {
     fn new(id: &str, label: &str) -> Self {
-        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None }
+        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None, est: None, est_parts: Vec::new() }
     }
 }
 
@@ -233,6 +244,9 @@ pub struct AutoState {
     /// "I have at most N hours": what the time limit made the run give up (`auto_speed::fit_budget`); None for a run without a limit
     #[serde(default)]
     pub budget: Option<super::auto_speed::BudgetFit>,
+    /// the last `auto_progress` snapshot (saved at the boundaries of the steps: a stopped run says "stopped at 42 %"); None for a run saved before it existed
+    #[serde(default)]
+    pub progress: Option<Value>,
 }
 
 impl AutoState {
@@ -240,7 +254,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None,
         }
     }
 
@@ -459,23 +473,28 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
         let Some(id) = st.next_step() else {
             st.status = "done".into();
             st.step = "done".into();
+            tick(fx, &mut st);
             finish(dir, &mut st);
             fx.emit(event(&st, "done", "done", None));
             return Ok(st);
         };
         st.step = id.clone();
         mark(&mut st, &id, "running", None);
+        fill_est(&mut st);
+        tick(fx, &mut st);
         save(dir, &mut st)?;
         fx.emit(event(&st, &id, "running", None));
         match run_step(p, &mut st, &id, fx) {
             Ok(Flow::Done(note)) => {
                 fx.emit(event(&st, &id, "done", note.as_deref()));
                 mark(&mut st, &id, "done", note);
+                tick(fx, &mut st);
                 save(dir, &mut st)?;
             }
             Ok(Flow::Skipped(why)) => {
                 fx.emit(event(&st, &id, "skipped", Some(&why)));
                 mark(&mut st, &id, "skipped", Some(why));
+                tick(fx, &mut st);
                 save(dir, &mut st)?;
             }
             Ok(Flow::Stopped) => {
@@ -488,6 +507,8 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
             Ok(Flow::Retry(note)) => {
                 fx.emit(event(&st, &id, "retry", Some(&note)));
                 mark(&mut st, &id, "pending", Some(note));
+                fill_est(&mut st);
+                tick(fx, &mut st);
                 save(dir, &mut st)?;
             }
             Ok(Flow::Halt(status)) => {
@@ -507,6 +528,28 @@ fn drive(p: &Project, dir: &Path, mut st: AutoState, fx: &mut dyn Effects) -> Re
                 return Err(e);
             }
         }
+    }
+}
+
+/// Fills the estimate of every step that has none from the plan's time estimate (a retry or a rebuilt list of steps gets its figures here too).
+fn fill_est(st: &mut AutoState) {
+    let Some(t) = st.plan.as_ref().and_then(|p| p.time.clone()) else { return };
+    for s in st.steps.iter_mut().filter(|s| s.est.is_none()) {
+        if let Some(x) = t.steps.iter().find(|x| x.id == s.id) {
+            s.est = Some(x.minutes);
+            s.est_parts = x.parts.iter().map(|q| (q.id.clone(), ((q.minutes.0 + q.minutes.1) * 5.0).round() / 10.0)).collect();
+        }
+    }
+}
+
+/// Sends the `auto_progress` snapshot of the steps as they are and keeps it in the state.
+fn tick(fx: &mut dyn Effects, st: &mut AutoState) {
+    fill_est(st);
+    let now = fx.now_secs() as f64;
+    if let Some(t) = fx.tracker() {
+        let snap = t.sync(st, now);
+        st.progress = Some(snap.clone());
+        fx.emit(snap);
     }
 }
 

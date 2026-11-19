@@ -263,6 +263,11 @@ impl EtaSmoother {
         if (ran >= MIN_RUN_S && self.windows >= MIN_WINDOWS) || f >= LIVE_FRAC { EtaState::Live } else { EtaState::Estimating }
     }
 
+    /// Whether the worker's own figure for the time left is in use (it counts the running part only, not the parts after it).
+    pub fn has_worker_eta(&self) -> bool {
+        self.eta.is_some()
+    }
+
     /// The seconds left in the step: the smoothed worker figure when there is one, else from the smoothed rate, else the plan's (`planned_s` times what is left).
     pub fn remaining_s(&mut self, now_s: f64, f: f64, planned_s: f64) -> f64 {
         let raw = if self.state(now_s, f) == EtaState::Live {
@@ -326,4 +331,149 @@ pub fn title_text(pct: f64, stage: Option<(u32, u32)>, step_label: &str, left_mi
         t.push_str(&format!(" · about {} left", short_duration(m)));
     }
     t
+}
+
+// ------------------------------------------------------------------------------------------------------------------ the tracker
+
+use serde_json::json;
+
+use super::auto::AutoState;
+
+#[derive(Debug, Clone)]
+struct TStep {
+    id: String,
+    label: String,
+    status: String,
+    est: Option<(f64, f64)>,
+    parts: Vec<(String, f64)>,
+    actual_min: Option<f64>,
+}
+
+/// Keeps what the running step reported last and makes the `auto_progress` event of the window from it. `sync` at every change of a step, `on_event` for every live worker event
+/// (it answers at most once a second). Clocks are passed in (seconds on any steady scale), so nothing here reads the time.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressTracker {
+    run: String,
+    base_elapsed_s: f64,
+    start_s: Option<f64>,
+    steps: Vec<TStep>,
+    of_stages: u32,
+    current: Option<usize>,
+    frac: Option<Frac>,
+    smoother: EtaSmoother,
+    last_emit_s: Option<f64>,
+    retry_added_min: Option<f64>,
+}
+
+fn parse_stamp(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
+}
+
+impl ProgressTracker {
+    pub fn new() -> Self {
+        ProgressTracker::default()
+    }
+
+    /// The run's steps changed (a step began, ended, was skipped or reopened): reads them from the state and returns the snapshot.
+    pub fn sync(&mut self, st: &AutoState, now_s: f64) -> Value {
+        if self.start_s.is_none() {
+            self.start_s = Some(now_s);
+            self.base_elapsed_s = st.progress.as_ref().and_then(|p| p["elapsed_s"].as_f64()).unwrap_or(0.0);
+        }
+        self.run = st.id.clone();
+        self.of_stages = st.stages.len().max(st.plan.as_ref().map(|p| p.stages.len()).unwrap_or(0)) as u32;
+        let old: Vec<(String, String)> = self.steps.iter().map(|s| (s.id.clone(), s.status.clone())).collect();
+        self.steps = st.steps.iter().map(|r| TStep {
+            id: r.id.clone(), label: r.label.clone(), status: r.status.clone(), est: r.est, parts: r.est_parts.clone(),
+            actual_min: (r.status == "done").then(|| match (r.started.as_deref().and_then(parse_stamp), r.finished.as_deref().and_then(parse_stamp)) {
+                (Some(a), Some(b)) if b > a => Some((b - a) as f64 / 60.0),
+                _ => None,
+            }).flatten(),
+        }).collect();
+        // a step that was done and is pending again: a retry; its weight comes back into the total
+        let reopened: f64 = self.steps.iter().filter(|s| s.status == "pending" && old.iter().any(|o| o.0 == s.id && o.1 == "done")).map(|s| weight(s.est.unwrap_or((1.0, 1.0)))).sum();
+        if reopened > 0.0 {
+            self.retry_added_min = Some(self.retry_added_min.unwrap_or(0.0) + reopened);
+        }
+        let cur = self.steps.iter().position(|s| s.status == "running");
+        if cur != self.current || cur.is_none() {
+            self.frac = None;
+            self.smoother.reset();
+        }
+        self.current = cur;
+        self.last_emit_s = Some(now_s);
+        self.snapshot(now_s)
+    }
+
+    /// A live worker event: answers a snapshot at most once a second.
+    pub fn on_event(&mut self, ev: &Value, now_s: f64) -> Option<Value> {
+        let cur = self.current?;
+        let s = &self.steps[cur];
+        let fr = step_fraction(&s.id, ev, &s.parts)?;
+        self.smoother.update(now_s, fr.f, fr.live_eta_s);
+        self.frac = Some(fr);
+        if self.last_emit_s.map(|t| now_s - t >= 1.0).unwrap_or(true) {
+            self.last_emit_s = Some(now_s);
+            Some(self.snapshot(now_s))
+        } else {
+            None
+        }
+    }
+
+    fn snapshot(&mut self, now_s: f64) -> Value {
+        let f = self.frac.as_ref().map(|x| x.f).unwrap_or(0.0);
+        let ins: Vec<StepIn> = self.steps.iter().enumerate().map(|(i, s)| StepIn {
+            id: s.id.clone(), status: s.status.clone(), est: s.est.unwrap_or((1.0, 1.0)), frac: if Some(i) == self.current { f } else { 0.0 },
+        }).collect();
+        let ov = overall(&ins);
+        let has_est = self.steps.iter().filter(|s| s.status != "skipped").all(|s| s.est.is_some());
+        let elapsed = self.base_elapsed_s + self.start_s.map(|s| (now_s - s).max(0.0)).unwrap_or(0.0);
+        let done_list: Vec<(String, f64, f64)> = self.steps.iter().filter_map(|s| Some((s.id.clone(), weight(s.est?), s.actual_min?))).collect();
+        let mut state = "plan";
+        let mut left: Option<(f64, f64)> = None;
+        if has_est {
+            let mut pending: Vec<(String, (f64, f64))> = self.steps.iter().enumerate().filter(|(i, s)| s.status == "pending" && Some(*i) != self.current).map(|(_, s)| (s.id.clone(), s.est.unwrap_or((1.0, 1.0)))).collect();
+            let (mut live_s, mut after) = (None, 0.0);
+            if let Some(cur) = self.current {
+                let c = self.steps[cur].clone();
+                let est = c.est.unwrap_or((1.0, 1.0));
+                let live = self.frac.clone().filter(|_| self.smoother.state(now_s, f) == EtaState::Live);
+                if let Some(fr) = live {
+                    state = "live";
+                    let planned = weight(est) * 60.0;
+                    live_s = Some(self.smoother.remaining_s(now_s, f, planned));
+                    if self.smoother.has_worker_eta() {
+                        after = fr.after_min;
+                    }
+                } else {
+                    if self.frac.is_some() {
+                        state = "estimating";
+                    }
+                    pending.push((c.id, (est.0 * (1.0 - f), est.1 * (1.0 - f))));
+                }
+            }
+            left = Some(remaining(live_s, after, &pending, &done_list));
+        }
+        let cal = self.current.and_then(|i| calibration(&done_list, &self.steps[i].id));
+        let (stage, step) = match self.current {
+            Some(i) => {
+                let s = &self.steps[i];
+                let counted: Vec<&TStep> = self.steps.iter().filter(|x| x.status != "skipped").collect();
+                let index = counted.iter().position(|x| x.id == s.id).map(|x| x + 1).unwrap_or(i + 1);
+                (
+                    stage_of(&s.id).map(|n| json!({"n": n, "of": self.of_stages.max(n)})),
+                    json!({"id": s.id, "label": s.label, "index": index, "count": counted.len(), "pct": (f * 1000.0).round() / 10.0,
+                           "part": self.frac.as_ref().and_then(|x| x.part.clone()), "sub": self.frac.as_ref().and_then(|x| x.sub.clone())}),
+                )
+            }
+            None => (None, Value::Null),
+        };
+        json!({
+            "kind": "auto_progress", "phase": "auto", "run": self.run, "pct": ov.pct, "state": state, "elapsed_s": elapsed.round(),
+            "left_s": left.map(|(a, b)| json!([(a * 60.0).round(), (b * 60.0).round()])).unwrap_or(Value::Null),
+            "stage": stage.unwrap_or(Value::Null), "step": step,
+            "steps": self.steps.iter().map(|s| json!({"id": s.id, "status": s.status, "weight_min": s.est.map(|e| (weight(e) * 10.0).round() / 10.0), "actual_min": s.actual_min.map(|a| (a * 10.0).round() / 10.0)})).collect::<Vec<_>>(),
+            "retry_added_min": self.retry_added_min.map(|x| (x * 10.0).round() / 10.0), "calibration": cal.map(|c| (c * 100.0).round() / 100.0),
+        })
+    }
 }

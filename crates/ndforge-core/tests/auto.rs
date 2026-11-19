@@ -79,13 +79,15 @@ struct Mock {
     imatrix: Vec<bool>,
     /// the clock of the time limit (seconds); None = the real one
     clock: Option<i64>,
+    /// the progress of the run (`auto_progress` events); None = the stand-in has none, like most tests
+    tracker: Option<ndforge_core::reshape::auto_progress::ProgressTracker>,
 }
 
 impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None,
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None,
         }
     }
 
@@ -111,6 +113,9 @@ impl Mock {
 impl Effects for Mock {
     fn emit(&mut self, event: Value) {
         self.events.push(event);
+    }
+    fn tracker(&mut self) -> Option<&mut ndforge_core::reshape::auto_progress::ProgressTracker> {
+        self.tracker.as_mut()
     }
     fn stopped(&self) -> bool {
         self.stop_flag
@@ -1490,4 +1495,112 @@ fn the_report_lists_every_speed_setting_that_is_not_the_recipe_with_its_risk() {
     assert!(md.contains("| Heal tokens of the first stage | 20 M tokens | 40 M tokens |") && md.contains("| Sequence length of the stages | the same in both stages (4096) |"), "{md}");
     // the plan's warnings and the notes said it before the run
     assert!(st.notes.iter().any(|n| n.contains("first stage heals on 20 M tokens")), "{:?}", st.notes);
+}
+
+fn progress_events(fx: &Mock) -> Vec<&Value> {
+    fx.events.iter().filter(|e| e["kind"] == "auto_progress").collect()
+}
+
+#[test]
+fn a_run_emits_auto_progress_that_rises_to_a_hundred_and_is_saved_in_the_state() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.tracker = Some(Default::default());
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let ev = progress_events(&fx);
+    assert!(ev.len() >= st.steps.len(), "one at every step change");
+    let pcts: Vec<f64> = ev.iter().map(|e| e["pct"].as_f64().unwrap()).collect();
+    assert!(pcts.windows(2).all(|w| w[1] >= w[0] - 1e-9), "{pcts:?}");
+    assert_eq!(*pcts.last().unwrap(), 100.0);
+    assert!(pcts.iter().any(|x| *x > 0.0 && *x < 100.0));
+    let mid = ev.iter().find(|e| e["step"]["id"] == "s1.heal").unwrap();
+    assert_eq!(mid["phase"], "auto");
+    assert_eq!(mid["stage"]["n"], 1);
+    assert_eq!(mid["stage"]["of"], 2);
+    assert_eq!(mid["state"], "plan");
+    assert!(mid["left_s"][0].as_f64().unwrap() > 0.0);
+    assert!(mid["steps"].as_array().unwrap().iter().any(|s| s["id"] == "s1.heal" && s["weight_min"].as_f64().unwrap() > 1.0));
+    // the state keeps the last snapshot and the estimates of the steps
+    let saved = load(&run_dir(&p, &st.id)).unwrap();
+    assert_eq!(saved.progress.as_ref().unwrap()["pct"], 100.0);
+    assert!(saved.steps.iter().find(|s| s.id == "s1.heal").unwrap().est_parts.iter().any(|x| x.0 == "train"));
+}
+
+#[test]
+fn the_bar_steps_back_only_after_a_retry_and_says_why() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.tracker = Some(Default::default());
+    fx.checks.insert("cut-1/healed".into(), bad());
+    let st = start(&p, &mut fx, spec(18.0)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let ev = progress_events(&fx);
+    let pcts: Vec<f64> = ev.iter().map(|e| e["pct"].as_f64().unwrap()).collect();
+    assert!(pcts.windows(2).any(|w| w[1] < w[0]), "a retry reopens steps: {pcts:?}");
+    assert!(ev.iter().any(|e| e["retry_added_min"].as_f64().map(|x| x > 0.0).unwrap_or(false)));
+    assert!(ev.iter().take_while(|e| e["retry_added_min"].is_null()).collect::<Vec<_>>().windows(2).all(|w| w[1]["pct"].as_f64() >= w[0]["pct"].as_f64()));
+}
+
+#[test]
+fn a_run_saved_before_the_progress_existed_loads_and_resumes() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.stop_at = Some(4);
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "stopped");
+    // the file as an older version wrote it: none of the new keys
+    let dir = run_dir(&p, &st.id);
+    let file = dir.join("auto.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("progress");
+    for s in v["steps"].as_array_mut().unwrap() {
+        s.as_object_mut().unwrap().remove("est");
+        s.as_object_mut().unwrap().remove("est_parts");
+    }
+    std::fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let old = load(&dir).unwrap();
+    assert!(old.progress.is_none() && old.steps.iter().all(|s| s.est.is_none() && s.est_parts.is_empty()));
+    fx.tracker = Some(Default::default());
+    let done = resume(&p, &mut fx, &st.id).unwrap();
+    assert_eq!(done.status, "done", "{:?}", done.error);
+    assert_eq!(progress_events(&fx).last().unwrap()["pct"], 100.0);
+}
+
+#[test]
+fn live_events_move_the_running_step_at_most_once_a_second_and_the_state_goes_live() {
+    use ndforge_core::reshape::auto_progress::ProgressTracker;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let mut st = start(&p, &mut fx, spec(21.1)).unwrap();
+    // pretend the first heal is running and everything before it is done
+    for s in st.steps.iter_mut() {
+        s.status = if s.id == "s1.heal" { "running".into() } else if matches!(s.id.as_str(), "plan" | "measure" | "try" | "s1.cut" | "s1.check_cut") { "done".into() } else { "pending".into() };
+    }
+    let mut t = ProgressTracker::new();
+    let first = t.sync(&st, 1000.0);
+    assert_eq!(first["step"]["id"], "s1.heal");
+    assert_eq!(first["state"], "plan");
+    let ev = |done: f64| json!({"kind": "progress", "step": "cache", "value": done / 30.0, "text": "", "detail": {"unit": "tokens", "done": done * 1e6, "total": 30e6, "rate": 3100.0, "rate_unit": "tokens/s", "eta_s": (30.0 - done) * 1e6 / 3100.0}});
+    // within a second of the last snapshot: nothing new
+    assert!(t.on_event(&ev(1.0), 1000.5).is_none());
+    let a = t.on_event(&ev(2.0), 1002.0).unwrap();
+    assert_eq!(a["step"]["part"], "cache");
+    assert!(a["step"]["sub"].as_str().unwrap().starts_with("Teacher cache: 2.0 M of 30.0 M tokens"), "{}", a["step"]["sub"]);
+    assert_eq!(a["state"], "estimating");
+    assert!(a["pct"].as_f64().unwrap() > first["pct"].as_f64().unwrap());
+    // after a few windows of progress the state is live and the time left comes from the speed
+    let mut last = a;
+    for (i, done) in [4.0, 6.0, 8.0, 10.0].iter().enumerate() {
+        if let Some(s) = t.on_event(&ev(*done), 1062.0 + 61.0 * i as f64) {
+            last = s;
+        }
+    }
+    assert_eq!(last["state"], "live");
+    assert!(last["left_s"][0].as_f64().unwrap() < last["left_s"][1].as_f64().unwrap());
+    assert!(last["elapsed_s"].as_f64().unwrap() > 200.0);
 }
