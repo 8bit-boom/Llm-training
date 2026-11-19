@@ -161,3 +161,38 @@ layers: 20 million words is a small part of what NVIDIA used), whether Unsloth l
 
 Version 2 (thinner layers and healing) is built. Still open: the first real run (checklist in `docs/RESHAPE.md`), the experimental thinning of the attention layers (offered in Expert mode once the checklist
 passes), hidden-size pruning for a text-only export, and healing with Unsloth for speed. These are listed as follow-ups in `docs/RESHAPE.md`.
+
+## Research notes: an outside document's claims against this code
+
+An outside research note on pruning and healing this model was read against the code. Its citations were **not** verified by us; only what the code does was. What follows says what is true, what was already done, what was added and what stays unmeasured.
+
+| Claim of the note | What the code does | What was done about it |
+|---|---|---|
+| Neuron scoring uses activations only, with no down-projection factor | True. The score is, per text, the mean of \|activation\| over its tokens, squared, summed over the texts, square-rooted (`reshapejob._measure_all`). That is not the mean square per token, so an output score cannot be derived from it | The measurement now also records the mean square (`mlp_ms`); `width_scoring: "output"` ranks by mean square x squared `down_proj` column norm, an option next to the default (docs/TRY_FIRST.md) |
+| The shared teacher cache id hashes the teacher's path and config, not its weights | True for a local folder; mostly harmless for a Hub id (a snapshot is a commit). The cache meta, `rows_key`, the Try key and the measurement had no weights identity either | `safetensors_io.weights_manifest` (commit or a sampled hash of every weight file, no file times) is part of the store id (version 2), the index, the Try key and the measurement; old stores are adopted once with a note; the program's `rows_key` counts a local teacher's files (docs/HEAL_SETTINGS.md) |
+| The loss checkpoints every output chunk, and there is no chunk knob | The first is true (`chunked_kd_loss`). The second is false: the chunk size is a setting (`distill.chunk`, "KL chunk" 64 to 512, halved by the out-of-memory ladder) | `distill.head_checkpoint` "off" keeps the logits instead (same loss, tokens x vocabulary x 10 bytes more memory); "Find the fastest loss settings" measures the options on the owner's card |
+| Keeping only the top-k does not make the student's output layer cheap | True: the student still makes the full log-softmax over about 248,000 words (`_chunk_losses`); the cache costs 196 bytes per token | Documented; a fused cross-entropy is not a drop-in (docs/TRAINING_SPEED.md), not built |
+| The planner's totals do not match the document's | Explained, not wrong: at an MLP width of 9,728 the text model is 19.35 B and the file with the vision tower 19.81 B (the multi-token head is removed by a width cut); the document's 20.23 B keeps a head | The parts of every size are shown (text layers, embeddings, output, vision, multi-token head removed, file total) |
+| Long chat rows keep the first tokens, rows over twice the length are skipped, and 1,024 loses reasoning answers | True for the mechanism (`general_rows`); outdated for the recipe, which heals at 8,192 (4,096 when 8,192 does not fit) on 80 % reasoning traces | A coverage report says how many rows are whole, cut or left out, how many reasoning rows lost their answer, and the lengths (docs/HEAL_SETTINGS.md) |
+| Calibrate on reasoning traces | Already done (`reasoning_key`, 50 % thinking traces of 2,048 tokens in the measurement) | none needed |
+| It has never been run on a real GPU | Partly outdated: `docs/REAL_RUN_17B.md` is a real run (Qwen3.5-family; nothing on Qwen3.8 yet). The kernel diagnostics exist and their speed effect is unmeasured | unchanged |
+| A 32-question check should not be the main gate | Partly outdated: answers are graded, the closed-trace rate and truncation are counted | A broader suite (structured output, multi-turn correction, tasks from the project's own data, code with tests) is not built |
+| (found while reading) the "calibration loss" of a heal | It is measured on `train.jsonl`, the file the student learns from: **not held out**, so it reads better than it is | A held-out loss on general rows the heal never learned from (docs/HEAL_SETTINGS.md) |
+
+### Added for the note's ideas, all experimental and off by default
+
+* **Refitting the kept neurons** (a least-squares correction of the kept neurons' output weights): Try first compares it with the plain cut; the cut can write it. The maths is standard algebra and is tested against `numpy.linalg.lstsq`; whether it keeps more quality is **not known** for any real model.
+* **Ranking the neurons by their expected output**: an option next to the default; Try first compares the two and calls a gain only when both halves of the text agree.
+* **Keeping the output layer's logits** and **the speed test** of the loss settings: the loss is the same; only speed and memory change, and the numbers are the owner's to produce.
+
+### What is measured here and what is not
+
+Measured (by tests, on tiny models and by arithmetic): that the replay of the layers equals the full forward, that the written bytes equal the refit, that the Try pass loss equals the written model's loss for the same cut, that every breakdown adds up, that the head switch does not change the loss, and that the held-out rows are not training rows. **Not measured, because nothing here runs on the owner's GPU:** whether the refit or the output ranking beats the default at any real size; how long a refit takes on a 27 B (the time shown is a formula); whether a gain before healing survives healing and quantisation to a GGUF; how much faster the loss is with the logits kept; how well the coverage numbers predict how the healed model thinks; and every outside citation.
+
+### Not doing (from the note)
+
+* **Reinforcement learning for recovery**: a generation loop with verifiers and rewards, many times the compute, a new training engine.
+* **Different widths for different layers**: the model has one `intermediate_size`; Transformers and llama.cpp build every layer from it.
+* **Packing for the hybrid recurrent layers**: the linear-attention state and the convolution cache would leak across packed examples unless the sequence boundaries are proven; length bucketing stays.
+* **A long bucket of rows over 8,192 tokens within one heal**: two sequence lengths mean two caches; the coverage report only says when it would matter.
+* **Changing the KL objective** (top-k-only logits for the student).
