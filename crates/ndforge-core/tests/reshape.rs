@@ -1098,9 +1098,21 @@ fn the_neuron_ranking_reaches_the_job_only_when_it_is_the_output_one() {
     let out = rruns::execute(&p, &ReshapeSpec { width_scoring: Some("output".into()), ..width_spec(0, 6400) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
     assert_eq!(seen(&out)["width_scoring"], "output");
     assert!(rruns::execute(&p, &ReshapeSpec { width_scoring: Some("magic".into()), ..width_spec(0, 6144) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("ranked is activation"));
+    // refitting the kept neurons: the job carries it only when asked for, with a width, and checks the numbers
+    let rec = rruns::execute(&p, &ReshapeSpec { reconstruct: Some(ReconSpec { variant: "original".into(), alpha: 0.02 }), ..width_spec(0, 5632) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert_eq!(seen(&rec)["reconstruct"], json!({"variant": "original", "alpha": 0.02}));
+    assert!(seen(&plain).get("reconstruct").is_none() && seen(&out).get("reconstruct").is_none(), "off: no key");
+    let no_width = ReshapeSpec { reconstruct: Some(ReconSpec { variant: "pruned".into(), alpha: 0.01 }), ..spec(Mode::Prune, 1).with_model("qwen3.5-4b") };
+    assert!(rruns::execute(&p, &no_width, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("needs a thinner-layers cut"));
+    for bad in [json!({"variant": "both"}), json!({"alpha": 0.0}), json!({"alpha": 1.5})] {
+        let r: ReconSpec = serde_json::from_value(bad).unwrap();
+        assert!(rruns::execute(&p, &ReshapeSpec { reconstruct: Some(r), ..width_spec(0, 5888) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).is_err());
+    }
+    assert_eq!(serde_json::from_value::<ReconSpec>(json!({})).unwrap(), ReconSpec { variant: "pruned".into(), alpha: 0.01 });
     // an old spec has no such key and writes none
     let old: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "m", "mode": "prune", "blocks": 1})).unwrap();
     assert!(old.width_scoring.is_none() && serde_json::to_value(&old).unwrap().get("width_scoring").is_none());
+    assert!(old.reconstruct.is_none() && serde_json::to_value(&old).unwrap().get("reconstruct").is_none());
 }
 
 #[cfg(unix)]

@@ -194,6 +194,9 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         if spec.width_scoring.as_deref() == Some("output") {
             job["width_scoring"] = json!("output");
         }
+        if let Some(r) = &spec.reconstruct {
+            job["reconstruct"] = json!({"variant": r.variant, "alpha": r.alpha});
+        }
     }
     Ok(job)
 }

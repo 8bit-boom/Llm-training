@@ -112,3 +112,30 @@ def test_a_try_pass_with_a_refit_is_repeatable_reuses_the_sidecar_and_leaves_the
     assert again[refit]["loss"] == pytest.approx(first[refit]["loss"], rel=1e-6) and again[plain]["loss"] == pytest.approx(first[plain]["loss"], rel=1e-6)
     assert (folder / "recon" / tags[0] / "model.safetensors").stat().st_mtime == mtime
     assert abs(first[refit]["loss"] - first[plain]["loss"]) > 1e-7, "the refit changes the cut model's loss"
+
+
+def test_the_written_model_has_the_loss_of_the_try_pass_with_the_same_refit(tmp_path, base, measured, monkeypatch):
+    from test_reshape_try_torch import written_loss
+    want = {"choices": [{"width": 80, "reconstruct": "pruned"}]}
+    code, _ = do_try(monkeypatch, try_cfg(tmp_path, base, measured, want))
+    assert code == 0
+    predicted = passes_of(tmp_path)[rt.pass_key((), 80, None, "pruned")]["loss"]
+    plain = passes_of(tmp_path)[rt.pass_key((), 80)]["loss"]
+    # the cut finds the sidecar Try first made (no second refit) and writes exactly its weights
+    folder, _ = measured
+    mtime = [(p / "model.safetensors").stat().st_mtime for p in (folder / "recon").iterdir()]
+    actual, r, _ = written_loss(tmp_path, base, measured, "wr", width={"intermediate_size": 80}, reconstruct={"variant": "pruned", "alpha": 0.01})
+    assert r["width"]["recon"]["made_now"] is False and r["width"]["recon"]["variant"] == "pruned"
+    assert [(p / "model.safetensors").stat().st_mtime for p in (folder / "recon").iterdir()] == mtime
+    assert actual == pytest.approx(predicted, rel=1e-4) and abs(actual - plain) > 1e-7
+
+
+def test_a_cut_without_a_sidecar_makes_the_refit_and_keeps_it(tmp_path, base, measured):
+    from test_reshape_try_torch import written_loss
+    folder, _ = measured
+    assert not (folder / "recon").exists()
+    actual, r, _ = written_loss(tmp_path, base, measured, "wm", width={"intermediate_size": 80}, reconstruct={"variant": "pruned", "alpha": 0.01})
+    assert r["width"]["recon"]["made_now"] is True and len(list((folder / "recon").iterdir())) == 1
+    assert r["width"]["recon"]["median_removed_share"] is not None and np.isfinite(actual)
+    again, r2, _ = written_loss(tmp_path, base, measured, "wm2", width={"intermediate_size": 80}, reconstruct={"variant": "pruned", "alpha": 0.01})
+    assert r2["width"]["recon"]["made_now"] is False and again == pytest.approx(actual, rel=1e-6)

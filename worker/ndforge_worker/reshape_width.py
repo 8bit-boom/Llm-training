@@ -304,6 +304,31 @@ def plan_width(out: list, src: list[int], types: list[str], dims: dict, width: d
     return result
 
 
+def apply_recon(plan: list, src: list[int], refs: dict) -> list:
+    """Replaces the sliced `down_proj` of every layer that has a refit by a plain copy of the refitted weights (`refs`: {old layer: TensorRef of W_K, BF16 [hidden, kept]}, the
+    sidecar of reshape_recon). Layer j of the new model is old layer src[j]; nothing else changes and no new writer path is needed: the OutTensor just has another source.
+    ReshapeError when a refit does not have the shape of the cut's tensor or the model's weights are not bf16."""
+    from .safetensors_io import OutTensor
+    out = []
+    used = set()
+    for t in plan:
+        sp = split_key(t.name)
+        if sp is not None and sp[2] == "mlp.down_proj.weight" and sp[1] < len(src) and src[sp[1]] in refs:
+            ref = refs[src[sp[1]]]
+            if t.dtype != "BF16" or ref.dtype != "BF16":
+                raise ReshapeError("The refit of the kept neurons is made for models stored in bf16; this model's weights are not.")
+            if tuple(ref.shape) != tuple(t.shape):
+                raise ReshapeError(f"The saved refit of layer {src[sp[1]]} has the shape {tuple(ref.shape)}, but the cut needs {tuple(t.shape)}. It was made for another width.")
+            out.append(OutTensor(t.name, "BF16", tuple(t.shape), ref))
+            used.add(src[sp[1]])
+            continue
+        out.append(t)
+    missing = [s for s in set(src) if s not in used]
+    if missing and refs:
+        raise ReshapeError(f"The saved refit has no weights for layer {min(missing)}; make it again.")
+    return out
+
+
 def _have(keep: dict, s: int, lt: str, dims: dict, width: dict) -> bool:
     """True when layer s needs slices; ReshapeError when a needed kept-list is missing."""
     need = []

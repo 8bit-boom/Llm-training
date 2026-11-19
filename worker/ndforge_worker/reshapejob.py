@@ -631,6 +631,71 @@ def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict, scorin
     return keep, (sum(ov) / len(ov) if ov else 1.0)
 
 
+def _recon_refs(cfg: dict, src_dir: Path, tensors: dict, types: list, dims: dict, width: dict, keep: dict, src: list, chosen: list, scoring: str, period: int, n_layers: int,
+                calibration: dict, stop):
+    """({old layer: TensorRef of the refitted down_proj}, info) for a cut that refits the kept neurons (job key `reconstruct` {"variant", "alpha"}): the sidecar Try first (or an
+    earlier cut) made for exactly this cut, else the refit is made now (needs torch, the model loaded again, and room for the sidecar). Experimental and off by default."""
+    from . import reshape_recon as rr
+    rc = cfg["reconstruct"]
+    variant, alpha = rc.get("variant", "pruned"), float(rc.get("alpha", rr.DEFAULT_ALPHA))
+    if variant not in rr.VARIANTS or not 0 < alpha <= 1:
+        raise ReshapeError("Refitting the kept neurons: the variant is \"pruned\" or \"original\" and the strength 0 to 1.")
+    scores_dir = cfg.get("scores_dir")
+    if not scores_dir:
+        raise ReshapeError("Refitting the kept neurons needs the folder of the measurement.")
+    weights = safetensors_io.weights_manifest(src_dir)
+    found = rr.find_sidecar(scores_dir, weights, width["intermediate"], scoring, chosen, variant, alpha)
+    made = False
+    if found is None:
+        _require_torch()
+        hidden, k = int(dims["hidden"]), int(width["intermediate"])
+        need = int(len(set(src)) * hidden * k * 2 * 1.1)
+        Path(scores_dir).mkdir(parents=True, exist_ok=True)
+        free = fsutil.free_bytes(Path(scores_dir))
+        if free < need:
+            raise ReshapeError(f"The refit is saved next to the measurement and needs about {need / 1e9:.1f} GB; {free / 1e9:.1f} GB are free there.")
+        from transformers import AutoTokenizer
+        est = sum(r.nbytes for r in tensors.values())
+        mode = _choose_load(cfg.get("load", "auto"), est)
+        fam = (cfg.get("source") or {}).get("family", "generic")
+        n_head = int(calibration.get("samples", 256))
+        rkey = reasoning_key(calibration)
+        used = max(1, min(n_head - 1, round(n_head * rkey["share"]))) if rkey and n_head > 1 else 0
+        r_samples, r_len = rr.DEFAULT_SAMPLES, rr.DEFAULT_LEN
+        protocol.progress("recon", 0.0, "Preparing the text for the refit")
+        batches = _calibration(AutoTokenizer.from_pretrained(str(src_dir)), {**calibration, "samples": r_samples, "max_len": r_len}, fam, tail=True, head=n_head, skip_reasoning=used)
+        protocol.progress("recon", 0.0, f"Loading the model ({mode})")
+        model = _load(src_dir, mode)
+        layers = _find_layers(model, n_layers)
+        skip = reshape.blocks_to_layers(list(chosen), period) if chosen else []
+        t0 = time.monotonic()
+        try:
+            out = rr.fit_layers(model, layers, batches, types, skip, {s: keep["mlp"][s] for s in keep["mlp"]}, rr.w0_reader(rr.down_refs(tensors, n_layers)), hidden, alpha, variant, stop, _ram_bytes())
+        except rr.Stopped:
+            raise ReshapeError("Stopped.") from None
+        finally:
+            del layers
+            del model
+            _free()
+        secs = round(time.monotonic() - t0, 1)
+        protocol.timing("recon", secs, tokens=out["tokens"], layers=len(out["w_k"]), variant=variant)
+        rows = rr.rows_key(rkey, r_samples, r_len, n_head, None, calibration.get("seed", 3407))
+        tag = rr.recon_tag(weights, width["intermediate"], scoring, chosen, variant, alpha, rows)
+        rr.write_sidecar(scores_dir, tag, out["w_k"], {s: keep["mlp"][s] for s in out["w_k"]},
+                         {"tag": tag, "variant": variant, "alpha": alpha, "width": width["intermediate"], "scoring": scoring, "skipped": list(chosen), "weights": weights, "rows": rows,
+                          "tokens": out["tokens"], "seconds": secs, "summary": out["summary"], "shares": {str(l): v for l, v in out["shares"].items()}})
+        found = rr.read_sidecar(scores_dir, tag)
+        made = True
+    refs, meta = found
+    for s in set(src):
+        if s not in refs or [int(i) for i in meta["kept"][str(s)]] != [int(i) for i in keep["mlp"][s]]:
+            raise ReshapeError(f"The saved refit does not belong to these neurons (layer {s}); delete the folder {Path(scores_dir) / 'recon'} and make it again.")
+    summary = meta.get("summary") or {}
+    return refs, {"variant": variant, "alpha": alpha, "tag": meta.get("tag"), "made_now": made, "median_removed_share": summary.get("median"), "worst_removed_share": summary.get("worst"),
+                  "layers": len(set(src)), "tokens": meta.get("tokens"), "overlap": meta.get("overlap"), "seconds": meta.get("seconds"),
+                  "note": "Experimental: the share is what the refit gives back on rows it was not fitted on; the loss gain before healing may not survive healing."}
+
+
 MTP_REMOVED = "removed (no longer fits)"
 
 
@@ -958,6 +1023,7 @@ def run(cfg: dict) -> int:
     nb = reshape.block_count(n_layers, period)
     protocol.progress("inspect", 1.0, f"{n_layers} layers in blocks of {period}")
     width = dims = keep = mtp_keep = sc = None
+    recon_refs = recon_info = None
     mtp_drop = False                    # a width cut that thins the MLP or the heads removes the multi-token head (job key keep_mtp: true keeps the old slicing)
     overlap = None
     if width_req:
@@ -1014,6 +1080,9 @@ def run(cfg: dict) -> int:
             keep, overlap = _keep_sets(sc, src, types, dims, width, scoring, norms)
             mtp_drop = bool(groups["mtp"]) and not cfg.get("keep_mtp") and reshape_width.mtp_removed(dims, width)
             mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] and not mtp_drop else None
+            if isinstance(cfg.get("reconstruct"), dict) and width["intermediate"] != dims["intermediate"]:
+                recon_refs, recon_info = _recon_refs(cfg, src_dir, tensors, types, dims, width, keep, src, chosen, scoring, period, n_layers, calibration, lambda: stop_file.exists())
+                notes.append("The kept neurons were refitted (experimental): the output weights of the kept neurons were changed to make up for part of what the removed ones did.")
             protocol.emit("width_scores", **_width_event(with_output_scores(sc, norms) if scoring == "output" else sc, keep, src, overlap))
             protocol.log(f"Thinning every layer: MLP {dims['intermediate']:,} to {width['intermediate']:,}"
                          + (f", linear-attention value heads {dims['lin_v_heads']} to {width['lin_v_heads']}" if width["lin_v_heads"] != dims["lin_v_heads"] else "")
@@ -1035,6 +1104,8 @@ def run(cfg: dict) -> int:
     if width:
         new_cfg = reshape_width.fix_config_width(new_cfg, dims, width)
         plan = reshape_width.plan_width(plan, src, types, dims, width, keep, mtp_keep)
+        if recon_refs:
+            plan = reshape_width.apply_recon(plan, src, recon_refs)
         if mtp_drop:
             plan = [t for t in plan if not t.name.startswith("mtp.")]
             tc_new = reshape.text_config(new_cfg)
@@ -1088,6 +1159,8 @@ def run(cfg: dict) -> int:
             wmeta = {"intermediate_size": [dims["intermediate"], width["intermediate"]], "linear_num_value_heads": [dims["lin_v_heads"], width["lin_v_heads"]],
                      "num_attention_heads": [dims["heads"], width["heads"]], "kept": "width_kept.npz", "scores_key": Path(cfg.get("scores_dir") or "").name or None,
                      "stable_overlap": round(overlap, 4), "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
+            if recon_info:
+                wmeta["recon"] = recon_info
             if scoring == "output":
                 wmeta["scoring"] = "output"             # only written when asked for: a cut as before has the file as before
             _save_kept(out / "width_kept.npz", src, keep, mtp_keep)
@@ -1133,6 +1206,6 @@ def run(cfg: dict) -> int:
                                                       "after": {"intermediate_size": width["intermediate"], "linear_num_value_heads": width["lin_v_heads"],
                                                                 "num_attention_heads": width["heads"]},
                                                       "stable_overlap": wmeta["stable_overlap"], "scores_key": wmeta["scores_key"], "mtp": wmeta["mtp"],
-                                                      **({"scoring": "output"} if wmeta.get("scoring") else {})}
+                                                      **({"scoring": "output"} if wmeta.get("scoring") else {}), **({"recon": wmeta["recon"]} if wmeta.get("recon") else {})}
                                                      if width else None)})
     return 0

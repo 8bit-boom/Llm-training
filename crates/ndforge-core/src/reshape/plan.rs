@@ -196,6 +196,28 @@ pub struct ReshapeSpec {
     /// says "output" is better. Not sent to the worker unless "output".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width_scoring: Option<String>,
+    /// Refit the kept neurons of the width cut (experimental, off): the output weights of the kept neurons are changed by least squares to make up for part of what the removed ones
+    /// did. Needs a width. Try first measures it first; nothing here says it keeps more quality. None = as it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruct: Option<ReconSpec>,
+}
+
+/// How the kept neurons are refitted: `variant` "pruned" (fit on what the cut model feeds each layer) or "original" (on the uncut model's activations), `alpha` the ridge strength
+/// relative to the mean eigenvalue (0 to 1, default 0.01).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconSpec {
+    #[serde(default = "pruned")]
+    pub variant: String,
+    #[serde(default = "recon_alpha")]
+    pub alpha: f64,
+}
+
+fn pruned() -> String {
+    "pruned".into()
+}
+
+fn recon_alpha() -> f64 {
+    0.01
 }
 
 fn r_share() -> f64 {
@@ -456,6 +478,14 @@ pub fn validate(spec: &ReshapeSpec, ins: &Inspect) -> Result<()> {
     }
     if let Some(r) = &spec.reasoning {
         r.validate()?;
+    }
+    if let Some(r) = &spec.reconstruct {
+        if !["pruned", "original"].contains(&r.variant.as_str()) || !(r.alpha > 0.0 && r.alpha <= 1.0) {
+            return Err(Error::new("Refitting the kept neurons: the variant is pruned or original, and the strength is above 0 and at most 1."));
+        }
+        if spec.width.is_none() {
+            return Err(Error::new("Refitting the kept neurons needs a thinner-layers cut (a width)."));
+        }
     }
     if spec.width_scoring.as_deref().is_some_and(|s| !["activation", "output"].contains(&s)) {
         return Err(Error::new("The way the neurons are ranked is activation (the default) or output."));

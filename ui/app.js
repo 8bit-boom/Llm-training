@@ -2187,7 +2187,7 @@ const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkp
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
-  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, scoring: "activation", meas: null, measModel: null,
+  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, scoring: "activation", recon: false, meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
   tr: { what: "blocks", scoring: false, recon: false, se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
@@ -2329,8 +2329,17 @@ function rsWidthUi(op, st) {
 }
 
 // Expert: how the neurons that stay are chosen. The default is how much they fire; "output" (experimental) also counts how much each one writes into the layer's output.
+function rsReconNumbers() {
+  const a = rs.tr && rs.tr.analysis, rows = ((a && a.variants) || []).filter((r) => r.tried && r.recon && r.intermediate === rs.wi);
+  if (!rows.length) return `<span class="dim small">Try first has not measured the refit for this width.</span>`;
+  const pc = (x) => x == null ? "–" : Math.round(100 * x) + " %";
+  return rows.map((r) => `<span class="dim small">Try first, ${esc(r.label)}: error ${(+r.loss).toFixed(3)} (${r.better_both_halves === true ? "better" : r.better_both_halves === false ? "not better" : "not compared"} than the plain cut in both halves); it gives back ${pc(r.recon.median_removed_share)} of what the cut took (median layer) on rows it was not fitted on.</span>`).join(" ");
+}
+
 function rsScoringHtml() {
-  return `<p id="rs-scoring-row">Rank the neurons by <select id="rs-scoring" ${rs.running ? "disabled" : ""}><option value="activation" ${rs.scoring !== "output" ? "selected" : ""}>how much they fire (the default)</option><option value="output" ${rs.scoring === "output" ? "selected" : ""}>their expected output (experimental)</option></select>
+  return `<p id="rs-recon-row"><label class="opt"><input type="checkbox" id="rs-recon" ${rs.recon ? "checked" : ""} ${rs.running ? "disabled" : ""}> Refit the kept neurons without training (experimental, off)</label>
+    <span class="dim small">Changes the output weights of the kept neurons by least squares to make up for part of what the removed ones did. Needs about 10 to 20 minutes more (a formula, not a measurement) and about 6 GB of disk next to the measurement. Nobody has measured here that it keeps more quality; compare it in Try first, and a gain before healing may not survive healing.</span> ${rsReconNumbers()}</p>
+  <p id="rs-scoring-row">Rank the neurons by <select id="rs-scoring" ${rs.running ? "disabled" : ""}><option value="activation" ${rs.scoring !== "output" ? "selected" : ""}>how much they fire (the default)</option><option value="output" ${rs.scoring === "output" ? "selected" : ""}>their expected output (experimental)</option></select>
     <span class="dim small">The second counts the mean square of what a neuron fires times the squared size of what it writes into the layer. Nobody has measured here that it keeps more quality; the “Try first” card below compares the two on your text and says whether both halves agree. A gain before healing may not survive healing.</span></p>`;
 }
 
@@ -3798,6 +3807,7 @@ function rsSpec() {
     spec.width = { intermediate: rs.wi, lin_v_heads: rs.lv ? rsAxis("lin_v_heads") : null, heads: rs.hh || null };
     spec.width_samples = rs.wsamples;
     if (rs.scoring === "output") spec.width_scoring = "output";          // only when chosen: the default sends nothing
+    if (rs.recon) spec.reconstruct = { variant: "pruned" };            // only when chosen (experimental)
     if (rs.shape === "width") spec.drop_layers = null;
   }
   return spec;
@@ -3862,6 +3872,7 @@ function wireReshape() {
   const lv = $("rs-lv"); if (lv) lv.onchange = () => { rs.lv = lv.checked; rs.options = null; rsOptions(); };
   const hh = $("rs-hh"); if (hh) hh.onchange = () => { rs.hh = hh.value ? +hh.value : null; rs.options = null; rsOptions(); };
   const wsm = $("rs-wsamples"); if (wsm) wsm.onchange = () => { rs.wsamples = +wsm.value; rsMeasInfo(); };
+  const wrc = $("rs-recon"); if (wrc) wrc.onchange = () => { rs.recon = wrc.checked; };
   const wsc = $("rs-scoring"); if (wsc) wsc.onchange = () => { rs.scoring = wsc.value === "output" ? "output" : "activation"; };
   const measure = rsMeasure;
   on("rs-measure-now", () => measure(false));

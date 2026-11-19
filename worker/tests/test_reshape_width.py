@@ -764,3 +764,81 @@ def test_an_old_measurement_is_read_as_before_and_ms_is_asked_for_only_when_need
     assert reshapejob._read_scores(old, cfg, 8, dims, types, need_ms=True) is None
     sc = reshapejob._read_scores(new, cfg, 8, dims, types, need_ms=True)
     assert sc is not None and sc["mlp_ms"].shape == (8, dims["intermediate"]) and sc["meta"]["mean_square"] is True
+
+
+# ------------------------------------------------------------------------------------------------------ refitting the kept neurons in the cut
+
+def sidecar_for(tmp_path, src, j, width=20, scoring="activation", variant="pruned", alpha=0.01, seed=11, scores_dir=None):
+    """a sidecar for the cut of job `j` made of random bf16 weights (the maths is tested elsewhere); returns {layer: bits}"""
+    np = pytest.importorskip("numpy")
+    from ndforge_worker import reshape_recon as rr
+    from ndforge_worker import safetensors_io as st
+    from ndforge_worker import slice_io
+    kept = {int(k.split("_")[1]): v for k, v in np.load(Path(j["final"]) / "width_kept.npz").items() if k.startswith("mlp_")}
+    d = fake_dims()
+    r = np.random.default_rng(seed)
+    bits = {l: slice_io.f32_to_bf16(r.standard_normal((d["hidden"], width)).astype(np.float32)) for l in kept}
+    weights = st.weights_manifest(src)
+    rr.write_sidecar(scores_dir or (tmp_path / "models" / "_scores" / "k1"), "tagA", bits, {l: kept[l].tolist() for l in kept},
+                     {"tag": "tagA", "variant": variant, "alpha": alpha, "width": width, "scoring": scoring, "skipped": [], "weights": weights, "rows": "r", "tokens": 100, "overlap": 0, "seconds": 1.0,
+                      "summary": {"median": 0.25, "worst": -0.05, "layers": len(bits)}})
+    return bits
+
+
+def test_apply_recon_replaces_only_the_down_proj_of_the_refitted_layers_and_the_written_bytes_equal_the_sidecar(tmp_path):
+    np = pytest.importorskip("numpy")
+    from ndforge_worker import safetensors_io as st
+    src, j = scoring_job(tmp_path, None, ms=False)
+    code, ev = run_job(tmp_path, j)
+    assert code == 0, ev[-1]
+    plain = st.list_tensors(Path(j["final"]))
+    bits = sidecar_for(tmp_path, src, j)
+    j2 = {**j, "out": str(tmp_path / "m2" / "model.partial"), "final": str(tmp_path / "m2" / "model"), "reconstruct": {"variant": "pruned", "alpha": 0.01}}
+    (tmp_path / "m2").mkdir()
+    code2, ev2 = run_job(tmp_path, j2)
+    assert code2 == 0 and ev2[-1]["type"] == "result", ev2[-1]
+    r = ev2[-1]["data"]
+    assert r["width"]["recon"]["made_now"] is False and r["width"]["recon"]["median_removed_share"] == 0.25 and r["width"]["recon"]["variant"] == "pruned"
+    assert any("refitted" in n for n in r["notes"])
+    meta = json.loads((Path(j2["final"]) / "ndforge_reshape.json").read_text())
+    assert meta["width"]["recon"]["tag"] == "tagA"
+    new = st.list_tensors(Path(j2["final"]))
+    assert set(new) == set(plain)
+    changed = []
+    for name, ref in new.items():
+        a = np.fromfile(ref.file, dtype="u1", count=ref.nbytes, offset=ref.start)
+        b = np.fromfile(plain[name].file, dtype="u1", count=plain[name].nbytes, offset=plain[name].start)
+        if not np.array_equal(a, b):
+            changed.append(name)
+    assert changed and all(n.endswith("mlp.down_proj.weight") for n in changed) and len(changed) == 8
+    for name in changed:
+        layer = int(name.split(".layers.")[1].split(".")[0])
+        got = np.fromfile(new[name].file, dtype="<u2", count=new[name].numel, offset=new[name].start).reshape(new[name].shape)
+        assert np.array_equal(got, bits[layer]), name
+
+
+def test_a_refit_is_found_only_for_exactly_this_cut_and_a_bad_request_is_refused(tmp_path):
+    from ndforge_worker import reshape_recon as rr
+    from ndforge_worker import safetensors_io as st
+    src, j = scoring_job(tmp_path, None, ms=False)
+    assert run_job(tmp_path, j)[0] == 0
+    scores = tmp_path / "models" / "_scores" / "k1"
+    sidecar_for(tmp_path, src, j, variant="original")
+    w = st.weights_manifest(src)
+    assert rr.find_sidecar(scores, w, 20, "activation", [], "original", 0.01) is not None
+    for other in (("pruned", 0.01, 20, "activation", []), ("original", 0.02, 20, "activation", []), ("original", 0.01, 24, "activation", []),
+                  ("original", 0.01, 20, "output", []), ("original", 0.01, 20, "activation", [2])):
+        variant, alpha, width, scoring, skipped = other
+        assert rr.find_sidecar(scores, w, width, scoring, skipped, variant, alpha) is None, other
+    assert rr.find_sidecar(scores, "dir:other", 20, "activation", [], "original", 0.01) is None, "other weights"
+    bad = {**j, "out": str(tmp_path / "m3" / "model.partial"), "final": str(tmp_path / "m3" / "model"), "reconstruct": {"variant": "both"}}
+    (tmp_path / "m3").mkdir()
+    code, ev = run_job(tmp_path, bad)
+    assert code != 0 and "variant" in ev[-1]["message"]
+
+
+def test_a_cut_without_the_key_is_exactly_as_before_and_has_no_recon_block(tmp_path):
+    _, j = scoring_job(tmp_path, None, ms=False)
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and "recon" not in ev[-1]["data"]["width"]
+    assert "recon" not in json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())["width"]

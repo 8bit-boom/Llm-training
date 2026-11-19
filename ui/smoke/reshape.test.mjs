@@ -982,3 +982,18 @@ test("Healing settings: keeping the output logits is off by default, offered onl
   b.run(`rs.hl.opts.safer = { label: "the output layer's logits made again in the backward pass (checkpointed)", head_checkpoint: "on", kbit_upcast: false, checkpointing: "on", batch: 2, per_update: 32, kl_chunk: 128 }; rs.hlSpec.head_checkpoint = "off"; healUseSafer()`);
   assert.equal(b.run("rs.hlSpec.head_checkpoint"), null);
 });
+
+test("the Slim form: refitting the kept neurons is Expert, off, sent only when ticked, and shows the Try numbers when there are some", () => {
+  const b = browser();
+  open(b, pageState());
+  b.run(`rs.options = ${JSON.stringify({ ...optionsFor("prune"), shape: "width", width: widthMeta(), width_options: [{ blocks: 0, options: widths.map((i) => widthOption(i)) }] })}; rs.shape = "width"; rs.wi = 12288`);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="rs-recon"/);
+  b.run(`state.settings.expert_mode = true`);
+  assert.match(b.run("renderReshape()"), /<input type="checkbox" id="rs-recon" +> Refit the kept neurons without training \(experimental, off\)/);
+  assert.equal(JSON.parse(b.run("JSON.stringify(rsSpec())")).reconstruct, undefined);
+  b.run(`rs.recon = true`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(rsSpec().reconstruct)")), { variant: "pruned" });
+  assert.match(b.run("renderReshape()"), /Try first has not measured the refit for this width/);
+  b.run(`rs.tr.analysis = ${JSON.stringify({ variants: [{ tried: true, intermediate: 12288, label: "MLP 12,288, kept neurons refitted", loss: 2.3, better_both_halves: true, recon: { median_removed_share: 0.2 } }] })}`);
+  assert.match(b.run("renderReshape()"), /error 2\.300 \(better than the plain cut in both halves\); it gives back 20 % of what the cut took/);
+});
