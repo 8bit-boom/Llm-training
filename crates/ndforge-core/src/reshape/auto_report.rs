@@ -47,6 +47,12 @@ fn stage_json(s: &StageState) -> Value {
         out["breakdown"] = json!(b);
         out["breakdown_line"] = json!(b.line());
     }
+    // the error on general rows the heal never learned from (the worker's summary; absent without them): the number the error on your own text, which the heal also trains on, is not
+    for k in ["holdout_loss_before", "holdout_loss_after", "teacher_holdout_loss"] {
+        if summary[k].is_number() {
+            out[k] = summary[k].clone();
+        }
+    }
     // what the heal's rows cover (the worker's summary; absent for an older worker)
     if summary["coverage"].is_object() {
         out["coverage"] = summary["coverage"].clone();

@@ -246,7 +246,7 @@ pub struct Sample {
 
 /// What the saved job logs say about this computer: rates per kind of work, newest sample first. The Auto-cut time estimate (`reshape::auto_time`) prefers them to its formulas.
 /// Keys: `teacher_tok_b_s` (the teacher's answers), `train_tok_b_s`, `score_tok_b_s` (measuring), `try_tok_b_s` (Try first), `merge_s_per_gb`, `write_gb_s`,
-/// `load_gb_s:<mode>`, `think_s_per_b:<quick|full>` (seconds of one thinking check per billion parameters).
+/// `train_bench_tok_b_s` (the speed test of the healing settings), `load_gb_s:<mode>`, `think_s_per_b:<quick|full>` (seconds of one thinking check per billion parameters).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct History {
     pub metrics: BTreeMap<String, Vec<Sample>>,
@@ -296,6 +296,14 @@ impl History {
                     if let (Some(b), Some(t)) = (model_b("load_teacher"), recs.iter().find(|t| t.stage == "teacher_pass")) {
                         if let Some(tps) = t.fields["tokens_per_s"].as_f64() {
                             h.push("teacher_tok_b_s", b, tps * b);
+                        }
+                    }
+                }
+                // the speed test of the loss settings (job key `bench`): its timing line is a rate on its own, and it has no training to attribute to the merge that follows it
+                "distill" if header.get("bench").is_some_and(|b| !b.is_null()) => {
+                    if let Some(t) = recs.iter().find(|t| t.stage == "heal_bench") {
+                        if let (Some(tps), Some(b)) = (t.fields["tokens_per_s"].as_f64(), t.fields["student_b"].as_f64().filter(|b| *b > 0.0)) {
+                            h.push("train_bench_tok_b_s", b, tps * b);
                         }
                     }
                 }

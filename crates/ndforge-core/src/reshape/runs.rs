@@ -970,6 +970,70 @@ fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBoo
     })
 }
 
+/// How many general rows are kept back from the heal and only measured (the held-out loss of the Heal card).
+pub const HOLDOUT_ROWS: u32 = 64;
+
+/// What the speed test of the loss settings (`heal_bench`) needs of a made model: the worker's python, the student's folder and family, the plan and settings the Heal card would use,
+/// the training file and the cache folder (used for the teacher's answers only when it is complete for this sequence length).
+pub(super) struct BenchBase {
+    pub py: PathBuf,
+    pub model: PathBuf,
+    pub family: String,
+    pub method: String,
+    pub ch: HealChoice,
+    pub train: PathBuf,
+    pub cache: Option<PathBuf>,
+    pub student_b: f64,
+    pub dims: plan::HealDims,
+    pub lr: f64,
+}
+
+/// A bench base with its worker job (see `BenchBase::job_base`).
+pub(super) struct BenchBaseJob {
+    pub py: PathBuf,
+    pub job: Value,
+}
+
+impl BenchBase {
+    /// The `distill` job every setting of the speed test starts from: the student, the training file, the settings the Heal card would use, and (when its answers are complete)
+    /// the teacher's cache. Each setting changes the KL chunk and the output-layer checkpointing and adds the `bench` key.
+    pub(super) fn job_base(&self, steps: u32, warmup: u32) -> BenchBaseJob {
+        let k = &self.ch.knobs;
+        let mut job = json!({
+            "job": "distill", "model": {"repo": self.model, "family": self.family}, "method": self.method, "backend": "hf",
+            "dataset": {"train": self.train, "general": Value::Null},
+            "hyper": {"rank": k.rank, "alpha": k.rank, "lr": self.lr, "max_seq": k.seq, "batch": k.batch, "grad_accum": k.grad_accum, "warmup": self.ch.warmup, "weight_decay": 0.0,
+                      "scheduler": "cosine", "seed": 3407, "save_steps": 1_000_000, "logging_steps": 1, "tokens": 1_000_000, "checkpointing": if k.checkpointing { "on" } else { "off" },
+                      "optimizer": self.ch.optimizer, "student_b": self.student_b},
+            "distill": {"mode": "cache", "k": self.ch.k, "chunk": k.kl_chunk, "alpha": 1.0, "kbit_upcast": k.upcast},
+            "bench": {"steps": steps, "warmup": warmup, "targets": "cache"},
+        });
+        if let Some(c) = &self.cache {
+            job["distill"]["cache"] = json!(c);
+        }
+        BenchBaseJob { py: self.py.clone(), job }
+    }
+}
+
+pub(super) fn bench_base(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>) -> Result<BenchBase> {
+    valid_name(name)?;
+    spec.validate()?;
+    let dir = models_dir(p).join(name);
+    let model = heal_source::student_folder(&dir)?.ok_or_else(|| Error::new("The speed test needs the model on this computer: heal it once, or choose a model that is a folder."))?;
+    let o = heal_source::read_origin(&dir)?;
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the speed is measured on your world's text."))?;
+    let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
+    if !train.is_file() {
+        return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
+    }
+    let dims = plan::HealDims::from_config(&o.config, o.student_b);
+    let ch = heal_choice(spec, o.student_b, vram_gb, &dims);
+    let hp = plan::heal_plan_with(o.student_b, o.teacher_b, vram_gb, &dims, &ch.knobs);
+    let cache = dir.join("distill").join("cache");
+    let complete = read_json(&cache.join("index.json")).is_some_and(|i| i["complete"] == true && i["k"] == ch.k && i["max_len"] == ch.knobs.seq);
+    Ok(BenchBase { py: python()?, model, family: o.family.clone(), method: hp.student_method.to_string(), ch, train, cache: complete.then_some(cache), student_b: o.student_b, dims, lr: spec.lr })
+}
+
 /// The teacher's answers are all there AND were made from this general text (an older cache has no key and counts as made from other data), with this many
 /// answers per token (`k`) and for this sequence length (`seq`). Student-side settings (batch, accumulation, checkpointing, rank, optimizer, KL chunk, learning
 /// rate) are not part of it: the answers stay when only those change.
@@ -1127,11 +1191,14 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         };
     }
     if mode == "cache" && !cache_complete(&cache_dir, &general_key, ch.k, ch.knobs.seq, &rows_key) {
-        let job = json!({
+        let mut job = json!({
             "job": "distill_cache", "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "student": model, "model": {"family": family},
             "data": {"train": train, "tokens": tokens, "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
             "out": cache_dir, "stop_file": stop_file, "rows_key": rows_key, "shared_cache": true, "shared_dir": teacher_cache_dir(p),
         });
+        if !general.is_null() {
+            job["holdout"] = json!({"rows": HOLDOUT_ROWS});          // general rows read past the ones the heal learns from: the loss on them is not optimistic
+        }
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));
@@ -1153,7 +1220,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
                       "checkpointing": if ch.knobs.checkpointing { "on" } else { "off" }, "optimizer": ch.optimizer, "student_b": student_b},
             "distill": {"mode": mode, "cache": cache_dir, "teacher": {"repo": origin, "load": ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string())}, "alpha": spec.alpha, "k": ch.k,
                         "chunk": ch.knobs.kl_chunk, "eval_every": 50, "kbit_upcast": ch.knobs.upcast},
-            "eval": {"calibration": calibration, "teacher_loss": o.loss_before, "slim_loss": o.loss_after},
+            "eval": {"calibration": calibration, "teacher_loss": o.loss_before, "slim_loss": o.loss_after, "holdout": {"rows": HOLDOUT_ROWS}},
             "out": run_dir, "resume": resume, "stop_file": stop_file,
         });
         if !ch.knobs.head_ckpt {
@@ -1291,12 +1358,15 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
     fn cache(&mut self, n: u32, upto_general_tokens: u64) -> Result<Value> {
         self.round = n;
         let c = self.c;
-        let job = json!({
+        let mut job = json!({
             "job": "distill_cache", "teacher": {"repo": c.origin, "load": c.teacher_load}, "student": c.model, "model": {"family": c.family},
             "data": {"train": c.train, "tokens": c.tokens, "general": c.general}, "k": c.ch.k, "max_seq": c.ch.knobs.seq, "batch": 4, "chunk": 256, "seed": crate::general::SEED,
             "out": c.cache_dir, "stop_file": c.stop_file, "rows_key": c.rows_key, "shared_cache": true, "shared_dir": teacher_cache_dir(c.p),
             "upto_general_tokens": upto_general_tokens, "reuse_rows": true,
         });
+        if !c.general.is_null() {
+            job["holdout"] = json!({"rows": HOLDOUT_ROWS});
+        }
         let r = self.job(&job, "cache")?;
         if !r["stopped"].as_bool().unwrap_or(false) && n == 1 {
             let note = r["notes"].as_array().and_then(|a| a.first()).and_then(|x| x.as_str());
@@ -1320,7 +1390,7 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
                       "checkpointing": if k.checkpointing { "on" } else { "off" }, "optimizer": c.ch.optimizer, "student_b": c.student_b},
             "distill": {"mode": "cache", "cache": c.cache_dir, "teacher": {"repo": c.origin, "load": c.teacher_load}, "alpha": c.spec.alpha, "k": c.ch.k,
                         "chunk": k.kl_chunk, "eval_every": 50, "kbit_upcast": k.upcast},
-            "eval": {"calibration": c.calibration, "teacher_loss": c.o.loss_before, "slim_loss": c.o.loss_after},
+            "eval": {"calibration": c.calibration, "teacher_loss": c.o.loss_before, "slim_loss": c.o.loss_after, "holdout": {"rows": HOLDOUT_ROWS}},
             "rounds": {"index": t.n, "round_tokens": t.round_tokens, "general_from": t.general_from, "general_to": t.general_to, "s_start": t.s_start},
             "out": c.run_dir, "resume": resume, "stop_file": c.stop_file,
         });

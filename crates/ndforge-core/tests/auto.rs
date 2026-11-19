@@ -252,7 +252,8 @@ impl Effects for Mock {
         self.made.insert(name.clone());
         self.done.push(format!("heal {name} teacher={teacher_repo} tokens={} recipe={:?}", spec.tokens_m, spec.recipe));
         let mut summary = json!({"kd_first": 1.5, "kd_last": 0.5, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0,
-                                  "coverage": {"v": 1, "chat_rows": {"complete": 5, "cut": 1, "skipped": 0}, "notes": []}});
+                                  "coverage": {"v": 1, "chat_rows": {"complete": 5, "cut": 1, "skipped": 0}, "notes": []},
+                                  "holdout_loss_before": 2.9, "holdout_loss_after": 2.6, "teacher_holdout_loss": 2.1});
         let mut tokens_m = spec.tokens_m;
         if let Some(r) = &spec.rounds {
             let reason = self.rounds_stops.pop_front().unwrap_or_else(|| "cap".into());
@@ -627,6 +628,7 @@ fn a_healed_model_that_misses_a_gate_is_healed_again_with_40_million_more_tokens
     let rep: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("auto_report.json")).unwrap()).unwrap();
     assert_eq!((rep["status"].as_str(), rep["retries"].as_u64()), (Some("done"), Some(1)));
     assert!(rep["stages"].as_array().unwrap().iter().any(|s| s["coverage"]["chat_rows"]["cut"] == 1), "what the heal's rows cover is in the report: {rep}");
+    assert!(rep["stages"].as_array().unwrap().iter().any(|s| s["holdout_loss_after"] == 2.6 && s["teacher_holdout_loss"] == 2.1), "the held-out loss is in the report: {rep}");
     assert!(rep["stages"].as_array().unwrap().iter().all(|s| s["breakdown_line"].as_str().is_some_and(|l| l.contains("text layers") && l.contains("file total"))), "{rep}");
     let md = std::fs::read_to_string(dir.join("auto_report.md")).unwrap();
     assert!(md.contains("passed on the second heal") && md.contains("healed again") && md.contains("file total"), "{md}");

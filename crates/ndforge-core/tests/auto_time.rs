@@ -308,3 +308,24 @@ fn without_rounds_nothing_changes_in_the_estimate_or_the_spec() {
     assert_eq!(serde_json::from_str::<AutoSpec>(&with).unwrap().heal_rounds, rounds_spec(5).heal_rounds);
     assert!(rounds_spec(3).validate().is_err() && rounds_spec(5).validate().is_ok());
 }
+
+#[test]
+fn the_speed_test_rate_stands_in_for_the_training_history_at_nine_tenths_and_an_earlier_heal_wins() {
+    let train_min = |t: &TimeEstimate| find(t, "s2.heal").unwrap().parts.iter().find(|x| x.id == "train").unwrap().clone();
+    let mut bench = History::default();
+    bench.push("train_bench_tok_b_s", 21.0, 700.0 * 21.0);
+    let from_bench = est(&owner_spec(), &bench).1;
+    let mut heal = History::default();
+    heal.push("train_tok_b_s", 21.0, 700.0 * 21.0);
+    let from_heal = est(&owner_spec(), &heal).1;
+    let (b, h) = (train_min(&from_bench), train_min(&from_heal));
+    assert_eq!(b.basis, "your_history", "{b:?}");
+    assert!((b.minutes.0 / h.minutes.0 - 1.0 / 0.9).abs() < 0.01, "the speed test's rate less a tenth: {b:?} {h:?}");
+    assert!(find(&from_bench, "s1.heal").unwrap().note.as_deref().is_some_and(|n| n.contains("speed test of the loss settings")), "the page says where the number comes from");
+    // both: the earlier heal is the better evidence
+    let mut both = heal.clone();
+    both.push("train_bench_tok_b_s", 21.0, 1400.0 * 21.0);
+    assert_eq!(train_min(&est(&owner_spec(), &both).1).minutes, h.minutes);
+    // neither: the formula
+    assert_eq!(train_min(&est(&owner_spec(), &History::default()).1).basis, "formula");
+}

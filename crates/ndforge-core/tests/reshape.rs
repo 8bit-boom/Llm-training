@@ -1234,6 +1234,14 @@ if kind == "think_check":
     res = {{"main": main, "control": {{}}, "stopped": False, "cached": False, "suite_version": 1}}
     json.dump({{"key": {{}}, "result": res}}, open(cf, "w"))
     out(type="result", data=res); sys.exit(0)
+if kind == "distill" and job.get("bench"):
+    chunk = job["distill"]["chunk"]
+    keep = job["distill"].get("head_checkpoint") == "off"
+    if marker("oom-bench") and chunk == 512:
+        out(type="error", code="distill_oom", message="The graphics card ran out of memory at sequence length 1024."); sys.exit(1)
+    rate = {{64: 100.0, 128: 120.0, 256: 140.0, 512: 150.0}}.get(chunk, 90.0) * (1.1 if keep else 1.0)
+    out(type="result", data={{"tokens_per_s": rate, "peak_vram_mb": 20000 + chunk, "chunk": chunk, "head_checkpoint": not keep, "student_b": 21.1, "steps": job["bench"]["steps"], "tokens": 1000,
+                             "seconds": 10.0, "targets": "cache" if job["distill"].get("cache") else "synthetic", "stopped": False}}); sys.exit(0)
 if kind == "distill_cache" and job.get("upto_general_tokens") is not None:
     os.makedirs(job["out"], exist_ok=True)
     ip = os.path.join(job["out"], "index.json")
@@ -1850,6 +1858,9 @@ fn healing_uses_the_chosen_dataset_and_the_token_only_through_the_environment() 
     let h: serde_json::Value = serde_json::from_str(&h).unwrap();
     assert_eq!(h["coverage"]["chat_rows"]["cut"], 1, "heal.json keeps what the rows cover for the Heal card");
     assert_eq!(h["coverage"]["notes"][0], "a note");
+    // the held-out rows: the cache job asks for them (the general text is on) and the training job's evaluation names them
+    assert_eq!(jobs[0]["holdout"], json!({"rows": 64}));
+    assert_eq!(jobs[1]["eval"]["holdout"], json!({"rows": 64}));
     // without a saved token no variable is set
     ndforge_core::general::token_clear().unwrap();
     assert!(ndforge_core::envmgr::jobs::job_env(&jobs[0]).is_empty());
@@ -2942,4 +2953,63 @@ fn rows_key_of_a_local_teacher_follows_its_weight_files() {
     assert_ne!(a, b, "a shard of another size is another key");
     std::fs::write(teacher.join("model-00002.safetensors"), vec![0u8; 8]).unwrap();
     assert_ne!(b, rows_key(&train, 1000, &repo, "auto"), "a new shard is another key");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_speed_test_of_the_loss_settings_runs_one_worker_per_setting_and_a_setting_that_runs_out_of_memory_fails_only_its_row() {
+    use ndforge_core::reshape::heal_bench;
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    std::fs::write(d.path().join("oom-bench"), "").unwrap();
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    let spec: rruns::HealSpec = serde_json::from_value(json!({"tokens_m": 10})).unwrap();
+    let mut events = Vec::new();
+    let r = heal_bench::run(&p, "slim", &spec, Some(32.0), 4, Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
+    let rows = r["rows"].as_array().unwrap();
+    let ok = |id: &str| rows.iter().find(|x| x["id"] == id).unwrap_or_else(|| panic!("{id} in {rows:?}"));
+    // round 1: the settings as they are and the other chunks (the defaults of this 21 B student use chunk 128); each is one worker job with the bench key and nothing saved
+    let jobs = jobs_seen(d.path());
+    assert!(jobs.iter().all(|j| j["job"] == "distill" && j["bench"]["steps"] == 4 && j["bench"]["warmup"] == 3 && j["hyper"]["save_steps"] == 1_000_000), "{jobs:?}");
+    assert!(jobs.iter().all(|j| j["distill"].get("cache").is_none()), "no complete cache of the teacher's answers: synthetic targets");
+    assert_eq!(ok("current")["chunk"], 128);
+    assert!(rows.iter().any(|x| x["id"] == "chunk_64") && rows.iter().any(|x| x["id"] == "chunk_256") && rows.iter().any(|x| x["id"] == "chunk_512"));
+    // the chunk that ran out of memory fails alone; the others have their rates, and the best is the fastest that finished
+    assert_eq!((ok("chunk_512")["ok"].clone(), ok("chunk_512")["oom"].clone()), (json!(false), json!(true)));
+    assert_eq!(ok("chunk_256")["tokens_per_s"], 140.0);
+    assert_eq!(r["best"], "keep_logits_chunk_256", "{r}");
+    assert_eq!(r["best_settings"], json!({"kl_chunk": 256, "head_checkpoint": "off"}));
+    // round 2: keeping the output logits at the current chunk and at the best chunk of round 1 (they fit the 32 GB card by the estimate)
+    assert!(rows.iter().any(|x| x["id"] == "keep_logits_chunk_128" && x["ok"] == true) && ok("keep_logits_chunk_256")["head_checkpoint"] == false);
+    assert_eq!(ok("current")["vs_current"], 1.0);
+    assert!(events.iter().any(|e| e["kind"] == "heal_bench" && e["row"].is_object()) && events.iter().all(|e| e["kind"] == "heal_bench"));
+    // the file and the way back
+    assert_eq!(heal_bench::last(&p, "slim").unwrap()["best"], "keep_logits_chunk_256");
+    assert!(p.folder.join("benchmarks").join("heal-slim.json").is_file() && !p.folder.join("benchmarks").join("tmp-heal").exists());
+    // a card that is not known gets no round 2; a stop ends it with the rows so far
+    let no_card = heal_bench::run(&p, "slim", &spec, None, 4, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert!(no_card["rows"].as_array().unwrap().iter().all(|x| x["round"] == 1));
+    let stopped = heal_bench::run(&p, "slim", &spec, Some(32.0), 4, Arc::new(AtomicBool::new(true)), &mut |_| {}).unwrap();
+    assert_eq!(stopped["stopped"], true);
+}
+
+#[test]
+fn the_variants_are_pure_and_round_two_only_offers_what_fits() {
+    use ndforge_core::reshape::heal_bench::*;
+    let k = HealKnobs { seq: 1024, batch: 2, grad_accum: 16, checkpointing: true, rank: 32, kl_chunk: 128, qlora: true, upcast: false, head_ckpt: true };
+    let first = first_round(&k);
+    assert_eq!(first.iter().map(|v| v.chunk).collect::<Vec<_>>(), [128, 64, 256, 512]);
+    assert_eq!(first[0].id, "current");
+    let rows = vec![json!({"id": "current", "ok": true, "tokens_per_s": 100.0, "chunk": 128}), json!({"id": "chunk_512", "ok": true, "tokens_per_s": 130.0, "chunk": 512}), json!({"id": "chunk_64", "ok": false})];
+    assert_eq!(best_row(&rows).unwrap()["id"], "chunk_512");
+    let d = HealDims { layers: 40, hidden: 5120, vocab: 248_320 };
+    let more = second_round(&rows, &k, 16.0, &d, Some(32.0));
+    assert_eq!(more.iter().map(|v| (v.chunk, v.head_ckpt, v.round)).collect::<Vec<_>>(), [(128, false, 2), (512, false, 2)]);
+    assert!(second_round(&rows, &k, 16.0, &d, Some(8.0)).is_empty(), "does not fit a small card");
+    assert!(second_round(&rows, &k, 16.0, &d, None).is_empty(), "no known card");
+    assert!(second_round(&rows, &HealKnobs { head_ckpt: false, ..k.clone() }, 16.0, &d, Some(32.0)).is_empty(), "already kept");
+    assert!(best_row(&[json!({"ok": false})]).is_none());
 }

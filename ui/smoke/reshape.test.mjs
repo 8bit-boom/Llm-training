@@ -997,3 +997,50 @@ test("the Slim form: refitting the kept neurons is Expert, off, sent only when t
   b.run(`rs.tr.analysis = ${JSON.stringify({ variants: [{ tried: true, intermediate: 12288, label: "MLP 12,288, kept neurons refitted", loss: 2.3, better_both_halves: true, recon: { median_removed_share: 0.2 } }] })}`);
   assert.match(b.run("renderReshape()"), /error 2\.300 \(better than the plain cut in both halves\); it gives back 20 % of what the cut took/);
 });
+
+test("the Heal card: find the fastest loss settings runs, shows a row per setting with out-of-memory rows, and Use the fastest fills the settings", async () => {
+  const sent = [];
+  const m = thinModel();
+  const b = browser({ heal_bench_start: (a) => { sent.push(a); return null; }, heal_estimate: () => estOf() });
+  open(b, pageState({ made: [m] }));
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts())} }; state.settings.expert_mode = true`);
+  let html = b.run("renderReshape()");
+  assert.match(html, /Find the fastest loss settings/); assert.match(html, /id="hb-go" >Find the fastest/); assert.match(html, /id="hb-use" disabled/);
+  assert.match(html, /Nothing is assumed: these numbers are this computer's/);
+  b.run(`renderReshape(); wireReshape();`);
+  await b.els["hb-go"].onclick();
+  assert.equal(sent.length, 1); assert.equal(sent[0].name, m.name); assert.equal(typeof sent[0].spec, "object");
+  const rows = [{ id: "current", label: "Your settings (KL chunk 128)", ok: true, tokens_per_s: 1200, vs_current: 1, peak_vram_mb: 20480, chunk: 128, head_checkpoint: true },
+    { id: "chunk_512", label: "KL chunk 512", ok: false, oom: true, chunk: 512, head_checkpoint: true },
+    { id: "keep_logits_chunk_256", label: "Keep the output layer's logits, KL chunk 256", ok: true, tokens_per_s: 1500, vs_current: 1.25, peak_vram_mb: 25600, chunk: 256, head_checkpoint: false }];
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "heal_bench", index: 0, total: 3, name: rows[0].label })})`);
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "heal_bench", index: 0, total: 3, name: rows[0].label, row: rows[0] })})`);
+  b.run("state.settings.expert_mode = true");
+  html = b.run("renderReshape()");
+  assert.match(html, /Setting 1 of 3: Your settings/); assert.match(html, /<td>Your settings \(KL chunk 128\)<\/td><td>1,200<\/td><td>×1\.00<\/td><td>20\.0 GB<\/td><td>ok<\/td>/);
+  b.run(`onReshapeEvent(${JSON.stringify({ phase: "healbench", kind: "done", data: { rows, best: "keep_logits_chunk_256", best_settings: { kl_chunk: 256, head_checkpoint: "off" } } })})`);
+  b.run("state.settings.expert_mode = true");
+  html = b.run("renderReshape()");
+  assert.match(html, /<td>KL chunk 512<\/td><td>–<\/td><td>–<\/td><td>–<\/td><td>ran out of memory<\/td>/);
+  assert.match(html, /<tr class="best"><td>Keep the output layer(?:'|&#39;)s logits, KL chunk 256<\/td><td>1,500<\/td><td>×1\.25<\/td><td>25\.0 GB<\/td><td>fastest<\/td>/);
+  assert.match(html, /id="hb-use" >Use the fastest \(KL chunk 256, logits kept\)/);
+  b.run(`wireReshape()`);
+  await b.els["hb-use"].onclick();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(b.run("rs.hlSpec.kl_chunk"), 256); assert.equal(b.run("rs.hlSpec.head_checkpoint"), "off");
+  assert.equal(b.run("rsHealSpec().head_checkpoint"), "off");
+});
+
+test("the Heal card shows the held-out loss next to the one on your own data, and says why they differ", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  const metrics = [{ kind: "distill_eval", step: 0, calib_loss: 3.1, holdout_loss: 2.9 }, { kind: "distill_eval", step: 50, calib_loss: 2.4, holdout_loss: 2.6 }, { kind: "distill_eval", step: 60, calib_loss: 2.3 }];
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ metrics, heal: { status: "done", result: { holdout_rows: 64, holdout_loss_before: 2.9, holdout_loss_after: 2.6, teacher_holdout_loss: 2.1 } } }))} }`);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(healSeries().hold)")), [[0, 2.9], [50, 2.6]]);
+  const html = b.run("renderReshape()");
+  assert.match(html, /Held out \(64 general rows the healing never learned from\): error 2\.90 → 2\.60; the original has 2\.10/);
+  assert.match(html, /reads better than it is/);
+  b.run(`rs.hl.opts.heal = { status: "done", result: { calib_loss_after: 2.3 } }; rs.hl.opts.metrics = []`);
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hl-holdout"/);
+});

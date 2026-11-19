@@ -177,3 +177,18 @@ fn the_history_prefers_the_same_size_class_and_the_newest_samples() {
     }
     assert_eq!(h.pick("k", 10.0).unwrap().1, 5, "only the newest five");
 }
+
+#[test]
+fn a_speed_test_log_gives_its_own_rate_and_is_not_taken_for_a_training_run() {
+    // a speed test of the loss settings (`bench` in the job header) of a 21 B student at 700 tokens per second, followed in time by a real merge of a 21 B model: the merge must not
+    // turn the test into a training rate
+    let bench = log(json!({"job": "distill", "bench": {"steps": 12, "warmup": 3, "targets": "cache"}}), &[rec("heal_bench", 60.0, json!({"tokens": 42000.0, "tokens_per_s": 700.0, "student_b": 21.0, "chunk": 128, "head_checkpoint": true}))], &[]);
+    let merge = log(json!({"job": "distill_merge"}), &[rec("merge_total", 840.0, json!({"bytes": 42e9}))], &[]);
+    let h = History::from_texts(&[bench.clone(), merge.clone()]);
+    assert!((h.pick("train_bench_tok_b_s", 21.0).unwrap().0 - 14_700.0).abs() < 1.0);
+    assert!(h.pick("train_tok_b_s", 21.0).is_none(), "a speed test is not a heal");
+    // a real heal's log with a train stage still gives the training rate, bench or no bench elsewhere
+    let train = log(json!({"job": "distill"}), &[rec("load_student", 60.0, json!({"method": "qlora"})), rec("train", 6000.0, json!({"tokens": 4.2e6, "tokens_per_s": 700.0}))], &[]);
+    let both = History::from_texts(&[bench, train, merge]);
+    assert!((both.pick("train_tok_b_s", 21.0).unwrap().0 - 14_700.0).abs() < 1.0);
+}

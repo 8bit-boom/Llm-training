@@ -2372,12 +2372,34 @@ async function rsHealEstimate() {
 // the measured numbers of a healing run (saved ones, then the live ones of this session), as chart points
 function healSeries() {
   const ev = ((rs.hl && rs.hl.opts && rs.hl.opts.metrics) || []).concat((rs.hlRun && rs.hlRun.live) || []);
-  const seen = new Set(), kd = [], cal = [];
-  ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") cal.push([e.step, e.calib_loss]); });
-  return { kd, cal };
+  const seen = new Set(), kd = [], cal = [], hold = [];
+  ev.forEach((e) => { const k = e.kind + ":" + e.step + ":" + (e.kd ?? e.calib_loss); if (seen.has(k)) return; seen.add(k); if (e.kind === "distill_metric") kd.push([e.step, e.kd]); else if (e.kind === "distill_eval") { cal.push([e.step, e.calib_loss]); if (e.holdout_loss != null) hold.push([e.step, e.holdout_loss]); } });
+  return { kd, cal, hold };
 }
 
 // the Expert "Healing settings" section of the Heal card; null in a field of the spec = the automatic value, shown here from `kn`
+// "Find the fastest loss settings": short real steps of the healing loss with several settings on this computer (the loss is the same in all of them), one row per setting.
+function hbHtml(busy) {
+  const hb = rs.hb || {}, res = hb.result || hb.last, rows = hb.running ? (hb.rows || []) : (res && res.rows) || [];
+  const gb = (mb) => mb == null ? "–" : (mb / 1024).toFixed(1) + " GB";
+  const body = rows.map((r) => `<tr${res && res.best === r.id && !hb.running ? ` class="best"` : ""}><td>${esc(r.label)}</td><td>${r.ok ? Math.round(r.tokens_per_s).toLocaleString("en-US") : "–"}</td><td>${r.ok && r.vs_current != null ? "×" + r.vs_current.toFixed(2) : "–"}</td><td>${r.ok ? gb(r.peak_vram_mb) : "–"}</td><td>${r.ok ? (res && res.best === r.id && !hb.running ? "fastest" : "ok") : r.oom ? "ran out of memory" : "failed"}</td></tr>`).join("");
+  const best = res && res.best_settings && !hb.running ? res.best_settings : null;
+  return `<div id="hb-box"><h4>Find the fastest loss settings</h4>
+    <p class="dim small">Runs ${hb.steps || 12} real steps of the healing loss with the KL chunk 64 to 512 and, when it fits the card, with the output layer's logits kept (about a quarter of an hour in all). The loss is the same in every row; only speed and memory differ. Nothing is assumed: these numbers are this computer's. A real heal is a little slower (checkpoints, checks).</p>
+    <div class="row"><button class="secondary" id="hb-go" ${busy || hb.running || !rs.hl || !rs.hl.opts || rs.running ? "disabled" : ""}>Find the fastest</button> <button class="secondary" id="hb-stop" ${hb.running ? "" : "disabled"}>Stop</button>
+      <button class="secondary" id="hb-use" ${best && !busy ? "" : "disabled"}>Use the fastest${best ? ` (KL chunk ${best.kl_chunk}${best.head_checkpoint === "off" ? ", logits kept" : ""})` : ""}</button></div>
+    ${hb.running ? `<div class="stepline" aria-live="polite">${esc(hb.text || "Starting…")}</div>` : ""}${hb.err ? `<p class="err">${esc(hb.err)}</p>` : ""}
+    ${rows.length ? `<table class="tbl" id="hb-table"><tr><th>Setting</th><th>Tokens per second</th><th>Against yours</th><th>Peak memory</th><th></th></tr>${body}</table>` : ""}</div>`;
+}
+
+function onHealBenchEvent(p) {
+  const hb = rs.hb || (rs.hb = {});
+  if (p.kind === "heal_bench") { hb.text = `Setting ${p.index + 1} of ${p.total}: ${p.name}`; if (p.row) (hb.rows || (hb.rows = [])).push(p.row); }
+  else if (p.kind === "error") { hb.running = false; hb.err = p.text; }
+  else if (p.kind === "done") { hb.running = false; hb.err = null; if (p.data) { hb.result = p.data; hb.last = p.data; } }
+  if (page === "reshape") render();
+}
+
 function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
   const d = busy ? "disabled" : "", v = (x, auto) => (x ?? auto);
   const sel = (id, cur, opts) => `<select id="${id}" ${d}>${opts.map(([val, label]) => `<option value="${val}" ${String(cur) === String(val) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
@@ -2401,6 +2423,7 @@ function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
     ${(() => { const on = sp.head_checkpoint === "off", gb = headOff && headOff.head_off_gb != null ? headOff.head_off_gb : null, fits = headOff ? headOff.head_off_fits : null; const off = busy || (!on && fits === false);
       return `<label class="opt"><input type="checkbox" id="hl-headkeep" ${on ? "checked" : ""} ${off ? "disabled" : ""}> Keep the output layer's logits for the backward pass (faster, the same learning; about <span id="hl-headkeep-gb">${gb != null ? gb : "several"}</span> GB more memory)${!on && fits === false ? " - does not fit this card" : ""}</label>
     <p class="dim small">Normally the logits of every chunk are made again in the backward pass to save memory. Keeping them stores about tokens × 250,000 × 10 bytes (about 20 GB for 8,192 tokens), so it is offered only when the estimate says it fits. It changes nothing about what is learned and keeps the saved answers and the learning done so far; how much faster it is is measured by "Find the fastest loss settings", not assumed. If healing runs out of memory with it on, the program turns it off first.</p>`; })()}
+    ${hbHtml(busy)}
     <p class="dim small">A different sequence length, LoRA size or top-k means the original answers again or the learning starts again; the other settings keep what was saved.</p>
     <div class="row"><button class="secondary" id="hl-reset" ${d}>Reset to safe defaults</button></div></details>`;
 }
@@ -2517,10 +2540,12 @@ function healCard(m, pair) {
   const busy = rs.running || rs.testing || (run && run.running);
   const prog = run && run.running ? `<div class="stepline" aria-live="polite">${esc(HEAL_STEPS[run.step] || "Starting…")}${run.text ? " · " + esc(run.text) : ""}</div>${run.progress != null ? `<progress max="1" value="${run.progress}"></progress>` : ""}` : "";
   const series = healSeries();
-  const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true);
+  const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true) + lineChart(series.hold, "Error on general text the healing never learned from (held out)", true);
   const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : pair ? `<p class="dim small">Nothing is recorded about how well this model answered before. The error on your data is measured at the start of healing and shown in the chart.</p>` : "";
   const usedG = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
-  const used = usedG + coverageHtml(h.heal && h.heal.coverage);
+  const hres = (h.heal && h.heal.result) || {};
+  const holdP = hres.holdout_loss_after != null ? `<p class="dim small" id="hl-holdout">Held out (${hres.holdout_rows || "some"} general rows the healing never learned from): error ${hres.holdout_loss_before != null ? (+hres.holdout_loss_before).toFixed(2) + " → " : ""}${(+hres.holdout_loss_after).toFixed(2)}${hres.teacher_holdout_loss != null ? `; the original has ${(+hres.teacher_holdout_loss).toFixed(2)}` : ""}. The error on your own data above is measured on text the healing also learns from, so it reads better than it is.</p>` : "";
+  const used = usedG + coverageHtml(h.heal && h.heal.coverage) + holdP;
   const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
   const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
   const resume = st === "stopped" || st === "failed";
@@ -3774,6 +3799,7 @@ function rsAfterState() {
 async function rsLoadHeal(name) {
   rs.hl = { name, opts: null };
   try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
+  try { const last = await invoke("heal_bench_last", { name }); rs.hb = { ...(rs.hb || {}), last: last || null }; } catch (e) { /* no earlier speed test */ }
   if (page === "reshape") render();
   if (rs.hl && rs.hl.opts) rsHealEstimate();
 }
@@ -3798,6 +3824,7 @@ function onReshapeEvent(p) {
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
+  if (p.phase === "healbench") return onHealBenchEvent(p);
   if (p.phase === "try") return onTryEvent(p);
   if (p.phase === "search") return onSearchEvent(p);
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
@@ -3933,6 +3960,18 @@ function wireReshape() {
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
   hv("hl-headkeep", (e) => { hs.head_checkpoint = e.checked ? "off" : null; });
+  const hbGo = $("hb-go");
+  if (hbGo) hbGo.onclick = async () => {
+    rs.hb = { ...(rs.hb || {}), running: true, rows: [], text: "Starting…", err: null, result: null };
+    render();
+    try { await invoke("heal_bench_start", { name: rs.hl.name, spec: rsHealSpec() }); } catch (e) { rs.hb.running = false; rs.hb.err = String(e); render(); }
+  };
+  const hbStop = $("hb-stop"); if (hbStop) hbStop.onclick = () => { if (rs.hb) rs.hb.text = "Stopping…"; invoke("heal_stop"); render(); };
+  const hbUse = $("hb-use");
+  if (hbUse) hbUse.onclick = () => {
+    const b = rs.hb && (rs.hb.result || rs.hb.last) && (rs.hb.result || rs.hb.last).best_settings; if (!b) return;
+    hs.kl_chunk = b.kl_chunk; hs.head_checkpoint = b.head_checkpoint === "off" ? "off" : null; render(); rsHealEstimate();
+  };
   on("hl-reset", () => { Object.assign(hs, HEAL_AUTO); render(); rsHealEstimate(); });
   on("hl-safer", () => { if (!healUseSafer()) return; render(); rsHealEstimate(); });
   hv("hl-lr", (e) => { const v = parseFloat(e.value); hs.lr = Number.isFinite(v) && v >= 1e-6 && v <= 1e-2 ? v : 1e-4; });
