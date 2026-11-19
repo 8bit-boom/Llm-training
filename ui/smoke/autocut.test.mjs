@@ -445,3 +445,55 @@ test("a cut chosen in Try first's search is shown, sent as the spec's cut, and r
   open(b, {}, `ac.pin = ${JSON.stringify({ blocks: [3], intermediate: 10752, loss: 2.0, search_id: "s1", think: { verdict: "kept" } })}`);
   assert.match(card(b), /its thinking was checked/); assert.match(card(b), /skips the thinking check before healing/);
 });
+
+// ---- healing in rounds (experimental): the preset, the knob, the plan text and the sub-status
+
+const roundsTime = (id, best, worst) => ({ id, label: "heal", minutes: [best[0], worst[1]], basis: "formula", note: null, parts: [], rounds: { round_m: 5, first_check_m: 10, cap_m: 40, rounds: [2, 8], per_round: [250, 400], overhead_share: [0.08, 0.15], best, worst, thinking: true } });
+
+test("the early preset sets heal_rounds, the spec carries it, and every other preset turns it off again", () => {
+  const b = browser();
+  open(b, {}, `acDefaults(); acApplyPreset("early")`);
+  assert.deepEqual(plain(b.run("acSpec().heal_rounds")), { round_m: 5, check: "quick" });
+  assert.equal(b.run("acPresetNow()"), "early");
+  assert.match(card(b), /name="ac-preset" value="early" checked/);
+  assert.match(card(b), /Stop early when good \(periodic checks, experimental\)/);
+  b.run(`acApplyPreset("balanced")`);
+  assert.equal("heal_rounds" in plain(b.run("acSpec()")), false);
+  assert.equal(b.run("acPresetNow()"), "balanced");
+  // a knob choice of the program's table sets it too, and the knob shows its best and worst delta
+  const knob = { knob: "heal_rounds", label: "Heal in rounds, stop when good (experimental)", risk: "Experimental.", options: [
+    { label: "Off: one heal on the whole budget (recipe)", set: { heal_rounds: null }, current: true, total_h: [30, 60], delta_min: [0, 0] },
+    { label: "5 M rounds, quick checks", set: { heal_rounds: { round_m: 5, check: "quick" } }, current: false, total_h: [12, 66], delta_min: [-1080, 360], note: "The range is: the first check passes to every round to the cap." }] };
+  b.run(`ac.plan = ${JSON.stringify(plan({ speed: { current_preset: "balanced", default_preset: "balanced", total_h: [30, 60], presets: [], knobs: [knob] } }))}; ac.advOpen = true`);
+  const html = card(b);
+  assert.match(html, /data-acknob="heal_rounds"/);
+  assert.match(html, /5 M rounds, quick checks/);
+  assert.match(html, /The range is: the first check passes to every round to the cap\./);
+});
+
+test("the plan says how long the rounds take, and the warnings come once in the plan's words", () => {
+  const b = browser();
+  const pl = plan({ time: { steps: [roundsTime("s1.heal", [600, 1000], [3000, 4600]), roundsTime("s2.heal", [700, 1100], [5000, 8000])], total_h: [20, 130] } });
+  open(b, {}, `acDefaults(); acApplyPreset("early"); ac.plan = ${JSON.stringify(pl)}`);
+  const html = card(b);
+  assert.match(html, /Stage 1: Healing in 5 M rounds: about 10-17 h if the first check passes, up to 50-77 h\./);
+  assert.match(html, /Stage 2: Healing in 5 M rounds: about 12-18 h if the first check passes, up to 83-133 h\./);
+  assert.equal((html.match(/A Quick check asks 16 questions: one or two answers decide pass or fail\. That is why the merged model is checked again at the end; if it fails there, healing goes on and then needs two passed checks in a row\./g) || []).length, 1);
+  assert.equal((html.match(/The checks during healing look at the model as it is trained \(4-bit with the learning on top\); the merged model can score a little differently\. The merged check decides\./g) || []).length, 1);
+  assert.equal((html.match(/Experimental: whether healing in rounds ends as good as one long heal is not known yet\./g) || []).length, 1);
+  // without rounds none of it is there
+  b.run(`acApplyPreset("balanced")`);
+  assert.doesNotMatch(card(b), /Healing in 5 M rounds|id="ac-rounds-plan"/);
+});
+
+test("during the heal the sub-status and the round chips come from the auto_progress event", () => {
+  const b = browser();
+  open(b, {}, `ac.run = ${JSON.stringify(run("running"))}; ac.running = true`);
+  const snap = { kind: "auto_progress", phase: "auto", pct: 41.2, state: "live", elapsed_s: 7200, left_s: [3600, 36000], stage: { n: 1, of: 2 },
+    step: { id: "s1.heal", label: "Stage 1 of 2: heal in rounds", index: 7, count: 14, pct: 38.0, part: "train", sub: "Round 3 of up to 8 · 10 M of 40 M tokens · last check: fail (closed 69 %, loops 13 %) · Training: step 12 of 38", rounds: { n: 3, max: 8, tokens_m: 10, cap_m: 40, stopped: false } } };
+  b.run(`ac.run.progress = ${JSON.stringify(snap)}`);
+  const html = b.run("acProgressBlock(ac.run, true, Date.now())");
+  assert.match(html, /id="ac-sub"[^>]*>Round 3 of up to 8 · 10 M of 40 M tokens · last check: fail \(closed 69 %, loops 13 %\)/);
+  const chips = [...html.matchAll(/ac-rchip-(done|now|next)/g)].map((m) => m[1]);
+  assert.deepEqual(chips, ["done", "done", "now", "next", "next", "next", "next", "next"]);
+});

@@ -2815,6 +2815,23 @@ function acKnobDelta(pl, knob, labelStart) {
   return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
+// "Healing in 5 M rounds: about A-B h if the first check passes, up to C-D h." for every stage, and the warnings once (the plan's own words)
+function acRoundsPlan(pl) {
+  if (!pl || !pl.time || !ac.sp.hr) return "";
+  const rows = (pl.time.steps || []).filter((x) => x.rounds && /\.heal$/.test(x.id));
+  if (!rows.length) return "";
+  const h = (m) => (m / 60).toFixed(0);
+  const lines = rows.map((x) => { const r = x.rounds; return `<li data-acrounds="${esc(x.id)}">${rows.length > 1 ? `Stage ${esc(x.id.slice(1, x.id.indexOf(".")))}: ` : ""}Healing in ${r.round_m} M rounds: about ${h(r.best[0])}-${h(r.best[1])} h if the first check passes, up to ${h(r.worst[0])}-${h(r.worst[1])} h.</li>`; }).join("");
+  const warn = (id, t) => `<div class="warn small" id="${id}">${esc(t)}</div>`;
+  return `<div id="ac-rounds-plan"><ul class="small">${lines}</ul>${ac.thinking ? warn("ac-quick-noise", HL_QUICK_NOISE) + warn("ac-adapter-note", HL_ADAPTER_NOTE) : ""}${warn("ac-rounds-experimental", HL_EXPERIMENTAL)}</div>`;
+}
+// the chips of the rounds of the heal that runs: done, in work, to come
+function acRoundChips(st) {
+  const r = st && st.rounds; if (!r || !r.max) return "";
+  const chips = Array.from({ length: r.max }, (_, i) => { const state = r.stopped || i < r.n - 1 ? "done" : i === r.n - 1 ? "now" : "next"; return `<span class="tag ac-rchip ac-rchip-${state}" title="Round ${i + 1}">${i + 1}</span>`; }).join(" ");
+  return `<div class="ac-rchips small" id="ac-rchips">${chips}</div>`;
+}
+
 function autoCard() {
   const ins = acIns();
   if (!rs.state) return "";
@@ -2826,7 +2843,7 @@ function autoCard() {
   const lock = live ? "disabled" : "";
   const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
     ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
-  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") : "";
+  const notes = pl ? pl.blockers.map((b) => `<div class="err">${esc(b)}</div>`).join("") + pl.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") + acRoundsPlan(pl) : "";
   const steps = run && run.steps ? `<ol class="stepper" id="ac-steps">${run.steps.map((x) => `<li class="ac-${esc(x.status)}" data-acstep="${esc(x.id)}"><span>${AC_ICON[x.status] || "○"}</span> ${esc(x.label)} <span class="tag ac-chip ac-chip-${esc(x.status)}">${esc(AC_CHIP[x.status] || x.status)}</span>${acStepFig(x) ? ` <span class="dim small ac-fig">${esc(acStepFig(x))}</span>` : ""}${x.note ? ` <span class="dim small">${esc(x.note)}</span>` : ""}</li>`).join("")}</ol>` : "";
   const status = run ? `<p><strong id="ac-status">${esc(AC_STATUS[run.status] || run.status)}</strong>${run.error ? `: ${esc(run.error)}` : ""} <span class="dim small">${esc(run.id)}</span></p>` : "";
   const ended = run && ["done", "gates_failed", "failed"].includes(run.status);
@@ -2981,7 +2998,7 @@ function acProgressBlock(run, live, nowMs) {
   const pct = Math.round(pr.pct), st = pr.step && pr.step.id ? pr.step : null;
   const head = live ? `${pct} % · ${acDuration((pr.elapsed_s || 0) / 3600)} so far · ${acProgLeft(pr, nowMs)}` : `${run.status === "done" ? "Finished" : "Stopped at " + pct + " %"} · ${acDuration((pr.elapsed_s || 0) / 3600)} spent`;
   const chip = pr.stage && pr.stage.of > 1 ? `<span class="tag ac-stage" id="ac-stagechip">Stage ${pr.stage.n} of ${pr.stage.of}</span> ` : "";
-  const sub = live && st ? `<div class="ac-substep">${st.sub ? `<div class="stepline" aria-live="polite" id="ac-sub">${esc(st.sub)}</div>` : ""}<progress max="100" value="${st.pct}" id="ac-stepbar"></progress> <span class="dim small">${esc(st.label)} (step ${st.index} of ${st.count})</span></div>` : "";
+  const sub = live && st ? `<div class="ac-substep">${st.sub ? `<div class="stepline" aria-live="polite" id="ac-sub">${esc(st.sub)}</div>` : ""}<progress max="100" value="${st.pct}" id="ac-stepbar"></progress> <span class="dim small">${esc(st.label)} (step ${st.index} of ${st.count})</span>${acRoundChips(st)}</div>` : "";
   const back = pr.retry_added_min ? `<p class="dim small" id="ac-retrynote">The bar stepped back once: a thinking check failed and the stage is healed again (about ${acDuration(pr.retry_added_min / 60)} more).</p>` : "";
   const cal = live && pr.calibration && Math.abs(pr.calibration - 1) >= 0.15 ? `<p class="dim small" id="ac-calnote">This computer is running ${pr.calibration > 1 ? "slower" : "faster"} than the plan so far (${pr.calibration.toFixed(2)} times); the steps still to come are counted that way.</p>` : "";
   return `<div class="ac-progress" id="ac-progress"><div class="ac-head">${chip}<strong id="ac-overall-text">${esc(head)}</strong></div>
