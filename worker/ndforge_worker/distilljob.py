@@ -587,10 +587,12 @@ def _file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, version: int = 2) -> str:
+def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, version: int = 2, engine_id: dict | None = None) -> str:
     """The folder name of the shared cache these rows belong to: the teacher (its folder and config), the tokenizer, k, the length, how the teacher is loaded, the general text
     WITHOUT its share (the share is the budget: a bigger budget only adds rows), the seed, the model family and the project's training file.
-    Version 2 adds the identity of the teacher's weight files (`safetensors_io.weights_manifest`); version 1 is the id older caches were saved under."""
+    Version 2 adds the identity of the teacher's weight files (`safetensors_io.weights_manifest`); version 1 is the id older caches were saved under.
+    `engine_id` (only for the vLLM teacher: `vllmcache.identity`: engine version, teacher quantization, the original's repo and weights) is part of the id when given, so a vLLM cache never
+    shares a store with the standard (Hugging Face, 4-bit) teacher; without it the id is exactly what it always was."""
     data_cfg = cfg.get("data") or {}
     g = data_cfg.get("general")
     used = bool(g) and float(g.get("share", 0) or 0) > 0
@@ -602,18 +604,22 @@ def shared_store_id(cfg: dict, teacher_dir, student, k: int, max_seq: int, seed:
     if int(version) >= 2:
         ident["v"] = 2
         ident["teacher_weights"] = safetensors_io.weights_manifest(teacher_dir)
+    if engine_id:
+        ident["engine_id"] = engine_id
     return hashlib.sha256(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
 
 ADOPT_NOTE = ("These answers were made before the program checked the original's weight files; if you replaced them in place, delete the saved answers.")
 
 
-def choose_store(base, cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, meta: dict, hashes: list):
+def choose_store(base, cfg: dict, teacher_dir, student, k: int, max_seq: int, seed: int, meta: dict, hashes: list, engine_id: dict | None = None):
     """(folder, note) of the shared cache for these rows. The id of the current version first; when no store of that id exists yet but one made under the old id (before the
     weights were part of it) does, that store is adopted once: it gets `teacher_weights` in its index and a note says so. An old store whose index already names other weights is
     not used."""
     base = Path(base)
-    new_id = shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 2)
+    new_id = shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 2, engine_id)
+    if engine_id:                                       # a vLLM cache has no older id to adopt from
+        return pick_store(base, new_id, meta, hashes), None
     if read_cache_index(base / new_id) is None:
         old_dir = base / shared_store_id(cfg, teacher_dir, student, k, max_seq, seed, 1)
         idx = read_cache_index(old_dir)
@@ -645,7 +651,7 @@ def store_extends(folder, meta: dict, hashes: list) -> bool:
     old = read_cache_index(folder)
     if old is None:
         return True
-    if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len")):
+    if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len", "engine", "teacher_quant", "teacher_origin")):
         return False
     if old.get("teacher_weights") and meta.get("teacher_weights") and old["teacher_weights"] != meta["teacher_weights"]:
         return False
@@ -763,10 +769,12 @@ def length_order(window: list) -> list:
     return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
 
 
-def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int, teacher_dir=None) -> dict:
-    """What index.json says about a teacher cache (the first eight keys decide `cache_matches`)."""
+def cache_meta(cfg: dict, rows: list, stats: dict, student, k: int, max_seq: int, teacher_dir=None, engine_id: dict | None = None) -> dict:
+    """What index.json says about a teacher cache (the first eight keys decide `cache_matches`). `engine_id` (vLLM teacher only) adds `engine`, `teacher_quant` and `teacher_origin`,
+    which `cache_matches` and `store_extends` compare too: a cache made by another engine or another teacher quantization is never taken over."""
     gen = (cfg.get("data") or {}).get("general")
     extra = {"teacher_weights": safetensors_io.weights_manifest(teacher_dir)} if teacher_dir else {}
+    extra.update(engine_id or {})
     return {**extra, "teacher": cfg["teacher"]["repo"], "k": k, "rows": len(rows), "data_hash": data_hash(rows), "tokenizer_hash": tokenizer_hash(student), "max_len": max_seq,
             "project_rows": stats["project_rows"], "general_rows": stats["general_rows"],
             "general_key": generaltext.general_key(gen, (gen or {}).get("share", 0), int(cfg.get("seed", 3407))),
@@ -861,21 +869,37 @@ def run_cache(cfg: dict) -> int:
         hold_n = int((cfg.get("holdout") or {}).get("rows", 0) or 0) if isinstance(cfg.get("holdout"), dict) else 0
         rows, stats = build_rows(tok, cfg["data"], cfg["model"].get("family", "generic"), max_seq, int(cfg.get("seed", 3407)), hold_n)
     hold = stats.pop("holdout_rows", None) or []
-    meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir)
+    from . import vllmcache
+    veng = None                                         # the vLLM teacher (job key `engine: {"kind": "vllm"}`, off when absent): its identity is part of the cache's
+    if vllmcache.wanted(cfg):
+        try:
+            veng = vllmcache.identity(cfg, cfg["teacher"]["repo"], teacher_dir)
+        except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
+            if (cfg.get("engine") or {}).get("required"):
+                raise ReshapeError(f"vLLM was required for the teacher's answers but cannot be used: {exc}") from None
+            protocol.log(f"vLLM is not used for the teacher's answers: {exc} The standard teacher is used.")
+    meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir, veng)
     upto = cfg.get("upto_general_tokens")
     target = len(rows) if upto is None else rows_upto(rows, upto)
     legacy = read_cache_index(out)
     adopt_note = None
-    if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
-        # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
-        hashes = row_hashes(rows)
-        store, adopt_note = choose_store(cfg["shared_dir"], cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407)), meta, hashes)
-        if adopt_note:
-            protocol.log(adopt_note)
-        writer = SharedCacheWriter(store, out, meta, hashes, int(cfg.get("part_tokens", 262144)))
-        protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({writer.done_rows} of {len(rows)} rows are already there).")
-    else:
-        writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
+    hashes = row_hashes(rows) if cfg.get("shared_cache") and cfg.get("shared_dir") else None
+
+    def open_writer(meta: dict, engine_id: dict | None):
+        nonlocal adopt_note
+        part_tokens = int(cfg.get("part_tokens", 262144))
+        if cfg.get("shared_cache") and cfg.get("shared_dir") and not (legacy and "store" not in legacy and legacy.get("parts")):
+            # parts in the shared folder, this model's own index and rows next to it (see "the shared cache")
+            store, note = choose_store(cfg["shared_dir"], cfg, teacher_dir, student, k, max_seq, int(cfg.get("seed", 3407)), meta, hashes, engine_id)
+            adopt_note = adopt_note or note
+            if note:
+                protocol.log(note)
+            w = SharedCacheWriter(store, out, meta, hashes, part_tokens)
+            protocol.log(f"The teacher's answers are kept in the shared folder {store.name} ({w.done_rows} of {len(rows)} rows are already there).")
+            return w
+        return CacheWriter(out, meta, part_tokens)
+
+    writer = open_writer(meta, veng)
     if not again:
         save_rows(out, rows)
         if hold:
@@ -909,6 +933,27 @@ def run_cache(cfg: dict) -> int:
     if free < need * 1.05:
         protocol.error("disk_full", f"The teacher's answers need {need / 1e9:.1f} GB in {out}; {free / 1e9:.1f} GB free.")
         return 1
+    if veng:
+        outcome, note = _vllm_teacher(cfg, writer, rows, out, meta, teacher_dir, k, max_seq, target, stop_file, result)
+        if outcome == "done":
+            result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), **counts())
+            protocol.result(result)
+            return 0
+        if outcome == "stopped":
+            result.update(stopped=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), **counts())
+            protocol.result(result)
+            return 0
+        # the vLLM teacher failed (and was not required): the standard teacher answers the rest, into a cache of ITS OWN identity (never mixed with the vLLM rows)
+        writer.close()
+        meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir)
+        writer = open_writer(meta, None)
+        rows_before = writer.done_rows
+        protocol.log(note)
+        result["notes"].append(note)
+        if writer.done_rows >= target:
+            result.update(reused=True, bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), **counts())
+            protocol.result(result)
+            return 0
     est = sum(r.nbytes for r in safetensors_io.list_tensors(teacher_dir).values())
     mode = reshapejob._choose_load(cfg["teacher"].get("load", "auto"), est)
     protocol.progress("cache", 0.0, f"Loading the original model ({mode})")
@@ -992,6 +1037,42 @@ def run_cache(cfg: dict) -> int:
     result.update(bytes=_dir_bytes(writer.dir), seconds=round(time.monotonic() - started, 1), tokens_per_s=round(tps, 1), **counts())
     protocol.result(result)
     return 0
+
+
+def _vllm_teacher(cfg: dict, writer, rows: list, out, meta: dict, teacher_dir, k: int, max_seq: int, target: int, stop_file, result: dict):
+    """The vLLM teacher answers the rows after `writer.done_rows` up to `target` (vllmcache.run_chunk). ("done" | "stopped" | "fallback", note). A failure is a "fallback" with a plain
+    note (the heal goes on with the standard teacher) unless the job says `engine.required`; then it is an error. The record of what happened goes to `result["teacher_engine"]`."""
+    from . import vllmcache
+    eng = cfg.get("engine") or {}
+    check = eng.get("teacher_check") or {}
+    rec = {"engine": meta.get("engine"), "teacher_quant": meta.get("teacher_quant"), "used": True, "fallback": False, "teacher_check": check.get("verdict")}
+    result["teacher_engine"] = rec
+    problem = None
+    if str(check.get("verdict") or "").lower() == "different":
+        problem = "The check of the vLLM teacher says it is a different teacher than the standard one, so it is not used."
+    else:
+        if not check.get("verdict"):
+            protocol.log("The vLLM teacher was not checked against the standard teacher yet (job vllm_teacher_check): its answers are used as they are.")
+            rec["unchecked"] = True
+        try:
+            r = vllmcache.run_chunk(cfg, writer, out, meta, cfg["teacher"]["repo"], teacher_dir, writer.done_rows, target, k, max_seq, stop_file)
+            rec.update({kk: r.get(kk) for kk in ("startup_seconds", "load_seconds", "tokens", "tokens_per_s", "route", "reason", "load_phases", "timings", "stage_seconds", "rows")})
+            writer.flush()
+            result["notes"] += r.get("notes") or []
+            if r.get("stopped"):
+                return "stopped", ""
+            if writer.done_rows < target:
+                problem = f"vLLM stopped after {writer.done_rows} of {target} rows."
+            else:
+                if r.get("tokens_per_s"):
+                    result["tokens_per_s"] = r["tokens_per_s"]
+                return "done", ""
+        except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
+            problem = str(exc)
+    rec.update(used=False, fallback=True, problem=problem)
+    if eng.get("required"):
+        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}")
+    return "fallback", f"vLLM could not make the teacher's answers ({problem}) The standard teacher makes them instead."
 
 
 def _dir_bytes(folder) -> int:

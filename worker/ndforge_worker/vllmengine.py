@@ -57,10 +57,14 @@ KINDS = ("docker", "docker_wsl", "wslc", "wsl", "url")
 WSLC_TEMPLATES = {"run": "wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}",
                   "stop": "wslc stop {name}", "remove": "wslc remove {name}", "logs": "wslc logs {name}", "list": "wslc list", "pull": "wslc pull {image}",
                   "gputest": "wslc run --rm {gpu_flag} {test_image} nvidia-smi",
-                  "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04"}
+                  "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04",
+                  # GUESS (docker-like; the syntax of `wslc cp` / `wslc exec` is NOT yet seen: the self-test captures `wslc cp --help` and `wslc exec --help`). Used by the teacher cache (vllmcache.py).
+                  "cp_in": "wslc cp {src} {name}:{dst}", "cp_out": "wslc cp {name}:{src} {dst}", "exec": "wslc exec {name} {args}",
+                  "run_idle": "wslc run -d --rm --name {name} {gpu_flag} --shm-size {shm} -v {model_dir}:/models {env} --entrypoint sleep {image} infinity"}
 WSLC_HELP_COMMANDS = (["wslc", "--version"], ["wslc", "info"], ["wslc", "--help"], ["wslc", "run", "--help"], ["wslc", "system", "--help"], ["wslc", "container", "--help"],
                       ["wslc", "stop", "--help"], ["wslc", "remove", "--help"], ["wslc", "list", "--help"], ["wslc", "logs", "--help"], ["wslc", "pull", "--help"],
-                      ["wslc", "volume", "--help"], ["wslc", "volume", "create", "--help"], ["wslc", "network", "--help"], ["wslc", "registry", "--help"])
+                      ["wslc", "volume", "--help"], ["wslc", "volume", "create", "--help"], ["wslc", "network", "--help"], ["wslc", "registry", "--help"],
+                      ["wslc", "cp", "--help"], ["wslc", "exec", "--help"])
 HELP_LIMIT = 8000
 KIND_NAMES = {"docker": "Docker Desktop", "docker_wsl": "Docker inside WSL", "wslc": "WSLc (WSL 3.x containers)"}
 MIN_WSL = (2, 7, 3)                                     # from the research report (the CUDA-graph crash fix); newer, 3.x included, is assumed fine

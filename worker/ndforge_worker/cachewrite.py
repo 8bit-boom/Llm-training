@@ -35,7 +35,7 @@ def cache_matches(index: dict, expect: dict) -> bool:
     """True when the saved teacher answers belong to this data, tokenizer, length, k and teacher"""
     if index.get("teacher_weights") and expect.get("teacher_weights") and index["teacher_weights"] != expect["teacher_weights"]:
         return False                                    # an older cache without the field is accepted as before
-    return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len", "general_key", "general_rows"))
+    return all(index.get(k) == expect.get(k) for k in ("teacher", "k", "rows", "data_hash", "tokenizer_hash", "max_len", "general_key", "general_rows", "engine", "teacher_quant", "teacher_origin"))
 
 
 class CacheWriter:
