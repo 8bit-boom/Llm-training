@@ -32,6 +32,15 @@ or `wsl.exe` on Windows does not end the container. The app only touches contain
 Models: prefer a NAMED volume (`ndforge-vllm-hf`, the default for a Hub id) or a folder inside the WSL filesystem. A folder on a Windows drive (`/mnt/c/...`) goes through a slow
 9p share; the self-test report warns when your model folder is there.
 
+## In the app (step 3)
+
+- **Training setup, "vLLM engine (experimental)"**: the switch (off), the way to run it (auto / docker / docker in WSL / WSLc / WSL / url), the pinned image (`vllm/vllm-openai:v0.34.0`), the WSL
+  distribution and folder, the Docker volume for models (`ndforge-vllm-*` only), an optional model folder, the pre-quantized original (`cyankiwi/Qwen3.8-27B-AWQ-INT4`), the round-check switch (off) and
+  the WSLc templates. "Look for the engine" asks `docker version`, `wsl.exe -- docker version`, `wslc --version`, a vLLM install in WSL, `wsl --version` and `nvidia-smi`; it starts and installs
+  nothing and prints plain install text when nothing is found (Docker Desktop or Docker in WSL or WSLc or a vLLM environment; Windows driver 580 or newer; about 60 GB of disk).
+- **Thinking check card**: the engine choice and the separate vLLM table (see docs/THINKING_CHECK.md).
+- **Before a vLLM check** the checklist asks: an engine is there, the card is free (nothing else above 2 GB), driver and WSL not too old (versions are compared as numbers; unreadable = "unknown, continuing").
+
 ## WSLc (WSL 3.x containers)
 
 What we know, from the owner's `wslc --help` and `wslc run --help` (3.0.x): the global option `--session`; top-level commands `container image network registry settings system volume attach build cp create exec events export images import info inspect kill list load login logout logs pull push remove restart rmi run save start stats stop tag version`. `wslc run [options] <image> [<command>] [<arguments>...]` has `-d/--detach`, `--gpus` ("Add GPU devices to the container ('all' to pass all GPUs)"), `-v/--volume`, `--mount`, `-p/--publish`, `--name`, `--rm`, `-e/--env`, `--shm-size`, `--pull (always|missing|never)`, `--entrypoint`, `--network`, and more. **There is no `--ipc` option** (docker's `--ipc=host` does not exist here): the shared memory vLLM needs is `--shm-size` (default 16g).

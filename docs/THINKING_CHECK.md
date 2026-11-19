@@ -132,3 +132,13 @@ Stop asks the worker to end (a STOP file) and, after a grace period, ends the wo
 `ThinkSpec.target = "round"` with `round: n` checks the student of the heal (`heal_config.json`'s model) with `distill/run/rounds/r<n>/adapter` put on top and **not merged**: the job carries `adapter` and `double_quant`
 (and a `load` that follows how the student was trained). The result is kept in `think_check/round-r<n>.<quick|full>.json`; the cache key has a content hash of the adapter, and only when there is one (the keys of every other check
 are unchanged). It looks at the model as it is trained; the merged model can score a little differently (`docs/HEAL_ROUNDS.md`).
+
+## The vLLM engine (experimental, off by default)
+
+> Built from a research report, not yet run on this PC. Run the vLLM self-test first (docs/VLLM.md). Speeds are estimates, not measurements.
+
+Under Training setup, "vLLM engine (experimental)" switches the engine on; then the Thinking check card offers **Engine: Transformers (default) / llama-server (GGUF files) / vLLM (experimental)**.
+vLLM asks all questions at once (40 in parallel) and is estimated at about 400 tokens per second (the standard engine: about 55, llama-server: about 165) plus 2-5 minutes of start-up; the plan
+says so. Its results are kept in their own files (`<target>.<mode>.vllm.json`) and shown in their own table: a model is judged against the original checked **the same way** (the numbers of two
+engines are not identical: same distribution, other random numbers). Before a vLLM check starts, the checklist asks that the engine exists (Docker, Docker inside WSL, WSLc, or vLLM in WSL) and
+that nothing else uses more than about 2 GB of the graphics card (vLLM reserves about 88 %).

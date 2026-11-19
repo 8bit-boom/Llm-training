@@ -68,7 +68,7 @@ impl AppModel {
             "bundle": bundle,
             "recent": recent,
             "settings": {"keep_awake": self.settings.keep_awake, "keep_display_on": self.settings.keep_display_on, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth,
-                         "auto_continue_interrupted": self.settings.auto_continue_interrupted, "notifications": self.settings.notifications, "webhook_url": self.settings.webhook_url},
+                         "auto_continue_interrupted": self.settings.auto_continue_interrupted, "notifications": self.settings.notifications, "webhook_url": self.settings.webhook_url, "vllm": self.settings.vllm},
             "projects_dir": default_projects_dir(),
         })
     }
@@ -199,6 +199,35 @@ impl AppModel {
         let p = self.project_ref()?;
         store::set_status_matching(p, &Self::filter_from(filter), if status == "drop" { Status::Drop } else { Status::Keep })?;
         Ok(store::summary(p)?.unwrap_or(Value::Null))
+    }
+
+    /// Saves the experimental vLLM engine settings (docs/VLLM.md) after checking them; nothing is started.
+    pub fn vllm_set(&mut self, v: crate::settings::VllmSettings) -> Result<()> {
+        let mut v = v;
+        for f in [&mut v.kind, &mut v.image, &mut v.distro, &mut v.venv, &mut v.url, &mut v.model_volume, &mut v.model_dir, &mut v.teacher_repo] {
+            *f = f.trim().to_string();
+        }
+        if v.kind.is_empty() {
+            v.kind = "auto".into();
+        }
+        if v.kind != "auto" && !crate::vllm::KINDS.contains(&v.kind.as_str()) {
+            return Err(Error::new("The way to run the engine must be auto, docker, docker_wsl, wslc, wsl or url."));
+        }
+        if v.kind == "url" && !(v.url.starts_with("http://") || v.url.starts_with("https://")) {
+            return Err(Error::new("The address of the vLLM server must start with http:// or https://."));
+        }
+        if !v.model_volume.is_empty() && !v.model_volume.starts_with("ndforge-vllm-") {
+            return Err(Error::new("The Docker volume for the models must be named ndforge-vllm-<something>: this program only touches volumes with that name."));
+        }
+        if v.image.is_empty() {
+            v.image = crate::settings::VllmSettings::default().image;
+        }
+        if !v.wslc.is_object() {
+            v.wslc = serde_json::json!({});
+        }
+        self.settings.vllm = v;
+        self.settings.save();
+        Ok(())
     }
 
     /// Saves the teacher's address, model and key (an empty key keeps the stored one; "-" removes it).

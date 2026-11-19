@@ -358,3 +358,44 @@ fn the_other_targets_are_as_they_were() {
     let s: ThinkSpec = serde_json::from_value(json!({"name": "slim-a"})).unwrap();
     assert_eq!((s.target.as_str(), s.round), ("cut", None));
 }
+
+#[test]
+fn the_vllm_way_is_its_own_backend_with_its_own_result_files() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let mut s = spec("slim-a", "cut");
+    s.quick = true;
+    let plain = build_job(&p, &s).unwrap();
+    assert_eq!(plain["backend"], json!("hf"));
+    assert!(plain.get("engine").is_none(), "the standard way is as it was");
+    s.backend = Some("vllm".into());
+    s.engine = Some(json!({"kind": "docker", "image": "x"}));
+    let j = build_job(&p, &s).unwrap();
+    let t = p.folder.join("models").join("slim-a").join("think_check");
+    assert_eq!((j["backend"].clone(), j["engine"]["kind"].clone()), (json!("vllm"), json!("docker")));
+    assert_eq!(j["cache_file"], json!(t.join("cut.quick.vllm.json")), "kept apart: the gates compare a model with the original of the SAME way");
+    s.engine = None;
+    assert_eq!(build_job(&p, &s).unwrap()["engine"], json!({"kind": "auto"}));
+    let mut g = spec("slim-a", "gguf");
+    g.backend = Some("vllm".into());
+    assert!(!ndforge_core::reshape::thinkcheck::uses_vllm(&g), "a GGUF file always uses llama.cpp");
+    assert_eq!(cache_name(&s), "cut.quick.vllm.json");
+}
+
+#[test]
+fn the_results_keep_the_vllm_numbers_in_their_own_table() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let dir = p.folder.join("models").join("slim-a").join("think_check");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, closed) in [("original.full.vllm.json", 1.0), ("cut.full.vllm.json", 0.5), ("original.full.json", 0.9)] {
+        std::fs::write(dir.join(file), serde_json::to_vec(&json!({"key": {}, "result": {"suite_version": 1, "backend": "x", "main": m(closed, 0.8, 0.0, 800), "control": {"n": 0}}})).unwrap()).unwrap();
+    }
+    let r = results(&p, "slim-a").unwrap();
+    assert_eq!(r["modes"]["full"]["rows"]["original"]["main"]["closed_rate"], json!(0.9));
+    assert!(r["modes"]["full"]["rows"].get("cut").is_none());
+    assert_eq!(r["vllm_modes"]["full"]["rows"]["original"]["main"]["closed_rate"], json!(1.0));
+    assert_eq!(r["vllm_modes"]["full"]["gates"]["cut"]["verdict"], json!("fail"));
+}

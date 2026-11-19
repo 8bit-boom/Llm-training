@@ -254,5 +254,9 @@ pub fn check(p: Option<&Project>, kind: &str, spec: &Value) -> Vec<Check> {
     if !KINDS.contains(&kind) {
         return Vec::new();
     }
-    evaluate(&gather(p, kind, spec))
+    let mut checks = evaluate(&gather(p, kind, spec));
+    if kind == "think_check" && spec["backend"].as_str() == Some("vllm") && spec["target"].as_str() != Some("gguf") {
+        checks.extend(crate::vllm::preflight_now(&crate::settings::Settings::load().vllm));      // the experimental engine: it is there, the card is free
+    }
+    checks
 }

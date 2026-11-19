@@ -134,12 +134,21 @@ pub struct ThinkSpec {
     pub max_new: Option<u32>,
     /// target "round": the round of a heal in rounds whose adapter is checked on top of the student, NOT merged (docs/HEAL_ROUNDS.md)
     pub round: Option<u32>,
+    /// the way the questions are answered: None / "hf" (the standard engine), or "vllm" (EXPERIMENTAL, docs/VLLM.md; a GGUF file always uses llama.cpp)
+    pub backend: Option<String>,
+    /// the vLLM engine settings the worker gets (`vllm::engine_job`); the window's command fills it from the settings, the page does not send it
+    pub engine: Option<Value>,
 }
 
 impl Default for ThinkSpec {
     fn default() -> Self {
-        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None, round: None }
+        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None, round: None, backend: None, engine: None }
     }
+}
+
+/// Does this check go through the experimental vLLM engine? (Its numbers are kept in their own files: the gates compare a model with the original of the SAME way.)
+pub fn uses_vllm(spec: &ThinkSpec) -> bool {
+    spec.backend.as_deref() == Some("vllm") && spec.target != "gguf"
 }
 
 pub fn think_dir(p: &Project, name: &str) -> PathBuf {
@@ -155,11 +164,15 @@ fn file_name(target: &str, quick: bool) -> String {
     format!("{target}.{}.json", if quick { "quick" } else { "full" })
 }
 
+fn file_name_for(target: &str, quick: bool, vllm: bool) -> String {
+    if vllm { format!("{target}.{}.vllm.json", if quick { "quick" } else { "full" }) } else { file_name(target, quick) }
+}
+
 /// Where the result of a check is kept: `<target>.<mode>.json`, for a round of a heal in rounds `round-r<n>.<mode>.json`.
 pub fn cache_name(spec: &ThinkSpec) -> String {
     match (spec.target.as_str(), spec.round) {
-        ("round", Some(n)) => format!("round-r{n}.{}.json", if spec.quick { "quick" } else { "full" }),
-        _ => file_name(&spec.target, spec.quick),
+        ("round", Some(n)) => format!("round-r{n}.{}{}.json", if spec.quick { "quick" } else { "full" }, if uses_vllm(spec) { ".vllm" } else { "" }),
+        _ => file_name_for(&spec.target, spec.quick, uses_vllm(spec)),
     }
 }
 
@@ -229,6 +242,10 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
         job["double_quant"] = json!(qlora);
         job["load"] = json!(if qlora { "4bit" } else { "16bit" });
     }
+    if uses_vllm(spec) {
+        job["backend"] = json!("vllm");
+        job["engine"] = spec.engine.clone().unwrap_or_else(|| json!({"kind": "auto"}));
+    }
     if let Some(b) = spec.batch.filter(|b| (1..=64).contains(b)) {
         job["batch"] = json!(b);
     }
@@ -264,7 +281,7 @@ impl Drop for Running {
 /// What a check would do (the questions, the settings, a rough size) without loading anything.
 pub fn plan(spec: &ThinkSpec, kill: &AtomicBool) -> Result<Value> {
     let py = python()?;
-    let backend = if spec.target == "gguf" { "llama" } else { "hf" };
+    let backend = if spec.target == "gguf" { "llama" } else if uses_vllm(spec) { "vllm" } else { "hf" };
     run_job(&py, &worker_dir(), &json!({"job": "think_check_plan", "backend": backend, "quick": spec.quick}), kill, &mut |_| {})
 }
 
@@ -283,8 +300,8 @@ pub fn run(p: &Project, spec: &ThinkSpec, stop: Arc<AtomicBool>, on_event: &mut 
 
 // ------------------------------------------------------------------------------------------------------------------ the saved results
 
-fn saved(dir: &Path, target: &str, quick: bool) -> Option<Value> {
-    let f = read_json(&dir.join(file_name(target, quick)))?;
+fn saved(dir: &Path, target: &str, quick: bool, vllm: bool) -> Option<Value> {
+    let f = read_json(&dir.join(file_name_for(target, quick, vllm)))?;
     let r = f["result"].clone();
     (r.is_object() && r["suite_version"] == json!(SUITE_VERSION) && r["main"].is_object()).then_some(r)
 }
@@ -309,30 +326,35 @@ pub fn results(p: &Project, name: &str) -> Result<Value> {
     valid_name(name)?;
     let dir = models_dir(p).join(name);
     let tdir = think_dir(p, name);
-    let mut modes = serde_json::Map::new();
-    for (mode, quick) in [("full", false), ("quick", true)] {
-        let mut rows = serde_json::Map::new();
-        for t in TARGETS {
-            if let Some(r) = saved(&tdir, t, quick) {
-                rows.insert(t.to_string(), r);
-            }
-        }
-        let mut gs = serde_json::Map::new();
-        if let Some(orig) = rows.get("original").map(|o| o["main"].clone()) {
-            for (t, r) in &rows {
-                if t != "original" {
-                    gs.insert(t.clone(), gates(&orig, &r["main"]));
+    let modes_of = |vllm: bool| {
+        let mut modes = serde_json::Map::new();
+        for (mode, quick) in [("full", false), ("quick", true)] {
+            let mut rows = serde_json::Map::new();
+            for t in TARGETS {
+                if let Some(r) = saved(&tdir, t, quick, vllm) {
+                    rows.insert(t.to_string(), r);
                 }
             }
+            let mut gs = serde_json::Map::new();
+            if let Some(orig) = rows.get("original").map(|o| o["main"].clone()) {
+                for (t, r) in &rows {
+                    if t != "original" {
+                        gs.insert(t.clone(), gates(&orig, &r["main"]));
+                    }
+                }
+            }
+            modes.insert(mode.into(), json!({"rows": rows, "gates": gs}));
         }
-        modes.insert(mode.into(), json!({"rows": rows, "gates": gs}));
-    }
+        modes
+    };
+    let modes = modes_of(false);
+    let vllm_modes = modes_of(true);
     let ggufs: Vec<Value> = crate::export::runs::list_exports(p).into_iter().filter(|m| m["gguf_exists"] == json!(true))
         .filter_map(|m| {
             let path = Path::new(m["dir"].as_str()?).join(m["gguf_file"].as_str()?);
             Some(json!({"name": m["name"], "path": path}))
         }).collect();
-    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "ggufs": ggufs, "guardrails": cut_guardrails(&dir),
+    Ok(json!({"suite_version": SUITE_VERSION, "modes": modes, "vllm_modes": vllm_modes, "ggufs": ggufs, "guardrails": cut_guardrails(&dir),
               "targets": {"original": heal_source::read_origin(&dir).is_ok(), "cut": dir.join("model").join("config.json").is_file() || heal_source::student_folder(&dir).ok().flatten().is_some(),
                           "healed": dir.join("healed").join("config.json").is_file()}}))
 }

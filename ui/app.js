@@ -1745,7 +1745,7 @@ const QU_ARGS = {
   export: () => usMakeArgs(),
   heal: () => ({ name: rs.hl.name, spec: rsHealSpec() }),
   quantcheck: () => ({ spec: qkSpec() }),
-  think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null } }; },
+  think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null, ...tkSpecExtra() } }; },
 };
 async function quAdd(kind, btn) {
   const make = QU_ARGS[kind];
@@ -2045,6 +2045,46 @@ function renderTimeCard() {
     <div class="row"><button class="secondary" id="tm-load" ${tm.loading ? "disabled" : ""}>${d ? "Look again" : "Show where the time went"}</button></div></div>`;
 }
 
+// ------------------------------------------------------------------------------------------------------- the vLLM engine (EXPERIMENTAL, off by default; docs/VLLM.md)
+// Built from a research report and not yet run on this PC. Nothing is installed by the program; the status says what was found and what to install yourself.
+const vl = { status: null, busy: false, err: null, saved: null };
+const VL_KINDS = [["auto", "Find it myself"], ["docker", "Docker Desktop (docker.exe)"], ["docker_wsl", "Docker inside WSL"], ["wslc", "WSLc (WSL 3.x containers, templates)"], ["wsl", "vLLM installed in WSL"], ["url", "A server that already runs"]];
+function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {} }; }
+async function vllmDetect() {
+  vl.busy = true; vl.err = null; render();
+  try { vl.status = await invoke("vllm_status"); } catch (e) { vl.err = String(e); }
+  vl.busy = false; render();
+}
+function renderVllm() {
+  const v = vllmSettings(), st = vl.status;
+  const lamp = { ok: "●", warn: "!", fail: "✕" };
+  const lines = st ? `<ul class="checks">${st.lines.map((l) => `<li class="check lt-${esc(l.light)}"><span class="lamp">${lamp[l.light] || "·"}</span><div><strong>${esc(l.label)}</strong><div class="detail">${esc(l.detail)}</div></div></li>`).join("")}</ul>${st.guide.length ? `<ul class="small dim">${st.guide.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}` : `<p class="dim small">Press “Look for the engine” to see what this computer has (it only asks small programs; nothing is started or installed).</p>`;
+  const f = (id, label, val, ph, w) => `<label>${label} <input type="text" id="${id}" value="${esc(val || "")}" placeholder="${esc(ph || "")}" style="min-width:${w || 220}px"></label>`;
+  return `<div class="card wide" id="vl-card"><h2>vLLM engine (experimental)</h2>
+    <p class="warn small">Built from a research report, not yet run on this PC. It is off unless you switch it on, and nothing here installs Docker, WSL or a driver for you. Run the vLLM self-test first; every speed in the app for it is an estimate.</p>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-enabled" ${v.enabled ? "checked" : ""}> Offer the vLLM engine in the thinking check</label></div>
+    <div class="row"><label>Way to run it <select id="vl-kind">${VL_KINDS.map(([k, n]) => `<option value="${k}" ${v.kind === k ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+      ${f("vl-image", "Docker image", v.image, "vllm/vllm-openai:v0.34.0", 280)}</div>
+    <div class="row">${f("vl-distro", "WSL distribution", v.distro, "(the default one)")}${f("vl-venv", "vLLM folder in WSL", v.venv, "~/.ndforge/vllm")}${f("vl-url", "Server address (way: url)", v.url, "http://127.0.0.1:8000")}</div>
+    <div class="row">${f("vl-volume", "Docker volume for models", v.model_volume, "ndforge-vllm-hf")}${f("vl-dir", "Model folder (optional, slow under /mnt/)", v.model_dir, "")}${f("vl-teacher", "Pre-quantized original (27 B)", v.teacher_repo, "", 300)}</div>
+    <div class="row"><label class="opt" title="Untested: LoRA on the linear-attention layers is reported garbled in some versions. The standard engine stays the exact way until an agreement run."><input type="checkbox" id="vl-adapter" ${v.adapter_rounds ? "checked" : ""}> Check the rounds of a heal (model + LoRA) with vLLM (untested, off)</label></div>
+    <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
+    <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
+    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}</div>`;
+}
+function wireVllm() {
+  const val = (id) => (($(id) || {}).value || "").trim();
+  const sv = $("vl-save"); if (sv) sv.onclick = async () => {
+    let wslc = {};
+    try { wslc = JSON.parse(val("vl-wslc") || "{}"); } catch (_) { vl.err = "The WSLc templates are not valid JSON."; render(); return; }
+    const v = { enabled: $("vl-enabled").checked, kind: val("vl-kind") || "auto", image: val("vl-image"), distro: val("vl-distro"), venv: val("vl-venv"), url: val("vl-url"), model_volume: val("vl-volume"), model_dir: val("vl-dir"),
+      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc };
+    try { setState(await invoke("vllm_set", { vllm: v })); vl.err = null; vl.saved = "Saved."; } catch (e) { vl.err = String(e); vl.saved = null; }
+    render();
+  };
+  const dt = $("vl-detect"); if (dt) dt.onclick = vllmDetect;
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -2068,6 +2108,7 @@ function renderSetup() {
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
     ${renderTimeCard()}
     ${renderLlamaSection()}
+    ${renderVllm()}
     ${renderUnsloth()}`;
 }
 
@@ -3162,6 +3203,16 @@ const TK_NUMBERS = [["think_rate", "Writes a reasoning trace", "rate"], ["closed
   ["garbage_rate", "Garbled text (lower is better)", "rate"], ["truncated_rate", "Cut off by the length limit", "rate"], ["median_think_tokens", "Typical length of the reasoning (tokens)", "n"]];
 const TK_GATE_WORD = { closed_rate: "finishing its reasoning", accuracy: "right answers", loop_rate: "loops", garbage_rate: "garbled text", median_think_tokens: "length of the reasoning" };
 
+const tkBackend = () => (rs.tk.backend === "vllm" && vllmSettings().enabled ? "vllm" : rs.tk.backend === "llama" ? "llama" : "hf");
+const tkSpecBackend = () => (tkBackend() === "vllm" ? "vllm" : null);
+const tkSpecExtra = () => (tkBackend() === "vllm" ? { backend: "vllm" } : {});          // nothing added for the standard way: its spec is as it always was
+function tkBackendRow() {
+  const be = tkBackend(), on = !!vllmSettings().enabled;
+  return `<div class="row"><label>Engine <select id="tk-backend"><option value="hf" ${be === "hf" ? "selected" : ""}>Transformers (default)</option><option value="llama" ${be === "llama" ? "selected" : ""}>llama-server (GGUF files)</option>`
+    + `<option value="vllm" ${be === "vllm" ? "selected" : ""} ${on ? "" : "disabled"}>vLLM (experimental${on ? "" : ": switched off in Training setup"})</option></select></label>`
+    + (be === "llama" ? ` <span class="dim small">llama-server runs GGUF files: choose one below.</span>` : "") + `</div>`;
+}
+
 function tkQuick(m) {
   if (rs.tk.quick != null) return rs.tk.quick;
   const b = m && m.summary ? (m.summary.params_after || 0) / 1e9 : 0;
@@ -3173,16 +3224,16 @@ function thinkCard(m) {
   const sm = m.summary;
   if (!sm || m.status !== "done") return "";
   const tk = rs.tk, d = tk.name === m.name ? tk.data : null;
-  const quick = tkQuick(m), mode = d ? d.modes[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
+  const quick = tkQuick(m), be = tkBackend(), set = (d && be === "vllm" ? d.vllm_modes : d && d.modes) || null, mode = set ? set[quick ? "quick" : "full"] : null, rows = mode ? mode.rows : {}, gates = mode ? mode.gates : {};
   const busy = rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || tk.run;
-  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : d.targets[t]);
+  const can = (t) => d && d.targets && (t === "gguf" ? !!tk.gguf : be !== "llama" && d.targets[t]);
   const btn = (t, label) => `<button class="${rows[t] ? "secondary" : "primary"}" data-tkgo="${t}" ${busy || !rs.state.env_ready || !can(t) || pfBlocked("think_check") ? "disabled" : ""}>${rows[t] ? "Check again: " : "Check "}${label}</button>${quBtn("think_check", `data-target="${t}" ${!rs.state.env_ready || !can(t) ? "disabled" : ""}`)}`;
   const cols = TK_TARGETS.filter(([t]) => rows[t]);
   const table = cols.length ? `<table class="tbl"><tr><th>${quick ? "16" : "32"} questions, thinking on</th>${cols.map(([, n]) => `<th>${n}</th>`).join("")}</tr>
       ${TK_NUMBERS.map(([k, name, kind]) => `<tr><td>${name}</td>${cols.map(([t]) => `<td>${tkCell(rows[t].main[k], kind)}</td>`).join("")}</tr>`).join("")}
       <tr><td>Thinking off (control): right answers</td>${cols.map(([t]) => `<td>${tkCell(rows[t].control && rows[t].control.n ? rows[t].control.accuracy : null, "rate")}</td>`).join("")}</tr>
       <tr><td><strong>Compared with the original</strong></td>${cols.map(([t]) => { const g = gates[t]; return `<td>${t === "original" ? "–" : g ? `<strong class="${g.verdict === "pass" ? "ok" : g.verdict === "warn" ? "warn" : "err"}" data-tkverdict="${t}">${g.verdict === "pass" ? "Pass" : g.verdict === "warn" ? "Close to the limit" : "Fail"}</strong>${g.failed.length ? `<br><span class="dim small">too weak: ${g.failed.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : g.warned.length ? `<br><span class="dim small">near the limit: ${g.warned.map((x) => TK_GATE_WORD[x]).join(", ")}</span>` : ""}` : "<span class=\"dim small\">check the original first</span>"}</td>`; }).join("")}</tr></table>
-      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : ""}`).join(" · ")}</p>` : "";
+      <p class="dim small">${cols.map(([t]) => `${TK_TARGETS.find((x) => x[0] === t)[1]}: ${esc(rows[t].created || "")}${rows[t].backend === "llama" ? " (llama.cpp)" : rows[t].backend === "vllm" ? " (vLLM, experimental)" : ""}`).join(" · ")}</p>` : "";
   const gg = d && d.ggufs && d.ggufs.length ? `<select id="tk-gguf-pick"><option value="">Choose an exported GGUF…</option>${d.ggufs.map((g) => `<option value="${esc(g.path)}" ${g.path === tk.gguf ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>` : "";
   const note = mode && !rows.original ? `<p class="dim small">Check the original first: the other numbers are judged against it (it is checked once and kept).</p>` : "";
   // a cut that goes beyond what Auto-cut does by itself (the program names how): the thinking numbers of the cut when it was checked, else a pointer to the button
@@ -3195,7 +3246,8 @@ function thinkCard(m) {
   return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>${guard}
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
-    ${pfBox("think_check", {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    ${tkBackendRow()}${be === "vllm" ? `<p class="warn small" id="tk-vllm-note">vLLM is experimental: built from a research report and not yet run on this PC (run the vLLM self-test in Training setup first). Its numbers are kept apart from the standard engine's: a model is compared with the original checked the same way.</p>` : ""}
+    ${pfBox("think_check", be === "vllm" ? { backend: "vllm" } : {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
     ${tk.run && tk.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
     ${tk.err ? errDiv(tk.err, "p") : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
@@ -3210,7 +3262,7 @@ async function tkLoad(name) {
 function tkStart(m, target) {
   const tk = rs.tk;
   tk.run = { name: m.name, target, text: "Starting…", progress: null, done: 0 }; tk.err = null; tk.ok = null; render();
-  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
+  invoke("think_check_start", { spec: { name: m.name, target, quick: tkQuick(m), gguf: target === "gguf" ? tk.gguf : null, ...tkSpecExtra() } }).catch((e) => { tk.run = null; tk.err = String(e); render(); });
 }
 
 function onThinkEvent(p) {
@@ -3233,6 +3285,7 @@ function wireThink() {
   const tk = rs.tk;
   document.querySelectorAll("input[name=tk-mode]").forEach((r) => r.onchange = () => { tk.quick = r.value === "quick"; render(); });
   document.querySelectorAll("[data-tkgo]").forEach((b) => b.onclick = () => { if (m) tkStart(m, b.dataset.tkgo); });
+  const bsel = $("tk-backend"); if (bsel) bsel.onchange = () => { tk.backend = bsel.value; pfReset(); render(); };
   const pick = $("tk-gguf-pick"); if (pick) pick.onchange = () => { tk.gguf = pick.value; render(); };
   const gf = $("tk-gguf"); if (gf) gf.onchange = () => { tk.gguf = gf.value.trim(); render(); };
   const st = $("tk-stop"); if (st) st.onclick = () => { if (tk.run) tk.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
@@ -4080,6 +4133,7 @@ function wire() {
   wireRetrain();
   wireUnsloth();
   wireLlama();
+  wireVllm();
   on("recheck", refreshEnv);
   const nu = $("no-unsloth"); if (nu) nu.onchange = () => { env.noUnsloth = nu.checked; };
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));

@@ -1,0 +1,106 @@
+//! The program side of the experimental vLLM engine: version parsing, the detection order, the preflight and the worker's `engine` object, with fake runners.
+use ndforge_core::envmgr::health::Light;
+use ndforge_core::settings::{Settings, VllmSettings};
+use ndforge_core::vllm::*;
+
+fn runner<'a>(answers: &'a [(&'a str, bool, &'a str)]) -> impl Fn(&[&str]) -> Option<(bool, String)> + 'a {
+    move |args: &[&str]| {
+        let line = args.join(" ");
+        answers.iter().find(|(k, _, _)| line.starts_with(k)).map(|(_, ok, out)| (*ok, out.to_string()))
+    }
+}
+
+#[test]
+fn it_is_off_by_default_and_the_defaults_are_the_reports() {
+    let s = Settings::default().vllm;
+    assert!(!s.enabled && !s.adapter_rounds && s.kind == "auto");
+    assert_eq!(s.image, "vllm/vllm-openai:v0.34.0");
+    assert_eq!(s.teacher_repo, "cyankiwi/Qwen3.8-27B-AWQ-INT4");
+    assert!(s.model_volume.starts_with("ndforge-vllm-"));
+    let back: Settings = serde_json::from_str("{\"expert_mode\": true}").unwrap();      // an old settings file loads
+    assert_eq!(back.vllm, VllmSettings::default());
+}
+
+#[test]
+fn wsl_versions_are_compared_as_numbers_and_unknown_is_not_old() {
+    assert_eq!(parse_wsl_version("WSL version: 3.0.1.0\nKernel version: 6.18"), Some(vec![3, 0, 1, 0]));
+    assert_eq!(parse_wsl_version("Version de WSL : 2.7.3"), Some(vec![2, 7, 3]));
+    assert_eq!(parse_wsl_version("W\0S\0L\0 \02\0.\08\0.\01\0"), Some(vec![2, 8, 1]));
+    assert_eq!(parse_wsl_version("garbage"), None);
+    assert_eq!(wsl_note("WSL version: 2.7.3.0").0, Some(true));
+    assert_eq!(wsl_note("WSL version: 3.0.1.0").0, Some(true));
+    assert_eq!(wsl_note("WSL version: 2.10.0").0, Some(true), "2.10 is newer than 2.7: numbers, not strings");
+    let (old, text) = wsl_note("WSL version: 2.6.1.0");
+    assert_eq!(old, Some(false));
+    assert!(text.contains("wsl --update"));
+    let (unknown, text) = wsl_note("");
+    assert_eq!(unknown, None);
+    assert!(text.contains("unknown, continuing"));
+}
+
+#[test]
+fn the_detection_order_is_docker_then_docker_in_wsl_then_wslc_then_wsl() {
+    let s = VllmSettings::default();
+    let f = |a: &[(&str, bool, &str)]| gather_facts(&runner(a), &s);
+    assert_eq!(detect_kind(&f(&[("docker version", true, ""), ("wslc --version", true, ""), ("wsl.exe -- docker version", true, "")])), "docker");
+    assert_eq!(detect_kind(&f(&[("wsl.exe -- docker version", true, ""), ("wslc --version", true, "")])), "docker_wsl");
+    assert_eq!(detect_kind(&f(&[("wslc --version", true, "")])), "wslc");
+    assert_eq!(detect_kind(&f(&[("wsl.exe -- test -x ~/.ndforge/vllm/bin/vllm", true, "")])), "wsl");
+    assert_eq!(detect_kind(&f(&[])), "missing");
+    let with_distro = VllmSettings { distro: "Ubuntu".into(), ..VllmSettings::default() };
+    let got = gather_facts(&runner(&[("wsl.exe -d Ubuntu -- docker version", true, "")]), &with_distro);
+    assert!(got.docker_wsl && !got.docker);
+}
+
+#[test]
+fn the_choice_of_the_person_wins_over_the_detection() {
+    let f = gather_facts(&runner(&[("docker version", true, "")]), &VllmSettings::default());
+    assert_eq!(used_kind(&VllmSettings::default(), &f), "docker");
+    assert_eq!(used_kind(&VllmSettings { kind: "wslc".into(), ..VllmSettings::default() }, &f), "wslc");
+    assert_eq!(used_kind(&VllmSettings { kind: "nonsense".into(), ..VllmSettings::default() }, &f), "missing");
+}
+
+#[test]
+fn the_status_lines_and_the_guided_text() {
+    let s = VllmSettings::default();
+    let missing = status(&s, &runner(&[("nvidia-smi", true, "572.16, 1500, 32768\n")]));
+    assert_eq!(missing["kind_used"], "missing");
+    assert_eq!(missing["ready"], false);
+    assert!(missing["guide"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("Nothing is installed for you")));
+    let driver = missing["lines"].as_array().unwrap().iter().find(|l| l["label"] == "NVIDIA driver").unwrap();
+    assert_eq!(driver["light"], "warn", "572 is older than 580");
+    let ready = status(&s, &runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 900, 32768\n"), ("wsl.exe --version", true, "WSL version: 3.0.1.0")]));
+    assert_eq!(ready["ready"], true);
+    assert_eq!(ready["kind_used"], "docker");
+    let wsl = ready["lines"].as_array().unwrap().iter().find(|l| l["label"] == "WSL").unwrap();
+    assert_eq!(wsl["light"], "ok");
+    assert!(ready["guide"].as_array().unwrap()[0].as_str().unwrap().contains("untested"));
+}
+
+#[test]
+fn the_preflight_blocks_a_busy_card_and_a_missing_engine() {
+    let s = VllmSettings::default();
+    let busy = preflight_checks(&s, &gather_facts(&runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 6144, 32768\n")]), &s));
+    assert!(busy.iter().any(|c| c.id == "vllm_gpu" && c.light == Light::Fail && c.detail.contains("6.0 GB")));
+    assert!(busy.iter().any(|c| c.id == "vllm_engine" && c.light == Light::Ok));
+    let free = preflight_checks(&s, &gather_facts(&runner(&[("docker version", true, ""), ("nvidia-smi", true, "581.42, 1200, 32768\n")]), &s));
+    assert!(free.iter().all(|c| c.light != Light::Fail));
+    let none = preflight_checks(&s, &gather_facts(&runner(&[]), &s));
+    assert!(none.iter().any(|c| c.id == "vllm_engine" && c.light == Light::Fail));
+    assert!(none.iter().any(|c| c.id == "vllm_gpu" && c.light == Light::Warn), "an unreadable card is a warning, not a block");
+    let old_wsl = preflight_checks(&VllmSettings { kind: "wsl".into(), ..s.clone() }, &gather_facts(&runner(&[("wsl.exe --version", true, "WSL version: 2.5.0")]), &s));
+    assert!(old_wsl.iter().any(|c| c.id == "vllm_wsl"));
+}
+
+#[test]
+fn the_engine_object_for_the_worker_leaves_out_empty_settings() {
+    let e = engine_job(&VllmSettings::default());
+    assert_eq!(e["kind"], "auto");
+    assert_eq!(e["image"], "vllm/vllm-openai:v0.34.0");
+    assert_eq!(e["hf_volume"], "ndforge-vllm-hf");
+    assert!(e.get("distro").is_none() && e.get("url").is_none() && e.get("wslc").is_none());
+    let s = VllmSettings { kind: "wslc".into(), distro: "U".into(), wslc: serde_json::json!({"shm": "8g"}), ..VllmSettings::default() };
+    let e = engine_job(&s);
+    assert_eq!(e["distro"], "U");
+    assert_eq!(e["wslc"]["shm"], "8g");
+}
