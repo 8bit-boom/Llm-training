@@ -621,7 +621,9 @@ def run_try(cfg: dict) -> int:
     data = read_results(folder, key if src_dir else None, protocol.log) if src_dir else None
     if data is None:
         data = empty_results(key)
-    todo = [k for k in keys if k not in data["passes"]]
+    # the search measures the original in its own first round: the plain list leaves it out, so every pass of a search carries its round
+    own = (lambda ks: [k for k in ks if k != BASE_KEY]) if sctx is not None and not (want.get("blocks") or want.get("runs") or want.get("widths") or want.get("choices")) else (lambda ks: list(ks))
+    todo = own([k for k in keys if k not in data["passes"]])
     mm = meas["meta"] if meas else {}
     known, known_tokens = data["seconds_per_pass"], data["tokens"]
     if known is None and mm.get("seconds_per_pass"):
@@ -670,7 +672,7 @@ def run_try(cfg: dict) -> int:
     if data["load_used"] not in (None, mode):
         protocol.log(f"The earlier answers were made with the model loaded as {data['load_used']}; they are computed again as {mode}.")
         data = empty_results(key)
-        todo = list(keys)
+        todo = own(keys)
     stop_file = folder.parent / "STOP"
     stop = stop_file.exists
     from transformers import AutoTokenizer
