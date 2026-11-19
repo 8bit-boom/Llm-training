@@ -912,3 +912,25 @@ test("the result card says what became of the multi-token head", () => {
   assert.match(b.run("renderReshape()"), /The multi-token head \(speculative decoding\) was removed: it no longer fits the thinner layers\./);
   assert.equal(b.run(`mtpText(null)`), "The vision part and the multi-token head were copied unchanged.");
 });
+
+test("the Heal card shows what the rows cover and the advice when reasoning rows lose their answer", () => {
+  const b = browser();
+  const m = thinModel();
+  open(b, pageState({ made: [m] }));
+  const cov = { v: 1, max_seq: 4096, rows: { project_text: 3, project_chat: 40, general_text: 0, general_chat: 20 },
+    chat_rows: { complete: 40, cut: 15, skipped: 5, skipped_by: { project_chat: 2, general_chat: 3 } },
+    reasoning_rows: { complete: 30, cut_reasoning: 4, cut_answer: 6, skipped: 5, total: 45, known: true },
+    token_share: { prompt: 0.1, reasoning: 0.6, answer: 0.25, plain: 0.05 }, length_buckets: { "<=512": 4, "<=1k": 9, ">16k": 1 },
+    notes: ["33% of the reasoning rows lost their answer or were left out because they are longer than 4096 tokens: choose 8192 in Heal settings if the plan says it fits."] };
+  b.run(`rs.hl = { name: ${JSON.stringify(m.name)}, opts: ${JSON.stringify(healOpts({ heal: { status: "stopped", coverage: cov } }))} }`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="hl-coverage"/);
+  assert.match(html, /3 texts and 40 conversations from your world, 0 texts and 20 conversations of general text/);
+  assert.match(html, /<strong>40<\/strong> whole, <strong>15<\/strong> cut at the sequence length, <strong>5<\/strong> left out as too long/);
+  assert.match(html, /Reasoning rows: <strong>30<\/strong> whole, <strong>6<\/strong> lost part of the answer, <strong>4<\/strong> cut inside the reasoning, <strong>5<\/strong> left out/);
+  assert.match(html, /10% question, 60% reasoning, 25% answer, 5% plain text/);
+  assert.match(html, /&lt;=512 4 · &lt;=1k 9 · &gt;16k 1|<=512 4/);
+  assert.match(html, /choose 8192 in Heal settings if the plan says it fits/);
+  b.run("rs.hl.opts.heal = { status: 'stopped' }");
+  assert.doesNotMatch(b.run("renderReshape()"), /id="hl-coverage"/);
+});

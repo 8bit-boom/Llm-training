@@ -196,7 +196,8 @@ def test_a_chat_conversation_is_one_row_cut_at_the_length_and_a_very_long_one_is
     rows, tokens = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
     lens = [len(r["input_ids"]) for r in rows]
     # 50 chars -> cut to 32 (no second window); 31 chars -> 31; 71 chars is more than twice 32 -> skipped; 12 chars -> too short; 201 -> skipped
-    assert lens == [32, 31] and tokens == 63 and stats == {"cut_rows": 1, "skipped_long": 2}
+    assert lens == [32, 31] and tokens == 63 and {k: stats[k] for k in ("cut_rows", "skipped_long")} == {"cut_rows": 1, "skipped_long": 2}
+    assert sum(stats["length_buckets"].values()) == 5, "the skipped and the too short ones are counted by length too"
     assert all(r["kind"] == "general" and r["completion_mask"] == [1] * len(r["input_ids"]) for r in rows)
 
 
@@ -204,7 +205,7 @@ def test_plain_text_is_still_windowed_and_a_text_column_of_turns_counts_as_text(
     f = jsonl(tmp_path / "t.jsonl", [{"text": "a" * 100}])
     stats: dict = {}
     rows, _ = dj.general_rows({"file": f, "report": {}}, lambda t: CharTok()(t)["input_ids"], max_seq=32, budget=10_000, stats=stats)
-    assert [len(r["input_ids"]) for r in rows] == [32, 32, 32] and stats == {"cut_rows": 0, "skipped_long": 0}
+    assert [len(r["input_ids"]) for r in rows] == [32, 32, 32] and {k: stats[k] for k in ("cut_rows", "skipped_long")} == {"cut_rows": 0, "skipped_long": 0}
 
 
 def test_the_conversation_rule_does_not_need_a_stats_dict_or_a_report(tmp_path):

@@ -190,15 +190,28 @@ def _general_texts(source: dict):
     yield from generaltext.texts(source)
 
 
-def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407, stats: dict | None = None):
+def data_length_labels():
+    from . import data
+    return data.LENGTH_LABELS
+
+
+def data_length_bucket(n: int) -> str:
+    from . import data
+    return data.length_bucket(n)
+
+
+def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 3407, stats: dict | None = None, probe=None):
     """General text cut into rows of at most max_seq tokens, about `budget` tokens in all. tok_fn(text) -> list of token ids.
     A plain-text source is windowed: a long text gives several rows. A chat-shaped source (messages, conversations, prompt + answer) gives ONE row per conversation, its first
     max_seq tokens (a later window would have neither the question nor the chat frame); a conversation longer than twice max_seq is skipped. `stats` (a dict, optional)
-    receives {"cut_rows": conversations cut to max_seq, "skipped_long": conversations skipped as too long}.
+    receives {"cut_rows": conversations cut to max_seq, "skipped_long": conversations skipped as too long, "length_buckets": every text or conversation counted by its length
+    before cutting (the ones left out included), "skipped_reasoning": skipped conversations for which `probe(ids)` (optional) says they were reasoning rows}.
     The order is the dataset's own, or mixed by source["seed"] when it has one (the same seed gives the same sample); returns (rows, tokens). Raises whatever the source raises (the caller explains it)."""
     stats = stats if stats is not None else {}
     stats.setdefault("cut_rows", 0)
     stats.setdefault("skipped_long", 0)
+    stats.setdefault("skipped_reasoning", 0)
+    buckets = stats.setdefault("length_buckets", {label: 0 for label in data_length_labels()})
     report = source.get("report")
     if not isinstance(report, dict):
         report = {}
@@ -206,9 +219,12 @@ def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 34
     rows, tokens = [], 0
     for text in _general_texts(source):
         ids = tok_fn(text)
+        buckets[data_length_bucket(len(ids))] += 1
         if (report.get("detected") or {}).get("kind", "text") != "text":
             if len(ids) > 2 * max_seq:
                 stats["skipped_long"] += 1
+                if probe is not None and probe(ids):
+                    stats["skipped_reasoning"] += 1
                 continue
             if len(ids) > max_seq:
                 stats["cut_rows"] += 1
@@ -225,6 +241,144 @@ def general_rows(source: dict, tok_fn, max_seq: int, budget: int, seed: int = 34
     return rows, tokens
 
 
+# ------------------------------------------------------------------------------------------------------------ what the heal's rows cover
+
+def marker_ids(tokenizer, fam_name: str) -> dict:
+    """The token ids that mark a chat: {"assistant": ids of the start of an assistant turn ("<|im_start|>assistant\\n") or None, "end": the end-of-turn id or None,
+    "think_open", "think_close": the reasoning markers or None}. A marker the tokenizer does not know as one token is None (the row statistics then say less, never more)."""
+    from . import data
+    from .families import family
+    tok = data.text_tokenizer(tokenizer)
+    unk = getattr(tok, "unk_token_id", None)
+
+    def one(text):
+        try:
+            i = tok.convert_tokens_to_ids(text)
+        except Exception:                                   # noqa: BLE001 - a tokenizer without the call
+            return None
+        return None if i is None or i == unk or not isinstance(i, int) or i < 0 else i
+
+    out = {"assistant": None, "end": None, "think_open": one("<think>"), "think_close": one("</think>")}
+    end = (family(fam_name).get("end") or "").strip()
+    out["end"] = one(end) if end else (tok.eos_token_id if isinstance(getattr(tok, "eos_token_id", None), int) else None)
+    if one("<|im_start|>") is not None:
+        try:
+            out["assistant"] = list(tok("<|im_start|>assistant\n", add_special_tokens=False)["input_ids"])
+        except Exception:                                   # noqa: BLE001
+            pass
+    return out
+
+
+def _find_last(ids: list, pat: list) -> int:
+    """The index just after the last occurrence of the id list `pat` in `ids`, or -1."""
+    n = len(pat)
+    for a in range(len(ids) - n, -1, -1):
+        if ids[a:a + n] == pat:
+            return a + n
+    return -1
+
+
+BLANK_THINK = 2                 # a reasoning block of this many tokens or fewer (the newlines of an empty one) is not reasoning
+
+
+def reasoning_probe(markers: dict):
+    """A function ids -> True when the row holds a non-empty reasoning block (or a reasoning block that was cut), None when the tokenizer has no such markers."""
+    o, c = markers.get("think_open"), markers.get("think_close")
+    if o is None or c is None:
+        return None
+
+    def probe(ids: list) -> bool:
+        try:
+            a = ids.index(o)
+        except ValueError:
+            return False
+        try:
+            b = ids.index(c, a)
+        except ValueError:
+            return True
+        return b - a - 1 > BLANK_THINK
+    return probe
+
+
+def classify_row(row: dict, markers: dict, max_seq: int, chat: bool) -> dict:
+    """How one kept row splits: {"chat", "complete", "think": "none"|"complete"|"cut_reasoning"|"cut_answer", "prompt", "reasoning", "answer", "plain"} in tokens.
+    A text row is all `plain`. A chat row is split at the start of the assistant turn (the marker ids, else the project's completion mask); with the reasoning markers the block
+    from <think> to </think> is `reasoning` and what follows is `answer`. `complete`: the end-of-turn token closes the row (families without one: the row is shorter than max_seq)."""
+    ids = row["input_ids"]
+    n = len(ids)
+    end = markers.get("end")
+    closed = (end is not None and end in ids[-3:]) if end is not None else n < max_seq
+    if not chat:
+        return {"chat": False, "complete": n < max_seq, "think": "none", "prompt": 0, "reasoning": 0, "answer": 0, "plain": n}
+    start = _find_last(ids, markers["assistant"]) if markers.get("assistant") else -1
+    if start < 0:
+        mask = row.get("completion_mask") or []
+        first = next((i for i, m in enumerate(mask) if m), None) if len(mask) == n else None
+        if first is None or first == 0:
+            return {"chat": True, "complete": closed, "think": "none", "prompt": 0, "reasoning": 0, "answer": 0, "plain": n}
+        start = first
+    tail = ids[start:]
+    prompt, reasoning, think = start, 0, "none"
+    o, c = markers.get("think_open"), markers.get("think_close")
+    if o is not None and c is not None and o in tail:
+        a = tail.index(o)
+        if c in tail[a:]:
+            b = tail.index(c, a)
+            if b - a - 1 > BLANK_THINK:
+                prompt, reasoning, think = start + a, b - a + 1, "complete" if closed else "cut_answer"
+            else:
+                prompt = start + b + 1                      # the empty block of a template that switched thinking off belongs to the prompt
+        else:
+            prompt, reasoning, think = start + a, len(tail) - a, "cut_reasoning"
+    answer = n - prompt - reasoning
+    return {"chat": True, "complete": closed, "think": think, "prompt": prompt, "reasoning": reasoning, "answer": answer, "plain": 0}
+
+
+def coverage(rows: list, markers: dict, max_seq: int, stats: dict | None = None, general_chat: bool = False) -> dict:
+    """What the rows of a heal cover (docs/HEAL_SETTINGS.md): the row counts by kind, how many chat rows are complete, cut or left out, the same for reasoning rows, the share of the
+    kept tokens that is prompt / reasoning / answer / plain text, and the lengths of all rows before cutting (the ones left out included). `stats` is build_rows' (the left-out
+    counts and `length_buckets`); `general_chat`: the general rows are conversations. Pure: no tokenizer, no files."""
+    stats = stats or {}
+    kinds = {"project_text": 0, "project_chat": 0, "general_text": 0, "general_chat": 0}
+    chat = {"complete": 0, "cut": 0}
+    think = {"complete": 0, "cut_reasoning": 0, "cut_answer": 0}
+    tokens = {"prompt": 0, "reasoning": 0, "answer": 0, "plain": 0}
+    for r in rows:
+        is_general = r.get("source") == "general"
+        is_chat = general_chat if is_general else r.get("kind") == "chat"
+        c = classify_row(r, markers, max_seq, is_chat)
+        kinds[("general_" if is_general else "project_") + ("chat" if is_chat else "text")] += 1
+        if is_chat:
+            chat["complete" if c["complete"] else "cut"] += 1
+            if c["think"] != "none":
+                think[c["think"]] += 1
+        for key in tokens:
+            tokens[key] += c[key]
+    total = sum(tokens.values())
+    skipped = {"project_chat": int(stats.get("skipped_too_long", 0)), "general_chat": int(stats.get("general_skipped_long", 0))}
+    skipped_reasoning = int(stats.get("skipped_reasoning", 0)) + int(stats.get("general_skipped_reasoning", 0))
+    reasoning_rows = sum(think.values())
+    out = {"v": 1, "max_seq": int(max_seq), "rows": kinds, "chat_rows": {**chat, "skipped": skipped["project_chat"] + skipped["general_chat"], "skipped_by": skipped},
+           "reasoning_rows": {**think, "skipped": skipped_reasoning, "total": reasoning_rows + skipped_reasoning, "known": markers.get("think_open") is not None and markers.get("think_close") is not None},
+           "token_share": {k: (round(v / total, 4) if total else 0.0) for k, v in tokens.items()}, "tokens": tokens,
+           "length_buckets": dict(stats.get("length_buckets") or {}), "notes": []}
+    gb = stats.get("general_length_buckets") or {}
+    if gb:
+        out["length_buckets"] = {k: out["length_buckets"].get(k, 0) + gb.get(k, 0) for k in set(out["length_buckets"]) | set(gb)}
+        out["length_buckets"] = {k: out["length_buckets"][k] for k in data_length_labels() if k in out["length_buckets"]}
+    lost = think["cut_reasoning"] + think["cut_answer"] + skipped_reasoning
+    total_reasoning = out["reasoning_rows"]["total"]
+    if total_reasoning and lost / total_reasoning > 0.10:
+        pct = round(100 * lost / total_reasoning)
+        if max_seq < 8192:
+            out["notes"].append(f"{pct}% of the reasoning rows lost their answer or were left out because they are longer than {max_seq} tokens: choose 8192 in Heal settings if the plan says it fits.")
+        else:
+            out["notes"].append(f"{pct}% of the reasoning rows lost their answer or were left out: these traces are longer than {max_seq} tokens, and a longer bucket is not available yet.")
+    if total_reasoning and out["token_share"]["reasoning"] < 0.75 and think["complete"] + think["cut_answer"] + think["cut_reasoning"]:
+        out["notes"].append(f"Reasoning is {round(100 * out['token_share']['reasoning'])}% of the kept tokens; Unsloth's guidance for keeping thinking is 75% or more (a guide, not a rule).")
+    return out
+
+
 def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int = 3407):
     """The unique rows the teacher answers and the student learns from: the project's saved training data (as in training) followed by general text.
     data_cfg: {"train": path, "tokens": total heal tokens, "general": {"share": 0.5, "id" | "file", "column", "config", "split"} | None}.
@@ -232,7 +386,9 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
     text cannot be read (offline ...), healing goes on with the project's data only and stats["general_error"] says why.
     Returns (rows, stats)."""
     from . import data
-    proj, pstats = data.load_training_rows(tokenizer, data_cfg["train"], fam_name, max_seq, seed)
+    markers = marker_ids(tokenizer, fam_name)
+    probe = reasoning_probe(markers)
+    proj, pstats = data.load_training_rows(tokenizer, data_cfg["train"], fam_name, max_seq, seed, **({"probe": probe} if probe else {}))
     for r in proj:
         r["source"] = "project"
     stats = {"project_rows": len(proj), "project_tokens": pstats["tokens"], "general_rows": 0, "general_tokens": 0, "general_error": None, "general_error_code": None,
@@ -253,14 +409,15 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
         protocol.progress("data", 0.0, f"Getting the general text ({name})")
         long_rows: dict = {}
         try:
-            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed, long_rows)
+            grows, gtok = general_rows(g, lambda t: inner(t, add_special_tokens=False)["input_ids"], max_seq, budget, seed, long_rows, probe)
         except Exception as exc:      # noqa: BLE001 - offline, gated, wrong id or column: all end the same plain way
             grows, gtok = [], 0
             stats["general_error"], stats["general_error_code"] = generaltext.failure_note(
                 exc, g, "downloaded", "Healing goes on with your world's text only; try again later or choose another dataset.", DEFAULT_GENERAL)
             protocol.log(stats["general_error"])
         stats.update(general_detected=report.get("detected"), general_texts_skipped=report.get("skipped", 0), general_cut_rows=long_rows.get("cut_rows", 0),
-                     general_skipped_long=long_rows.get("skipped_long", 0))
+                     general_skipped_long=long_rows.get("skipped_long", 0), general_skipped_reasoning=long_rows.get("skipped_reasoning", 0),
+                     general_length_buckets=long_rows.get("length_buckets") or {})
         rows += grows
         stats.update(general_rows=len(grows), general_tokens=gtok)
         if grows:
@@ -268,6 +425,9 @@ def build_rows(tokenizer, data_cfg: dict, fam_name: str, max_seq: int, seed: int
             if stats["general_cut_rows"] or stats["general_skipped_long"]:
                 protocol.log(f"Long conversations: {stats['general_cut_rows']} were cut to {max_seq} tokens, {stats['general_skipped_long']} were longer than {2 * max_seq} tokens and left out.")
         protocol.progress("data", 1.0, "")
+    stats["length_buckets"] = pstats.get("length_buckets") or {}
+    stats["skipped_too_long"], stats["skipped_reasoning"] = pstats.get("skipped_too_long", 0), pstats.get("skipped_reasoning", 0)
+    stats["coverage"] = coverage(rows, markers, max_seq, stats, (stats.get("general_detected") or {}).get("kind", "text") != "text")
     return rows, stats
 
 
@@ -779,6 +939,20 @@ def _reusable_rows(out, cfg: dict, k: int, max_seq: int, student):
     return rows, stats
 
 
+def _read_coverage(folder):
+    try:
+        c = json.loads((Path(folder) / "coverage.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return c if isinstance(c, dict) and c.get("v") == 1 else None
+
+
+def _write_coverage(folder, cov: dict) -> None:
+    tmp = Path(folder) / "coverage.partial.json"
+    tmp.write_text(json.dumps(cov, indent=2), encoding="utf-8")
+    os.replace(tmp, Path(folder) / "coverage.json")
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
@@ -821,11 +995,14 @@ def run_cache(cfg: dict) -> int:
         writer = CacheWriter(out, meta, int(cfg.get("part_tokens", 262144)))
     if not again:
         save_rows(out, rows)
+    cov = stats.get("coverage") or _read_coverage(out) or coverage(rows, marker_ids(tok, cfg["model"].get("family", "generic")), max_seq, stats,
+                                                                   ((stats.get("general_detected") or {}).get("kind", "text") != "text"))
+    _write_coverage(out, cov)
     notes = [stats["general_error"]] if stats["general_error"] else []
     if adopt_note:
         notes.append(adopt_note)
     total_tokens = sum(len(r["input_ids"]) for r in rows)
-    result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False}
+    result = {"rows": len(rows), "tokens": total_tokens, "k": k, "dir": str(out), "stats": stats, "notes": notes, "stopped": False, "reused": False, "coverage": cov}
     rows_before = writer.done_rows
     target_tokens = sum(len(r["input_ids"]) for r in rows[:target]) if target < len(rows) else total_tokens
 
@@ -1433,11 +1610,14 @@ def run(cfg: dict) -> int:
     hist = hist_all
     gen_info = {k: stats.get(k) for k in ("general_source", "general_rows", "general_tokens", "general_error", "general_error_code", "general_detected")} if mode == "online" else \
         {"general_source": idx.get("general_source"), "general_rows": idx.get("general_rows")}
+    cov = stats.get("coverage") if mode == "online" else _read_coverage(d["cache"])
     summary = {"general": gen_info, "backend": "hf", "method": method, "mode": mode, "steps": r["steps"], "total_steps": steps, "tokens_seen": r["tokens"],
                "kd_first": hist[0][1] if hist else None, "kd_last": hist[-1][1] if hist else None, "calib_loss_before": done["before"],
                "calib_loss_after": r["after"] if r["after"] is not None else (calib_all[-1][1] if calib_all else None), "teacher_calib_loss": ev.get("teacher_loss") if ev else None,
                "train_seconds": round(time.time() - done["t0"], 1), "peak_vram_mb": r["vram"], "adapter_dir": str(r["target"]), "stopped": r["stopped"],
                "rows": len(order), "tokens_planned": tokens_planned, "settings": used, "optimizer": optim, "oom_retries": tried}
+    if cov:
+        summary["coverage"] = cov
     if rd:
         # r["steps"] is HF's step counter: the round's own steps are what it counted since the round began
         done_in_round = max(0, r["steps"] - gs_start)

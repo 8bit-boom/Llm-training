@@ -2442,6 +2442,21 @@ function hlMoreBox(h, busy) {
 
 // "Heal it": the original teaches the thinner model to answer like it did
 // `pair`: a model from elsewhere (or another original for a made one), chosen in the Heal section: the same card, bound to the pair
+// What the rows of a heal cover (`coverage` of the worker's teacher pass): how many conversations are whole, cut or left out, the same for reasoning rows, what the kept tokens are, and the lengths.
+function coverageHtml(c) {
+  if (!c || !c.rows) return "";
+  const r = c.rows, ch = c.chat_rows || {}, th = c.reasoning_rows || {}, sh = c.token_share || {};
+  const pc = (x) => Math.round(100 * (+x || 0)) + "%";
+  const rowsLine = `${r.project_text || 0} texts and ${r.project_chat || 0} conversations from your world` + (r.general_text || r.general_chat ? `, ${r.general_text || 0} texts and ${r.general_chat || 0} conversations of general text` : "");
+  const chats = `<span>Conversations: <strong>${ch.complete || 0}</strong> whole, <strong>${ch.cut || 0}</strong> cut at the sequence length, <strong>${ch.skipped || 0}</strong> left out as too long.</span>`;
+  const reasoning = th.known && (th.total || 0) > 0 ? `<span>Reasoning rows: <strong>${th.complete || 0}</strong> whole, <strong>${th.cut_answer || 0}</strong> lost part of the answer, <strong>${th.cut_reasoning || 0}</strong> cut inside the reasoning, <strong>${th.skipped || 0}</strong> left out.</span>` : "";
+  const shares = `<span>The kept tokens are ${pc(sh.prompt)} question, ${pc(sh.reasoning)} reasoning, ${pc(sh.answer)} answer, ${pc(sh.plain)} plain text.</span>`;
+  const lb = c.length_buckets || {};
+  const lens = Object.keys(lb).length ? `<span>Lengths before cutting: ${Object.keys(lb).map((k) => `${esc(k)} ${lb[k]}`).join(" · ")}.</span>` : "";
+  const notes = (c.notes || []).map((n) => `<p class="warn small">${esc(n)}</p>`).join("");
+  return `<div class="dim small" id="hl-coverage"><span>What healing learns from: ${esc(rowsLine)}.</span> ${chats} ${reasoning} ${shares} ${lens}</div>${notes}`;
+}
+
 function healCard(m, pair) {
   const sm = m.summary;
   if (!sm || sm.mode !== "prune") return "";
@@ -2473,7 +2488,8 @@ function healCard(m, pair) {
   const series = healSeries();
   const charts = lineChart(series.kd, `How far ${thin}'s answers are from the original's (KL)`.replace(/^How far the model's/, "How far this model's"), true) + lineChart(series.cal, "Text-prediction error on your data", true);
   const loss = h.loss && h.loss.original != null && h.loss.thinned != null ? `<p class="dim small">Before healing: error ${(+h.loss.thinned).toFixed(2)} on your data; the original has ${(+h.loss.original).toFixed(2)}. Healing aims to bring the first close to the second.</p>` : pair ? `<p class="dim small">Nothing is recorded about how well this model answered before. The error on your data is measured at the start of healing and shown in the chart.</p>` : "";
-  const used = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
+  const usedG = h.heal && h.heal.general_used && h.heal.general_used.source ? `<p class="dim small">General text: ${h.heal.general_used.skipped ? "skipped" : "used"} <strong>${esc(h.heal.general_used.source)}</strong>${h.heal.general_used.rows ? ` (${h.heal.general_used.rows} rows${h.heal.general_used.detected ? ", read as " + esc(h.heal.general_used.detected.kind) : ""})` : ""}.</p>` : "";
+  const used = usedG + coverageHtml(h.heal && h.heal.coverage);
   const other = sp.general && gc.state && gcSel("heal") !== gc.state.default;
   const note = h.heal && h.heal.note ? `<p class="warn">${esc(h.heal.note)}${other ? ` <button class="secondary" id="hl-usedefault">Use ${esc(gc.state.default)} instead</button>` : ""}</p>${used}` : used;
   const resume = st === "stopped" || st === "failed";

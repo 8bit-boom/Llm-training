@@ -920,6 +920,14 @@ fn set_heal(dir: &Path, patch: Value) {
     let _ = write_json(&dir.join("heal.json"), &v);
 }
 
+/// Keeps what the rows of the heal cover (`coverage` of the worker's `distill_cache` result: row counts, complete or cut conversations, reasoning rows, token shares, lengths)
+/// in heal.json for the Heal card. A worker that does not report it (an older one) leaves heal.json as it was.
+fn set_coverage(dir: &Path, result: &Value) {
+    if result["coverage"].is_object() {
+        set_heal(dir, json!({"coverage": result["coverage"].clone()}));
+    }
+}
+
 /// One healing job: runs it, forwards its events tagged {"phase": "heal", "heal_step": step}, keeps the chart numbers (`heal_metrics.jsonl`).
 fn heal_job(py: &Path, dir: &Path, job: &Value, step: &str, stop: &Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
     set_heal(dir, json!({"step": step}));
@@ -1117,6 +1125,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         // the page shows which general text was used or skipped, and why
         set_heal(&dir, json!({"note": note, "note_code": r["stats"]["general_error_code"], "general_used": {"source": r["stats"]["general_source"], "rows": r["stats"]["general_rows"],
                               "tokens": r["stats"]["general_tokens"], "detected": r["stats"]["general_detected"], "skipped": note.is_some()}}));
+        set_coverage(&dir, &r);
     }
     let mut summary = read_json(&run_dir.join("summary.json")).filter(|_| training_done(&run_dir)).unwrap_or(Value::Null);
     if summary.is_null() {
@@ -1275,6 +1284,7 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
             let note = r["notes"].as_array().and_then(|a| a.first()).and_then(|x| x.as_str());
             set_heal(&c.dir, json!({"note": note, "note_code": r["stats"]["general_error_code"], "general_used": {"source": r["stats"]["general_source"], "rows": r["stats"]["general_rows"],
                                     "tokens": r["stats"]["general_tokens"], "detected": r["stats"]["general_detected"], "skipped": note.is_some()}}));
+            set_coverage(&c.dir, &r);
         }
         Ok(r)
     }

@@ -42,6 +42,10 @@ fn stage_json(s: &StageState) -> Value {
     let p = &s.plan;
     let summary = s.heal.as_ref().and_then(|h| h.summary.clone()).unwrap_or(Value::Null);
     let mut out = stage_core(s, p, &summary);
+    // what the heal's rows cover (the worker's summary; absent for an older worker)
+    if summary["coverage"].is_object() {
+        out["coverage"] = summary["coverage"].clone();
+    }
     // a stage healed in rounds: the latest heal's rounds hold every round (an extension goes on from the same ones); additive, absent without rounds
     if let Some(r) = s.rounds.last() {
         out["rounds"] = r.clone();

@@ -1190,7 +1190,8 @@ if kind == "distill_cache":
     key = {{"used": False}} if not g else {{"used": True, "id": g.get("id"), "file": g.get("file"), "config": g.get("config"), "split": g.get("split"), "column": g.get("column"), "share": g["share"], "seed": job["seed"], "render": 2}}
     json.dump({{"complete": True, "rows": 10, "done_rows": 10, "general_key": key, "k": job["k"], "max_len": job["max_seq"], "rows_key": job.get("rows_key")}}, open(os.path.join(job["out"], "index.json"), "w"))
     out(type="progress", step="cache", value=0.5, text="The original model answers your texts")
-    out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."]}})
+    out(type="result", data={{"rows": 10, "tokens": 1000, "stopped": False, "notes": ["The general text (org/x) could not be downloaded: offline."],
+                             "coverage": {{"v": 1, "max_seq": job["max_seq"], "rows": {{"project_text": 1, "project_chat": 9, "general_text": 0, "general_chat": 0}}, "chat_rows": {{"complete": 8, "cut": 1, "skipped": 0}}, "notes": ["a note"]}}}})
 elif kind == "distill":
     os.makedirs(os.path.join(job["out"], "checkpoints", "checkpoint-50"), exist_ok=True)
     out(type="heal_settings", settings={{"checkpointing": job["hyper"]["checkpointing"] == "on", "batch": job["hyper"]["batch"], "grad_accum": job["hyper"]["grad_accum"], "chunk": job["distill"]["chunk"], "max_seq": job["hyper"]["max_seq"], "rank": job["hyper"]["rank"], "method": job["method"], "upcast": job["distill"].get("kbit_upcast", False)}})
@@ -1735,6 +1736,9 @@ fn healing_uses_the_chosen_dataset_and_the_token_only_through_the_environment() 
     // what the page reads back says which dataset was used or skipped, and the token is nowhere in it
     let h = std::fs::read_to_string(p.folder.join("models/slim/heal.json")).unwrap();
     assert!(h.contains("ultrachat_200k") && h.contains("general_used") && !h.contains(&token));
+    let h: serde_json::Value = serde_json::from_str(&h).unwrap();
+    assert_eq!(h["coverage"]["chat_rows"]["cut"], 1, "heal.json keeps what the rows cover for the Heal card");
+    assert_eq!(h["coverage"]["notes"][0], "a note");
     // without a saved token no variable is set
     ndforge_core::general::token_clear().unwrap();
     assert!(ndforge_core::envmgr::jobs::job_env(&jobs[0]).is_empty());

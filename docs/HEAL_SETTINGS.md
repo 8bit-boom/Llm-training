@@ -172,3 +172,15 @@ The Heal card has **Heal in rounds and check after each (stop early when it is g
 reads "At most N million tokens" (the cap), the first check comes after 5, 10 or 20 M, the check is Quick or Full, and the stop rule is "the first passed check" or "never" (record the checks, to compare
 with a normal heal). A round with fewer than 8 estimated steps is not offered. The card shows the steps and the overhead of a round, the best and the worst time next to a normal heal's, and a live table
 of the rounds. After the cap without a pass it offers **Heal 10 M more** (the same run goes on). The rules, the schedule, the costs and what is not verified: `docs/HEAL_ROUNDS.md`.
+
+## What the rows cover (the coverage report)
+
+Every teacher pass (`distill_cache`) and every online heal writes `coverage.json` next to the cache's `index.json`, puts it in the result (`coverage`), in the training `summary.json`, in `heal.json` (the Heal card shows it under "General text used") and in the Auto-cut report (`stages[].coverage`). It counts, for the rows the heal really learns from:
+
+* rows by kind: your world's texts and conversations, the general text's texts and conversations;
+* conversations whole (the end-of-turn token closes the row), cut at the sequence length (a family without an end token: a row as long as the sequence length), and left out (the prompt alone does not fit, or a general conversation longer than twice the sequence length);
+* reasoning rows (a non-empty `<think>` block; the empty block of a template with thinking off is not one): whole, answer lost, cut inside the reasoning, left out. The left-out ones are known only by their ids, so a family or tokenizer without the `<think>` markers reports no reasoning rows at all (`known: false`) and only whole / cut for conversations;
+* the share of the kept tokens that is question, reasoning, answer and plain text (the split of a conversation is found from the ids of the assistant turn's start, `<think>` and `</think>`, else from the completion mask of your own conversations);
+* the lengths of all rows before cutting (<=512, 1k, 2k, 4k, 8k, 16k, >16k), the left-out rows included.
+
+`notes` says something only when more than 10% of the reasoning rows lost their answer or were left out: below a sequence length of 8192 it advises choosing 8192 in Heal settings if the plan says it fits; at 8192 or more it says the traces are longer and that a longer bucket is not available yet. A reasoning share of the kept tokens below 75% is mentioned as Unsloth's guidance for keeping thinking, a guide and not a rule. The numbers describe the rows; they say nothing about how well the healed model will think.
