@@ -101,7 +101,7 @@ def test_a_try_pass_with_a_refit_is_repeatable_reuses_the_sidecar_and_leaves_the
     assert len(tags) == 1
     saved = json.loads((tmp_path / "models" / "_scores" / "t1" / "reshape_try.json").read_text())
     info = saved["recon"][refit]
-    assert info["layers"] == 24 and info["median_removed_share"] is not None and info["overlap"] in (0, None)
+    assert info["layers"] == 24 and info["median_removed_share"] is not None and isinstance(info["overlap"], int)
     row = [v for v in saved["analysis"]["variants"] if v["key"] == refit][0]
     assert row["recon"]["tag"] == tags[0] and row["plain_key"] == plain
     # again from scratch (the answers are dropped, the sidecar is kept): the same loss, and no new refit

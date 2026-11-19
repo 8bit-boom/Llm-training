@@ -842,3 +842,29 @@ def test_a_cut_without_the_key_is_exactly_as_before_and_has_no_recon_block(tmp_p
     code, ev = run_job(tmp_path, j)
     assert code == 0 and "recon" not in ev[-1]["data"]["width"]
     assert "recon" not in json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())["width"]
+
+
+def test_apply_recon_converts_the_refit_for_a_model_stored_in_32_bit_floats(tmp_path):
+    np = pytest.importorskip("numpy")
+    from stfile import write_file
+    from ndforge_worker import safetensors_io as st
+    from ndforge_worker import slice_io
+    H, I, k = 3, 8, 4
+    r = np.random.default_rng(2)
+    orig = r.standard_normal((H, I)).astype("<f4")
+    bits = slice_io.f32_to_bf16(r.standard_normal((H, k)).astype("<f4"))
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    write_file(tmp_path / "a" / "orig.safetensors", [("model.layers.0.mlp.down_proj.weight", "F32", (H, I), orig.tobytes())])
+    write_file(tmp_path / "b" / "side.safetensors", [("layers.0.down_proj.weight", "BF16", (H, k), bits.astype("<u2").tobytes())])
+    src_ref = st.list_tensors(tmp_path / "a")["model.layers.0.mlp.down_proj.weight"]
+    side = {0: st.list_tensors(tmp_path / "b")["layers.0.down_proj.weight"]}
+    plan = [st.OutTensor("model.layers.0.mlp.down_proj.weight", "F32", (H, k), src_ref, slice=(1, [0, 2, 4, 6]))]
+    out = rw.apply_recon(plan, [0], side)
+    assert len(out) == 1 and out[0].source is None and out[0].dtype == "F32" and out[0].nbytes == H * k * 4
+    got = np.frombuffer(bytes(out[0].data()), dtype="<f4").reshape(H, k)
+    assert np.array_equal(got, slice_io.bf16_to_f32(bits)), "the same values, exactly"
+    with pytest.raises(ReshapeError, match="another width"):
+        rw.apply_recon([st.OutTensor("model.layers.0.mlp.down_proj.weight", "F32", (H, k + 1), src_ref, slice=(1, [0, 1, 2, 3, 4]))], [0], side)
+    with pytest.raises(ReshapeError, match="no weights for layer 1"):
+        rw.apply_recon(plan + [st.OutTensor("model.layers.1.mlp.down_proj.weight", "F32", (H, k), src_ref, slice=(1, [0, 2, 4, 6]))], [0, 1], side)

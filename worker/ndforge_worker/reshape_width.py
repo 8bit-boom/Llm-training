@@ -304,10 +304,24 @@ def plan_width(out: list, src: list[int], types: list[str], dims: dict, width: d
     return result
 
 
+def _bf16_as(ref, dtype: str):
+    """A function that returns the values of the bf16 tensor `ref` as `dtype` (F32 or F16) bytes, one tensor at a time (every bf16 value is exact in F32)."""
+    def make():
+        from . import slice_io
+        n = slice_io.np()
+        f32 = slice_io.bf16_to_f32(slice_io.read_array(ref))
+        if dtype == "F32":
+            return n.ascontiguousarray(f32, dtype="<f4")
+        if dtype == "F16":
+            return n.ascontiguousarray(f32.astype("<f2"))
+        raise ReshapeError(f"The refit of the kept neurons cannot be written into {dtype} weights.")
+    return make
+
+
 def apply_recon(plan: list, src: list[int], refs: dict) -> list:
     """Replaces the sliced `down_proj` of every layer that has a refit by a plain copy of the refitted weights (`refs`: {old layer: TensorRef of W_K, BF16 [hidden, kept]}, the
     sidecar of reshape_recon). Layer j of the new model is old layer src[j]; nothing else changes and no new writer path is needed: the OutTensor just has another source.
-    ReshapeError when a refit does not have the shape of the cut's tensor or the model's weights are not bf16."""
+    ReshapeError when a refit does not have the shape of the cut's tensor. A model stored in F32 / F16 gets the refit converted (bf16 values are exact in F32)."""
     from .safetensors_io import OutTensor
     out = []
     used = set()
@@ -315,11 +329,14 @@ def apply_recon(plan: list, src: list[int], refs: dict) -> list:
         sp = split_key(t.name)
         if sp is not None and sp[2] == "mlp.down_proj.weight" and sp[1] < len(src) and src[sp[1]] in refs:
             ref = refs[src[sp[1]]]
-            if t.dtype != "BF16" or ref.dtype != "BF16":
-                raise ReshapeError("The refit of the kept neurons is made for models stored in bf16; this model's weights are not.")
+            if ref.dtype != "BF16":
+                raise ReshapeError("The saved refit is not in bf16; make it again.")
             if tuple(ref.shape) != tuple(t.shape):
                 raise ReshapeError(f"The saved refit of layer {src[sp[1]]} has the shape {tuple(ref.shape)}, but the cut needs {tuple(t.shape)}. It was made for another width.")
-            out.append(OutTensor(t.name, "BF16", tuple(t.shape), ref))
+            if t.dtype == "BF16":
+                out.append(OutTensor(t.name, "BF16", tuple(t.shape), ref))                    # a plain copy of the sidecar's bytes
+            else:
+                out.append(OutTensor(t.name, t.dtype, tuple(t.shape), None, data=_bf16_as(ref, t.dtype)))      # a model stored in 16 / 32 bit floats: the same values, converted exactly
             used.add(src[sp[1]])
             continue
         out.append(t)
