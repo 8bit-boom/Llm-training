@@ -274,3 +274,87 @@ fn the_results_page_names_how_a_cut_goes_beyond_the_guardrails() {
     std::fs::write(dir.join("model").join("ndforge_reshape.json"), json!({"mode": "grow", "period": 4, "dropped": []}).to_string()).unwrap();
     assert!(cut_guardrails(&dir).is_empty());
 }
+
+// ----------------------------------------------------------------------------------------------------------------- a round of a heal (the adapter on top, not merged)
+
+fn with_round(p: &Project, name: &str, n: u32, method: &str, student: &str) -> std::path::PathBuf {
+    let dir = made(p, name, false);
+    std::fs::create_dir_all(dir.join("distill").join("run").join("rounds").join(format!("r{n}")).join("adapter")).unwrap();
+    let adapter = dir.join("distill").join("run").join("rounds").join(format!("r{n}")).join("adapter");
+    std::fs::write(adapter.join("adapter_config.json"), "{}").unwrap();
+    std::fs::write(dir.join("heal_config.json"), json!({"job": "distill", "model": {"repo": student, "family": "qwen3_5"}, "method": method}).to_string()).unwrap();
+    adapter
+}
+
+#[test]
+fn a_round_is_the_student_of_the_heal_with_its_adapter_on_top() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let student = d.path().join("retry-student");
+    let adapter = with_round(&p, "slim-a", 3, "qlora", &student.to_string_lossy());
+    let mut s = spec("slim-a", "round");
+    s.round = Some(3);
+    s.quick = true;
+    assert_eq!(model_of(&p, &s).unwrap(), (student.to_string_lossy().to_string(), "hf"));
+    let j = build_job(&p, &s).unwrap();
+    let t = p.folder.join("models").join("slim-a").join("think_check");
+    assert_eq!((j["adapter"].clone(), j["double_quant"].clone(), j["load"].clone(), j["backend"].clone(), j["quick"].clone()), (json!(adapter), json!(true), json!("4bit"), json!("hf"), json!(true)));
+    assert_eq!(j["cache_file"], json!(t.join("round-r3.quick.json")));
+    s.quick = false;
+    assert_eq!(build_job(&p, &s).unwrap()["cache_file"], json!(t.join("round-r3.full.json")));
+    assert_eq!(cache_name(&s), "round-r3.full.json");
+    // the load follows how the student was trained, whatever the person chose
+    s.load = Some("16bit".into());
+    assert_eq!(build_job(&p, &s).unwrap()["load"], json!("4bit"));
+}
+
+#[test]
+fn a_plain_lora_student_is_checked_in_16_bit_without_double_quantization() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-b", 1, "lora", "some/student");
+    let mut s = spec("slim-b", "round");
+    s.round = Some(1);
+    let j = build_job(&p, &s).unwrap();
+    assert_eq!((j["double_quant"].clone(), j["load"].clone()), (json!(false), json!("16bit")));
+    assert_eq!(model_of(&p, &s).unwrap().0, "some/student");
+}
+
+#[test]
+fn without_a_heal_config_the_made_model_is_the_student() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-c", 2, "qlora", "x");
+    let dir = p.folder.join("models").join("slim-c");
+    std::fs::remove_file(dir.join("heal_config.json")).unwrap();
+    let mut s = spec("slim-c", "round");
+    s.round = Some(2);
+    assert_eq!(model_of(&p, &s).unwrap().0, dir.join("model").to_string_lossy());
+}
+
+#[test]
+fn a_round_without_its_number_or_its_adapter_is_a_plain_error() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-a", 3, "qlora", "x");
+    let mut s = spec("slim-a", "round");
+    assert!(build_job(&p, &s).unwrap_err().0.contains("Which round"));
+    s.round = Some(4);
+    assert!(build_job(&p, &s).unwrap_err().0.contains("adapter of round 4 was not found"));
+}
+
+#[test]
+fn the_other_targets_are_as_they_were() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    with_round(&p, "slim-a", 3, "qlora", "x");
+    for target in ["original", "cut"] {
+        let mut s = spec("slim-a", target);
+        s.round = Some(3);                                   // a round number on another target changes nothing
+        let j = build_job(&p, &s).unwrap();
+        assert!(j.get("adapter").is_none() && j.get("double_quant").is_none(), "{target}");
+        assert_eq!(j["cache_file"], json!(p.folder.join("models").join("slim-a").join("think_check").join(format!("{target}.full.json"))));
+    }
+    let s: ThinkSpec = serde_json::from_value(json!({"name": "slim-a"})).unwrap();
+    assert_eq!((s.target.as_str(), s.round), ("cut", None));
+}

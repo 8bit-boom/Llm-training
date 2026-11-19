@@ -132,11 +132,13 @@ pub struct ThinkSpec {
     pub batch: Option<u32>,
     /// the most new tokens per answer (the worker's own limit when None); only the end-to-end test on a tiny model sets it
     pub max_new: Option<u32>,
+    /// target "round": the round of a heal in rounds whose adapter is checked on top of the student, NOT merged (docs/HEAL_ROUNDS.md)
+    pub round: Option<u32>,
 }
 
 impl Default for ThinkSpec {
     fn default() -> Self {
-        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None }
+        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None, round: None }
     }
 }
 
@@ -151,6 +153,24 @@ pub fn cut_checked(p: &Project, name: &str) -> bool {
 
 fn file_name(target: &str, quick: bool) -> String {
     format!("{target}.{}.json", if quick { "quick" } else { "full" })
+}
+
+/// Where the result of a check is kept: `<target>.<mode>.json`, for a round of a heal in rounds `round-r<n>.<mode>.json`.
+pub fn cache_name(spec: &ThinkSpec) -> String {
+    match (spec.target.as_str(), spec.round) {
+        ("round", Some(n)) => format!("round-r{n}.{}.json", if spec.quick { "quick" } else { "full" }),
+        _ => file_name(&spec.target, spec.quick),
+    }
+}
+
+/// The LoRA folder of round `n` of the heal of `name` (written by the worker's distill job).
+pub fn round_adapter(p: &Project, name: &str, n: u32) -> PathBuf {
+    models_dir(p).join(name).join("distill").join("run").join("rounds").join(format!("r{n}")).join("adapter")
+}
+
+/// How the student of the heal was loaded for training: `heal_config.json` is the distill job the program wrote.
+fn heal_config(dir: &Path) -> Option<Value> {
+    read_json(&dir.join("heal_config.json"))
 }
 
 /// (the model the worker loads: a folder, a Hugging Face id or a GGUF file, the way it runs: "hf" | "llama")
@@ -169,6 +189,13 @@ pub fn model_of(p: &Project, spec: &ThinkSpec) -> Result<(String, &'static str)>
                 return Err(Error::new("This model has not been healed yet."));
             }
             Ok((h.to_string_lossy().to_string(), "hf"))
+        }
+        "round" => {
+            // the exact student the distill job used (a retry student folder too), else the made model's folder
+            if let Some(repo) = heal_config(&dir).and_then(|c| c["model"]["repo"].as_str().map(String::from)).filter(|r| !r.is_empty()) {
+                return Ok((repo, "hf"));
+            }
+            Ok((heal_source::resolve_student(&dir)?.to_string_lossy().to_string(), "hf"))
         }
         "gguf" => {
             let f = spec.gguf.as_deref().map(str::trim).filter(|f| !f.is_empty()).ok_or_else(|| Error::new("Choose the GGUF file to check."))?;
@@ -189,7 +216,19 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
     let load = spec.load.as_deref().filter(|l| matches!(*l, "auto" | "16bit" | "4bit" | "offload")).unwrap_or("auto");
     let dir = think_dir(p, &spec.name);
     let mut job = json!({"job": "think_check", "model": model, "backend": backend, "quick": spec.quick, "control": true, "load": load,
-                         "stop_file": dir.join("STOP"), "cache_file": dir.join(file_name(&spec.target, spec.quick))});
+                         "stop_file": dir.join("STOP"), "cache_file": dir.join(cache_name(spec))});
+    if spec.target == "round" {
+        let n = spec.round.ok_or_else(|| Error::new("Which round should be checked?"))?;
+        let adapter = round_adapter(p, &spec.name, n);
+        if !adapter.join("adapter_config.json").is_file() {
+            return Err(Error::new(format!("The adapter of round {n} was not found. A round is checked right after it was trained; its adapter is deleted when the heal is finished.")));
+        }
+        // the model as it is trained: the base the way the student was loaded (4-bit NF4 with double quantization for QLoRA, else 16-bit) and the LoRA on top, not merged
+        let qlora = heal_config(&models_dir(p).join(&spec.name)).is_none_or(|c| c["method"] != json!("lora"));
+        job["adapter"] = json!(adapter);
+        job["double_quant"] = json!(qlora);
+        job["load"] = json!(if qlora { "4bit" } else { "16bit" });
+    }
     if let Some(b) = spec.batch.filter(|b| (1..=64).contains(b)) {
         job["batch"] = json!(b);
     }

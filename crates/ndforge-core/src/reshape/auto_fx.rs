@@ -163,7 +163,7 @@ impl Effects for RealEffects<'_> {
     }
 
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>> {
-        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None };
+        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None, round: None };
         let stop = self.stop.clone();
         let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
         done(r, Ok)
