@@ -148,6 +148,29 @@ def params_for(dims: dict, layer_types: list[str], width: dict, vision: int, oth
     return layers + dims["vocab"] * H + head + H + mtp + vision + other
 
 
+# --------------------------------------------------------------------------------------------------------- output-contribution scores
+
+SCORINGS = ("activation", "output")
+
+
+def check_scoring(value) -> str:
+    """The `width_scoring` of a job: "activation" (default, None) or "output"."""
+    if value in (None, "", "activation"):
+        return "activation"
+    if value == "output":
+        return "output"
+    raise ReshapeError("The way the neurons are ranked is \"activation\" (the default) or \"output\".")
+
+
+def output_scores(ms, norms):
+    """The output-contribution score of the MLP neurons: the mean square of the neuron's activation (over the real tokens of the measuring text) times the squared
+    norm of its column of `down_proj`, the expected squared size of what the neuron adds to the layer's output when the neurons are treated as independent. `ms` and `norms`
+    are arrays (or nested lists) of the same shape, e.g. [layers, neurons]; the result has that shape. Elementwise, so the halves of the text are scored the same way."""
+    if hasattr(ms, "shape") and hasattr(norms, "shape"):
+        return ms * norms
+    return [output_scores(a, b) if isinstance(a, (list, tuple)) else float(a) * float(b) for a, b in zip(ms, norms)]
+
+
 # --------------------------------------------------------------------------------------------------------- choosing what stays
 
 def head_rows(h: int, size: int) -> list[int]:

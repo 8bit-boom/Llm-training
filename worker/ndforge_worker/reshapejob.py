@@ -130,7 +130,7 @@ def run_measure(cfg: dict) -> int:
     folder = Path(cfg["out_dir"])
     if cfg.get("force") and folder.is_dir():
         shutil.rmtree(folder)
-    sc = _scores_for({**cfg, "scores_dir": str(folder)}, src_dir, period, config, dims, types, True)
+    sc = _scores_for({**cfg, "scores_dir": str(folder)}, src_dir, period, config, dims, types, True, need_ms=True)      # a measurement without the mean squares is made again
     m = sc["meta"]
     stable = None
     try:
@@ -513,9 +513,11 @@ SCORES_FORMAT = 1
 SCORE_ARRAYS = ("mlp", "attn", "gdn")
 
 
-def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list, weights: str | None = None):
+def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list, weights: str | None = None, need_ms: bool = False):
     """The measurement cached in `scores_dir` (scores.json + scores.npz), or None when there is none or it does not belong to this model and data.
-    Returns {"meta": scores.json, "mlp"/"attn"/"gdn": float32 arrays [layers, structures], and the same with "_h1" / "_h2" for the two halves}."""
+    Returns {"meta": scores.json, "mlp"/"attn"/"gdn": float32 arrays [layers, structures], and the same with "_h1" / "_h2" for the two halves}.
+    A measurement made since the mean squares were recorded also has "mlp_ms" (+ "_h1", "_h2"), the mean square of every neuron's activation, and `"mean_square": true` in its
+    scores.json; with `need_ms` one without them is None (the caller measures again)."""
     if not scores_dir:
         return None
     folder = Path(scores_dir)
@@ -554,6 +556,12 @@ def _read_scores(scores_dir, cfg: dict, n_layers: int, dims: dict, types: list, 
             if a is None or tuple(a.shape) != shape:
                 protocol.log("The earlier measurement does not fit this model's layers; measuring again.")
                 return None
+    if need_ms:
+        for suffix in ("", "_h1", "_h2"):
+            a = arrays.get("mlp_ms" + suffix)
+            if not meta.get("mean_square") or a is None or tuple(a.shape) != want["mlp"]:
+                protocol.log("The earlier measurement did not record the mean square of the neurons, which ranking them by their output needs; measuring again.")
+                return None
     return {"meta": meta, **arrays}
 
 
@@ -565,9 +573,9 @@ def _depth_from_scores(sc: dict):
     return m["matrix"], m.get("matrix_h1") or m["matrix"], m.get("matrix_h2") or m["matrix"], m.get("loss_before"), {"load": m.get("load"), "tokens": m.get("tokens")}
 
 
-def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list, need_depth: bool):
-    """The cached measurement when it covers what is needed; otherwise the model is measured (needs torch)."""
-    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types, weights=safetensors_io.weights_manifest(src_dir))
+def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list, need_depth: bool, need_ms: bool = False):
+    """The cached measurement when it covers what is needed (`need_ms`: it also recorded the mean squares of the neurons); otherwise the model is measured (needs torch)."""
+    sc = _read_scores(cfg.get("scores_dir"), cfg, int(reshape.text_config(config)["num_hidden_layers"]), dims, types, weights=safetensors_io.weights_manifest(src_dir), need_ms=need_ms)
     if sc is not None and (not need_depth or sc["meta"].get("matrix")):
         protocol.log("Using the earlier measurement of this model on your data.")
         return sc
@@ -575,9 +583,20 @@ def _scores_for(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict,
     return _measure_and_save(cfg, src_dir, period, config, dims, types)
 
 
-def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict):
+def with_output_scores(sc: dict, norms) -> dict:
+    """`sc` with the MLP scores (and those of the two halves) replaced by the output-contribution score: the mean square of the neuron's activation times the squared norm of its
+    down_proj column. Everything else (the attention heads, the layer distances) is as measured."""
+    out = dict(sc)
+    for suffix in ("", "_h1", "_h2"):
+        out["mlp" + suffix] = reshape_width.output_scores(sc["mlp_ms" + suffix], norms)
+    return out
+
+
+def _keep_sets(sc: dict, src: list, types: list, dims: dict, width: dict, scoring: str = "activation", norms=None):
     """(keep, overlap): per kept old layer the structures that stay, and the mean Jaccard overlap of the choices made from the two halves of the
-    measuring text (1.0 = the same choice from either half)."""
+    measuring text (1.0 = the same choice from either half). With `scoring` "output" the neurons are ranked by `with_output_scores(sc, norms)` instead of the activation."""
+    if scoring == "output":
+        sc = with_output_scores(sc, norms)
     keep: dict = {"mlp": {}, "heads": {}, "gdn": {}}
     ov: list = []
     ordinal = {"full_attention": [], "linear_attention": []}
@@ -649,12 +668,15 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
     Width importance (NVIDIA Model-Optimizer's aggregation): a hook on the INPUT of each output projection (mlp.down_proj, self_attn.o_proj,
     linear_attn.out_proj) takes |activation|, averages it over the real tokens of every text, squares it, and sums over the texts; the score of a channel is the
     square root of that sum. A head's score is the L2 norm of its channels' scores. Kept for all texts and separately for the two halves (by batch parity).
-    Returns ((D, D1, D2, loss, tokens), scores) with scores = {"mlp": [L, I], "attn": [n_full, nh], "gdn": [n_lin, nv]} (+ "_h1", "_h2") as float32 numpy arrays."""
+    The same pass also records `mlp_ms` [L, I] (+ "_h1", "_h2"): the mean over the real tokens of the SQUARED activation of every MLP neuron. That is not the square of the score above
+    (which averages |a| per text first), so the output-contribution score needs it on its own: `reshape_width.output_scores(mlp_ms, down-column norms)`.
+    Returns ((D, D1, D2, loss, tokens), scores) with scores = {"mlp": [L, I], "attn": [n_full, nh], "gdn": [n_lin, nv], "mlp_ms": [L, I]} (+ "_h1", "_h2") as float32 numpy arrays."""
     import numpy as np
     import torch
     sizes = {"mlp": dims["intermediate"], "attn": dims["heads"] * dims["head_dim"], "gdn": dims["lin_v_heads"] * dims["lin_v_dim"]}
     state = {"mask": None, "batch": 0}
     acc: dict = {}            # (kind, ordinal, part) -> float32 [C], part 0 = all texts, 1 / 2 = the halves
+    msq: dict = {}            # (ordinal, part) -> [sum over real tokens of a^2 (float64 [I]), number of real tokens] for the MLP neurons (the output-contribution score)
     ordinals = {"mlp": {}, "attn": {}, "gdn": {}}
     handles = []
 
@@ -672,6 +694,12 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
             for part in (0, 1 + state["batch"] % 2):
                 key = (kind, k, part)
                 acc[key] = sq.clone() if key not in acc else acc[key] + sq
+            if kind == "mlp":
+                sq_tok = ((a * a) * m[..., None]).sum((0, 1)).double()
+                n_tok = float(m.sum())
+                for part in (0, 1 + state["batch"] % 2):
+                    cur = msq.get((k, part))
+                    msq[(k, part)] = [sq_tok.clone(), n_tok] if cur is None else [cur[0] + sq_tok, cur[1] + n_tok]
         return hook
 
     for i, layer in enumerate(layers):
@@ -709,6 +737,14 @@ def _measure_all(model, layers, period: int, batches: list, mode: str, types: li
                     s = s.reshape(-1, per_head[kind]).pow(2).sum(1).sqrt()
                 rows.append(s.cpu().numpy().astype(np.float32))
             scores[kind + suffix] = np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
+    for part, suffix in ((0, ""), (1, "_h1"), (2, "_h2")):
+        rows = []
+        for k in range(len(ordinals["mlp"])):
+            v = msq.get((k, part)) or (msq.get((k, 1)) if part == 2 else None)
+            if v is None:
+                raise ReshapeError("Nothing was measured; the measuring text is empty.")
+            rows.append((v[0] / max(v[1], 1.0)).cpu().numpy().astype(np.float32))
+        scores["mlp_ms" + suffix] = np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
     return depth, scores
 
 
@@ -723,6 +759,33 @@ def _write_scores(folder: Path, meta: dict, scores: dict) -> None:
     tmp_json = folder / "scores.partial.json"
     tmp_json.write_text(json.dumps(meta), encoding="utf-8")
     os.replace(tmp_json, folder / "scores.json")
+
+
+DOWN_NORMS_FILE = "down_norms.npz"
+
+
+def _down_norms(scores_dir, src_dir: Path, n_layers: int, tensors: dict | None = None):
+    """float32 [layers, neurons]: the squared column norms of every layer's down_proj, from the weight files (no torch). Kept next to the measurement in `down_norms.npz` with the
+    identity of the weight files, so the next job reads 1 file instead of every down_proj again; a file for other weights is made again."""
+    np = slice_io.np()
+    weights = safetensors_io.weights_manifest(src_dir)
+    folder = Path(scores_dir) if scores_dir else None
+    f = folder / DOWN_NORMS_FILE if folder else None
+    if f is not None and f.is_file():
+        try:
+            with np.load(f) as z:
+                if str(z["weights"]) == weights and z["norms"].shape[0] == n_layers:
+                    return np.array(z["norms"], dtype=np.float32)
+        except (OSError, ValueError, KeyError):
+            pass
+    norms = slice_io.down_col_sq_norms(tensors if tensors is not None else safetensors_io.list_tensors(src_dir), n_layers)
+    if f is not None:
+        import os
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / "down_norms.partial.npz"
+        np.savez(tmp, norms=norms, weights=np.array(weights))
+        os.replace(tmp, f)
+    return norms
 
 
 def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims: dict, types: list) -> dict:
@@ -767,7 +830,7 @@ def _measure_and_save(cfg: dict, src_dir: Path, period: int, config: dict, dims:
     protocol.timing("score", time.monotonic() - timer, tokens=tokens, load=mode)
     meta = {"format": SCORES_FORMAT, "source": (cfg.get("source") or {}).get("repo"), "key": Path(cfg.get("scores_dir") or "").name or None,
             "data_version": calib.get("version"), "samples": calib.get("samples"), "max_len": calib.get("max_len"), "seed": calib.get("seed", 3407), "load": mode,
-            "reasoning": reasoning_key(calib), "weights": safetensors_io.weights_manifest(src_dir), "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
+            "reasoning": reasoning_key(calib), "weights": safetensors_io.weights_manifest(src_dir), "mean_square": True, "tokens": tokens, "period": period, "boundary_distance": [D[k][k + 1] for k in range(len(D) - 1)], "matrix": D, "matrix_h1": D1, "matrix_h2": D2,
             "loss_before": loss, "seconds_per_pass": round(time.monotonic() - timer, 1), "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     if cfg.get("scores_dir"):
         _write_scores(Path(cfg["scores_dir"]), meta, scores)
@@ -892,6 +955,9 @@ def run(cfg: dict) -> int:
             raise ReshapeError(why)
         dims = reshape_width.width_dims(config)
         width = reshape_width.check_width(dims, width_req, divisor)
+    scoring = reshape_width.check_scoring(cfg.get("width_scoring"))
+    if scoring == "output" and not (width and width["intermediate"] != dims["intermediate"]):
+        scoring = "activation"                  # only the MLP neurons are ranked this way: nothing to rank without an MLP cut
 
     scores, loss_before, loss_after, stable, strategy, chosen = None, None, None, None, cfg.get("strategy", "contiguous"), []
     load_used, tokens = cfg.get("load", "auto"), None
@@ -909,7 +975,7 @@ def run(cfg: dict) -> int:
             if not lo <= blocks <= hi:
                 raise ReshapeError("Slim at most half of the layers, and never the first or last block.")
             if width:
-                sc = _scores_for(cfg, src_dir, period, config, dims, types, True)
+                sc = _scores_for(cfg, src_dir, period, config, dims, types, True, scoring == "output")
                 D, D1, D2, loss_before, info = _depth_from_scores(sc)
             else:
                 _require_torch()
@@ -928,13 +994,16 @@ def run(cfg: dict) -> int:
             src = list(range(n_layers))
         if width:
             if sc is None:
-                sc = _scores_for(cfg, src_dir, period, config, dims, types, False)
+                sc = _scores_for(cfg, src_dir, period, config, dims, types, False, scoring == "output")
                 load_used, tokens = sc["meta"].get("load", load_used), sc["meta"].get("tokens")
                 loss_before = sc["meta"].get("loss_before")
-            keep, overlap = _keep_sets(sc, src, types, dims, width)
+            norms = _down_norms(cfg.get("scores_dir"), src_dir, n_layers, tensors) if scoring == "output" else None
+            if scoring == "output":
+                protocol.log("Ranking the MLP neurons by their expected output: the mean square of the activation times the squared size of the neuron's output column.")
+            keep, overlap = _keep_sets(sc, src, types, dims, width, scoring, norms)
             mtp_drop = bool(groups["mtp"]) and not cfg.get("keep_mtp") and reshape_width.mtp_removed(dims, width)
             mtp_keep = _mtp_keep(tensors, dims, width) if groups["mtp"] and not mtp_drop else None
-            protocol.emit("width_scores", **_width_event(sc, keep, src, overlap))
+            protocol.emit("width_scores", **_width_event(with_output_scores(sc, norms) if scoring == "output" else sc, keep, src, overlap))
             protocol.log(f"Thinning every layer: MLP {dims['intermediate']:,} to {width['intermediate']:,}"
                          + (f", linear-attention value heads {dims['lin_v_heads']} to {width['lin_v_heads']}" if width["lin_v_heads"] != dims["lin_v_heads"] else "")
                          + (f", attention heads {dims['heads']} to {width['heads']}" if width["heads"] != dims["heads"] else "") + ".")
@@ -1008,6 +1077,8 @@ def run(cfg: dict) -> int:
             wmeta = {"intermediate_size": [dims["intermediate"], width["intermediate"]], "linear_num_value_heads": [dims["lin_v_heads"], width["lin_v_heads"]],
                      "num_attention_heads": [dims["heads"], width["heads"]], "kept": "width_kept.npz", "scores_key": Path(cfg.get("scores_dir") or "").name or None,
                      "stable_overlap": round(overlap, 4), "mtp": MTP_REMOVED if mtp_drop else ("sliced by weight size, not measured" if mtp_keep else "copied unchanged") if groups["mtp"] else "none"}
+            if scoring == "output":
+                wmeta["scoring"] = "output"             # only written when asked for: a cut as before has the file as before
             _save_kept(out / "width_kept.npz", src, keep, mtp_keep)
         shape_word = ("both" if chosen else "width") if width else ("depth" if mode == "prune" else None)
         meta = {"format": 2 if width else 1, "tool": "ND Lore Forge", "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1050,6 +1121,7 @@ def run(cfg: dict) -> int:
                                                                 "num_attention_heads": dims["heads"]},
                                                       "after": {"intermediate_size": width["intermediate"], "linear_num_value_heads": width["lin_v_heads"],
                                                                 "num_attention_heads": width["heads"]},
-                                                      "stable_overlap": wmeta["stable_overlap"], "scores_key": wmeta["scores_key"], "mtp": wmeta["mtp"]}
+                                                      "stable_overlap": wmeta["stable_overlap"], "scores_key": wmeta["scores_key"], "mtp": wmeta["mtp"],
+                                                      **({"scoring": "output"} if wmeta.get("scoring") else {})}
                                                      if width else None)})
     return 0

@@ -37,4 +37,6 @@ No job, event or error code was added for these; `contract.json` is unchanged. E
 - `reshape_try`: the result key (`key`) gains `weights_sample`; saved answers without it are accepted. `scores.json` gains `weights`; a measurement without it is accepted.
 - `reshape` result: `params_breakdown` `{text_layers, embeddings, output, vision, mtp, other, total, mtp_removed}`.
 - `distill`: `distill.head_checkpoint` `"on"` (default) | `"off"` (keep the output layer's logits for the backward pass; the `heal_settings` event then carries `settings.head_checkpoint: false`; the same loss, more memory, student-side only, in no cache key).
+- `reshape`: `width_scoring` `"activation"` (default) | `"output"`; the result's `width` and `ndforge_reshape.json` `width` carry `scoring: "output"` only then. `reshape_measure` / `scores.json`: `mean_square: true` and the arrays `mlp_ms`, `mlp_ms_h1`, `mlp_ms_h2` in `scores.npz`; `down_norms.npz` next to them.
+- `reshape_try`: a choice may carry `scoring: "output"` (needs a width; the plain cut is tried as well); pass keys get an optional suffix segment `|s=output`; the analysis gets `variants` (only when there are some).
 

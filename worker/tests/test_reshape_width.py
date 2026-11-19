@@ -415,7 +415,7 @@ def test_inspect_says_why_width_is_not_possible(tmp_path):
 
 # ----------------------------------------------------------------------------------------------------- 8: the job (no torch)
 
-def write_scores(folder, src_repo, layers=8, data_version=3, dims=None, **over):
+def write_scores(folder, src_repo, layers=8, data_version=3, dims=None, ms=False, **over):
     """a cached measurement for the fake model (8 or 16 layers) or, with `dims`, for another Qwen3.5 model; deterministic random scores; returns the arrays"""
     np = pytest.importorskip("numpy")
     d = dims or fake_dims()
@@ -429,13 +429,16 @@ def write_scores(folder, src_repo, layers=8, data_version=3, dims=None, **over):
         arrays[k] = base
         arrays[k + "_h1"] = (base + 0.01 * r.random(sh)).astype(np.float32)          # nearly the same ranking in both halves
         arrays[k + "_h2"] = (base + 0.01 * r.random(sh)).astype(np.float32)
+    if ms:                                  # a measurement that recorded the mean square of the MLP neurons (the output-contribution score)
+        for suffix in ("", "_h1", "_h2"):
+            arrays["mlp_ms" + suffix] = (r.random(shapes["mlp"]) + 0.5).astype(np.float32)
     Path(folder).mkdir(parents=True, exist_ok=True)
     np.savez(Path(folder) / "scores.npz", **arrays)
     nb = layers // 4
     D = [[abs(a - b) * 0.2 + (-0.05 if {a, b} == {1, 2} else 0.0) for b in range(nb + 1)] for a in range(nb + 1)]
     meta = {"format": 1, "source": src_repo, "key": Path(folder).name, "data_version": data_version, "samples": 16, "max_len": 32, "seed": 3407, "load": "16bit",
             "tokens": 777, "period": 4, "boundary_distance": [D[k][k + 1] for k in range(nb)], "matrix": D, "matrix_h1": D, "matrix_h2": D, "loss_before": 1.5,
-            "created": "2026-11-13T00:00:00Z", **over}
+            "created": "2026-11-13T00:00:00Z", **({"mean_square": True} if ms else {}), **over}
     (Path(folder) / "scores.json").write_text(json.dumps(meta), encoding="utf-8")
     return arrays
 
@@ -662,3 +665,102 @@ def test_keep_mtp_restores_the_old_slicing(tmp_path):
     assert refs["mtp.layers.0.mlp.down_proj.weight"].shape == (8, 20)
     meta = json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())
     assert "mtp_removed" not in meta and "weight size" in meta["mtp"]
+
+
+# ------------------------------------------------------------------------------------------------------ ranking the neurons by their output
+
+def test_output_scores_are_the_product_and_work_on_arrays_and_lists():
+    np = pytest.importorskip("numpy")
+    ms, norms = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32), np.array([[0.5, 1.0, 2.0], [1.0, 0.0, 0.25]], dtype=np.float32)
+    got = rw.output_scores(ms, norms)
+    assert got.tolist() == [[0.5, 2.0, 6.0], [4.0, 0.0, 1.5]]
+    assert rw.output_scores(ms.tolist(), norms.tolist()) == got.tolist() and rw.output_scores([2.0, 3.0], [4.0, 0.5]) == [8.0, 1.5]
+    # the ranking changes: a neuron that fires a little but writes a lot beats one that fires a lot and writes nothing
+    act = [1.0, 0.9, 0.1]
+    assert rw.keep_top(act, 1) == [0] and rw.keep_top(rw.output_scores([1.0, 1.0, 1.0], [0.0, 0.0, 9.0]), 1) == [2]
+
+
+def test_keep_top_of_the_output_scores_is_deterministic_and_ties_keep_the_lower_index():
+    scores = rw.output_scores([1.0, 1.0, 1.0, 2.0], [3.0, 3.0, 3.0, 1.5])         # 3, 3, 3, 3: every neuron ties
+    assert rw.keep_top(scores, 2) == [0, 1] == rw.keep_top(scores, 2)
+
+
+def test_check_scoring_accepts_the_default_and_output_only():
+    assert rw.check_scoring(None) == rw.check_scoring("") == rw.check_scoring("activation") == "activation" and rw.check_scoring("output") == "output"
+    with pytest.raises(ReshapeError):
+        rw.check_scoring("magic")
+
+
+def scoring_job(tmp_path, scoring=None, ms=True, width=20):
+    src = fake_qwen_width(tmp_path)
+    write_scores(tmp_path / "models" / "_scores" / "k1", str(src), ms=ms)
+    over = {} if scoring is None else {"width_scoring": scoring}
+    return src, wjob(tmp_path, src, {"intermediate_size": width, "linear_num_value_heads": None, "num_attention_heads": None}, **over)
+
+
+def kept_mlp(final):
+    meta_dir = Path(final)
+    np = pytest.importorskip("numpy")
+    with np.load(meta_dir / "width_kept.npz") as z:
+        return {k: z[k].tolist() for k in z.files if k.startswith("mlp_")}
+
+
+def test_a_cut_with_output_scoring_keeps_what_the_product_ranks_first(tmp_path):
+    np = pytest.importorskip("numpy")
+    from ndforge_worker import safetensors_io as st
+    from ndforge_worker import slice_io
+    src, j = scoring_job(tmp_path, "output")
+    code, ev = run_job(tmp_path, j)
+    assert code == 0 and ev[-1]["type"] == "result", ev[-1]
+    r = ev[-1]["data"]
+    assert r["width"]["scoring"] == "output"
+    assert any("ranking the mlp neurons by their expected output" in e.get("text", "").lower() for e in ev if e["type"] == "log")
+    arrays = np.load(tmp_path / "models" / "_scores" / "k1" / "scores.npz")
+    norms = slice_io.down_col_sq_norms(st.list_tensors(src), 8)
+    want_scores = arrays["mlp_ms"] * norms
+    kept = kept_mlp(j["final"])
+    for layer in range(8):
+        assert kept[f"mlp_{layer}"] == rw.keep_top([float(x) for x in want_scores[layer]], 20), layer
+    meta = json.loads((Path(j["final"]) / "ndforge_reshape.json").read_text())
+    assert meta["width"]["scoring"] == "output"
+    assert (tmp_path / "models" / "_scores" / "k1" / "down_norms.npz").is_file(), "the column norms are kept next to the measurement"
+
+
+def test_the_default_cut_is_the_same_with_and_without_the_key_and_records_no_scoring(tmp_path):
+    from ndforge_worker import reshapejob
+    _, j0 = scoring_job(tmp_path / "a", None)
+    code, ev0 = run_job(tmp_path / "a", j0)
+    _, j1 = scoring_job(tmp_path / "b", "activation")
+    code1, ev1 = run_job(tmp_path / "b", j1)
+    assert code == code1 == 0
+    assert "scoring" not in ev0[-1]["data"]["width"] and "scoring" not in json.loads((Path(j0["final"]) / "ndforge_reshape.json").read_text())["width"]
+    assert kept_mlp(j0["final"]) == kept_mlp(j1["final"])
+    assert ev0[-1]["data"]["params_after"] == ev1[-1]["data"]["params_after"]
+    assert reshapejob  # imported: the module is the one under test
+
+
+def test_output_scoring_needs_a_measurement_with_mean_squares_and_says_so_without_torch(tmp_path, monkeypatch):
+    from ndforge_worker import reshapejob
+    _, j = scoring_job(tmp_path, "output", ms=False)
+    monkeypatch.setattr(reshapejob, "_have_torch", lambda: False)
+    monkeypatch.setattr(reshapejob, "_require_torch", lambda: (_ for _ in ()).throw(ReshapeError("Measuring the layers needs the training software (Training setup).")))
+    code, ev = run_job(tmp_path, j)
+    assert code != 0 and ev[-1]["type"] == "error" and "training software" in ev[-1]["message"], ev[-1]
+    # the plain cut from the same old measurement still works
+    _, j2 = scoring_job(tmp_path / "plain", None, ms=False)
+    assert run_job(tmp_path / "plain", j2)[0] == 0
+
+
+def test_an_old_measurement_is_read_as_before_and_ms_is_asked_for_only_when_needed(tmp_path):
+    from ndforge_worker import reshapejob
+    src = fake_qwen_width(tmp_path)
+    dims, types = fake_dims(), fake_types()
+    cfg = {"source": {"repo": str(src)}, "calibration": {"version": 3, "samples": 16, "max_len": 32}}
+    old = tmp_path / "old"
+    write_scores(old, str(src))
+    new = tmp_path / "new"
+    write_scores(new, str(src), ms=True)
+    assert reshapejob._read_scores(old, cfg, 8, dims, types) is not None
+    assert reshapejob._read_scores(old, cfg, 8, dims, types, need_ms=True) is None
+    sc = reshapejob._read_scores(new, cfg, 8, dims, types, need_ms=True)
+    assert sc is not None and sc["mlp_ms"].shape == (8, dims["intermediate"]) and sc["meta"]["mean_square"] is True

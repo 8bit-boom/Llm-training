@@ -350,3 +350,36 @@ test("starting a search sends the spec, and the thinking check of the top 2 resu
   assert.equal(again[1].resume, "20261119-s");
   assert.equal(again[1].spec.think_check, "top2");
 });
+
+test("ranking the neurons by their output: Expert only, sent only when ticked, and the comparison table is honest", () => {
+  const b = browser();
+  openWidth(b, pageState(), "width", `rs.tr.what = "widths"; rs.meas = { exists: true }; rs.wi = 12288;`);
+  const spec = () => JSON.parse(b.run("JSON.stringify(trySpec())"));
+  assert.doesNotMatch(b.run("tryCard()"), /id="tr-scoring"/);                                  // Expert only
+  b.run(`state.settings.expert_mode = true`);
+  assert.match(b.run("tryCard()"), /<input type="checkbox" id="tr-scoring" +>/);
+  assert.deepEqual(spec().choices, []);                                                         // the default sends nothing new
+  b.run(`rs.tr.scoring = true`);
+  let s = spec();
+  assert.equal(s.widths.length, 34); assert.equal(s.choices.length, 34);
+  assert.deepEqual(s.choices[0], { blocks: [], width: s.widths[0], scoring: "output" });
+  b.run(`rs.tr.what = "choice"; rs.wi = 12288`);
+  assert.deepEqual(spec().choices, [{ blocks: [], width: 12288 }, { blocks: [], width: 12288, scoring: "output" }]);
+  // the Make form: the setting is in the spec only when chosen
+  assert.equal(JSON.parse(b.run("JSON.stringify(rsSpec())")).width_scoring, undefined);
+  assert.match(b.run("renderReshape()"), /id="rs-scoring"/);
+  b.run(`rs.scoring = "output"`);
+  assert.equal(JSON.parse(b.run("JSON.stringify(rsSpec())")).width_scoring, "output");
+  assert.match(b.run("renderReshape()"), /<option value="output" selected>their expected output \(experimental\)/);
+  // the table of variants
+  const v = (key, loss, plain, both) => ({ key, tried: true, loss, rel: loss / 2 - 1, label: "MLP 12,288, neurons ranked by their output", rel_vs_plain: loss / plain - 1, better_both_halves: both, options: { s: "output" } });
+  b.run(`rs.tr.analysis = ${JSON.stringify(analysis({ widths: [wrow(12288, 2.4)], blocks: [], runs: {}, variants: [v("d=|w=12288|s=output", 2.3, 2.4, true)] }))}`);
+  const html = b.run("tryCard()");
+  assert.match(html, /id="tr-variants"/);
+  assert.match(html, /<td>MLP 12,288, neurons ranked by their output<\/td><td>2\.300<\/td><td>\+15\.0 %<\/td><td>−4\.2 %<\/td><td>yes<\/td>/);
+  assert.match(html, /a gain on both halves is a reason to try the same cut healed, not a promise/);
+  b.run(`rs.tr.analysis.variants[0].better_both_halves = false`);
+  assert.match(b.run("tryCard()"), /−4\.2 %<\/td><td>no<\/td>/);
+  b.run(`rs.tr.analysis.variants = []`);
+  assert.doesNotMatch(b.run("tryCard()"), /tr-variants/);
+});

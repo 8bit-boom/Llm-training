@@ -191,6 +191,11 @@ pub struct ReshapeSpec {
     /// do not measure the new model's loss after the cut (its loss was measured already, for instance by Try first): saves loading it once more
     #[serde(default)]
     pub skip_check: bool,
+    /// how the MLP neurons are ranked when the width is cut: None / "activation" (the default: the mean of the absolute activation) or "output" (experimental: the mean square
+    /// of the activation times the squared size of the neuron's output column, the expected squared contribution to the layer's output). Try first compares them; nothing here
+    /// says "output" is better. Not sent to the worker unless "output".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_scoring: Option<String>,
 }
 
 fn r_share() -> f64 {
@@ -451,6 +456,9 @@ pub fn validate(spec: &ReshapeSpec, ins: &Inspect) -> Result<()> {
     }
     if let Some(r) = &spec.reasoning {
         r.validate()?;
+    }
+    if spec.width_scoring.as_deref().is_some_and(|s| !["activation", "output"].contains(&s)) {
+        return Err(Error::new("The way the neurons are ranked is activation (the default) or output."));
     }
     if let Some(w) = &spec.width {
         validate_width(spec, ins, w)?;

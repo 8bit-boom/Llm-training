@@ -2187,9 +2187,9 @@ const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkp
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
-  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, meas: null, measModel: null,
+  shape: "depth", wi: null, lv: false, hh: null, wsamples: 256, scoring: "activation", meas: null, measModel: null,
   // "Try first": what to try, the clicked blocks, the plan (how many cuts, how long), the kept answers and a run in progress
-  tr: { what: "blocks", se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
+  tr: { what: "blocks", scoring: false, se: { target: "b", b: null, gb: "", pct: 75, budget: 20, keep: null, axes: "both", think: true, confirm: true, many: false, beyond: false, thorough: false, plan: null, planErr: null, planFor: "", planTok: 0, running: false, text: "", progress: null, done: 0, total: 0, round: null, left: null, best: null, rows: [], result: null, err: null, partial: null, id: null }, quick: null, sel: [], plan: null, planErr: null, planFor: null, planTok: 0, resFor: null, analysis: null, sps: null, running: false, text: "", progress: null, done: 0, total: 0 },
   hs: { cand: null, studentPick: "", studentFolder: "", studentHub: "", teacherPick: "", teacherFolder: "", teacherHub: "", checking: false, check: null, checkKey: null, err: null },
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", rounds: false, roundM: 5, firstCheck: 10, roundCheck: "quick", stopRule: "pass", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
@@ -2325,7 +2325,13 @@ function rsWidthUi(op, st) {
       <input type="range" id="rs-slider" min="0" max="${op.options.length - 1}" step="1" value="${bidx}" style="width:100%;max-width:560px" ${rs.running ? "disabled" : ""}>
       <div id="rs-sizeinfo" class="dim small">${rsSizeInfo()}</div>` : ""}${warn}</div>
     <p>Measure on: ${st.dataset_version ? `data version v${st.dataset_version} (world book + practice answers), ${expert ? `<select id="rs-wsamples">${[128, 256, 512, 1024].map((n) => `<option ${rs.wsamples === n ? "selected" : ""}>${n}</option>`).join("")}</select>` : rs.wsamples} samples` : `<span class="err">Save a training-data version in Step 2 first: the layers are measured on your own text.</span>`}</p>
-    <p class="dim small" id="rs-measinfo">${meas}</p>${axes}`;
+    <p class="dim small" id="rs-measinfo">${meas}</p>${expert ? rsScoringHtml() : ""}${axes}`;
+}
+
+// Expert: how the neurons that stay are chosen. The default is how much they fire; "output" (experimental) also counts how much each one writes into the layer's output.
+function rsScoringHtml() {
+  return `<p id="rs-scoring-row">Rank the neurons by <select id="rs-scoring" ${rs.running ? "disabled" : ""}><option value="activation" ${rs.scoring !== "output" ? "selected" : ""}>how much they fire (the default)</option><option value="output" ${rs.scoring === "output" ? "selected" : ""}>their expected output (experimental)</option></select>
+    <span class="dim small">The second counts the mean square of what a neuron fires times the squared size of what it writes into the layer. Nobody has measured here that it keeps more quality; the “Try first” card below compares the two on your text and says whether both halves agree. A gain before healing may not survive healing.</span></p>`;
 }
 
 // a small line chart: the points as a line, the first and the last value written out
@@ -3207,11 +3213,15 @@ function trySpec() {
   if (w === "search") return null;
   if (w === "blocks") { if (!tryDepthOn()) return null; spec.blocks = true; }
   else if (w === "runs") { if (!tryDepthOn() || !rs.blocks) return null; spec.runs = [rs.blocks]; }
-  else if (w === "widths") { const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws; }
+  else if (w === "widths") {
+    const ws = tryWidthOnShape() ? tryWidths() : []; if (!ws.length) return null; spec.widths = ws;
+    if (rs.tr.scoring) spec.choices = ws.map((x) => ({ blocks: [], width: x, scoring: "output" }));          // the plain widths are tried as well: it is what they are compared with
+  }
   else {
     const c = tryChoice();
     if (!c.blocks.length && c.width == null) return null;
     spec.choices = [c.width == null ? { blocks: c.blocks } : { blocks: c.blocks, width: c.width }];
+    if (rs.tr.scoring && c.width != null) spec.choices.push({ ...spec.choices[0], scoring: "output" });
   }
   return spec;
 }
@@ -3330,6 +3340,17 @@ function tryWidthTable(a) {
     `<tr data-trwidth="${r.intermediate}" style="cursor:pointer;${rs.wi === r.intermediate ? "background:var(--sel)" : ""}"><td>${thou(r.intermediate)}</td><td>−${Math.round(100 * (1 - r.intermediate / full))} %</td><td><span class="tr-chip" style="background:${bandCss(r.band)}"></span> ${pct(r.rel)}</td><td>${r.ppl}</td></tr>`).join("")}</table></details>`;
 }
 
+// The cuts that rank the neurons another way, next to the same cut without it. "Better in both halves" is the only thing called a gain: one half alone can be luck.
+function tryVariantsTable(a) {
+  const rows = ((a && a.variants) || []).filter((r) => r.tried);
+  if (!rows.length) return "";
+  const pct = (x) => x == null ? "–" : (x >= 0 ? "+" : "−") + Math.abs(100 * x).toFixed(1) + " %";
+  const both = (r) => r.better_both_halves === true ? "yes" : r.better_both_halves === false ? "no" : "–";
+  return `<h4>Another way of choosing the neurons</h4><table class="tbl" id="tr-variants"><tr><th>Cut</th><th>Error</th><th>Against the original</th><th>Against the same cut by activation</th><th>Better in both halves</th></tr>${rows.map((r) =>
+    `<tr><td>${esc(r.label)}</td><td>${(+r.loss).toFixed(3)}</td><td>${pct(r.rel)}</td><td>${pct(r.rel_vs_plain)}</td><td>${both(r)}</td></tr>`).join("")}</table>
+    <p class="dim small">Experimental, and measured here only before healing: a gain on both halves is a reason to try the same cut healed, not a promise. The citations that motivate this ranking have not been checked by this program.</p>`;
+}
+
 // the plain verdict for one answer, with the honest part that never changes
 function tryVerdict(a, r, what) {
   const [e1, e2] = a.bands.edges, band = r.band, base = a.base;
@@ -3372,6 +3393,7 @@ function tryCard() {
     else if (tryDepthOn() && (tr.what === "choice" || Object.keys(a.runs || {}).length)) parts.push(`<h4>Choose blocks</h4>${tryBlockChart(a, ins)}${tryLegend(a)}`);
     if (tryDepthOn() && rs.blocks && a.runs && a.runs[String(rs.blocks)]) parts.push(tryRunsTable(a, rs.blocks));
     if (tryWidthOnShape() && a.widths.some((w) => w.tried)) parts.push(`<h4>Thinner layers: quality against size</h4>${tryWidthChart(a, ins)}${tryLegend(a)}${tryWidthTable(a)}`);
+    if ((a.variants || []).length) parts.push(tryVariantsTable(a));
     const ch = tryChoice(), hit = tryLookup(a, ch);
     const label = (ch.blocks.length ? `blocks ${ranges(ch.blocks)}` : "") + (ch.blocks.length && ch.width != null ? " and " : "") + (ch.width != null ? `MLP ${thou(ch.width)}` : "");
     const verdict = hit ? tryVerdict(a, hit, "Your choice (" + label + ")") : (ch.blocks.length || ch.width != null) ? `<p class="dim">Your choice (${esc(label)}) has not been tried yet: choose “My choice” above and press Try.</p>` : "";
@@ -3384,6 +3406,7 @@ function tryCard() {
     <div class="row">${what}</div>
     <p>Text: <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="quick" ${q === 64 ? "checked" : ""} ${run ? "disabled" : ""}> Quick (64 samples)</label> <label class="opt" style="display:inline"><input type="radio" name="tr-q" value="full" ${q === 128 ? "checked" : ""} ${run ? "disabled" : ""}> Full (128 samples)</label>
       <span class="dim small">${ins.total_params / 1e9 >= 15 ? "Quick is the default for models of 15 B or more." : "Full is the default for smaller models."}</span></p>
+    ${tryWidthOnShape() && state.settings.expert_mode && !searchOn ? `<label class="opt" id="tr-scoring-row"><input type="checkbox" id="tr-scoring" ${tr.scoring ? "checked" : ""} ${run ? "disabled" : ""}> Also try ranking the neurons by their expected output (experimental; the plain cut is tried too, to compare)</label>` : ""}
     ${searchOn ? trySearchBlock(ins) : `<p id="tr-plan">${planLine}</p>
     <div class="row"><button class="primary" id="tr-go" ${disabled ? "disabled" : ""}>${tr.what === "choice" ? "Preview my choice" : "Try"}</button><button class="secondary" id="tr-stop" ${run ? "" : "disabled"}>Stop</button><span class="dim small">Stopping keeps the cuts already tried.</span></div>
     ${progress}${body}`}</div>`;
@@ -3572,6 +3595,7 @@ function wireTry() {
   const tr = rs.tr;
   document.querySelectorAll("input[name=tr-what]").forEach((r) => r.onchange = () => { tr.what = r.value; render(); });
   document.querySelectorAll("input[name=tr-q]").forEach((r) => r.onchange = () => { tr.quick = r.value === "quick"; tr.analysis = null; render(); });
+  const trs = $("tr-scoring"); if (trs) trs.onchange = () => { tr.scoring = trs.checked; render(); };
   document.querySelectorAll("[data-trblock]").forEach((g) => g.onclick = () => { tryToggle(+g.dataset.trblock); render(); });
   document.querySelectorAll("[data-trrun]").forEach((row) => row.onclick = () => {
     const w = (((tr.analysis || {}).runs || {})[String(rs.blocks)] || {}).windows || [], hit = w.find((x) => x.start === +row.dataset.trrun);
@@ -3769,6 +3793,7 @@ function rsSpec() {
     spec.blocks = rs.shape === "width" ? 0 : rs.blocks;
     spec.width = { intermediate: rs.wi, lin_v_heads: rs.lv ? rsAxis("lin_v_heads") : null, heads: rs.hh || null };
     spec.width_samples = rs.wsamples;
+    if (rs.scoring === "output") spec.width_scoring = "output";          // only when chosen: the default sends nothing
     if (rs.shape === "width") spec.drop_layers = null;
   }
   return spec;
@@ -3833,6 +3858,7 @@ function wireReshape() {
   const lv = $("rs-lv"); if (lv) lv.onchange = () => { rs.lv = lv.checked; rs.options = null; rsOptions(); };
   const hh = $("rs-hh"); if (hh) hh.onchange = () => { rs.hh = hh.value ? +hh.value : null; rs.options = null; rsOptions(); };
   const wsm = $("rs-wsamples"); if (wsm) wsm.onchange = () => { rs.wsamples = +wsm.value; rsMeasInfo(); };
+  const wsc = $("rs-scoring"); if (wsc) wsc.onchange = () => { rs.scoring = wsc.value === "output" ? "output" : "activation"; };
   const measure = rsMeasure;
   on("rs-measure-now", () => measure(false));
   on("rs-measure-again", () => measure(true));

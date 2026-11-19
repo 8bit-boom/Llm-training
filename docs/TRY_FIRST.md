@@ -100,6 +100,15 @@ Code: `reshapesearch.py`, `reshapetry.py` (`_search_loop`, `search_summary`), `r
 
 Not verified: the real time per pass and load on a 27 B; whether about 70 passes find a better cut than the 66-pass sweep of neighbouring runs; whether non-contiguous sets heal as well as neighbouring ones; how Quick and Full thinking checks agree on close calls.
 
+## Ranking the neurons by their output (experimental, Expert)
+
+Today the neurons of the MLP that stay are the ones with the largest score of the measurement: for every text the mean of the absolute activation over its tokens, squared, summed over the texts, square-rooted (`reshapejob._measure_all`). That score looks only at how much a neuron fires. The option `width_scoring: "output"` ranks them by the expected squared size of what each neuron adds to the layer's output instead: **the mean over all real tokens of the squared activation** (not the square of the score above, so it is a second accumulator that the measurement now always records: `mlp_ms`, `mlp_ms_h1`, `mlp_ms_h2` in `scores.npz`, `"mean_square": true` in `scores.json`) **times the squared norm of the neuron's column of `down_proj`** (read from the weight files with no torch, kept in `down_norms.npz` next to the measurement with the identity of the weights). The two halves of the text use their own mean squares, so the stability overlap is computed the same way.
+
+* Default unchanged: `activation`. A job without the key, a spec without `width_scoring` and a Try pass key without a suffix are exactly what they were. Only `width_scoring: "output"` is sent to the worker; `ndforge_reshape.json` and the result carry `width.scoring` only then.
+* A measurement made before this recorded no mean squares: the cut job measures again (logged) only when the output ranking is asked for, `reshape_measure` measures such a folder again, and Try first says "Measure the model again" instead of guessing.
+* Try first compares the two on your text: a choice or a list of widths with `scoring: "output"` also tries the plain cut, the pass key of the variant has the suffix `|s=output` (`d=2|w=13312|s=output`), and the analysis has a `variants` list: the error, the change against the original, the change against the same cut by activation, and **whether it is better in both halves of the text**. One half alone can be luck, so the program calls only both a gain. The Try card and the Slim page say that nobody measured this here, that it is measured before healing only and may not survive healing, and that the citations behind the formula have not been checked by this program (it is algebra: the expected squared contribution of a neuron when the neurons are treated as independent).
+* The model written by the cut uses the same scores, so the Try pass loss of a variant equals the loss of the written model (a torch test checks it on a tiny model).
+
 ## Tests
 
 - `worker/tests/test_reshape_try.py` (no torch): keys, windows, choices, the order of passes, bands, rows, stability, cheapest window, the analysis, the cache key and its reasons, results file, time estimate, and the plan job through the real worker entry point.

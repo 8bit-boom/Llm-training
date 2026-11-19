@@ -123,6 +123,23 @@ def test_masking_neurons_predicts_the_loss_of_the_thinned_model(tmp_path, base, 
     assert abs(predicted - passes_of(tmp_path)[rt.BASE_KEY]["loss"]) > 1e-6
 
 
+@pytest.mark.parametrize("width", [96, 80])
+def test_ranking_by_output_predicts_the_loss_of_the_model_the_cut_writes_and_is_compared_with_the_plain_cut(tmp_path, base, measured, monkeypatch, width):
+    code, _ = do_try(monkeypatch, try_cfg(tmp_path, base, measured, {"choices": [{"width": width, "scoring": "output"}]}))
+    assert code == 0
+    passes = passes_of(tmp_path)
+    plain_key, out_key = rt.pass_key((), width), rt.pass_key((), width, "output")
+    assert out_key == f"d=|w={width}|s=output" and {plain_key, out_key} <= set(passes)       # the plain cut is tried too: it is what the variant is compared with
+    actual, r, _ = written_loss(tmp_path, base, measured, "wo", width={"intermediate_size": width}, width_scoring="output")
+    assert r["width"]["scoring"] == "output"
+    close(passes[out_key]["loss"], actual)
+    analysis = json.loads((tmp_path / "models" / "_scores" / "t1" / "reshape_try.json").read_text(encoding="utf-8"))["analysis"]
+    row = analysis["variants"][0]
+    assert row["key"] == out_key and row["plain_key"] == plain_key and row["options"] == {"s": "output"}
+    close(row["rel_vs_plain"] + 1.0, passes[out_key]["loss"] / passes[plain_key]["loss"])
+    assert [w["intermediate"] for w in analysis["widths"]] == [width], "the variant does not appear among the plain widths"
+
+
 @pytest.mark.parametrize("blocks,width", [([2], 96), ([1, 2], 80)])
 def test_depth_and_width_together_predict_the_loss_of_the_written_model(tmp_path, base, measured, monkeypatch, blocks, width):
     code, _ = do_try(monkeypatch, try_cfg(tmp_path, base, measured, {"choices": [{"blocks": blocks, "width": width}]}))

@@ -39,17 +39,36 @@ GUESS_TOKENS_PER_SAMPLE = 256
 
 # ------------------------------------------------------------------------------------------------------------ pass keys
 
-def pass_key(blocks, width=None) -> str:
-    """The name of one question: which blocks are skipped and which MLP width is kept ("d=" and "w=" empty = the original). Sorted, so the same set is the same key."""
+def pass_key(blocks, width=None, scoring=None) -> str:
+    """The name of one question: which blocks are skipped and which MLP width is kept ("d=" and "w=" empty = the original). Sorted, so the same set is the same key.
+    A cut that ranks the neurons by their output (`scoring` "output") has the suffix "|s=output"; with the default ranking (activation) the key is exactly the old one."""
     b = ",".join(str(int(x)) for x in sorted(set(blocks or ())))
-    return f"d={b}|w={int(width) if width else ''}"
+    key = f"d={b}|w={int(width) if width else ''}"
+    if scoring and scoring != "activation":
+        key += f"|s={scoring}"
+    return key
 
 
 def parse_key(key: str):
-    """(blocks tuple, width or None) of a pass key."""
-    d, w = key.split("|")
+    """(blocks tuple, width or None) of a pass key (optional suffix segments such as "s=output" are ignored: see `key_options`)."""
+    parts = key.split("|")
+    d, w = parts[0], parts[1]
     blocks = tuple(int(x) for x in d[2:].split(",") if x)
     return blocks, (int(w[2:]) if w[2:] else None)
+
+
+def key_options(key: str) -> dict:
+    """The optional segments of a pass key as {name: value}, e.g. {"s": "output"}; empty for a key without them."""
+    out = {}
+    for seg in key.split("|")[2:]:
+        name, _, value = seg.partition("=")
+        out[name] = value
+    return out
+
+
+def plain_key(key: str) -> str:
+    """The key of the same cut without the optional segments (what a variant is compared with)."""
+    return "|".join(key.split("|")[:2])
 
 
 BASE_KEY = pass_key(())
@@ -103,7 +122,12 @@ def expand_want(want: dict, nb: int, pf: int, pl: int, strategy: str = "contiguo
         width = check_widths(dims, [ch["width"]], divisor)[0] if ch.get("width") else None
         if not blocks and width is None:
             raise ReshapeError("Choose at least one block or a width to try.")
-        keys.append(pass_key(blocks, width))
+        scoring = reshape_width.check_scoring(ch.get("scoring"))
+        if scoring != "activation":
+            if width is None:
+                raise ReshapeError("Ranking the neurons by their output needs a width to try.")
+            keys.append(pass_key(blocks, width))               # the same cut with the default ranking: what the variant is compared with
+        keys.append(pass_key(blocks, width, scoring))
     if want.get("blocks"):
         keys += [pass_key((b,)) for b in candidates(nb, pf, pl)]
     lo, hi = reshape.limits(nb, "prune", pf, pl)
@@ -113,8 +137,11 @@ def expand_want(want: dict, nb: int, pf: int, pl: int, strategy: str = "contiguo
         keys += [pass_key(w) for w in windows(nb, k, pf, pl)]
         if strategy == "separate" and matrix:
             keys.append(pass_key(reshape.choose_drop(matrix, k, "separate", pf, pl)))
+    compare = reshape_width.check_scoring(want.get("scoring")) if want.get("widths") else "activation"
     for w in check_widths(dims, want.get("widths"), divisor) if want.get("widths") else ():
         keys.append(pass_key((), w))
+        if compare != "activation":
+            keys.append(pass_key((), w, compare))
     return list(dict.fromkeys(keys))
 
 
@@ -313,9 +340,13 @@ def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, s
     runs: dict = {}
     singles, widths, others = set(pass_key((b,)) for b in candidates(nb, pf, pl)), [], []
     by_k: dict = {}
+    variant_keys = []
     for key in passes:
         blocks, width = parse_key(key)
         if key == BASE_KEY:
+            continue
+        if key_options(key):
+            variant_keys.append(key)                        # a cut with another ranking of the neurons: shown on its own, next to the plain cut
             continue
         if not blocks and width:
             widths.append(row_of(passes, key, base_loss) | {"intermediate": width})
@@ -355,10 +386,38 @@ def analyse(passes: dict, nb: int, period: int, pf: int, pl: int, matrix=None, s
     for key in others:
         blocks, width = parse_key(key)
         choices.append(row_of(passes, key, base_loss) | {"blocks": list(blocks), "layers": reshape.blocks_to_layers(list(blocks), period), "intermediate": width})
-    return {"base": {"loss": base_loss, "ppl": ppl_of(base_loss), "tokens": base.get("tokens") if base else None},
-            "bands": {"edges": list(BAND_EDGES), "names": list(BAND_NAMES), "agree_pairs": AGREE_PAIRS},
-            "blocks": blocks_rows, "blocks_stability": stability(blocks_rows), "runs": runs, "widths": widths, "widths_stability": stability(widths), "choices": choices,
-            "passes": len(passes)}
+    out = {"base": {"loss": base_loss, "ppl": ppl_of(base_loss), "tokens": base.get("tokens") if base else None},
+           "bands": {"edges": list(BAND_EDGES), "names": list(BAND_NAMES), "agree_pairs": AGREE_PAIRS},
+           "blocks": blocks_rows, "blocks_stability": stability(blocks_rows), "runs": runs, "widths": widths, "widths_stability": stability(widths), "choices": choices,
+           "passes": len(passes)}
+    if variant_keys:
+        out["variants"] = variant_rows(passes, variant_keys, base_loss, period)
+    return out
+
+
+OPTION_WORDS = {"s": {"output": "neurons ranked by their output"}}
+
+
+def key_label(key: str) -> str:
+    """"MLP 13,312, neurons ranked by their output": what a pass with options does, in words."""
+    return describe_key(key)
+
+
+def variant_rows(passes: dict, keys: list, base_loss, period: int) -> list:
+    """One row per pass with options: its loss, the change against the original and against the same cut without the options (when that was tried), and whether it is better
+    in BOTH halves of the text (the only comparison the program calls a gain: one half alone can be luck)."""
+    rows = []
+    for key in sorted(keys):
+        blocks, width = parse_key(key)
+        r = row_of(passes, key, base_loss)
+        plain = passes.get(plain_key(key))
+        p_loss = plain["loss"] if plain else None
+        both = None
+        if plain and None not in (r["loss_h1"], r["loss_h2"], plain.get("loss_h1"), plain.get("loss_h2")):
+            both = bool(r["loss_h1"] < plain["loss_h1"] and r["loss_h2"] < plain["loss_h2"])
+        rows.append({**r, "label": key_label(key), "options": key_options(key), "plain_key": plain_key(key), "plain_loss": p_loss, "rel_vs_plain": rel_increase(r["loss"], p_loss),
+                     "better_both_halves": both, "blocks": list(blocks), "layers": reshape.blocks_to_layers(list(blocks), period), "intermediate": width})
+    return rows
 
 
 # ------------------------------------------------------------------------------------------------ running the model (needs torch)
@@ -368,7 +427,7 @@ class _Stopped(Exception):
 
 
 def describe_key(key: str) -> str:
-    """"block 5 skipped", "blocks 9-12 skipped, MLP 13,312": what a pass does, for the progress line."""
+    """"block 5 skipped", "blocks 9-12 skipped, MLP 13,312, neurons ranked by their output": what a pass does, for the progress line."""
     blocks, width = parse_key(key)
     parts = []
     if blocks:
@@ -376,6 +435,7 @@ def describe_key(key: str) -> str:
                                                                                   else ", ".join(map(str, blocks)))) + " skipped")
     if width:
         parts.append(f"MLP {width:,}")
+    parts += [OPTION_WORDS.get(n, {}).get(v, f"{n}={v}") for n, v in key_options(key).items()]
     return ", ".join(parts) or "the original"
 
 
@@ -612,11 +672,14 @@ def run_try(cfg: dict) -> int:
         meas = reshapejob._read_scores(cfg["measure_dir"], {"source": cfg["source"], "calibration": {"version": calib.get("version"), "samples": cfg.get("measure_samples"),
                                                                                                     "max_len": calib.get("max_len"), "reasoning": calib.get("reasoning")}}, n_layers, dims, types,
                                       weights=safetensors_io.weights_manifest(src_dir) if src_dir else None)
-    needs_measurement = wants_width and meas is None
+    keys = expand_want(want, nb, pf, pl, strategy, (meas["meta"].get("matrix") or None) if meas else None, dims, divisor)
+    wants_ms = any(key_options(k).get("s") == "output" for k in keys)
+    needs_measurement = wants_width and (meas is None or (wants_ms and "mlp_ms" not in meas))
     if needs_measurement and not plan_only:
+        if wants_ms and meas is not None:
+            raise ReshapeError("Ranking the neurons by their output needs a measurement that recorded the mean square of the neurons, and the earlier one did not. Measure the model again.")
         raise ReshapeError("Trying a width needs the measurement of the neurons. Measure the model first.")
     matrix = (meas["meta"].get("matrix") or None) if meas else None
-    keys = expand_want(want, nb, pf, pl, strategy, matrix, dims, divisor)
     search = want.get("search") if isinstance(want.get("search"), dict) else None
     sctx = None
     if search is not None:
@@ -696,23 +759,30 @@ def run_try(cfg: dict) -> int:
     speed.report_kernels(model)
     layers = reshapejob._find_layers(model, n_layers)
     mlp = meas["mlp"] if meas else None
+    mlp_out = None
+    if wants_ms:                    # the scores of the neurons by their output: mean square of the activation x the squared size of the neuron's down_proj column
+        mlp_out = reshape_width.output_scores(meas["mlp_ms"], reshapejob._down_norms(cfg.get("measure_dir"), src_dir, n_layers))
     size = dims["intermediate"] if dims else 0
     stopped = False
     t_pass0 = time.monotonic()
     state = {"batches": batches, "model": model, "layers": layers}
 
+    def scores_of(k):
+        """the neuron scores the cut of pass key `k` keeps by: the activation scores, or the output scores for a key with "|s=output" """
+        return mlp_out if key_options(k).get("s") == "output" else mlp
+
     def run_pass(k):
         """One pass; a graphics card that runs out of memory is asked again with one text at a time."""
         try:
             try:
-                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, scores_of(k), size, stop)
             except RuntimeError as exc:
                 if not reshapejob._is_oom(exc):
                     raise
                 protocol.log("Out of memory; trying again with one text at a time.")
                 reshapejob._free()
                 state["batches"] = reshapejob._split_single(state["batches"])
-                return _one_pass(state["model"], state["layers"], state["batches"], period, k, mlp, size, stop)
+                return _one_pass(state["model"], state["layers"], state["batches"], period, k, scores_of(k), size, stop)
         except RuntimeError as exc:
             if reshapejob._is_oom(exc):
                 raise ReshapeError("The graphics card ran out of memory while trying the cuts. Choose 4-bit loading (Expert mode) or fewer samples.") from None

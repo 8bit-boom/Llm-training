@@ -89,6 +89,27 @@ def test_weight_norm_scores_of_the_multi_token_head(tmp_path):
     assert s[0]["heads"] == pytest.approx([math.sqrt(5), 5.0])
 
 
+def test_down_column_norms_equal_numpy_for_every_dtype(tmp_path):
+    r = np.random.default_rng(3)
+    mats = [r.standard_normal((4, 6)).astype("<f4") for _ in range(3)]
+    items = []
+    for i, m in enumerate(mats):
+        if i == 1:                       # a bf16 file: the values the file holds, not the originals
+            u = slice_io.f32_to_bf16(m)
+            items.append((f"model.language_model.layers.{i}.mlp.down_proj.weight", "BF16", m.shape, u.astype("<u2").tobytes()))
+            mats[i] = slice_io.bf16_to_f32(u)
+        else:
+            items.append((f"model.language_model.layers.{i}.mlp.down_proj.weight", "F32", m.shape, m.tobytes()))
+    items.append(("model.language_model.layers.0.mlp.up_proj.weight", "F32", (6, 4), fill(2, 96)))
+    write_file(Path(tmp_path) / "m.safetensors", items)
+    got = slice_io.down_col_sq_norms(st.list_tensors(tmp_path), 3)
+    want = np.stack([(m.astype("float64") ** 2).sum(axis=0) for m in mats])
+    assert got.shape == (3, 6) and got.dtype == np.float32
+    assert np.allclose(got, want, rtol=1e-5)
+    with pytest.raises(ReshapeError, match="Layer 3 has no plain MLP output projection"):
+        slice_io.down_col_sq_norms(st.list_tensors(tmp_path), 4)
+
+
 def test_numpy_is_not_imported_by_the_depth_modules():
     code = "import sys; import ndforge_worker.reshape, ndforge_worker.reshapejob, ndforge_worker.safetensors_io, ndforge_worker.reshape_width; print('numpy' in sys.modules)"
     worker = Path(__file__).resolve().parents[1]

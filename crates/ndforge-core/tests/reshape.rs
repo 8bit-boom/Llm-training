@@ -1085,6 +1085,26 @@ fn width_spec(blocks: u32, intermediate: u32) -> ReshapeSpec {
 
 #[cfg(unix)]
 #[test]
+fn the_neuron_ranking_reaches_the_job_only_when_it_is_the_output_one() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker_with(d.path(), &inspect_width(), MAKES_A_THIN_MODEL);
+    let p = project_with_version(d.path());
+    let seen = |r: &serde_json::Value| -> serde_json::Value { serde_json::from_slice(&std::fs::read(p.folder.join("models").join(r["name"].as_str().unwrap()).join("job-seen.json")).unwrap()).unwrap() };
+    let plain = rruns::execute(&p, &width_spec(0, 6912), Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert!(seen(&plain).get("width_scoring").is_none(), "a spec without the setting is the job it always was");
+    let act = rruns::execute(&p, &ReshapeSpec { width_scoring: Some("activation".into()), ..width_spec(0, 6656) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert!(seen(&act).get("width_scoring").is_none(), "the default ranking is not sent either");
+    let out = rruns::execute(&p, &ReshapeSpec { width_scoring: Some("output".into()), ..width_spec(0, 6400) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap();
+    assert_eq!(seen(&out)["width_scoring"], "output");
+    assert!(rruns::execute(&p, &ReshapeSpec { width_scoring: Some("magic".into()), ..width_spec(0, 6144) }, Arc::new(AtomicBool::new(false)), &mut |_| {}).unwrap_err().0.contains("ranked is activation"));
+    // an old spec has no such key and writes none
+    let old: ReshapeSpec = serde_json::from_value(json!({"source_model_id": "m", "mode": "prune", "blocks": 1})).unwrap();
+    assert!(old.width_scoring.is_none() && serde_json::to_value(&old).unwrap().get("width_scoring").is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn a_thinner_model_is_made_with_the_width_job_and_listed() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let d = tempdir().unwrap();
@@ -2014,6 +2034,15 @@ fn a_try_spec_has_the_owner_defaults_and_refuses_nonsense() {
     let ok: rruns::TrySpec = serde_json::from_value(json!({"model_id": "m", "blocks": true, "runs": [4], "widths": [13312], "choices": [{"blocks": [9, 10], "width": 12288}, {"width": 13312}]})).unwrap();
     assert!(ok.validate().is_ok());
     assert_eq!(ok.want(), json!({"blocks": true, "runs": [4], "widths": [13312], "choices": [{"blocks": [9, 10], "width": 12288}, {"blocks": [], "width": 13312}]}));
+    // ranking the neurons by their output: only in the request when asked for, and only with a width
+    let with: rruns::TrySpec = serde_json::from_value(json!({"model_id": "m", "choices": [{"width": 12288, "scoring": "output"}]})).unwrap();
+    assert!(with.validate().is_ok());
+    assert_eq!(with.want()["choices"], json!([{"blocks": [], "width": 12288, "scoring": "output"}]));
+    for bad in [json!({"choices": [{"blocks": [3], "scoring": "output"}]}), json!({"choices": [{"width": 12288, "scoring": "magic"}]})] {
+        let mut v = json!({"model_id": "m"});
+        v.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<rruns::TrySpec>(v).unwrap().validate().is_err());
+    }
 }
 
 #[test]
