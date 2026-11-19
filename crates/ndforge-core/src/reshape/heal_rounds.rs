@@ -3,7 +3,7 @@
 //! fall (`points`), the size rules, the stop decisions (`decide`, the plateau rules) and the overhead arithmetic. The driver that runs the jobs follows below (`run`).
 //! Nothing here touches the disk or a worker.
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::runs::HealSpec;
 use super::thinkcheck::{think_score, THINK_TIE};
@@ -378,4 +378,383 @@ pub fn decide(rows: &[RoundRow], ctx: &Ctx) -> Decision {
         }
     }
     Decision::Continue
+}
+
+// ------------------------------------------------------------------------------------------------------------------ the driver
+
+/// The jobs a heal in rounds runs, one at a time (the graphics card holds one model). The real ones wrap the worker jobs (`runs.rs`); the tests script them.
+/// Every job returns the worker's result; `{"stopped": true}` in it means the person pressed Stop (nothing is half-written, the driver returns and a later call continues).
+pub trait RoundJobs {
+    /// the `rounds` block of heal.json, as the last call saved it
+    fn load(&mut self) -> Option<Value>;
+    fn save(&mut self, state: &Value);
+    /// the original answers the project rows and the general rows up to `upto_general_tokens` general tokens (all earlier rows are already there)
+    fn cache(&mut self, n: u32, upto_general_tokens: u64) -> Result<Value>;
+    /// the student trains one round
+    fn train(&mut self, t: &TrainRound) -> Result<Value>;
+    /// the thinking check of the student as it is after round `n` (base + adapter, not merged)
+    fn check_round(&mut self, n: u32, quick: bool) -> Result<Value>;
+    /// the thinking check of the original (cached by the worker)
+    fn check_original(&mut self, quick: bool) -> Result<Value>;
+    /// merge the latest round's adapter into the healed model folder (not registered yet); a finished merge is not repeated
+    fn merge(&mut self) -> Result<Value>;
+    /// the thinking check of the merged model
+    fn check_merged(&mut self, quick: bool) -> Result<Value>;
+    /// forget the merged model: its folder, its registration and its saved checks
+    fn unmerge(&mut self) -> Result<()>;
+    /// add the merged model to the model list; returns what the heal's result carries (`model_id`, `healed_dir`)
+    fn register(&mut self) -> Result<Value>;
+    fn now_secs(&self) -> u64;
+}
+
+/// What the student needs to train round `n`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainRound {
+    pub n: u32,
+    pub round_tokens: u64,
+    pub general_from: u64,
+    pub general_to: u64,
+    pub s_start: u64,
+}
+
+/// What the driver is told by the heal.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub spec: RoundSpec,
+    pub cap: u64,
+    pub round: u64,
+    pub first_check: u64,
+    /// the share of the tokens that is general text (0 = the project's own text only)
+    pub share: f64,
+    /// the student thinks: its rounds and the merged model are checked
+    pub thinking: bool,
+    /// the high estimate of the merge and the check of the merged model, in seconds (for the time limit)
+    pub tail_secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Stop was pressed during this step ("cache" | "train" | "check" | "merge" | "final_check"); the state is saved
+    Stopped(String),
+    /// the heal ended; the value is the `rounds` result (see `result_of`)
+    Done(Value),
+}
+
+pub const STATE_VERSION: u64 = 1;
+pub const TAIL_SECS_DEFAULT: f64 = 3600.0;
+const WRONG_ORDER: &str = "The original's answers were made again from the start (the general text came in another order), so the earlier rounds' text is not reused.";
+
+fn secs(since: std::time::Instant) -> f64 {
+    (since.elapsed().as_secs_f64() * 10.0).round() / 10.0
+}
+
+fn stopped(r: &Value) -> bool {
+    r["stopped"].as_bool().unwrap_or(false)
+}
+
+fn new_state(plan: &Plan) -> Value {
+    let base = plan.spec.baseline.clone().filter(|b| b.is_object()).unwrap_or_else(|| json!({}));
+    json!({"v": STATE_VERSION, "spec": plan.spec, "cap": plan.cap, "cap_m": plan.cap as f64 / 1e6, "round": plan.round, "round_m": plan.round as f64 / 1e6, "state": "rounds",
+           "rows": [], "merged_checks": [], "strict": false, "merged": false, "baseline": {"quick": base.get("quick").cloned().unwrap_or(Value::Null), "full": base.get("full").cloned().unwrap_or(Value::Null)},
+           "stop": null, "final": null, "registered": null, "notes": []})
+}
+
+fn rows_of(st: &Value) -> Vec<RoundRow> {
+    st["rows"].as_array().map(|a| a.iter().filter(|r| r["decision"].as_str().is_some_and(|d| !d.is_empty()) || r["trained"] == true).filter_map(|r| serde_json::from_value(r.clone()).ok()).collect()).unwrap_or_default()
+}
+
+fn mode_name(quick: bool) -> &'static str {
+    if quick {
+        "quick"
+    } else {
+        "full"
+    }
+}
+
+fn check_of(mode: &str, original_main: &Value, r: &Value) -> RoundCheck {
+    let g = super::thinkcheck::gates(original_main, &r["main"]);
+    RoundCheck {
+        mode: mode.into(),
+        verdict: g["verdict"].as_str().unwrap_or("fail").into(),
+        failed: g["failed"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+        main: r["main"].clone(),
+        score: think_score(&r["main"]),
+    }
+}
+
+fn note(st: &mut Value, text: &str) {
+    if let Some(a) = st["notes"].as_array_mut() {
+        if !a.iter().any(|x| x == text) {
+            a.push(json!(text));
+        }
+    }
+}
+
+/// The original's numbers for a mode: from the caller, from an earlier call, else the original is checked (the worker answers a repeated check from its file).
+fn original_main(jobs: &mut dyn RoundJobs, st: &mut Value, quick: bool, on_event: &mut dyn FnMut(Value)) -> Result<std::result::Result<Value, String>> {
+    let mode = mode_name(quick);
+    if st["baseline"][mode].is_object() {
+        return Ok(Ok(st["baseline"][mode].clone()));
+    }
+    on_event(json!({"kind": "heal_round", "phase": "heal", "round": st["rows"].as_array().map(|r| r.len()).unwrap_or(0), "decision": "baseline", "note": "Checking the original model first, to compare with."}));
+    let r = jobs.check_original(quick)?;
+    if stopped(&r) {
+        return Ok(Err("check".into()));
+    }
+    st["baseline"][mode] = r["main"].clone();
+    jobs.save(st);
+    Ok(Ok(r["main"].clone()))
+}
+
+fn brief(rows: &[Value]) -> Vec<Value> {
+    rows.iter().map(|r| json!({"n": r["n"], "tokens_m": r["tokens_m"], "calib_loss": r["calib_loss"], "check": r["check"], "decision": r["decision"], "seconds": r["total_s"]})).collect()
+}
+
+/// What the heal's result carries as `rounds`.
+pub fn result_of(st: &Value) -> Value {
+    let rows = st["rows"].as_array().cloned().unwrap_or_default();
+    let tokens_m = rows.last().and_then(|r| r["tokens_m"].as_f64()).unwrap_or(0.0);
+    json!({"tokens_m": tokens_m, "cap_m": st["cap_m"], "stop": st["stop"], "rows": brief(&rows), "final": st["final"], "merged_checks": st["merged_checks"], "baseline": st["baseline"], "notes": st["notes"]})
+}
+
+fn emit(on_event: &mut dyn FnMut(Value), st: &Value, row: &Value, plan: &Plan, text: &str) {
+    let n = row["n"].as_u64().unwrap_or(0);
+    let rounds_max = plan.cap.div_ceil(plan.round.max(1));
+    on_event(json!({"kind": "heal_round", "phase": "heal", "round": n, "rounds_max": rounds_max, "tokens_m": row["tokens_m"], "cap_m": st["cap_m"], "calib_loss": row["calib_loss"],
+                    "check": row["check"], "decision": row["decision"], "note": text}));
+}
+
+/// Runs a heal in rounds to its end, or until Stop. Every decision is written with `jobs.save` before the next job starts, so a stopped or crashed heal continues with the part
+/// that is missing (a finished cache pass, round or check is never repeated; the worker's jobs are idempotent too). See docs/HEAL_ROUNDS.md for the rules.
+pub fn run(plan: &Plan, jobs: &mut dyn RoundJobs, on_event: &mut dyn FnMut(Value)) -> Result<Outcome> {
+    let spec = &plan.spec;
+    let mut st = match jobs.load() {
+        Some(s) if s["v"] == STATE_VERSION && s["round"] == plan.round => s,
+        _ => new_state(plan),
+    };
+    // a finished heal that did not pass can be taken further (the cap is higher now)
+    if st["state"] == "ended" {
+        let tokens = st["rows"].as_array().and_then(|r| r.last()).and_then(|r| r["tokens"].as_u64()).unwrap_or(0);
+        let final_ok = st["final"]["verdict"].as_str().is_some_and(|v| v == "pass" || v == "warn");
+        if spec.extend && !final_ok && plan.cap > tokens {
+            jobs.unmerge()?;
+            st["state"] = json!("rounds");
+            st["merged"] = json!(false);
+            st["final"] = Value::Null;
+            st["stop"] = Value::Null;
+            st["registered"] = Value::Null;
+            st["cap"] = json!(plan.cap);
+            st["cap_m"] = json!(plan.cap as f64 / 1e6);
+            note(&mut st, &format!("Healing goes on to {} million tokens after the check of the merged model did not pass.", plan.cap / 1_000_000));
+            jobs.save(&st);
+        } else {
+            return Ok(Outcome::Done(result_of(&st)));
+        }
+    }
+    st["cap"] = json!(plan.cap);
+    loop {
+        match st["state"].as_str().unwrap_or("rounds") {
+            "rounds" => {
+                if let Some(out) = round_step(plan, jobs, &mut st, on_event)? {
+                    return Ok(out);
+                }
+            }
+            "merging" => {
+                if st["merged"] != true {
+                    let r = jobs.merge()?;
+                    if stopped(&r) {
+                        return Ok(Outcome::Stopped("merge".into()));
+                    }
+                    st["merged"] = json!(true);
+                }
+                st["state"] = json!(if plan.thinking { "final_check" } else { "ending" });
+                jobs.save(&st);
+            }
+            "final_check" => {
+                if let Some(out) = final_step(plan, jobs, &mut st, on_event)? {
+                    return Ok(out);
+                }
+            }
+            "ending" => {
+                let reg = jobs.register()?;
+                st["registered"] = reg;
+                st["state"] = json!("ended");
+                jobs.save(&st);
+                return Ok(Outcome::Done(result_of(&st)));
+            }
+            other => return Err(Error::new(format!("The saved state of the heal in rounds is not understood ({other}). Heal again from the start."))),
+        }
+    }
+}
+
+/// One step of the rounds loop: the missing part of the current round (or the start of a new one) and the decision after it. Returns Some(outcome) when Stop was pressed.
+fn round_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &mut dyn FnMut(Value)) -> Result<Option<Outcome>> {
+    let spec = &plan.spec;
+    let rows = st["rows"].as_array().cloned().unwrap_or_default();
+    // the row in work: the last one when it has no decision yet, else a new one
+    let open = rows.last().is_some_and(|r| r["decision"].as_str().unwrap_or("").is_empty());
+    let idx = if open { rows.len() - 1 } else { rows.len() };
+    if !open {
+        let start = rows.last().and_then(|r| r["tokens"].as_u64()).unwrap_or(0);
+        let end = (start + plan.round).min(plan.cap);
+        if end <= start {
+            // nothing left to train (the cap is not above what was trained): end it
+            st["state"] = json!("merging");
+            st["stop"] = json!({"reason": "cap", "round": rows.len(), "tokens_m": start as f64 / 1e6});
+            jobs.save(st);
+            return Ok(None);
+        }
+        let n = rows.len() as u64 + 1;
+        let want_check = plan.thinking && end < plan.cap && end >= plan.first_check;
+        let s_start = rows.last().and_then(|r| r["s_end"].as_u64()).unwrap_or(0);
+        let row = json!({"n": n, "tokens": end, "tokens_m": end as f64 / 1e6, "round_tokens": end - start, "s_start": s_start, "check_wanted": want_check, "cache_done": false, "trained": false,
+                         "check": null, "decision": "", "calib_loss": null, "at": null});
+        st["rows"].as_array_mut().map(|a| a.push(row));
+        jobs.save(st);
+    }
+    let i = idx;
+    let mut row = st["rows"][i].clone();
+    let n = row["n"].as_u64().unwrap_or(1) as u32;
+    let round_tokens = row["round_tokens"].as_u64().unwrap_or(plan.round);
+    // 1. the original answers this round's chunk of text
+    if row["cache_done"] != true {
+        let t0 = std::time::Instant::now();
+        let cumulative = row["tokens"].as_u64().unwrap_or(0);
+        let upto = (cumulative as f64 * plan.share).round() as u64;
+        let r = jobs.cache(n, upto)?;
+        if stopped(&r) {
+            return Ok(Some(Outcome::Stopped("cache".into())));
+        }
+        let done = r["done_rows"].as_u64().unwrap_or(0);
+        let prev = i.checked_sub(1).map(|j| st["rows"][j].clone());
+        let from = prev.as_ref().and_then(|p| p["general_to"].as_u64()).unwrap_or_else(|| r["stats"]["project_rows"].as_u64().unwrap_or(0));
+        if let Some(p) = &prev {
+            let had_general = p["general_to"].as_u64().unwrap_or(0) > p["general_from"].as_u64().unwrap_or(0);
+            if had_general && r["stats"]["general_error"].is_string() {
+                return Err(Error::new("The general text could not be read again for the next round, so healing stops here instead of training on a different mix. Healing can be continued when the text is available again."));
+            }
+            if r["rows_before"].as_u64().unwrap_or(u64::MAX) < p["general_to"].as_u64().unwrap_or(0) {
+                note(st, WRONG_ORDER);
+            }
+        }
+        row["general_from"] = json!(from);
+        row["general_to"] = json!(done.max(from));
+        row["general_tokens_done"] = r["general_tokens_done"].clone();
+        row["cache_s"] = json!(secs(t0));
+        row["cache_done"] = json!(true);
+        st["rows"][i] = row.clone();
+        jobs.save(st);
+    }
+    // 2. the student learns it
+    if row["trained"] != true {
+        let t0 = std::time::Instant::now();
+        let t = TrainRound { n, round_tokens, general_from: row["general_from"].as_u64().unwrap_or(0), general_to: row["general_to"].as_u64().unwrap_or(0), s_start: row["s_start"].as_u64().unwrap_or(0) };
+        let r = jobs.train(&t)?;
+        if stopped(&r) {
+            return Ok(Some(Outcome::Stopped("train".into())));
+        }
+        if r["round"]["complete"] == false {
+            return Err(Error::new(format!("Round {n} did not finish training. Healing can be continued.")));
+        }
+        row["s_end"] = r["round"]["s_end"].clone();
+        row["steps"] = r["round"]["steps"].clone();
+        row["calib_loss"] = r["round"]["calib_loss_after"].clone();
+        if row["calib_loss"].is_null() {
+            row["calib_loss"] = r["calib_loss_after"].clone();
+        }
+        row["train_s"] = json!(secs(t0));
+        row["trained"] = json!(true);
+        st["rows"][i] = row.clone();
+        jobs.save(st);
+    }
+    // 3. the thinking check of the student as it is (base + adapter, not merged)
+    if row["check_wanted"] == true && row["check"].is_null() {
+        let t0 = std::time::Instant::now();
+        let quick = spec.quick();
+        let orig = match original_main(jobs, st, quick, on_event)? {
+            Ok(m) => m,
+            Err(step) => return Ok(Some(Outcome::Stopped(step))),
+        };
+        let r = jobs.check_round(n, quick)?;
+        if stopped(&r) {
+            return Ok(Some(Outcome::Stopped("check".into())));
+        }
+        row["check"] = serde_json::to_value(check_of(mode_name(quick), &orig, &r)).unwrap_or(Value::Null);
+        row["check_s"] = json!(secs(t0));
+        st["rows"][i] = row.clone();
+        jobs.save(st);
+    }
+    // 4. what next
+    let total: f64 = ["cache_s", "train_s", "check_s"].iter().map(|k| row[*k].as_f64().unwrap_or(0.0)).sum();
+    row["total_s"] = json!((total * 10.0).round() / 10.0);
+    let typed = rows_of(st);
+    let slowest = st["rows"].as_array().map(|a| a.iter().filter_map(|r| r["total_s"].as_f64().or_else(|| Some(["cache_s", "train_s", "check_s"].iter().map(|k| r[*k].as_f64().unwrap_or(0.0)).sum::<f64>()))).fold(total, f64::max)).unwrap_or(total);
+    let ctx = Ctx {
+        cap: plan.cap, thinking: plan.thinking, stop_never: spec.never(), plateau: spec.plateau, strict: st["strict"] == true, now: jobs.now_secs(), deadline: spec.deadline,
+        next_round_secs: slowest * 1.2, tail_secs: plan.tail_secs,
+    };
+    let d = decide(&typed, &ctx);
+    row["decision"] = json!(d.as_str());
+    row["at"] = json!(jobs.now_secs());
+    st["rows"][i] = row.clone();
+    if let Some(reason) = d.reason() {
+        st["stop"] = json!({"reason": reason, "round": n, "tokens_m": row["tokens_m"]});
+        st["state"] = json!("merging");
+    }
+    jobs.save(st);
+    let text = match d {
+        Decision::Continue => String::new(),
+        Decision::StopPass => format!("Round {n} passed the thinking check: merging and checking the merged model."),
+        Decision::StopPlateau => format!("Healing stopped after round {n}: neither the thinking nor the loss improves any more. Merging and checking the merged model."),
+        Decision::StopCap | Decision::StopNever => format!("Round {n} reached the most tokens ({} million). Merging the model.", row["tokens_m"].as_f64().unwrap_or(0.0)),
+        Decision::StopTime => format!("Healing stopped after round {n}: the time limit leaves no room for another round. Merging the model."),
+    };
+    emit(on_event, st, &row, plan, &text);
+    Ok(None)
+}
+
+/// The check of the merged model: the real gate. A pass or warn ends the heal. A fail after a stop on a passed round check goes on with more rounds (deleting the merged model),
+/// now needing two passed round checks in a row; a fail after the cap, a plateau or the time limit ends it.
+fn final_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &mut dyn FnMut(Value)) -> Result<Option<Outcome>> {
+    let spec = &plan.spec;
+    let quick = spec.final_is_quick();
+    let orig = match original_main(jobs, st, quick, on_event)? {
+        Ok(m) => m,
+        Err(step) => return Ok(Some(Outcome::Stopped(step))),
+    };
+    let t0 = std::time::Instant::now();
+    let r = jobs.check_merged(quick)?;
+    if stopped(&r) {
+        return Ok(Some(Outcome::Stopped("final_check".into())));
+    }
+    let c = check_of(mode_name(quick), &orig, &r);
+    let after = st["stop"]["round"].as_u64().unwrap_or(0);
+    let tokens = st["rows"].as_array().and_then(|r| r.last()).and_then(|r| r["tokens"].as_u64()).unwrap_or(0);
+    let reason = st["stop"]["reason"].as_str().unwrap_or("").to_string();
+    let fin = json!({"verdict": c.verdict, "failed": c.failed, "main": c.main, "mode": c.mode, "score": c.score, "after_round": after, "seconds": secs(t0)});
+    let more = !c.passed() && reason == "pass" && tokens < plan.cap && !spec.never();
+    if more {
+        jobs.unmerge()?;
+        if let Some(a) = st["merged_checks"].as_array_mut() {
+            a.push(fin.clone());
+        }
+        st["strict"] = json!(true);
+        st["merged"] = json!(false);
+        st["stop"] = Value::Null;
+        st["state"] = json!("rounds");
+        jobs.save(st);
+        let row = st["rows"].as_array().and_then(|r| r.last().cloned()).unwrap_or(Value::Null);
+        let text = format!("The merged model did not pass the check after round {after}. Healing goes on; it now needs two passed checks in a row.");
+        on_event(json!({"kind": "heal_round", "phase": "heal", "round": after, "rounds_max": plan.cap.div_ceil(plan.round.max(1)), "tokens_m": row["tokens_m"], "cap_m": st["cap_m"],
+                        "calib_loss": row["calib_loss"], "check": fin, "decision": "merged_fail", "note": text}));
+        return Ok(None);
+    }
+    st["final"] = fin.clone();
+    st["state"] = json!("ending");
+    jobs.save(st);
+    let row = st["rows"].as_array().and_then(|r| r.last().cloned()).unwrap_or(Value::Null);
+    let text = format!("The merged model's check: {}.", c.verdict);
+    on_event(json!({"kind": "heal_round", "phase": "heal", "round": after, "rounds_max": plan.cap.div_ceil(plan.round.max(1)), "tokens_m": row["tokens_m"], "cap_m": st["cap_m"],
+                    "calib_loss": row["calib_loss"], "check": fin, "decision": "final", "note": text}));
+    Ok(None)
 }

@@ -295,3 +295,358 @@ fn the_train_key_of_a_heal_in_rounds_does_not_change_with_the_cap() {
     assert_ne!(n40, key(json!({"tokens_m": 80})));
     assert_eq!(a["seq"], n40["seq"]);
 }
+
+// ----------------------------------------------------------------------------------------------------------------- the driver with scripted jobs
+
+use std::collections::VecDeque;
+
+use ndforge_core::error::Result;
+
+fn orig() -> Value {
+    json!({"closed_rate": 0.97, "accuracy": 0.8, "loop_rate": 0.0, "garbage_rate": 0.0, "median_think_tokens": 800})
+}
+fn good() -> Value {
+    json!({"closed_rate": 0.96, "accuracy": 0.8, "loop_rate": 0.0, "garbage_rate": 0.0, "median_think_tokens": 800})
+}
+fn bad() -> Value {
+    json!({"closed_rate": 0.5, "accuracy": 0.3, "loop_rate": 0.4, "garbage_rate": 0.0, "median_think_tokens": 800})
+}
+
+/// A stand-in for the worker jobs: 10 project rows and general rows of 100,000 tokens; every call is written down; checks answer from a script.
+struct Mock {
+    state: Option<Value>,
+    calls: Vec<String>,
+    ok_calls: Vec<String>,
+    round_checks: VecDeque<Value>,
+    merged_checks: VecDeque<Value>,
+    losses: Vec<f64>,
+    done_rows: u64,
+    now: u64,
+    /// the call with this number (1-based, over all calls) answers {"stopped": true}
+    stop_at: Option<usize>,
+    count: usize,
+    steps_per_round: u64,
+    healed: bool,
+    unmerged: usize,
+}
+
+impl Mock {
+    fn new(round_checks: Vec<Value>, merged_checks: Vec<Value>) -> Mock {
+        Mock { state: None, calls: vec![], ok_calls: vec![], round_checks: round_checks.into(), merged_checks: merged_checks.into(), losses: (0..40).map(|i| 3.0 - 0.1 * i as f64).collect(), done_rows: 0, now: 1_000_000,
+               stop_at: None, count: 0, steps_per_round: 8, healed: false, unmerged: 0 }
+    }
+
+    /// Writes the call down; true when this call is the one that is stopped.
+    fn call(&mut self, what: &str) -> bool {
+        self.count += 1;
+        self.calls.push(what.to_string());
+        if self.stop_at == Some(self.count) {
+            return true;
+        }
+        self.ok_calls.push(what.to_string());
+        false
+    }
+}
+
+impl RoundJobs for Mock {
+    fn load(&mut self) -> Option<Value> {
+        self.state.clone()
+    }
+    fn save(&mut self, state: &Value) {
+        self.state = Some(state.clone());
+    }
+    fn cache(&mut self, n: u32, upto: u64) -> Result<Value> {
+        if self.call(&format!("cache {n}")) {
+            return Ok(json!({"stopped": true}));
+        }
+        let before = self.done_rows;
+        let general = upto.div_ceil(100_000);
+        self.done_rows = self.done_rows.max(10 + general);
+        Ok(json!({"stopped": false, "done_rows": self.done_rows, "rows_before": before, "general_tokens_done": general * 100_000, "stats": {"project_rows": 10, "general_error": null}}))
+    }
+    fn train(&mut self, t: &TrainRound) -> Result<Value> {
+        if self.call(&format!("train {} from {} rows {}..{}", t.n, t.s_start, t.general_from, t.general_to)) {
+            return Ok(json!({"stopped": true}));
+        }
+        let loss = self.losses[t.n as usize - 1];
+        Ok(json!({"stopped": false, "round": {"index": t.n, "s_start": t.s_start, "s_end": t.s_start + self.steps_per_round, "steps": self.steps_per_round, "complete": true, "calib_loss_after": loss}}))
+    }
+    fn check_round(&mut self, n: u32, quick: bool) -> Result<Value> {
+        if self.call(&format!("check_round {n} {}", if quick { "quick" } else { "full" })) {
+            return Ok(json!({"stopped": true}));
+        }
+        Ok(json!({"stopped": false, "main": self.round_checks.pop_front().expect("a scripted round check")}))
+    }
+    fn check_original(&mut self, quick: bool) -> Result<Value> {
+        if self.call(&format!("check_original {}", if quick { "quick" } else { "full" })) {
+            return Ok(json!({"stopped": true}));
+        }
+        Ok(json!({"stopped": false, "main": orig()}))
+    }
+    fn merge(&mut self) -> Result<Value> {
+        if self.call("merge") {
+            return Ok(json!({"stopped": true}));
+        }
+        self.healed = true;
+        Ok(json!({"stopped": false}))
+    }
+    fn check_merged(&mut self, quick: bool) -> Result<Value> {
+        if self.call(&format!("check_merged {}", if quick { "quick" } else { "full" })) {
+            return Ok(json!({"stopped": true}));
+        }
+        Ok(json!({"stopped": false, "main": self.merged_checks.pop_front().expect("a scripted merged check")}))
+    }
+    fn unmerge(&mut self) -> Result<()> {
+        self.calls.push("unmerge".into());
+        self.ok_calls.push("unmerge".into());
+        self.unmerged += 1;
+        self.healed = false;
+        Ok(())
+    }
+    fn register(&mut self) -> Result<Value> {
+        self.calls.push("register".into());
+        self.ok_calls.push("register".into());
+        Ok(json!({"model_id": "local:x", "healed_dir": "healed"}))
+    }
+    fn now_secs(&self) -> u64 {
+        self.now
+    }
+}
+
+fn plan_of(spec: RoundSpec, cap_m: u64, thinking: bool) -> Plan {
+    let m = 1_000_000;
+    Plan { cap: cap_m * m, round: spec.round_tokens(), first_check: spec.first_check_tokens(&heal(json!({"tokens_m": 40, "rounds": {}}))).max(spec.round_tokens()), share: 0.5, thinking, tail_secs: TAIL_SECS_DEFAULT, spec }
+}
+
+fn spec_of(v: Value) -> RoundSpec {
+    serde_json::from_value(v).unwrap()
+}
+
+fn drive(mock: &mut Mock, plan: &Plan) -> (Outcome, Vec<Value>) {
+    let mut events = vec![];
+    let out = run(plan, mock, &mut |e| events.push(e)).unwrap();
+    (out, events)
+}
+
+fn done(o: Outcome) -> Value {
+    match o {
+        Outcome::Done(v) => v,
+        Outcome::Stopped(s) => panic!("stopped at {s}"),
+    }
+}
+
+fn kinds(m: &Mock, what: &str) -> usize {
+    m.calls.iter().filter(|c| c.starts_with(what)).count()
+}
+
+#[test]
+fn the_first_passed_check_stops_merges_once_and_the_merged_check_decides() {
+    // 5 M rounds, first check at 10 M: round 2 fails, round 3 passes
+    let mut m = Mock::new(vec![bad(), good()], vec![good()]);
+    let plan = plan_of(spec_of(json!({})), 40, true);
+    let (out, events) = drive(&mut m, &plan);
+    let r = done(out);
+    assert_eq!(r["stop"], json!({"reason": "pass", "round": 3, "tokens_m": 15.0}));
+    assert_eq!(r["final"]["verdict"], "pass");
+    assert_eq!((kinds(&m, "cache"), kinds(&m, "train"), kinds(&m, "check_round"), kinds(&m, "merge"), kinds(&m, "check_merged"), kinds(&m, "check_original"), kinds(&m, "register")), (3, 3, 2, 1, 1, 1, 1));
+    assert_eq!(m.calls.iter().filter(|c| c.starts_with("check_round")).cloned().collect::<Vec<_>>(), vec!["check_round 2 quick", "check_round 3 quick"]);
+    // the rounds go on from the step the last one ended at and use the rows the original answered for them
+    assert_eq!(m.calls.iter().filter(|c| c.starts_with("train")).cloned().collect::<Vec<_>>(), vec!["train 1 from 0 rows 10..35", "train 2 from 8 rows 35..60", "train 3 from 16 rows 60..85"]);
+    assert_eq!(r["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(r["rows"][1]["decision"], "continue");
+    assert_eq!(r["rows"][2]["decision"], "stop_pass");
+    assert!(events.iter().any(|e| e["kind"] == "heal_round" && e["decision"] == "stop_pass" && e["round"] == 3 && e["cap_m"] == 40.0));
+    assert!(events.iter().any(|e| e["kind"] == "heal_round" && e["decision"] == "final"));
+    // the last thing is to register the model
+    assert_eq!(m.calls.last().unwrap(), "register");
+    assert_eq!(m.state.as_ref().unwrap()["state"], "ended");
+}
+
+#[test]
+fn a_failed_merged_model_goes_on_and_then_needs_two_passed_checks_in_a_row() {
+    // round 2 passes -> merged fails -> round 3 passes (two in a row with round 2) -> stops, merged passes
+    let mut m = Mock::new(vec![good(), good()], vec![bad(), good()]);
+    let plan = plan_of(spec_of(json!({})), 40, true);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!(r["stop"]["round"], 3);
+    assert_eq!((kinds(&m, "merge"), m.unmerged, kinds(&m, "check_merged"), kinds(&m, "register")), (2, 1, 2, 1));
+    assert_eq!(r["merged_checks"].as_array().unwrap().len(), 1);
+    assert_eq!((r["merged_checks"][0]["after_round"].clone(), r["merged_checks"][0]["verdict"].clone()), (json!(2), json!("fail")));
+    assert_eq!(r["final"]["verdict"], "pass");
+    assert_eq!(m.state.as_ref().unwrap()["strict"], true);
+    // with a fail in between, two passes in a row come later
+    let mut m = Mock::new(vec![good(), bad(), good(), good()], vec![bad(), good()]);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!(r["stop"]["round"], 5);
+    assert_eq!(kinds(&m, "train"), 5);
+}
+
+#[test]
+fn the_cap_ends_the_heal_with_the_last_round_merged_and_checked() {
+    let mut m = Mock::new(vec![bad(); 6], vec![bad()]);
+    let plan = plan_of(spec_of(json!({"plateau": false})), 40, true);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!(r["stop"], json!({"reason": "cap", "round": 8, "tokens_m": 40.0}));
+    assert_eq!((kinds(&m, "train"), kinds(&m, "check_round"), kinds(&m, "merge"), kinds(&m, "register")), (8, 6, 1, 1));       // checks after rounds 2..7; none at the cap
+    assert_eq!(r["final"]["verdict"], "fail");
+    assert_eq!(r["rows"][7]["decision"], "stop_cap");
+    assert_eq!(r["final"]["failed"].as_array().unwrap().len() > 0, true);
+}
+
+#[test]
+fn an_extension_goes_on_after_the_last_round_and_repeats_nothing() {
+    let mut m = Mock::new(vec![bad(); 4], vec![bad(), good()]);
+    let first = plan_of(spec_of(json!({"plateau": false})), 20, true);                // 4 rounds: checks after rounds 2 and 3
+    let r = done(drive(&mut m, &first).0);
+    assert_eq!((r["stop"]["reason"].clone(), r["final"]["verdict"].clone(), kinds(&m, "train")), (json!("cap"), json!("fail"), 4));
+    m.calls.clear();
+    m.round_checks = vec![bad(), good()].into();
+    // the stage goes on to 30 M: the heal is opened again (the merged model is forgotten) and rounds 5 and 6 follow
+    let more = plan_of(spec_of(json!({"plateau": false, "extend": true})), 30, true);
+    let r = done(drive(&mut m, &more).0);
+    assert_eq!(m.unmerged, 1);
+    assert_eq!(m.calls.iter().filter(|c| c.starts_with("train")).cloned().collect::<Vec<_>>(), vec!["train 5 from 32 rows 110..135", "train 6 from 40 rows 135..160"]);
+    assert_eq!(kinds(&m, "cache"), 2);
+    assert_eq!(r["rows"].as_array().unwrap().len(), 6);
+    assert_eq!(r["final"]["verdict"], "pass");
+    // a heal that already passed is not opened again
+    m.calls.clear();
+    let r = done(drive(&mut m, &plan_of(spec_of(json!({"plateau": false, "extend": true})), 40, true)).0);
+    assert!(m.calls.is_empty() && r["final"]["verdict"] == "pass");
+}
+
+#[test]
+fn stop_at_every_call_then_continue_repeats_no_job() {
+    let script = || Mock::new(vec![bad(), good(), good()], vec![bad(), good()]);
+    let plan = plan_of(spec_of(json!({})), 40, true);
+    let mut whole = script();
+    let reference = done(drive(&mut whole, &plan).0);
+    let total = whole.count;
+    assert!(total >= 15);
+    for k in 1..=total {
+        let mut m = script();
+        m.stop_at = Some(k);
+        let (first, _) = drive(&mut m, &plan);
+        assert!(matches!(first, Outcome::Stopped(_)), "call {k}: {first:?}");
+        m.stop_at = None;
+        let r = done(drive(&mut m, &plan).0);
+        // what the stopped call did not do is done once; nothing that was done is done again
+        assert_eq!(m.ok_calls, whole.ok_calls, "stopped at call {k}");
+        assert_eq!(r["stop"], reference["stop"], "stopped at call {k}");
+        assert_eq!(r["final"]["verdict"], reference["final"]["verdict"], "stopped at call {k}");
+    }
+}
+
+#[test]
+fn a_plateau_stops_and_a_failed_merged_check_after_it_ends_the_stage() {
+    // flat scores and a flat loss from round 4 on; 30 M of a 40 M cap are trained when the plateau is seen (round 6)
+    let mut m = Mock::new(vec![json!({"closed_rate": 0.3, "accuracy": 0.3, "loop_rate": 0.0}), json!({"closed_rate": 0.55, "loop_rate": 0.0}), json!({"closed_rate": 0.6, "loop_rate": 0.0}),
+                               json!({"closed_rate": 0.6, "loop_rate": 0.0}), json!({"closed_rate": 0.55, "loop_rate": 0.0}), json!({"closed_rate": 0.6, "loop_rate": 0.0})], vec![bad()]);
+    m.losses = vec![3.0, 2.5, 2.2, 2.19, 2.185, 2.18, 2.0, 2.0];
+    // the checks start at the first round here, so that six checks are scored
+    let spec = spec_of(json!({"round_m": 5, "first_check_m": 5}));
+    let plan = plan_of(spec, 40, true);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!(r["stop"]["reason"], "plateau");
+    assert_eq!(r["stop"]["round"], 6);
+    // the merged model failed, but a plateau means more rounds would not help: the stage ends there
+    assert_eq!((r["final"]["verdict"].clone(), kinds(&m, "train"), m.unmerged, kinds(&m, "register")), (json!("fail"), 6, 0, 1));
+}
+
+#[test]
+fn the_time_limit_stops_with_the_reason_time_and_the_merged_model_is_still_checked() {
+    let mut m = Mock::new(vec![], vec![bad()]);
+    let mut spec = spec_of(json!({"round_m": 5, "first_check_m": 10}));
+    spec.deadline = Some(m.now + 3_000);                                 // the tail alone (merge and check, one hour) does not fit
+    let plan = plan_of(spec, 40, true);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!(r["stop"], json!({"reason": "time", "round": 1, "tokens_m": 5.0}));
+    assert_eq!((kinds(&m, "train"), kinds(&m, "merge"), kinds(&m, "check_merged"), r["final"]["verdict"].clone()), (1, 1, 1, json!("fail")));
+    assert_eq!(r["rows"][0]["decision"], "stop_time");
+    assert_eq!(m.unmerged, 0);
+    // enough time: it goes on
+    let mut m = Mock::new(vec![good()], vec![good()]);
+    let mut spec = spec_of(json!({"round_m": 5, "first_check_m": 5}));
+    spec.deadline = Some(m.now + 10 * 3_600);
+    let r = done(drive(&mut m, &plan_of(spec, 40, true)).0);
+    assert_eq!(r["stop"]["reason"], "pass");
+}
+
+#[test]
+fn a_student_that_does_not_think_has_no_checks_and_stops_on_the_loss() {
+    let mut m = Mock::new(vec![], vec![]);
+    m.losses = vec![3.0, 2.0, 1.5, 1.3, 1.25, 1.249, 1.2489, 1.2488];
+    let plan = plan_of(spec_of(json!({})), 40, false);
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!((kinds(&m, "check_round"), kinds(&m, "check_original"), kinds(&m, "check_merged"), kinds(&m, "merge"), kinds(&m, "register")), (0, 0, 0, 1, 1));
+    assert_eq!(r["stop"]["reason"], "plateau");
+    assert!(r["stop"]["round"].as_u64().unwrap() >= 5 && r["stop"]["round"].as_u64().unwrap() < 8);
+    assert!(r["final"].is_null());
+    // without a plateau the cap is reached
+    let mut m = Mock::new(vec![], vec![]);
+    m.losses = (0..40).map(|i| 3.0 - 0.05 * i as f64).collect();
+    let r = done(drive(&mut m, &plan).0);
+    assert_eq!((r["stop"]["reason"].clone(), kinds(&m, "train")), (json!("cap"), 8));
+}
+
+#[test]
+fn the_originals_numbers_from_the_caller_are_used_and_the_original_is_checked_once_per_mode() {
+    let mut m = Mock::new(vec![good()], vec![good()]);
+    let spec = spec_of(json!({"round_m": 5, "first_check_m": 5, "baseline": {"quick": orig()}}));
+    done(drive(&mut m, &plan_of(spec, 40, true)).0);
+    assert_eq!(kinds(&m, "check_original"), 0);
+    // the round checks are quick and the final one is full: the original is asked for once in each mode
+    let mut m = Mock::new(vec![bad(), good()], vec![good()]);
+    let spec = spec_of(json!({"round_m": 5, "first_check_m": 5, "final_quick": false}));
+    done(drive(&mut m, &plan_of(spec, 40, true)).0);
+    assert_eq!(m.calls.iter().filter(|c| c.starts_with("check_original")).cloned().collect::<Vec<_>>(), vec!["check_original quick", "check_original full"]);
+    assert!(m.calls.contains(&"check_merged full".to_string()));
+    // "never" runs to the cap, records the checks and ignores a pass
+    let mut m = Mock::new(vec![good(); 7], vec![good()]);
+    let spec = spec_of(json!({"stop": "never", "first_check_m": 5}));
+    let r = done(drive(&mut m, &plan_of(spec, 40, true)).0);
+    assert_eq!((r["stop"]["reason"].clone(), kinds(&m, "train"), kinds(&m, "check_round")), (json!("cap"), 8, 7));
+    assert_eq!(r["rows"][7]["decision"], "stop_never");
+}
+
+#[test]
+fn a_changed_round_size_starts_a_new_state_and_an_old_state_is_not_misread() {
+    let mut m = Mock::new(vec![good()], vec![good()]);
+    m.state = Some(json!({"v": 1, "round": 10_000_000u64, "state": "ended", "rows": [{"n": 1}]}));
+    let r = done(drive(&mut m, &plan_of(spec_of(json!({"round_m": 5, "first_check_m": 5})), 40, true)).0);
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(kinds(&m, "train"), 1);
+}
+
+#[test]
+fn the_original_being_answered_again_and_a_lost_general_text_are_noticed() {
+    // the saved answers were made again from the start: a note, the heal goes on
+    let mut m = Mock::new(vec![bad(), bad()], vec![bad()]);
+    let plan = plan_of(spec_of(json!({"first_check_m": 5, "plateau": false})), 15, true);
+    struct Again(Mock);
+    impl RoundJobs for Again {
+        fn load(&mut self) -> Option<Value> { self.0.load() }
+        fn save(&mut self, s: &Value) { self.0.save(s) }
+        fn cache(&mut self, n: u32, upto: u64) -> Result<Value> {
+            let mut r = self.0.cache(n, upto)?;
+            if n == 2 { r["rows_before"] = json!(0); }
+            if n == 3 { r["stats"]["general_error"] = json!("offline"); }
+            Ok(r)
+        }
+        fn train(&mut self, t: &TrainRound) -> Result<Value> { self.0.train(t) }
+        fn check_round(&mut self, n: u32, q: bool) -> Result<Value> { self.0.check_round(n, q) }
+        fn check_original(&mut self, q: bool) -> Result<Value> { self.0.check_original(q) }
+        fn merge(&mut self) -> Result<Value> { self.0.merge() }
+        fn check_merged(&mut self, q: bool) -> Result<Value> { self.0.check_merged(q) }
+        fn unmerge(&mut self) -> Result<()> { self.0.unmerge() }
+        fn register(&mut self) -> Result<Value> { self.0.register() }
+        fn now_secs(&self) -> u64 { self.0.now_secs() }
+    }
+    let mut a = Again(std::mem::replace(&mut m, Mock::new(vec![], vec![])));
+    let err = run(&plan, &mut a, &mut |_| {}).unwrap_err().to_string();
+    assert!(err.contains("could not be read again") && err.contains("continued"), "{err}");
+    let st = a.0.state.clone().unwrap();
+    assert!(st["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("made again from the start")));
+    assert_eq!(st["rows"].as_array().unwrap().len(), 3);          // round 3 was opened, nothing trained for it
+    assert_eq!(st["rows"][2]["trained"], false);
+}
