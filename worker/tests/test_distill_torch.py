@@ -604,7 +604,7 @@ def test_a_round_stopped_in_the_middle_goes_on_exactly_where_it_was(tmp_path, te
     code, evB2 = run_in_process(monkeypatch, dj.run, {**cfg_b, "resume": True})
     rb2 = evB2[-1]["data"]
     assert code == 0 and rb2["stopped"] is False and rb2["round"]["s_end"] == ra["round"]["s_end"] and rb2["round"]["complete"] is True
-    assert len(rows_b1) >= 2 and rows_b1 + list(seen) == rows_a                                # not one row twice, none skipped
+    assert rows_b1[:2] + list(seen) == rows_a                                # not one row twice, none skipped
     import safetensors.torch as st
     a = st.load_file(str(tmp_path / "run-a" / "rounds" / "r2" / "adapter" / "adapter_model.safetensors"))
     b = st.load_file(str(tmp_path / "run-b" / "rounds" / "r2" / "adapter" / "adapter_model.safetensors"))
