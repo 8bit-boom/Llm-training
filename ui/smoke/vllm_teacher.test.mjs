@@ -162,3 +162,31 @@ test("ticking a switch puts the key in the spec (and makes the setting Custom); 
   assert.equal(b.run("ac.sp.vl"), null);
   assert.equal("vllm" in JSON.parse(JSON.stringify(b.run("acSpec()"))), false);
 });
+
+// ---- the optional 8-bit KV cache
+
+test("Settings: the 8-bit KV cache is off by default, explained, and the teacher has its own confirmation", () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState() });
+  b.run(`state = ${JSON.stringify(baseState())}`);
+  const html = b.run("renderVllm()");
+  assert.match(html, /8-bit KV cache \(experimental, off\)/);
+  assert.match(html, /71,141 tokens now, roughly 140,000 with fp8/); assert.match(html, /only its full-attention layers have a KV cache/);
+  assert.match(html, /<option value="auto" selected>auto \(the default\)/); assert.doesNotMatch(html, /id="vl-kv-teacher"[^>]*checked/);
+  assert.match(html, /<option value="f16" selected>f16 \(the default\)/);
+  assert.match(html, /id="vl-tkv"/);
+});
+
+test("Auto-cut: the 8-bit KV cache switch is for the checks and goes into the spec only when ticked", () => {
+  const b = acOpen({ enabled: true, kind: "auto" });
+  assert.match(b.run("autoCard()"), /id="ac-vl-kv"/);
+  b.run("ac.sp.vl = { teacher_cache: false, checks: true, automatic: false, kv_fp8: true }");
+  assert.deepEqual(JSON.parse(JSON.stringify(b.run("acSpec().vllm"))), { teacher_cache: false, checks: true, automatic: false, kv_fp8: true });
+  b.run("ac.sp.vl = { teacher_cache: false, checks: true, automatic: false }");
+  assert.equal("kv_fp8" in JSON.parse(JSON.stringify(b.run("acSpec().vllm"))), false);
+});
+
+test("the Heal card can measure the cost of the 8-bit KV cache on the teacher's answers", () => {
+  const b = open(on);
+  b.run("rs.hlSpec.vllm = true");
+  assert.match(b.run("renderReshape()"), /id="hl-vllm-checkkv"[^>]*>Check with the 8-bit KV cache/);
+});

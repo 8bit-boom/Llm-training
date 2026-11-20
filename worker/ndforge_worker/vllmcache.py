@@ -63,7 +63,17 @@ def identity(job: dict, origin: str, origin_dir) -> dict:
     from . import safetensors_io
     e = container_config(job)
     sel = select_teacher((job.get("engine") or {}).get("teacher") or {}, origin, origin_dir)
-    return {"engine": f"vllm-{e['version']}", "teacher_quant": sel["quant"], "teacher_origin": {"repo": str(origin), "weights": safetensors_io.weights_manifest(origin_dir)}}
+    out = {"engine": f"vllm-{e['version']}", "teacher_quant": sel["quant"], "teacher_origin": {"repo": str(origin), "weights": safetensors_io.weights_manifest(origin_dir)}}
+    if teacher_kv(job) == "fp8":
+        out["kv_cache"] = "fp8"
+    return out
+
+
+def teacher_kv(job: dict) -> str:
+    """The KV cache type of the teacher's answers: "fp8" ONLY when the 8-bit KV cache is on AND the owner confirmed it for the teacher (`kv_cache_dtype_teacher`): the teacher's logits are the training
+    target, so the exact cache is the default. A cache made with fp8 carries it in its identity and is never mixed with exact ones."""
+    e = job.get("engine") or {}
+    return "fp8" if str(e.get("kv_cache_dtype") or "auto").lower() == "fp8" and e.get("kv_cache_dtype_teacher") is True else "auto"
 
 
 def container_config(job: dict) -> dict:
@@ -211,6 +221,8 @@ def script_args(job: dict, sel: dict, model_arg: str, extra_llm: dict, first: in
         quant = tail[tail.index("--quantization") + 1] if "--quantization" in tail and tail.index("--quantization") + 1 < len(tail) else "bitsandbytes"
         a += ["--quantization", quant]
     kw = {**extra_llm, **(e.get("llm_kwargs") or {})}
+    if teacher_kv(job) == "fp8":
+        a += ["--kv-cache-dtype", "fp8"]
     if kw:
         a += ["--llm-kwargs", json.dumps(kw)]
     return a

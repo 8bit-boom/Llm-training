@@ -128,3 +128,88 @@ def test_the_report_prints_the_rates_the_think_blocks_and_two_samples(tmp_path):
     assert "think_rate 1.0, closed_rate 0.97, 15 of 16 with a `<think>` block" in md and "First 300 characters of sample answer `a`" in md
     assert "x" * 400 not in md.split("First 300 characters of sample answer `a`:")[1].split("First 300")[0]
     assert "SHORT" not in md and "did not think" not in md
+
+
+# ---- the polish of the report (4th run)
+
+LOG = """INFO 11-20 Using FLASH_ATTN attention backend on sm_120
+INFO Using FlashInfer GDN prefill kernel for gated delta rule
+INFO quantization compressed-tensors, using Marlin kernel
+INFO Model loading took 19.3 GiB and 64.1 seconds
+INFO GPU KV cache size: 71,141 tokens
+INFO Maximum concurrency for 8,192 tokens per request: 8.68x
+INFO init engine (profile, create kv cache, warmup model) took 100.33 s
+INFO Capturing CUDA graphs
+INFO unrelated noise line
+"""
+
+
+def test_kernel_lines_come_first_and_the_kv_cache_gets_a_plain_note():
+    h = ve.log_highlights(LOG, 60)
+    assert "FLASH_ATTN" in h[0] and any("Marlin" in x for x in h[:4]) and any("KV cache size" in x for x in h) and "noise" not in " ".join(h)
+    assert h.index(next(x for x in h if "FlashInfer" in x)) < h.index(next(x for x in h if "KV cache size" in x)), "kernel lines before the memory lines"
+    p = st.startup_parts(205.2, LOG)
+    assert p["kv"]["kv_tokens"] == 71141 and p["kv"]["max_concurrency"] == 8.68
+    assert "only about 21 fit at once" in p["kv"]["note"] and "waves" in p["kv"]["note"]
+
+
+def test_the_startup_breakdown_says_where_the_seconds_went():
+    p = st.startup_parts(205.2, LOG)
+    assert p["init_engine_s"] == 100.33 and p["startup_breakdown"] == "startup: container + model load 104.9 s, engine init (profile, create kv cache, warmup model) 100.33 s"
+    assert st.startup_parts(205.2, "nothing here") == {}
+
+
+def test_big_logs_read_more_than_60_lines(monkeypatch):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout=LOG.encode(), stderr=b"")
+
+    monkeypatch.setattr(ve, "_run", run)
+    e = ve.Engine(ve.engine_config({"engine": {"kind": "wslc"}}), "m")
+    e.port = 7
+    assert "FLASH_ATTN" in e.logs_big(800) and calls[0][:3] == ["wslc", "logs", "-n"] and calls[0][3] == "800"
+    d = ve.Engine(ve.engine_config({"engine": {"kind": "docker"}}), "m")
+    d.port = 7
+    d.logs_big(500)
+    assert calls[1][-3:-1] == ["--tail", "500"]
+
+
+def test_thinking_samples_show_a_short_and_a_long_answer_with_both_ends_of_the_block():
+    raws = [{"id": "a", "text": "<think>\nshort " + "y" * 50 + "\n</think>\n\nanswer a", "gen_tokens": 30}, {"id": "b", "text": "<think>\n" + "z" * 900 + "\n</think>\n\nanswer b", "gen_tokens": 900},
+            {"id": "c", "text": "control", "gen_tokens": 5}]
+    s = st.thinking_samples(raws, {"a", "b"})
+    assert [x["id"] for x in s] == ["a", "b"] and len(s[1]["start"]) == 300 and "</think>" in s[1]["end"] and "answer b" in s[1]["end"] and "control" not in json.dumps(s)
+
+
+def test_a_comparison_with_another_model_is_not_a_pass():
+    rep = {"startup_seconds": 205.2, "tokens_per_s": 500, "long_tokens_per_s": 564.2, "comparisons": [{"with": "hf", "model": "Someone/Heretic", "other_model": True, "tolerance": 0.06, "deltas": {}, "within_noise": True}]}
+    c = {x["id"]: x for x in st.criteria_of(rep)}
+    assert c["noise_hf"]["ok"] is None and "not like-for-like (reference: Someone/Heretic)" in c["noise_hf"]["label"]
+    rep["criteria"] = list(c.values())
+    v, _ = st.verdict({**rep, "prerequisites": [], "criteria": list(c.values())})
+    assert v == "pass", "the other-model line is neither a pass nor a failure"
+    only = {"startup_seconds": None, "comparisons": rep["comparisons"]}
+    assert st.verdict({"prerequisites": [], "criteria": [x for x in st.criteria_of(only) if x["id"] == "noise_hf"]})[0] == "fail", "n/a alone is no measurement"
+
+
+def test_list_samples_are_taken_while_the_container_runs_and_an_empty_json_is_said(tmp_path, monkeypatch):
+    seen = []
+
+    def run(cmd, timeout=600):
+        seen.append(cmd)
+        return {"cmd": cmd, "returncode": 0, "output": "" if "--format" in cmd else "NAME STATE\nndforge-vllm-9 running"}
+
+    monkeypatch.setattr(st, "_run", run)
+    rep: dict = {}
+    st.list_sample(rep, {"kind": "wslc"}, "right after /health answered", "ndforge-vllm-9")
+    assert [c[:3] for c in seen] == [["wslc", "list", "-a"], ["wslc", "list", "-a"], ["wslc", "inspect", "ndforge-vllm-9"]]
+    full = {"version": 1, "created": "t", "model": "m", "engine": {"kind": "wslc"}, "note": "n", "error": "x", "prerequisites": [], "comparisons": [], "hints": [], "commands": [], "wslc": {"help": {}, **rep["wslc"]}}
+    st._finish(full, tmp_path, 0.0)
+    md = (tmp_path / "vllm_selftest.md").read_text()
+    assert "right after /health answered" in md and "empty while the container ran: `wslc list --format json` printed nothing" in md and "ndforge-vllm-9 running" in md and "`wslc inspect <name>`" in md
+
+
+def test_the_wslc_hint_says_what_the_runs_verified():
+    assert "verified `run -d`" in st.WSLC_VERIFIED and "Still untested: `cp`, `exec`" in st.WSLC_VERIFIED and "unverified" not in st.WSLC_VERIFIED.lower().replace("untested", "")

@@ -234,11 +234,12 @@ def verdict(rep: dict) -> tuple[str, str]:
         return "fail", "The engine cannot run here yet: " + ", ".join(bad) + ". See the prerequisites in the report."
     crit = rep.get("criteria", [])
     failed = [c["label"] for c in crit if c["ok"] is False]
-    if not crit:
+    scored = [c for c in crit if c["ok"] is not None]
+    if not scored:
         return "fail", "No measurement was made."
     if not failed:
         return "pass", "All the report's criteria were met on this PC: the engine is worth using for the thinking check and for making thinking answers (still check a few answers by eye)."
-    if len(failed) < len(crit):
+    if len(failed) < len(scored):
         return "partial", "Some criteria were not met: " + "; ".join(failed) + ". Use vLLM only where those do not matter, or keep the standard engine."
     return "fail", "No criterion was met: " + "; ".join(failed) + ". Keep the standard engine."
 
@@ -252,13 +253,20 @@ def criteria_of(rep: dict) -> list:
     out.append({"id": "speed", "label": f"at least {int(CRITERIA['tokens_per_s'])} tokens/s with 40 requests at once" + (" (long answers)" if lt is not None else " (short answers: not measured on long ones)"), "limit": CRITERIA["tokens_per_s"], "value": tps,
                 "ok": None if tps is None else tps >= CRITERIA["tokens_per_s"]})
     for c in rep.get("comparisons", []):
-        out.append({"id": "noise_" + c["with"], "label": f"numbers within noise of {c['with']} (+-{NOISE_QUESTIONS} questions)", "limit": c["tolerance"], "value": c["deltas"], "ok": c["within_noise"]})
+        if c.get("other_model"):
+            out.append({"id": "noise_" + c["with"], "label": f"numbers within noise of {c['with']} (+-{NOISE_QUESTIONS} questions): not like-for-like (reference: {c.get('model')})", "limit": c["tolerance"], "value": c["deltas"], "ok": None, "not_like_for_like": True})
+        else:
+            out.append({"id": "noise_" + c["with"], "label": f"numbers within noise of {c['with']} (+-{NOISE_QUESTIONS} questions)", "limit": c["tolerance"], "value": c["deltas"], "ok": c["within_noise"]})
     return out
+
+
+WSLC_VERIFIED = ("wslc: your runs verified `run -d` with --gpus, --shm-size, -p and -v, `stop -t`, `remove -f`, `pull` and that the published port is reachable from Windows. Still untested: `cp`, `exec`, the field names of "
+                 "`list --format json` (see the samples below) and the flags of `logs`. The commands are templates you can edit.")
 
 
 def markdown(rep: dict) -> str:
     L = ["# vLLM self-test", "", f"**{rep['verdict'].upper()}**: {rep['verdict_text']}", "", f"> {NOTE}", "", f"> {generic_note(rep.get('model'))}", "", f"Created {rep['created']} - model `{rep.get('model')}` - engine {rep.get('engine', {}).get('kind')} ({rep.get('engine', {}).get('image', '')})", ""]
-    L += ["## Success criteria (from the report)", ""] + [f"- [{'x' if c['ok'] else ' ' if c['ok'] is False else '?'}] {c['label']}: {'not reached' if c.get('not_reached') else c['value']}" for c in rep.get("criteria", [])] + [""]
+    L += ["## Success criteria (from the report)", ""] + [f"- [{'x' if c['ok'] else ' ' if c['ok'] is False else '?'}] {c['label']}: {'not reached' if c.get('not_reached') else 'n/a' if c.get('not_like_for_like') else c['value']}" for c in rep.get("criteria", [])] + [""]
     L += ["## Prerequisites", ""] + [f"- [{'x' if p['ok'] else ' ' if p['ok'] is False else '?'}] {p['id']}: {p['detail']}" for p in rep.get("prerequisites", [])] + [""]
     if rep.get("download_note"):
         L += [rep["download_note"], ""]
@@ -298,7 +306,11 @@ def markdown(rep: dict) -> str:
         else:
             L += ["No saved standard-engine (hf / llama.cpp) numbers for this model were given, so nothing is compared.", ""]
     if rep.get("startup_seconds") is not None:
-        L += ["## Start-up", "", f"Ready after {rep['startup_seconds']} s. Server version: {rep.get('server_version') or 'unknown'}.", "", "Log lines about the attention / GDN kernel and the cache:", ""] + [f"    {x}" for x in rep.get("highlights", [])] + [""]
+        L += ["## Start-up", "", f"Ready after {rep['startup_seconds']} s. Server version: {rep.get('server_version') or 'unknown'}.", "", "Log lines about the attention / GDN kernel, the backend, the quantization and the cache (kernel lines first):", ""] + [f"    {x}" for x in rep.get("highlights", [])] + [""]
+        if rep.get("startup_breakdown"):
+            L += [rep["startup_breakdown"] + ".", ""]
+        if (rep.get("kv") or {}).get("note"):
+            L += [rep["kv"]["note"], ""]
     if rep.get("reachability"):
         L += ["## Reachability from this side", "", rep["reachability"]["detail"], ""]
     if rep.get("tokens_per_s") is not None:
@@ -307,12 +319,36 @@ def markdown(rep: dict) -> str:
               f"closed {s.get('closed_rate')}, accuracy {s.get('accuracy')}, loops {s.get('loop_rate')}, garbage {s.get('garbage_rate')}, cut by the limit {s.get('truncated_rate')}", ""]
     for c in rep.get("comparisons", []):
         L += [f"Against {c['with']} ({c.get('backend')}, model {c.get('model')}): differences {c['deltas']}, {'within' if c['within_noise'] else 'OUTSIDE'} the noise of +-{c['tolerance']}. The saved result may be of another model (the original): a difference is not necessarily a fault.", ""]
+    kf = rep.get("kv_fp8")
+    if kf:
+        L += ["## 8-bit KV cache (fp8), the optional second pass", ""]
+        for key in ("auto", "fp8"):
+            x = kf.get(key)
+            if x:
+                L += [f"- **{key}**: KV cache {x.get('kv_tokens') if x.get('kv_tokens') is not None else 'unknown'} tokens, max concurrency {x.get('max_concurrency') if x.get('max_concurrency') is not None else 'unknown'}x, long-answer speed {x.get('long_tokens_per_s')} tokens/s, "
+                      f"think_rate {x.get('think_rate')}, closed_rate {x.get('closed_rate')}, accuracy {x.get('accuracy')}; attention backend: {x.get('attention_backend') or 'not found in the log'}."]
+        for k in ("text", "warning", "fp8_failed"):
+            if kf.get(k):
+                L += ["", kf[k]]
+        if kf.get("exit_logs"):
+            L += ["", "Last lines of the fp8 engine's log:", ""] + [f"    {x}" for x in str(kf["exit_logs"]).splitlines()[-40:]]
+        L += [""]
+    if rep.get("think_samples"):
+        L += ["## Two thinking answers (one short, one long: the start and the end of the `<think>` block)", ""]
+        for x in rep["think_samples"]:
+            L += [f"### {x['id']} ({x.get('gen_tokens')} tokens)", "", "start:", "", "    " + x["start"].replace("\n", "\n    "), "", "around the end of the block:", "", "    " + x["end"].replace("\n", "\n    "), ""]
     if rep.get("samples"):
         L += ["## Sample answers (look at them: garbled text means a problem)", ""] + [f"### {x['id']}\n\n    {x['text'][:600]!r}\n" for x in rep["samples"]]
     if rep.get("wslc"):
-        L += ["## wslc help (for adapting the templates)", "", "wslc syntax unverified.", ""]
+        L += ["## wslc help (for adapting the templates)", "", WSLC_VERIFIED, ""]
         for smp in rep["wslc"].get("list_samples", []):
-            L += [f"### `wslc list -a --format json` at {smp['at']} (exit code {smp['returncode']}): the real field names", "", "    " + (smp["output"] or "(empty)").replace("\n", "\n    "), ""]
+            j = smp.get("json") or {}
+            L += [f"### `wslc list -a --format json` {smp.get('when') or ''} at {smp['at']} (exit code {j.get('returncode')}): the real field names", ""]
+            L += ["    " + (j.get("output") or "").replace("\n", "\n    ")] if (j.get("output") or "").strip() else ["    (empty while the container ran: `wslc list --format json` printed nothing)"]
+            for key, title in (("table", "`wslc list -a` (table)"), ("inspect", "`wslc inspect <name>`")):
+                if smp.get(key):
+                    L += ["", f"{title} at the same moment (exit code {smp[key]['returncode']}):", "", "    " + (smp[key]["output"] or "(empty)").replace("\n", "\n    ")]
+            L += [""]
         for k, v in rep["wslc"].get("help", {}).items():
             L += [f"### {k} (exit code {v['returncode']})", "", "```", v["output"], "```", ""]
         if rep["wslc"].get("loopback"):
@@ -323,12 +359,101 @@ def markdown(rep: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-def list_sample(rep: dict, cfg: dict) -> None:
-    """One `wslc list -a --format json` sample while the engine's container exists (and again in the failure path before it is removed): the real field names of the JSON."""
+def list_sample(rep: dict, cfg: dict, when: str = "", name: str = "") -> None:
+    """A sample of what wslc says about the containers WHILE the engine's container exists (after /health answered, right before the stop, and in the failure path before the removal):
+    `wslc list -a --format json` (the real field names), `wslc list -a` (the table) and `wslc inspect <name>`. An empty JSON is said to be empty."""
     if cfg.get("kind") != "wslc":
         return
-    r = _run(["wslc", "list", "-a", "--format", "json"], 60)
-    rep.setdefault("wslc", {}).setdefault("list_samples", []).append({"at": time.strftime("%H:%M:%S"), "output": tidy(r["output"])[-3000:], "returncode": r["returncode"]})
+    smp = {"at": time.strftime("%H:%M:%S"), "when": when}
+    for key, cmd in (("json", ["wslc", "list", "-a", "--format", "json"]), ("table", ["wslc", "list", "-a"]), ("inspect", ["wslc", "inspect", name] if name else None)):
+        if cmd:
+            r = _run(cmd, 60)
+            smp[key] = {"returncode": r["returncode"], "output": tidy(r["output"])[-3000:]}
+    rep.setdefault("wslc", {}).setdefault("list_samples", []).append(smp)
+
+
+FP8_REFUSED = re.compile(r"(fp8|kv.cache.dtype|kv_cache_dtype)[^\n]*(not supported|unsupported|incompatible|not implemented|does not support|cannot|invalid|error)|(not supported|unsupported|does not support)[^\n]*(fp8|kv.cache)", re.I)
+ATTN_BACKEND = re.compile(r"(attention backend|attn backend|FLASH_ATTN|FLASHINFER|TRITON_ATTN|FLEX_ATTENTION)[^\n]*", re.I)
+
+
+def kv_summary(label: str, log: str, extra: dict | None = None) -> dict:
+    """What one engine start says about its KV cache: tokens, concurrency, the attention backend the log names, and whether the log refuses fp8."""
+    kv = vllmengine.kv_facts(log)
+    be = ATTN_BACKEND.search(log or "")
+    refused = FP8_REFUSED.search(log or "")
+    return {"setting": label, **kv, "attention_backend": be.group(0).strip()[:200] if be else None, "refuses_fp8": refused.group(0).strip()[:200] if refused else None, **(extra or {})}
+
+
+def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep: dict, first_engine, reqs: list, by_id: dict, settings: dict, should_stop, model_name: str) -> None:
+    """The optional second pass ("also test the 8-bit KV cache"): stops the first engine, starts the same model with `--kv-cache-dtype fp8`, and reports for BOTH settings the KV cache size in tokens and the maximum
+    concurrency, the speed on the same long-answer test and the Quick suite's rates (think_rate, closed_rate, accuracy), the attention backend the log names, and whether the log refuses fp8. A start that fails
+    (or a log that refuses fp8) is a plain message, never a hang (the start fails fast and times out), and the result says the setting stays "auto". Writes `rep["kv_fp8"]`."""
+    out: dict = {"auto": kv_summary("auto", rep.get("_full_log", ""), {"long_tokens_per_s": rep.get("long_tokens_per_s"), "think_rate": (rep.get("suite") or {}).get("think_rate"),
+                                                                     "closed_rate": (rep.get("suite") or {}).get("closed_rate"), "accuracy": (rep.get("suite") or {}).get("accuracy")})}
+    rep["kv_fp8"] = out
+    first_engine.stop()
+    eng = vllmengine.Engine(cfg, model, quant=quant, gpu_util=util, extra_args=extra_args, kv_cache_dtype="fp8")
+    try:
+        eng.start()
+        list_sample(rep, cfg, "while the fp8 KV cache engine runs", vllmengine.container_name(eng.port))
+        eng.wait_ready(float(cfg.get("start_timeout") or vllmengine.DEFAULT_START_TIMEOUT), should_stop)
+        log = eng.logs_big(800) + "\n" + eng.log_text()
+        fp8 = kv_summary("fp8", log)
+        results, tokens, t0 = [], 0, time.monotonic()
+        with ThreadPoolExecutor(max_workers=thinkcheck_vllm.DEFAULT_PARALLEL) as pool:
+            for raw in pool.map(lambda r: thinkcheck_vllm.ask(eng.url, r, settings, model_name, eng.api_key), reqs):
+                item, is_main = by_id[raw["id"]]
+                tokens += int(raw.get("gen_tokens") or 0)
+                results.append({**thinkcheck.score_item(item, raw, thinking=is_main), "control": not is_main})
+        suite = thinkcheck.summarize([r for r in results if not r["control"]])
+        fp8.update(think_rate=suite.get("think_rate"), closed_rate=suite.get("closed_rate"), accuracy=suite.get("accuracy"), suite_tokens_per_s=round(tokens / max(time.monotonic() - t0, 1e-9), 1))
+        fp8.update(long_decode(eng, should_stop, model_name))
+        out["fp8"] = fp8
+        a, b = out["auto"].get("kv_tokens"), fp8.get("kv_tokens")
+        out["text"] = (f"KV cache: {a:,} tokens with auto, {b:,} with fp8 ({b / a:.2f} times)." if a and b else "The KV cache size was not found in the logs.")
+        if fp8.get("refuses_fp8"):
+            out["warning"] = f"The log mentions a problem with fp8: {fp8['refuses_fp8']}"
+    except vllmengine.EngineError as exc:
+        logs = eng.exit_logs or eng.logs_tail(60)
+        refused = FP8_REFUSED.search(logs or "")
+        out["fp8_failed"] = f"vLLM did not run with the 8-bit KV cache{' (the log refuses it: ' + refused.group(0).strip()[:160] + ')' if refused else ''}: {str(exc)[:300]}. The setting stays auto."
+        out["fallback"] = "auto"
+        out["exit_logs"] = logs
+    except Exception as exc:                                  # noqa: BLE001 - the second pass must never lose the report
+        out["fp8_failed"] = f"The fp8 pass failed ({type(exc).__name__}: {protocol.scrub(str(exc))[:200]}). The setting stays auto."
+        out["fallback"] = "auto"
+    finally:
+        eng.stop()
+        rep.setdefault("commands", [])
+        rep["fp8_commands"] = eng.commands
+
+
+def startup_parts(ready_s, log: str) -> dict:
+    """What the engine's log says about the cache and where the start-up went: `kv` (KV cache tokens, concurrency, the note), `init_engine_s` and the sentence "container + model load X s, engine init Y s"."""
+    out: dict = {}
+    kv = vllmengine.kv_facts(log)
+    if kv.get("kv_tokens"):
+        fit = kv["kv_tokens"] // 3300
+        kv["note"] = (f"The KV cache holds {kv['kv_tokens']:,} tokens" + (f" (maximum concurrency {kv['max_concurrency']}x for {kv['per_request_tokens']:,}-token requests)" if kv.get("max_concurrency") else "")
+                      + f": with answers of about 3.3k tokens only about {fit} fit at once; the other requests wait, so 40 questions at once are served in waves.")
+        out["kv"] = kv
+    init = vllmengine.init_engine_seconds(log)
+    if init is not None and ready_s:
+        out["init_engine_s"] = init
+        out["startup_breakdown"] = f"startup: container + model load {round(float(ready_s) - init, 1)} s, engine init (profile, create kv cache, warmup model) {init} s"
+    return out
+
+
+def thinking_samples(raws: list, main_ids: set) -> list:
+    """One short and one long THINKING answer: the start (300 characters) and the place where the `<think>` block ends, so both ends of the block are visible."""
+    mains = sorted([r for r in raws if r["id"] in main_ids and r.get("text")], key=lambda r: r.get("gen_tokens") or 0)
+    pick = [mains[0], mains[-1]] if len(mains) > 1 else mains
+    out = []
+    for r in pick:
+        t = r["text"]
+        i = t.find("</think>")
+        out.append({"id": r["id"], "gen_tokens": r.get("gen_tokens"), "start": t[:300], "end": t[max(0, i - 150): i + 150] if i >= 0 else "(no </think> in this answer)"})
+    return out
 
 
 def tidy(text: str) -> str:
@@ -418,16 +543,19 @@ def run(job: dict) -> int:
         t_wait = time.monotonic()
         try:
             engine.start()
-            list_sample(rep, cfg)
             engine.wait_ready(float(job.get("start_timeout") or vllmengine.DEFAULT_START_TIMEOUT), should_stop)
         except vllmengine.EngineError as exc:
             rep["error"] = str(exc)
             rep["timings"]["waited_for_ready_s"] = round(time.monotonic() - t_wait, 1)
-            list_sample(rep, cfg)
+            list_sample(rep, cfg, "in the failure path, before the container is removed", vllmengine.container_name(engine.port))
             rep["exit_logs"] = engine.exit_logs or engine.logs_tail(60)       # read before `_finish` removes the container
             rep["highlights"] = vllmengine.log_highlights(rep["exit_logs"] + "\n" + engine.log_text())
             return _finish(rep, out_dir, t_start, engine)
-        rep.update(startup_seconds=engine.ready_seconds, server_version=engine.server_version(), highlights=vllmengine.log_highlights(engine.log_text()))
+        full_log = engine.logs_big(800) + "\n" + engine.log_text()
+        rep["_full_log"] = full_log
+        rep.update(startup_seconds=engine.ready_seconds, server_version=engine.server_version(), highlights=vllmengine.log_highlights(full_log, 60))
+        rep.update(startup_parts(engine.ready_seconds, full_log))
+        list_sample(rep, cfg, "right after /health answered", vllmengine.container_name(engine.port))
         rep["reachability"] = reachability(engine)
         if should_stop():
             rep["stopped"] = True
@@ -462,11 +590,15 @@ def run(job: dict) -> int:
             rep["samples"] = [{"id": r["id"], "text": r["text"], "gen_tokens": r.get("gen_tokens")} for r in raws[:5]]
             main_ids = {it["id"] for it in main}
             rep["answer_tokens"] = answer_stats([r.get("gen_tokens") or 0 for r in raws if r["id"] in main_ids])
+            rep["think_samples"] = thinking_samples(raws, main_ids)
             rep["think_blocks"] = sum(1 for r in raws if r["id"] in main_ids and ("</think>" in (r.get("text") or "") or "<think>" in (r.get("text") or "")))
             rep["request_check"] = {"enable_thinking_sent": True, "same_request_as_the_thinking_check": True, "note": "Sent through thinkcheck_vllm.ask, the request of the real vLLM check: enable_thinking true for the questions, false for the controls; the `<think>` prefix is written by the server's chat template (see the samples)."}
             protocol.progress("selftest", 0.92, "Measuring the speed on long answers")
             if not should_stop():
                 rep.update(long_decode(engine, should_stop, model_name))
+            if job.get("kv_fp8_test") and not should_stop() and engine.kind != "url":
+                protocol.progress("selftest", 0.95, "Testing the 8-bit KV cache (a second engine start)")
+                kv_fp8_pass(cfg, model, thinkcheck_vllm.quant_of(job), util_now, e.get("extra_args"), rep, engine, reqs, by_id, settings, should_stop, model_name)
             refs: list = []
             for label in ("hf", "llama") + (("hf_adapter",) if adapter else ()):
                 saved = _load_result((job.get("compare") or {}).get(label)) if (job.get("compare") or {}).get(label) else None
@@ -482,6 +614,8 @@ def run(job: dict) -> int:
 
 def _finish(rep: dict, out_dir: Path, t_start: float, engine=None) -> int:
     if engine is not None:
+        if engine.kind == "wslc" and not rep.get("error") and engine.port:
+            list_sample(rep, {"kind": "wslc"}, "right before the stop", vllmengine.container_name(engine.port))
         engine.stop()                                 # explicit stop, always (also after a failure and a Stop)
         rep["commands"] = engine.commands                 # the start command is in it, the API key replaced by [key]
         rep["engine_stopped"] = engine.stopped
@@ -489,7 +623,8 @@ def _finish(rep: dict, out_dir: Path, t_start: float, engine=None) -> int:
         if engine.exit_logs and not rep.get("exit_logs"):
             rep["exit_logs"] = engine.exit_logs
     if engine is not None and engine.kind == "wslc":
-        rep.setdefault("hints", []).append("wslc syntax unverified: the commands above are templates; adapt them from the help output in this report.")
+        rep.setdefault("hints", []).append(WSLC_VERIFIED)
+    rep.pop("_full_log", None)
     rep["criteria"] = criteria_of(rep) if not rep.get("error") and not rep.get("stopped") else [{**c, "value": None, "ok": None, "not_reached": True} for c in criteria_of({})]
     rep["verdict"], rep["verdict_text"] = verdict(rep)
     if (rep.get("answer_check") or {}).get("level") == "warn":

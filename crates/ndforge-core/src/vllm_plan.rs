@@ -47,6 +47,9 @@ pub struct AutoVllm {
     /// "automatic": use vLLM for a step only when its estimate is lower than the standard engine's (the plan says why); the two switches above are then ignored
     #[serde(default)]
     pub automatic: bool,
+    /// the 8-bit KV cache for the thinking checks (never for the teacher's answers); experimental, off
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kv_fp8: bool,
 }
 
 impl AutoVllm {

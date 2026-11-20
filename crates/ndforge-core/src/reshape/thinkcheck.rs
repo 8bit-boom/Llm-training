@@ -249,6 +249,12 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
         job["double_quant"] = json!(qlora);
         job["load"] = json!(if qlora { "4bit" } else { "16bit" });
     }
+    if backend == "llama" {
+        let ct = crate::settings::Settings::load().vllm.llama_cache_type;
+        if ct == "q8_0" {
+            job["cache_type"] = json!(ct);          // llama.cpp's 8-bit KV cache (`-ctk/-ctv q8_0`, flash attention); off by default, recorded in the result
+        }
+    }
     if uses_vllm(spec) {
         job["backend"] = json!("vllm");
         job["engine"] = spec.engine.clone().unwrap_or_else(|| json!({"kind": "auto"}));

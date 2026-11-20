@@ -2049,7 +2049,7 @@ function renderTimeCard() {
 // Built from a research report and not yet run on this PC. Nothing is installed by the program; the status says what was found and what to install yourself.
 const vl = { status: null, busy: false, err: null, saved: null, report: undefined, run: null, model: "", confirm: false, adapter: "" };
 const VL_KINDS = [["auto", "Find it myself"], ["docker", "Docker Desktop (docker.exe)"], ["docker_wsl", "Docker inside WSL"], ["wslc", "WSLc (WSL 3.x containers, templates)"], ["wsl", "vLLM installed in WSL"], ["url", "A server that already runs"]];
-function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {}, teacher: VL_TEACHER_DEFAULT }; }
+function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, kv_cache_dtype: "auto", kv_cache_dtype_teacher: false, llama_cache_type: "f16", wslc: {}, teacher: VL_TEACHER_DEFAULT }; }
 const VL_TEACHER_DEFAULT = { enabled: false, route: "auto", pairs: { "Qwen/Qwen3.8-27B": "cyankiwi/Qwen3.8-27B-AWQ-INT4" }, confirmed: {}, required: false };
 const vllmTeacher = () => ({ ...VL_TEACHER_DEFAULT, ...(vllmSettings().teacher || {}) });
 const vlPairsText = (m) => Object.entries(m || {}).map(([a, b]) => `${a} = ${b}`).join("\n");
@@ -2073,10 +2073,20 @@ function renderVllm() {
     <div class="row">${f("vl-distro", "WSL distribution", v.distro, "(the default one)")}${f("vl-venv", "vLLM folder in WSL", v.venv, "~/.ndforge/vllm")}${f("vl-url", "Server address (way: url)", v.url, "http://127.0.0.1:8000")}</div>
     <div class="row">${f("vl-volume", "Docker volume for models", v.model_volume, "ndforge-vllm-hf")}${f("vl-dir", "Model folder (optional, slow under /mnt/)", v.model_dir, "")}${f("vl-teacher", "Pre-quantized original (27 B)", v.teacher_repo, "", 300)}</div>
     <div class="row"><label class="opt" title="Untested: LoRA on the linear-attention layers is reported garbled in some versions. The standard engine stays the exact way until an agreement run."><input type="checkbox" id="vl-adapter" ${v.adapter_rounds ? "checked" : ""}> Check the rounds of a heal (model + LoRA) with vLLM (untested, off)</label></div>
+    ${vllmKvCard(v)}
     ${vllmTeacherCard()}
     <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
     <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
     ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+}
+// the optional 8-bit KV cache (docs/VLLM.md): off by default; the teacher's answers need a second, explicit confirmation
+function vllmKvCard(v) {
+  const sel = (id, cur, opts) => `<select id="${id}">${opts.map(([k, n]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>`;
+  return `<fieldset class="soft" id="vl-kv-card"><legend>8-bit KV cache (experimental, off)</legend>
+    <p class="dim small">Stores the attention cache in 8 bits: about twice as many cached tokens (the 27 B 4-bit model on a 5090: 71,141 tokens now, roughly 140,000 with fp8) so more answers run at once, and a tiny numeric change. Qwen3.8 is a hybrid: only its full-attention layers have a KV cache; the DeltaNet state is unchanged. Untested on this PC until you run the self-test with the fp8 pass. Thinking checks and trace generation may use it (the result says "kv cache fp8" and has its own key); the teacher's answers for healing do not, unless you confirm below.</p>
+    <div class="row"><label>vLLM KV cache ${sel("vl-kv", v.kv_cache_dtype || "auto", [["auto", "auto (the default)"], ["fp8", "fp8 (8 bit)"]])}</label>
+      <label class="opt"><input type="checkbox" id="vl-kv-teacher" ${v.kv_cache_dtype_teacher ? "checked" : ""}> Also use it for the original's answers (the training target; cached answers carry it in their identity and are never mixed with exact ones)</label></div>
+    <div class="row"><label>llama.cpp KV cache (GGUF thinking check) ${sel("vl-llama-kv", v.llama_cache_type || "f16", [["f16", "f16 (the default)"], ["q8_0", "q8_0 (8 bit, needs flash attention)"]])}</label></div></fieldset>`;
 }
 // the original's answers through vLLM (docs/VLLM.md, "Teacher cache"): the teacher must be YOUR original model, so a pre-quantized copy is used only for the original it was made from
 function vllmTeacherCard() {
@@ -2102,6 +2112,7 @@ function renderVllmTest(v) {
     <div class="row"><label>Model folder or Hugging Face id <input type="text" id="vl-tmodel" value="${esc(vl.model)}" placeholder="${esc(v.teacher_repo || "")}" style="min-width:320px"></label>
       <span class="dim small">Empty = the default, ${esc(v.teacher_repo || "the configured pre-quantized original")} (about 21 GB, 4-bit). A 16-bit model larger than the card is refused before anything starts.</span>
       <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-tkv" ${vl.kv ? "checked" : ""}> Also test the 8-bit KV cache (a second engine start: reports the cache size and speed for both)</label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
     <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
     ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}${vllmFilesBox(vl.files, "vl-files", "The report is saved in:")}`;
@@ -2137,7 +2148,7 @@ function wireVllm() {
     let wslc = {};
     try { wslc = JSON.parse(val("vl-wslc") || "{}"); } catch (_) { vl.err = "The WSLc templates are not valid JSON."; render(); return; }
     const v = { enabled: $("vl-enabled").checked, kind: val("vl-kind") || "auto", image: val("vl-image"), distro: val("vl-distro"), venv: val("vl-venv"), url: val("vl-url"), model_volume: val("vl-volume"), model_dir: val("vl-dir"),
-      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc,
+      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc, kv_cache_dtype: val("vl-kv") || "auto", kv_cache_dtype_teacher: !!($("vl-kv-teacher") || {}).checked, llama_cache_type: val("vl-llama-kv") || "f16",
       teacher: { enabled: $("vl-t-on").checked, route: val("vl-t-route") || "auto", required: $("vl-t-required").checked, pairs: vlPairsParse(($("vl-t-pairs") || {}).value), confirmed: vlPairsParse(($("vl-t-confirmed") || {}).value) } };
     try { setState(await invoke("vllm_set", { vllm: v })); vl.err = null; vl.saved = "Saved."; } catch (e) { vl.err = String(e); vl.saved = null; }
     render();
@@ -2147,10 +2158,11 @@ function wireVllm() {
   const tm = $("vl-tmodel"); if (tm) tm.onchange = () => { vl.model = tm.value.trim(); };
   const ta = $("vl-tadapter"); if (ta) ta.onchange = () => { vl.adapter = ta.value.trim(); };
   const tc = $("vl-tconfirm"); if (tc) tc.onchange = () => { vl.confirm = tc.checked; };
+  const tk8 = $("vl-tkv"); if (tk8) tk8.onchange = () => { vl.kv = tk8.checked; };
   const tt = $("vl-test"); if (tt) tt.onclick = () => {
     vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.adapter = (($("vl-tadapter") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
     vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
-    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
+    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null, ...(vl.kv ? { kv_fp8_test: true } : {}) } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
   };
   const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
@@ -2592,7 +2604,7 @@ function hlVllmBox(sp, est, busy) {
   }
   html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
   const running = vch.run !== null;
-  html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
+  html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkkv" ${busy || running ? "disabled" : ""} title="Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
     ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}</div>` : ""}</div>`;
   return html;
@@ -2970,7 +2982,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -3071,6 +3083,7 @@ function acVllmBox(pl, lock) {
     <label class="opt"><input type="checkbox" id="ac-vl-t" ${v.teacher_cache && !v.automatic ? "checked" : ""} ${lock}> The original's answers with vLLM${delta("The original's answers")}</label>
     <label class="opt"><input type="checkbox" id="ac-vl-c" ${v.checks && !v.automatic ? "checked" : ""} ${lock}> The thinking checks with vLLM${delta("The thinking checks")}</label>
     <label class="opt"><input type="checkbox" id="ac-vl-a" ${v.automatic ? "checked" : ""} ${lock}> Automatic: vLLM only for a step where its estimate is lower than the standard engine's (the plan says why)${delta("Automatic")}</label>
+    <label class="opt"><input type="checkbox" id="ac-vl-kv" ${v.kv_fp8 ? "checked" : ""} ${lock}> 8-bit KV cache for the thinking checks (experimental; never for the original's answers): more answers at once, usually faster, a tiny numeric change; the checks keep their own results</label>
     <ul class="small" id="ac-vllm-pre">${pre}</ul>${reasons}</fieldset>`;
 }
 // "Healing in 5 M rounds: about A-B h if the first check passes, up to C-D h." for every stage, and the warnings once (the plan's own words)
@@ -3296,6 +3309,7 @@ function wireAuto() {
   });
   const pr = $("ac-pin-remove"); if (pr) pr.onclick = () => { ac.pin = null; ac.err = null; render(); };
   const vlset = (k) => (e) => { const cur = ac.sp.vl || { teacher_cache: false, checks: false, automatic: false }; if (k === "automatic") { cur.automatic = e.checked; if (e.checked) { cur.teacher_cache = false; cur.checks = false; } } else { cur[k] = e.checked; if (e.checked) cur.automatic = false; } ac.sp.vl = cur.teacher_cache || cur.checks || cur.automatic ? cur : null; };
+  set("ac-vl-kv", (e) => { const cur = ac.sp.vl || { teacher_cache: false, checks: false, automatic: false }; cur.kv_fp8 = e.checked; ac.sp.vl = cur.teacher_cache || cur.checks || cur.automatic || cur.kv_fp8 ? cur : null; });
   set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
@@ -4182,6 +4196,7 @@ function wireReshape() {
   hv("hl-vllm", (e) => { hs.vllm = e.checked; });
   wireVllmFiles();
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
   hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again

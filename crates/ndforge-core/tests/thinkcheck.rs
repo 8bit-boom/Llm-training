@@ -470,3 +470,22 @@ mod tracegen_tests {
         assert_eq!((s["count"].clone(), s["rejected"].clone()), (json!(2), json!(1)));
     }
 }
+
+#[test]
+fn llama_cpp_gets_an_8_bit_kv_cache_only_when_the_setting_says_so() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let f = d.path().join("m.gguf");
+    std::fs::write(&f, b"x").unwrap();
+    let mut s = spec("slim-a", "gguf");
+    s.gguf = Some(f.to_string_lossy().to_string());
+    assert!(build_job(&p, &s).unwrap().get("cache_type").is_none(), "off by default: the job is what it was");
+    let mut st = ndforge_core::settings::Settings::default();
+    st.vllm.llama_cache_type = "q8_0".into();
+    st.save();
+    assert_eq!(build_job(&p, &s).unwrap()["cache_type"], "q8_0");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}

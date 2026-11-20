@@ -132,6 +132,9 @@ pub fn speed_warnings(spec: &AutoSpec, stages: &[StagePlan], natural_seq: &[u32]
     if !spec.imatrix {
         w.push("No importance matrix is measured for the export: the small sizes (Q4 and below) are made without it and are a little less exact.".into());
     }
+    if spec.vllm.as_ref().is_some_and(|v| v.kv_fp8 && v.any()) {
+        w.push("Experimental: the thinking checks use vLLM's 8-bit KV cache: about twice as many cached tokens (more answers at once, usually faster) and a tiny numeric change, so their numbers are kept apart from exact ones. Untested on this PC until you run the self-test's fp8 pass. The original's answers for healing always use the exact cache unless you confirmed otherwise in Settings.".into());
+    }
     if let Some(v) = spec.vllm.as_ref().filter(|v| v.any()) {
         w.push(format!("Experimental: vLLM {} (docs/VLLM.md). Built from a research report and not run on a real heal yet; a step that cannot use it goes on with the standard engine and the report says which steps used it.",
                        if v.automatic { "is used for a step only where its estimate is lower than the standard engine's".to_string() } else { format!("makes {}", [(v.teacher_cache, "the original's answers"), (v.checks, "the thinking checks")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join(" and ")) }));
@@ -365,7 +368,7 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
                          else { "Experimental. Nothing is measured on this PC yet (run the vLLM self-test): the numbers are the research report's estimates.".to_string() });
         let v = |t: bool, c: bool, a: bool| serde_json::json!({"teacher_cache": t, "checks": c, "automatic": a});
         let eq = |x: Option<crate::vllm_plan::AutoVllm>| { let now = spec.vllm.clone(); move |_: &AutoPlan, _: &AutoSpec| now == x };
-        let av = |t: bool, c: bool, a: bool| Some(crate::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a });
+        let av = |t: bool, c: bool, a: bool| Some(crate::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a, kv_fp8: false });
         knobs.push(SpeedKnob { knob: "vllm".into(), label: "vLLM engine (experimental)".into(), risk: knob_risk("vllm").into(), options: vec![
             option("Off (recipe)".into(), set_of(&[("vllm", Value::Null)]), &eq(None), None),
             option("The original's answers with vLLM".into(), set_of(&[("vllm", v(true, false, false))]), &eq(av(true, false, false)), note.clone()),

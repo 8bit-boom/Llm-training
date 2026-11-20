@@ -302,12 +302,15 @@ def engine_config(job: dict) -> dict:
         e["distro"] = ""                                    # the default distro
     if kind == "url" and not e.get("url"):
         raise EngineError("The vLLM engine is set to 'url' but no address is given.")
+    e["kv_cache_dtype"] = str(e.get("kv_cache_dtype") or "auto").lower()
+    if e["kv_cache_dtype"] not in ("auto", "fp8"):
+        raise EngineError(f"The KV cache type must be auto or fp8, not {e['kv_cache_dtype']!r}.")
     e["version"] = str(e.get("version") or (image_version(e["image"]) if kind in ("docker", "docker_wsl") else DEFAULT_VERSION if kind == "wsl" else "unknown"))
     return e
 
 
 def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, max_len: int = DEFAULT_MAX_MODEL_LEN, max_seqs: int = DEFAULT_MAX_SEQS,
-               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None, api_key: str | None = None) -> list:
+               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None, api_key: str | None = None, kv_cache_dtype: str = "auto") -> list:
     """The vLLM flags (all from the research report, untested): no reasoning parser (the template ends the prompt with `<think>\\n`), model defaults off
     (`--generation-config vllm`), vision tower off, the served name `model`. `quant`: "none" | "fp8" (`--quantization fp8`) | anything else is a pre-quantized checkpoint (nothing added:
     vLLM reads its own quantization config). `adapter`: the path (as the server sees it) of a LoRA folder, served as `round`."""
@@ -315,6 +318,8 @@ def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, m
             "--max-num-seqs", str(int(max_seqs)), "--gpu-memory-utilization", f"{float(gpu_util):g}"]
     if api_key:
         args += ["--api-key", api_key]                      # the port may not be loopback-only (WSLc): every request must carry `Authorization: Bearer <key>`
+    if kv_cache_dtype == "fp8":
+        args += ["--kv-cache-dtype", "fp8"]                 # OPTIONAL 8-bit KV cache (off by default): about twice the cached tokens; only the full-attention layers of a hybrid model have a KV cache
     if quant == "bnb-nf4":
         args += ["--quantization", "bitsandbytes"]          # UNVERIFIED (the in-flight 4-bit route: the plugin may be needed, see vllmquant.BNB_ARGS)
     if quant == "fp8":
@@ -382,17 +387,40 @@ def stop_commands(cfg: dict, port: int, *, wsl: str = "wsl.exe") -> list:
     return []
 
 
+KERNEL_LINES = re.compile(r"(attention|backend|flashinfer|flash_attn|flash-attn|triton|\bgdn\b|gated|delta|linear_attention|kernel|quantization|\bawq\b|marlin|cuda graph|compressed.tensors)", re.I)
+KV_TOKENS = re.compile(r"KV cache size:\s*([\d,]+)\s*tokens", re.I)
+KV_CONCURRENCY = re.compile(r"Maximum concurrency for ([\d,]+) tokens per request:\s*([\d.]+)x", re.I)
+INIT_ENGINE = re.compile(r"init engine .*?took ([\d.]+) s", re.I)
+
+
 def log_highlights(text: str, limit: int = 40) -> list:
-    """The lines of the server log that name the attention / GDN kernel, the cache size and problems (for the self-test report)."""
+    """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems."""
     out, seen = [], set()
-    for ln in (text or "").splitlines():
-        s = ln.strip()
-        if s and HIGHLIGHT.search(s) and s not in seen:
-            seen.add(s)
-            out.append(protocol.scrub(s)[:300])
-            if len(out) >= limit:
-                break
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for pat in (KERNEL_LINES, HIGHLIGHT):
+        for s in lines:
+            if pat.search(s) and s not in seen:
+                seen.add(s)
+                out.append(protocol.scrub(s)[:300])
+                if len(out) >= limit:
+                    return out
     return out
+
+
+def kv_facts(text: str) -> dict:
+    """{"kv_tokens", "max_concurrency", "per_request_tokens"} from the engine's log (the KV cache size line), or {}."""
+    a, b = KV_TOKENS.search(text or ""), KV_CONCURRENCY.search(text or "")
+    d: dict = {}
+    if a:
+        d["kv_tokens"] = int(a.group(1).replace(",", ""))
+    if b:
+        d["max_concurrency"], d["per_request_tokens"] = float(b.group(2)), int(b.group(1).replace(",", ""))
+    return d
+
+
+def init_engine_seconds(text: str):
+    m = INIT_ENGINE.search(text or "")
+    return float(m.group(1)) if m else None
 
 
 def engine_identity(job: dict, quant: str, lora: bool) -> dict:
@@ -400,6 +428,8 @@ def engine_identity(job: dict, quant: str, lora: bool) -> dict:
     cfg = engine_config(job)
     ident = {"vllm": cfg["version"], "quant": quant, "lora": bool(lora)}
     e = job.get("engine") or {}
+    if cfg.get("kv_cache_dtype") == "fp8":
+        ident["kv_cache"] = "fp8"                                # an 8-bit KV cache changes the numbers a little: its results never share a key with exact ones (additive: no key otherwise)
     if e.get("original") and quant.split(":")[0] in ("prequant", "bnb-nf4"):
         ident["teacher_origin"] = str(e.get("original_repo") or job.get("model") or "")      # whose weights these are: the original a stand-in was made for (additive: no key for other checks)
     return ident
@@ -411,8 +441,9 @@ class Engine:
     """A vLLM server: start() (does not wait), wait_ready(), stop() (always the explicit stop). `_popen` and `_run` are the module-level hooks tests replace."""
 
     def __init__(self, cfg: dict, model: str, *, adapter: str | None = None, quant: str = "none", extra_args: list | None = None, max_len: int = DEFAULT_MAX_MODEL_LEN,
-                 max_seqs: int = DEFAULT_MAX_SEQS, gpu_util: float = DEFAULT_GPU_UTIL):
+                 max_seqs: int = DEFAULT_MAX_SEQS, gpu_util: float = DEFAULT_GPU_UTIL, kv_cache_dtype: str | None = None):
         self.cfg, self.model, self.adapter, self.quant = cfg, model, adapter, quant
+        self.kv_cache_dtype = kv_cache_dtype or str(cfg.get("kv_cache_dtype") or "auto")
         self.extra_args, self.max_len, self.max_seqs, self.gpu_util = extra_args, max_len, max_seqs, gpu_util
         self.kind = cfg["kind"]
         self.port = 0
@@ -457,9 +488,9 @@ class Engine:
                 extra += ["--download-dir", "/models"]
             if adapter:
                 raise EngineError("A LoRA on top is not set up for the wslc way yet (use docker or the url way).")
-            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key)
+            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key, kv_cache_dtype=self.kv_cache_dtype)
             return render_template(wslc_templates(self.cfg)["run"], wslc_values(self.cfg, self.port, model_dir, args))
-        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key,
+        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key, kv_cache_dtype=self.kv_cache_dtype,
                           lora_rank=lora_rank_for(self.adapter) if self.adapter else DEFAULT_LORA_RANK)
         return docker_command(self.cfg, self.port, args, mounts=mounts) if self.kind in ("docker", "docker_wsl") else wsl_command(self.cfg, self.port, args)
 
@@ -543,6 +574,30 @@ class Engine:
             except (OSError, subprocess.SubprocessError, AttributeError):
                 pass
         return self.tail(n)
+
+    def logs_big(self, n: int = 800, limit: int = 200_000) -> str:
+        """Many more log lines (the kernel and the cache lines are far above the last 60): docker `logs --tail n`, wslc the `logs` template with its `-n` replaced; size-limited."""
+        cmd = None
+        if self.kind in ("docker", "docker_wsl") and self.port:
+            cmd = docker_prefix(self.cfg) + ["logs", "--tail", str(n), container_name(self.port)]
+        elif self.kind == "wslc" and self.port:
+            try:
+                cmd = render_template(wslc_templates(self.cfg)["logs"], wslc_values(self.cfg, self.port, "", []))
+                if "-n" in cmd and cmd.index("-n") + 1 < len(cmd):
+                    cmd[cmd.index("-n") + 1] = str(n)
+                elif "--tail" in cmd and cmd.index("--tail") + 1 < len(cmd):
+                    cmd[cmd.index("--tail") + 1] = str(n)
+            except EngineError:
+                cmd = None
+        if cmd:
+            try:
+                r = _run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=60, **_win_kw())
+                text = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace").replace("\x00", "")
+                if text.strip() and "container_not_found" not in text.lower():
+                    return text[-limit:]
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                pass
+        return self.log_text()[-limit:]
 
     def tail(self, n: int = 12) -> str:
         return protocol.scrub("\n".join(self.log_text().strip().splitlines()[-n:]))

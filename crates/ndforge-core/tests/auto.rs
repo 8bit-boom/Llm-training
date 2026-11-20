@@ -242,9 +242,10 @@ impl Effects for Mock {
         self.hist.clone()
     }
     fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
-        if engine != "vllm" {
+        if !engine.starts_with("vllm") {
             return self.think_check(name, target, quick, gguf);
         }
+        self.vllm_log.push(format!("engine={engine}"));
         assert!(!self.engine_running, "a vLLM job must never start while another engine runs");
         self.vllm_log.push(format!("check {name} {target}"));
         self.engine_running = true;
@@ -2005,7 +2006,7 @@ fn vllm_hist() -> ndforge_core::timing::History {
 }
 
 fn vspec(t: bool, c: bool, a: bool) -> AutoSpec {
-    AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a }), ..gspec(21.1) }
+    AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a, kv_fp8: false }), ..gspec(21.1) }
 }
 
 #[test]
@@ -2034,6 +2035,7 @@ fn a_run_with_both_switches_uses_vllm_for_the_answers_and_every_check_and_record
     fx.leak_engine = true;          // a vLLM check leaves the engine running (a crash): the next step must clean it up before training
     let st = start(&p, &mut fx, vspec(true, true, false)).unwrap();
     assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(!fx.vllm_log.iter().any(|l| l.contains("fp8kv")), "the 8-bit KV cache is off unless asked");
     let plan = st.plan.as_ref().unwrap().time.as_ref().unwrap().vllm.as_ref().unwrap();
     assert!(plan.uses("checks") && plan.uses("s1.heal:cache"), "{:?}", plan.decisions);
     assert!(plan.decisions.iter().all(|d| d.step == "checks" || d.step.contains(':')) && !plan.notes.is_empty());
@@ -2085,7 +2087,7 @@ fn failing_vllm_checks_fall_back_with_a_note_and_the_run_goes_on_with_one_engine
     assert!(st.engines.iter().all(|e| e["fallback"] == true && e["engine"] == "hf"));
     assert!(st.notes.iter().any(|n| n.contains("vLLM could not be used for") && n.contains("the run went on")));
     // after the first fallback every later check is the standard one (no more vLLM attempts)
-    assert_eq!(fx.vllm_log.len(), 1, "{:?}", fx.vllm_log);
+    assert_eq!(fx.vllm_log.iter().filter(|l| l.starts_with("check ")).count(), 1, "{:?}", fx.vllm_log);
 }
 
 #[test]
@@ -2130,7 +2132,7 @@ fn automatic_uses_vllm_only_where_the_estimate_is_lower_and_says_why() {
 fn the_time_estimate_with_vllm_counts_start_up_and_the_choice_changes_the_total() {
     let ins = qwen27();
     let off = AutoSpec { allow_many_blocks: true, ..gspec(17.4) };
-    let on = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false }), ..off.clone() };
+    let on = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false, kv_fp8: false }), ..off.clone() };
     let h = vllm_hist();
     let est = |s: &AutoSpec| {
         let p = ndforge_core::reshape::auto_plan::plan(&ins, s, Some(32.0), Some(2000.0));
@@ -2150,4 +2152,23 @@ fn the_time_estimate_with_vllm_counts_start_up_and_the_choice_changes_the_total(
     let p = ndforge_core::reshape::auto_plan::plan(&ins, &on, Some(32.0), Some(2000.0));
     let t9 = ndforge_core::reshape::auto_time::time_estimate(&ins, &on, &p, &h9);
     assert!(t9.vllm.as_ref().unwrap().notes.iter().any(|n| n.contains("NOT used")), "{:?}", t9.vllm.unwrap().notes);
+}
+
+#[test]
+fn the_8_bit_kv_cache_is_for_the_checks_only_and_the_report_says_so() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    let spec = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false, kv_fp8: true }), ..gspec(21.1) };
+    let st = start(&p, &mut fx, spec).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert!(fx.vllm_log.iter().any(|l| l == "engine=vllm_fp8kv"));
+    assert!(fx.heal_specs.iter().all(|h| h["vllm"].get("kv_cache_dtype").is_none()), "the teacher's answers never get the 8-bit cache from Auto-cut");
+    let c = st.engines.iter().find(|e| e["kind"] == "checks" && e["engine"] == "vllm").unwrap();
+    assert_eq!(c["kv_cache"], "fp8");
+    assert!(st.plan.as_ref().unwrap().warnings.iter().any(|w| w.contains("8-bit KV cache")) && st.plan.as_ref().unwrap().time.as_ref().unwrap().vllm.as_ref().unwrap().notes.iter().any(|n| n.contains("8-bit KV cache")));
+    // off: the key is not even written
+    let off = serde_json::to_value(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, ..Default::default() }).unwrap();
+    assert!(off.get("kv_fp8").is_none());
 }

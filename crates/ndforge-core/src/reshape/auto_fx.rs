@@ -170,7 +170,7 @@ impl Effects for RealEffects<'_> {
     }
 
     fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
-        if engine != "vllm" || gguf.is_some() || target == "gguf" {
+        if !engine.starts_with("vllm") || gguf.is_some() || target == "gguf" {
             return self.think_check(name, target, quick, gguf);
         }
         let s = crate::settings::Settings::load().vllm;
@@ -194,6 +194,12 @@ impl Effects for RealEffects<'_> {
             return fall(self, format!("vLLM cannot start now: {}", bad.detail));
         }
         let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: None, load: None, batch: None, max_new: None, round: None, backend: Some("vllm".into()), engine: Some(crate::vllm::engine_job_with_card(&s)) };
+        let mut spec = spec;
+        if engine == "vllm_fp8kv" {
+            if let Some(e) = spec.engine.as_mut() {
+                e["kv_cache_dtype"] = json!("fp8");
+            }
+        }
         let stop = self.stop.clone();
         let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
         let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);

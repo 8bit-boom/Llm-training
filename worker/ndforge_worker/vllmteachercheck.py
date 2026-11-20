@@ -174,6 +174,11 @@ def run(job: dict) -> int:
     stop_file = Path(job["stop_file"]) if job.get("stop_file") else None
     if not vllmcache.wanted(job):
         raise TeacherCheckError("The job needs engine: {\"kind\": \"vllm\", ...} (the same settings the heal would use).")
+    kv = str(job.get("kv_cache_dtype") or "auto").lower()
+    if kv not in ("auto", "fp8"):
+        raise TeacherCheckError("kv_cache_dtype must be auto or fp8.")
+    if kv == "fp8":                                              # measuring the cost of an 8-bit KV cache on the teacher's logits: the explicit confirmation is given by asking for the measurement
+        job = {**job, "engine": {**job["engine"], "kv_cache_dtype": "fp8", "kv_cache_dtype_teacher": True}}
     teacher_dir = reshapejob._resolve_source(repo)
     weights = safetensors_io.weights_manifest(teacher_dir)
     try:
@@ -230,12 +235,12 @@ def run(job: dict) -> int:
     cmp_ = compare(ref, got, np)
     v = verdict_of(cmp_["overall"])
     report = {"v": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **v, "rows": len(rows), "tokens": tokens, "k": k, "max_seq": max_seq, "metrics": cmp_["overall"],
-              "by_position": cmp_["by_position"], "reference": ref_source, "identity": ident,
+              "by_position": cmp_["by_position"], "reference": ref_source, "identity": ident, "kv_cache_dtype": kv,
               "vllm": {kk: res.get(kk) for kk in ("engine", "teacher_quant", "route", "reason", "startup_seconds", "load_seconds", "stage_seconds", "tokens_per_s", "tokens", "load_phases", "timings", "seconds")},
               "seconds": round(time.monotonic() - started, 1)}
     tmp = out_file.with_name(out_file.name + ".partial")
     out_file.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, out_file)
-    protocol.result({**{kk: report[kk] for kk in ("verdict", "text", "rows", "tokens", "k", "max_seq", "metrics", "by_position", "reference", "identity", "vllm", "thresholds", "seconds")}, "report": str(out_file)})
+    protocol.result({**{kk: report[kk] for kk in ("verdict", "text", "rows", "tokens", "k", "max_seq", "metrics", "by_position", "reference", "identity", "vllm", "thresholds", "seconds", "kv_cache_dtype")}, "report": str(out_file)})
     return 0

@@ -263,6 +263,12 @@ pub fn engine_job(s: &VllmSettings) -> Value {
     if s.wslc.as_object().is_some_and(|m| !m.is_empty()) {
         o.insert("wslc".into(), s.wslc.clone());
     }
+    if s.kv_cache_dtype == "fp8" {
+        o.insert("kv_cache_dtype".into(), json!("fp8"));          // only when set: an engine without it is the engine it always was
+        if s.kv_cache_dtype_teacher {
+            o.insert("kv_cache_dtype_teacher".into(), json!(true));
+        }
+    }
     Value::Object(o)
 }
 
@@ -313,6 +319,9 @@ pub fn selftest_job(s: &VllmSettings, spec: &Value, p: Option<&crate::project::P
                          "stop_file": dir.join("STOP"), "quick": true, "gpu_test": true, "compare": compare_files(p)});
     if let Some(a) = spec["adapter"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
         job["adapter"] = json!(a);
+    }
+    if spec["kv_fp8_test"].as_bool() == Some(true) {
+        job["kv_fp8_test"] = json!(true);          // the optional second pass: the same test with the 8-bit KV cache
     }
     Ok(job)
 }
@@ -371,6 +380,10 @@ pub fn teacher_route(t: &crate::settings::VllmTeacherSettings, origin: &str) -> 
 pub fn teacher_engine_job(s: &VllmSettings, check: Option<&Value>) -> Value {
     let t = &s.teacher;
     let mut e = json!({"kind": "vllm", "teacher": {"route": t.route, "pairs": t.pairs, "confirmed": t.confirmed}, "container": engine_job_with_card(s), "required": t.required});
+    if s.kv_cache_dtype == "fp8" && s.kv_cache_dtype_teacher {
+        e["kv_cache_dtype"] = json!("fp8");          // both switches: the 8-bit KV cache for the teacher's answers (its identity records it)
+        e["kv_cache_dtype_teacher"] = json!(true);
+    }
     if let Some(v) = check.and_then(|c| c["verdict"].as_str()) {
         e["teacher_check"] = json!({"verdict": v});
     }
@@ -380,7 +393,11 @@ pub fn teacher_engine_job(s: &VllmSettings, check: Option<&Value>) -> Value {
 /// The identity a vLLM cache has (`engine`, `teacher_quant`), as far as the program can know it before the worker runs.
 pub fn teacher_identity(s: &VllmSettings, origin: &str) -> Value {
     let r = teacher_route(&s.teacher, origin);
-    json!({"engine": format!("vllm-{}", image_version(&s.image)), "teacher_quant": r["quant"], "route": r["route"]})
+    let mut id = json!({"engine": format!("vllm-{}", image_version(&s.image)), "teacher_quant": r["quant"], "route": r["route"]});
+    if s.kv_cache_dtype == "fp8" && s.kv_cache_dtype_teacher {
+        id["kv_cache"] = json!("fp8");          // an 8-bit KV cache is part of the identity of the answers
+    }
+    id
 }
 
 /// Where the fidelity check of a made model is saved.
@@ -397,7 +414,7 @@ pub fn read_teacher_check(model_dir: &std::path::Path, s: &VllmSettings, origin:
 }
 
 /// The worker job `vllm_teacher_check` for a made model (docs/WORKER_CONTRACT.md): `common` holds what the heal's cache job has (teacher, student, model, data, k, max_seq, seed).
-pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path::Path, reference_cache: Option<&std::path::Path>) -> Value {
+pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path::Path, reference_cache: Option<&std::path::Path>, kv_cache_dtype: Option<&str>) -> Value {
     let mut job = json!({"job": "vllm_teacher_check", "rows": 100, "out": teacher_check_file(model_dir), "work": model_dir.join("vllm_teacher_check_work"), "stop_file": model_dir.join("STOP"),
                          "engine": teacher_engine_job(s, None)});
     for k in ["teacher", "student", "model", "data", "k", "max_seq", "seed"] {
@@ -405,6 +422,9 @@ pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path
     }
     if let Some(r) = reference_cache {
         job["reference_cache"] = json!(r);
+    }
+    if kv_cache_dtype == Some("fp8") {
+        job["kv_cache_dtype"] = json!("fp8");          // measure the cost of the 8-bit KV cache on the teacher's answers (mean KL, top-1 agreement against the exact reference)
     }
     job
 }

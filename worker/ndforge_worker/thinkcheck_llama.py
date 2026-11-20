@@ -49,9 +49,20 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+CACHE_TYPES = ("f16", "q8_0")
+
+
 def command(exe: str, gguf: str, port: int, job: dict) -> list:
-    return [exe, "-m", gguf, "--host", "127.0.0.1", "--port", str(port), "--jinja", "-np", str(int(job.get("parallel") or DEFAULT_PARALLEL)),
-            "-c", str(int(job.get("ctx") or DEFAULT_CTX)), "-ngl", str(int(job.get("ngl", 99)))]
+    cmd = [exe, "-m", gguf, "--host", "127.0.0.1", "--port", str(port), "--jinja", "-np", str(int(job.get("parallel") or DEFAULT_PARALLEL)),
+           "-c", str(int(job.get("ctx") or DEFAULT_CTX)), "-ngl", str(int(job.get("ngl", 99)))]
+    ct = str(job.get("cache_type") or "f16").lower()
+    if ct not in CACHE_TYPES:
+        raise ThinkCheckError(f"The KV cache type must be f16 or q8_0, not {ct!r}.")
+    if ct != "f16":
+        # an 8-bit KV cache (off by default): `-ctk/-ctv q8_0`; llama.cpp needs flash attention for a quantized V cache. The flash-attention spelling (`-fa on` of newer builds, `-fa` alone of older ones)
+        # is UNVERIFIED here: `flash_attn_args` of the job replaces it.
+        cmd += ["-ctk", ct, "-ctv", ct] + [str(x) for x in (job.get("flash_attn_args") or ["-fa", "on"])]
+    return cmd
 
 
 def _die_with_parent():

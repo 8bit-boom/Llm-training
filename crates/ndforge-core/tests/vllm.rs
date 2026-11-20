@@ -163,3 +163,14 @@ fn the_card_is_shared_with_the_desktop_the_share_is_lowered_not_refused() {
         assert_eq!((g.ok, g.util), (None, 0.88));
     }
 }
+
+#[test]
+fn the_self_test_job_asks_for_the_fp8_pass_only_when_ticked() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let s = VllmSettings::default();
+    assert!(selftest_job(&s, &json!({}), None).unwrap().get("kv_fp8_test").is_none());
+    assert_eq!(selftest_job(&s, &json!({"kv_fp8_test": true}), None).unwrap()["kv_fp8_test"], true);
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}

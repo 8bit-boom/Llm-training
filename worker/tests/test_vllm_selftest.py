@@ -145,7 +145,7 @@ def test_wslc_help_is_captured_into_the_report_and_templates_are_used(tmp_path, 
         assert gpu["command"][:3] == ["wslc", "run", "--rm"] and "nvidia-smi" in gpu["command"]
         assert any(c[:2] == ["wslc", "stop"] for c in env.run) and any(c[:2] == ["wslc", "remove"] for c in env.run)
         md = (tmp_path / "out" / "vllm_selftest.md").read_text()
-        assert "wslc help (for adapting the templates)" in md and "wslc syntax unverified" in md
+        assert "wslc help (for adapting the templates)" in md and "Still untested: `cp`, `exec`" in md
         assert all("Bearer" not in " ".join(map(str, c)) for c in rep["commands"])
         assert not any(f"--api-key" in " ".join(map(str, c)) and "[key]" not in " ".join(map(str, c)) for c in rep["commands"]), "the key is redacted in the report"
     finally:

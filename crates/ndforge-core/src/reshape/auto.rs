@@ -640,6 +640,9 @@ fn record_engine(st: &mut AutoState, key: &str, kind: &str, used: Option<&Value>
     let engine = used.and_then(|u| u["engine"].as_str()).unwrap_or("hf").to_string();
     let fallback = used.map(|u| u["fallback"] == true || (u["engine"] == "hf" && u["requested"] == true)).unwrap_or(false);
     let mut rec = json!({"step": key, "kind": kind, "engine": engine, "fallback": fallback, "planned_vllm": d.as_ref().is_some_and(|d| d.use_vllm)});
+    if kind == "checks" && engine == "vllm" && st.spec.vllm.as_ref().is_some_and(|v| v.kv_fp8) {
+        rec["kv_cache"] = json!("fp8");          // "kv cache fp8" in the report
+    }
     if let Some(u) = used {
         for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "engine_version", "teacher_check", "problem", "unchecked"] {
             if !u[k].is_null() {
@@ -679,7 +682,8 @@ fn run_check(st: &mut AutoState, fx: &mut dyn Effects, step: &str, name: &str, t
         return Ok(r);
     }
     fx.engine_cleanup();          // a vLLM job starts on a free card
-    let r = fx.think_check_with(name, target, quick, None, "vllm")?;
+    let kv8 = st.spec.vllm.as_ref().is_some_and(|v| v.kv_fp8);          // the 8-bit KV cache for the CHECKS only (never the teacher's answers)
+    let r = fx.think_check_with(name, target, quick, None, if kv8 { "vllm_fp8kv" } else { "vllm" })?;
     let Out::Done(v) = r else { return Ok(Out::Stopped) };
     let used = v.get("engine_used").cloned();
     let fell = used.as_ref().is_some_and(|u| u["engine"] != "vllm");
@@ -1172,7 +1176,7 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
     let heal_key = format!("s{}.heal:cache", idx + 1);
     let via_vllm = spec.rounds.is_none() && vllm_decision(st, &heal_key).is_some_and(|d| d.use_vllm);
     if via_vllm {
-        spec.vllm = Some(super::runs::HealVllm { teacher_cache: true });
+        spec.vllm = Some(super::runs::HealVllm { teacher_cache: true, kv_cache_dtype: None });
     }
     let h = out!(fx.heal(&student, &teacher, &spec)?);
     if via_vllm {
