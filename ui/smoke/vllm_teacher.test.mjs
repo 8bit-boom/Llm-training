@@ -190,3 +190,18 @@ test("the Heal card can measure the cost of the 8-bit KV cache on the teacher's 
   b.run("rs.hlSpec.vllm = true");
   assert.match(b.run("renderReshape()"), /id="hl-vllm-checkkv"[^>]*>Check with the 8-bit KV cache/);
 });
+
+// ---- Measure heal speed
+
+test("the Heal card has a Measure heal speed box: off until pressed, with the report path, buttons and the Windows hint", () => {
+  const b = open(null);
+  b.run(`hsp.name = "slim-w"; hsp.files = { exists: true, dir: "C:\\\\p\\\\benchmarks\\\\heal_speed-slim-w", markdown: "# Heal speed report\\nGatedDeltaNet kernels take about 31 % of a step", windows_hints: ["Hardware-accelerated GPU scheduling: off. Windows Settings ..."] }`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="hl-speed"[^>]*open/); assert.match(html, /<strong>Measure heal speed<\/strong> \(where does the time go/);
+  assert.match(html, /hypotheses until this measurement confirms them/);
+  assert.match(html, /id="hl-speed-go"/); assert.match(html, /id="hl-speed-hint">Hardware-accelerated GPU scheduling: off/);
+  assert.match(html, /heal_speed-slim-w/); assert.match(html, /Open the folder/); assert.match(html, /Copy path/);
+  assert.doesNotMatch(html, /id="hl-speed-stop"/);
+  b.run(`hsp.run = { text: "Profiling" }`);
+  assert.match(b.run("renderReshape()"), /id="hl-speed-stop"/);
+});

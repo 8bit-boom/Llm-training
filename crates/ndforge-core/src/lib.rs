@@ -29,6 +29,7 @@ pub mod teacher;
 pub mod timing;
 pub mod unsloth;
 pub mod vllm;
+pub mod winhints;
 pub mod vllm_plan;
 pub mod settings;
 

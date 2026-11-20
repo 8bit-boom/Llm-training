@@ -1378,6 +1378,17 @@ def _bench_targets(k: int, vocab: int, seed: int):
 
 
 def run_bench(cfg: dict) -> int:
+    """job distill with `bench` (see `_run_bench`); with `bench.out_dir` the heal speed report is written on EVERY end, a failure included."""
+    box: dict = {}
+    try:
+        return _run_bench(cfg, box)
+    except BaseException as exc:        # noqa: BLE001 - the report first, then the failure goes on its way
+        if box.get("write"):
+            box["write"]("failed", f"{type(exc).__name__}: {protocol.scrub(str(exc))[:300]}")
+        raise
+
+
+def _run_bench(cfg: dict, box: dict) -> int:
     """job distill with "bench": {"steps": 12, "warmup": 3, "targets": "cache" | "synthetic"}: the speed of the healing step at the chosen settings, nothing is saved (no checkpoint,
     no adapter, no evaluation, no output folder). Real rows of the project at the chosen sequence length; the teacher's answers from the complete cache when it is there and asked
     for, else seeded synthetic ones with the same shapes (no teacher is loaded). Plain training steps (forward, the KL loss, backward, the optimizer): the first `warmup` are not
@@ -1392,6 +1403,17 @@ def run_bench(cfg: dict) -> int:
     from . import data
     b = cfg["bench"] if isinstance(cfg.get("bench"), dict) else {}
     steps, warm = max(1, int(b.get("steps", BENCH_STEPS))), max(0, int(b.get("warmup", BENCH_WARMUP)))
+    from . import healspeed
+    report = {"created": healspeed.now(), "status": "running", "environment": healspeed.environment_facts(), "windows_hints": b.get("windows_hints") or [], "notes": []} if b.get("out_dir") else None
+
+    def write_report(status: str, error: str | None = None) -> None:
+        """the heal speed report (only when the Heal card's "Measure heal speed" asked for it): written on EVERY end"""
+        if report is not None:
+            report.update(status=status, error=error)
+            try:
+                protocol.add_extra("heal_speed_report", healspeed.write_report(b["out_dir"], report))
+            except Exception as exc:        # noqa: BLE001 - the report must never hide the job's own result
+                protocol.log(f"The heal speed report could not be written: {type(exc).__name__}: {exc}")
     d = cfg.get("distill") or {}
     student_dir = cfg["model"]["repo"]
     h = resolve_hyper(cfg, student_dir)
@@ -1403,6 +1425,11 @@ def run_bench(cfg: dict) -> int:
     protocol.progress("bench", 0.0, "Loading the model")
     model, tokenizer, _ = backends.load(lcfg, "hf")
     cuda = torch.cuda.is_available()
+    from . import speed
+    kern = speed.report_kernels(model)
+    box["write"] = write_report
+    if report is not None:
+        report["kernels"] = kern
     free_gb = torch.cuda.mem_get_info()[0] / 1e9 if cuda else None
     _apply_checkpointing(model, _decide_checkpointing(h, student_dir, free_gb))
     reader, use = None, "synthetic"
@@ -1453,6 +1480,7 @@ def run_bench(cfg: dict) -> int:
             torch.cuda.synchronize()
     except RuntimeError as exc:
         if healmem.is_oom(exc):
+            write_report("failed", "out of memory")
             protocol.error("distill_oom", f"The graphics card ran out of memory at sequence length {h['max_seq']}, batch {batch}, KL chunk {chunk}, output-layer checkpointing {'on' if head_ckpt else 'off'}.")
             return 1
         raise
@@ -1461,6 +1489,32 @@ def run_bench(cfg: dict) -> int:
     res = {"tokens_per_s": round(tokens / secs, 2), "peak_vram_mb": peak, "chunk": chunk, "head_checkpoint": head_ckpt, "student_b": h["student_b"], "steps": steps, "warmup": warm,
            "tokens": tokens, "seconds": round(secs, 2), "targets": use, "max_seq": int(h["max_seq"]), "batch": batch, "stopped": False}
     protocol.timing("heal_bench", secs, tokens=tokens, tokens_per_s=res["tokens_per_s"], peak_vram_mb=peak, chunk=chunk, head_checkpoint=head_ckpt, student_b=h["student_b"])
+    if report is not None:
+        report["bench"] = {k_: res[k_] for k_ in ("tokens_per_s", "peak_vram_mb", "chunk", "max_seq", "batch", "student_b", "targets")}
+        try:
+            if b.get("profile"):
+                protocol.progress("bench", 0.97, "Profiling two steps")
+                res["heal_profile"] = report["heal_profile"] = healspeed.profile_steps(model, rows, collate, targets, chunk, head_ckpt, opt, batch, dev, 2, (warm + steps) * batch)
+            if b.get("microbench"):
+                report["microbench"] = healspeed.gdn_microbench()
+            if b.get("teacher_bench") and (d.get("teacher") or {}).get("repo"):
+                del opt
+                model = None
+                import gc
+                gc.collect()
+                if cuda:
+                    torch.cuda.empty_cache()
+                from . import reshapejob
+                tdir = reshapejob._resolve_source(d["teacher"]["repo"])
+                tmodel = reshapejob._load(tdir, reshapejob._choose_load(d["teacher"].get("load", "auto"), sum(r.nbytes for r in safetensors_io.list_tensors(tdir).values())), "load_teacher")
+                try:
+                    report["teacher_bench"] = healspeed.teacher_bench(rows, lambda br: _teacher_answers(tmodel, br, k, 256, pad_id), sync=torch.cuda.synchronize if cuda else (lambda: None))
+                finally:
+                    del tmodel
+                    reshapejob._free()
+        except Exception as exc:        # noqa: BLE001 - the plain speed number is still a result; the report says what failed
+            report["notes"].append(f"An extra measurement failed: {type(exc).__name__}: {protocol.scrub(str(exc))[:240]}")
+        write_report("done")
     protocol.progress("bench", 1.0, "")
     protocol.result(res)
     return 0

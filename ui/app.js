@@ -2587,6 +2587,27 @@ function hlRoundsTable(h, run) {
 }
 // the controls of the card
 // "Make the original's answers with vLLM (experimental)": only offered when Settings switch it on; the numbers are the person's own where they exist (docs/VLLM.md)
+// "Measure heal speed" (docs/HEAL_SPEED.md): where the time of a heal goes on this computer; nothing runs unless the button is pressed
+const hsp = { run: null, err: null, files: undefined, name: null, teacher: false };
+function hlSpeedBox(busy) {
+  const name = rs.hl && rs.hl.name;
+  if (name && hsp.name !== name) { hsp.name = name; hsp.files = undefined; }
+  if (name && hsp.files === undefined) { hsp.files = null; Promise.resolve(invoke("heal_speed_report", { name })).then((f) => { hsp.files = f || null; try { render(); } catch (_) { /* a preview without a window */ } }).catch(() => {}); }
+  const f = hsp.files, hint = f && (f.windows_hints || []).find((h) => /: off|A display is attached|never changes/.test(h));
+  const running = hsp.run !== null;
+  return `<details id="hl-speed" ${f && f.exists ? "open" : ""}><summary class="small"><strong>Measure heal speed</strong> (where does the time go on this computer?)</summary>
+    <p class="dim small">Profiles a few real steps of the healing step (forward, loss, backward, optimizer, the GatedDeltaNet and matrix-multiplication kernels), times one GatedDeltaNet forward + backward, and writes a report you can read or paste. Nothing runs unless you press the button; it takes a few minutes. The research report's speed claims are hypotheses until this measurement confirms them.</p>
+    <div class="row"><label class="opt"><input type="checkbox" id="hl-speed-teacher" ${hsp.teacher ? "checked" : ""}> Also time the original's answers per rows-per-forward (loads the original: slow)</label>
+      <button class="secondary" id="hl-speed-go" ${busy || running ? "disabled" : ""}>Measure heal speed</button>${running ? `<button class="secondary" id="hl-speed-stop">Stop</button>` : ""}</div>
+    ${running ? `<div class="stepline" aria-live="polite">${esc(hsp.run.text)}</div>` : ""}${hsp.err ? `<div class="err">${esc(hsp.err)}</div>` : ""}${hint ? `<p class="warn small" id="hl-speed-hint">${esc(hint)}</p>` : ""}
+    ${f ? vllmFilesBox({ ...f, open: false }, "hl-speed-files", "The report is saved in:") : ""}</details>`;
+}
+function onHealSpeedEvent(p) {
+  if (p.kind === "heal_speed" || p.kind === "progress") { if (hsp.run) hsp.run.text = p.text || p.step || hsp.run.text; }
+  else if (p.kind === "error") { hsp.run = null; hsp.err = p.text; hsp.files = undefined; }
+  else if (p.kind === "done") { hsp.run = null; hsp.err = p.data && p.data.error ? p.data.error : null; hsp.files = undefined; }
+  if (page === "reshape") render();
+}
 const hlVllmAvailable = () => !!(vllmSettings().enabled && vllmTeacher().enabled);
 const vch = { run: null, err: null };
 function hlVllmBox(sp, est, busy) {
@@ -2716,6 +2737,7 @@ function healCard(m, pair) {
       <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
     ${hlRoundsBox(h, sp, kn, est, busy, recipeOn, tk)}${sp.rounds ? hlRoundsTable(h, run) : ""}
     ${hlVllmBox(sp, est, busy)}
+    ${hlSpeedBox(busy)}
     ${mem}${loss}${note}
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
@@ -4068,6 +4090,7 @@ function onReshapeEvent(p) {
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
   if (p.phase === "vllm_teacher_check") return onVcheckEvent(p);
+  if (p.phase === "healspeed") return onHealSpeedEvent(p);
   if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "healbench") return onHealBenchEvent(p);
@@ -4196,6 +4219,9 @@ function wireReshape() {
   hv("hl-vllm", (e) => { hs.vllm = e.checked; });
   wireVllmFiles();
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const hst = $("hl-speed-teacher"); if (hst) hst.onchange = () => { hsp.teacher = hst.checked; };
+  const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), with_teacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
+  const hss = $("hl-speed-stop"); if (hss) hss.onclick = () => { if (hsp.run) hsp.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
