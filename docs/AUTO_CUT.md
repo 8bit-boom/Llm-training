@@ -272,7 +272,7 @@ the registration is not checked against that list.
 
 ## The page (`ui/app.js`, "Auto-cut (one click)")
 
-A card at the top of the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
+A page of its own, **🚀 Auto** (left list, between the steps and "Slim or grow a model"); it reads the same state as the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
 Full or Quick, **How careful, how fast** (the presets with their totals, the heal tokens and the sequence length of the stages with the hours each choice changes, More speed settings, "I have at most N hours"), *keep the intermediate files*, the confirmation of more than 4 blocks (only when the plan says it is needed), and the Studio publish box with the share fields (Save and Check). Under them the plan: blockers (red, Start
 disabled), warnings, the stages (size, cut, healing tokens and hours, card), the disk and **How long this will take** (see "How long it takes"). Start / Stop / Continue / Show the report, then a **stepper** of the run's steps (done, running, pending, skipped, failed, with the note of the step), the live text
 and bar of the running job, and the report as text.

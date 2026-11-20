@@ -8,6 +8,7 @@ const TITLES = {
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
   quantcheck: ["Compare quants", "Measure how far each smaller GGUF file is from the 16-bit model, as KL divergence, and see which size keeps the most."],
+  auto: ["Auto", "One click: measures, cuts, heals, checks and exports a model. It runs the same steps as the manual pages, one after the other."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
 
@@ -31,10 +32,15 @@ function applyTheme() {
   $("night").checked = t === "dark" || (t === "auto" && systemDark());
 }
 
+// Auto-cut shares the state of the Slim page (`rs`): what refreshes the Slim page refreshes the Auto page too.
+const onAutoPage = () => page === "auto";
+const onReshape = () => page === "reshape" || page === "auto";
+
 function setState(s) { if (s) { state = s; } }
 
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
+  items.push({ key: "auto", label: "🚀 Auto", unlocked: !!state.bundle, done: false });
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
   items.push({ key: "quantcheck", label: "📏 Compare quants", unlocked: !!state.bundle, done: false });
@@ -2520,7 +2526,7 @@ function onHealBenchEvent(p) {
   if (p.kind === "heal_bench") { hb.text = `Setting ${p.index + 1} of ${p.total}: ${p.name}`; if (p.row) (hb.rows || (hb.rows = [])).push(p.row); }
   else if (p.kind === "error") { hb.running = false; hb.err = p.text; }
   else if (p.kind === "done") { hb.running = false; hb.err = null; if (p.data) { hb.result = p.data; hb.last = p.data; } }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
@@ -2606,7 +2612,7 @@ function onHealSpeedEvent(p) {
   if (p.kind === "heal_speed" || p.kind === "progress") { if (hsp.run) hsp.run.text = p.text || p.step || hsp.run.text; }
   else if (p.kind === "error") { hsp.run = null; hsp.err = p.text; hsp.files = undefined; }
   else if (p.kind === "done") { hsp.run = null; hsp.err = p.data && p.data.error ? p.data.error : null; hsp.files = undefined; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 const hlVllmAvailable = () => !!(vllmSettings().enabled && vllmTeacher().enabled);
 const vch = { run: null, err: null };
@@ -2634,7 +2640,7 @@ function onVcheckEvent(p) {
   if (p.kind === "progress") { if (vch.run) { vch.run.text = p.text || p.step; vch.run.progress = p.value; } }
   else if (p.kind === "error") { vch.run = null; vch.err = p.text; }
   else if (p.kind === "done") { vch.run = null; vch.err = null; try { rsHealEstimate(); } catch (_) { /* a preview without a window */ } }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function hlRoundsBox(h, sp, kn, est, busy, thinks, cap) {
   const d = busy ? "disabled" : "", rt = est && est.rounds ? est.rounds : null, tm = rt && rt.time;
@@ -2790,7 +2796,7 @@ function hsPassed() { const h = rs.hs; return !!(h.check && h.check.ok && h.chec
 
 async function hsLoadCand() {
   try { rs.hs.cand = await invoke("heal_candidates"); } catch (_) { rs.hs.cand = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // the choice changed: the Check no longer belongs to it, and the card that was bound to the old pair goes
 function hsChanged() {
@@ -3008,11 +3014,11 @@ function acSpec() {
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // keeps the plan in step with the choices; asks the program only when the request changed
 function acRefresh() {
-  if (page !== "reshape" || !rs.state) return;
+  if (!onAutoPage() || !rs.state) return;
   if (!ac.loaded) { ac.loaded = true; acLoad(); }
   const ins = acIns(); acDefaults();
   if (!ins || ac.target == null) return;
@@ -3020,8 +3026,8 @@ function acRefresh() {
   if (sig === ac.planFor) return;
   ac.planFor = sig; ac.plan = null; ac.planErr = null;
   const token = ++ac.planTok;
-  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (page === "reshape") render(); } })
-    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (onReshape()) render(); } })
+    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (onReshape()) render(); } });
 }
 
 // a change of the total in hours: "−6 h to −11 h" (minutes in)
@@ -3204,7 +3210,7 @@ function autoCard() {
   const rep = ac.report ? `<details open id="ac-report"><summary>Report</summary><pre class="log">${esc(ac.report)}</pre></details>` : "";
   return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
     <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
-    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “1 · Start from”.</p>` : `
+    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “Start from” above.</p>` : `
     <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     ${ac.pin ? `<div class="ac-pin" id="ac-pin"><strong>Chosen cut:</strong> ${ac.pin.blocks.length ? `blocks ${esc(ranges(ac.pin.blocks))} out` : "no blocks out"}${ac.pin.intermediate ? `, MLP ${thou(ac.pin.intermediate)}` : ""}${ac.pin.loss != null ? `, text-prediction error ${(+ac.pin.loss).toFixed(3)}` : ""} <span class="dim small">found by the search on the Try first card${ac.pin.think ? " (its thinking was checked)" : ""}; Auto-cut does not search or try again${ac.pin.think ? " and skips the thinking check before healing" : ""}.</span> <button class="secondary" id="ac-pin-remove" ${lock}>Remove</button></div>` : ""}
@@ -3358,13 +3364,13 @@ function acStepFig(x) {
 }
 
 function onAutoEvent(p) {
-  if (p.kind === "auto_progress") { ac.prog = p; if (page === "reshape" || page === "welcome") render(); return; }
+  if (p.kind === "auto_progress") { ac.prog = p; if (onReshape() || page === "welcome") render(); return; }
   if (p.eta_s != null && p.auto_step) ac.eta = { s: +p.eta_s, step: p.auto_step, at: Date.now() };
   if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
   if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
   else if (p.kind === "error") { ac.running = false; ac.err = p.text; ac.progress = null; acLoad(); return; }
   else if (p.kind === "done") { ac.running = false; ac.progress = null; ac.text = ""; if (p.data) ac.run = p.data; acLoad(); return; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function wireAuto() {
@@ -3472,7 +3478,7 @@ function thinkCard(m) {
 async function tkLoad(name) {
   rs.tk.name = name;
   try { rs.tk.data = await invoke("think_check_results", { name }); } catch (e) { rs.tk.data = null; rs.tk.err = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function tkStart(m, target) {
@@ -3493,7 +3499,7 @@ function onThinkEvent(p) {
     tk.ok = p.data && p.data.stopped ? "Stopped. Nothing was saved from this check." : p.data && p.data.cached ? "Done (the saved numbers of this model were used)." : "Done. The numbers are in the table.";
     if (name) { tkLoad(name); return; }
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 // "Make thinking answers with the original model" (worker job trace_gen, docs/VLLM.md): the original writes thinking answers for prompts; they are filtered and kept in a jsonl file that a
@@ -3518,7 +3524,7 @@ function traceCard(m) {
 async function tgLoad(name) {
   tg.name = name;
   try { tg.state = await invoke("trace_gen_state", { name }); } catch (_) { tg.state = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function onTraceEvent(p) {
   if (p.kind === "progress") { if (tg.run) { tg.run.text = p.text || p.step; tg.run.progress = p.value; } }
@@ -3529,7 +3535,7 @@ function onTraceEvent(p) {
     tg.ok = `${d.stopped ? "Stopped. " : "Done. "}${d.kept || 0} of ${d.attempted || 0} answers kept${d.backend ? " (way: " + d.backend + ")" : ""}${(d.notes || []).length ? ". " + d.notes.join(" ") : ""}${d.note ? " " + d.note : ""}`;
     if (name) { tgLoad(name); return; }
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function wireTrace() {
   const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
@@ -3620,14 +3626,14 @@ function tryRefresh() {
     tr.planFor = sig; tr.plan = null; tr.planErr = null;
     if (spec && !tryNeedsMeasure(spec)) {
       const token = ++tr.planTok;
-      invoke("reshape_try_plan", { spec }).then((p) => { if (token === tr.planTok) { tr.plan = p; if (page === "reshape") render(); } })
-        .catch((e) => { if (token === tr.planTok) { tr.planErr = String(e); if (page === "reshape") render(); } });
+      invoke("reshape_try_plan", { spec }).then((p) => { if (token === tr.planTok) { tr.plan = p; if (onReshape()) render(); } })
+        .catch((e) => { if (token === tr.planTok) { tr.planErr = String(e); if (onReshape()) render(); } });
     }
   }
   const rsig = rs.model + "|" + trySamples() + "|" + rs.load;
   if (rsig !== tr.resFor && rs.state.dataset_version) {
     tr.resFor = rsig;
-    invoke("reshape_try_results", { model: rs.model, samples: trySamples(), len: 512, load: rs.load }).then((r) => { if (rsig === tr.resFor && !tr.running) { tr.analysis = r && r.exists ? r.analysis : null; tr.sps = r && r.exists ? r.seconds_per_pass : null; if (page === "reshape") render(); } })
+    invoke("reshape_try_results", { model: rs.model, samples: trySamples(), len: 512, load: rs.load }).then((r) => { if (rsig === tr.resFor && !tr.running) { tr.analysis = r && r.exists ? r.analysis : null; tr.sps = r && r.exists ? r.seconds_per_pass : null; if (onReshape()) render(); } })
       .catch(() => {});
   }
 }
@@ -3864,8 +3870,8 @@ function seRefresh() {
   se.planFor = sig; se.plan = null; se.planErr = null;
   if (!spec) return;
   const token = ++se.planTok;
-  invoke("reshape_search_plan", { spec, inspect: rs.options.inspect }).then((p) => { if (token === se.planTok) { se.plan = p; if (page === "reshape") render(); } })
-    .catch((e) => { if (token === se.planTok) { se.planErr = String(e); if (page === "reshape") render(); } });
+  invoke("reshape_search_plan", { spec, inspect: rs.options.inspect }).then((p) => { if (token === se.planTok) { se.plan = p; if (onReshape()) render(); } })
+    .catch((e) => { if (token === se.planTok) { se.planErr = String(e); if (onReshape()) render(); } });
 }
 function onSearchEvent(p) {
   const se = rs.tr.se;
@@ -3883,10 +3889,10 @@ function onSearchEvent(p) {
     if (p.data && p.data.status === "stopped") {
       rs.ok = "Stopped. What was measured is kept; Find the best cut goes on from there.";
       const spec = seSpec();
-      if (spec) invoke("reshape_search_status", { spec, inspect: rs.options.inspect }).then((r) => { se.partial = r && r.partial && r.partial.rows && r.partial.rows.length ? r.partial : null; se.result = null; if (page === "reshape") render(); }).catch(() => {});
+      if (spec) invoke("reshape_search_status", { spec, inspect: rs.options.inspect }).then((r) => { se.partial = r && r.partial && r.partial.rows && r.partial.rows.length ? r.partial : null; se.result = null; if (onReshape()) render(); }).catch(() => {});
     } else rs.ok = "The search is done. The answers are kept: another search over the same text costs nothing for the cuts it has.";
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // what a recommended cut says to the rest of the program
 function seChosen() {
@@ -3897,8 +3903,10 @@ function sePin(stages) {
   const c = seChosen(); if (!c) return;
   ac.pin = { blocks: c.blocks, intermediate: c.intermediate, loss: c.loss, search_id: c.search_id, think: c.think };
   if (stages) ac.stages = stages;
+  go("auto");          // Auto-cut lives on its own page: the pinned cut is shown there
   rs.ok = `This cut is pinned for Auto-cut: ${c.blocks.length ? "blocks " + ranges(c.blocks) : "no blocks"}${c.intermediate ? `, MLP ${thou(c.intermediate)}` : ""}. Auto-cut will not search again.`;
-  const el = document.getElementById("ac-card"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
+  render();
+  const el = document.getElementById("ac-pin") || document.getElementById("ac-card"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
 }
 function seCutNow() {
   const c = seChosen(), ins = rs.options.inspect; if (!c) return;
@@ -3927,9 +3935,9 @@ function wireSearch() {
   on("se-go", () => start(null));
   on("se-think-go", () => start(se.id || (se.result && se.result.id) || null));
   on("se-stop", () => { se.text = "Stopping…"; invoke("reshape_stop"); render(); });
-  on("se-use-ac", () => { sePin(null); render(); });
+  on("se-use-ac", () => sePin(null));
   on("se-cut-now", () => { seCutNow(); render(); });
-  on("se-cut-heal", () => { sePin(1); render(); });
+  on("se-cut-heal", () => sePin(1));
   seRefresh();
 }
 
@@ -3965,7 +3973,7 @@ function onTryEvent(p) {
     if (p.data && p.data.analysis) tr.analysis = p.data.analysis;
     rs.ok = p.data && p.data.stopped ? `Stopped. ${p.data.passes_done} of ${p.data.passes_total} cuts are kept; Try goes on from there.` : "Tried. The answers are kept; trying the same again costs nothing.";
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function wireTry() {
@@ -4053,7 +4061,26 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + autoCard() + pick + size + tryCard() + make + healSection() + result + list;
+  const toAuto = `<div class="card wide"><p style="margin:0">Want it all in one click? <button class="link" id="rs-open-auto">Open Auto</button> <span class="dim small">(measures, cuts, heals, checks and exports, one step after the other)</span></p></div>`;
+  return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list;
+}
+
+// The Auto page: the Auto-cut card (and what it needs: the model it starts from, the pinned cut, the run's panels) on a page of its own. It reads the Slim page's state (`rs`).
+function renderAuto() {
+  const head = `<h1>🚀 ${TITLES.auto[0]}</h1><p class="lead">${TITLES.auto[1]}</p>`;
+  if (!state.bundle) return head + `<p class="lead">Import your world data first (Step 1).</p>`;
+  const st = rs.state;
+  if (!st) return head + `<p class="lead">Loading…</p>`;
+  const msg = (rs.error ? errDiv(rs.error) : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
+  const modelOpts = st.models.map((m) => `<option value="${esc(m.id)}" ${m.id === rs.model ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("");
+  const ins = rs.options && rs.options.inspect;
+  let info = "";
+  if (rs.loadingOpts) info = `<p class="dim">Looking at the model… (the first time this can take a moment; nothing is downloaded)</p>`;
+  else if (rs.optErr) info = `<div class="err">${esc(rs.optErr)}</div>`;
+  else if (ins && !ins.supported) info = `<div class="err">${esc(ins.why || "This model cannot be slimmed or grown.")}</div>`;
+  const busy = rs.running || rs.testing || (ac && ac.running);
+  const pick = `<div class="card wide"><h2>Start from</h2><div class="row"><select id="ac-model" ${busy ? "disabled" : ""}>${modelOpts}</select></div>${info}</div>`;
+  return head + msg + pick + autoCard();
 }
 
 async function rsRefresh(stale) {
@@ -4061,7 +4088,7 @@ async function rsRefresh(stale) {
     rs.state = await invoke("reshape_state");
     if (!rs.model && rs.state.models.length) rs.model = (rs.state.models.find((m) => m.id === "qwen3.5-9b") || rs.state.models[0]).id;
   } catch (e) { rs.error = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
   if (stale && rs.hl) rs.hl.stale = true;
   hsLoadCand();
@@ -4087,7 +4114,7 @@ async function rsOptions() {
     rsPickWidth();
   } catch (e) { if (token !== rs.token) return; rs.optErr = String(e); }
   rs.loadingOpts = false;
-  if (page === "reshape") render();
+  if (onReshape()) render();
   rsMeasInfo();
 }
 
@@ -4101,7 +4128,7 @@ async function rsMeasInfo() {
     const meas = await invoke("reshape_measurement", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load });
     rs.meas = meas || null;
   } catch (_) { rs.meas = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 // the person's Heal card needs the options of the model that is shown
@@ -4119,7 +4146,7 @@ async function rsLoadHeal(name) {
   rs.hl = { name, opts: null };
   try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
   try { const last = await invoke("heal_bench_last", { name }); rs.hb = { ...(rs.hb || {}), last: last || null }; } catch (e) { /* no earlier speed test */ }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   if (rs.hl && rs.hl.opts) rsHealEstimate();
 }
 
@@ -4136,7 +4163,7 @@ function onHealEvent(p) {
     else if (p.data) rs.ok = `Healed: ${p.data.name} now has a healed version, and it is in the model list of Step 3.`;
     setState_(); rsRefresh(true); return;
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function onReshapeEvent(p) {
@@ -4166,7 +4193,7 @@ function onReshapeEvent(p) {
     else if (p.data) { rs.ok = `Done: ${p.data.name} is ready and is in the model list of Step 3.`; rs.view = p.data.name; }
     setState_(); rsRefresh(); return;
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight;
 }
 
@@ -4220,6 +4247,12 @@ function wireHealSection() {
     try { rs.state = await invoke("reshape_remove", { name }); h.studentPick = ""; rs.hl = null; rs.ok = "Deleted."; } catch (e) { rs.error = String(e); }
     hsLoadCand(); render();
   });
+}
+
+function wireAutoPage() {
+  if (!onAutoPage() || !rs.state) return;
+  const m = $("ac-model"); if (m) m.onchange = () => { rs.model = m.value; rs.tr.sel = []; rs.tr.analysis = null; rs.tr.planFor = null; rs.tr.resFor = null; rs.dropText = ""; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
+  wireAuto();
 }
 
 function wireReshape() {
@@ -4333,6 +4366,7 @@ function wireReshape() {
   wireThink();
   wireTrace();
   wireAuto();
+  on("rs-open-auto", () => go("auto"));
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
   document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
@@ -4374,7 +4408,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -4409,6 +4443,7 @@ function wire() {
   wireQuantcheck();
   wireTest();
   wireReshape();
+  wireAutoPage();
   wireGuide();
   wireRetrain();
   wireUnsloth();
@@ -4523,7 +4558,7 @@ async function go(key) {
   if (key === "guide") gdLoad();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
-  if (key === "reshape" && state.bundle) { rs.ok = null; rs.error = null; rsRefresh(); }
+  if ((key === "reshape" || key === "auto") && state.bundle) { rs.ok = null; rs.error = null; if (key === "auto") ac.loaded = false; rsRefresh(); }
   if (key === "use" && state.bundle) usRefresh();
   if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
   if (key === "quantcheck" && state.bundle) { qk.ok = null; qk.error = null; qkRefresh(); }

@@ -17,7 +17,7 @@ const step = (id, label, status, note = null) => ({ id, label, status, note });
 const run = (status, over = {}) => ({ id: "20261117-100000-qwen3-8-27b-21b", status, error: null, steps: [step("plan", "Check the model", "done"), step("measure", "Measure the model", "running"), step("s1.cut", "Stage 1 of 2: cut", "pending")], ...over });
 
 function open(b, over = {}, ac = "") {
-  b.run(`state = ${JSON.stringify(baseState())}; page = "reshape"; rs.state = ${JSON.stringify(pageState(over))}; rs.model = "qwen3.8-27b"; rs.options = { inspect: ${JSON.stringify(insp())}, options: [], width: null, width_options: null }; ${ac}`);
+  b.run(`state = ${JSON.stringify(baseState())}; page = "auto"; rs.state = ${JSON.stringify(pageState(over))}; rs.model = "qwen3.8-27b"; rs.options = { inspect: ${JSON.stringify(insp())}, options: [], width: null, width_options: null }; ${ac}`);
 }
 const card = (b) => b.run("autoCard()");
 const plain = (x) => JSON.parse(JSON.stringify(x));
@@ -217,9 +217,9 @@ test("the estimate follows the choices: a changed size, stage count or Quick ask
   let n = 0;
   const b = browser({ auto_plan: () => ({ plan: plan({ time: timed({ total_h: totals[n++ % 2] }) }) }), auto_start: null });
   open(b);
-  b.run('page = "reshape"; acRefresh()'); await tick();
+  b.run('page = "auto"; acRefresh()'); await tick();
   assert.match(card(b), /id="ac-time-total">[^]*9 h 30 min to 14 h 30 min/);
-  b.run('page = "reshape"; ac.stages = 1; acRefresh()'); await tick();
+  b.run('page = "auto"; ac.stages = 1; acRefresh()'); await tick();
   assert.equal(b.calls.filter((x) => x[0] === "auto_plan").length, 2, "the plan, and so the estimate, is asked again when the spec changes");
   assert.match(card(b), /id="ac-time-total">[^]*40 h to 60 h/);
   b.run(`ac.run = ${JSON.stringify(run("running"))}; ac.running = true`);
@@ -337,7 +337,7 @@ test("Fast shows a red warning for a model that thinks and not for one that does
 
 test("a small model has the recipe chosen, and the time limit shows what was given up or the refusal", () => {
   const b = browser();
-  b.run(`state = ${JSON.stringify(baseState())}; page = "reshape"; rs.state = ${JSON.stringify(pageState())}; rs.model = "small"; rs.options = { inspect: ${JSON.stringify(insp({ total_params: 8e9 }))}, options: [], width: null, width_options: null };`);
+  b.run(`state = ${JSON.stringify(baseState())}; page = "auto"; rs.state = ${JSON.stringify(pageState())}; rs.model = "small"; rs.options = { inspect: ${JSON.stringify(insp({ total_params: 8e9 }))}, options: [], width: null, width_options: null };`);
   card(b);
   assert.equal(b.run("acSpec().preset"), "thorough");
   assert.equal(b.run("acSpec().max_hours"), undefined, "no limit unless asked");

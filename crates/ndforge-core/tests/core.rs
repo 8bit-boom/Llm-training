@@ -424,3 +424,11 @@ fn unsloth_is_remembered_with_its_key_in_the_secrets_and_an_old_settings_file_st
     m.remove_unsloth().unwrap();
     assert!(m.unsloth_target().is_err() && !std::fs::read_to_string(cfg.join("secrets.json")).unwrap().contains("sk-unsloth-"));
 }
+
+#[test]
+fn the_auto_page_has_its_own_help_and_the_slim_page_points_to_it() {
+    let a = help_markdown("auto");
+    assert!(a.contains("Auto-cut") && a.contains("This page does the whole Slim page for you") && !a.contains("No help text"));
+    let r = help_markdown("reshape");
+    assert!(r.contains("**🚀 Auto**") && !r.contains("Move the slider to the size you want"));
+}
