@@ -382,17 +382,40 @@ def stop_commands(cfg: dict, port: int, *, wsl: str = "wsl.exe") -> list:
     return []
 
 
+KERNEL_LINES = re.compile(r"(attention|backend|flashinfer|flash_attn|flash-attn|triton|\bgdn\b|gated|delta|linear_attention|kernel|quantization|\bawq\b|marlin|cuda graph|compressed.tensors)", re.I)
+KV_TOKENS = re.compile(r"KV cache size:\s*([\d,]+)\s*tokens", re.I)
+KV_CONCURRENCY = re.compile(r"Maximum concurrency for ([\d,]+) tokens per request:\s*([\d.]+)x", re.I)
+INIT_ENGINE = re.compile(r"init engine .*?took ([\d.]+) s", re.I)
+
+
 def log_highlights(text: str, limit: int = 40) -> list:
-    """The lines of the server log that name the attention / GDN kernel, the cache size and problems (for the self-test report)."""
+    """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems."""
     out, seen = [], set()
-    for ln in (text or "").splitlines():
-        s = ln.strip()
-        if s and HIGHLIGHT.search(s) and s not in seen:
-            seen.add(s)
-            out.append(protocol.scrub(s)[:300])
-            if len(out) >= limit:
-                break
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for pat in (KERNEL_LINES, HIGHLIGHT):
+        for s in lines:
+            if pat.search(s) and s not in seen:
+                seen.add(s)
+                out.append(protocol.scrub(s)[:300])
+                if len(out) >= limit:
+                    return out
     return out
+
+
+def kv_facts(text: str) -> dict:
+    """{"kv_tokens", "max_concurrency", "per_request_tokens"} from the engine's log (the KV cache size line), or {}."""
+    a, b = KV_TOKENS.search(text or ""), KV_CONCURRENCY.search(text or "")
+    d: dict = {}
+    if a:
+        d["kv_tokens"] = int(a.group(1).replace(",", ""))
+    if b:
+        d["max_concurrency"], d["per_request_tokens"] = float(b.group(2)), int(b.group(1).replace(",", ""))
+    return d
+
+
+def init_engine_seconds(text: str):
+    m = INIT_ENGINE.search(text or "")
+    return float(m.group(1)) if m else None
 
 
 def engine_identity(job: dict, quant: str, lora: bool) -> dict:
@@ -543,6 +566,30 @@ class Engine:
             except (OSError, subprocess.SubprocessError, AttributeError):
                 pass
         return self.tail(n)
+
+    def logs_big(self, n: int = 800, limit: int = 200_000) -> str:
+        """Many more log lines (the kernel and the cache lines are far above the last 60): docker `logs --tail n`, wslc the `logs` template with its `-n` replaced; size-limited."""
+        cmd = None
+        if self.kind in ("docker", "docker_wsl") and self.port:
+            cmd = docker_prefix(self.cfg) + ["logs", "--tail", str(n), container_name(self.port)]
+        elif self.kind == "wslc" and self.port:
+            try:
+                cmd = render_template(wslc_templates(self.cfg)["logs"], wslc_values(self.cfg, self.port, "", []))
+                if "-n" in cmd and cmd.index("-n") + 1 < len(cmd):
+                    cmd[cmd.index("-n") + 1] = str(n)
+                elif "--tail" in cmd and cmd.index("--tail") + 1 < len(cmd):
+                    cmd[cmd.index("--tail") + 1] = str(n)
+            except EngineError:
+                cmd = None
+        if cmd:
+            try:
+                r = _run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=60, **_win_kw())
+                text = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace").replace("\x00", "")
+                if text.strip() and "container_not_found" not in text.lower():
+                    return text[-limit:]
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                pass
+        return self.log_text()[-limit:]
 
     def tail(self, n: int = 12) -> str:
         return protocol.scrub("\n".join(self.log_text().strip().splitlines()[-n:]))
