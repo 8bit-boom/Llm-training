@@ -60,3 +60,7 @@ No job, event or error code was added for these; `contract.json` is unchanged. E
 ## 8-bit KV cache (additive keys, experimental)
 
 `engine.kv_cache_dtype` ("auto" | "fp8") of `think_check` / `trace_gen` / `vllm_selftest` engine objects (result `engine.kv_cache: "fp8"` and a `kv_cache` key in the check's cache key only when fp8); `engine.kv_cache_dtype` + `engine.kv_cache_dtype_teacher: true` of the `distill_cache` engine object (index/identity key `kv_cache: "fp8"` only then); `vllm_teacher_check` job key `kv_cache_dtype` (result `kv_cache_dtype`, `identity.kv_cache`); `vllm_selftest` job key `kv_fp8_test` (report `kv_fp8`); `think_check` (backend llama) job key `cache_type` ("f16" | "q8_0", `flash_attn_args`), result and cache key `llama_cache_type` only when q8_0. No job type, event or error code was added.
+
+## Heal speed measurement (additive keys, experimental)
+
+`distill` job, `bench` object: `profile: true` (result `heal_profile {forward_s, loss_s, backward_s, optimizer_s, gdn_s, gemm_s, top_kernels, ...}`), `microbench: true`, `teacher_bench: true` (needs `distill.teacher {repo, load}`), `out_dir` (the worker writes `heal_speed_report.json/.md` there on every end; result extra `heal_speed_report {report, report_md}`), `windows_hints: [..]`. Result/extras `kernels {delta_rule: fla | torch | unknown, causal_conv1d, how, module}` (`speed.gdn_kernels`). `distill_cache` job key `teacher_batch_tokens` (rows per forward by a token budget; absent or 0 = the fixed `batch`; not part of the cache identity). No job type, event or error code was added.

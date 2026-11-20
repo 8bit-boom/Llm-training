@@ -764,6 +764,22 @@ WINDOW_ROWS = 64            # rows answered together in length order before they
 SPEED_LOG_EVERY = 60.0      # seconds between the "cache_speed" lines
 
 
+TEACHER_MAX_ROWS = 16               # the most rows of one forward pass when the rows are taken by a token budget
+
+
+def rows_in_budget(lengths_longest_first: list, budget: int, cap: int = TEACHER_MAX_ROWS) -> int:
+    """How many of the rows (sorted from the longest, as `length_order` gives them) go through the original together: as many as fit `budget` tokens when each is padded to the longest of the batch
+    (the first), at least 1, at most `cap`. A budget of 0 is "the fixed number of rows" (the caller's)."""
+    if not lengths_longest_first:
+        return 0
+    return max(1, min(cap, int(budget) // max(1, int(lengths_longest_first[0]))))
+
+
+def shrink_budget(budget: int, longest: int) -> int:
+    """After an out-of-memory error: half the token budget (a budget below the longest row means one row at a time)."""
+    return max(int(budget) // 2, 0) if int(budget) // 2 >= longest else 0
+
+
 def length_order(window: list) -> list:
     """The positions of `window` from the longest row to the shortest (equal lengths keep their order): the order the teacher answers them in."""
     return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
@@ -964,6 +980,7 @@ def run_cache(cfg: dict) -> int:
     inner = text_tokenizer(tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
+    budget = max(0, int(cfg.get("teacher_batch_tokens") or 0))          # 0 / absent: today's fixed number of rows per forward pass; the cache's rows, identity and rows_key do not depend on it
     window_rows = max(WINDOW_ROWS, batch)
     held = _read_holdout_meta(out)
     if held is not None and held.get("teacher_loss") is None and (out / "holdout.npz").is_file():
@@ -995,15 +1012,24 @@ def run_cache(cfg: dict) -> int:
                 if stop_file.exists():
                     cut_short = True
                     break
-                idx = order[pos:pos + batch]
+                if budget > 0:
+                    idx = order[pos:pos + rows_in_budget([len(window[j]["input_ids"]) for j in order[pos:pos + TEACHER_MAX_ROWS]], budget)]
+                else:
+                    idx = order[pos:pos + batch]
                 try:
                     got = _teacher_answers(model, [window[j] for j in idx], k, chunk, pad_id)
                 except RuntimeError as exc:
                     if not reshapejob._is_oom(exc) or len(idx) == 1:
                         raise
-                    protocol.log("Out of memory; the original model answers one text at a time.")
                     reshapejob._free()
-                    batch = 1
+                    if budget > 0:
+                        budget = shrink_budget(budget, len(window[idx[0]]["input_ids"]))
+                        protocol.log(f"Out of memory; the original model takes {'about half as many tokens' if budget else 'one text'} per pass.")
+                        if budget == 0:
+                            batch = 1
+                    else:
+                        protocol.log("Out of memory; the original model answers one text at a time.")
+                        batch = 1
                     continue
                 for j, a in zip(idx, got):
                     answers[j] = a

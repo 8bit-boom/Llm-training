@@ -158,6 +158,9 @@ pub struct Settings {
     pub teacher: TeacherSettings,
     /// the experimental vLLM engine (off by default)
     pub vllm: VllmSettings,
+    /// the original's answers (the teacher cache) take as many rows per forward pass as fit this many tokens (rows sorted by length); 0 = the fixed 4 rows of before. The answers are the same
+    /// (up to rounding) and the cache's identity does not change.
+    pub teacher_batch_tokens: u32,
     pub recent_projects: Vec<String>,
     /// Set (for this run of the program only, never saved) when `settings.json` could not be read: where the damaged file was kept. The window shows it once.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,7 +170,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true, keep_display_on: false, auto_continue_interrupted: false, notifications: true, webhook_url: String::new(),
-            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), vllm: VllmSettings::default(), recent_projects: Vec::new(), load_note: None }
+            ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), vllm: VllmSettings::default(), teacher_batch_tokens: 16384, recent_projects: Vec::new(), load_note: None }
     }
 }
 

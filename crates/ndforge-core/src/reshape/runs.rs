@@ -1065,6 +1065,14 @@ fn record_teacher_engine(dir: &Path, r: &Value) {
     }
 }
 
+/// The original's answers take rows by a token budget (setting `teacher_batch_tokens`, default 16,384; 0 = the fixed 4 rows): the key is only added when it is on, so a job with 0 is the job it was.
+pub fn with_teacher_batch(job: &mut Value) {
+    let n = crate::settings::Settings::load().teacher_batch_tokens;
+    if n > 0 {
+        job["teacher_batch_tokens"] = json!(n);
+    }
+}
+
 /// How many general rows are kept back from the heal and only measured (the held-out loss of the Heal card).
 pub const HOLDOUT_ROWS: u32 = 64;
 
@@ -1312,6 +1320,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             job["engine"] = e.clone();
             set_heal(&dir, json!({"teacher_engine": {"requested": true, "identity": ident}}));
         }
+        with_teacher_batch(&mut job);
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));
@@ -1485,6 +1494,7 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
         if !c.general.is_null() {
             job["holdout"] = json!({"rows": HOLDOUT_ROWS});
         }
+        with_teacher_batch(&mut job);
         if let Some(e) = &c.vllm {
             job["engine"] = e.clone();          // every round's chunk starts the engine again (its start-up is paid each time: the card warns)
         }

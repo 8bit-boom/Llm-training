@@ -46,3 +46,29 @@ fn windows_hints_are_read_not_changed_and_empty_elsewhere() {
     let unknown = hints_with(true, &|_: &[&str]| None);
     assert!(unknown.iter().all(|x| x.contains("unknown")));
 }
+
+#[test]
+fn the_teacher_rows_per_forward_come_from_a_token_budget_unless_it_is_zero() {
+    use ndforge_core::reshape::runs::{rows_key, with_teacher_batch};
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    assert_eq!(ndforge_core::settings::Settings::default().teacher_batch_tokens, 16384);
+    let mut job = json!({"job": "distill_cache"});
+    with_teacher_batch(&mut job);
+    assert_eq!(job["teacher_batch_tokens"], 16384);
+    let mut s = ndforge_core::settings::Settings::default();
+    s.teacher_batch_tokens = 0;
+    s.save();
+    let mut job0 = json!({"job": "distill_cache"});
+    with_teacher_batch(&mut job0);
+    assert_eq!(job0, json!({"job": "distill_cache"}), "0 = the job as it was: the fixed 4 rows");
+    let f = d.path().join("t.jsonl");
+    std::fs::write(&f, "{}\n").unwrap();
+    let k = rows_key(&f, 1, "o/T", "4bit");
+    s.teacher_batch_tokens = 4096;
+    s.save();
+    assert_eq!(rows_key(&f, 1, "o/T", "4bit"), k, "the same data: the cache key does not depend on the grouping");
+    std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
