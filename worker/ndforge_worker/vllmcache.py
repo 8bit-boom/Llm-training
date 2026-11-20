@@ -26,9 +26,9 @@ import threading
 import time
 from pathlib import Path
 
-from . import protocol, vllmengine
+from . import protocol, vllmengine, vllmquant
 
-DEFAULT_PAIRS = {"Qwen/Qwen3.8-27B": "cyankiwi/Qwen3.8-27B-AWQ-INT4"}      # the only confirmed pair by default (from the research report)
+DEFAULT_PAIRS = vllmquant.DEFAULT_PAIRS
 BNB_ARGS = ["--quantization", "bitsandbytes"]                               # UNVERIFIED: the report says bitsandbytes moved into the plugin `vllm-bnb-plugin` 0.0.3; its flags are unknown
 BNB_PIP = "vllm-bnb-plugin==0.0.3"                                          # UNVERIFIED: installed into the throw-away container before the run (needs network)
 WORK = "/work"
@@ -45,34 +45,16 @@ class VllmCacheError(Exception):
 
 # ----------------------------------------------------------------------------------------------------------------- which weights (the identity rule)
 
-def _key(x) -> str:
-    return str(x or "").strip().rstrip("/").lower()
+_key = vllmquant.norm_id
 
 
 def select_teacher(tcfg: dict, origin: str, origin_dir) -> dict:
-    """Which weights the engine loads for the original `origin` (the job's `teacher.repo`, a Hub id or a folder; `origin_dir` is its local folder).
-    `tcfg`: {"route": "auto" | "bnb" | "prequant", "pairs": {original: quantized}, "confirmed": {original: quantized}, "quantized_repo": str, "quantized_rev": str, "bnb_args": [...], "bnb_pip": str}.
-    -> {"route": "prequant" | "bnb", "model", "quant": "bnb-nf4" | "awq:<repo>@<rev>", "quantized_repo", "reason"}; VllmCacheError when the route asked for cannot be used for this original."""
-    route = str(tcfg.get("route") or "auto").lower()
-    if route not in ("auto", "bnb", "prequant"):
-        raise VllmCacheError(f"Unknown vLLM teacher route {route!r}: use auto, bnb or prequant.")
-    pairs = {_key(k): str(v) for k, v in {**DEFAULT_PAIRS, **(tcfg.get("pairs") or {})}.items()}
-    confirmed = {_key(k): str(v) for k, v in (tcfg.get("confirmed") or {}).items()}
-    mine = _key(origin)
-    paired = pairs.get(mine) or confirmed.get(mine)
-    asked = str(tcfg.get("quantized_repo") or "")
-    if asked and _key(asked) != _key(paired) and _key(confirmed.get(mine)) != _key(asked):
-        raise VllmCacheError(f"{asked} is not a confirmed quantized copy of {origin}. Tick \"this repo is a quantized copy of my original model\" for it, or use the in-flight 4-bit route on your own folder.")
-    if asked and not paired:
-        paired = asked if _key(confirmed.get(mine)) == _key(asked) else None
-    if route == "prequant" and not paired:
-        raise VllmCacheError(f"There is no confirmed quantized copy of {origin}: the pre-quantized checkpoint of another model would teach the wrong model. Use the in-flight 4-bit route, or confirm a copy in the settings.")
-    if route in ("auto", "prequant") and paired:
-        rev = str(tcfg.get("quantized_rev") or "unpinned")
-        return {"route": "prequant", "model": paired, "quant": f"awq:{paired}@{rev}", "quantized_repo": paired,
-                "reason": f"{paired} is the confirmed quantized copy of {origin}."}
-    return {"route": "bnb", "model": str(origin_dir), "quant": "bnb-nf4", "quantized_repo": "",
-            "reason": f"No confirmed quantized copy of {origin}: the original's own folder is loaded and quantized to 4 bits while loading (the in-flight bitsandbytes route)."}
+    """Which weights the engine loads for the original `origin`: the ONE identity rule of `vllmquant.select_original` (shared with the thinking checks, trace generation and the self-test);
+    a refusal is a VllmCacheError."""
+    try:
+        return vllmquant.select_original(tcfg, origin, origin_dir)
+    except vllmquant.IdentityError as exc:
+        raise VllmCacheError(str(exc)) from None
 
 
 def identity(job: dict, origin: str, origin_dir) -> dict:

@@ -315,6 +315,8 @@ def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, m
             "--max-num-seqs", str(int(max_seqs)), "--gpu-memory-utilization", f"{float(gpu_util):g}"]
     if api_key:
         args += ["--api-key", api_key]                      # the port may not be loopback-only (WSLc): every request must carry `Authorization: Bearer <key>`
+    if quant == "bnb-nf4":
+        args += ["--quantization", "bitsandbytes"]          # UNVERIFIED (the in-flight 4-bit route: the plugin may be needed, see vllmquant.BNB_ARGS)
     if quant == "fp8":
         args += ["--quantization", "fp8"]            # any other value ("none", "prequant:<repo>", "stored:<method>"): nothing is added, vLLM reads the checkpoint's own configuration
     if adapter:
@@ -396,7 +398,11 @@ def log_highlights(text: str, limit: int = 40) -> list:
 def engine_identity(job: dict, quant: str, lora: bool) -> dict:
     """What the result cache key adds for backend vllm: {"vllm": version, "quant": ..., "lora": bool} (additive: other backends' keys do not have it)."""
     cfg = engine_config(job)
-    return {"vllm": cfg["version"], "quant": quant, "lora": bool(lora)}
+    ident = {"vllm": cfg["version"], "quant": quant, "lora": bool(lora)}
+    e = job.get("engine") or {}
+    if e.get("original") and quant.split(":")[0] in ("prequant", "bnb-nf4"):
+        ident["teacher_origin"] = str(e.get("original_repo") or job.get("model") or "")      # whose weights these are: the original a stand-in was made for (additive: no key for other checks)
+    return ident
 
 
 # ------------------------------------------------------------------------------------------------------------------ the running engine

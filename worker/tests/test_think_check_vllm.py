@@ -260,3 +260,22 @@ def test_dora_and_loftq_adapters_keep_raising_a_plain_message(fake, tmp_path):
 def test_llama_still_refuses_an_adapter(tmp_path):
     with pytest.raises(tc.ThinkCheckError, match="LoRA"):
         tc.run({"job": "think_check", "model": "org/x", "backend": "llama", "adapter": str(lora_dir(tmp_path))})
+
+
+def test_a_refused_original_is_checked_by_the_standard_engine_with_a_note(monkeypatch):
+    seen = []
+
+    def one(job, note=None):
+        seen.append((job.get("backend"), job.get("cache_file"), note))
+        if job.get("backend") == "vllm":
+            raise tc.ThinkCheckError("There is no confirmed quantized copy of Someone/Finetune: the pre-quantized checkpoint of another model would teach the wrong model.")
+        return 0
+
+    monkeypatch.setattr(tc, "_run_one", one)
+    job = {"model": "Someone/Finetune", "backend": "vllm", "cache_file": "/m/original.quick.vllm.json", "engine": {"kind": "docker", "original": True}}
+    assert tc.run(job) == 0
+    assert seen[0][0] == "vllm" and seen[1][0] == "hf" and seen[1][1] == "/m/original.quick.json" and "standard engine" in seen[1][2] and "wrong model" in seen[1][2]
+    seen.clear()
+    with pytest.raises(tc.ThinkCheckError):
+        tc.run({"model": "org/cut", "backend": "vllm", "engine": {"kind": "docker"}})
+    assert len(seen) == 1, "a cut is not an original: no silent fallback"

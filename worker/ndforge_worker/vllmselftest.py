@@ -101,6 +101,11 @@ def answer_stats(tokens: list) -> dict:
     return {"n": len(t), "total": sum(t), "mean": round(sum(t) / len(t), 1), "median": pick(0.5), "p90": pick(0.9)}
 
 
+def generic_note(model) -> str:
+    return (f"This is a generic engine test on `{model}` (the configured checkpoint or the model you chose). It does NOT test your own original model: a finetune is served from its own folder, quantized to 4 bits while loading "
+            "(the in-flight bitsandbytes route, unverified), and a pre-quantized checkpoint stands in only for the original it was made from or a copy you confirmed.")
+
+
 def short_sentence(stats: dict) -> str:
     return (f"The answers are short (median {stats['median']} tokens, mean {stats['mean']}): either the model did not think, or max_tokens or the chat template differ from a real thinking check "
             "(look at `enable_thinking` and the `<think>` prefix in the sample answers). This speed does not predict a real thinking check; the long-answer speed below does.")
@@ -232,7 +237,7 @@ def criteria_of(rep: dict) -> list:
 
 
 def markdown(rep: dict) -> str:
-    L = ["# vLLM self-test", "", f"**{rep['verdict'].upper()}**: {rep['verdict_text']}", "", f"> {NOTE}", "", f"Created {rep['created']} - model `{rep.get('model')}` - engine {rep.get('engine', {}).get('kind')} ({rep.get('engine', {}).get('image', '')})", ""]
+    L = ["# vLLM self-test", "", f"**{rep['verdict'].upper()}**: {rep['verdict_text']}", "", f"> {NOTE}", "", f"> {generic_note(rep.get('model'))}", "", f"Created {rep['created']} - model `{rep.get('model')}` - engine {rep.get('engine', {}).get('kind')} ({rep.get('engine', {}).get('image', '')})", ""]
     L += ["## Success criteria (from the report)", ""] + [f"- [{'x' if c['ok'] else ' ' if c['ok'] is False else '?'}] {c['label']}: {'not reached' if c.get('not_reached') else c['value']}" for c in rep.get("criteria", [])] + [""]
     L += ["## Prerequisites", ""] + [f"- [{'x' if p['ok'] else ' ' if p['ok'] is False else '?'}] {p['id']}: {p['detail']}" for p in rep.get("prerequisites", [])] + [""]
     if rep.get("download_note"):
@@ -341,7 +346,7 @@ def run(job: dict) -> int:
         cfg = vllmengine.engine_config(job)
     except vllmengine.EngineError as exc:
         raise ThinkCheckError(str(exc), "vllm_selftest_failed") from exc
-    rep: dict = {"version": REPORT_VERSION, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "note": NOTE, "model": model, "adapter": adapter, "download_note": download_note(model),
+    rep: dict = {"generic_test": generic_note(model), "version": REPORT_VERSION, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "note": NOTE, "model": model, "adapter": adapter, "download_note": download_note(model),
                  "engine": {k: cfg.get(k) for k in ("kind", "image", "distro", "venv", "url", "version")}, "prerequisites": [], "comparisons": [], "hints": [], "commands": [], "stopped": False}
     engine = None
     try:

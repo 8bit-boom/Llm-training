@@ -450,6 +450,18 @@ def run(job: dict) -> int:
         note = why + " The standard engine (Transformers) was used instead."
         protocol.log(note)
         return _run_one({**{k: v for k, v in job.items() if k not in ("engine", "_engine_report", "fallback_hf")}, "backend": "hf"}, note)
+    if job.get("backend") == "vllm" and (job.get("engine") or {}).get("original") and not job.get("adapter"):
+        # the ORIGINAL through vLLM: the identity rule (vllmquant.select_original) may refuse, or the engine may not work (the 4-bit route is unverified): the standard engine then checks the
+        # original, in the standard result file, with a plain note. The base model's pre-quantized checkpoint never stands in for another original.
+        try:
+            return _run_one(job)
+        except Exception as exc:                           # noqa: BLE001 - a refusal or any problem of the experiment
+            note = f"vLLM did not check the original ({protocol.scrub(str(exc))[:240]}). The standard engine (Transformers) was used instead."
+            protocol.log(note)
+            plain = {k: v for k, v in job.items() if k not in ("engine", "_engine_report", "fallback_hf")}
+            if plain.get("cache_file"):
+                plain["cache_file"] = str(plain["cache_file"]).replace(".vllm.json", ".json")
+            return _run_one({**plain, "backend": "hf"}, note)
     return _run_one(job)
 
 

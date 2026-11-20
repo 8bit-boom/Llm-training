@@ -269,6 +269,7 @@ pub fn engine_job(s: &VllmSettings) -> Value {
 /// `engine_job` plus the card's memory (the pick of the weights depends on it); asks `nvidia-smi` (remembered for a minute).
 pub fn engine_job_with_card(s: &VllmSettings) -> Value {
     let mut e = engine_job(s);
+    e["teacher"] = json!({"route": s.teacher.route, "pairs": s.teacher.pairs, "confirmed": s.teacher.confirmed});          // the identity rule: which pre-quantized checkpoint may stand in for an original
     if let Some(g) = crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())) {
         e["vram_gb"] = json!((g * 10.0).round() / 10.0);
     }
@@ -478,4 +479,15 @@ pub fn teacher_check_files(model_dir: &std::path::Path) -> Value {
     let f = teacher_check_file(model_dir);
     let text = std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| serde_json::to_string_pretty(&v).ok());
     json!({"dir": model_dir.display().to_string(), "file": f.display().to_string(), "text": text, "exists": text.is_some()})
+}
+
+/// What the person is told about WHICH model a vLLM check or trace generation of the original really loads: its own folder in 4 bits ("original: <id> (4-bit on the fly)"), a confirmed
+/// pre-quantized copy ("confirmed copy <repo>"), or nothing (refused: the standard engine is used). Same rule as the worker's `vllmquant.select_original`.
+pub fn served_text(t: &crate::settings::VllmTeacherSettings, origin: &str) -> String {
+    let r = teacher_route(t, origin);
+    match r["route"].as_str() {
+        Some("prequant") => format!("confirmed copy {}", r["quantized_repo"].as_str().unwrap_or("")),
+        Some("bnb") => format!("original: {origin} (4-bit on the fly; the in-flight route is unverified, the standard engine answers if it does not work)"),
+        _ => format!("nothing: {} The standard engine is used.", r["reason"].as_str().unwrap_or("")),
+    }
 }

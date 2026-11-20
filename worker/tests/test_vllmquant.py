@@ -28,9 +28,9 @@ def test_pick_table_for_a_cut_on_a_32_gb_card(gb, quant, fits):
 
 
 def test_the_original_uses_the_configured_pre_quantized_checkpoint():
-    r = vq.pick("unsloth/Qwen3.5-27B", {**E32, "original": True, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "weights_gb": 55})
+    r = vq.pick("Qwen/Qwen3.8-27B", {**E32, "original": True, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "weights_gb": 55})
     assert r["model"] == "cyankiwi/Qwen3.8-27B-AWQ-INT4" and r["quant"] == "prequant:cyankiwi/Qwen3.8-27B-AWQ-INT4" and r["fits"] is True
-    assert vq.pick("unsloth/Qwen3.5-27B", {**E32, "original": True, "teacher_repo": ""})["quant"] in ("none", "fp8")       # nothing configured
+    assert vq.pick("unsloth/Qwen3.5-27B", {**E32, "original": True, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "weights_gb": 55})["quant"] == "bnb-nf4"       # another original: never that checkpoint
     small = vq.pick("org/small", {**E32, "original": True, "teacher_repo": "x/y", "weights_gb": 8})
     assert small["quant"] == "none" and small["model"] == "org/small", "an original that fits is not replaced"
 
@@ -56,7 +56,7 @@ def test_language_model_only_is_always_passed_and_fp8_only_when_picked():
 
 
 def test_the_engine_uses_the_pick_and_a_misfit_is_a_plain_error():
-    job = {"model": "unsloth/Qwen3.5-27B", "backend": "vllm", "engine": {"kind": "docker", "original": True, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "vram_gb": 32}}
+    job = {"model": "Qwen/Qwen3.8-27B", "backend": "vllm", "engine": {"kind": "docker", "original": True, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "vram_gb": 32, "weights_gb": 55}}
     e = tv.make_engine(job)
     assert e.model == "cyankiwi/Qwen3.8-27B-AWQ-INT4" and e.quant == "prequant:cyankiwi/Qwen3.8-27B-AWQ-INT4"
     assert job["_engine_report"]["pick"]["reason"].startswith("The original does not fit")
@@ -65,3 +65,45 @@ def test_the_engine_uses_the_pick_and_a_misfit_is_a_plain_error():
         tv.make_engine({"model": "org/huge", "engine": {"kind": "docker", "weights_gb": 80, "vram_gb": 32}})
     cut = tv.make_engine({"model": "org/cut", "engine": {"kind": "docker", "weights_gb": 34, "vram_gb": 32}})
     assert cut.quant == "fp8" and "--quantization" in cut.build()
+
+
+# ---- the identity rule for checks, trace generation and the self-test's "original" runs (the same rule as the teacher cache)
+
+E_BIG = {"kind": "docker", "original": True, "vram_gb": 32, "weights_gb": 55}
+
+
+def test_a_finetune_original_is_never_served_as_the_configured_awq():
+    for m in ("Someone/Qwen3.8-27B-Heretic", "C:\\models\\heretic"):
+        p = vq.pick(m, {**E_BIG, "teacher_repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4"})
+        assert p["quant"] == "bnb-nf4" and p["model"] == m and "cyankiwi" not in json.dumps(p), p
+        assert p["served"] == f"original: {m} (4-bit on the fly)" and p["fits"] is True and "UNVERIFIED" in p["reason"]
+    assert "--quantization" in ve.serve_args("m", quant="bnb-nf4")
+
+
+def test_the_base_original_and_a_confirmed_copy_may_use_a_pre_quantized_checkpoint():
+    p = vq.pick("Qwen/Qwen3.8-27B", E_BIG)
+    assert p["quant"] == "prequant:cyankiwi/Qwen3.8-27B-AWQ-INT4" and p["served"] == "confirmed copy cyankiwi/Qwen3.8-27B-AWQ-INT4"
+    c = vq.pick("Someone/Finetune", {**E_BIG, "teacher": {"confirmed": {"Someone/Finetune": "Someone/Finetune-AWQ"}, "quantized_repo": "Someone/Finetune-AWQ"}})
+    assert c["quant"] == "prequant:Someone/Finetune-AWQ" and c["model"] == "Someone/Finetune-AWQ"
+    other = vq.pick("Other/Model", {**E_BIG, "teacher": {"confirmed": {"Someone/Finetune": "Someone/Finetune-AWQ"}}})
+    assert other["quant"] == "bnb-nf4", "a confirmation is per original"
+
+
+def test_a_refused_route_or_a_model_too_big_even_in_4_bits_is_a_plain_refusal_never_the_base_checkpoint():
+    p = vq.pick("Someone/Finetune", {**E_BIG, "teacher": {"route": "prequant"}})
+    assert p["fits"] is False and "wrong model" in p["reason"]
+    huge = vq.pick("Someone/Huge", {**E_BIG, "weights_gb": 200})
+    assert huge["fits"] is False and "NOT used for another model" in huge["reason"] and huge["model"] == "Someone/Huge"
+    with pytest.raises(tc.ThinkCheckError, match="wrong model"):
+        tv.make_engine({"model": "Someone/Finetune", "engine": {**E_BIG, "kind": "docker", "teacher": {"route": "prequant"}}})
+
+
+def test_the_check_key_and_report_say_which_model_was_loaded():
+    job = {"model": "Someone/Finetune", "backend": "vllm", "engine": {**E_BIG, "kind": "docker"}}
+    e = tv.make_engine(job)
+    assert e.quant == "bnb-nf4" and e.model == "Someone/Finetune"
+    key = tc.cache_key(job, "vllm", tc.settings_of({}))["engine"]
+    assert key["quant"] == "bnb-nf4" and key["teacher_origin"] == "Someone/Finetune"
+    assert job["_engine_report"]["pick"]["served"].startswith("original: Someone/Finetune")
+    plain = {"model": "org/cut", "backend": "vllm", "engine": {"kind": "docker", "vram_gb": 32, "weights_gb": 20}}
+    assert "teacher_origin" not in tc.cache_key(plain, "vllm", tc.settings_of({}))["engine"], "other checks keep their keys"

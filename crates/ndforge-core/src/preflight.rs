@@ -257,6 +257,16 @@ pub fn check(p: Option<&Project>, kind: &str, spec: &Value) -> Vec<Check> {
     let mut checks = evaluate(&gather(p, kind, spec));
     if matches!(kind, "think_check" | "trace_gen") && spec["backend"].as_str() == Some("vllm") && spec["target"].as_str() != Some("gguf") {
         checks.extend(crate::vllm::preflight_now(&crate::settings::Settings::load().vllm));      // the experimental engine: it is there, the card is free
+        let st = crate::settings::Settings::load().vllm;
+        if let (Some(p), Some(name)) = (p, spec["name"].as_str()) {
+            if kind == "trace_gen" || spec["target"].as_str() == Some("original") {
+                if let Ok(o) = crate::reshape::heal_source::read_origin(&crate::reshape::runs::models_dir(p).join(name)) {
+                    let r = crate::vllm::teacher_route(&st.teacher, &o.teacher);
+                    let light = if r["route"] == "refused" { crate::envmgr::health::Light::Warn } else { crate::envmgr::health::Light::Ok };
+                    checks.push(Check { id: "vllm_identity", label: "Which model vLLM loads", light, detail: format!("{} (only when the original does not fit the card in 16 bits)", crate::vllm::served_text(&st.teacher, &o.teacher)), fix: String::new(), action: None });
+                }
+            }
+        }
     }
     if kind == "heal" && spec["vllm_teacher"].as_bool() == Some(true) {
         checks.extend(vllm_teacher_checks(&crate::settings::Settings::load().vllm, p, spec));          // vLLM makes the original's answers: the engine, the card, the disk

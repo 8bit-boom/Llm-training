@@ -82,3 +82,10 @@ def test_answer_statistics_and_the_short_answer_warning():
     crit = {c["id"]: c for c in st.criteria_of(rep)}
     assert crit["speed"]["value"] == 280.0 and crit["speed"]["ok"] is False and "long answers" in crit["speed"]["label"], "the long-answer speed decides, not the short one"
     assert st.criteria_of({"startup_seconds": 263.5, "tokens_per_s": 447.6})[1]["label"].endswith("not measured on long ones)")
+
+
+def test_the_report_says_it_is_a_generic_engine_test_not_a_test_of_your_original(tmp_path):
+    rep = {"version": 1, "created": "t", "model": "cyankiwi/Qwen3.8-27B-AWQ-INT4", "engine": {"kind": "docker"}, "note": "n", "error": "x", "prerequisites": [], "comparisons": [], "hints": [], "commands": [], "generic_test": st.generic_note("cyankiwi/Qwen3.8-27B-AWQ-INT4")}
+    st._finish(rep, tmp_path, 0.0)
+    md = (tmp_path / "vllm_selftest.md").read_text()
+    assert "generic engine test" in md and "does NOT test your own original" in md

@@ -270,3 +270,19 @@ fn the_selftest_files_say_where_they_are() {
     assert!(c["exists"] == true && c["text"].as_str().unwrap().contains("\"verdict\": \"same\""));
     std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
+
+#[test]
+fn a_vllm_check_of_the_original_follows_the_same_identity_rule_and_says_which_model_it_loads() {
+    let t = VllmTeacherSettings::default();
+    assert_eq!(served_text(&t, "Qwen/Qwen3.8-27B"), "confirmed copy cyankiwi/Qwen3.8-27B-AWQ-INT4");
+    let finetune = served_text(&t, "Someone/Qwen3.8-27B-Heretic");
+    assert!(finetune.starts_with("original: Someone/Qwen3.8-27B-Heretic (4-bit on the fly") && !finetune.contains("cyankiwi"), "{finetune}");
+    let confirmed = VllmTeacherSettings { confirmed: [("Someone/Finetune".to_string(), "Someone/Finetune-AWQ".to_string())].into(), ..t.clone() };
+    assert_eq!(served_text(&confirmed, "Someone/Finetune"), "confirmed copy Someone/Finetune-AWQ");
+    let refused = served_text(&VllmTeacherSettings { route: "prequant".into(), ..t }, "Someone/Finetune");
+    assert!(refused.starts_with("nothing:") && refused.contains("wrong model") && refused.contains("standard engine"));
+    // the engine object of a check carries the table the worker applies
+    let e = engine_job_with_card(&VllmSettings::default());
+    assert_eq!(e["teacher"]["pairs"]["Qwen/Qwen3.8-27B"], "cyankiwi/Qwen3.8-27B-AWQ-INT4");
+    assert_eq!(e["teacher"]["route"], "auto");
+}

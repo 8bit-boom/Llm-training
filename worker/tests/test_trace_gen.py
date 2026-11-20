@@ -153,3 +153,19 @@ def test_missing_input_is_a_plain_error(tmp_path):
         tg.run({"job": "trace_gen", "model": "m"})
     with pytest.raises(tc.ThinkCheckError):
         tg.run({"job": "trace_gen", "model": "m", "source": {"file": str(tmp_path / "none.jsonl")}, "out_file": str(tmp_path / "o.jsonl")})
+
+
+def test_trace_generation_never_writes_in_the_base_models_voice_for_another_original(tmp_path, monkeypatch):
+    import ndforge_worker.thinkcheck_vllm as tv
+    hf = Backend()
+    monkeypatch.setattr(tc, "load_backend", lambda n: tv if n == "vllm" else hf)
+    o = out(monkeypatch)
+    eng = {"kind": "docker", "original": True, "vram_gb": 32, "weights_gb": 55, "teacher": {"route": "prequant"}}
+    assert tg.run(job(tmp_path, model="Someone/Qwen3.8-27B-Heretic", backend="auto", engine=eng)) == 0
+    res = o()[-1]["data"]
+    assert res["backend"] == "hf" and "wrong model" in res["notes"][0], res["notes"]
+    # the same original in the default pair is allowed to be served as the configured checkpoint
+    assert tv.make_engine({"model": "Qwen/Qwen3.8-27B", "engine": {"kind": "docker", "original": True, "vram_gb": 32, "weights_gb": 55}}).model == "cyankiwi/Qwen3.8-27B-AWQ-INT4"
+    # and without a confirmed pair a finetune is served from its OWN folder in 4 bits
+    e = tv.make_engine({"model": "Someone/Qwen3.8-27B-Heretic", "engine": {"kind": "docker", "original": True, "vram_gb": 32, "weights_gb": 55}})
+    assert e.model == "Someone/Qwen3.8-27B-Heretic" and e.quant == "bnb-nf4" and "bitsandbytes" in e.build()
