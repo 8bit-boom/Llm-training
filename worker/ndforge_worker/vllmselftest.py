@@ -88,7 +88,6 @@ def fit_problem(facts: dict, vram_gb, default_model: str = "", util: float | Non
             f"{default_model or DEFAULT_MODEL}, about 21 GB) or a smaller model.")
 
 
-SHORT_MEDIAN_TOKENS = 300          # a thinking answer is hundreds to thousands of tokens: a median below this means the model did not think (or the template / limit differ)
 LONG_REQUESTS, LONG_TOKENS = 8, 2048
 
 
@@ -106,9 +105,30 @@ def generic_note(model) -> str:
             "(the in-flight bitsandbytes route, unverified), and a pre-quantized checkpoint stands in only for the original it was made from or a copy you confirmed.")
 
 
-def short_sentence(stats: dict) -> str:
-    return (f"The answers are short (median {stats['median']} tokens, mean {stats['mean']}): either the model did not think, or max_tokens or the chat template differ from a real thinking check "
-            "(look at `enable_thinking` and the `<think>` prefix in the sample answers). This speed does not predict a real thinking check; the long-answer speed below does.")
+GENERIC_RANGE = "100-250"
+
+
+def assess_answers(stats: dict, suite: dict, think_blocks: int, n_answers: int, reference: dict | None = None) -> dict:
+    """Are the answers of the Quick suite plausible thinking answers? -> {"level": "ok" | "note" | "warn", "text", "reference_median"}.
+    The yardstick is the saved standard-engine check of the same suite when there is one (its `median_think_tokens`): a WARNING only when the vLLM median is below half of it, when the thinking rate
+    is low, or when no answer has a `<think>` block. Without a reference the median is only a NOTE (a 27 B original typically writes a median of about 100-250 tokens on this suite); a fixed
+    token limit is not a rule. "did not think" is said only when the thinking rate or the `<think>` blocks say so."""
+    med, rate = stats.get("median", 0), (suite or {}).get("think_rate")
+    ref = None
+    if reference and isinstance(reference.get("main"), dict):
+        ref = reference["main"].get("median_think_tokens")
+    if stats.get("n", 0) == 0:
+        return {"level": "note", "text": "No thinking answers were measured.", "reference_median": ref}
+    if (rate is not None and rate < 0.2) or (n_answers > 0 and think_blocks == 0):
+        return {"level": "warn", "reference_median": ref, "text": f"The model did not think: think_rate {rate}, {think_blocks} of {n_answers} answers have a `<think>` block. Check `enable_thinking` and the `<think>` prefix of the chat template in the sample answers. "
+                "This speed does not predict a real thinking check; the long-answer speed below does."}
+    if ref:
+        if med < 0.5 * float(ref):
+            return {"level": "warn", "reference_median": ref, "text": f"The answers are much shorter than your saved standard-engine check of this suite (median {med} tokens against {ref}): the quantized model may think less, or max_tokens or the chat template differ. "
+                    "Look at the sample answers. This speed does not predict a real thinking check; the long-answer speed below does."}
+        return {"level": "ok", "reference_median": ref, "text": f"The answers are as long as your saved standard-engine check of this suite (median {med} tokens against {ref})."}
+    return {"level": "note", "reference_median": None, "text": f"The answers are short (median {med} tokens): the original thinking check of a 27 B model on this suite typically has a median around {GENERIC_RANGE} tokens; compare with your standard check "
+            "(no saved standard-engine numbers were given). The long-answer speed below is the one the estimates use."}
 
 
 def long_decode(engine, should_stop, model_name: str = vllmengine.SERVED_NAME, n: int = LONG_REQUESTS, tokens: int = LONG_TOKENS) -> dict:
@@ -259,8 +279,13 @@ def markdown(rep: dict) -> str:
     if su:
         L += ["## Thinking suite on this engine", "", f"{rep.get('completion_tokens')} tokens generated in {rep.get('wall_seconds')} s ({rep.get('tokens_per_s')} tokens/s). Tokens per thinking answer: " + (f"mean {at['mean']}, median {at['median']}, 90th percentile {at['p90']} ({at['n']} answers)." if at else "not known."), "",
               "| think_rate | closed_rate | accuracy | loop_rate | truncated_rate |", "|---|---|---|---|---|", f"| {su.get('think_rate')} | {su.get('closed_rate')} | {su.get('accuracy')} | {su.get('loop_rate')} | {su.get('truncated_rate')} |", ""]
-        if rep.get("short_answers") and at:
-            L += [f"**{short_sentence(at)}**", ""]
+        ck = rep.get("answer_check")
+        L += [f"Thinking answers: think_rate {su.get('think_rate')}, closed_rate {su.get('closed_rate')}, {rep.get('think_blocks', '?')} of {at['n'] if at else '?'} with a `<think>` block."]
+        if ck:
+            L += ["", ("**" + ck["text"] + "**") if ck["level"] == "warn" else ck["text"]]
+        L += [""]
+        for smp in [x for x in rep.get("samples", []) if x.get("text")][:2]:
+            L += [f"First 300 characters of sample answer `{smp['id']}`:", "", "    " + str(smp["text"])[:300].replace("\n", "\n    "), ""]
         if rep.get("request_check"):
             L += [rep["request_check"]["note"], ""]
         if rep.get("long_tokens_per_s") is not None:
@@ -437,15 +462,19 @@ def run(job: dict) -> int:
             rep["samples"] = [{"id": r["id"], "text": r["text"], "gen_tokens": r.get("gen_tokens")} for r in raws[:5]]
             main_ids = {it["id"] for it in main}
             rep["answer_tokens"] = answer_stats([r.get("gen_tokens") or 0 for r in raws if r["id"] in main_ids])
-            rep["short_answers"] = rep["answer_tokens"]["n"] > 0 and rep["answer_tokens"]["median"] < SHORT_MEDIAN_TOKENS
+            rep["think_blocks"] = sum(1 for r in raws if r["id"] in main_ids and ("</think>" in (r.get("text") or "") or "<think>" in (r.get("text") or "")))
             rep["request_check"] = {"enable_thinking_sent": True, "same_request_as_the_thinking_check": True, "note": "Sent through thinkcheck_vllm.ask, the request of the real vLLM check: enable_thinking true for the questions, false for the controls; the `<think>` prefix is written by the server's chat template (see the samples)."}
             protocol.progress("selftest", 0.92, "Measuring the speed on long answers")
             if not should_stop():
                 rep.update(long_decode(engine, should_stop, model_name))
+            refs: list = []
             for label in ("hf", "llama") + (("hf_adapter",) if adapter else ()):
                 saved = _load_result((job.get("compare") or {}).get(label)) if (job.get("compare") or {}).get(label) else None
                 if saved:
                     rep["comparisons"].append(compare(rep["suite"], saved, label, model))
+                    refs.append(saved)
+            rep["answer_check"] = assess_answers(rep["answer_tokens"], rep["suite"], rep["think_blocks"], rep["answer_tokens"]["n"], refs[0] if refs else None)
+            rep["short_answers"] = rep["answer_check"]["level"] == "warn"
     except Exception as exc:                          # noqa: BLE001 - the report must still be written and the engine stopped (a ThinkCheckError too)
         rep["error"] = f"{type(exc).__name__}: {protocol.scrub(str(exc))[:300]}"
     return _finish(rep, out_dir, t_start, engine)
@@ -463,10 +492,10 @@ def _finish(rep: dict, out_dir: Path, t_start: float, engine=None) -> int:
         rep.setdefault("hints", []).append("wslc syntax unverified: the commands above are templates; adapt them from the help output in this report.")
     rep["criteria"] = criteria_of(rep) if not rep.get("error") and not rep.get("stopped") else [{**c, "value": None, "ok": None, "not_reached": True} for c in criteria_of({})]
     rep["verdict"], rep["verdict_text"] = verdict(rep)
-    if rep.get("short_answers") and rep.get("answer_tokens"):
-        rep["verdict_text"] += " " + short_sentence(rep["answer_tokens"])
+    if (rep.get("answer_check") or {}).get("level") == "warn":
+        rep["verdict_text"] += " " + rep["answer_check"]["text"]
     rep["seconds"] = round(time.monotonic() - t_start, 1)
     _write(out_dir, rep)
-    protocol.result({k: rep[k] for k in ("verdict", "verdict_text", "criteria", "startup_seconds", "tokens_per_s", "wall_seconds", "suite", "comparisons", "stopped", "seconds", "answer_tokens", "short_answers", "long_tokens_per_s", "long_wall_seconds", "model_info", "model_params_b", "model_quant", "gpu") if k in rep}
+    protocol.result({k: rep[k] for k in ("verdict", "verdict_text", "criteria", "startup_seconds", "tokens_per_s", "wall_seconds", "suite", "comparisons", "stopped", "seconds", "answer_tokens", "answer_check", "think_blocks", "short_answers", "long_tokens_per_s", "long_wall_seconds", "model_info", "model_params_b", "model_quant", "gpu") if k in rep}
                     | {"report": str(out_dir / "vllm_selftest.json"), "report_md": str(out_dir / "vllm_selftest.md")})
     return 0

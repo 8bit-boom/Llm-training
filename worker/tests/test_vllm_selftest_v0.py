@@ -77,7 +77,6 @@ def test_wslc_list_json_is_read_defensively():
 def test_answer_statistics_and_the_short_answer_warning():
     s = st.answer_stats([60, 80, 90, 100, 120, 3000])
     assert s["n"] == 6 and s["median"] == 100 and s["total"] == 3450 and s["p90"] == 3000 and st.answer_stats([])["n"] == 0
-    assert "median 100 tokens" in st.short_sentence(s) and "does not predict a real thinking check" in st.short_sentence(s) and "enable_thinking" in st.short_sentence(s)
     rep = {"startup_seconds": 263.5, "tokens_per_s": 447.6, "long_tokens_per_s": 280.0}
     crit = {c["id"]: c for c in st.criteria_of(rep)}
     assert crit["speed"]["value"] == 280.0 and crit["speed"]["ok"] is False and "long answers" in crit["speed"]["label"], "the long-answer speed decides, not the short one"
@@ -89,3 +88,43 @@ def test_the_report_says_it_is_a_generic_engine_test_not_a_test_of_your_original
     st._finish(rep, tmp_path, 0.0)
     md = (tmp_path / "vllm_selftest.md").read_text()
     assert "generic engine test" in md and "does NOT test your own original" in md
+
+
+def stats(median):
+    return {"n": 16, "total": 16 * median, "mean": median, "median": median, "p90": median * 2}
+
+
+REF = {"main": {"median_think_tokens": 121}}
+
+
+def test_answers_similar_to_the_saved_check_are_fine():
+    a = st.assess_answers(stats(219), {"think_rate": 1.0}, 16, 16, REF)
+    assert a["level"] == "ok" and a["reference_median"] == 121 and "as long as" in a["text"]
+
+
+def test_answers_much_shorter_than_the_saved_check_warn():
+    a = st.assess_answers(stats(40), {"think_rate": 1.0}, 16, 16, REF)
+    assert a["level"] == "warn" and "much shorter" in a["text"] and "did not think" not in a["text"]
+
+
+def test_no_think_block_or_a_low_think_rate_is_the_only_reason_to_say_did_not_think():
+    assert st.assess_answers(stats(300), {"think_rate": 1.0}, 0, 16, REF)["level"] == "warn"
+    w = st.assess_answers(stats(300), {"think_rate": 0.0}, 16, 16, None)
+    assert w["level"] == "warn" and "did not think" in w["text"]
+
+
+def test_without_a_reference_it_is_only_a_note_with_the_typical_range():
+    a = st.assess_answers(stats(219), {"think_rate": 1.0}, 16, 16, None)
+    assert a["level"] == "note" and "median around 100-250 tokens" in a["text"] and "did not think" not in a["text"] and "compare with your standard check" in a["text"]
+    assert st.assess_answers({"n": 0}, {}, 0, 0, None)["level"] == "note"
+
+
+def test_the_report_prints_the_rates_the_think_blocks_and_two_samples(tmp_path):
+    rep = {"version": 1, "created": "t", "model": "m", "engine": {"kind": "docker"}, "note": "n", "prerequisites": [], "comparisons": [], "hints": [], "commands": [], "completion_tokens": 3400, "wall_seconds": 7.3, "tokens_per_s": 472.3,
+           "suite": {"think_rate": 1.0, "closed_rate": 0.97}, "answer_tokens": stats(219), "think_blocks": 15, "answer_check": st.assess_answers(stats(219), {"think_rate": 1.0}, 15, 16, None),
+           "samples": [{"id": "a", "text": "<think>\nhmm " + "x" * 400}, {"id": "b", "text": "<think>\nsecond"}, {"id": "c", "text": "third"}]}
+    st._finish(rep, tmp_path, 0.0)
+    md = (tmp_path / "vllm_selftest.md").read_text()
+    assert "think_rate 1.0, closed_rate 0.97, 15 of 16 with a `<think>` block" in md and "First 300 characters of sample answer `a`" in md
+    assert "x" * 400 not in md.split("First 300 characters of sample answer `a`:")[1].split("First 300")[0]
+    assert "SHORT" not in md and "did not think" not in md
