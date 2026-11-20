@@ -278,7 +278,10 @@ def markdown(rep: dict) -> str:
     if rep.get("error"):
         L += ["## Error", "", rep["error"], ""]
     if rep.get("start_command"):
-        L += ["## Start command (the API key is replaced)", "", "    " + " ".join(str(x) for x in rep["start_command"]), ""]
+        kr = rep.get("kv_requested") or {}
+        L += ["## Start command (the API key is replaced)", "", f"KV cache type passed to this engine: {kr.get('first', 'auto')}.", "", "    " + " ".join(str(x) for x in rep["start_command"]), ""]
+    if rep.get("start_command_fp8"):
+        L += ["## Start command of the fp8 engine (the API key is replaced)", "", "KV cache type passed to this engine: fp8.", "", "    " + " ".join(str(x) for x in rep["start_command_fp8"]), ""]
     if rep.get("exit_logs"):
         L += ["## Last lines of the container's log (read before it was removed)", ""] + [f"    {x}" for x in str(rep["exit_logs"]).splitlines()[-60:]] + [""]
     if rep.get("timings"):
@@ -324,12 +327,18 @@ def markdown(rep: dict) -> str:
         L += ["## 8-bit KV cache (fp8), the optional second pass", ""]
         for key in ("auto", "fp8"):
             x = kf.get(key)
+            if x and kf.get("comparison_refused") and key == "fp8":
+                continue
             if x:
-                L += [f"- **{key}**: KV cache {x.get('kv_tokens') if x.get('kv_tokens') is not None else 'unknown'} tokens, max concurrency {x.get('max_concurrency') if x.get('max_concurrency') is not None else 'unknown'}x, long-answer speed {x.get('long_tokens_per_s')} tokens/s, "
+                L += [f"- **{key}** (passed: {x.get('requested_dtype')}; the log {'CONFIRMS' if x.get('log_confirms_fp8') else 'does not mention'} an fp8 KV cache): KV cache {x.get('kv_tokens') if x.get('kv_tokens') is not None else 'unknown'} tokens, max concurrency {x.get('max_concurrency') if x.get('max_concurrency') is not None else 'unknown'}x, long-answer speed {x.get('long_tokens_per_s')} tokens/s, "
                       f"think_rate {x.get('think_rate')}, closed_rate {x.get('closed_rate')}, accuracy {x.get('accuracy')}; attention backend: {x.get('attention_backend') or 'not found in the log'}."]
-        for k in ("text", "warning", "fp8_failed"):
-            if kf.get(k):
+        for k in ("comparison_refused", "text", "warning", "fp8_failed"):
+            if kf.get(k) and not (k == "text" and kf.get("text") == kf.get("comparison_refused")):
                 L += ["", kf[k]]
+        for key in ("auto", "fp8"):
+            x = kf.get(key)
+            if x and x.get("highlights") and not (kf.get("comparison_refused") and key == "fp8"):
+                L += ["", f"Kernel / backend / cache lines of the {key} engine:", ""] + [f"    {h}" for h in x["highlights"]]
         if kf.get("exit_logs"):
             L += ["", "Last lines of the fp8 engine's log:", ""] + [f"    {x}" for x in str(kf["exit_logs"]).splitlines()[-40:]]
         L += [""]
@@ -341,6 +350,8 @@ def markdown(rep: dict) -> str:
         L += ["## Sample answers (look at them: garbled text means a problem)", ""] + [f"### {x['id']}\n\n    {x['text'][:600]!r}\n" for x in rep["samples"]]
     if rep.get("wslc"):
         L += ["## wslc help (for adapting the templates)", "", WSLC_VERIFIED, ""]
+        for f in rep["wslc"].get("findings", []):
+            L += [f"**Finding:** {f}", ""]
         for smp in rep["wslc"].get("list_samples", []):
             j = smp.get("json") or {}
             L += [f"### `wslc list -a --format json` {smp.get('when') or ''} at {smp['at']} (exit code {j.get('returncode')}): the real field names", ""]
@@ -356,6 +367,11 @@ def markdown(rep: dict) -> str:
     if rep.get("hints"):
         L += ["## Hints", ""] + [f"- {h}" for h in rep["hints"]] + [""]
     L += ["## Commands that were run", ""] + [f"    {' '.join(map(str, c))}" for c in rep.get("commands", [])]
+    if rep.get("fp8_commands"):
+        L += ["", f"Commands of the fp8 engine ({rep.get('fp8_engine_name')}):", ""] + [f"    {' '.join(map(str, c))}" for c in rep["fp8_commands"]]
+    lo = rep.get("leftovers")
+    if lo:
+        L += ["", "Containers left behind after the stops: " + (", ".join(lo["found"]) + (f" (removed: {', '.join(lo['removed']) or 'none'})" if lo["found"] else "") if lo["found"] else "none (a final `list -a` found no ndforge-vllm- container).")]
     return "\n".join(L) + "\n"
 
 
@@ -370,18 +386,46 @@ def list_sample(rep: dict, cfg: dict, when: str = "", name: str = "") -> None:
             r = _run(cmd, 60)
             smp[key] = {"returncode": r["returncode"], "output": tidy(r["output"])[-3000:]}
     rep.setdefault("wslc", {}).setdefault("list_samples", []).append(smp)
+    ins = ((smp.get("inspect") or {}).get("output") or "").lower()
+    empty = not ((smp.get("json") or {}).get("output") or "").strip().strip("[]").strip() and not ((smp.get("table") or {}).get("output") or "").strip()
+    if empty and name and re.search(r'"running"\s*:\s*true|status"?\s*[:=]\s*"?running|\brunning\b', ins):
+        rep["wslc"].setdefault("findings", []).append(f"{when or 'at ' + smp['at']}: `wslc list` is empty while the container {name} runs (`wslc inspect` says it is running).")
 
 
 FP8_REFUSED = re.compile(r"(fp8|kv.cache.dtype|kv_cache_dtype)[^\n]*(not supported|unsupported|incompatible|not implemented|does not support|cannot|invalid|error)|(not supported|unsupported|does not support)[^\n]*(fp8|kv.cache)", re.I)
-ATTN_BACKEND = re.compile(r"(attention backend|attn backend|FLASH_ATTN|FLASHINFER|TRITON_ATTN|FLEX_ATTENTION)[^\n]*", re.I)
+TEXT_BACKEND = re.compile(r"Using (\w+) attention backend out of potential backends:?\s*(\[[^\]]*\])?")
+VIT_BACKEND = re.compile(r"[^\n]*(?:for vit attention|MMEncoderAttention)[^\n]*", re.I)
+DECODE_BACKEND = re.compile(r"decode_backend=(\w+)")
+FLASHINFER_KV = re.compile(r"FlashInfer resolved query dtypes:[^\n]*?kv_cache_dtype=([\w.]+)")
+GDN_KERNEL = re.compile(r"Using (\w+) GDN prefill kernel")
+LINEAR_KERNEL = re.compile(r"Using (\w*LinearKernel)")
+FP8_KV_SAYS = re.compile(r"Using fp8 data type to store kv cache|kv_cache_dtype=torch\.float8", re.I)
 
 
-def kv_summary(label: str, log: str, extra: dict | None = None) -> dict:
-    """What one engine start says about its KV cache: tokens, concurrency, the attention backend the log names, and whether the log refuses fp8."""
+def backend_facts(log: str) -> dict:
+    """What the log names, from the real lines of vLLM 0.34: the TEXT layers' attention backend ("Using FLASHINFER attention backend out of potential backends: [...]"), the decode backend and the KV dtype
+    FlashInfer resolved, the GDN prefill kernel, the linear (Marlin) kernel; the vision encoder's attention line is kept apart (it is not the text layers). `summary` is the sentence of the report."""
+    log = log or ""
+    m, d, k, g, l_, v = TEXT_BACKEND.search(log), DECODE_BACKEND.search(log), FLASHINFER_KV.search(log), GDN_KERNEL.search(log), LINEAR_KERNEL.search(log), VIT_BACKEND.search(log)
+    out = {"text_attention": m.group(1) if m else None, "decode_backend": d.group(1) if d else None, "flashinfer_kv_dtype": k.group(1) if k else None, "gdn_prefill_kernel": g.group(1) if g else None,
+           "linear_kernel": l_.group(1) if l_ else None, "vision_encoder_line": v.group(0).strip()[:200] if v else None, "log_says_fp8_kv": bool(FP8_KV_SAYS.search(log))}
+    bits = [f"attention backend (text layers): {out['text_attention'] or 'not found in the log'}" + (f" ({out['decode_backend']} decode)" if out["decode_backend"] else "")]
+    if out["gdn_prefill_kernel"]:
+        bits.append(f"GDN prefill kernel: {out['gdn_prefill_kernel']}")
+    if out["linear_kernel"]:
+        bits.append(f"linear kernel: {out['linear_kernel'].replace('LinearKernel', '')}")
+    bits.append(f"KV dtype in the log: {out['flashinfer_kv_dtype'] or ('fp8 (\"Using fp8 data type to store kv cache\")' if out['log_says_fp8_kv'] else 'not named (auto)')}")
+    out["summary"] = ", ".join(bits)
+    return out
+
+
+def kv_summary(label: str, log: str, extra: dict | None = None, requested: str | None = None) -> dict:
+    """What one engine start says about its KV cache: tokens, concurrency, the backends the log names, the dtype that was PASSED (`requested`) and whether the log confirms fp8, and whether the log refuses fp8."""
     kv = vllmengine.kv_facts(log)
-    be = ATTN_BACKEND.search(log or "")
+    bf = backend_facts(log)
     refused = FP8_REFUSED.search(log or "")
-    return {"setting": label, **kv, "attention_backend": be.group(0).strip()[:200] if be else None, "refuses_fp8": refused.group(0).strip()[:200] if refused else None, **(extra or {})}
+    return {"setting": label, "requested_dtype": requested or label, "log_confirms_fp8": bf["log_says_fp8_kv"], **kv, "attention_backend": bf["summary"], "backends": bf,
+            "refuses_fp8": refused.group(0).strip()[:200] if refused else None, "highlights": vllmengine.log_highlights(log, 40), **(extra or {})}
 
 
 def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep: dict, first_engine, reqs: list, by_id: dict, settings: dict, should_stop, model_name: str) -> None:
@@ -389,16 +433,20 @@ def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep:
     concurrency, the speed on the same long-answer test and the Quick suite's rates (think_rate, closed_rate, accuracy), the attention backend the log names, and whether the log refuses fp8. A start that fails
     (or a log that refuses fp8) is a plain message, never a hang (the start fails fast and times out), and the result says the setting stays "auto". Writes `rep["kv_fp8"]`."""
     out: dict = {"auto": kv_summary("auto", rep.get("_full_log", ""), {"long_tokens_per_s": rep.get("long_tokens_per_s"), "think_rate": (rep.get("suite") or {}).get("think_rate"),
-                                                                     "closed_rate": (rep.get("suite") or {}).get("closed_rate"), "accuracy": (rep.get("suite") or {}).get("accuracy")})}
+                                                                     "closed_rate": (rep.get("suite") or {}).get("closed_rate"), "accuracy": (rep.get("suite") or {}).get("accuracy")}, requested="auto")}
     rep["kv_fp8"] = out
+    if out["auto"]["log_confirms_fp8"]:
+        out["comparison_refused"] = ("The log of the \"auto\" run says it used the 8-bit KV cache (\"Using fp8 data type to store kv cache\"), so the two runs are not different settings: no comparison is printed. "
+                                     "Check that nothing else passes --kv-cache-dtype fp8 (the engine's extra arguments, the engine settings).")
     first_engine.stop()
     eng = vllmengine.Engine(cfg, model, quant=quant, gpu_util=util, extra_args=extra_args, kv_cache_dtype="fp8")
     try:
         eng.start()
-        list_sample(rep, cfg, "while the fp8 KV cache engine runs", vllmengine.container_name(eng.port))
         eng.wait_ready(float(cfg.get("start_timeout") or vllmengine.DEFAULT_START_TIMEOUT), should_stop)
+        list_sample(rep, cfg, "right after /health answered (the fp8 engine)", vllmengine.container_name(eng.port))
         log = eng.logs_big(800) + "\n" + eng.log_text()
-        fp8 = kv_summary("fp8", log)
+        fp8 = kv_summary("fp8", log, requested="fp8")
+        rep["start_command_fp8"] = eng.commands[0] if eng.commands else None
         results, tokens, t0 = [], 0, time.monotonic()
         with ThreadPoolExecutor(max_workers=thinkcheck_vllm.DEFAULT_PARALLEL) as pool:
             for raw in pool.map(lambda r: thinkcheck_vllm.ask(eng.url, r, settings, model_name, eng.api_key), reqs):
@@ -410,7 +458,12 @@ def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep:
         fp8.update(long_decode(eng, should_stop, model_name))
         out["fp8"] = fp8
         a, b = out["auto"].get("kv_tokens"), fp8.get("kv_tokens")
-        out["text"] = (f"KV cache: {a:,} tokens with auto, {b:,} with fp8 ({b / a:.2f} times)." if a and b else "The KV cache size was not found in the logs.")
+        if out.get("comparison_refused"):
+            out["text"] = out["comparison_refused"]
+        elif not fp8["log_confirms_fp8"] and not fp8.get("refuses_fp8"):
+            out["text"] = "The fp8 engine's log does NOT say it used an 8-bit KV cache (no \"Using fp8 data type to store kv cache\"): the numbers below are not an fp8 measurement."
+        else:
+            out["text"] = (f"KV cache: {a:,} tokens with auto, {b:,} with fp8 ({b / a:.2f} times)." if a and b else "The KV cache size was not found in the logs.")
         if fp8.get("refuses_fp8"):
             out["warning"] = f"The log mentions a problem with fp8: {fp8['refuses_fp8']}"
     except vllmengine.EngineError as exc:
@@ -423,9 +476,38 @@ def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep:
         out["fp8_failed"] = f"The fp8 pass failed ({type(exc).__name__}: {protocol.scrub(str(exc))[:200]}). The setting stays auto."
         out["fallback"] = "auto"
     finally:
+        if eng.port and not out.get("fp8_failed"):
+            list_sample(rep, cfg, "right before the stop (the fp8 engine)", vllmengine.container_name(eng.port))
         eng.stop()
-        rep.setdefault("commands", [])
         rep["fp8_commands"] = eng.commands
+        rep["fp8_engine_name"] = vllmengine.container_name(eng.port) if eng.port else None
+
+
+def remove_leftovers(engine) -> dict:
+    """After every stop: a final `list -a` (wslc) / `ps -a` (docker) and a removal of any `ndforge-vllm-*` container still there, by its own name; says what it found. Never raises."""
+    out = {"found": [], "removed": [], "listing": None}
+    try:
+        if engine.kind == "wslc":
+            r = _run(["wslc", "list", "-a"], 60)
+            names = re.findall(r"ndforge-vllm-\d+", r["output"])
+            tmpl = vllmengine.wslc_templates(engine.cfg)["remove"]
+            mk = lambda n: vllmengine.render_template(tmpl, {**vllmengine.wslc_values(engine.cfg, 0, "", []), "name": n})      # noqa: E731
+        elif engine.kind in ("docker", "docker_wsl"):
+            pre = vllmengine.docker_prefix(engine.cfg)
+            r = _run(pre + ["ps", "-a", "--filter", "name=ndforge-vllm-", "--format", "{{.Names}}"], 60)
+            names = re.findall(r"ndforge-vllm-\d+", r["output"])
+            mk = lambda n: pre + ["rm", "-f", n]      # noqa: E731
+        else:
+            return out
+        out["listing"] = tidy(r["output"])[-1500:]
+        for n in sorted(set(names)):
+            out["found"].append(n)
+            res = _run(mk(n), 60)
+            if res["returncode"] == 0:
+                out["removed"].append(n)
+    except Exception as exc:                                  # noqa: BLE001 - a clean-up check must never lose the report
+        out["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    return out
 
 
 def startup_parts(ready_s, log: str) -> dict:
@@ -538,7 +620,8 @@ def run(job: dict) -> int:
         main, control = thinkcheck.questions(thinkcheck.load_suite(), settings)
         reqs = thinkcheck.requests_for(main, control, settings)
         e = job.get("engine") or {}
-        engine = vllmengine.Engine(cfg, model, adapter=adapter, quant=thinkcheck_vllm.quant_of(job), extra_args=e.get("extra_args"), gpu_util=util_now)
+        engine = vllmengine.Engine(cfg, model, adapter=adapter, quant=thinkcheck_vllm.quant_of(job), extra_args=e.get("extra_args"), gpu_util=util_now,
+                                   kv_cache_dtype="auto" if job.get("kv_fp8_test") else None)          # the baseline of the fp8 pass is "auto" whatever the setting says
         protocol.progress("selftest", 0.15, "Starting the engine (a first start downloads the image and the model)")
         t_wait = time.monotonic()
         try:
@@ -614,12 +697,14 @@ def run(job: dict) -> int:
 
 def _finish(rep: dict, out_dir: Path, t_start: float, engine=None) -> int:
     if engine is not None:
-        if engine.kind == "wslc" and not rep.get("error") and engine.port:
+        if engine.kind == "wslc" and not rep.get("error") and engine.port and not rep.get("kv_fp8"):
             list_sample(rep, {"kind": "wslc"}, "right before the stop", vllmengine.container_name(engine.port))
         engine.stop()                                 # explicit stop, always (also after a failure and a Stop)
         rep["commands"] = engine.commands                 # the start command is in it, the API key replaced by [key]
         rep["engine_stopped"] = engine.stopped
         rep["start_command"] = engine.commands[0] if engine.commands else None
+        rep["kv_requested"] = {"first": engine.kv_cache_dtype, "second": "fp8" if rep.get("kv_fp8") else None}
+        rep["leftovers"] = remove_leftovers(engine)
         if engine.exit_logs and not rep.get("exit_logs"):
             rep["exit_logs"] = engine.exit_logs
     if engine is not None and engine.kind == "wslc":

@@ -170,7 +170,7 @@ test("Settings: the 8-bit KV cache is off by default, explained, and the teacher
   b.run(`state = ${JSON.stringify(baseState())}`);
   const html = b.run("renderVllm()");
   assert.match(html, /8-bit KV cache \(experimental, off\)/);
-  assert.match(html, /71,141 tokens now, roughly 140,000 with fp8/); assert.match(html, /only its full-attention layers have a KV cache/);
+  assert.match(html, /71,141 cached tokens with auto, 85,196 with fp8 \(only about 1\.2 times, not 2 times\)/); assert.match(html, /only its full-attention layers have a KV cache/);
   assert.match(html, /<option value="auto" selected>auto \(the default\)/); assert.doesNotMatch(html, /id="vl-kv-teacher"[^>]*checked/);
   assert.match(html, /<option value="f16" selected>f16 \(the default\)/);
   assert.match(html, /id="vl-tkv"/);
