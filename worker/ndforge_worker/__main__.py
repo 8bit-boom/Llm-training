@@ -41,6 +41,8 @@ def _accelerators() -> dict:
 
 
 def _explain(exc: Exception) -> str:
+    if isinstance(getattr(exc, "tail", None), list):     # a llama.cpp tool failed: its message already holds the last output lines (scrubbed); keep them whole, user name out
+        return protocol.redact_user(protocol.scrub(str(exc)))[:4000]
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
     if "no space left" in low:

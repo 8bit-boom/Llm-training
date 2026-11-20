@@ -295,10 +295,21 @@ pub fn markdown(r: &Value) -> String {
         _ => "Running",
     };
     s.push_str(&format!("# Auto-cut report: {} to about {} B\n\n**{headline}.** ", r["model"].as_str().unwrap_or("model"), num(&r["target_b"], 1)));
+    let mut tail_block = None;
     if let Some(e) = r["error"].as_str() {
-        s.push_str(e);
+        // a failed tool's last output lines follow the first line of the message: they go into a block of their own, not into the sentence
+        match e.split_once('\n') {
+            Some((first, rest)) => {
+                s.push_str(first);
+                tail_block = Some(rest.trim().to_string());
+            }
+            None => s.push_str(e),
+        }
     }
     s.push_str("\n\n");
+    if let Some(t) = tail_block.filter(|t| !t.is_empty()) {
+        s.push_str(&format!("```text\n{}\n```\n\n", t.replace("```", "~~~")));
+    }
     s.push_str(&format!("- Original: {} B. Result: {} B ({} blocks removed, MLP width {}).\n", num(&r["original_b"], 1), num(&r["actual_b"], 2), r["blocks_removed"].as_u64().unwrap_or(0), r["mlp_width"].as_u64().map(|x| x.to_string()).unwrap_or_else(|| "unchanged".into())));
     s.push_str(&format!("- Keep thinking: {}. Stages: {}. Retries: {}. Time (the steps added up): {} minutes.\n", if r["keep_thinking"] == true { "yes" } else { "no" }, r["stages"].as_array().map(|a| a.len()).unwrap_or(0), r["retries"].as_u64().unwrap_or(0), num(&r["active_minutes"], 1)));
     if let Some(d) = r["disk"].as_object() {
@@ -476,7 +487,7 @@ pub fn markdown(r: &Value) -> String {
     }
     s.push_str("\n## Steps\n\n| Step | Status | Seconds | Note |\n|---|---|---|---|\n");
     for x in r["steps"].as_array().cloned().unwrap_or_default() {
-        s.push_str(&format!("| {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["status"].as_str().unwrap_or(""), x["seconds"].as_i64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()), x["note"].as_str().unwrap_or("").replace('|', "/")));
+        s.push_str(&format!("| {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["status"].as_str().unwrap_or(""), x["seconds"].as_i64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()), x["note"].as_str().unwrap_or("").lines().next().unwrap_or("").replace('|', "/")));
     }
     s.push_str("\nThe numbers come from a thinking check of 32 questions per model (16 in Quick); they show a trend, not a benchmark.\n");
     s

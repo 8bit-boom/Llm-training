@@ -67,6 +67,7 @@ struct Mock {
     losses: BTreeMap<(Vec<u32>, Option<u32>), (f64, f64, f64)>,
     try_acc: BTreeMap<u32, (Vec<(u32, f64)>, BTreeMap<u32, Vec<Value>>, Vec<Value>)>,
     fail_heal_once: bool,
+    fail_text: Option<String>,
     publish_ok: bool,
     /// the measured file beats the plain file of its size in the comparison
     promote: bool,
@@ -103,7 +104,7 @@ impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, fail_text: None, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
             hist: ndforge_core::timing::History::default(), vllm_log: Vec::new(), engine_running: false, cleanups: 0, leak_engine: false, vllm_checks_fail: false, teacher_engine: None,
         }
     }
@@ -279,7 +280,7 @@ impl Effects for Mock {
         }
         if self.fail_heal_once {
             self.fail_heal_once = false;
-            return Err(Error::new("The graphics card ran out of memory."));
+            return Err(Error::new(self.fail_text.take().unwrap_or_else(|| "The graphics card ran out of memory.".into())));
         }
         assert!(!self.engine_running, "a training must never start while the vLLM engine runs");
         self.heals += 1;
@@ -2303,4 +2304,24 @@ fn suggestions_after_a_failed_heal_are_offered_unless_locked() {
     let texts: Vec<String> = pv["suggestions"].as_array().unwrap().iter().map(|x| x["text"].as_str().unwrap().to_string()).collect();
     assert!(texts.iter().any(|t| t.contains("ran out of memory")) && texts.iter().any(|t| t.contains("rounds")) && texts.iter().any(|t| t.contains("vLLM")), "{texts:?}");
     assert!(pv["locks"].as_array().unwrap().iter().any(|l| l["key"] == "target_b" && l["state"] == "locked"));
+}
+
+#[test]
+fn a_failed_step_carries_the_last_lines_of_the_tool_into_its_note_and_the_report() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    fx.fail_text = Some("The GGUF conversion failed (exit code 1). Last lines:\nINFO:hf-to-gguf:Model architecture: Qwen3_5ForConditionalGeneration\n  File \"~/llama.cpp/conversion/qwen.py\", line 323, in __init__\n    assert self.opt_num_mtp_layers != 0\nAssertionError".into());
+    start(&p, &mut fx, spec(21.1)).unwrap_err();
+    let st = latest(&p).unwrap();
+    let note = st.steps.iter().find(|s| s.id == "s1.heal").unwrap().note.clone().unwrap();
+    assert!(note.contains("failed (exit code 1)") && note.contains("AssertionError") && note.contains("qwen.py\", line 323"), "{note}");
+    let md = std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.md")).unwrap();
+    assert!(md.contains("**Failed.** The GGUF conversion failed (exit code 1). Last lines:"), "{md}");
+    assert!(md.contains("```text\nINFO:hf-to-gguf") && md.contains("assert self.opt_num_mtp_layers != 0\nAssertionError\n```"), "the tail is a block in the report: {md}");
+    let row = md.lines().find(|l| l.starts_with("| ") && l.contains("failed")).unwrap_or("");
+    assert!(!row.contains("AssertionError"), "the steps table keeps one line: {row}");
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("AssertionError"));
 }

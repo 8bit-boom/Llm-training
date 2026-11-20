@@ -121,3 +121,16 @@ def test_the_matrix_conversion_uses_the_flag_and_reports_the_tail(tmp_path):
     c2 = conv(tmp_path, ALWAYS, "other.py")
     with pytest.raises(imatrixjob.MatrixError, match="opt_num_mtp_layers"):
         imatrixjob.convert_to_f16(c2, folder(d, mtp_tensors=True), tmp_path / "g.gguf", {}, (0.0, 0.1))
+
+
+def test_an_export_that_fails_in_the_converter_sends_the_last_lines_to_the_window(tmp_path, monkeypatch, capsys):
+    from ndforge_worker import __main__ as main_mod
+    c = conv(tmp_path, ALWAYS)
+    m = folder(tmp_path, mtp_tensors=True)
+    try:
+        exportjob.convert_to(c, m, tmp_path / "out.gguf")
+    except RuntimeError as e:
+        text = main_mod._explain(e)
+    assert text.startswith("The GGUF conversion failed (exit code 1). Last lines:")
+    assert "assert self.opt_num_mtp_layers != 0" in text and "AssertionError" in text
+    assert "Someone" not in text and "<user>" in text
