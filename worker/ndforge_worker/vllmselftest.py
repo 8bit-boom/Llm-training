@@ -262,7 +262,7 @@ def criteria_of(rep: dict) -> list:
 
 WSLC_VERIFIED = ("wslc: your runs verified `run -d` with --gpus, --shm-size, -p and -v, `stop -t`, `remove -f`, `pull`, `logs -n N`, `inspect <name>`, `list -a` (table) and `list -a --format json` "
                  "(fields Command, CreatedAt, HealthStatus, ID, Image, Labels, LocalVolumes, Mounts, Names, Networks, Platform, Ports, RunningFor, Size, State, Status; one JSON object per container, "
-                 "a single object and not an array when there is one container), and that the published port is reachable from Windows. Still untested: `cp` and `exec`. The commands are templates you can edit.")
+                 "a single object and not an array when there is one container), and that the published port is reachable from Windows. Still untested: `cp`, `exec`. The commands are templates you can edit.")
 
 
 def backend_note(kf: dict):
@@ -507,7 +507,7 @@ def remove_leftovers(engine) -> dict:
     try:
         if engine.kind == "wslc":
             r = _run(["wslc", "list", "-a", "--format", "json"], 60)
-            if r["returncode"] != 0 or vllmengine.parse_list(r["output"]) is None:
+            if r["returncode"] != 0 or not (r["output"] or "").strip() or vllmengine.parse_list(r["output"]) is None:
                 r = _run(["wslc", "list", "-a"], 60)                 # the table, when the JSON is not there
             names = vllmengine.list_names(r["output"], "ndforge-vllm-")
             tmpl = vllmengine.wslc_templates(engine.cfg)["remove"]

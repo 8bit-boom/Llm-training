@@ -16,7 +16,7 @@ def test_the_list_is_read_as_an_array_one_object_or_one_object_per_line():
     assert vllmengine.wslc_running(json.dumps([ONE, GONE]), "ndforge-vllm-8001") is False
     assert vllmengine.wslc_running(json.dumps(ONE) + "\n" + json.dumps(GONE), "ndforge-vllm-8001") is False
     assert vllmengine.wslc_running(json.dumps(GONE), "ndforge-vllm-8000") is False, "not in the list"
-    assert vllmengine.wslc_running("", "ndforge-vllm-8000") is False and vllmengine.wslc_running("[]", "x") is False
+    assert vllmengine.wslc_running("", "ndforge-vllm-8000") is None and vllmengine.wslc_running("[]", "x") is False
     assert vllmengine.list_names(json.dumps(ONE) + "\n" + json.dumps(GONE), "ndforge-vllm-") == ["ndforge-vllm-8000", "ndforge-vllm-8001"]
     assert vllmengine.list_names(json.dumps({**ONE, "Names": ["/ndforge-vllm-9"]}), "ndforge-vllm-") == ["ndforge-vllm-9"]
 
@@ -49,4 +49,4 @@ def test_the_late_list_is_labelled_and_the_hint_names_what_is_verified():
     rep = {"wslc": {"help": {"wslc list -a --format json": {"returncode": 0, "output": ""}}}}
     md = vllmselftest.markdown({**BASE, **rep})
     assert "taken after the engines were removed: empty is expected" in md
-    assert "Still untested: `cp` and `exec`" in vllmselftest.WSLC_VERIFIED and "HealthStatus" in vllmselftest.WSLC_VERIFIED
+    assert "Still untested: `cp`, `exec`" in vllmselftest.WSLC_VERIFIED and "HealthStatus" in vllmselftest.WSLC_VERIFIED

@@ -255,6 +255,8 @@ def list_names(text: str, prefix: str = "") -> list:
 def wslc_running(text: str, name: str):
     """True / False / None from the output of `wslc list -a --format json` (verified fields: `Names`, `State`, `Status`, `ID`; an array, one object, or one object per line): the container is looked
     for by `Names` (or the `ID` prefix, else anywhere in the object); `State` says running or not; not in the list -> False; no list could be read -> None."""
+    if not (text or "").strip():
+        return None
     items = parse_list(text)
     if items is None:
         # not JSON (a table, an unknown format): the name anywhere in the raw output counts as running when the line does not say it stopped
