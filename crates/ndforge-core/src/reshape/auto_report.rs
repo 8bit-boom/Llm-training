@@ -132,6 +132,7 @@ pub fn build(st: &AutoState) -> Value {
         "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget, "speed": speed_json(st),
         "estimate": estimate_json(st, active),
         "vllm": vllm_json(st),
+        "settings_changes": st.settings_changes,
     })
 }
 
@@ -331,6 +332,21 @@ pub fn markdown(r: &Value) -> String {
         s.push_str(&rounds_markdown(st));
     }
     s.push_str(&vllm_markdown(r));
+    if let Some(c) = r["settings_changes"].as_array().filter(|c| !c.is_empty()) {
+        s.push_str("\n## Settings changed while the run went on\n\nThe run was started with other settings; the person changed these when continuing (finished steps were not redone).\n\n");
+        for x in c {
+            s.push_str(&format!("- {} ({}){}:\n", x["at"].as_str().unwrap_or("?"), x["who"].as_str().unwrap_or("person"), if x["confirmed"] == true { ", confirmed" } else { "" }));
+            for d in x["changes"].as_array().cloned().unwrap_or_default() {
+                s.push_str(&format!("  - {}\n", d["text"].as_str().unwrap_or("").trim_start_matches("you changed: ")));
+            }
+            if let Some(rd) = x["redo"].as_array().filter(|r| !r.is_empty()) {
+                s.push_str(&format!("  - redone because of it: {}\n", rd.iter().filter_map(|y| y.as_str()).collect::<Vec<_>>().join("; ")));
+            }
+            if let (Some(n), Some(w)) = (x["remaining_h"].as_array(), x["was_remaining_h"].as_array()) {
+                s.push_str(&format!("  - time left: about {:.1}-{:.1} h (was {:.1}-{:.1} h)\n", n[0].as_f64().unwrap_or(0.0), n[1].as_f64().unwrap_or(0.0), w[0].as_f64().unwrap_or(0.0), w[1].as_f64().unwrap_or(0.0)));
+            }
+        }
+    }
     if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
         s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");
         for x in g.iter().filter_map(|x| x.as_str()) {

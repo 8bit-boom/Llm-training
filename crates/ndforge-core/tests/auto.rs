@@ -2172,3 +2172,135 @@ fn the_8_bit_kv_cache_is_for_the_checks_only_and_the_report_says_so() {
     let off = serde_json::to_value(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, ..Default::default() }).unwrap();
     assert!(off.get("kv_fp8").is_none());
 }
+
+
+// ------------------------------------------------------------------------------------------------------------------ change the settings and continue
+
+fn stopped_at_the_first_heal(p: &Project) -> (Mock, AutoState) {
+    let mut fx = Mock::new();
+    fx.stop_at = Some(8);          // inspect, measure, try x2, cut, check original, check cut, HEAL
+    let st = start(p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "stopped", "{:?}", st.error);
+    (fx, st)
+}
+
+#[test]
+fn the_lock_table_follows_the_state_of_the_steps() {
+    use ndforge_core::reshape::auto_change::lock_of;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (_, st) = stopped_at_the_first_heal(&p);
+    assert!(st.steps.iter().find(|s| s.id == "s1.heal").unwrap().started.is_some(), "the heal was begun");
+    for k in ["model_id", "target_b", "keep_thinking", "cut", "allow_many_blocks"] {
+        assert_eq!(lock_of(&st, k).state, "locked", "{k}");
+    }
+    for k in ["stages", "quick", "search_minutes"] {
+        assert_eq!(lock_of(&st, k).state, "locked", "{k}: the cut / Try first happened");
+    }
+    assert_eq!(lock_of(&st, "last_tokens_m").state, "free", "stage 2 has not started");
+    let a = lock_of(&st, "stage_a_tokens_m");
+    assert_eq!(a.state, "confirm");
+    assert!(a.redo.unwrap().contains("heal of stage 1 starts again") && a.reason.contains("has started"));
+    assert_eq!(lock_of(&st, "think_quick").state, "confirm", "the original was checked in the old mode");
+    for k in ["imatrix", "quants", "target_gb", "max_hours", "retry_heal", "vllm", "heal_rounds"] {
+        assert!(matches!(lock_of(&st, k).state, "free" | "confirm"), "{k}");
+    }
+    assert_eq!(lock_of(&st, "heal_rounds").state, "confirm");
+    assert_eq!(lock_of(&st, "unheard_of").state, "locked");
+}
+
+#[test]
+fn a_finished_stage_cannot_change_and_the_preview_names_what_would_be_redone_and_the_time() {
+    use ndforge_core::reshape::auto_change::{lock_of, preview};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut dry = Mock::new();
+    start(&project(tempdir().unwrap().path()), &mut dry, spec(21.1)).unwrap();
+    let second_heal = dry.all.iter().enumerate().filter(|(_, x)| x.starts_with("heal ")).nth(1).map(|(i, _)| i + 1).unwrap();
+    let mut fx = Mock::new();
+    fx.stop_at = Some(second_heal);          // stage 1 is healed and checked, stage 2's heal begins
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "stopped");
+    assert_eq!(lock_of(&st, "stage_a_tokens_m").state, "locked");
+    assert!(lock_of(&st, "stage_a_tokens_m").reason.contains("Stage 1 is healed already"));
+    let patch = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let h = ndforge_core::timing::History::default();
+    let pv = preview(&st, &patch(json!({"last_tokens_m": 20, "target_b": 18.0, "stage_a_tokens_m": 20})), Some(32.0), Some(900.0), &h);
+    assert_eq!(pv["ok"], false);
+    let refused: Vec<&str> = pv["refused"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+    assert!(refused.contains(&"target_b") && refused.contains(&"stage_a_tokens_m"), "{refused:?}");
+    let ok = preview(&st, &patch(json!({"last_tokens_m": 20})), Some(32.0), Some(900.0), &h);
+    assert_eq!(ok["ok"], true);
+    assert_eq!(ok["diff"][0]["text"], "you changed: heal tokens of the last stage (million) from the recipe's value to 20");
+    let (now, was) = (ok["remaining_h"].as_array().unwrap(), ok["was_remaining_h"].as_array().unwrap());
+    assert!(now[1].as_f64().unwrap() < was[1].as_f64().unwrap(), "fewer tokens: less time left: {now:?} against {was:?}");
+    assert_eq!(preview(&st, &patch(json!({"last_tokens_m": st.spec.last_tokens_m})), Some(32.0), Some(900.0), &h)["diff"], json!([]), "the same value is no change");
+}
+
+#[test]
+fn a_change_that_redoes_work_needs_the_confirmation_that_names_it() {
+    use ndforge_core::reshape::auto_change::apply;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (_, mut st) = stopped_at_the_first_heal(&p);
+    let patch = json!({"stage_a_tokens_m": 20}).as_object().unwrap().clone();
+    let h = ndforge_core::timing::History::default();
+    let err = apply(&mut st, &patch, false, Some(32.0), Some(900.0), &h, 1_800_000_000).unwrap_err().0;
+    assert!(err.contains("needs your confirmation") && err.contains("heal of stage 1 starts again") && err.contains("time left"), "{err}");
+    assert!(st.settings_changes.is_empty() && st.start_spec.is_none(), "nothing happened");
+    apply(&mut st, &patch, true, Some(32.0), Some(900.0), &h, 1_800_000_000).unwrap();
+    assert_eq!(st.settings_changes.len(), 1);
+    let c = &st.settings_changes[0];
+    assert_eq!((c["who"].clone(), c["confirmed"].clone()), (json!("person"), json!(true)));
+    assert!(c["redo"][0].as_str().unwrap().contains("heal of stage 1 starts again") && c["at"].as_str().unwrap().starts_with("2027"));
+    assert_eq!(st.spec.stage_a_tokens_m, Some(20));
+    assert_eq!(st.start_spec.as_ref().unwrap().stage_a_tokens_m, None, "the start spec is not rewritten");
+    assert_eq!(st.stages[0].plan.tokens_m, 20, "the stage whose heal is not finished takes the new number");
+    let refused = apply(&mut st, &json!({"target_b": 15.0}).as_object().unwrap().clone(), true, Some(32.0), Some(900.0), &h, 1).unwrap_err().0;
+    assert!(refused.contains("cannot change now") && refused.contains("target_b"));
+}
+
+#[test]
+fn stop_mid_way_continue_with_other_settings_and_nothing_finished_is_redone() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (mut fx, st) = stopped_at_the_first_heal(&p);
+    let before = fx.done.clone();
+    assert_eq!(before.iter().filter(|x| x.starts_with("cut ")).count(), 1);
+    let patch = json!({"last_tokens_m": 20, "imatrix": false, "retry_heal": false}).as_object().unwrap().clone();
+    let st2 = ndforge_core::reshape::auto::resume_with(&p, &mut fx, &st.id, Some((patch, false))).unwrap();
+    assert_eq!(st2.status, "done", "{:?}", st2.error);
+    let after: Vec<String> = fx.done[before.len()..].to_vec();
+    assert!(!after.iter().any(|x| x.starts_with("inspect") || x.starts_with("measure") || x.starts_with("try ") || x == "cut cut-1 from qwen3.8-27b blocks=0 drop=None width=Some(14080) reasoning=true"), "finished steps are not run again: {after:?}");
+    assert!(after.iter().filter(|x| x.starts_with("check cut-1 original") || x.starts_with("check cut-1 cut")).count() == 0, "the checks that were done are not repeated: {after:?}");
+    assert!(after.iter().any(|x| x.starts_with("heal cut-1 ") && x.contains("tokens=40")), "stage 1 keeps its 40 M: its heal had started but its number did not change");
+    assert!(after.iter().any(|x| x.starts_with("heal cut-2 ") && x.contains("tokens=20")), "the changed number is used by stage 2: {after:?}");
+    assert_eq!(fx.imatrix, vec![false], "the changed export option is used");
+    assert_eq!(st2.settings_changes.len(), 1);
+    assert_eq!(st2.start_spec.as_ref().unwrap().last_tokens_m, None);
+    let r = ndforge_core::reshape::auto_report::build(&st2);
+    assert_eq!(r["settings_changes"].as_array().unwrap().len(), 1);
+    let md = ndforge_core::reshape::auto_report::markdown(&r);
+    assert!(md.contains("## Settings changed while the run went on") && md.contains("heal tokens of the last stage") && md.contains("time left"), "{md}");
+    let again = load(&run_dir(&p, &st2.id)).unwrap();
+    assert_eq!(again.settings_changes, st2.settings_changes);
+    // a run that is done or running cannot change
+    let late = ndforge_core::reshape::auto::resume_with(&p, &mut Mock::new(), &st2.id, Some((json!({"imatrix": true}).as_object().unwrap().clone(), false))).unwrap_err().0;
+    assert!(late.contains("only be changed on a stopped or failed run"), "{late}");
+}
+
+#[test]
+fn suggestions_after_a_failed_heal_are_offered_unless_locked() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    let _ = start(&p, &mut fx, spec(21.1));
+    let st = latest(&p).unwrap();
+    assert_eq!(st.status, "failed");
+    let pv = ndforge_core::reshape::auto::change_preview(&p, &st.id, &serde_json::Map::new(), Some(32.0)).unwrap();
+    assert_eq!((pv["can_change"].clone(), pv["failed_step"].clone()), (json!(true), json!("s1.heal")));
+    let texts: Vec<String> = pv["suggestions"].as_array().unwrap().iter().map(|x| x["text"].as_str().unwrap().to_string()).collect();
+    assert!(texts.iter().any(|t| t.contains("ran out of memory")) && texts.iter().any(|t| t.contains("rounds")) && texts.iter().any(|t| t.contains("vLLM")), "{texts:?}");
+    assert!(pv["locks"].as_array().unwrap().iter().any(|l| l["key"] == "target_b" && l["state"] == "locked"));
+}

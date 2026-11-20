@@ -6,6 +6,7 @@ pub mod auto_fx;
 pub mod auto_plan;
 pub mod auto_progress;
 pub mod auto_report;
+pub mod auto_change;
 pub mod auto_speed;
 pub mod auto_time;
 pub mod heal_bench;

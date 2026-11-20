@@ -568,3 +568,52 @@ test("two quick clicks on different knobs while the table is stale both stick in
   assert.equal(s.imatrix, false); assert.equal(s.share_teacher_cache, false);
   assert.equal(isChecked(card(b), "imatrix", 1), true); assert.equal(isChecked(card(b), "share_teacher_cache", 1), true);
 });
+
+// ---- Change settings and continue
+
+function stoppedRun(open2) {
+  const b = browser();
+  open(b, {}, `ac.run = ${JSON.stringify(run("stopped", { id: "run-1" }))}; ac.plan = ${JSON.stringify(plan())};`);
+  return b;
+}
+const pv = (over = {}) => ({ ok: true, status: "stopped", can_change: true, current: { last_tokens_m: null, stage_a_tokens_m: null, think_quick: false, check_cut: true, retry_heal: true, back_off: true, imatrix: true, heal_rounds: null, share_teacher_cache: false },
+  failed_step: "s1.heal", error: null, diff: [], refused: [], confirm: [], accepted: [], remaining_h: [20, 30], was_remaining_h: [30, 44], suggestions: [{ text: "Heal in rounds of 5 M tokens ...", patch: { heal_rounds: { round_m: 5, check: "quick" } } }],
+  locks: [{ key: "last_tokens_m", state: "free", reason: "" }, { key: "stage_a_tokens_m", state: "confirm", reason: "The heal of stage 1 has started.", redo: "the heal of stage 1 starts again (the original's answers are made again for the new amount)" },
+    { key: "think_quick", state: "free", reason: "" }, { key: "stages", state: "locked", reason: "The cut of stage 1 is made already: the number of stages is fixed." }, { key: "heal_rounds", state: "free", reason: "" }], ...over });
+
+test("a stopped run offers Change settings and continue next to Continue", () => {
+  const b = stoppedRun();
+  const html = card(b);
+  assert.match(html, /id="ac-continue">Continue<\/button><button class="secondary" id="ac-change">Change settings and continue/);
+  assert.doesNotMatch(html, /id="acc-panel"/);
+  const b2 = browser();
+  open(b2, {}, `ac.run = ${JSON.stringify(run("running", { id: "run-1" }))}; ac.running = true; ac.plan = ${JSON.stringify(plan())};`);
+  assert.doesNotMatch(card(b2), /id="ac-change"/);
+});
+
+test("the panel greys locked knobs with the reason, shows the suggestions, the diff, the time left and asks for the confirmation", () => {
+  const b = stoppedRun();
+  b.run(`acc.open = true; acc.id = "run-1"; acc.pv = ${JSON.stringify(pv({ diff: [{ key: "stage_a_tokens_m", text: "you changed: heal tokens of the first stage (million) from the recipe's value to 20" }],
+    confirm: [{ key: "stage_a_tokens_m", reason: "x", redo: "the heal of stage 1 starts again (the original's answers are made again for the new amount)" }] }))}; acc.patch = { stage_a_tokens_m: 20 };`);
+  const html = card(b);
+  assert.match(html, /id="acc-panel"/); assert.match(html, /Suggestions for the step that stopped \(s1\.heal\)/); assert.match(html, /Heal in rounds of 5 M tokens/);
+  assert.match(html, /you changed: heal tokens of the first stage \(million\) from the recipe&#39;s value to 20|you changed: heal tokens of the first stage \(million\) from the recipe's value to 20/);
+  assert.match(html, /Time left: about 20-30 h \(was 30-44 h\)/);
+  assert.match(html, /needs your confirmation: the heal of stage 1 starts again/);
+  assert.match(html, /id="acc-confirmed"/);
+  assert.match(html, /id="acc-go" disabled/, "not before the confirmation");
+  b.run("acc.confirmed = true");
+  assert.doesNotMatch(card(b), /id="acc-go" disabled/);
+});
+
+test("a locked setting is disabled and the patch goes with the continue", async () => {
+  const calls = [];
+  const b = browser({ auto_start: (a) => { calls.push(a); return null; }, auto_change_preview: () => pv() });
+  open(b, {}, `ac.run = ${JSON.stringify(run("stopped", { id: "run-1" }))}; ac.plan = ${JSON.stringify(plan())}; acc.open = true; acc.id = "run-1"; acc.pv = ${JSON.stringify(pv({ diff: [{ text: "you changed: x" }] }))}; acc.patch = { last_tokens_m: 20 }; `);
+  const html = card(b);
+  assert.match(html, /data-acc-row="last_tokens_m"/); assert.doesNotMatch(html.split('data-acc-row="last_tokens_m"')[1].split("</li>")[0], /disabled/);
+  b.run("acc.pv.locks.push({ key: 'imatrix', state: 'locked', reason: 'The export has started.' })");
+  assert.match(card(b).split('data-acc-row="imatrix"')[1].split("</li>")[0], /disabled[\s\S]*The export has started/);
+  b.run(`wireAcc(); document.getElementById ? 0 : 0`);
+  assert.deepEqual(JSON.parse(JSON.stringify(b.run("acc.patch"))), { last_tokens_m: 20 });
+});

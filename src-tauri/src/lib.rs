@@ -1052,6 +1052,14 @@ fn vllm_selftest_files() -> Value {
     ndforge_core::vllm::selftest_files()
 }
 
+/// "What if I change these settings and continue?" for a stopped or failed Auto-cut run (nothing is changed): the diff, the locks, what needs a confirmation, the time left.
+#[tauri::command(async)]
+fn auto_change_preview(s: State<App>, id: String, patch: Value) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let m = match patch { Value::Object(m) => m, _ => serde_json::Map::new() };
+    ndforge_core::reshape::auto::change_preview(&p, &id, &m, card_vram_gb()).map_err(|e| e.to_string())
+}
+
 /// The report of the last vLLM self-test (null when there is none).
 #[tauri::command(async)]
 fn vllm_selftest_report() -> Value {
@@ -1111,7 +1119,11 @@ fn auto_plan(s: State<App>, spec: Value, inspect: Value) -> Out<Value> {
 /// Starts an Auto-cut (`resume` null) or continues a stopped or failed one (`resume` is its run id; `spec` is then ignored). Events on "reshape-event" tagged {"phase": "auto"}:
 /// the run's own {"kind": "auto", "auto_step", "status", "note"} and the jobs' events with "auto_step" added; the end is {"kind": "done", "data": <the run's state>} or {"kind": "error"}.
 #[tauri::command]
-fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value, resume: Option<String>) -> Out<()> {
+fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value, resume: Option<String>, changes: Option<Value>, confirmed: Option<bool>) -> Out<()> {
+    let changes: Option<(serde_json::Map<String, Value>, bool)> = match (&resume, changes) {
+        (Some(_), Some(Value::Object(m))) if !m.is_empty() => Some((m, confirmed.unwrap_or(false))),
+        _ => None,
+    };
     let spec: Option<ndforge_core::reshape::auto_plan::AutoSpec> = if resume.is_some() { None } else { Some(serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?) };
     let m = lock(&s);
     let p = m.project_clone().map_err(|e| e.to_string())?;
@@ -1134,7 +1146,7 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
         };
         let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), &mut wrapped);
         let r = match (&resume, spec) {
-            (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
+            (Some(id), _) => ndforge_core::reshape::auto::resume_with(&p, &mut fx, id, changes),
             (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
             _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
         };
@@ -1469,7 +1481,7 @@ fn queue_start_item(app: &tauri::AppHandle, it: &ndforge_core::queue::Item) -> O
     let text = |k: &str| a[k].as_str().unwrap_or("").to_string();
     let bad = |e: serde_json::Error| format!("The saved choice is not valid any more: {e}");
     match it.kind.as_str() {
-        "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from)),
+        "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from), a.get("changes").cloned().filter(|c| !c.is_null()), a["confirmed"].as_bool()),
         "export" => export_start(app.clone(), s, t, text("run"), text("quant"), a["num_ctx"].as_u64().or(a["numCtx"].as_u64()).unwrap_or(8192) as u32, a["what"].as_str().map(String::from),
             serde_json::from_value(a["quants"].clone()).map_err(bad)?, serde_json::from_value(a["imatrix"].clone()).map_err(bad)?, serde_json::from_value(a["mixed"].clone()).map_err(bad)?),
         "heal" => heal_start(app.clone(), s, t, text("name"), a["spec"].clone()),
@@ -1853,7 +1865,7 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

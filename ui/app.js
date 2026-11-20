@@ -3125,6 +3125,58 @@ function acRoundChips(st) {
   return `<div class="ac-rchips small" id="ac-rchips">${chips}</div>`;
 }
 
+// "Change settings and continue" for a stopped or failed run: the same knobs as the start screen, locked ones greyed with the reason, the diff, the time left, a confirmation for what would be redone
+const acc = { open: false, patch: {}, pv: null, busy: false, err: null, confirmed: false, id: null };
+const ACC_ROWS = [
+  ["last_tokens_m", "Heal tokens of the last stage (million)", "num", [null, 10, 20, 40, 80]], ["stage_a_tokens_m", "Heal tokens of the first stage (million)", "num", [null, 10, 20, 40, 80]],
+  ["think_quick", "Quick thinking checks (16 questions)", "bool"], ["check_cut", "Check the unhealed cut", "bool"], ["retry_heal", "Heal again when a check fails", "bool"], ["back_off", "Cut one step less after a second failed check", "bool"],
+  ["heal_rounds", "Heal in rounds of 5 M with a quick check after each (experimental)", "rounds"], ["share_teacher_cache", "Same sequence length in both stages", "bool"], ["imatrix", "Importance matrix for the export", "bool"],
+  ["vllm.teacher_cache", "vLLM for the original's answers (experimental)", "vl"], ["vllm.checks", "vLLM for the thinking checks (experimental)", "vl"], ["vllm.kv_fp8", "8-bit KV cache for the checks (experimental)", "vl"],
+];
+const accCur = (k) => { const c = (acc.pv && acc.pv.current) || {}, [a, b] = k.split("."); return b ? ((c[a] || {})[b] ?? false) : c[a]; };
+const accVal = (k) => { const [a, b] = k.split("."); if (b) { const cur = acc.patch[a] !== undefined ? acc.patch[a] : ((acc.pv && acc.pv.current) || {})[a]; return !!(cur || {})[b]; } return acc.patch[a] !== undefined ? acc.patch[a] : accCur(k); };
+async function accPreview() {
+  acc.busy = true; render();
+  try { acc.pv = await invoke("auto_change_preview", { id: acc.id, patch: acc.patch }); acc.err = null; } catch (e) { acc.err = String(e); }
+  acc.busy = false; render();
+}
+function accSet(k, v) {
+  const [a, b] = k.split(".");
+  if (b) { const cur = { ...(acc.patch[a] !== undefined ? acc.patch[a] : (((acc.pv || {}).current || {})[a] || {})) }; cur[b] = v; if (cur.kv_fp8 === false) delete cur.kv_fp8; acc.patch[a] = cur.teacher_cache || cur.checks || cur.kv_fp8 || cur.automatic ? { teacher_cache: !!cur.teacher_cache, checks: !!cur.checks, automatic: !!cur.automatic, ...(cur.kv_fp8 ? { kv_fp8: true } : {}) } : null; }
+  else acc.patch[a] = v;
+  acc.confirmed = false; accPreview();
+}
+function accPanel() {
+  const pv = acc.pv; if (!acc.open) return "";
+  const lock = (k) => ((pv && pv.locks) || []).find((l) => l.key === k.split(".")[0]) || { state: "free", reason: "" };
+  const rows = ACC_ROWS.map(([k, label, kind, opts]) => {
+    const l = lock(k), off = l.state === "locked" || acc.busy, v = accVal(k);
+    const input = kind === "num" ? `<select data-acc="${k}" ${off ? "disabled" : ""}>${opts.map((o) => `<option value="${o ?? ""}" ${(v ?? null) === o ? "selected" : ""}>${o == null ? "the recipe's" : o}</option>`).join("")}</select>`
+      : kind === "rounds" ? `<input type="checkbox" data-acc="${k}" ${v ? "checked" : ""} ${off ? "disabled" : ""}>` : `<input type="checkbox" data-acc="${k}" ${v ? "checked" : ""} ${off ? "disabled" : ""}>`;
+    return `<li class="${l.state === "locked" ? "dim" : ""}" data-acc-row="${esc(k)}"><label>${input} ${esc(label)}</label> ${l.state === "locked" ? `<span class="small">🔒 ${esc(l.reason)}</span>` : l.state === "confirm" ? `<span class="small warn">needs your confirmation: ${esc(l.redo || l.reason)}</span>` : ""}</li>`;
+  }).join("");
+  const sug = pv && pv.suggestions && pv.suggestions.length ? `<p class="small"><strong>Suggestions for the step that stopped${pv.failed_step ? ` (${esc(pv.failed_step)})` : ""}:</strong></p><ul class="small" id="acc-suggest">${pv.suggestions.map((x, i) => `<li>${esc(x.text)} <button class="secondary" data-acc-sug="${i}">Use</button></li>`).join("")}</ul>` : "";
+  const diff = pv && pv.diff && pv.diff.length ? `<ul id="acc-diff">${pv.diff.map((d) => `<li>${esc(d.text)}</li>`).join("")}</ul>` : `<p class="dim small" id="acc-diff">Nothing changed yet.</p>`;
+  const rem = pv && pv.remaining_h && pv.was_remaining_h ? `<p id="acc-remaining">Time left: about ${pv.remaining_h[0]}-${pv.remaining_h[1]} h (was ${pv.was_remaining_h[0]}-${pv.was_remaining_h[1]} h).</p>` : "";
+  const refused = pv && pv.refused && pv.refused.length ? pv.refused.map((r) => `<div class="err">${esc(r.key)}: ${esc(r.reason)}</div>`).join("") : "";
+  const conf = pv && pv.confirm && pv.confirm.length ? `<div class="warn" id="acc-confirm"><label class="opt"><input type="checkbox" id="acc-confirmed" ${acc.confirmed ? "checked" : ""}> I understand that this redoes: ${pv.confirm.map((c) => esc(c.redo || c.reason)).join("; ")}.</label></div>` : "";
+  const can = pv && pv.ok && !acc.busy && Object.keys(acc.patch).length && (!(pv.confirm || []).length || acc.confirmed);
+  return `<div class="card-in" id="acc-panel"><h3>Change settings and continue</h3>
+    <p class="dim small">Only settings that have not taken effect yet can change. The steps that are done are not run again, and the changes are kept in the run's report.</p>
+    ${sug}<ul class="plain">${rows}</ul>${diff}${rem}${refused}${conf}${acc.err ? `<div class="err">${esc(acc.err)}</div>` : ""}
+    <div class="row"><button class="primary" id="acc-go" ${can ? "" : "disabled"}>Continue with these settings</button><button class="secondary" id="acc-close">Cancel</button></div></div>`;
+}
+function wireAcc() {
+  const op = $("ac-change"); if (op) op.onclick = () => { acc.open = !acc.open; acc.id = ac.run && ac.run.id; acc.patch = {}; acc.pv = null; acc.confirmed = false; if (acc.open) accPreview(); else render(); };
+  document.querySelectorAll("[data-acc]").forEach((e) => e.onchange = () => { const k = e.dataset.acc; if (e.tagName === "SELECT") accSet(k, e.value === "" ? null : +e.value); else if (k === "heal_rounds") accSet(k, e.checked ? { round_m: 5, check: "quick" } : null); else accSet(k, e.checked); });
+  document.querySelectorAll("[data-acc-sug]").forEach((b) => b.onclick = () => { const x = acc.pv.suggestions[+b.dataset.accSug]; Object.assign(acc.patch, x.patch); acc.confirmed = false; accPreview(); });
+  const cf = $("acc-confirmed"); if (cf) cf.onchange = () => { acc.confirmed = cf.checked; render(); };
+  const cl = $("acc-close"); if (cl) cl.onclick = () => { acc.open = false; render(); };
+  const go = $("acc-go"); if (go) go.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing with the changed settings…"; acc.open = false; render();
+    try { await invoke("auto_start", { spec: null, resume: acc.id, changes: acc.patch, confirmed: acc.confirmed }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+}
 function autoCard() {
   const ins = acIns();
   if (!rs.state) return "";
@@ -3171,9 +3223,10 @@ function autoCard() {
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
-      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
+      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button><button class="secondary" id="ac-change">Change settings and continue</button>` : ""}
       ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
+    ${accPanel()}
     ${acProgressBlock(run, live)}
     ${live && !acProg(run) && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
     ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
@@ -3346,6 +3399,7 @@ function wireAuto() {
     ac.err = null; ac.report = null; ac.running = true; ac.text = "Starting…"; ac.progress = null; render();
     try { await invoke("auto_start", { spec: acSpec(), resume: null }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
   };
+  wireAcc();
   const co = $("ac-continue");
   if (co) co.onclick = async () => {
     ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing…"; render();
