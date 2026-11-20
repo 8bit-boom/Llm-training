@@ -106,31 +106,115 @@ def _origin(fn) -> str:
     return str(getattr(fn, "__module__", "") or "")
 
 
+# transformers 5.23 chooses the delta-rule implementation ONCE, at import time, inside the modeling module (there is no `chunk_gated_delta_rule` attribute on the layers any more): the
+# module's own globals, the closure of its torch reference, and the warning it logs when the fast path is not available are the evidence.
+FALLBACK_WARNINGS: list = []
+_FALLBACK_WORDS = ("fast path is not available", "falling back", "fall back", "flash-linear-attention", "causal-conv1d")
+
+
+def install_fallback_watch() -> None:
+    """Remembers the warnings transformers logs about a missing fast path (`FALLBACK_WARNINGS`); called when this module is imported, before any model is loaded."""
+    import logging
+    if any(getattr(h, "_nd_watch", False) for h in logging.getLogger("transformers").handlers):
+        return
+
+    class Watch(logging.Handler):
+        _nd_watch = True
+
+        def emit(self, record):
+            try:
+                msg = record.getMessage()
+            except Exception:       # noqa: BLE001
+                return
+            if any(w in msg.lower() for w in _FALLBACK_WORDS) and len(FALLBACK_WARNINGS) < 20:
+                FALLBACK_WARNINGS.append(msg[:300])
+
+    logging.getLogger("transformers").addHandler(Watch(level=logging.WARNING))
+
+
+try:
+    install_fallback_watch()
+except Exception:       # noqa: BLE001 - never stop an import
+    pass
+
+
+def _is_fla(fn) -> bool:
+    return _origin(fn).split(".")[0] in ("fla", "flash_linear_attention")
+
+
+def _callables_in(fn):
+    """The values a function can see besides its arguments: the cells of its closure and its module globals' callables of the same names."""
+    out = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            out.append(cell.cell_contents)
+        except ValueError:
+            pass
+    return out
+
+
+def _delta_rule(model_module) -> tuple:
+    """(\"fla\" | \"torch\" | \"unknown\", how) from the modeling module of the layers (a module object or None)."""
+    import sys
+    mod = sys.modules.get(model_module) if isinstance(model_module, str) else model_module
+    if mod is not None:
+        fn = getattr(mod, "chunk_gated_delta_rule", None)
+        if fn is not None:
+            return ("fla" if _is_fla(fn) else "torch"), "the module's chunk_gated_delta_rule"
+        flag = getattr(mod, "is_fast_path_available", None)
+        if isinstance(flag, bool):
+            return ("fla" if flag else "torch"), "the module's is_fast_path_available flag"
+        ref = getattr(mod, "torch_chunk_gated_delta_rule", None)
+        if ref is not None:
+            seen = _callables_in(ref) + [v for v in vars(mod).values() if callable(v) and not isinstance(v, type)]
+            if any(_is_fla(v) for v in seen if callable(v)):
+                return "fla", "an fla callable next to the torch reference"
+    if FALLBACK_WARNINGS:
+        return "torch", "transformers warned about a missing fast path: " + FALLBACK_WARNINGS[0][:120]
+    return "unknown", "no evidence in the module or in the warnings"
+
+
 def gdn_kernels(model):
-    """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed:
-    the first module that has `chunk_gated_delta_rule` gives {"delta_rule": "fla" | "torch", "conv": "causal_conv1d" | "kernels-hub" | "torch", "module": its class's module}.
-    None when the model has no such layer (or cannot be looked at)."""
+    """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed: {"delta_rule": "fla" | "torch" | "unknown",
+    "conv": / "causal_conv1d": "causal_conv1d" | "kernels-hub" | "torch" | "unknown", "how": what the answer is based on, "module": the layers' module}. None when the model has no such layer (or cannot
+    be looked at). Works for the older layers that carry `chunk_gated_delta_rule` AND for transformers 5.23, where the choice sits in the modeling module."""
     try:
+        layer = None
         for m in model.modules():
-            fn = getattr(m, "chunk_gated_delta_rule", None)
-            if fn is None:
-                continue
-            delta = "fla" if _origin(fn).split(".")[0] in ("fla", "flash_linear_attention") else "torch"
-            conv_fn = getattr(m, "causal_conv1d_fn", None)
+            if "gateddeltanet" in type(m).__name__.lower() or getattr(m, "chunk_gated_delta_rule", None) is not None:
+                layer = m
+                break
+        if layer is None:
+            return None
+        fn = getattr(layer, "chunk_gated_delta_rule", None)
+        if fn is not None:                                  # older versions: the layer holds the function
+            delta, how = ("fla" if _is_fla(fn) else "torch"), "the layer's chunk_gated_delta_rule"
+        else:
+            delta, how = _delta_rule(type(layer).__module__)
+        conv_fn = getattr(layer, "causal_conv1d_fn", None)
+        if conv_fn is not None:
             origin = _origin(conv_fn)
-            conv = "torch" if conv_fn is None else "kernels-hub" if origin.split(".")[0] in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2] else "causal_conv1d"
-            return {"delta_rule": delta, "conv": conv, "module": type(m).__module__}
+            conv = "kernels-hub" if origin.split(".")[0] in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2] else "causal_conv1d"
+        elif hasattr(layer, "causal_conv1d_fn"):
+            conv = "torch"
+        else:
+            import sys
+            mod = sys.modules.get(type(layer).__module__)
+            cf = getattr(mod, "causal_conv1d_fn", "missing") if mod is not None else "missing"
+            conv = "unknown" if cf == "missing" else ("torch" if cf is None else "causal_conv1d")
+        return {"delta_rule": delta, "conv": conv, "causal_conv1d": conv, "how": how, "module": type(layer).__module__}
     except Exception:       # noqa: BLE001 - looking must never stop a job
         return None
-    return None
 
 
 def gdn_note(info) -> str:
     """A plain sentence about slow kernels, or "" when the fast ones run (or there is nothing to say)."""
     if not info:
         return ""
+    if info.get("delta_rule") == "unknown":
+        return "It could not be found out which GatedDeltaNet kernels run (" + str(info.get("how", "")) + "): measure the speed (Heal card, Measure heal speed) before trusting it."
     if info.get("delta_rule") != "fla":
-        return "GatedDeltaNet runs on the slow PyTorch kernels (flash-linear-attention not installed)."
+        return "GatedDeltaNet runs on the slow PyTorch kernels (flash-linear-attention not installed or its import failed)."
     if info.get("conv") == "torch":
         return "The short convolution of GatedDeltaNet uses the PyTorch version (causal-conv1d not installed); that is a small part of the time."
     return ""
