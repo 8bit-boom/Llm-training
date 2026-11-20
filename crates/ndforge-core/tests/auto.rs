@@ -392,6 +392,8 @@ fn shape(st: &AutoState) -> Value {
     for s in o.get_mut("steps").and_then(|s| s.as_array_mut()).unwrap() {
         s.as_object_mut().unwrap().remove("started");
         s.as_object_mut().unwrap().remove("finished");
+        s.as_object_mut().unwrap().remove("attempts");          // a stop makes another attempt: the time of the steps is not part of "the same run"
+        s.as_object_mut().unwrap().remove("spent_s");
     }
     v
 }
@@ -2324,4 +2326,45 @@ fn a_failed_step_carries_the_last_lines_of_the_tool_into_its_note_and_the_report
     assert!(!row.contains("AssertionError"), "the steps table keeps one line: {row}");
     let json: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
     assert!(json["error"].as_str().unwrap().contains("AssertionError"));
+}
+
+#[test]
+fn step_seconds_add_up_over_every_attempt_and_old_runs_still_load() {
+    // a step that ran three times: a stop, a cut-off by closing the program, and the one that finished
+    let mut s = StepRec::new("s1.heal", "Heal");
+    for (a, b, outcome) in [("2026-11-20T01:00:00Z", "2026-11-20T04:00:00Z", "stopped"), ("2026-11-20T05:00:00Z", "2026-11-20T06:30:00Z", "cut off"), ("2026-11-20T07:00:00Z", "2026-11-20T10:45:00Z", "done")] {
+        s.started = Some(a.into());
+        s.finished = Some(b.into());
+        s.close(b, outcome);
+    }
+    assert_eq!(s.attempts.len(), 3);
+    assert_eq!(s.seconds(), Some(3 * 3600 + 5400 + 3 * 3600 + 2700), "the total is every attempt, not the last one (13,500 s)");
+    assert_eq!(s.attempts.iter().map(|a| a.seconds).sum::<i64>(), s.spent_s);
+    // a run saved before attempts existed: only started / finished, and it loads
+    let old: StepRec = serde_json::from_value(json!({"id": "s1.heal", "label": "Heal", "status": "done", "note": null, "started": "2026-11-20T07:00:00Z", "finished": "2026-11-20T10:45:00Z"})).unwrap();
+    assert!(old.attempts.is_empty() && old.spent_s == 0);
+    assert_eq!(old.seconds(), Some(13500), "an old run keeps its last-attempt time");
+}
+
+#[test]
+fn a_stop_a_continue_and_a_retry_leave_attempts_that_the_report_adds_up() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    start(&p, &mut fx, spec(21.1)).unwrap_err();           // the heal fails: one attempt of s1.heal
+    let st = latest(&p).unwrap();
+    let st = resume(&p, &mut fx, &st.id).unwrap();         // continued: a second attempt, done
+    assert_eq!(st.status, "done");
+    let heal = st.steps.iter().find(|s| s.id == "s1.heal").unwrap();
+    assert!(heal.attempts.len() >= 2, "{:?}", heal.attempts);
+    assert_eq!(heal.attempts[0].outcome, "failed");
+    assert_eq!(heal.attempts.last().unwrap().outcome, "done");
+    assert_eq!(heal.seconds(), Some(heal.attempts.iter().map(|a| a.seconds).sum::<i64>()));
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
+    let step = json["steps"].as_array().unwrap().iter().find(|s| s["id"] == "s1.heal").unwrap();
+    assert_eq!(step["seconds"].as_i64(), heal.seconds());
+    assert!(step["attempts"].as_array().unwrap().len() >= 2);
+    let total: i64 = st.steps.iter().filter_map(|s| s.seconds()).sum();
+    assert_eq!(json["active_minutes"].as_f64().unwrap(), (total as f64 / 60.0 * 10.0).round() / 10.0, "the report's total is the accumulated seconds");
 }

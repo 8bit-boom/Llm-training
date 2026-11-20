@@ -172,11 +172,48 @@ pub struct StepRec {
     /// the estimated minutes (middle) of the parts of the step in the order they run (`start`, `load`, `cache`, `train`, `merge` ...)
     #[serde(default)]
     pub est_parts: Vec<(String, f64)>,
+    /// the seconds of every finished attempt of this step added up (a stop and continue, a restart of the program or a retry each start another attempt: `started` / `finished` only hold the last one)
+    #[serde(default)]
+    pub spent_s: i64,
+    /// one entry per attempt that ran; a run saved before this existed has none (its time is `finished - started`)
+    #[serde(default)]
+    pub attempts: Vec<Attempt>,
+}
+
+/// One go at a step: from the moment it was marked running to the moment it ended (done, failed, stopped, taken up again, or cut off by closing the program).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub started: String,
+    pub finished: String,
+    pub seconds: i64,
+    pub outcome: String,
+}
+
+/// Seconds between two stamps of the state (`2026-11-20T01:19:00Z`); None when one cannot be read.
+pub(crate) fn stamp_secs(a: &str, b: &str) -> Option<i64> {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ").ok();
+    Some((parse(b)? - parse(a)?).num_seconds().max(0))
 }
 
 impl StepRec {
-    pub(crate) fn new(id: &str, label: &str) -> Self {
-        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None, est: None, est_parts: Vec::new() }
+    pub fn new(id: &str, label: &str) -> Self {
+        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None, est: None, est_parts: Vec::new(), spent_s: 0, attempts: Vec::new() }
+    }
+
+    /// Ends the attempt that is open (the step was running) at `end`.
+    pub fn close(&mut self, end: &str, outcome: &str) {
+        let Some(start) = self.started.clone() else { return };
+        let seconds = stamp_secs(&start, end).unwrap_or(0);
+        self.spent_s += seconds;
+        self.attempts.push(Attempt { started: start, finished: end.to_string(), seconds, outcome: outcome.to_string() });
+    }
+
+    /// The time the step took over ALL its attempts; a run saved before attempts were kept has only the last one (`finished - started`).
+    pub fn seconds(&self) -> Option<i64> {
+        if !self.attempts.is_empty() {
+            return Some(self.spent_s);
+        }
+        stamp_secs(self.started.as_deref()?, self.finished.as_deref()?)
     }
 }
 
@@ -415,12 +452,18 @@ enum Flow {
 fn mark(st: &mut AutoState, id: &str, status: &str, note: Option<String>) {
     let now = now();
     if let Some(s) = st.step_mut(id) {
+        let was_running = s.status == "running";
         s.status = status.into();
         if status == "running" {
             s.started = Some(now.clone());
             s.finished = None;
-        } else if status != "pending" {
-            s.finished = Some(now);
+        } else {
+            if was_running {
+                s.close(&now, if status == "pending" { "stopped or taken up again" } else { status });
+            }
+            if status != "pending" {
+                s.finished = Some(now);
+            }
         }
         if note.is_some() {
             s.note = note;
@@ -474,7 +517,11 @@ pub fn resume_with(p: &Project, fx: &mut dyn Effects, id: &str, changes: Option<
     st.status = "running".into();
     st.interrupted = false;
     st.error = None;
+    let last_seen = st.updated.clone();
     for s in st.steps.iter_mut().filter(|s| s.status == "failed" || s.status == "stopped" || s.status == "running") {
+        if s.status == "running" && s.finished.is_none() {
+            s.close(&last_seen, "cut off (the program was closed)");          // the attempt ended when the state was last saved
+        }
         s.status = "pending".into();
     }
     save(&dir, &mut st)?;
@@ -505,7 +552,9 @@ pub fn mark_interrupted(p: &Project) -> usize {
             if let Some(mut s) = load(&dir) {
                 s.status = "stopped".into();
                 s.interrupted = true;
+                let last_seen = s.updated.clone();
                 for r in s.steps.iter_mut().filter(|r| r.status == "running") {
+                    r.close(&last_seen, "cut off (the program was closed)");          // the attempt lasted until the state was last saved
                     r.status = "pending".into();
                 }
                 if save(&dir, &mut s).is_ok() {

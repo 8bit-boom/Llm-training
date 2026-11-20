@@ -683,3 +683,18 @@ fn the_estimate_of_the_heal_card_carries_the_rounds_and_flags_a_round_with_too_f
     // the memory estimate itself is the one of a normal heal
     assert_eq!(r["plan"], est(json!({"tokens_m": 40, "seq": 8192, "recipe": "thinking"}))["plan"]);
 }
+
+#[test]
+fn the_time_of_a_phase_that_was_stopped_is_kept_in_the_rounds_minutes() {
+    let plan = plan_of(spec_of(json!({})), 40, true);
+    let mut m = Mock::new(vec![bad(), good(), good()], vec![bad(), good()]);
+    m.stop_at = Some(2);
+    let (first, _) = drive(&mut m, &plan);
+    assert!(matches!(first, Outcome::Stopped(_)));
+    let st = m.state.clone().unwrap();
+    let lost: f64 = st["rows"].as_array().unwrap().iter().map(|r| r["lost_s"].as_f64().unwrap_or(-1.0)).sum();
+    assert!(lost >= 0.0, "the stopped phase left its time in `lost_s`: {st}");
+    m.stop_at = None;
+    let r = done(drive(&mut m, &plan).0);
+    assert!(r["rows"].as_array().unwrap().iter().all(|x| x["seconds"].as_f64().is_some()), "every round has its minutes");
+}

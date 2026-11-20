@@ -448,6 +448,13 @@ fn secs(since: std::time::Instant) -> f64 {
     (since.elapsed().as_secs_f64() * 10.0).round() / 10.0
 }
 
+/// The time of a phase that did not finish (stopped, failed): kept in the round's `lost_s` so that the round's minutes are wall-clock over every attempt, not only the last one.
+fn lose(jobs: &mut dyn RoundJobs, st: &mut Value, i: usize, row: &mut Value, t0: std::time::Instant) {
+    row["lost_s"] = json!(((row["lost_s"].as_f64().unwrap_or(0.0) + secs(t0)) * 10.0).round() / 10.0);
+    st["rows"][i] = row.clone();
+    jobs.save(st);
+}
+
 fn stopped(r: &Value) -> bool {
     r["stopped"].as_bool().unwrap_or(false)
 }
@@ -621,8 +628,15 @@ fn round_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &
         let t0 = std::time::Instant::now();
         let cumulative = row["tokens"].as_u64().unwrap_or(0);
         let upto = (cumulative as f64 * plan.share).round() as u64;
-        let r = jobs.cache(n, upto)?;
+        let r = match jobs.cache(n, upto) {
+            Ok(r) => r,
+            Err(e) => {
+                lose(jobs, st, i, &mut row, t0);
+                return Err(e);
+            }
+        };
         if stopped(&r) {
+            lose(jobs, st, i, &mut row, t0);
             return Ok(Some(Outcome::Stopped("cache".into())));
         }
         let done = r["done_rows"].as_u64().unwrap_or(0);
@@ -649,11 +663,19 @@ fn round_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &
     if row["trained"] != true {
         let t0 = std::time::Instant::now();
         let t = TrainRound { n, round_tokens, general_from: row["general_from"].as_u64().unwrap_or(0), general_to: row["general_to"].as_u64().unwrap_or(0), s_start: row["s_start"].as_u64().unwrap_or(0) };
-        let r = jobs.train(&t)?;
+        let r = match jobs.train(&t) {
+            Ok(r) => r,
+            Err(e) => {
+                lose(jobs, st, i, &mut row, t0);
+                return Err(e);
+            }
+        };
         if stopped(&r) {
+            lose(jobs, st, i, &mut row, t0);
             return Ok(Some(Outcome::Stopped("train".into())));
         }
         if r["round"]["complete"] == false {
+            lose(jobs, st, i, &mut row, t0);
             return Err(Error::new(format!("Round {n} did not finish training. Healing can be continued.")));
         }
         row["s_end"] = r["round"]["s_end"].clone();
@@ -675,8 +697,15 @@ fn round_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &
             Ok(m) => m,
             Err(step) => return Ok(Some(Outcome::Stopped(step))),
         };
-        let r = jobs.check_round(n, quick)?;
+        let r = match jobs.check_round(n, quick) {
+            Ok(r) => r,
+            Err(e) => {
+                lose(jobs, st, i, &mut row, t0);
+                return Err(e);
+            }
+        };
         if stopped(&r) {
+            lose(jobs, st, i, &mut row, t0);
             return Ok(Some(Outcome::Stopped("check".into())));
         }
         row["check"] = serde_json::to_value(check_of(mode_name(quick), &orig, &r)).unwrap_or(Value::Null);
@@ -685,10 +714,10 @@ fn round_step(plan: &Plan, jobs: &mut dyn RoundJobs, st: &mut Value, on_event: &
         jobs.save(st);
     }
     // 4. what next
-    let total: f64 = ["cache_s", "train_s", "check_s"].iter().map(|k| row[*k].as_f64().unwrap_or(0.0)).sum();
+    let total: f64 = ["cache_s", "train_s", "check_s", "lost_s"].iter().map(|k| row[*k].as_f64().unwrap_or(0.0)).sum();
     row["total_s"] = json!((total * 10.0).round() / 10.0);
     let typed = rows_of(st);
-    let slowest = st["rows"].as_array().map(|a| a.iter().filter_map(|r| r["total_s"].as_f64().or_else(|| Some(["cache_s", "train_s", "check_s"].iter().map(|k| r[*k].as_f64().unwrap_or(0.0)).sum::<f64>()))).fold(total, f64::max)).unwrap_or(total);
+    let slowest = st["rows"].as_array().map(|a| a.iter().filter_map(|r| r["total_s"].as_f64().or_else(|| Some(["cache_s", "train_s", "check_s", "lost_s"].iter().map(|k| r[*k].as_f64().unwrap_or(0.0)).sum::<f64>()))).fold(total, f64::max)).unwrap_or(total);
     let ctx = Ctx {
         cap: plan.cap, thinking: plan.thinking, stop_never: spec.never(), plateau: spec.plateau, strict: st["strict"] == true, now: jobs.now_secs(), deadline: spec.deadline,
         next_round_secs: slowest * 1.2, tail_secs: plan.tail_secs,

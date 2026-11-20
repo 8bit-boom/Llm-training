@@ -347,3 +347,7 @@ A stopped or failed run has a second button next to Continue: **Change settings 
 - **Steps**: done steps are kept as they are and never run again; steps the new settings add or drop are reconciled; stages whose heal is not finished take their new numbers.
 - **Suggestions** for the step that stopped (a failed heal is the common case): fewer tokens after an out-of-memory error, healing in rounds, vLLM off or on, quick checks, retry; locked ones are left out.
 - The same works through `auto_start {resume, changes, confirmed}`; `auto_change_preview {id, patch}` shows the diff, the locks and the time without touching the run.
+
+## Time totals after a stop, a restart or a retry
+
+A step's `started` / `finished` only describe its last attempt. The state now keeps every attempt (`attempts`: started, finished, seconds, outcome) and their sum (`spent_s`); the report's step seconds, "Time (the steps added up)", the "actual" column and the progress actuals use the sum. A run saved before this keeps its old numbers (the last attempt only). In a heal in rounds, a round's minutes are wall-clock over every attempt of its phases (`lost_s` holds the time of a phase that was stopped or failed), and the report says how the rounds, the merge and the final check add up to the heal step's time.
