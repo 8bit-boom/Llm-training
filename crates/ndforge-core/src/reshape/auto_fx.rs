@@ -124,7 +124,7 @@ impl Effects for RealEffects<'_> {
     }
 
     fn history(&self) -> crate::timing::History {
-        crate::timing::History::recent(60)
+        crate::vllm::history_with_measured(crate::timing::History::recent(60), Some(self.p))          // plus the numbers of your own vLLM self-test and teacher check
     }
     fn free_disk_gb(&self) -> Option<f64> {
         crate::envmgr::health::free_disk_gb(&runs::models_dir(self.p))
@@ -169,7 +169,71 @@ impl Effects for RealEffects<'_> {
         done(r, Ok)
     }
 
+    fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        if engine != "vllm" || gguf.is_some() || target == "gguf" {
+            return self.think_check(name, target, quick, gguf);
+        }
+        let s = crate::settings::Settings::load().vllm;
+        let fall = |me: &mut Self, why: String| -> Result<Out<Value>> {
+            let note = format!("{why} The standard engine does this check.");
+            (me.on_event)(tag(json!({"kind": "log", "text": note.clone()}), &me.step));
+            let r = me.think_check(name, target, quick, None)?;
+            Ok(match r {
+                Out::Done(mut v) => {
+                    v["engine_used"] = json!({"engine": "hf", "fallback": true, "requested": true, "note": note});
+                    Out::Done(v)
+                }
+                Out::Stopped => Out::Stopped,
+            })
+        };
+        if !s.enabled {
+            return fall(self, "vLLM is switched off in Settings.".into());
+        }
+        let facts = crate::vllm::preflight_now(&s);
+        if let Some(bad) = facts.iter().find(|c| c.light == crate::envmgr::health::Light::Fail) {
+            return fall(self, format!("vLLM cannot start now: {}", bad.detail));
+        }
+        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: None, load: None, batch: None, max_new: None, round: None, backend: Some("vllm".into()), engine: Some(crate::vllm::engine_job_with_card(&s)) };
+        let stop = self.stop.clone();
+        let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
+        let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);
+        if was_stopped(&r) {
+            return Ok(Out::Stopped);
+        }
+        match r {
+            Ok(mut v) => {
+                v["engine_used"] = json!({"engine": "vllm", "fallback": false, "engine_version": v["engine"]["vllm"], "startup_seconds": v["engine"]["startup_seconds"], "tokens_per_s": v["tokens_per_s"]});
+                Ok(Out::Done(v))
+            }
+            Err(e) => fall(self, format!("vLLM did not work ({}).", e.0.chars().take(200).collect::<String>())),
+        }
+    }
+
+    fn engine_cleanup(&mut self) {
+        let s = crate::settings::Settings::load().vllm;
+        if s.enabled {
+            let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);
+        }
+    }
+
     fn heal(&mut self, student: &Student, teacher_repo: &str, spec: &HealSpec) -> Result<Out<HealRef>> {
+        let mut spec = spec.clone();
+        let mut gate_note: Option<String> = None;
+        if spec.vllm_teacher() {
+            // the heal's own gate (settings, route, the saved check): a refusal is a fallback to the standard teacher with a note, unless the settings say vLLM is required
+            let dir = match student {
+                Student::Made(n) => runs::models_dir(self.p).join(n),
+                Student::Folder(f) => std::path::PathBuf::from(f),
+            };
+            if let Err(e) = runs::vllm_teacher_gate(&dir, &spec, teacher_repo, "cache") {
+                if crate::settings::Settings::load().vllm.teacher.required {
+                    return Err(e);
+                }
+                spec.vllm = None;
+                gate_note = Some(e.0);
+            }
+        }
+        let spec = &spec;
         let student = match student {
             Student::Made(name) => Source::Made { name: name.clone() },
             Student::Folder(path) => Source::Folder { path: path.clone() },
@@ -189,6 +253,15 @@ impl Effects for RealEffects<'_> {
                     }
                     None => spec.tokens_m,
                 };
+                // which engine made the original's answers (vLLM asked for): what the worker said, or why the heal went on with the standard teacher
+                if let Some(note) = &gate_note {
+                    summary.insert("teacher_engine".into(), json!({"used": false, "fallback": true, "problem": note}));
+                } else if spec.vllm_teacher() {
+                    let t = std::fs::read(runs::models_dir(self.p).join(name).join("heal.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|h| h["teacher_engine"].clone());
+                    if let Some(t) = t.filter(|t| t.is_object()) {
+                        summary.insert("teacher_engine".into(), t);
+                    }
+                }
                 Ok(HealRef { name: name.into(), model_id: id.into(), dir: dir.into(), tokens_m, summary: Some(Value::Object(summary)) })
             }
             _ => Err(Error::new("The heal did not give a model.")),

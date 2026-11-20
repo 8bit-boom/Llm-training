@@ -2049,7 +2049,11 @@ function renderTimeCard() {
 // Built from a research report and not yet run on this PC. Nothing is installed by the program; the status says what was found and what to install yourself.
 const vl = { status: null, busy: false, err: null, saved: null, report: undefined, run: null, model: "", confirm: false, adapter: "" };
 const VL_KINDS = [["auto", "Find it myself"], ["docker", "Docker Desktop (docker.exe)"], ["docker_wsl", "Docker inside WSL"], ["wslc", "WSLc (WSL 3.x containers, templates)"], ["wsl", "vLLM installed in WSL"], ["url", "A server that already runs"]];
-function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {} }; }
+function vllmSettings() { return (typeof state !== "undefined" && state && state.settings && state.settings.vllm) || { enabled: false, kind: "auto", image: "vllm/vllm-openai:v0.34.0", distro: "", venv: "~/.ndforge/vllm", url: "", model_volume: "ndforge-vllm-hf", model_dir: "", teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4", adapter_rounds: false, wslc: {}, teacher: VL_TEACHER_DEFAULT }; }
+const VL_TEACHER_DEFAULT = { enabled: false, route: "auto", pairs: { "Qwen/Qwen3.8-27B": "cyankiwi/Qwen3.8-27B-AWQ-INT4" }, confirmed: {}, required: false };
+const vllmTeacher = () => ({ ...VL_TEACHER_DEFAULT, ...(vllmSettings().teacher || {}) });
+const vlPairsText = (m) => Object.entries(m || {}).map(([a, b]) => `${a} = ${b}`).join("\n");
+const vlPairsParse = (t) => Object.fromEntries(String(t || "").split("\n").map((l) => l.split("=").map((x) => x.trim())).filter((p) => p.length === 2 && p[0] && p[1]));
 async function vllmDetect() {
   vl.busy = true; vl.err = null; render();
   try { vl.status = await invoke("vllm_status"); } catch (e) { vl.err = String(e); }
@@ -2069,9 +2073,23 @@ function renderVllm() {
     <div class="row">${f("vl-distro", "WSL distribution", v.distro, "(the default one)")}${f("vl-venv", "vLLM folder in WSL", v.venv, "~/.ndforge/vllm")}${f("vl-url", "Server address (way: url)", v.url, "http://127.0.0.1:8000")}</div>
     <div class="row">${f("vl-volume", "Docker volume for models", v.model_volume, "ndforge-vllm-hf")}${f("vl-dir", "Model folder (optional, slow under /mnt/)", v.model_dir, "")}${f("vl-teacher", "Pre-quantized original (27 B)", v.teacher_repo, "", 300)}</div>
     <div class="row"><label class="opt" title="Untested: LoRA on the linear-attention layers is reported garbled in some versions. The standard engine stays the exact way until an agreement run."><input type="checkbox" id="vl-adapter" ${v.adapter_rounds ? "checked" : ""}> Check the rounds of a heal (model + LoRA) with vLLM (untested, off)</label></div>
+    ${vllmTeacherCard()}
     <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
     <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
     ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+}
+// the original's answers through vLLM (docs/VLLM.md, "Teacher cache"): the teacher must be YOUR original model, so a pre-quantized copy is used only for the original it was made from
+function vllmTeacherCard() {
+  const t = vllmTeacher();
+  const route = (k, n) => `<option value="${k}" ${t.route === k ? "selected" : ""}>${esc(n)}</option>`;
+  return `<fieldset class="soft" id="vl-teacher-card"><legend>The original's answers through vLLM (experimental)</legend>
+    <p class="dim small">Off unless you tick it. The heal's teacher must be your ORIGINAL model. A pre-quantized checkpoint is a quantization of one repository, so it is used only for that original (the list below) or one you confirm; every other original is loaded from its own folder and quantized to 4 bits while loading, which is the standard teacher's number format (how vLLM does that is unverified and its speed unknown).</p>
+    <div class="row"><label class="opt"><input type="checkbox" id="vl-t-on" ${t.enabled ? "checked" : ""}> Offer "make the original's answers with vLLM" on the Heal card</label></div>
+    <div class="row"><label>Route <select id="vl-t-route">${route("auto", "Automatic: a confirmed copy, else 4-bit while loading")}${route("bnb", "Always 4-bit while loading, from the original's folder")}${route("prequant", "Only a confirmed pre-quantized copy (refuses otherwise)")}</select></label>
+      <label class="opt"><input type="checkbox" id="vl-t-required" ${t.required ? "checked" : ""}> A heal stops when vLLM does not work (else it goes on with the standard teacher and says so)</label></div>
+    <label>Confirmed pairs: original = its quantized copy, one per line (the default list holds the one the research report names)<textarea id="vl-t-pairs" rows="2" style="width:100%">${esc(vlPairsText(t.pairs))}</textarea></label>
+    <label>Copies you confirm: "this repository is a quantized copy of my original model", one per line: original = copy<textarea id="vl-t-confirmed" rows="2" style="width:100%" placeholder="your/original = your/original-AWQ">${esc(vlPairsText(t.confirmed))}</textarea></label>
+  </fieldset>`;
 }
 // the self-test: the report's 1-hour experiment, run for you (docs/VLLM.md). Everything stoppable; the engine is always stopped again.
 function renderVllmTest(v) {
@@ -2079,17 +2097,32 @@ function renderVllmTest(v) {
   const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
   const rep = r ? `<div class="${r.verdict === "pass" ? "ok" : r.verdict === "partial" ? "warn" : "err"}" id="vl-verdict"><strong>${esc(word[r.verdict] || r.verdict)}</strong>: ${esc(r.verdict_text)}
       <ul class="small">${(r.criteria || []).map((c) => `<li>${c.ok ? "✓" : c.ok === false ? "✕" : "?"} ${esc(c.label)}: ${esc(typeof c.value === "object" ? JSON.stringify(c.value) : c.value == null ? "not measured" : String(c.value))}</li>`).join("")}</ul>
-      <p class="dim small">Report: ${esc(r.report || "")} (also in the problem-report bundle). ${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
+      <p class="dim small">(also in the problem-report bundle). ${r.answer_tokens ? `Answers: median ${r.answer_tokens.median} tokens. ` : ""}${r.long_tokens_per_s != null ? `Long answers: ${r.long_tokens_per_s} tokens/s. ` : ""}${r.tokens_per_s != null ? `Measured: ${r.tokens_per_s} tokens/s in ${r.wall_seconds} s; engine ready after ${r.startup_seconds} s.` : ""}</p></div>` : "";
   return `<h3>vLLM self-test</h3><p class="dim small">Runs the research report's experiment for you: checks the driver and that a container can use the graphics card, starts the engine on a model, waits for it, asks the Quick thinking suite with 40 questions at once, measures start-up time and tokens per second, compares with your saved standard-engine numbers, stops the engine and writes a report with a plain verdict. A first run downloads the engine's image and the model.</p>
     <div class="row"><label>Model folder or Hugging Face id <input type="text" id="vl-tmodel" value="${esc(vl.model)}" placeholder="${esc(v.teacher_repo || "")}" style="min-width:320px"></label>
+      <span class="dim small">Empty = the default, ${esc(v.teacher_repo || "the configured pre-quantized original")} (about 21 GB, 4-bit). A 16-bit model larger than the card is refused before anything starts.</span>
       <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
     <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
-    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}`;
+    ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}${vllmFilesBox(vl.files, "vl-files", "The report is saved in:")}`;
+}
+// the report's folder as text, with Copy path / Open the folder / Copy the whole report, and the text inline (also after a failure): the owner must be able to paste it into an issue
+function vllmFilesBox(files, id, title) {
+  if (!files || !(files.exists || files.dir)) return "";
+  const dir = files.dir || "", text = files.markdown || files.text || "";
+  return `<div class="card-in" id="${id}"><p class="small">${esc(title)} <code class="vl-path" data-path>${esc(dir)}</code>
+    <button class="secondary" data-vlcopy="${esc(dir)}">Copy path</button><button class="secondary" data-vlopen="${esc(dir)}">Open the folder</button>${text ? `<button class="secondary" data-vlcopy-text="${id}">Copy the whole report</button>` : ""}</p>
+    ${text ? `<details ${files.open === false ? "" : "open"}><summary class="small">The report (text)</summary><pre class="vl-report small" id="${id}-text" style="white-space:pre-wrap;max-height:28em;overflow:auto">${esc(text)}</pre></details>` : `<p class="dim small">No report file yet.</p>`}</div>`;
+}
+function wireVllmFiles() {
+  document.querySelectorAll("[data-vlcopy]").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.vlcopy); b.textContent = "Copied"; } catch (_) { b.textContent = "Select the path and copy by hand"; } });
+  document.querySelectorAll("[data-vlcopy-text]").forEach((b) => b.onclick = async () => { const e = $(b.dataset.vlcopyText + "-text"); try { await navigator.clipboard.writeText(e ? e.textContent : ""); b.textContent = "Copied"; } catch (_) { b.textContent = "Select the text and copy by hand"; } });
+  document.querySelectorAll("[data-vlopen]").forEach((b) => b.onclick = async () => { try { await invoke("imatrix_open_folder", { path: b.dataset.vlopen }); } catch (e) { b.textContent = String(e).slice(0, 120); } });
 }
 async function vllmLoadReport() {
   vl.report = null;
   try { vl.report = await invoke("vllm_selftest_report"); } catch (_) { vl.report = null; }
+  try { vl.files = await invoke("vllm_selftest_files"); } catch (_) { vl.files = null; }
   try { render(); } catch (_) { /* a preview without a window */ }
 }
 function onVllmEvent(p) {
@@ -2104,10 +2137,12 @@ function wireVllm() {
     let wslc = {};
     try { wslc = JSON.parse(val("vl-wslc") || "{}"); } catch (_) { vl.err = "The WSLc templates are not valid JSON."; render(); return; }
     const v = { enabled: $("vl-enabled").checked, kind: val("vl-kind") || "auto", image: val("vl-image"), distro: val("vl-distro"), venv: val("vl-venv"), url: val("vl-url"), model_volume: val("vl-volume"), model_dir: val("vl-dir"),
-      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc };
+      teacher_repo: val("vl-teacher"), adapter_rounds: $("vl-adapter").checked, wslc,
+      teacher: { enabled: $("vl-t-on").checked, route: val("vl-t-route") || "auto", required: $("vl-t-required").checked, pairs: vlPairsParse(($("vl-t-pairs") || {}).value), confirmed: vlPairsParse(($("vl-t-confirmed") || {}).value) } };
     try { setState(await invoke("vllm_set", { vllm: v })); vl.err = null; vl.saved = "Saved."; } catch (e) { vl.err = String(e); vl.saved = null; }
     render();
   };
+  wireVllmFiles();
   const dt = $("vl-detect"); if (dt) dt.onclick = vllmDetect;
   const tm = $("vl-tmodel"); if (tm) tm.onchange = () => { vl.model = tm.value.trim(); };
   const ta = $("vl-tadapter"); if (ta) ta.onchange = () => { vl.adapter = ta.value.trim(); };
@@ -2539,6 +2574,35 @@ function hlRoundsTable(h, run) {
   return `<table id="hl-rounds-table" class="small"><thead><tr><th>Round</th><th>Tokens so far (M)</th><th>Finishes reasoning</th><th>Right</th><th>Loops</th><th>Score</th><th>Loss on your text</th><th>Decision</th><th>Time</th></tr></thead><tbody>${body}</tbody></table>${merged}${fin}`;
 }
 // the controls of the card
+// "Make the original's answers with vLLM (experimental)": only offered when Settings switch it on; the numbers are the person's own where they exist (docs/VLLM.md)
+const hlVllmAvailable = () => !!(vllmSettings().enabled && vllmTeacher().enabled);
+const vch = { run: null, err: null };
+function hlVllmBox(sp, est, busy) {
+  if (!hlVllmAvailable()) return "";
+  const v = est && est.vllm_teacher, ck = v && v.check && v.check.verdict ? v.check : null;
+  const fh = (m) => (m[0] / 60).toFixed(1) + " to " + (m[1] / 60).toFixed(1);
+  const verdict = ck ? `<p id="hl-vllm-verdict" class="${ck.verdict === "different" ? "err" : ck.verdict === "same" ? "ok" : "warn"}"><strong>Check: ${esc(ck.verdict)}</strong>${ck.current === false ? " (made for other settings: check again)" : ""}. ${esc(ck.text || "")}${ck.vllm ? ` <span class="dim">Start-up ${ck.vllm.startup_seconds != null ? Math.round(ck.vllm.startup_seconds) + " s" : "not timed"}, scoring ${ck.vllm.tokens_per_s != null ? Math.round(ck.vllm.tokens_per_s) + " tokens/s" : "not timed"}.</span>` : ""}</p>` : "";
+  let html = `<label class="opt"><input type="checkbox" id="hl-vllm" ${sp.vllm ? "checked" : ""} ${busy ? "disabled" : ""}> <strong>Make the original's answers with vLLM</strong> — experimental</label>`;
+  if (!sp.vllm) return html;
+  html += `<div id="hl-vllm-box" class="card-in">`;
+  if (v) {
+    html += `<p class="${v.route.route === "refused" ? "err" : "dim"} small" id="hl-vllm-route">${esc(v.route.reason)}</p><p id="hl-vllm-est">${esc(v.text)}</p>`;
+    html += (v.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("");
+    html += `<details><summary class="small">Where these numbers come from</summary><ul class="small dim">${(v.basis || []).map((b) => `<li>${esc(b)}</li>`).join("")}</ul></details>`;
+  }
+  html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
+  const running = vch.run !== null;
+  html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
+    <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
+    ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}</div>` : ""}</div>`;
+  return html;
+}
+function onVcheckEvent(p) {
+  if (p.kind === "progress") { if (vch.run) { vch.run.text = p.text || p.step; vch.run.progress = p.value; } }
+  else if (p.kind === "error") { vch.run = null; vch.err = p.text; }
+  else if (p.kind === "done") { vch.run = null; vch.err = null; try { rsHealEstimate(); } catch (_) { /* a preview without a window */ } }
+  if (page === "reshape") render();
+}
 function hlRoundsBox(h, sp, kn, est, busy, thinks, cap) {
   const d = busy ? "disabled" : "", rt = est && est.rounds ? est.rounds : null, tm = rt && rt.time;
   const label = thinks ? "Heal in rounds and check after each (stop early when it is good enough) — experimental" : "Heal in rounds and stop when the error stops falling — experimental";
@@ -2639,6 +2703,7 @@ function healCard(m, pair) {
     <div class="row">${sp.rounds ? "At most" : "Healing text:"} <select id="hl-tokens" ${busy ? "disabled" : ""}>${(h.tokens || []).map((x) => `<option value="${x.tokens_m}" ${x.tokens_m === tk ? "selected" : ""}>${x.tokens_m} million tokens</option>`).join("")}</select>
       <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
     ${hlRoundsBox(h, sp, kn, est, busy, recipeOn, tk)}${sp.rounds ? hlRoundsTable(h, run) : ""}
+    ${hlVllmBox(sp, est, busy)}
     ${mem}${loss}${note}
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
@@ -2646,7 +2711,7 @@ function healCard(m, pair) {
       <label>Learning rate<input type="text" id="hl-lr" value="${sp.lr}"></label>
       <label>Way<select id="hl-mode"><option value="" ${sp.mode ? "" : "selected"}>what fits (${esc(plan.mode)})</option><option value="cache" ${sp.mode === "cache" ? "selected" : ""}>the original answers first</option><option value="online" ${sp.mode === "online" ? "selected" : ""}>both at once</option></select></label></div></details>` : ""}
     ${expert ? healSettings(sp, kn, plan, busy, est && est.upcast_gb != null ? est.upcast_gb : h.upcast_gb, est && est.head_off_gb != null ? est : h) : ""}${oomBlock}
-    ${pfBox("heal", { tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
+    ${pfBox("heal", { ...(hlVllmAvailable() && sp.vllm ? { vllm_teacher: true } : {}), tokens_m: sp.tokens_m, mode: sp.mode || plan.mode, verdict: plan.verdict, verdict_text: plan.verdict_text, thinks: !pair && !!(rs.options && rs.options.inspect && rs.options.inspect.model_type === "qwen3_5"), name: m.name })}
     <div class="row"><button class="primary" id="hl-go" ${busy || plan.fits === false || !h.has_data || !rs.state.env_ready || blocked || (pair && !hsPassed()) || pfBlocked("heal") ? "disabled" : ""}>${oomFailed ? "Continue with the settings above" : resume ? "Continue healing" : "Start healing"}</button>${!pair ? quBtn("heal") : ""}<button class="secondary" id="hl-stop" ${run && run.running ? "" : "disabled"}>Stop</button></div>
     ${blocked ? `<p class="warn small">${esc(blocked)}</p>` : ""}${pair && !hsPassed() ? `<p class="warn small">The two models have not passed the check (or the choice changed since): press Check above.</p>` : ""}
     ${resume && h.heal ? `<p class="dim small">${oomFailed ? "Healing stopped: " + esc(h.heal.error || "") : st === "failed" ? "Healing stopped with an error: " + esc(h.heal.error || "") : "Healing was stopped"}${!oomFailed && h.heal.step ? " during step " + esc(h.heal.step) : ""}. ${oomFailed ? "The saved answers and the training so far are kept. A changed sequence length, LoRA size or top-k makes the original answer again or starts the learning again; the other settings go on from the last checkpoint." : "Continue goes on where it stopped."}</p>` : ""}
@@ -2843,7 +2908,7 @@ function madeCard(m) {
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
 let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
-  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
+  sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null, vl: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
 const AC_SPEED_PRESETS = [
@@ -2875,6 +2940,7 @@ function acKnobs() {
 const AC_THINK_KNOBS = ["think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal"];
 // the preset whose values the knobs have; "custom" when they are a mix (the thinking knobs do not count for a model that does not think)
 function acPresetNow() {
+  if (ac.sp.vl && (ac.sp.vl.teacher_cache || ac.sp.vl.checks || ac.sp.vl.automatic)) return "custom";
   const kn = acKnobs();
   const hit = AC_SPEED_PRESETS.find((p) => p.id !== "custom" && Object.entries(p.set).every(([k, v]) => {
     if (k === "search_minutes" || (!ac.thinking && AC_THINK_KNOBS.includes(k))) return true;      // how long the search looks is not part of what makes a recipe
@@ -2887,6 +2953,7 @@ function acApplyPreset(id) {
   const p = AC_SPEED_PRESETS.find((x) => x.id === id);
   if (!p) return;
   acApplySet(p.set);
+  if (id !== "custom") ac.sp.vl = null;          // a preset is a recipe without the experimental engine (the program does the same)
 }
 // a choice of a knob (or a preset) sets these spec fields
 function acApplySet(set) {
@@ -2895,6 +2962,7 @@ function acApplySet(set) {
     else if (k === "stage_a_tokens_m") ac.sp.stage_a = v; else if (k === "last_tokens_m") ac.sp.last = v; else if (k === "think_quick") ac.sp.tq = v;
     else if (k === "search_minutes") ac.sp.search = v;
     else if (k === "heal_rounds") ac.sp.hr = v ? { ...v } : null;
+    else if (k === "vllm") ac.sp.vl = v ? { ...v } : null;
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
@@ -2902,7 +2970,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -2962,7 +3030,7 @@ function acSpeedBlock(pl, live) {
   };
   const optRow = (k) => `<tr data-acknob="${esc(k.knob)}"><td>${esc(k.label)}<div class="dim small">${esc(k.risk)}</div></td><td>${k.options.map((o, i) => `<label class="opt ac-choice"><input type="radio" name="ac-k-${esc(k.knob)}" data-acknob="${esc(k.knob)}" data-acopt="${i}" ${acOptionOn(o) ? "checked" : ""} ${lock || (o.total_h ? "" : "disabled")}> ${esc(o.label)}
       <span class="dim small ac-delta">${acOptionOn(o) ? "now" : esc(acDelta(o.delta_min))}</span>${o.note ? `<div class="dim small">${esc(o.note)}</div>` : ""}</label>`).join("")}</td></tr>`;
-  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick"].includes(k.knob)) : [];
+  const knobs = sp ? sp.knobs.filter((k) => !["stages", "quick", "vllm"].includes(k.knob)) : [];
   const big = knobs.filter((k) => ["last_tokens_m", "stage_a_tokens_m", "share_teacher_cache"].includes(k.knob)), rest = knobs.filter((k) => !big.includes(k));
   const bud = pl && pl.budget;
   const budList = bud ? (bud.dropped.length ? `<div id="ac-budget-list"><p class="small">To fit ${esc(String(bud.max_hours))} hours these settings are given up (the estimate goes from ${esc(acTotal(bud.asked_h))} to ${esc(acTotal(bud.total_h))}):</p>
@@ -2984,6 +3052,27 @@ function acKnobDelta(pl, knob, labelStart) {
   return o && !o.current && o.delta_min ? ` <span class="dim small ac-delta">${esc(acDelta(o.delta_min))}</span>` : "";
 }
 
+// vLLM (experimental) in Auto-cut: two switches and "automatic", each with the change in time from YOUR measured numbers (the plan's own words), the prerequisites, and the decision of every step
+function acVllmBox(pl, lock) {
+  if (!vllmSettings().enabled) return "";
+  const v = ac.sp.vl || {}, rep = vl.report, mi = rep && rep.model_info;
+  const word = { pass: "Pass", partial: "Partly", fail: "Fail", stopped: "Stopped" };
+  const td = (label, on) => `<li class="${on ? "ok" : "warn"}">${on ? "✓" : "!"} ${label}</li>`;
+  const pre = [
+    td(rep ? `Self-test run: ${esc(word[rep.verdict] || rep.verdict)}${mi ? ` — measured on ${esc(mi.model)}${mi.params_b != null ? ` (${mi.params_b} B)` : ""}, ${esc(mi.quant || "")}; the plan scales its numbers by model size or does not use them when the size is more than 2 times different` : " (an older report: it does not say which model, so its numbers are not used)"}` : "The vLLM self-test has not been run: every vLLM time below is the research report's estimate", !!rep && !!mi),
+    td(rep && rep.long_tokens_per_s != null ? `Speed on long answers measured: ${rep.long_tokens_per_s} tokens per second` : "Speed on long (thinking-length) answers not measured: the Quick suite's short answers overstate it and are not used", !!rep && rep.long_tokens_per_s != null),
+    td("The check of the vLLM teacher (Heal card, \"Check the vLLM teacher\") is run for each made model: a teacher the check calls \"different\" is refused and the heal falls back to the standard teacher", false),
+  ].join("");
+  const dec = pl && pl.time && pl.time.vllm ? pl.time.vllm : null;
+  const reasons = dec ? `<ul class="small" id="ac-vllm-decisions">${dec.decisions.filter((d, i, a) => a.findIndex((x) => x.kind === d.kind && x.reason === d.reason) === i && d.reason).map((d) => `<li>${esc(d.reason)}</li>`).join("")}</ul><ul class="small dim">${dec.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  const delta = (l) => acKnobDelta(pl, "vllm", l);
+  return `<fieldset class="soft" id="ac-vllm"><legend>vLLM (experimental)</legend>
+    <p class="warn small">Built from a research report. It starts a container for every use: it pays for hours of the original's answers, and it does not pay for a short thinking check. A step that cannot use it goes on with the standard engine and the report says so.</p>
+    <label class="opt"><input type="checkbox" id="ac-vl-t" ${v.teacher_cache && !v.automatic ? "checked" : ""} ${lock}> The original's answers with vLLM${delta("The original's answers")}</label>
+    <label class="opt"><input type="checkbox" id="ac-vl-c" ${v.checks && !v.automatic ? "checked" : ""} ${lock}> The thinking checks with vLLM${delta("The thinking checks")}</label>
+    <label class="opt"><input type="checkbox" id="ac-vl-a" ${v.automatic ? "checked" : ""} ${lock}> Automatic: vLLM only for a step where its estimate is lower than the standard engine's (the plan says why)${delta("Automatic")}</label>
+    <ul class="small" id="ac-vllm-pre">${pre}</ul>${reasons}</fieldset>`;
+}
 // "Healing in 5 M rounds: about A-B h if the first check passes, up to C-D h." for every stage, and the warnings once (the plan's own words)
 function acRoundsPlan(pl) {
   if (!pl || !pl.time || !ac.sp.hr) return "";
@@ -3043,7 +3132,7 @@ function autoCard() {
     <label class="opt"><input type="checkbox" id="ac-gbon" ${ac.gbOn ? "checked" : ""} ${lock}> Also make a file of about <input type="text" id="ac-gb" value="${esc(ac.gb)}" placeholder="10.6" style="width:70px;flex:0" ${lock}> GB (measured mixed precision) and compare it with the plain sizes</label>
     ${ac.gbOn ? `<p class="dim small" id="ac-gbnote">Each tensor gets the type that spends the bytes best (measured on the healed model's weights, weighted by its importance matrix), then <strong>Compare quants</strong> (KL divergence) checks the file against the plain sizes next to it. It is published only when it is clearly better than the plain file of its size.${pl && pl.measured_minutes ? ` About ${Math.round(pl.measured_minutes[0])} min to measure and ${Math.round(pl.measured_minutes[1])} min to compare (guesses). The 16-bit file is kept until the comparison is done, so this needs more disk.` : ""}${!(+ac.gb > 0) ? ` <span class="warn" id="ac-gbwhy">Give the size in GB.</span>` : ""}</p>` : ""}
     ${studio}
-    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${sizes}${live ? "" : acTimeBlock(pl)}`}
+    ${ac.planErr ? `<div class="err">${esc(ac.planErr)}</div>` : !pl ? `<p class="dim">Planning…</p>` : ""}${notes}${acVllmBox(pl, lock)}${sizes}${live ? "" : acTimeBlock(pl)}`}
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
@@ -3206,6 +3295,8 @@ function wireAuto() {
     if (y && typeof window.scrollTo === "function") window.scrollTo(0, y);
   });
   const pr = $("ac-pin-remove"); if (pr) pr.onclick = () => { ac.pin = null; ac.err = null; render(); };
+  const vlset = (k) => (e) => { const cur = ac.sp.vl || { teacher_cache: false, checks: false, automatic: false }; if (k === "automatic") { cur.automatic = e.checked; if (e.checked) { cur.teacher_cache = false; cur.checks = false; } } else { cur[k] = e.checked; if (e.checked) cur.automatic = false; } ac.sp.vl = cur.teacher_cache || cur.checks || cur.automatic ? cur : null; };
+  set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
@@ -3281,8 +3372,8 @@ function thinkCard(m) {
   return `<div class="card-in" id="tk-card"><h3>Thinking check</h3>${guard}
     <p class="dim small">Does the model still think before it answers? It is asked ${quick ? 16 : 32} short questions (sums, logic, what a program prints, counting) with thinking switched on, and the table says how often it writes a reasoning trace, finishes it, finds the right answer and avoids loops. ${quick ? "Quick: about 10 minutes for a large model." : "Full: about 15 minutes for a large model."}</p>
     <div class="row"><label><input type="radio" name="tk-mode" value="quick" ${quick ? "checked" : ""}> Quick (16 questions)</label> <label><input type="radio" name="tk-mode" value="full" ${quick ? "" : "checked"}> Full (32 questions)</label></div>
-    ${tkBackendRow()}${be === "vllm" ? `<p class="warn small" id="tk-vllm-note">vLLM is experimental: built from a research report and not yet run on this PC (run the vLLM self-test in Training setup first). Its numbers are kept apart from the standard engine's: a model is compared with the original checked the same way.</p>` : ""}
-    ${pfBox("think_check", be === "vllm" ? { backend: "vllm" } : {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
+    ${tkBackendRow()}${be === "vllm" ? `<p class="warn small" id="tk-vllm-note">vLLM is experimental: built from a research report and not yet run on this PC (run the vLLM self-test in Training setup first). Its numbers are kept apart from the standard engine's: a model is compared with the original checked the same way. For the ORIGINAL, vLLM loads the original itself (its own folder, quantized to 4 bits while loading) unless it fits the card in 16 bits; a pre-quantized checkpoint stands in only for the original it was made from or a copy you confirmed in Settings. If neither works, the standard engine checks the original and the result says so. The preflight below names the model vLLM would load.</p>` : ""}
+    ${pfBox("think_check", be === "vllm" ? { backend: "vllm", name: rs.tk.name, target: "original" } : {})}<div class="row">${btn("original", "the original")}${btn("cut", "the cut model")}${m.healed ? btn("healed", "the healed model") : ""}</div>
     <div class="row">${gg}<input id="tk-gguf" type="text" placeholder="…or the path of a GGUF file (run with llama.cpp)" value="${esc(tk.gguf)}" style="min-width:18em">${btn("gguf", "this GGUF")}</div>
     ${tk.run && tk.run.name === m.name ? `<div class="stepline" aria-live="polite">${esc(tk.run.text)}</div>${tk.run.progress != null ? `<progress max="1" value="${tk.run.progress}"></progress>` : ""}<div class="row"><button class="secondary" id="tk-stop">Stop</button></div>` : ""}
     ${tk.err ? errDiv(tk.err, "p") : tk.ok ? `<p class="ok">${esc(tk.ok)}</p>` : ""}${note}${table}</div>`;
@@ -3962,6 +4053,7 @@ function onReshapeEvent(p) {
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
+  if (p.phase === "vllm_teacher_check") return onVcheckEvent(p);
   if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "healbench") return onHealBenchEvent(p);
@@ -4012,7 +4104,8 @@ function rsHealSpec() {
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
     kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null, head_checkpoint: sp.head_checkpoint === "off" ? "off" : null,
-    ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}) };
+    ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}),
+    ...(hlVllmAvailable() && sp.vllm ? { vllm: { teacher_cache: true } } : {}) };
 }
 
 async function rsMeasure(force) {
@@ -4086,6 +4179,10 @@ function wireReshape() {
   document.querySelectorAll("[data-rstest-healed]").forEach((b) => b.onclick = runTest(b.dataset.rstestHealed, "healed"));
   // healing
   const hs = rs.hlSpec, hv = (id, fn) => { const e = $(id); if (e) e.onchange = () => { fn(e); render(); rsHealEstimate(); }; };
+  hv("hl-vllm", (e) => { hs.vllm = e.checked; });
+  wireVllmFiles();
+  const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
   hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again
     hs.recipe = e.checked; hs.tokens_m = null; hs.shareSet = false;

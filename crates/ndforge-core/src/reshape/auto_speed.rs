@@ -44,7 +44,7 @@ pub fn default_preset(total_b: f64) -> &'static str {
 }
 
 /// The AutoSpec fields the presets set (the speed knobs).
-pub const KNOBS: [&str; 14] = ["search_minutes", "stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix", "heal_rounds"];
+pub const KNOBS: [&str; 15] = ["search_minutes", "stages", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "quick", "think_quick", "think_gate", "think_gate_n", "check_cut", "retry_heal", "back_off", "imatrix", "heal_rounds", "vllm"];
 
 impl AutoSpec {
     /// The spec with the values of preset `id` on top of it (everything that is not a speed knob stays). "custom" only names the choice.
@@ -56,6 +56,9 @@ impl AutoSpec {
                 o.insert(k.clone(), x.clone());
             }
             o.insert("preset".into(), Value::String(p.id.clone()));
+            if p.id != "custom" {
+                o.remove("vllm");          // a preset is a recipe without the experimental engine: only a custom choice has vLLM (docs/AUTO_CUT.md)
+            }
         }
         serde_json::from_value(v).map_err(|e| Error::new(format!("The preset {id} does not fit the spec: {e}")))
     }
@@ -129,6 +132,10 @@ pub fn speed_warnings(spec: &AutoSpec, stages: &[StagePlan], natural_seq: &[u32]
     if !spec.imatrix {
         w.push("No importance matrix is measured for the export: the small sizes (Q4 and below) are made without it and are a little less exact.".into());
     }
+    if let Some(v) = spec.vllm.as_ref().filter(|v| v.any()) {
+        w.push(format!("Experimental: vLLM {} (docs/VLLM.md). Built from a research report and not run on a real heal yet; a step that cannot use it goes on with the standard engine and the report says which steps used it.",
+                       if v.automatic { "is used for a step only where its estimate is lower than the standard engine's".to_string() } else { format!("makes {}", [(v.teacher_cache, "the original's answers"), (v.checks, "the thinking checks")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join(" and ")) }));
+    }
     if let Some(r) = &spec.heal_rounds {
         w.push(format!("Experimental: every stage heals in rounds of {} M tokens and stops at the first round whose thinking check passes. Whether healing in rounds ends as good as one long heal is not known yet. {}", r.round_m, knob_risk("heal_rounds")));
     }
@@ -167,6 +174,7 @@ pub fn knob_risk(knob: &str) -> &'static str {
         "last_tokens_m" => "Fewer tokens is linearly faster and learns less. Below the recipe a model that thinks has failed the thinking checks before; on 20 M tokens it will very likely fail them and the run may end without a model to keep.",
         "back_off" => "Without it the run ends with its report when a stage still fails; with it a stage is made again, larger.",
         "imatrix" => "The small sizes (Q4 and below) are made without it and are a little less exact.",
+        "vllm" => "Experimental, built from a research report. The engine takes minutes to start for every use; it pays for hours of the original's answers and not for a short thinking check. Its answers differ a little from the standard engine's (the teacher's through a check you run first). A step that cannot use it goes on with the standard engine.",
         "heal_rounds" => "Experimental. A quick check asks 16 questions, so one or two answers decide pass or fail; that is why the merged model is checked again at the end, and if it fails there healing goes on and then needs two passed checks in a row. The checks during healing look at the model as it is trained (4-bit with the learning on top); the merged model can score a little differently, and the merged check decides. Every round adds about 25 minutes of loading and checking. Whether healing in rounds ends as good as one long heal is not known yet.",
         _ => "",
     }
@@ -348,6 +356,22 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
             option("Off: one heal on the whole budget (recipe)".into(), set_of(&[("heal_rounds", Value::Null)]), &eq(None), None),
             option("5 M rounds, quick checks".into(), set_of(&[("heal_rounds", hr(5))]), &eq(Some(5)), note.clone()),
             option("10 M rounds, quick checks".into(), set_of(&[("heal_rounds", hr(10))]), &eq(Some(10)), note),
+        ] });
+    }
+    {
+        // vLLM (experimental): the time is the measured one of this PC where there is one, the research report's estimate otherwise (the note says which)
+        let nums = crate::vllm_plan::Numbers::from_history(history);
+        let note = Some(if nums.startup_s.is_some() { format!("Experimental. The engine's start-up ({:.1} min) is measured by your own self-test; the scoring speed {}.", nums.startup_s.unwrap_or(0.0) / 60.0, if nums.score_tps.is_some() { "is measured by your teacher check" } else { "is the report's estimate, not measured" }) }
+                         else { "Experimental. Nothing is measured on this PC yet (run the vLLM self-test): the numbers are the research report's estimates.".to_string() });
+        let v = |t: bool, c: bool, a: bool| serde_json::json!({"teacher_cache": t, "checks": c, "automatic": a});
+        let eq = |x: Option<crate::vllm_plan::AutoVllm>| { let now = spec.vllm.clone(); move |_: &AutoPlan, _: &AutoSpec| now == x };
+        let av = |t: bool, c: bool, a: bool| Some(crate::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a });
+        knobs.push(SpeedKnob { knob: "vllm".into(), label: "vLLM engine (experimental)".into(), risk: knob_risk("vllm").into(), options: vec![
+            option("Off (recipe)".into(), set_of(&[("vllm", Value::Null)]), &eq(None), None),
+            option("The original's answers with vLLM".into(), set_of(&[("vllm", v(true, false, false))]), &eq(av(true, false, false)), note.clone()),
+            option("The thinking checks with vLLM".into(), set_of(&[("vllm", v(false, true, false))]), &eq(av(false, true, false)), note.clone()),
+            option("Both".into(), set_of(&[("vllm", v(true, true, false))]), &eq(av(true, true, false)), note.clone()),
+            option("Automatic: vLLM only where it is faster".into(), set_of(&[("vllm", v(false, false, true))]), &eq(av(false, false, true)), note),
         ] });
     }
     knobs.push(SpeedKnob { knob: "back_off".into(), label: "Cut one step less after a second failed check".into(), risk: knob_risk("back_off").into(), options:
@@ -563,6 +587,9 @@ pub fn deviations(spec: &AutoSpec, stages: &[StagePlan], total_b: f64) -> Vec<De
     }
     if !spec.imatrix {
         add("imatrix", "Importance matrix for the export", "off".into(), "on".into());
+    }
+    if let Some(x) = spec.vllm.as_ref().filter(|x| x.any()) {
+        add("vllm", "vLLM engine (experimental)", if x.automatic { "automatic: only where it is faster".to_string() } else { [(x.teacher_cache, "the original's answers"), (x.checks, "the thinking checks")].iter().filter(|p| p.0).map(|p| p.1).collect::<Vec<_>>().join(" and ") }, "off".into());
     }
     if let Some(r) = &spec.heal_rounds {
         add("heal_rounds", "Heal in rounds (experimental)", format!("rounds of {} M tokens, {} thinking checks, stop at the first pass", r.round_m, if r.quick() { "quick" } else { "full" }), "one heal on the whole budget".into());

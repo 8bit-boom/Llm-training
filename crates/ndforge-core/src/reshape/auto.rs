@@ -121,6 +121,14 @@ pub trait Effects {
     fn cut(&mut self, spec: &ReshapeSpec) -> Result<Out<CutRef>>;
     /// One thinking check (`target`: original | cut | healed | gguf) of the model folder `name`; returns the worker's result (`main`, ...).
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>>;
+    /// The same check through `engine` ("hf": the standard engine, "vllm": the experimental vLLM engine). The result may carry `engine_used` (`{"engine", "fallback", "note", ...}`): vLLM that could not
+    /// do it falls back to the standard engine on its own and says so there. The default ignores the engine.
+    fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        let _ = engine;
+        self.think_check(name, target, quick, gguf)
+    }
+    /// Stops any vLLM engine that is still running (a crash, a Stop): called before a step that is not a vLLM step, so that the card is free for training and the other jobs.
+    fn engine_cleanup(&mut self) {}
     /// Heals `student` with `teacher_repo` (the original model) as the teacher.
     fn heal(&mut self, student: &Student, teacher_repo: &str, spec: &HealSpec) -> Result<Out<HealRef>>;
     /// Deletes what Auto-cut made (only ever something in the state's list of `Made`).
@@ -255,6 +263,12 @@ pub struct AutoState {
     /// the cuts the search found best (aligned with the rows of `try_result`): the thinking gate and the check of the first stage's cut read them instead of the planner's own list; None for a classic Try first
     #[serde(default)]
     pub try_cands: Option<Vec<Candidate>>,
+    /// experimental vLLM: one entry per step that was planned to use it: `{"step", "kind", "engine": "vllm" | "hf", "fallback", "note", "startup_seconds", "tokens_per_s", "teacher_quant", "estimated_min", ...}`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<Value>,
+    /// the engine the baseline (the original's check) was made with: every later check of the run uses the same one ("vllm" | "hf"); None until the first check
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_engine: Option<String>,
 }
 
 impl AutoState {
@@ -262,7 +276,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None, try_cands: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None, try_cands: None, engines: Vec::new(), check_engine: None,
         }
     }
 
@@ -588,6 +602,9 @@ macro_rules! out {
 
 fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> Result<Flow> {
     let _ = p;
+    if st.spec.vllm.as_ref().is_some_and(|v| v.any()) {
+        fx.engine_cleanup();          // the card is free before every step: vLLM takes most of it and must never run next to a training or another job
+    }
     match id {
         "plan" => step_plan(st, fx),
         "measure" => step_measure(st, fx),
@@ -609,6 +626,78 @@ fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> 
             }
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------------------------ vLLM (experimental, docs/AUTO_CUT.md)
+
+fn vllm_decision<'a>(st: &'a AutoState, key: &str) -> Option<&'a crate::vllm_plan::Decision> {
+    st.plan.as_ref().and_then(|p| p.time.as_ref()).and_then(|t| t.vllm.as_ref()).and_then(|v| v.decision(key))
+}
+
+/// What the plan says about a step's use of vLLM, recorded with what really happened (`used`: the worker's or the effects' account of the step) in the state and, for a fallback, in the notes.
+fn record_engine(st: &mut AutoState, key: &str, kind: &str, used: Option<&Value>) {
+    let d = vllm_decision(st, key).cloned();
+    let engine = used.and_then(|u| u["engine"].as_str()).unwrap_or("hf").to_string();
+    let fallback = used.map(|u| u["fallback"] == true || (u["engine"] == "hf" && u["requested"] == true)).unwrap_or(false);
+    let mut rec = json!({"step": key, "kind": kind, "engine": engine, "fallback": fallback, "planned_vllm": d.as_ref().is_some_and(|d| d.use_vllm)});
+    if let Some(u) = used {
+        for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "engine_version", "teacher_check", "problem", "unchecked"] {
+            if !u[k].is_null() {
+                rec[k] = u[k].clone();
+            }
+        }
+        if rec["engine_version"].is_null() && !u["engine"].is_null() && u["engine"] != "hf" {
+            rec["engine_version"] = u["engine"].clone();
+        }
+    }
+    if let Some(d) = &d {
+        rec["estimated_min"] = json!({"vllm": d.vllm_min, "standard": d.standard_min, "measured_basis": d.measured});
+    }
+    if fallback {
+        let why = used.and_then(|u| u["note"].as_str().or(u["problem"].as_str())).unwrap_or("it did not work");
+        st.notes.push(format!("vLLM could not be used for {key} ({why}); the standard engine did it and the run went on."));
+    }
+    st.engines.retain(|e| e["step"] != json!(key));
+    st.engines.push(rec);
+}
+
+/// One thinking check of the run's step `step` (`s1.check_cut`, `think_gate` ...): through vLLM when the plan chose it for the run's checks, else the standard way. ONE engine for the checks of
+/// a run: a check is judged against the original's, and a result is only comparable to one made by the same engine. When a vLLM check falls back to the standard engine, the original is checked
+/// again that way so the later comparisons stay honest.
+fn run_check(st: &mut AutoState, fx: &mut dyn Effects, step: &str, name: &str, target: &str) -> Result<Out<Value>> {
+    let quick = st.spec.think_quick();
+    let want = match st.check_engine.as_deref() {
+        Some(e) => e == "vllm",
+        None => vllm_decision(st, "checks").is_some_and(|d| d.use_vllm),
+    };
+    let key = format!("{step}:{target}");
+    if !want {
+        let r = fx.think_check(name, target, quick, None)?;
+        if let Out::Done(_) = &r {
+            st.check_engine.get_or_insert_with(|| "hf".into());
+        }
+        return Ok(r);
+    }
+    fx.engine_cleanup();          // a vLLM job starts on a free card
+    let r = fx.think_check_with(name, target, quick, None, "vllm")?;
+    let Out::Done(v) = r else { return Ok(Out::Stopped) };
+    let used = v.get("engine_used").cloned();
+    let fell = used.as_ref().is_some_and(|u| u["engine"] != "vllm");
+    if !fell {
+        st.check_engine.get_or_insert_with(|| "vllm".into());
+        record_engine(st, &key, "checks", Some(&used.clone().unwrap_or_else(|| json!({"engine": "vllm", "fallback": false}))));
+        return Ok(Out::Done(v));
+    }
+    // vLLM did not work for this check: the standard engine did it. The baseline made by vLLM cannot be compared with it, so the original is checked the standard way too
+    record_engine(st, &key, "checks", Some(&json!({"engine": "hf", "fallback": true, "requested": true, "note": used.as_ref().and_then(|u| u["note"].as_str()).unwrap_or("it did not work")})));
+    if st.check_engine.as_deref() == Some("vllm") && st.baseline.is_some() && target != "original" {
+        st.notes.push("The original's thinking check was made with vLLM and a later check could not be: the original is checked again with the standard engine so that the two can be compared.".into());
+        let b = fx.think_check(name, "original", quick, None)?;
+        let Out::Done(b) = b else { return Ok(Out::Stopped) };
+        st.baseline = Some(b);
+    }
+    st.check_engine = Some("hf".into());
+    Ok(Out::Done(v))
 }
 
 // ------------------------------------------------------------------------------------------------------------------ the steps
@@ -917,10 +1006,10 @@ fn step_think_gate(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
         // 2. the original once, then this cut
         st.think_gate = Some(gate.clone());
         if st.baseline.is_none() {
-            let r = out!(fx.think_check(&cut.name, "original", st.spec.think_quick(), None)?);
+            let r = out!(run_check(st, fx, "think_gate", &cut.name, "original")?);
             st.baseline = Some(r);
         }
-        let r = out!(fx.think_check(&cut.name, "cut", st.spec.think_quick(), None)?);
+        let r = out!(run_check(st, fx, "think_gate", &cut.name, "cut")?);
         let chk = check_json(&r, st.baseline.as_ref());
         let row = json!({"row": i, "blocks": cand.blocks, "intermediate": cand.intermediate, "params_b": cand.params_b, "loss": try_rows[i]["loss"], "cut": cut.name, "model_id": cut.model_id,
                          "cut_blocks": try_rows[i]["cut_blocks"], "score": thinkcheck::think_score(&chk["main"]), "check": chk, "removed": false});
@@ -1054,10 +1143,10 @@ fn step_check_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Resul
     let cut = st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to check."))?;
     if st.baseline.is_none() {
         // the original is checked once, from the folder of the first cut (that is where its record of the original is)
-        let r = out!(fx.think_check(&cut.name, "original", st.spec.think_quick(), None)?);
+        let r = out!(run_check(st, fx, &format!("s{}.check_cut", idx + 1), &cut.name, "original")?);
         st.baseline = Some(r);
     }
-    let r = out!(fx.think_check(&cut.name, "cut", st.spec.think_quick(), None)?);
+    let r = out!(run_check(st, fx, &format!("s{}.check_cut", idx + 1), &cut.name, "cut")?);
     st.stages[idx].cut_check = Some(check_json(&r, st.baseline.as_ref()));
     Ok(Flow::Done(None))
 }
@@ -1080,7 +1169,26 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
         Some(r) => spec.rounds = Some(r),
         None => spec.tokens_m += st.stages[idx].extra_tokens_m,
     }
+    let heal_key = format!("s{}.heal:cache", idx + 1);
+    let via_vllm = spec.rounds.is_none() && vllm_decision(st, &heal_key).is_some_and(|d| d.use_vllm);
+    if via_vllm {
+        spec.vllm = Some(super::runs::HealVllm { teacher_cache: true });
+    }
     let h = out!(fx.heal(&student, &teacher, &spec)?);
+    if via_vllm {
+        let used = h.summary.as_ref().and_then(|s| s.get("teacher_engine")).filter(|t| t.is_object()).cloned();
+        let rec = match used {
+            Some(mut u) => {
+                let fell = u["fallback"] == true || u["used"] == false;
+                u["engine_version"] = if fell { Value::Null } else { u["engine"].clone() };          // "vllm-0.34.0"
+                u["engine"] = json!(if fell { "hf" } else { "vllm" });
+                u["fallback"] = json!(fell);
+                u
+            }
+            None => json!({"engine": "hf", "fallback": true, "note": "the heal did not report which engine made the answers"}),
+        };
+        record_engine(st, &heal_key, "teacher_cache", Some(&rec));
+    }
     made(st, "healed", &h.name, Some(h.model_id.clone()), idx as u32 + 1);
     if let Some(r) = h.summary.as_ref().and_then(|s| s.get("rounds")).filter(|r| r.is_object()) {
         st.stages[idx].rounds.push(r.clone());
@@ -1127,10 +1235,10 @@ fn step_check_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Resu
     let h = st.stages[idx].heal.clone().ok_or_else(|| Error::new("There is no healed model to check."))?;
     if st.baseline.is_none() {
         // no check of the cut (and none before healing) came first: the original is checked here, once, so that the gates have something to compare with
-        let r = out!(fx.think_check(&h.name, "original", st.spec.think_quick(), None)?);
+        let r = out!(run_check(st, fx, &format!("s{}.check_heal", idx + 1), &h.name, "original")?);
         st.baseline = Some(r);
     }
-    let r = out!(fx.think_check(&h.name, "healed", st.spec.think_quick(), None)?);
+    let r = out!(run_check(st, fx, &format!("s{}.check_heal", idx + 1), &h.name, "healed")?);
     let chk = check_json(&r, st.baseline.as_ref());
     let verdict = chk["verdict"].as_str().unwrap_or("pass").to_string();
     let attempt = st.stages[idx].attempt;
@@ -1452,7 +1560,7 @@ fn step_publish(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
 
 /// The plan the window shows before a run: `spec` and the description of the model the Slim page already has (`Inspect`), the card and the disk. No job runs.
 pub fn preview(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>, has_training_data: bool) -> Value {
-    let history = crate::timing::History::recent(HISTORY_LOGS);
+    let history = crate::vllm::history_with_measured(crate::timing::History::recent(HISTORY_LOGS), None);
     // with a time limit the plan is the one of the settings the run will use (what start would do), with the list of what was given up
     let fit = spec.max_hours.map(|h| auto_speed::fit_budget(ins, spec, vram_gb, &history, h));
     let used = fit.as_ref().filter(|f| f.fits).map(|f| f.spec.clone()).unwrap_or_else(|| spec.clone());

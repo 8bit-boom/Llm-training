@@ -146,7 +146,7 @@ def test_docker_lifecycle_starts_waits_asks_and_stops_explicitly(fake, docker_fa
     assert tc.run(job) == 0
     res = out()[-1]["data"]
     assert docker_fake["popen"][0][:2] == ["docker", "run"] and "ndforge-vllm-%d" % fake.port in docker_fake["popen"][0]
-    assert docker_fake["run"][0][:2] == ["docker", "stop"], "the explicit stop must run when the check is done"
+    assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]], "the explicit stop must run when the check is done"
     assert res["engine"]["vllm"] == "0.34.0" and res["engine"]["highlights"] == ["INFO attention backend: FLASH_ATTN"] and res["engine"]["ready_seconds"] is not None
 
 
@@ -161,7 +161,7 @@ def test_the_stop_file_stops_the_questions_and_the_engine(tmp_path, docker_fake,
         assert tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "stop_file": str(stop)}) == 0
         assert time.time() - t0 < 3.0
         assert out()[-1]["data"]["stopped"] is True
-        assert docker_fake["run"] and docker_fake["run"][0][:2] == ["docker", "stop"]
+        assert docker_fake["run"] and ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
     finally:
         f.close()
 
@@ -172,7 +172,7 @@ def test_health_timeout_is_plain_and_stops_the_engine(docker_fake):
         docker_fake["port"] = f.port
         with pytest.raises(tc.ThinkCheckError, match="did not become ready"):
             tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "start_timeout": 0.5})
-        assert docker_fake["run"][0][:2] == ["docker", "stop"]
+        assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
     finally:
         f.close()
 
@@ -185,7 +185,7 @@ def test_a_crash_shows_the_last_lines_and_stops_the_engine(docker_fake, monkeypa
     monkeypatch.setattr(ve, "_popen", lambda cmd, **kw: (kw["stdout"].write(b"CUDA out of memory\n"), proc)[1])
     with pytest.raises(tc.ThinkCheckError, match="exit code 2.*CUDA out of memory"):
         tc.run({"job": "think_check", "model": "org/m", "backend": "vllm", "engine": {"kind": "docker"}, "start_timeout": 5})
-    assert docker_fake["run"][0][:2] == ["docker", "stop"]
+    assert ["docker", "stop"] in [c[:2] for c in docker_fake["run"]]
 
 
 def test_a_failing_question_stops_the_engine(docker_fake):
@@ -260,3 +260,22 @@ def test_dora_and_loftq_adapters_keep_raising_a_plain_message(fake, tmp_path):
 def test_llama_still_refuses_an_adapter(tmp_path):
     with pytest.raises(tc.ThinkCheckError, match="LoRA"):
         tc.run({"job": "think_check", "model": "org/x", "backend": "llama", "adapter": str(lora_dir(tmp_path))})
+
+
+def test_a_refused_original_is_checked_by_the_standard_engine_with_a_note(monkeypatch):
+    seen = []
+
+    def one(job, note=None):
+        seen.append((job.get("backend"), job.get("cache_file"), note))
+        if job.get("backend") == "vllm":
+            raise tc.ThinkCheckError("There is no confirmed quantized copy of Someone/Finetune: the pre-quantized checkpoint of another model would teach the wrong model.")
+        return 0
+
+    monkeypatch.setattr(tc, "_run_one", one)
+    job = {"model": "Someone/Finetune", "backend": "vllm", "cache_file": "/m/original.quick.vllm.json", "engine": {"kind": "docker", "original": True}}
+    assert tc.run(job) == 0
+    assert seen[0][0] == "vllm" and seen[1][0] == "hf" and seen[1][1] == "/m/original.quick.json" and "standard engine" in seen[1][2] and "wrong model" in seen[1][2]
+    seen.clear()
+    with pytest.raises(tc.ThinkCheckError):
+        tc.run({"model": "org/cut", "backend": "vllm", "engine": {"kind": "docker"}})
+    assert len(seen) == 1, "a cut is not an original: no silent fallback"

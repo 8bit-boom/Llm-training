@@ -248,6 +248,18 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error("vllm_selftest_failed", _explain(exc))
             return 1
+    if kind == "vllm_teacher_check":
+        from . import vllmteachercheck
+        try:
+            return vllmteachercheck.run(job)
+        except vllmteachercheck.TeacherCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error("vllm_teacher_check_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("vllm_teacher_check_failed", _explain(exc))
+            return 1
     if kind == "general_check":
         from . import generaltext
         return generaltext.run_check(job)

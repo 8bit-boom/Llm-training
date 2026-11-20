@@ -86,6 +86,17 @@ struct Mock {
     search_budget_stop: bool,
     /// why each heal in rounds ends (pass | plateau | cap | time), one per heal; "cap" when the list is used up
     rounds_stops: std::collections::VecDeque<String>,
+    /// vLLM (experimental): the numbers this PC measured, what the checks / heals did with the engine, and the simulated engine (running or not)
+    hist: ndforge_core::timing::History,
+    vllm_log: Vec<String>,
+    engine_running: bool,
+    cleanups: u32,
+    /// a vLLM check leaves the engine running (a crash), until `engine_cleanup`
+    leak_engine: bool,
+    /// the vLLM checks fail (the standard engine does them: the result says so)
+    vllm_checks_fail: bool,
+    /// what a heal that was asked to use vLLM reports: `teacher_engine` of its summary
+    teacher_engine: Option<Value>,
 }
 
 impl Mock {
@@ -93,6 +104,7 @@ impl Mock {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
             free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
+            hist: ndforge_core::timing::History::default(), vllm_log: Vec::new(), engine_running: false, cleanups: 0, leak_engine: false, vllm_checks_fail: false, teacher_engine: None,
         }
     }
 
@@ -226,6 +238,31 @@ impl Effects for Mock {
         self.done.push(format!("cut {} from {} blocks={} drop={:?} width={:?} reasoning={}", name, spec.source_model_id, spec.blocks, spec.drop_layers, spec.width.as_ref().map(|w| w.intermediate), spec.reasoning.is_some()));
         Ok(Out::Done(CutRef { model_id: format!("id-{name}"), name }))
     }
+    fn history(&self) -> ndforge_core::timing::History {
+        self.hist.clone()
+    }
+    fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        if engine != "vllm" {
+            return self.think_check(name, target, quick, gguf);
+        }
+        assert!(!self.engine_running, "a vLLM job must never start while another engine runs");
+        self.vllm_log.push(format!("check {name} {target}"));
+        self.engine_running = true;
+        let r = self.think_check(name, target, quick, gguf);
+        self.engine_running = self.leak_engine;
+        let r = r?;
+        Ok(match r {
+            Out::Done(mut v) => {
+                v["engine_used"] = if self.vllm_checks_fail { json!({"engine": "hf", "fallback": true, "requested": true, "note": "vLLM did not start."}) } else { json!({"engine": "vllm", "fallback": false, "startup_seconds": 263.5}) };
+                Out::Done(v)
+            }
+            o => o,
+        })
+    }
+    fn engine_cleanup(&mut self) {
+        self.cleanups += 1;
+        self.engine_running = false;
+    }
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>> {
         if self.stop_here(format!("check {name} {target}")) {
             return Ok(Out::Stopped);
@@ -243,8 +280,12 @@ impl Effects for Mock {
             self.fail_heal_once = false;
             return Err(Error::new("The graphics card ran out of memory."));
         }
+        assert!(!self.engine_running, "a training must never start while the vLLM engine runs");
         self.heals += 1;
         self.heal_specs.push(serde_json::to_value(spec).unwrap());
+        if spec.vllm_teacher() {
+            self.vllm_log.push(format!("heal teacher cache tokens={}", spec.tokens_m));
+        }
         let name = match student {
             Student::Made(n) => n.clone(),
             Student::Folder(_) => format!("heal-{}", self.heals),
@@ -254,6 +295,9 @@ impl Effects for Mock {
         let mut summary = json!({"kd_first": 1.5, "kd_last": 0.5, "calib_loss_before": 3.0, "calib_loss_after": 2.4, "teacher_calib_loss": 2.0,
                                   "coverage": {"v": 1, "chat_rows": {"complete": 5, "cut": 1, "skipped": 0}, "notes": []},
                                   "holdout_loss_before": 2.9, "holdout_loss_after": 2.6, "teacher_holdout_loss": 2.1});
+        if spec.vllm_teacher() {
+            summary["teacher_engine"] = self.teacher_engine.clone().unwrap_or_else(|| json!({"engine": "vllm-0.34.0", "teacher_quant": "bnb-nf4", "used": true, "fallback": false, "startup_seconds": 263.5, "tokens_per_s": 2900.0}));
+        }
         let mut tokens_m = spec.tokens_m;
         if let Some(r) = &spec.rounds {
             let reason = self.rounds_stops.pop_front().unwrap_or_else(|| "cap".into());
@@ -1950,4 +1994,160 @@ fn a_heal_in_rounds_weighs_its_worst_case_says_where_it_is_and_jumps_forward_whe
     let snap = t2.sync(&plain_run, 1000.0);
     assert!(snap["step"].get("rounds").is_none());
     assert!(t2.on_event(&json!({"kind": "heal_round", "round": 1, "decision": "continue"}), 1005.0).is_none(), "the event means nothing to a heal that is not in rounds");
+}
+
+// ------------------------------------------------------------------------------------------------------------------ vLLM (experimental)
+
+fn vllm_hist() -> ndforge_core::timing::History {
+    let mut h = ndforge_core::timing::History::default();
+    ndforge_core::vllm_plan::Numbers { startup_s: Some(263.5), long_tps: Some(120.0), model_b: Some(27.0), ..Default::default() }.push_into(&mut h);
+    h
+}
+
+fn vspec(t: bool, c: bool, a: bool) -> AutoSpec {
+    AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: t, checks: c, automatic: a }), ..gspec(21.1) }
+}
+
+#[test]
+fn a_run_without_vllm_is_exactly_the_run_it_was() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "done");
+    assert!(st.engines.is_empty() && st.check_engine.as_deref() != Some("vllm") && fx.vllm_log.is_empty() && fx.cleanups == 0, "no vLLM key: nothing happens");
+    assert!(fx.heal_specs.iter().all(|h| h.get("vllm").is_none()));
+    let mut v = serde_json::to_value(&st).unwrap();
+    v.as_object_mut().unwrap().remove("plan");
+    let text = v.to_string();
+    assert!(!text.contains("\"vllm\"") && !text.contains("\"engines\""), "the keys are not even written: {:?}", text.match_indices("vllm").map(|(i, _)| &text[i.saturating_sub(40)..(i + 40).min(text.len())]).collect::<Vec<_>>());
+    assert!(st.plan.as_ref().unwrap().time.as_ref().unwrap().vllm.is_none());
+}
+
+#[test]
+fn a_run_with_both_switches_uses_vllm_for_the_answers_and_every_check_and_records_it() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    fx.leak_engine = true;          // a vLLM check leaves the engine running (a crash): the next step must clean it up before training
+    let st = start(&p, &mut fx, vspec(true, true, false)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    let plan = st.plan.as_ref().unwrap().time.as_ref().unwrap().vllm.as_ref().unwrap();
+    assert!(plan.uses("checks") && plan.uses("s1.heal:cache"), "{:?}", plan.decisions);
+    assert!(plan.decisions.iter().all(|d| d.step == "checks" || d.step.contains(':')) && !plan.notes.is_empty());
+    assert_eq!(fx.heal_specs.iter().filter(|h| h["vllm"]["teacher_cache"] == true).count(), plan.decisions.iter().filter(|d| d.kind == "teacher_cache" && d.use_vllm).count());
+    assert!(fx.vllm_log.iter().any(|l| l.starts_with("check ")) && fx.vllm_log.iter().any(|l| l.starts_with("heal teacher cache")));
+    assert!(fx.cleanups >= 5 && !fx.engine_running, "the engine is stopped before every step: no training next to it (the mock panics otherwise)");
+    assert_eq!(st.check_engine.as_deref(), Some("vllm"));
+    let used: Vec<&str> = st.engines.iter().filter(|e| e["engine"] == "vllm").map(|e| e["step"].as_str().unwrap()).collect();
+    assert!(used.contains(&"s1.heal:cache") && used.contains(&"s2.check_heal:healed") && used.contains(&"think_gate:original"), "{used:?}");
+    let heal = st.engines.iter().find(|e| e["step"] == "s1.heal:cache").unwrap();
+    assert_eq!((heal["teacher_quant"].clone(), heal["engine_version"].clone()), (json!("bnb-nf4"), json!("vllm-0.34.0")));
+    assert!(heal["estimated_min"]["vllm"].is_array());
+    let r = ndforge_core::reshape::auto_report::build(&st);
+    assert_eq!(r["vllm"]["asked"]["checks"], true);
+    assert!(r["vllm"]["used"].as_u64().unwrap() >= 6 && r["vllm"]["fallbacks"] == 0);
+    let md = ndforge_core::reshape::auto_report::markdown(&r);
+    assert!(md.contains("## Steps that used vLLM (experimental)") && md.contains("bnb-nf4") && md.contains("vllm-0.34.0"));
+    let again = load(&run_dir(&p, &st.id)).unwrap();
+    let (a, b) = (serde_json::to_value(&again).unwrap(), serde_json::to_value(&st).unwrap());
+    for k in a.as_object().unwrap().keys() {
+        assert_eq!(a[k], b[k], "{k} differs after saving");
+    }
+}
+
+#[test]
+fn old_run_files_without_the_vllm_keys_load() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    let mut v = serde_json::to_value(&st).unwrap();
+    v.as_object_mut().unwrap().remove("engines");
+    v.as_object_mut().unwrap().remove("check_engine");
+    v["spec"].as_object_mut().unwrap().remove("vllm");
+    let back: AutoState = serde_json::from_value(v).unwrap();
+    assert!(back.engines.is_empty() && back.spec.vllm.is_none());
+}
+
+#[test]
+fn failing_vllm_checks_fall_back_with_a_note_and_the_run_goes_on_with_one_engine() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    fx.vllm_checks_fail = true;
+    let st = start(&p, &mut fx, vspec(false, true, false)).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(st.check_engine.as_deref(), Some("hf"));
+    assert!(st.engines.iter().all(|e| e["fallback"] == true && e["engine"] == "hf"));
+    assert!(st.notes.iter().any(|n| n.contains("vLLM could not be used for") && n.contains("the run went on")));
+    // after the first fallback every later check is the standard one (no more vLLM attempts)
+    assert_eq!(fx.vllm_log.len(), 1, "{:?}", fx.vllm_log);
+}
+
+#[test]
+fn a_heal_whose_vllm_teacher_failed_is_recorded_as_a_fallback() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    fx.teacher_engine = Some(json!({"used": false, "fallback": true, "problem": "CUDA out of memory"}));
+    let st = start(&p, &mut fx, vspec(true, false, false)).unwrap();
+    assert_eq!(st.status, "done");
+    let e = st.engines.iter().find(|e| e["step"] == "s1.heal:cache").unwrap();
+    assert_eq!((e["engine"].clone(), e["fallback"].clone()), (json!("hf"), json!(true)));
+    assert!(st.notes.iter().any(|n| n.contains("CUDA out of memory")));
+}
+
+#[test]
+fn automatic_uses_vllm_only_where_the_estimate_is_lower_and_says_why() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.hist = vllm_hist();
+    let st = start(&p, &mut fx, vspec(false, false, true)).unwrap();
+    assert_eq!(st.status, "done");
+    let plan = st.plan.as_ref().unwrap().time.as_ref().unwrap().vllm.as_ref().unwrap();
+    assert!(!plan.decisions.is_empty());
+    for dc in plan.decisions.iter().filter(|d| d.mode == "automatic") {
+        let (v, s) = ((dc.vllm_min.0 + dc.vllm_min.1) / 2.0, (dc.standard_min.0 + dc.standard_min.1) / 2.0);
+        assert_eq!(dc.use_vllm, v < s * ndforge_core::vllm_plan::AUTO_MARGIN, "{dc:?}");
+        assert!(dc.reason.starts_with("Automatic:"), "{dc:?}");
+    }
+    // 8 to 20 hours of the original's answers against a few hours of scoring: vLLM wins the answers
+    assert!(plan.uses("s1.heal:cache"), "{:?}", plan.decision("s1.heal:cache"));
+    // the steps follow the decisions
+    for (key, dc) in plan.decisions.iter().map(|d| (&d.step, d)).filter(|(k, _)| k.ends_with(":cache")) {
+        let stage = key.trim_start_matches('s').split('.').next().unwrap().parse::<usize>().unwrap() - 1;
+        assert_eq!(fx.heal_specs[stage]["vllm"]["teacher_cache"] == true, dc.use_vllm);
+    }
+}
+
+#[test]
+fn the_time_estimate_with_vllm_counts_start_up_and_the_choice_changes_the_total() {
+    let ins = qwen27();
+    let off = AutoSpec { allow_many_blocks: true, ..gspec(17.4) };
+    let on = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false }), ..off.clone() };
+    let h = vllm_hist();
+    let est = |s: &AutoSpec| {
+        let p = ndforge_core::reshape::auto_plan::plan(&ins, s, Some(32.0), Some(2000.0));
+        assert!(p.ok);
+        ndforge_core::reshape::auto_time::time_estimate(&ins, s, &p, &h)
+    };
+    let (a, b) = (est(&off), est(&on));
+    assert!(a.vllm.is_none() && b.vllm.is_some());
+    assert!(b.total_h.1 < a.total_h.1, "hours of answers become a few: {:?} vs {:?}", a.total_h, b.total_h);
+    let heal = b.steps.iter().find(|s| s.id == "s1.heal").unwrap();
+    assert!(heal.parts.iter().any(|x| x.id == "vllm_start") && !heal.parts.iter().any(|x| x.label == "load the original"));
+    let chk = b.steps.iter().find(|s| s.id == "s1.check_heal").unwrap();
+    assert!(chk.parts.iter().any(|x| x.id == "vllm_start"), "every check starts the engine");
+    // a 9 B self-test is not a 27 B number
+    let mut h9 = ndforge_core::timing::History::default();
+    ndforge_core::vllm_plan::Numbers { startup_s: Some(510.6), long_tps: Some(300.0), model_b: Some(9.0), ..Default::default() }.push_into(&mut h9);
+    let p = ndforge_core::reshape::auto_plan::plan(&ins, &on, Some(32.0), Some(2000.0));
+    let t9 = ndforge_core::reshape::auto_time::time_estimate(&ins, &on, &p, &h9);
+    assert!(t9.vllm.as_ref().unwrap().notes.iter().any(|n| n.contains("NOT used")), "{:?}", t9.vllm.unwrap().notes);
 }

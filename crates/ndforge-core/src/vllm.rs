@@ -20,7 +20,9 @@ pub const MIN_DRIVER: u32 = 580;
 /// The WSL version the report names (the crash fix); newer is assumed fine.
 pub const MIN_WSL: [u32; 3] = [2, 7, 3];
 /// vLLM reserves about 88 % of the card: anything else using more than this blocks a start.
-pub const BUSY_MB: u64 = 2048;
+pub const DEFAULT_UTIL: f64 = 0.88;
+/// Below this share of the card the engine is not started; the share is lowered to fit next to what other programs already use (same rule as the worker's `plan_gpu_util`).
+pub const UTIL_FLOOR: f64 = 0.70;
 pub const KINDS: [&str; 5] = ["docker", "docker_wsl", "wslc", "wsl", "url"];
 
 /// Runs a program: `Some((succeeded, output))`, None when it could not be started or took too long.
@@ -37,6 +39,34 @@ pub fn real_runner(args: &[&str]) -> Option<(bool, String)> {
         let _ = tx.send(cmd.output().ok().map(|o| (o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)).replace('\0', ""))));
     });
     rx.recv_timeout(Duration::from_secs(25)).ok().flatten()
+}
+
+/// How much of the card vLLM may take when other programs already use `used_mb` of `total_mb`: the engine reserves `util x total`; it needs `free >= that + 0.5 GB`, else the share is lowered to
+/// `(free - 0.6 GB) / total`; below 0.70 it is refused. `ok` None = the memory could not be read (continuing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPlan {
+    pub util: f64,
+    pub ok: Option<bool>,
+    pub lowered: bool,
+    pub text: String,
+}
+
+pub fn gpu_plan(total_mb: Option<u64>, used_mb: Option<u64>, configured: f64) -> GpuPlan {
+    let (Some(total), Some(used)) = (total_mb.filter(|t| *t > 0), used_mb) else {
+        return GpuPlan { util: configured, ok: None, lowered: false, text: "The memory in use on the card could not be read (nvidia-smi did not answer): continuing with the configured share.".into() };
+    };
+    let (t, u) = (total as f64, used as f64);
+    let free = t - u;
+    let gb = |x: f64| x / 1024.0;
+    if free >= configured * t + 512.0 {
+        return GpuPlan { util: configured, ok: Some(true), lowered: false, text: format!("{:.1} GB of the card are in use; {:.1} GB are free and the engine takes {:.1} GB ({configured} of the card): fine.", gb(u), gb(free), gb(configured * t)) };
+    }
+    let util = configured.min((free - 614.0) / t);
+    if util < UTIL_FLOOR {
+        return GpuPlan { util: configured, ok: Some(false), lowered: false, text: format!("{:.1} GB of the card ({:.1} GB) are in use by other programs (the desktop, a browser, Ollama, llama-server ...): only {:.1} GB are free, and even {UTIL_FLOOR} of the card ({:.1} GB) does not fit. Close those programs and try again.", gb(u), gb(t), gb(free), gb(UTIL_FLOOR * t)) };
+    }
+    let util = ((util - 0.0049) * 100.0).round() / 100.0;
+    GpuPlan { util, ok: Some(true), lowered: true, text: format!("Other programs use {:.1} GB of the card; vLLM will take {util} instead of {configured} of it.", gb(u)) }
 }
 
 /// The first `x.y` or `x.y.z...` number in a text, as numbers (tolerant of localized labels: "WSL version: 3.0.1.0", "Version de WSL : 2.7.3").
@@ -185,7 +215,7 @@ pub fn status(s: &VllmSettings, run: Runner) -> Value {
            "driver": f.driver, "vram_used_mb": f.vram_used_mb, "vram_total_mb": f.vram_total_mb})
 }
 
-/// The checks before a vLLM job: the engine is there, the graphics card is free (nothing else uses more than about 2 GB), the driver and WSL are not too old.
+/// The checks before a vLLM job: the engine is there, the graphics card has room (`gpu_plan`: the share is lowered to fit next to other programs, refused below 0.70), the driver and WSL are not too old.
 pub fn preflight_checks(s: &VllmSettings, f: &Facts) -> Vec<Check> {
     let c = |id, label, light, detail: &str, fix: &str| Check { id, label, light, detail: detail.to_string(), fix: fix.to_string(), action: None };
     let used = used_kind(s, f);
@@ -196,12 +226,12 @@ pub fn preflight_checks(s: &VllmSettings, f: &Facts) -> Vec<Check> {
         c("vllm_engine", "vLLM engine (experimental)", Light::Fail, "No way to run the vLLM engine was found (Docker, Docker inside WSL, WSLc, or vLLM in WSL).",
           "Open Settings, vLLM engine: it explains what to install. Or check with the standard engine instead.")
     });
-    match f.vram_used_mb {
-        Some(u) if u > BUSY_MB => out.push(c("vllm_gpu", "Graphics card free", Light::Fail, &format!("Something else is using {:.1} GB of the graphics card's memory; the vLLM engine takes about 88 % of it.", u as f64 / 1024.0),
-                                              "Close the programs that use the card (a browser tab with video, Ollama, llama-server, a training run), then try again.")),
-        Some(u) => out.push(c("vllm_gpu", "Graphics card free", Light::Ok, &format!("{:.1} GB in use.", u as f64 / 1024.0), "")),
-        None => out.push(c("vllm_gpu", "Graphics card free", Light::Warn, "The memory in use could not be read (nvidia-smi did not answer).", "Install or update the NVIDIA driver.")),
-    }
+    let g = gpu_plan(f.vram_total_mb, f.vram_used_mb, DEFAULT_UTIL);
+    out.push(match g.ok {
+        Some(true) => c("vllm_gpu", "Graphics card free", Light::Ok, &g.text, ""),
+        Some(false) => c("vllm_gpu", "Graphics card free", Light::Fail, &g.text, "Close the programs that use the card (a browser tab with video, Ollama, llama-server, a training run), then try again."),
+        None => c("vllm_gpu", "Graphics card free", Light::Warn, &g.text, "Install or update the NVIDIA driver."),
+    });
     if !f.driver.is_empty() {
         let (l, t) = driver_check(&f.driver);
         if l != Light::Ok {
@@ -239,6 +269,7 @@ pub fn engine_job(s: &VllmSettings) -> Value {
 /// `engine_job` plus the card's memory (the pick of the weights depends on it); asks `nvidia-smi` (remembered for a minute).
 pub fn engine_job_with_card(s: &VllmSettings) -> Value {
     let mut e = engine_job(s);
+    e["teacher"] = json!({"route": s.teacher.route, "pairs": s.teacher.pairs, "confirmed": s.teacher.confirmed});          // the identity rule: which pre-quantized checkpoint may stand in for an original
     if let Some(g) = crate::envmgr::gpu::detect_gpus_cached().ok().and_then(|g| g.first().map(|x| x.vram_gb())) {
         e["vram_gb"] = json!((g * 10.0).round() / 10.0);
     }
@@ -299,4 +330,164 @@ pub fn selftest_run(job: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicB
 /// The last report, `Value::Null` when there is none.
 pub fn selftest_report() -> Value {
     std::fs::read(selftest_dir().join("vllm_selftest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+}
+
+
+// ------------------------------------------------------------------------------------------------------------- the teacher's answers (docs/VLLM.md, "Teacher cache")
+
+/// The image tag's version (`vllm/vllm-openai:v0.34.0` -> `0.34.0`), as the worker's `image_version` reads it.
+pub fn image_version(image: &str) -> String {
+    let tag = image.rsplit('/').next().and_then(|last| last.split_once(':')).map(|x| x.1).unwrap_or("");
+    match Regex::new(r"^v?(\d+\.\d+(?:\.\d+)?)").ok().and_then(|re| re.captures(tag).map(|c| c[1].to_string())) {
+        Some(v) => v,
+        None if tag.is_empty() => "unknown".into(),
+        None => tag.to_string(),
+    }
+}
+
+fn norm_id(x: &str) -> String {
+    x.trim().trim_end_matches('/').to_lowercase()
+}
+
+/// Which weights the engine scores with for the original `origin` (a Hub id or a folder). THE TEACHER MUST BE THE PERSON'S ORIGINAL MODEL: a pre-quantized checkpoint is a quantization of
+/// ONE repo, so it is used only for that original (`pairs`) or one the person confirmed (`confirmed`); every other original goes through the in-flight 4-bit route on its own folder. This is
+/// the same rule as the worker's `vllmcache.select_teacher`, which decides for real; this one shows the person what will happen and is checked against the same cases.
+/// `{"route": "prequant" | "bnb" | "refused", "quant": "awq:<repo>@unpinned" | "bnb-nf4" | "", "quantized_repo", "reason"}`.
+pub fn teacher_route(t: &crate::settings::VllmTeacherSettings, origin: &str) -> Value {
+    let key = norm_id(origin);
+    let find = |m: &std::collections::BTreeMap<String, String>| m.iter().find(|(k, _)| norm_id(k) == key).map(|(_, v)| v.clone());
+    let paired = find(&t.pairs).or_else(|| find(&t.confirmed));
+    match (t.route.as_str(), paired) {
+        ("prequant", None) => json!({"route": "refused", "quant": "", "quantized_repo": "",
+                                     "reason": format!("There is no confirmed quantized copy of {origin}: the pre-quantized checkpoint of another model would teach the wrong model. Use the in-flight 4-bit route, or confirm a copy in the settings.")}),
+        ("auto" | "prequant", Some(q)) => json!({"route": "prequant", "quant": format!("awq:{q}@unpinned"), "quantized_repo": q, "reason": format!("{q} is the confirmed quantized copy of {origin}.")}),
+        _ => json!({"route": "bnb", "quant": "bnb-nf4", "quantized_repo": "",
+                    "reason": format!("No confirmed quantized copy of {origin}: the original's own folder is loaded and quantized to 4 bits while loading (the in-flight bitsandbytes route; how vLLM does it is unverified and its speed is not known).")}),
+    }
+}
+
+/// The worker's `engine` object of a `distill_cache` job that makes the original's answers with vLLM: `{"kind": "vllm", "teacher": {...}, "container": {...}, "required", "teacher_check"}`.
+/// `check` is the saved `vllm_teacher_check.json` of this model (its verdict travels with the job; the worker refuses a teacher the check called "different").
+pub fn teacher_engine_job(s: &VllmSettings, check: Option<&Value>) -> Value {
+    let t = &s.teacher;
+    let mut e = json!({"kind": "vllm", "teacher": {"route": t.route, "pairs": t.pairs, "confirmed": t.confirmed}, "container": engine_job_with_card(s), "required": t.required});
+    if let Some(v) = check.and_then(|c| c["verdict"].as_str()) {
+        e["teacher_check"] = json!({"verdict": v});
+    }
+    e
+}
+
+/// The identity a vLLM cache has (`engine`, `teacher_quant`), as far as the program can know it before the worker runs.
+pub fn teacher_identity(s: &VllmSettings, origin: &str) -> Value {
+    let r = teacher_route(&s.teacher, origin);
+    json!({"engine": format!("vllm-{}", image_version(&s.image)), "teacher_quant": r["quant"], "route": r["route"]})
+}
+
+/// Where the fidelity check of a made model is saved.
+pub fn teacher_check_file(model_dir: &std::path::Path) -> std::path::PathBuf {
+    model_dir.join("vllm_teacher_check.json")
+}
+
+/// The saved check of a made model: the file's JSON, with `current` (does it belong to the teacher the settings would use now: the same engine version and teacher quantization).
+pub fn read_teacher_check(model_dir: &std::path::Path, s: &VllmSettings, origin: &str) -> Value {
+    let Some(mut c) = std::fs::read(teacher_check_file(model_dir)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return Value::Null };
+    let now = teacher_identity(s, origin);
+    c["current"] = json!(c["identity"]["teacher_quant"] == now["teacher_quant"] && c["identity"]["engine"] == now["engine"]);
+    c
+}
+
+/// The worker job `vllm_teacher_check` for a made model (docs/WORKER_CONTRACT.md): `common` holds what the heal's cache job has (teacher, student, model, data, k, max_seq, seed).
+pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path::Path, reference_cache: Option<&std::path::Path>) -> Value {
+    let mut job = json!({"job": "vllm_teacher_check", "rows": 100, "out": teacher_check_file(model_dir), "work": model_dir.join("vllm_teacher_check_work"), "stop_file": model_dir.join("STOP"),
+                         "engine": teacher_engine_job(s, None)});
+    for k in ["teacher", "student", "model", "data", "k", "max_seq", "seed"] {
+        job[k] = common[k].clone();
+    }
+    if let Some(r) = reference_cache {
+        job["reference_cache"] = json!(r);
+    }
+    job
+}
+
+/// The numbers the person's own files hold: the self-test's start-up, Quick-suite time and generation speed, the teacher check's scoring speed (docs/VLLM.md).
+pub fn measured_numbers(selftest: &Value, checks: &[Value]) -> crate::vllm_plan::Numbers {
+    let f = |v: &Value| v.as_f64().filter(|x| x.is_finite() && *x > 0.0);
+    let ok = !matches!(selftest["verdict"].as_str(), Some("fail" | "stopped")) || f(&selftest["startup_seconds"]).is_some();
+    // the size of the model the self-test ran (the report's `model_params_b`, else `model_info.params_b`): the numbers are for that model
+    let model_b = f(&selftest["model_params_b"]).or_else(|| f(&selftest["model_info"]["params_b"]));
+    crate::vllm_plan::Numbers {
+        model_b,
+        startup_s: ok.then(|| f(&selftest["startup_seconds"])).flatten(),
+        // the Quick suite's wall time only when its answers were thinking-long; short answers (a model that did not think) say nothing about a real check
+        quick_wall_s: ok.then(|| f(&selftest["wall_seconds"])).flatten().filter(|_| selftest["short_answers"] != true && !selftest["answer_tokens"].is_null()),
+        long_tps: ok.then(|| f(&selftest["long_tokens_per_s"])).flatten(),
+        gen_tps: ok.then(|| f(&selftest["tokens_per_s"])).flatten(),
+        score_tps: checks.iter().find_map(|c| f(&c["vllm"]["tokens_per_s"])),
+    }
+}
+
+/// `history` with the numbers of the person's own vLLM files added (`vllm_plan::Numbers::push_into`): the self-test report and the newest teacher check of the project's models.
+pub fn history_with_measured(mut h: crate::timing::History, p: Option<&crate::project::Project>) -> crate::timing::History {
+    let mut checks: Vec<Value> = Vec::new();
+    if let Some(p) = p {
+        if let Ok(rd) = std::fs::read_dir(crate::reshape::runs::models_dir(p)) {
+            let mut found: Vec<(std::time::SystemTime, Value)> = rd.flatten().filter_map(|e| {
+                let f = teacher_check_file(&e.path());
+                let t = std::fs::metadata(&f).ok()?.modified().ok()?;
+                Some((t, serde_json::from_slice::<Value>(&std::fs::read(&f).ok()?).ok()?))
+            }).collect();
+            found.sort_by_key(|x| std::cmp::Reverse(x.0));
+            checks = found.into_iter().map(|x| x.1).collect();
+        }
+    }
+    measured_numbers(&selftest_report(), &checks).push_into(&mut h);
+    h
+}
+
+/// Stops and removes any container this program started and left behind (named `ndforge-vllm-*`): the engine must not be running when a training or another job takes the card. Docker kinds
+/// only (the WSLc listing syntax is not known); returns the names it removed. Nothing else is touched.
+pub fn stop_leftovers(s: &VllmSettings, run: Runner) -> Vec<String> {
+    let pre: Vec<String> = match s.kind.as_str() {
+        "docker_wsl" => wsl_prefix(&s.distro).into_iter().chain(["docker".to_string()]).collect(),
+        "docker" | "auto" | "" => vec!["docker".to_string()],
+        _ => return Vec::new(),
+    };
+    let call = |tail: &[&str]| -> Option<(bool, String)> {
+        let v: Vec<&str> = pre.iter().map(String::as_str).chain(tail.iter().copied()).collect();
+        run(&v)
+    };
+    let Some((true, names)) = call(&["ps", "-a", "--filter", "name=ndforge-vllm-", "--format", "{{.Names}}"]) else { return Vec::new() };
+    let found: Vec<String> = names.lines().map(str::trim).filter(|n| n.starts_with("ndforge-vllm-") && !n.is_empty()).map(String::from).collect();
+    for n in &found {
+        let _ = call(&["rm", "-f", n]);
+    }
+    found
+}
+
+
+/// Where the self-test's report is and what it says, for the card: `{"dir": the exact folder as text, "json", "md", "markdown": the report text or null, "exists": bool}`. The folder is
+/// `<config folder>/vllm_selftest` (on Windows `%APPDATA%\\NDLoreForge\\vllm_selftest`: Roaming, which is not obvious, so the card shows the path and can open it).
+pub fn selftest_files() -> Value {
+    let dir = selftest_dir();
+    let md = dir.join("vllm_selftest.md");
+    let text = std::fs::read_to_string(&md).ok();
+    json!({"dir": dir.display().to_string(), "json": dir.join("vllm_selftest.json").display().to_string(), "md": md.display().to_string(), "markdown": text, "exists": text.is_some()})
+}
+
+/// The same for the saved check of the vLLM teacher of a made model: `{"dir", "file", "text": the file as pretty JSON or null, "exists"}`.
+pub fn teacher_check_files(model_dir: &std::path::Path) -> Value {
+    let f = teacher_check_file(model_dir);
+    let text = std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| serde_json::to_string_pretty(&v).ok());
+    json!({"dir": model_dir.display().to_string(), "file": f.display().to_string(), "text": text, "exists": text.is_some()})
+}
+
+/// What the person is told about WHICH model a vLLM check or trace generation of the original really loads: its own folder in 4 bits ("original: <id> (4-bit on the fly)"), a confirmed
+/// pre-quantized copy ("confirmed copy <repo>"), or nothing (refused: the standard engine is used). Same rule as the worker's `vllmquant.select_original`.
+pub fn served_text(t: &crate::settings::VllmTeacherSettings, origin: &str) -> String {
+    let r = teacher_route(t, origin);
+    match r["route"].as_str() {
+        Some("prequant") => format!("confirmed copy {}", r["quantized_repo"].as_str().unwrap_or("")),
+        Some("bnb") => format!("original: {origin} (4-bit on the fly; the in-flight route is unverified, the standard engine answers if it does not work)"),
+        _ => format!("nothing: {} The standard engine is used.", r["reason"].as_str().unwrap_or("")),
+    }
 }

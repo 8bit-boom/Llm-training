@@ -106,7 +106,7 @@ def test_a_card_that_the_container_cannot_use_ends_the_test_before_the_engine_st
 
 def test_a_busy_card_ends_the_test_early(tmp_path, monkeypatch):
     env = Env(monkeypatch, 1)
-    env.answers["nvidia-smi"] = (0, "581.42, 9000, 32768\n")
+    env.answers["nvidia-smi"] = (0, "581.42, 13000, 32768\n")
     assert st.run(job(tmp_path)) == 0
     assert json.loads((tmp_path / "out" / "vllm_selftest.json").read_text())["verdict"] == "fail" and not env.popen
 
