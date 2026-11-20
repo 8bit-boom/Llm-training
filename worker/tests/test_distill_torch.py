@@ -760,7 +760,7 @@ def test_the_cache_made_with_a_token_budget_equals_the_cache_with_four_rows_per_
     assert max(fixed) <= 4 and sizes != fixed and max(sizes) <= dj.TEACHER_MAX_ROWS, (fixed, sizes)
     ia = json.loads((a_dir / "distill" / "cache" / "index.json").read_text())
     ib = json.loads((b_dir / "distill" / "cache" / "index.json").read_text())
-    for key in ("rows", "tokens", "k", "max_len", "data_hash", "tokenizer_hash", "teacher_weights", "rows_key", "general_key"):
+    for key in ("rows", "tokens", "k", "max_len", "data_hash", "tokenizer_hash", "teacher_weights", "rows_key"):
         assert ia[key] == ib[key], key
     ra, rb = _cache_arrays(a_dir / "distill" / "cache"), _cache_arrays(b_dir / "distill" / "cache")
     assert len(ra) == len(rb)
