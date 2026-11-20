@@ -90,14 +90,20 @@ def convert_to_f16(conv, folder, out_file, im: dict, span):
     part = fsutil.partial_of(out_file)
     part.unlink(missing_ok=True)
     try:
-        rc, _ = imatrix.run_streaming([sys.executable, conv, folder, "--outfile", part, "--outtype", "f16"], im, 1, None)
+        cmd = [sys.executable, conv, folder, *imatrix.no_mtp_extra(conv, folder), "--outfile", part, "--outtype", "f16"]
+        rc, tail = imatrix.run_streaming(cmd, im, 1, None)
+        if rc != 0 and imatrix.retry_wants_no_mtp(conv, [str(c) for c in cmd], tail):
+            protocol.log("The converter stopped on the MTP head check; running it once more with --no-mtp (this model has no MTP head).")
+            cmd.insert(3, "--no-mtp")
+            rc, tail = imatrix.run_streaming(cmd, im, 1, None)
         if rc == 0 and part.is_file():
             fsutil.replace_retry(part, out_file)
             return
     finally:
         part.unlink(missing_ok=True)
     Path(out_file).unlink(missing_ok=True)
-    raise MatrixError(f"llama.cpp could not turn this model into a GGUF file (exit code {rc}; the log has its last lines). Is it a full-precision Hugging Face model folder "
+    last = imatrix.tail_note(tail)
+    raise MatrixError(f"llama.cpp could not turn this model into a GGUF file (exit code {rc}). " + (f"Last lines:\n{last}\n" if last else "The log has its last lines. ") + "Is it a full-precision Hugging Face model folder "
                       "(safetensors files, the kind a trained model is saved as) of an architecture this llama.cpp knows? Update llama.cpp, or choose a GGUF file as the model.")
 
 

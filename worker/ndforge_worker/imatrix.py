@@ -116,6 +116,41 @@ def folder_has_mtp(folder):
     return mtp_in_tensor_names(names)
 
 
+_NO_MTP_SUPPORT: dict = {}
+NO_MTP_ASSERT = "opt_num_mtp_layers"
+
+
+def converter_has_no_mtp(conv) -> bool:
+    """Does this convert_hf_to_gguf.py know `--no-mtp` (alias `--no-nextn`)? Read from the script text once per script and remembered."""
+    key = str(conv)
+    if key not in _NO_MTP_SUPPORT:
+        try:
+            text = Path(conv).read_text(encoding="utf-8", errors="replace")
+            _NO_MTP_SUPPORT[key] = "--no-mtp" in text or "--no-nextn" in text
+        except OSError:
+            _NO_MTP_SUPPORT[key] = False
+    return _NO_MTP_SUPPORT[key]
+
+
+def no_mtp_extra(conv, folder) -> list:
+    """["--no-mtp"] when the model in FOLDER has no MTP head (config keys 0 / absent and no `mtp.` tensors) and the converter has the flag, else []. A newer converter asserts
+    when a model has no head and the flag is missing; a model that has one is converted exactly as before."""
+    if folder_has_mtp(folder) is False and converter_has_no_mtp(conv):
+        return ["--no-mtp"]
+    return []
+
+
+def retry_wants_no_mtp(conv, cmd, tail) -> bool:
+    """After a failed conversion: was it the converter's MTP assertion, and may it be run again with `--no-mtp`?"""
+    return (NO_MTP_ASSERT in "\n".join(tail or []) and "--no-mtp" not in cmd and "--no-nextn" not in cmd and converter_has_no_mtp(conv))
+
+
+def tail_note(tail, n: int = 25) -> str:
+    """The last N lines of a tool's output, scrubbed and with the user name redacted, as one text for an error message."""
+    lines = [protocol.redact_user(protocol.scrub(str(l))) for l in (tail or []) if str(l).strip()]
+    return "\n".join(lines[-n:])
+
+
 _GGUF_FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 

@@ -63,20 +63,41 @@ def _stop_info(cfg) -> dict:
     return {"stop_file": cfg.get("stop_file") or (cfg.get("imatrix") or {}).get("stop_file")}
 
 
+class ToolFailed(RuntimeError):
+    """A llama.cpp tool ended with an error; `.tail` holds its last output lines."""
+    tail: list = []
+
+
 def _run(cmd, label):
-    """Runs a tool of llama.cpp (converter, quantize). With a stop file in the job (`stop_file`) the Stop button ends the tool at once: raises imatrix.Stopped."""
-    rc, _tail = imatrix.run_streaming([str(c) for c in cmd], _stop_info(_JOB["cfg"]), 1, label=None, log_tail=True)
+    """Runs a tool of llama.cpp (converter, quantize). With a stop file in the job (`stop_file`) the Stop button ends the tool at once: raises imatrix.Stopped.
+    A failure names the cause: the last lines of the tool's output."""
+    rc, tail = imatrix.run_streaming([str(c) for c in cmd], _stop_info(_JOB["cfg"]), 1, label=None, log_tail=True)
     if rc != 0:
-        raise RuntimeError(f"{label} failed (exit code {rc}). See the log.")
+        last = imatrix.tail_note(tail)
+        err = ToolFailed(f"{label} failed (exit code {rc})." + (f" Last lines:\n{last}" if last else " See the log."))
+        err.tail = list(tail or [])
+        raise err
 
 
 def convert_to(conv, source, final: Path, label="The GGUF conversion", extra=()):
-    """convert_hf_to_gguf.py into `<final>.partial`, then the file gets its real name: a stopped or failed conversion never leaves a half `final`."""
+    """convert_hf_to_gguf.py into `<final>.partial`, then the file gets its real name: a stopped or failed conversion never leaves a half `final`.
+    A model folder without an MTP head gets `--no-mtp` (when the converter has it); the `--mmproj` conversion does not."""
     part = fsutil.partial_of(final)
     part.unlink(missing_ok=True)
+    extra = list(extra)
+    if "--mmproj" not in extra and "--no-mtp" not in extra:
+        extra = imatrix.no_mtp_extra(conv, source) + extra
     try:
         with protocol.timed("convert_f16"):
-            _run([sys.executable, conv, source, *extra, "--outfile", part, "--outtype", "f16"], label)
+            cmd = [sys.executable, conv, source, *extra, "--outfile", part, "--outtype", "f16"]
+            try:
+                _run(cmd, label)
+            except ToolFailed as e:
+                if not imatrix.retry_wants_no_mtp(conv, [str(c) for c in cmd], e.tail):
+                    raise
+                protocol.log("The converter stopped on the MTP head check; running it once more with --no-mtp (this model has no MTP head).")
+                cmd.insert(3, "--no-mtp")
+                _run(cmd, label)
         if not part.is_file():
             raise RuntimeError(f"{label} finished but wrote no file. See the log.")
         fsutil.replace_retry(part, final)
