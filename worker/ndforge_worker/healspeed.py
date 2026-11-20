@@ -196,12 +196,20 @@ def environment_facts() -> dict:
             facts["gpu"] = {"name": p.name, "memory_gb": round(p.total_memory / 1e9, 1), "capability": list(torch.cuda.get_device_capability(0))}
     except Exception:       # noqa: BLE001
         pass
+    try:
+        from . import tritonpin
+        facts["triton_match"] = tritonpin.installed_status()        # torch, triton(-windows) and whether they belong together
+    except Exception:       # noqa: BLE001
+        pass
     return facts
 
 
 def verdict_lines(rep: dict) -> list:
     """Plain sentences read off the numbers (hypotheses stay hypotheses)."""
     out = []
+    tm = (rep.get("environment") or {}).get("triton_match") or {}
+    if tm.get("matches") is False:
+        out.append(tm["text"])
     kern = rep.get("kernels") or {}
     if kern.get("delta_rule") == "torch":
         out.append("GatedDeltaNet runs on the slow PyTorch kernels: the fast kernels (flash-linear-attention) are the first thing to try.")
@@ -225,7 +233,7 @@ def markdown(rep: dict) -> str:
     L = ["# Heal speed report", "", f"> {DISCLAIMER}", "", f"Created {rep.get('created')}. Status: **{rep.get('status')}**" + (f": {rep['error']}" if rep.get("error") else ""), ""]
     for v in rep.get("verdict", []):
         L.append(f"- {v}")
-    L += ["", "## This computer", ""] + [f"- {k}: {v}" for k, v in (rep.get("environment") or {}).items()] + [""]
+    L += ["", "## This computer", ""] + [f"- {k}: {v['text'] if k == 'triton_match' and isinstance(v, dict) else v}" for k, v in (rep.get("environment") or {}).items()] + [""]
     if rep.get("windows_hints"):
         L += ["## Windows settings (shown, never changed)", ""] + [f"- {h}" for h in rep["windows_hints"]] + [""]
     if rep.get("kernels"):

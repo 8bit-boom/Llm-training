@@ -64,3 +64,5 @@ No job, event or error code was added for these; `contract.json` is unchanged. E
 ## Heal speed measurement (additive keys, experimental)
 
 `distill` job, `bench` object: `profile: true` (result `heal_profile {forward_s, loss_s, backward_s, optimizer_s, gdn_s, gemm_s, top_kernels, ...}`), `microbench: true`, `teacher_bench: true` (needs `distill.teacher {repo, load}`), `out_dir` (the worker writes `heal_speed_report.json/.md` there on every end; result extra `heal_speed_report {report, report_md}`), `windows_hints: [..]`. Result/extras `kernels {delta_rule: fla | torch | unknown, causal_conv1d, how, module}` (`speed.gdn_kernels`). `distill_cache` job key `teacher_batch_tokens` (rows per forward by a token budget; absent or 0 = the fixed `batch`; not part of the cache identity). No job type, event or error code was added.
+
+Additive: a heal-speed report's `environment` has `triton_match` ({torch, triton, wants, source, matches, text}); a failed export or conversion error message ends with the last lines of the tool's output (scrubbed, user name redacted).

@@ -464,3 +464,56 @@ fn the_kernel_check_says_plainly_what_works_and_rolls_nothing_back() {
     let none = parse_kernel_check(None, "could not start");
     assert!(!none.ok && none.text.contains("could not be run"));
 }
+
+fn reqs(v: &str) -> Vec<String> {
+    vec![format!("triton=={v}; platform_system == \"Linux\" and platform_machine == \"x86_64\""), "pytorch-triton-rocm==9.9; extra == 'rocm'".to_string(), "triton-windows==1.0".to_string()]
+}
+
+#[test]
+fn the_triton_pin_is_read_from_the_torch_wheel_then_the_table_then_unknown() {
+    use ndforge_core::envmgr::setup::{kernel_requirement_with, triton_pin_for, PinSource};
+    assert_eq!(triton_pin_for("2.11.0+cu128", &reqs("3.6.0")), Some((">=3.6,<3.7".into(), PinSource::Wheel)));
+    assert_eq!(triton_pin_for("2.14.1+cu130", &reqs("3.8.0")), Some((">=3.8,<3.9".into(), PinSource::Wheel)));
+    assert_eq!(triton_pin_for("2.15.0", &reqs("3.9.1")), Some((">=3.9,<3.10".into(), PinSource::Wheel)));
+    assert_eq!(triton_pin_for("2.14.1", &[]), Some((">=3.8,<3.9".into(), PinSource::Table)), "no requirement: the table");
+    assert_eq!(triton_pin_for("2.11.0", &[]), None, "no requirement and not in the table: unknown");
+    assert_eq!(triton_pin_for("2.11.0", &["triton (==3.6.0)".to_string()]), Some((">=3.6,<3.7".into(), PinSource::Wheel)), "the old requirement form");
+    assert_eq!(kernel_requirement_with("triton-windows", "2.11.0+cu128", &reqs("3.6.0")).unwrap(), "triton-windows>=3.6,<3.7");
+    let why = kernel_requirement_with("triton-windows", "2.11.0", &[]).unwrap_err();
+    assert!(why.contains("unknown") && why.contains("left as it is"), "{why}");
+}
+
+#[test]
+fn an_installed_triton_that_does_not_belong_to_the_torch_is_said_plainly_and_the_light_points_at_the_button() {
+    use ndforge_core::envmgr::health::{triton_check, Light};
+    use ndforge_core::envmgr::setup::triton_status;
+    let bad = triton_status("2.11.0+cu128", Some("3.9.0"), &reqs("3.6.0"));
+    assert_eq!(bad.matches, Some(false));
+    assert_eq!(bad.line(), "Triton 3.9.0 does not match torch 2.11.0 (wants 3.6.x): press Install fast kernels to fix.");
+    let c = triton_check(&bad).unwrap();
+    assert_eq!(c.light, Light::Warn);
+    assert!(c.detail.contains("press Install fast kernels") && c.fix.contains("Install fast kernels"), "{c:?}");
+    let good = triton_status("2.11.0+cu128", Some("3.6.2"), &reqs("3.6.0"));
+    assert!(good.line().contains("matches") && triton_check(&good).unwrap().light == Light::Ok);
+    assert!(triton_check(&triton_status("2.11.0", None, &reqs("3.6.0"))).is_none(), "no Triton installed: nothing to compare");
+    assert!(triton_check(&triton_status("2.11.0", Some("3.9.0"), &[])).is_none(), "unknown pin: no light");
+}
+
+#[test]
+fn the_metadata_script_reads_a_fake_torch_wheel() {
+    use ndforge_core::envmgr::setup::{parse_triton_facts, TRITON_FACTS};
+    let py = if cfg!(windows) { "python" } else { "python3" };
+    if std::process::Command::new(py).arg("--version").output().is_err() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    for (name, version, extra) in [("torch", "2.11.0+cu128", "Requires-Dist: triton==3.6.0; platform_system == \"Linux\"\n"), ("triton_windows", "3.9.0", "")] {
+        let di = d.path().join(format!("{name}-{version}.dist-info"));
+        std::fs::create_dir_all(&di).unwrap();
+        std::fs::write(di.join("METADATA"), format!("Metadata-Version: 2.1\nName: {}\nVersion: {version}\n{extra}", name.replace('_', "-"))).unwrap();
+    }
+    let o = std::process::Command::new(py).args(["-I", "-c", &format!("import sys; sys.path.insert(0, {:?})\n{}", d.path().to_string_lossy(), TRITON_FACTS)]).output().unwrap();
+    let t = parse_triton_facts(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(&o.stderr)));
+    assert_eq!((t.torch.as_str(), t.triton.as_deref(), t.matches), ("2.11.0+cu128", Some("3.9.0"), Some(false)), "{t:?}");
+    assert_eq!(t.wants().as_deref(), Some("3.6"));
+}

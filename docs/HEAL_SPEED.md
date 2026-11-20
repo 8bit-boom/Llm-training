@@ -25,3 +25,8 @@ The cache job takes as many rows per forward as fit `teacher_batch_tokens` (sett
 ## Not built yet (they come after your profiler numbers)
 
 Student micro-batching / packing (a 3-token conv1d boundary leak in transformers 5.23 must be fixed or tested away first), partial checkpointing, torch.compile, Liger, the Unsloth heal path.
+
+## Triton and torch must belong together
+
+`triton-windows` has to follow the minor of the installed PyTorch. The pin is read from the torch wheel's own requirement (`importlib.metadata.requires("torch")`: `triton==3.x.y`) and becomes `triton-windows>=3.x,<3.(x+1)`; the table in `envmgr/setup.rs` (torch 2.14, 2.15) is only the fallback, and a torch that is in neither leaves Triton alone ("unknown").
+The post-install check, the heal-speed report (`environment.triton_match`, additive) and a light on the Settings page and the Heal card say: `Triton 3.9.0 does not match torch 2.11.0 (wants 3.6.x): press Install fast kernels to fix.` Nothing is installed automatically; only the existing "Install the fast kernels" button runs pip.

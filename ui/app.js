@@ -2181,7 +2181,7 @@ function renderSetup() {
       <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
       <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
       <button class="primary" id="selftest" ${busy || !st || !st.env_installed ? "disabled" : ""}>Test the graphics card</button>
-      ${st && st.env_installed && (st.checks || []).some((c) => c.id === "kernels" && c.light !== "ok") ? `<button class="secondary" id="kernels" ${busy ? "disabled" : ""} title="Installs flash-linear-attention (and causal-conv1d where a ready-made package exists) so that Qwen3.5's linear-attention layers run fast. Nothing else is changed.">Install the fast kernels</button>` : ""}
+      ${st && st.env_installed && (st.checks || []).some((c) => (c.id === "kernels" || c.id === "triton") && c.light !== "ok") ? `<button class="secondary" id="kernels" ${busy ? "disabled" : ""} title="Installs flash-linear-attention (and causal-conv1d where a ready-made package exists) so that Qwen3.5's linear-attention layers run fast. Nothing else is changed.">Install the fast kernels</button>` : ""}
       <button class="secondary" id="cancelenv" ${busy ? "" : "disabled"}>Cancel</button>
     </div>
     ${env.step ? `<div class="stepline" aria-live="polite">${esc(env.step)}</div>` : ""}

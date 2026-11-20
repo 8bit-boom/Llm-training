@@ -53,13 +53,134 @@ pub fn triton_pin(torch_version: &str) -> Option<&'static str> {
     }
 }
 
+/// The Triton a torch wheel asks for, read from the wheel's own requirement lines (`importlib.metadata.requires("torch")`, e.g. `triton==3.6.0; platform_system == "Linux"`):
+/// the exact version, e.g. "3.6.0". Lines of other packages (`triton-windows`, `pytorch-triton`) do not count. The requirement is the truth for that very wheel.
+pub fn triton_exact_from_requires(lines: &[String]) -> Option<String> {
+    for l in lines {
+        let Some(rest) = l.trim().strip_prefix("triton") else { continue };
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            continue;
+        }
+        let rest = rest.trim_start().trim_start_matches('(').trim_start();
+        if let Some(v) = rest.strip_prefix("==") {
+            let v: String = v.trim_start().chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            if v.split('.').filter(|x| !x.is_empty()).count() >= 2 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// The first two numbers of a version ("3.9.0" -> (3, 9)).
+fn major_minor(v: &str) -> Option<(u32, u32)> {
+    let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty());
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+fn pin_of_minor((a, b): (u32, u32)) -> String {
+    format!(">={a}.{b},<{a}.{}", b + 1)
+}
+
+/// Where a Triton pin came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// the torch wheel's own requirement
+    Wheel,
+    /// the table of `triton_pin`
+    Table,
+}
+
+/// The `triton-windows` pin for a torch: from the wheel's requirement lines first, then the table, else None ("unknown"). The pin is `>=3.x,<3.(x+1)`.
+pub fn triton_pin_for(torch_version: &str, requires: &[String]) -> Option<(String, PinSource)> {
+    if let Some(m) = triton_exact_from_requires(requires).as_deref().and_then(major_minor) {
+        return Some((pin_of_minor(m), PinSource::Wheel));
+    }
+    triton_pin(torch_version).map(|p| (p.to_string(), PinSource::Table))
+}
+
 /// The requirement text of one kernel package: triton-windows pinned from the torch version (None = not installed, with the reason in the log), flash-linear-attention `>=0.6`.
-pub fn kernel_requirement(pkg: &str, torch_version: &str) -> std::result::Result<String, String> {
+/// `requires` are the requirement lines of the installed torch wheel (empty when they could not be read): the table is only the fallback.
+pub fn kernel_requirement_with(pkg: &str, torch_version: &str, requires: &[String]) -> std::result::Result<String, String> {
     match pkg {
-        "triton-windows" => triton_pin(torch_version).map(|p| format!("triton-windows{p}")).ok_or_else(|| format!("PyTorch {torch_version} is not in the table of Triton versions (2.14 and 2.15 are): triton-windows is left as it is, because an unpinned install can pull the build made for another torch.")),
+        "triton-windows" => triton_pin_for(torch_version, requires).map(|(p, _)| format!("triton-windows{p}")).ok_or_else(|| format!("The Triton version for PyTorch {torch_version} is unknown (its wheel names none and it is not in the table of 2.14 and 2.15): triton-windows is left as it is, because an unpinned install can pull the build made for another torch.")),
         "flash-linear-attention" => Ok("flash-linear-attention>=0.6".to_string()),
         other => Ok(other.to_string()),
     }
+}
+
+/// `kernel_requirement_with` without the wheel's requirement lines (the table only).
+pub fn kernel_requirement(pkg: &str, torch_version: &str) -> std::result::Result<String, String> {
+    kernel_requirement_with(pkg, torch_version, &[])
+}
+
+/// Does the installed Triton belong to the installed torch?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TritonStatus {
+    pub torch: String,
+    /// the installed `triton-windows` (else `triton`) version; None: none installed
+    pub triton: Option<String>,
+    /// the pin for this torch (`>=3.6,<3.7`), None when unknown
+    pub pin: Option<String>,
+    pub source: Option<PinSource>,
+    /// None: unknown (no pin or no Triton to compare)
+    pub matches: Option<bool>,
+}
+
+/// Compares the installed Triton with what the torch wheel asks for (pure: the facts come from `read_triton_status`).
+pub fn triton_status(torch: &str, triton: Option<&str>, requires: &[String]) -> TritonStatus {
+    let pin = triton_pin_for(torch, requires);
+    let matches = match (&pin, triton) {
+        (Some((p, _)), Some(t)) => {
+            let want = p.strip_prefix(">=").and_then(|x| x.split(',').next()).and_then(major_minor);
+            want.zip(major_minor(t)).map(|(w, h)| w == h)
+        }
+        _ => None,
+    };
+    TritonStatus { torch: torch.to_string(), triton: triton.map(String::from), pin: pin.as_ref().map(|(p, _)| p.clone()), source: pin.map(|(_, s)| s), matches }
+}
+
+impl TritonStatus {
+    /// "3.x" of the pin (">=3.6,<3.7" -> "3.6").
+    pub fn wants(&self) -> Option<String> {
+        self.pin.as_deref().and_then(|p| p.strip_prefix(">=")).and_then(|x| x.split(',').next()).map(String::from)
+    }
+
+    /// One plain line for the post-install check, the report and the cards.
+    pub fn line(&self) -> String {
+        let torch = self.torch.split('+').next().unwrap_or(&self.torch);
+        let wants = self.wants().map(|w| format!("wants {w}.x")).unwrap_or_else(|| "its Triton version is unknown".into());
+        match (&self.triton, self.matches) {
+            (Some(t), Some(true)) => format!("PyTorch {torch}, Triton {t}: matches ({wants})."),
+            (Some(t), Some(false)) => format!("Triton {t} does not match torch {torch} ({wants}): press Install fast kernels to fix."),
+            (Some(t), None) => format!("PyTorch {torch}, Triton {t}: whether they match is unknown ({wants})."),
+            (None, _) => format!("PyTorch {torch}: no Triton is installed ({wants})."),
+        }
+    }
+}
+
+/// Prints one JSON line: the torch version, the installed triton-windows / triton version and the requirement lines of the torch wheel. Imports no torch (only the metadata).
+pub const TRITON_FACTS: &str = "import json, importlib.metadata as m\nr = {'torch': None, 'triton': None, 'requires': []}\ntry:\n r['torch'] = m.version('torch')\n r['requires'] = [x for x in (m.requires('torch') or []) if x.lower().startswith('triton')]\nexcept Exception:\n pass\nfor n in ('triton-windows', 'triton'):\n try:\n  r['triton'] = m.version(n)\n  break\n except Exception:\n  pass\nprint(json.dumps(r))\n";
+
+/// Asks the environment's Python (metadata only, about a second) for `TritonStatus`; None when there is no torch or the answer cannot be read.
+pub fn read_triton_status(py: &str) -> Option<TritonStatus> {
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", TRITON_FACTS]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let o = cmd.output().ok().filter(|o| o.status.success())?;
+    parse_triton_facts(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// Reads the line of `TRITON_FACTS`.
+pub fn parse_triton_facts(out: &str) -> Option<TritonStatus> {
+    let v: serde_json::Value = serde_json::from_str(out.lines().rev().find(|l| l.trim_start().starts_with('{'))?).ok()?;
+    let torch = v["torch"].as_str()?;
+    let requires: Vec<String> = v["requires"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    Some(triton_status(torch, v["triton"].as_str(), &requires))
 }
 
 /// The `uv` arguments that install one kernel package: ready-made packages only (never a build from source), into this Python. The pins are added by the caller.
@@ -118,6 +239,18 @@ pub fn torch_version(py: &str) -> Option<String> {
     }
     let o = cmd.output().ok().filter(|o| o.status.success())?;
     Some(String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The torch wheel's own `triton...` requirement lines (empty when they cannot be read).
+fn read_triton_requires(py: &str) -> Vec<String> {
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", "import importlib.metadata as m\nfor x in (m.requires('torch') or []):\n if x.lower().startswith('triton'): print(x)"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default()
 }
 
 /// What the log says when a kernel package could not be installed.
@@ -250,8 +383,9 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
 fn install_kernels(plan: &SetupPlan, py: &str, with_pins: &dyn Fn(Vec<String>) -> Vec<String>, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<Vec<String>> {
     let mut done = Vec::new();
     let tv = torch_version(py).unwrap_or_default();
+    let requires = read_triton_requires(py);
     for pkg in kernel_extras() {
-        let req = match kernel_requirement(pkg, &tv) {
+        let req = match kernel_requirement_with(pkg, &tv, &requires) {
             Ok(r) => r,
             Err(why) => {
                 on_event(Event::Log(why));          // an unknown torch: nothing is guessed
@@ -267,6 +401,9 @@ fn install_kernels(plan: &SetupPlan, py: &str, with_pins: &dyn Fn(Vec<String>) -
     }
     if done.iter().any(|d| d == "flash-linear-attention") {
         run_kernel_check(py, on_event);          // says plainly whether the kernels work; nothing is rolled back
+    }
+    if let Some(t) = read_triton_status(py) {
+        on_event(Event::Log(t.line()));          // torch, triton-windows and whether they match, after the install too
     }
     Ok(done)
 }

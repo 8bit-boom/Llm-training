@@ -268,6 +268,9 @@ pub fn check(p: Option<&Project>, kind: &str, spec: &Value) -> Vec<Check> {
             }
         }
     }
+    if matches!(kind, "heal" | "heal_speed") {
+        checks.extend(crate::envmgr::health::triton_check_now());          // a Triton that does not belong to this torch: said plainly, never installed by itself
+    }
     if kind == "heal" && spec["vllm_teacher"].as_bool() == Some(true) {
         checks.extend(vllm_teacher_checks(&crate::settings::Settings::load().vllm, p, spec));          // vLLM makes the original's answers: the engine, the card, the disk
     }

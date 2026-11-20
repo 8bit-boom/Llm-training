@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 /// The checklist and the GPU for the setup page.
 pub fn status() -> Value {
     let facts = gather();
-    let checks: Vec<Check> = evaluate(&facts);
+    let mut checks: Vec<Check> = evaluate(&facts);
+    checks.extend(super::health::triton_check_now());
     let gpu = facts.gpus.as_ref().ok().and_then(|g| g.first().cloned());
     json!({
         "checks": checks,
