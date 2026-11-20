@@ -260,8 +260,19 @@ def criteria_of(rep: dict) -> list:
     return out
 
 
-WSLC_VERIFIED = ("wslc: your runs verified `run -d` with --gpus, --shm-size, -p and -v, `stop -t`, `remove -f`, `pull` and that the published port is reachable from Windows. Still untested: `cp`, `exec`, the field names of "
-                 "`list --format json` (see the samples below) and the flags of `logs`. The commands are templates you can edit.")
+WSLC_VERIFIED = ("wslc: your runs verified `run -d` with --gpus, --shm-size, -p and -v, `stop -t`, `remove -f`, `pull`, `logs -n N`, `inspect <name>`, `list -a` (table) and `list -a --format json` "
+                 "(fields Command, CreatedAt, HealthStatus, ID, Image, Labels, LocalVolumes, Mounts, Names, Networks, Platform, Ports, RunningFor, Size, State, Status; one JSON object per container, "
+                 "a single object and not an array when there is one container), and that the published port is reachable from Windows. Still untested: `cp` and `exec`. The commands are templates you can edit.")
+
+
+def backend_note(kf: dict):
+    """When the two engines of the fp8 comparison use another text-layer attention backend: the sentence that says the comparison is dtype and backend together. None when they match or are unknown."""
+    a = ((kf.get("auto") or {}).get("backends") or {}).get("text_attention")
+    b = ((kf.get("fp8") or {}).get("backends") or {}).get("text_attention")
+    if a and b and a != b:
+        return (f"Not only the cache type changed: the attention backend changed from {a} to {b} (vLLM switches because the backend of the standard engine has no fp8 KV cache on this card). "
+                "The comparison is the cache type and the backend together; a difference in speed or in the answers cannot be put on the cache type alone.")
+    return None
 
 
 def markdown(rep: dict) -> str:
@@ -332,6 +343,9 @@ def markdown(rep: dict) -> str:
             if x:
                 L += [f"- **{key}** (passed: {x.get('requested_dtype')}; the log {'CONFIRMS' if x.get('log_confirms_fp8') else 'does not mention'} an fp8 KV cache): KV cache {x.get('kv_tokens') if x.get('kv_tokens') is not None else 'unknown'} tokens, max concurrency {x.get('max_concurrency') if x.get('max_concurrency') is not None else 'unknown'}x, long-answer speed {x.get('long_tokens_per_s')} tokens/s, "
                       f"think_rate {x.get('think_rate')}, closed_rate {x.get('closed_rate')}, accuracy {x.get('accuracy')}; attention backend: {x.get('attention_backend') or 'not found in the log'}."]
+        bn = kf.get("backend_note") or backend_note(kf)
+        if bn and not kf.get("comparison_refused"):
+            L += ["", bn]
         for k in ("comparison_refused", "text", "warning", "fp8_failed"):
             if kf.get(k) and not (k == "text" and kf.get("text") == kf.get("comparison_refused")):
                 L += ["", kf[k]]
@@ -361,7 +375,8 @@ def markdown(rep: dict) -> str:
                     L += ["", f"{title} at the same moment (exit code {smp[key]['returncode']}):", "", "    " + (smp[key]["output"] or "(empty)").replace("\n", "\n    ")]
             L += [""]
         for k, v in rep["wslc"].get("help", {}).items():
-            L += [f"### {k} (exit code {v['returncode']})", "", "```", v["output"], "```", ""]
+            late = " (taken after the engines were removed: empty is expected)" if k.endswith("list -a --format json") else ""
+            L += [f"### {k} (exit code {v['returncode']}){late}", "", "```", v["output"] or ("(empty: expected, no container is left)" if late else ""), "```", ""]
         if rep["wslc"].get("loopback"):
             L += ["Loopback publish test: " + rep["wslc"]["loopback"], ""]
     if rep.get("hints"):
@@ -464,6 +479,9 @@ def kv_fp8_pass(cfg: dict, model: str, quant: str, util: float, extra_args, rep:
             out["text"] = "The fp8 engine's log does NOT say it used an 8-bit KV cache (no \"Using fp8 data type to store kv cache\"): the numbers below are not an fp8 measurement."
         else:
             out["text"] = (f"KV cache: {a:,} tokens with auto, {b:,} with fp8 ({b / a:.2f} times)." if a and b else "The KV cache size was not found in the logs.")
+        bn = backend_note(out)
+        if bn:
+            out["backend_note"] = bn                      # additive: the comparison is the cache type AND the backend
         if fp8.get("refuses_fp8"):
             out["warning"] = f"The log mentions a problem with fp8: {fp8['refuses_fp8']}"
     except vllmengine.EngineError as exc:
@@ -488,8 +506,10 @@ def remove_leftovers(engine) -> dict:
     out = {"found": [], "removed": [], "listing": None}
     try:
         if engine.kind == "wslc":
-            r = _run(["wslc", "list", "-a"], 60)
-            names = re.findall(r"ndforge-vllm-\d+", r["output"])
+            r = _run(["wslc", "list", "-a", "--format", "json"], 60)
+            if r["returncode"] != 0 or vllmengine.parse_list(r["output"]) is None:
+                r = _run(["wslc", "list", "-a"], 60)                 # the table, when the JSON is not there
+            names = vllmengine.list_names(r["output"], "ndforge-vllm-")
             tmpl = vllmengine.wslc_templates(engine.cfg)["remove"]
             mk = lambda n: vllmengine.render_template(tmpl, {**vllmengine.wslc_values(engine.cfg, 0, "", []), "name": n})      # noqa: E731
         elif engine.kind in ("docker", "docker_wsl"):

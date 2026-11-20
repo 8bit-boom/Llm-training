@@ -198,3 +198,18 @@ The `wslc list -a --format json` sample, the `wslc list -a` table and `wslc insp
 ### Update: the fp8 pass compares what it says it compares (5th report)
 
 The first self-test engine of the pass is now started with `--kv-cache-dtype auto` explicitly (the baseline), whatever the setting says, and the second with `fp8`; each section of the report says the dtype that was passed and whether the log confirms an 8-bit cache ("Using fp8 data type to store kv cache" or `kv_cache_dtype=torch.float8...` in FlashInfer's line), and no comparison is printed when the "auto" run's log says fp8. The backends come from the real lines: "Using <X> attention backend out of potential backends: [...]" (text layers), the decode backend and KV dtype of "FlashInfer resolved query dtypes", "Using FlashInfer GDN prefill kernel", "Using MarlinLinearKernel"; the vision encoder's attention line is kept apart. The second engine's `wslc list` / `inspect` sample is taken after its `/health` answers and with its own name ("`wslc list` is empty while the container runs" is printed as a finding), its commands are printed, its kernel/cache log lines are printed, and a final `list -a` removes any `ndforge-vllm-*` container left behind.
+
+### Update: verified wslc listing and the fp8 comparison on the owner's PC
+
+**wslc.** The runs verified `list -a --format json` (fields `Command, CreatedAt, HealthStatus, ID, Image, Labels, LocalVolumes, Mounts, Names, Networks, Platform, Ports, RunningFor, Size, State, Status`; one JSON object per container, and a single object, not an array, when there is one container), `list -a` (table), `inspect <name>` (an array with `Name`, `State.Running`, `State.Status`, `HostConfig`, `Ports` ...) and `logs -n N`. Still untested: `cp`, `exec`.
+Everything that reads the listing (`vllmengine.parse_list`, `wslc_running`, `list_names`, the clean-up of left-over containers) accepts an array, a single object and one object per line, finds the container by `Names` (a string or a list, a leading `/` dropped) and reads `State`; a table is still understood.
+The block "`wslc list -a --format json`" at the end of the report is taken after the engines were removed: empty is expected.
+
+**fp8 comparison on this PC (RTX 5090, 27B, Quick suite).** The two engines differ in the attention backend as well: vLLM uses FlashAttention-2 for `auto` and switches to FlashInfer for fp8 (FA2 has no fp8 KV cache on this card). So the comparison is cache type and backend together, and the report says so whenever the text-layer backend differs ("Not only the cache type changed: the attention backend changed from X to Y").
+
+| engine | attention backend | KV cache | tokens per second (three runs) |
+|---|---|---|---|
+| auto | FLASH_ATTN, 832-token attention blocks | 71,141 tokens | 520 to 564 |
+| fp8 | FLASHINFER (xqa decode), 1600-token blocks | 85,196 tokens (1.20 times) | 525 to 548 |
+
+The run-to-run spread is about 5 %, so fp8 gives more room (1.2 times the tokens) and **no speed gain**. The report's kernel / backend / cache lines no longer contain the CUDA-graph progress bars, so the `GPU KV cache size` and `init engine ... took` lines of each engine are never cut off.
