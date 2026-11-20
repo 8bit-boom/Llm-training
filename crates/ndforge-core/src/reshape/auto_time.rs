@@ -740,6 +740,9 @@ pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &
     let vllm = spec.vllm.as_ref().filter(|a| a.any()).map(|_| {
         let mut notes = vllm_plan::basis_notes(&vx.n, ob);
         notes.push("Experimental: built from a research report. A step that cannot use vLLM (it is missing, the card is busy, the teacher check says \"different\") falls back to the standard engine and the run goes on.".into());
+        if spec.vllm.as_ref().is_some_and(|v| v.kv_fp8) {
+            notes.push("8-bit KV cache for the checks: more answers fit at once (the cache of the 27 B 4-bit model roughly doubles), which usually makes a check faster; not measured, so the time above does not count it.".into());
+        }
         if spec.keep_thinking && !vx.dec.iter().any(|d| d.kind == "checks") {
             notes.push("This run has no thinking check that could use vLLM.".into());
         }

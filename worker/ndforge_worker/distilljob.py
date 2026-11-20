@@ -651,7 +651,7 @@ def store_extends(folder, meta: dict, hashes: list) -> bool:
     old = read_cache_index(folder)
     if old is None:
         return True
-    if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len", "engine", "teacher_quant", "teacher_origin")):
+    if not all(old.get(key) == meta.get(key) for key in ("teacher", "k", "tokenizer_hash", "max_len", "engine", "teacher_quant", "teacher_origin", "kv_cache")):
         return False
     if old.get("teacher_weights") and meta.get("teacher_weights") and old["teacher_weights"] != meta["teacher_weights"]:
         return False

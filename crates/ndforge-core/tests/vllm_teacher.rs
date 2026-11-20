@@ -106,12 +106,12 @@ fn the_job_object_carries_the_route_the_container_and_the_checks_verdict() {
 fn the_check_job_asks_for_100_rows_next_to_the_models_folder() {
     let d = tempfile::tempdir().unwrap();
     let common = json!({"teacher": {"repo": "org/T", "load": "4bit"}, "student": "/s", "model": {"family": "qwen3_5"}, "data": {"train": "/t.jsonl"}, "k": 32, "max_seq": 4096, "seed": 3407});
-    let j = teacher_check_job(&VllmSettings::default(), &common, d.path(), Some(&d.path().join("cache")));
+    let j = teacher_check_job(&VllmSettings::default(), &common, d.path(), Some(&d.path().join("cache")), None);
     assert_eq!((j["job"].clone(), j["rows"].clone(), j["k"].clone(), j["max_seq"].clone()), (json!("vllm_teacher_check"), json!(100), json!(32), json!(4096)));
     assert_eq!(j["out"], json!(d.path().join("vllm_teacher_check.json")));
     assert_eq!(j["reference_cache"], json!(d.path().join("cache")));
     assert_eq!(j["engine"]["kind"], "vllm");
-    assert!(teacher_check_job(&VllmSettings::default(), &common, d.path(), None).get("reference_cache").is_none());
+    assert!(teacher_check_job(&VllmSettings::default(), &common, d.path(), None, None).get("reference_cache").is_none());
 }
 
 #[test]
@@ -285,4 +285,32 @@ fn a_vllm_check_of_the_original_follows_the_same_identity_rule_and_says_which_mo
     let e = engine_job_with_card(&VllmSettings::default());
     assert_eq!(e["teacher"]["pairs"]["Qwen/Qwen3.8-27B"], "cyankiwi/Qwen3.8-27B-AWQ-INT4");
     assert_eq!(e["teacher"]["route"], "auto");
+}
+
+#[test]
+fn the_8_bit_kv_cache_is_off_by_default_and_the_teacher_needs_its_own_confirmation() {
+    let d = VllmSettings::default();
+    assert_eq!((d.kv_cache_dtype.as_str(), d.kv_cache_dtype_teacher, d.llama_cache_type.as_str()), ("auto", false, "f16"));
+    assert!(engine_job(&d).get("kv_cache_dtype").is_none() && engine_job(&d).get("kv_cache_dtype_teacher").is_none(), "the engine object is what it was");
+    let old: ndforge_core::settings::Settings = serde_json::from_str("{\"vllm\": {\"enabled\": true}}").unwrap();
+    assert_eq!(old.vllm.kv_cache_dtype, "auto");
+    let fp8 = VllmSettings { kv_cache_dtype: "fp8".into(), ..Default::default() };
+    assert_eq!(engine_job(&fp8)["kv_cache_dtype"], "fp8");
+    assert!(engine_job(&fp8).get("kv_cache_dtype_teacher").is_none());
+    // the teacher's job: only with BOTH switches, and then the identity says so
+    assert!(teacher_engine_job(&fp8, None).get("kv_cache_dtype").is_none() && teacher_identity(&fp8, "Someone/Finetune").get("kv_cache").is_none());
+    let both = VllmSettings { kv_cache_dtype: "fp8".into(), kv_cache_dtype_teacher: true, ..Default::default() };
+    let e = teacher_engine_job(&both, None);
+    assert_eq!((e["kv_cache_dtype"].clone(), e["kv_cache_dtype_teacher"].clone()), (json!("fp8"), json!(true)));
+    assert_eq!(teacher_identity(&both, "Someone/Finetune")["kv_cache"], "fp8");
+    let d2 = tempfile::tempdir().unwrap();
+    let common = json!({"teacher": {"repo": "o/T"}, "student": "/s", "model": {"family": "g"}, "data": {}, "k": 32, "max_seq": 64, "seed": 1});
+    assert_eq!(teacher_check_job(&d, &common, d2.path(), None, Some("fp8"))["kv_cache_dtype"], "fp8");
+    assert!(teacher_check_job(&d, &common, d2.path(), None, None).get("kv_cache_dtype").is_none());
+    // the cache key of the answers
+    let f = d2.path().join("t.jsonl");
+    std::fs::write(&f, "{}\n").unwrap();
+    let a = rows_key_with(&f, 1, "o/T", "4bit", Some(&json!({"engine": "vllm-0.34.0", "teacher_quant": "bnb-nf4"})));
+    let b = rows_key_with(&f, 1, "o/T", "4bit", Some(&json!({"engine": "vllm-0.34.0", "teacher_quant": "bnb-nf4", "kv_cache": "fp8"})));
+    assert_ne!(a, b);
 }

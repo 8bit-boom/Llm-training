@@ -225,6 +225,17 @@ impl AppModel {
         if !v.wslc.is_object() {
             v.wslc = serde_json::json!({});
         }
+        v.kv_cache_dtype = v.kv_cache_dtype.trim().to_lowercase();
+        if v.kv_cache_dtype.is_empty() {
+            v.kv_cache_dtype = "auto".into();
+        }
+        v.llama_cache_type = v.llama_cache_type.trim().to_lowercase();
+        if v.llama_cache_type.is_empty() {
+            v.llama_cache_type = "f16".into();
+        }
+        if !["auto", "fp8"].contains(&v.kv_cache_dtype.as_str()) || !["f16", "q8_0"].contains(&v.llama_cache_type.as_str()) {
+            return Err(Error::new("The KV cache type of vLLM is auto or fp8; llama.cpp's is f16 or q8_0."));
+        }
         v.teacher.route = v.teacher.route.trim().to_lowercase();
         if v.teacher.route.is_empty() {
             v.teacher.route = "auto".into();

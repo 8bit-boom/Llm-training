@@ -302,12 +302,15 @@ def engine_config(job: dict) -> dict:
         e["distro"] = ""                                    # the default distro
     if kind == "url" and not e.get("url"):
         raise EngineError("The vLLM engine is set to 'url' but no address is given.")
+    e["kv_cache_dtype"] = str(e.get("kv_cache_dtype") or "auto").lower()
+    if e["kv_cache_dtype"] not in ("auto", "fp8"):
+        raise EngineError(f"The KV cache type must be auto or fp8, not {e['kv_cache_dtype']!r}.")
     e["version"] = str(e.get("version") or (image_version(e["image"]) if kind in ("docker", "docker_wsl") else DEFAULT_VERSION if kind == "wsl" else "unknown"))
     return e
 
 
 def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, max_len: int = DEFAULT_MAX_MODEL_LEN, max_seqs: int = DEFAULT_MAX_SEQS,
-               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None, api_key: str | None = None) -> list:
+               gpu_util: float = DEFAULT_GPU_UTIL, lora_rank: int = DEFAULT_LORA_RANK, extra: list | None = None, api_key: str | None = None, kv_cache_dtype: str = "auto") -> list:
     """The vLLM flags (all from the research report, untested): no reasoning parser (the template ends the prompt with `<think>\\n`), model defaults off
     (`--generation-config vllm`), vision tower off, the served name `model`. `quant`: "none" | "fp8" (`--quantization fp8`) | anything else is a pre-quantized checkpoint (nothing added:
     vLLM reads its own quantization config). `adapter`: the path (as the server sees it) of a LoRA folder, served as `round`."""
@@ -315,6 +318,8 @@ def serve_args(model: str, *, quant: str = "none", adapter: str | None = None, m
             "--max-num-seqs", str(int(max_seqs)), "--gpu-memory-utilization", f"{float(gpu_util):g}"]
     if api_key:
         args += ["--api-key", api_key]                      # the port may not be loopback-only (WSLc): every request must carry `Authorization: Bearer <key>`
+    if kv_cache_dtype == "fp8":
+        args += ["--kv-cache-dtype", "fp8"]                 # OPTIONAL 8-bit KV cache (off by default): about twice the cached tokens; only the full-attention layers of a hybrid model have a KV cache
     if quant == "bnb-nf4":
         args += ["--quantization", "bitsandbytes"]          # UNVERIFIED (the in-flight 4-bit route: the plugin may be needed, see vllmquant.BNB_ARGS)
     if quant == "fp8":
@@ -423,6 +428,8 @@ def engine_identity(job: dict, quant: str, lora: bool) -> dict:
     cfg = engine_config(job)
     ident = {"vllm": cfg["version"], "quant": quant, "lora": bool(lora)}
     e = job.get("engine") or {}
+    if cfg.get("kv_cache_dtype") == "fp8":
+        ident["kv_cache"] = "fp8"                                # an 8-bit KV cache changes the numbers a little: its results never share a key with exact ones (additive: no key otherwise)
     if e.get("original") and quant.split(":")[0] in ("prequant", "bnb-nf4"):
         ident["teacher_origin"] = str(e.get("original_repo") or job.get("model") or "")      # whose weights these are: the original a stand-in was made for (additive: no key for other checks)
     return ident
@@ -434,8 +441,9 @@ class Engine:
     """A vLLM server: start() (does not wait), wait_ready(), stop() (always the explicit stop). `_popen` and `_run` are the module-level hooks tests replace."""
 
     def __init__(self, cfg: dict, model: str, *, adapter: str | None = None, quant: str = "none", extra_args: list | None = None, max_len: int = DEFAULT_MAX_MODEL_LEN,
-                 max_seqs: int = DEFAULT_MAX_SEQS, gpu_util: float = DEFAULT_GPU_UTIL):
+                 max_seqs: int = DEFAULT_MAX_SEQS, gpu_util: float = DEFAULT_GPU_UTIL, kv_cache_dtype: str | None = None):
         self.cfg, self.model, self.adapter, self.quant = cfg, model, adapter, quant
+        self.kv_cache_dtype = kv_cache_dtype or str(cfg.get("kv_cache_dtype") or "auto")
         self.extra_args, self.max_len, self.max_seqs, self.gpu_util = extra_args, max_len, max_seqs, gpu_util
         self.kind = cfg["kind"]
         self.port = 0
@@ -480,9 +488,9 @@ class Engine:
                 extra += ["--download-dir", "/models"]
             if adapter:
                 raise EngineError("A LoRA on top is not set up for the wslc way yet (use docker or the url way).")
-            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key)
+            args = serve_args(model, quant=self.quant, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=extra, api_key=self.api_key, kv_cache_dtype=self.kv_cache_dtype)
             return render_template(wslc_templates(self.cfg)["run"], wslc_values(self.cfg, self.port, model_dir, args))
-        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key,
+        args = serve_args(model, quant=self.quant, adapter=adapter, max_len=self.max_len, max_seqs=self.max_seqs, gpu_util=self.gpu_util, extra=self.extra_args, api_key=self.api_key, kv_cache_dtype=self.kv_cache_dtype,
                           lora_rank=lora_rank_for(self.adapter) if self.adapter else DEFAULT_LORA_RANK)
         return docker_command(self.cfg, self.port, args, mounts=mounts) if self.kind in ("docker", "docker_wsl") else wsl_command(self.cfg, self.port, args)
 

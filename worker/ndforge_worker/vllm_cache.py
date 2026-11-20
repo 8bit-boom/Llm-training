@@ -200,6 +200,8 @@ def llm_kwargs(args) -> dict:
           "language_model_only": True, "generation_config": "vllm", "disable_log_stats": True, "logprobs_mode": "raw_logprobs", "enable_prefix_caching": False}
     if args.quantization:
         kw["quantization"] = args.quantization
+    if getattr(args, "kv_cache_dtype", "auto") == "fp8":
+        kw["kv_cache_dtype"] = "fp8"          # an unknown keyword is NOT dropped: the identity says fp8, so it must really be fp8
     if args.max_num_batched_tokens:
         kw["max_num_batched_tokens"] = int(args.max_num_batched_tokens)
     kw.update(json.loads(args.llm_kwargs or "{}"))
@@ -349,6 +351,7 @@ def parse_args(argv=None):
     p.add_argument("--max-num-batched-tokens", type=int, default=0)
     p.add_argument("--llm-kwargs", default="", help="JSON object of more LLM(...) arguments")
     p.add_argument("--stop-file", default="")
+    p.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8"])
     return p.parse_args(argv)
 
 

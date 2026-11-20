@@ -392,7 +392,7 @@ fn vllm_is_a_knob_with_times_and_a_risk_and_every_preset_but_custom_switches_it_
     assert!(answers.1 < 0.0, "hours of the original's answers become a few: {answers:?}");
     assert!(k.options[1..].iter().all(|o| o.note.as_deref().is_some_and(|n| n.contains("Experimental"))));
     // a spec with vLLM is a Custom choice; a preset switches it off again; custom keeps it
-    let on = AutoSpec { vllm: Some(AutoVllm { teacher_cache: true, checks: false, automatic: false }), ..owner() };
+    let on = AutoSpec { vllm: Some(AutoVllm { teacher_cache: true, checks: false, automatic: false, kv_fp8: false }), ..owner() };
     assert_eq!(on.matching_preset(), None);
     assert!(on.with_preset("balanced").unwrap().vllm.is_none() && on.with_preset("thorough").unwrap().vllm.is_none() && on.with_preset("fast").unwrap().vllm.is_none());
     assert!(on.with_preset("custom").unwrap().vllm.is_some());

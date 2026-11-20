@@ -405,6 +405,8 @@ def cache_key(job: dict, backend: str, settings: dict) -> dict:
             key["engine"] = vllmengine.engine_identity(job, thinkcheck_vllm.quant_of(job), bool(job.get("adapter")))
         except vllmengine.EngineError as exc:
             raise ThinkCheckError(str(exc)) from exc
+    if backend == "llama" and str(job.get("cache_type") or "f16").lower() != "f16":
+        key["llama_cache_type"] = str(job["cache_type"]).lower()        # a quantized KV cache changes the numbers a little: its results never share a key with the default f16 ones
     return key
 
 
@@ -498,6 +500,8 @@ def _run_one(job: dict, fallback_note: str | None = None) -> int:
     res = {**result_of(str(job.get("model") or ""), name, settings, run_, time.monotonic() - started), "cached": False}
     if fallback_note:
         res["fallback"] = fallback_note
+    if name == "llama" and str(job.get("cache_type") or "f16").lower() != "f16":
+        res["llama_cache_type"] = str(job["cache_type"]).lower()
     if name == "vllm":                                                 # additive: what the engine was and how it ran (the numbers are estimates until the self-test ran)
         res["engine"] = {**(key or cache_key(job, name, settings))["engine"], **(job.get("_engine_report") or {})}
     if cache and not res["stopped"]:

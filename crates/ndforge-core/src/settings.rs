@@ -112,6 +112,12 @@ pub struct VllmSettings {
     pub teacher_repo: String,
     /// check the rounds of a heal (model + LoRA) with vLLM; off until an agreement run showed it matches the standard engine
     pub adapter_rounds: bool,
+    /// the KV cache type of the engine: "auto" (default, today's behaviour) | "fp8" (8 bit: about twice the cached tokens, a tiny numeric change; experimental)
+    pub kv_cache_dtype: String,
+    /// the 8-bit KV cache may ALSO be used for the teacher's answers (the training target): a second, explicit confirmation, off by default
+    pub kv_cache_dtype_teacher: bool,
+    /// llama.cpp's KV cache type for the GGUF thinking check: "f16" (default) | "q8_0" (needs flash attention)
+    pub llama_cache_type: String,
     /// edits of the WSLc command templates (docs/VLLM.md); an object, empty = the defaults
     pub wslc: serde_json::Value,
     /// the teacher's answers through vLLM (off by default)
@@ -121,7 +127,7 @@ pub struct VllmSettings {
 impl Default for VllmSettings {
     fn default() -> Self {
         VllmSettings { enabled: false, kind: "auto".into(), image: "vllm/vllm-openai:v0.34.0".into(), distro: String::new(), venv: "~/.ndforge/vllm".into(), url: String::new(),
-            model_volume: "ndforge-vllm-hf".into(), model_dir: String::new(), teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4".into(), adapter_rounds: false, wslc: serde_json::json!({}), teacher: VllmTeacherSettings::default() }
+            model_volume: "ndforge-vllm-hf".into(), model_dir: String::new(), teacher_repo: "cyankiwi/Qwen3.8-27B-AWQ-INT4".into(), adapter_rounds: false, kv_cache_dtype: "auto".into(), kv_cache_dtype_teacher: false, llama_cache_type: "f16".into(), wslc: serde_json::json!({}), teacher: VllmTeacherSettings::default() }
     }
 }
 

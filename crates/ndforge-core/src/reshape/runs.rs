@@ -796,6 +796,9 @@ pub struct HealVllm {
     /// the original's answers (the teacher cache) are made by vLLM
     #[serde(default)]
     pub teacher_cache: bool,
+    /// only for "Check the vLLM teacher": measure the 8-bit KV cache ("fp8") against the exact reference
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<String>,
 }
 
 impl HealSpec {
@@ -1038,7 +1041,7 @@ pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Opt
                         "data": {"train": train, "tokens": spec.tokens(), "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "seed": crate::general::SEED});
     let cache = dir.join("distill").join("cache");
     let reference = read_json(&cache.join("index.json")).filter(|i| i["complete"] == true && i["engine"].is_null()).map(|_| cache);
-    let job = crate::vllm::teacher_check_job(&s, &common, &dir, reference.as_deref());
+    let job = crate::vllm::teacher_check_job(&s, &common, &dir, reference.as_deref(), spec.vllm.as_ref().and_then(|v| v.kv_cache_dtype.as_deref()));
     let py = python()?;
     let _active = Active::begin(&dir)?;
     let _ = std::fs::remove_file(dir.join("STOP"));
@@ -1153,6 +1156,9 @@ pub fn rows_key_with(train: &Path, tokens: u64, teacher_repo: &str, teacher_load
     let mut text = json!({"train": train.to_string_lossy(), "size": meta.map(|m| m.len()).unwrap_or(0), "mtime": mtime, "tokens": tokens, "teacher": teacher_repo, "load": teacher_load});
     if let Some(e) = engine {
         text["engine"] = json!({"engine": e["engine"], "teacher_quant": e["teacher_quant"]});
+        if !e["kv_cache"].is_null() {
+            text["engine"]["kv_cache"] = e["kv_cache"].clone();          // an 8-bit KV cache is another cache (only written when on: the key is otherwise what it was)
+        }
     }
     // a teacher that is a local folder also counts by its weight files (a replaced checkpoint must not reuse the old answers); a Hub id keeps the key it always had
     if let Some(files) = local_teacher_files(Path::new(teacher_repo)) {

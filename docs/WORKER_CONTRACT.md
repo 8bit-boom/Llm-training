@@ -56,3 +56,7 @@ No job, event or error code was added for these; `contract.json` is unchanged. E
 - `vllm_teacher_check` job and error code `vllm_teacher_check_failed`: see above (one entry in `contract.json`).
 - `vllm_selftest` report/result: `model_info` (`model`, `params_b`, `params_source`, `weights_gb`, `quant`), `model_params_b`, `model_quant`, `gpu`, `answer_tokens`, `short_answers`, `long_tokens_per_s`, `exit_logs`, `start_command`, `timings`.
 - The standalone script `vllm_cache.py` (runs inside the container) prints protocol-shaped JSON lines; its error code `vllm_cache_failed` is internal to the runner and not a worker error code.
+
+## 8-bit KV cache (additive keys, experimental)
+
+`engine.kv_cache_dtype` ("auto" | "fp8") of `think_check` / `trace_gen` / `vllm_selftest` engine objects (result `engine.kv_cache: "fp8"` and a `kv_cache` key in the check's cache key only when fp8); `engine.kv_cache_dtype` + `engine.kv_cache_dtype_teacher: true` of the `distill_cache` engine object (index/identity key `kv_cache: "fp8"` only then); `vllm_teacher_check` job key `kv_cache_dtype` (result `kv_cache_dtype`, `identity.kv_cache`); `vllm_selftest` job key `kv_fp8_test` (report `kv_fp8`); `think_check` (backend llama) job key `cache_type` ("f16" | "q8_0", `flash_attn_args`), result and cache key `llama_cache_type` only when q8_0. No job type, event or error code was added.
