@@ -433,3 +433,34 @@ fn a_kernel_that_cannot_be_installed_is_a_note_and_the_rest_goes_on_and_the_butt
     let after = std::fs::read_to_string(plan.env_dir.join("ndforge_env.json")).unwrap();
     assert!(after.contains("\"unsloth\": true") && after.contains("flash-linear-attention"), "{after}");
 }
+
+// ---- pinned fast kernels (docs/HEAL_SPEED.md)
+
+#[test]
+fn triton_is_pinned_from_the_torch_version_and_an_unknown_torch_is_left_alone() {
+    use ndforge_core::envmgr::setup::{kernel_requirement, triton_pin};
+    assert_eq!(triton_pin("2.14.1+cu130"), Some(">=3.8,<3.9"));
+    assert_eq!(triton_pin("2.14.0"), Some(">=3.8,<3.9"));
+    assert_eq!(triton_pin("2.15.0+cu130"), Some(">=3.9,<3.10"));
+    assert_eq!(triton_pin("2.13.0"), None);
+    assert_eq!(triton_pin(""), None);
+    assert_eq!(kernel_requirement("triton-windows", "2.14.1+cu130").unwrap(), "triton-windows>=3.8,<3.9");
+    let why = kernel_requirement("triton-windows", "2.99.0").unwrap_err();
+    assert!(why.contains("2.99.0") && why.contains("left as it is") && why.contains("unpinned"), "{why}");
+    assert_eq!(kernel_requirement("flash-linear-attention", "x").unwrap(), "flash-linear-attention>=0.6");
+    assert_eq!(kernel_requirement("causal-conv1d", "x").unwrap(), "causal-conv1d");
+}
+
+#[test]
+fn the_kernel_check_says_plainly_what_works_and_rolls_nothing_back() {
+    use ndforge_core::envmgr::setup::{parse_kernel_check, KERNEL_CHECK};
+    assert!(KERNEL_CHECK.contains("fla.ops.gated_delta_rule") && KERNEL_CHECK.contains("backward") && KERNEL_CHECK.contains("cuda"));
+    let ok = parse_kernel_check(Some(0), "...\nOK\n");
+    assert!(ok.ok && ok.text.contains("work"));
+    let imp = parse_kernel_check(Some(4), "IMPORT ModuleNotFoundError No module named 'triton'");
+    assert!(!imp.ok && imp.text.contains("does not import") && imp.text.contains("slow PyTorch kernels") && imp.text.contains("Nothing was removed"), "{}", imp.text);
+    let run = parse_kernel_check(Some(5), "RUN RuntimeError no kernel image is available for execution on the device");
+    assert!(!run.ok && run.text.contains("failed on this graphics card") && run.text.contains("no kernel image"));
+    let none = parse_kernel_check(None, "could not start");
+    assert!(!none.ok && none.text.contains("could not be run"));
+}

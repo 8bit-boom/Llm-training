@@ -42,9 +42,82 @@ pub fn kernel_extras() -> Vec<&'static str> {
     v
 }
 
+/// The Triton that belongs to a PyTorch version (triton-windows must match the torch minor: an unpinned install pulls the build made for the NEXT torch). From the research report:
+/// torch 2.14.x needs triton ~= 3.8 (`>=3.8,<3.9`), torch 2.15 `>=3.9,<3.10`. None for a torch this table does not know: the install then leaves Triton as it is and says so.
+pub fn triton_pin(torch_version: &str) -> Option<&'static str> {
+    let mut it = torch_version.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty());
+    match (it.next().and_then(|x| x.parse::<u32>().ok()), it.next().and_then(|x| x.parse::<u32>().ok())) {
+        (Some(2), Some(14)) => Some(">=3.8,<3.9"),
+        (Some(2), Some(15)) => Some(">=3.9,<3.10"),
+        _ => None,
+    }
+}
+
+/// The requirement text of one kernel package: triton-windows pinned from the torch version (None = not installed, with the reason in the log), flash-linear-attention `>=0.6`.
+pub fn kernel_requirement(pkg: &str, torch_version: &str) -> std::result::Result<String, String> {
+    match pkg {
+        "triton-windows" => triton_pin(torch_version).map(|p| format!("triton-windows{p}")).ok_or_else(|| format!("PyTorch {torch_version} is not in the table of Triton versions (2.14 and 2.15 are): triton-windows is left as it is, because an unpinned install can pull the build made for another torch.")),
+        "flash-linear-attention" => Ok("flash-linear-attention>=0.6".to_string()),
+        other => Ok(other.to_string()),
+    }
+}
+
 /// The `uv` arguments that install one kernel package: ready-made packages only (never a build from source), into this Python. The pins are added by the caller.
 pub fn kernel_extra_args(pkg: &str, py: &str) -> Vec<String> {
     ["pip", "install", "--python", py, "--only-binary=:all:", pkg].iter().map(|s| s.to_string()).collect()
+}
+
+/// The check after the fast kernels are installed: `fla.ops.gated_delta_rule` imports AND a tiny forward + backward runs on the graphics card.
+pub const KERNEL_CHECK: &str = "import sys\ntry:\n import torch\n from fla.ops.gated_delta_rule import chunk_gated_delta_rule as f\nexcept Exception as e:\n print('IMPORT', type(e).__name__, str(e)[:200]); sys.exit(4)\ntry:\n \
+    assert torch.cuda.is_available(), 'no graphics card'\n b, t, h, d = 1, 128, 4, 64\n mk = lambda *s: torch.randn(*s, device='cuda', dtype=torch.bfloat16, requires_grad=True)\n q, k, v = mk(b, t, h, d), mk(b, t, h, d), mk(b, t, h, d)\n \
+    g = (-torch.rand(b, t, h, device='cuda')).requires_grad_(True); beta = torch.rand(b, t, h, device='cuda', dtype=torch.bfloat16).requires_grad_(True)\n o = f(q, k, v, g, beta)\n o = o[0] if isinstance(o, tuple) else o\n \
+    o.float().sum().backward(); torch.cuda.synchronize(); print('OK')\nexcept Exception as e:\n print('RUN', type(e).__name__, str(e)[:200]); sys.exit(5)\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelCheck {
+    pub ok: bool,
+    pub text: String,
+}
+
+/// Reads the answer of `KERNEL_CHECK` (exit code and output) as a plain sentence. Nothing is rolled back: a failed check only says what happens now.
+pub fn parse_kernel_check(code: Option<i32>, out: &str) -> KernelCheck {
+    let line = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    match code {
+        Some(0) if line.contains("OK") => KernelCheck { ok: true, text: "The fast kernels work: flash-linear-attention imported and a small forward and backward ran on the graphics card.".into() },
+        Some(4) => KernelCheck { ok: false, text: format!("flash-linear-attention is installed but does not import ({line}). The heal keeps using the slow PyTorch kernels. Nothing was removed or changed back; the package can be removed with `uv pip uninstall` if it gets in the way.") },
+        Some(5) => KernelCheck { ok: false, text: format!("flash-linear-attention imports but its kernel failed on this graphics card ({line}). The heal keeps using the slow PyTorch kernels unless the import works at run time. Nothing was removed or changed back.") },
+        _ => KernelCheck { ok: false, text: format!("The check of the fast kernels could not be run ({line}). The environment is as the install left it.") },
+    }
+}
+
+/// Runs `KERNEL_CHECK` in the environment's Python.
+pub fn run_kernel_check(py: &str, on_event: &mut dyn FnMut(Event)) -> KernelCheck {
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", KERNEL_CHECK]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let r = match cmd.output() {
+        Ok(o) => parse_kernel_check(o.status.code(), &format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+        Err(e) => parse_kernel_check(None, &e.to_string()),
+    };
+    on_event(Event::Log(r.text.clone()));
+    r
+}
+
+/// The PyTorch version of the environment ("2.14.1+cu130"), None when it cannot be read.
+pub fn torch_version(py: &str) -> Option<String> {
+    let mut cmd = Command::new(py);
+    cmd.args(["-c", "import torch; print(torch.__version__)"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let o = cmd.output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// What the log says when a kernel package could not be installed.
@@ -176,13 +249,24 @@ pub fn run_setup(plan: &SetupPlan, cancel: &AtomicBool, on_event: &mut dyn FnMut
 /// a failure is only logged in plain words. An error is returned only when the install was cancelled.
 fn install_kernels(plan: &SetupPlan, py: &str, with_pins: &dyn Fn(Vec<String>) -> Vec<String>, cancel: &AtomicBool, on_event: &mut dyn FnMut(Event)) -> Result<Vec<String>> {
     let mut done = Vec::new();
+    let tv = torch_version(py).unwrap_or_default();
     for pkg in kernel_extras() {
-        let st = run_uv(plan, &with_pins(kernel_extra_args(pkg, py)), cancel, on_event)?;
+        let req = match kernel_requirement(pkg, &tv) {
+            Ok(r) => r,
+            Err(why) => {
+                on_event(Event::Log(why));          // an unknown torch: nothing is guessed
+                continue;
+            }
+        };
+        let st = run_uv(plan, &with_pins(kernel_extra_args(&req, py)), cancel, on_event)?;
         if st.success() {
             done.push(pkg.to_string());
         } else {
-            on_event(Event::Log(kernel_failure_note(pkg)));
+            on_event(Event::Log(format!("{} The environment is as it was before this package.", kernel_failure_note(pkg))));
         }
+    }
+    if done.iter().any(|d| d == "flash-linear-attention") {
+        run_kernel_check(py, on_event);          // says plainly whether the kernels work; nothing is rolled back
     }
     Ok(done)
 }
