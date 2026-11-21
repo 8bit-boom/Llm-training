@@ -15,6 +15,8 @@ use crate::project::Project;
 
 pub const STEPS: u32 = 6;
 pub const WARMUP: u32 = 3;
+/// The token budgets of the student's micro-batches the report measures on real rows (0 = one row per forward pass, today's way).
+pub const BATCH_TOKENS_SWEEP: [u32; 5] = [0, 2048, 4096, 8192, 16384];
 
 /// Where the report of a made model is kept: `benchmarks/heal_speed-<model>/`.
 pub fn report_dir(p: &Project, name: &str) -> PathBuf {
@@ -24,7 +26,8 @@ pub fn report_dir(p: &Project, name: &str) -> PathBuf {
 /// The worker job of the measurement (pure: tested without a worker). `teacher`: also time the original's answers per rows-per-forward (loads the original: slow).
 pub fn job_of(base_job: &Value, teacher: Option<(&str, &str)>, out_dir: &std::path::Path, windows_hints: &[String]) -> Value {
     let mut job = base_job.clone();
-    let mut bench = json!({"steps": STEPS, "warmup": WARMUP, "targets": "cache", "profile": true, "microbench": true, "out_dir": out_dir});
+    let mut bench = json!({"steps": STEPS, "warmup": WARMUP, "targets": "rows", "profile": true, "microbench": true, "out_dir": out_dir,
+                              "batch_tokens_sweep": BATCH_TOKENS_SWEEP});
     if let Some((repo, load)) = teacher {
         bench["teacher_bench"] = json!(true);
         job["distill"]["teacher"] = json!({"repo": repo, "load": load});
@@ -62,5 +65,7 @@ pub fn run(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, with_
 pub fn files(p: &Project, name: &str) -> Value {
     let dir = report_dir(p, name);
     let md = std::fs::read_to_string(dir.join("heal_speed_report.md")).ok();
-    json!({"dir": dir.display().to_string(), "markdown": md, "exists": md.is_some()})
+    // the token budget the measurement recommends (never applied by itself): `{"value", "speedup", "why"}` when the report has the measurement, else null
+    let recommended = std::fs::read(dir.join("heal_speed_report.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|r| r["batch_sweep"]["recommended"].clone()).filter(|r| r.is_object()).unwrap_or(Value::Null);
+    json!({"dir": dir.display().to_string(), "markdown": md, "exists": md.is_some(), "recommended": recommended})
 }

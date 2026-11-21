@@ -2341,6 +2341,21 @@ fn the_checks_of_a_run_are_served_the_way_the_original_was_and_the_report_says_t
 }
 
 #[test]
+fn the_student_token_budget_of_the_run_reaches_every_heal_and_is_off_by_default() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    start(&p, &mut fx, spec(21.1)).unwrap();
+    assert!(fx.heal_specs.iter().all(|h| h.get("student_batch_tokens").is_none()), "the heal as it always was");
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    start(&p2, &mut fx2, AutoSpec { student_batch_tokens: Some(4096), ..spec(21.1) }).unwrap();
+    assert!(!fx2.heal_specs.is_empty() && fx2.heal_specs.iter().all(|h| h["student_batch_tokens"] == 4096), "{:?}", fx2.heal_specs);
+    assert!(AutoSpec { student_batch_tokens: Some(100), ..spec(21.1) }.validate().is_err());
+}
+
+#[test]
 fn a_failed_vllm_container_offers_the_teacher_cache_off_first() {
     let d = tempdir().unwrap();
     let p = project(d.path());

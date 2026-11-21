@@ -387,7 +387,20 @@ class _Model:
         return iter(self.mods)
 
 
-def test_gdn_kernels_reads_the_model_and_names_fla_or_torch():
+def test_a_conv_that_transformers_says_falls_back_is_reported_as_torch(monkeypatch):
+    # the owner's case: a function object exists, but transformers logged the fallback because causal_conv1d is not installed
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", ["`causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed."])
+    m = _Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule.chunk"), causal_conv1d_fn=_fn("causal_conv1d.cpp_functions")))
+    got = speed.gdn_kernels(m)
+    assert got["delta_rule"] == "fla" and got["conv"] == "torch" and got["causal_conv1d"] == "torch"
+    assert "PyTorch version" in speed.gdn_note(got)
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])
+    ref = speed.gdn_kernels(_Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops"), causal_conv1d_fn=_fn("transformers.models.qwen3_5.modeling_qwen3_5", "torch_causal_conv1d"))))
+    assert ref["conv"] == "torch", "a reference function that lives in transformers is not the package"
+
+
+def test_gdn_kernels_reads_the_model_and_names_fla_or_torch(monkeypatch):
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])        # transformers may have logged a fallback while it was imported in this process: that is the other test
     fast = _Model(_Mod(), _Mod(chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule.chunk"), causal_conv1d_fn=_fn("causal_conv1d.cpp_functions")))
     got = speed.gdn_kernels(fast)
     assert {k: got[k] for k in ("delta_rule", "conv", "module")} == {"delta_rule": "fla", "conv": "causal_conv1d", "module": _Mod.__module__}

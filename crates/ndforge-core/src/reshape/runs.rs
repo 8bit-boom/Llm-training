@@ -799,6 +799,10 @@ pub struct HealSpec {
     /// more graphics memory). Student-side only: the training key and the teacher's cache key do not include it. None = on; the job then carries no key for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_checkpoint: Option<String>,
+    /// Student micro-batching: the rows of one update are split into forward passes of at most this many tokens (rows of similar length together, padded). None or 0 = one row per forward pass,
+    /// the heal as it always was (the job then carries no key for it). 512 to 65,536. The sequences per update and the loss per row stay the same (docs/HEAL_SPEED.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub student_batch_tokens: Option<u32>,
     /// "thinking": heal so that the model keeps thinking (`plan::THINKING_RECIPE`). The window sends the recipe's numbers (`heal_options` says them: tokens, general share);
     /// what it leaves empty is filled here: the general text (the reasoning traces of Qwen3.8-27B), the sequence length, the batch and the LoRA size. Written to `heal.json`
     /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
@@ -869,6 +873,9 @@ impl HealSpec {
         }
         if self.head_checkpoint.as_deref().is_some_and(|c| !["on", "off"].contains(&c)) {
             return bad("output-layer checkpointing on or off");
+        }
+        if self.student_batch_tokens.is_some_and(|n| n != 0 && !(512..=65_536).contains(&n)) {
+            return bad("tokens per forward pass 0 (one row) or 512 to 65,536");
         }
         if self.optimizer.as_deref().is_some_and(|o| !["adamw_8bit", "adamw"].contains(&o)) || self.teacher_load.as_deref().is_some_and(|l| !["auto", "4bit", "16bit"].contains(&l)) {
             return bad("optimizer adamw_8bit or adamw; original loaded auto, 4bit or 16bit");
@@ -1373,6 +1380,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         if !ch.knobs.head_ckpt {
             job["distill"]["head_checkpoint"] = json!("off");          // only an explicit "off" is sent: a default job is the job it always was
         }
+        if let Some(n) = spec.student_batch_tokens.filter(|n| *n > 0) {
+            job["hyper"]["student_batch_tokens"] = json!(n);            // only a chosen budget is sent
+        }
         std::fs::create_dir_all(&run_dir)?;
         write_json(&dir.join("heal_config.json"), &job)?;
         let r = heal_job(&py, &dir, &job, "train", &stop, grace, on_event).map_err(failed)?;
@@ -1552,6 +1562,9 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
         });
         if !k.head_ckpt {
             job["distill"]["head_checkpoint"] = json!("off");
+        }
+        if let Some(n) = c.spec.student_batch_tokens.filter(|n| *n > 0) {
+            job["hyper"]["student_batch_tokens"] = json!(n);
         }
         std::fs::create_dir_all(&c.run_dir)?;
         write_json(&c.dir.join("heal_config.json"), &job)?;

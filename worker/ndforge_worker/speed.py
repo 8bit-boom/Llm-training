@@ -36,6 +36,37 @@ def bucket_order(lengths, batch, seed, epoch, mega=8):
     return [j for b in batches for j in b], batches
 
 
+def split_by_token_budget(lengths, budget):
+    """The rows of ONE optimizer update (their `lengths`) split into micro-batches that each hold at most `budget` tokens once padded to their longest row: the rows are taken from the longest
+    to the shortest (ties in their order), a micro-batch is closed when one more row would pass the budget; a row longer than the budget is a micro-batch of its own.
+    -> list of lists of positions (into `lengths`), every position exactly once. `budget` <= 0: one row per micro-batch, in the given order (today's way)."""
+    if budget <= 0:
+        return [[i] for i in range(len(lengths))]
+    order = sorted(range(len(lengths)), key=lambda j: (-lengths[j], j))
+    out, cur = [], []
+    for j in order:
+        if cur and (len(cur) + 1) * lengths[cur[0]] > budget:
+            out.append(cur)
+            cur = []
+        cur.append(j)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def micro_batches(lengths, budget, seed, step):
+    """`split_by_token_budget` with the order of the micro-batches shuffled by a seed and the update's number (the same update gets the same order on every run, another update another one:
+    the order does not change the sum of the gradients, it only avoids always running the longest rows first)."""
+    batches = split_by_token_budget(lengths, budget)
+    random.Random(int(seed) * 1_000_003 + int(step)).shuffle(batches)
+    return batches
+
+
+def padded_share(lengths, batches) -> float:
+    """The share of the computed tokens that is padding in these micro-batches (positions into `lengths`)."""
+    return padding_fraction(lengths, batches)
+
+
 def padding_estimate(lengths, batch, seed=1, trials=6):
     """(random batches, bucketed batches): the average padding share of each way of making batches."""
     if batch <= 1 or len(lengths) < 2:
@@ -174,6 +205,26 @@ def _delta_rule(model_module) -> tuple:
     return "unknown", "no evidence in the module or in the warnings"
 
 
+def _conv_of(fn) -> str:
+    """Where the short-convolution function comes from, by its module: the causal-conv1d package, the kernels hub, or a plain PyTorch reference (a function that lives in transformers or anywhere else)."""
+    origin = _origin(fn)
+    top = origin.split(".")[0]
+    if top in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2]:
+        return "kernels-hub"
+    if top == "causal_conv1d":
+        return "causal_conv1d"
+    return "torch"
+
+
+def _conv_fallback_warned() -> bool:
+    """transformers logged "`causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed" (or the package cannot be found)."""
+    for w in FALLBACK_WARNINGS:
+        low = w.lower()
+        if "causal_conv1d" in low and ("falling back" in low or "not installed" in low or "reference" in low):
+            return True
+    return False
+
+
 def gdn_kernels(model):
     """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed: {"delta_rule": "fla" | "torch" | "unknown",
     "conv": / "causal_conv1d": "causal_conv1d" | "kernels-hub" | "torch" | "unknown", "how": what the answer is based on, "module": the layers' module}. None when the model has no such layer (or cannot
@@ -192,16 +243,18 @@ def gdn_kernels(model):
         else:
             delta, how = _delta_rule(type(layer).__module__)
         conv_fn = getattr(layer, "causal_conv1d_fn", None)
-        if conv_fn is not None:
-            origin = _origin(conv_fn)
-            conv = "kernels-hub" if origin.split(".")[0] in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2] else "causal_conv1d"
-        elif hasattr(layer, "causal_conv1d_fn"):
-            conv = "torch"
-        else:
+        if conv_fn is None and not hasattr(layer, "causal_conv1d_fn"):
             import sys
             mod = sys.modules.get(type(layer).__module__)
             cf = getattr(mod, "causal_conv1d_fn", "missing") if mod is not None else "missing"
-            conv = "unknown" if cf == "missing" else ("torch" if cf is None else "causal_conv1d")
+            conv_fn = None if cf == "missing" else cf
+            conv = "unknown" if cf == "missing" else ("torch" if cf is None else _conv_of(cf))
+        elif conv_fn is None:
+            conv = "torch"
+        else:
+            conv = _conv_of(conv_fn)
+        if conv in ("causal_conv1d", "kernels-hub", "unknown") and _conv_fallback_warned():
+            conv = "torch"                                  # the package is not there: whatever name the function has, transformers said it runs its reference PyTorch version
         return {"delta_rule": delta, "conv": conv, "causal_conv1d": conv, "how": how, "module": type(layer).__module__}
     except Exception:       # noqa: BLE001 - looking must never stop a job
         return None

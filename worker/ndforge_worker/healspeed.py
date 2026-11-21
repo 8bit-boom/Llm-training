@@ -175,6 +175,59 @@ def teacher_bench(rows: list, answer, sizes=ROWS_PER_FORWARD, limit: int = TEACH
 
 # ----------------------------------------------------------------------------------------------------------------------------------- the report
 
+BATCH_TOKENS_SWEEP = (0, 2048, 4096, 8192, 16384)
+VRAM_SHARE_LIMIT = 0.90          # a recommended budget keeps the peak below this share of the card
+LOSS_TOLERANCE = 1e-3            # relative: the first update's loss must be the same as with one row per step
+MIN_SPEEDUP = 1.05
+
+
+def length_stats(lengths) -> dict:
+    """The length distribution of the rows a measurement used: {"n", "mean", "p50", "p90", "max"} in tokens."""
+    t = sorted(int(x) for x in lengths)
+    if not t:
+        return {"n": 0, "mean": 0, "p50": 0, "p90": 0, "max": 0}
+    q = lambda f: t[min(len(t) - 1, int(f * (len(t) - 1) + 0.5))]      # noqa: E731
+    return {"n": len(t), "mean": round(sum(t) / len(t), 1), "p50": q(0.5), "p90": q(0.9), "max": t[-1]}
+
+
+def recommend_batch_tokens(results: list, card_mb) -> dict:
+    """`results`: [{"batch_tokens", "tokens_per_s", "peak_vram_mb", "first_loss", "error"?}] with 0 (one row per step) as the baseline. The recommendation is the value with the largest speedup whose peak
+    stays below 90 % of the card and whose first-update loss equals the baseline's within a relative 1e-3; None (value 0) when nothing is faster by 5 %. Adds `speedup` to every result.
+    -> {"value", "speedup", "why"}."""
+    base = next((r for r in results if r.get("batch_tokens") == 0 and r.get("tokens_per_s")), None)
+    if base is None:
+        return {"value": 0, "speedup": 1.0, "why": "The measurement with one row per step is missing, so nothing can be compared."}
+    for r in results:
+        r["speedup"] = round(r["tokens_per_s"] / base["tokens_per_s"], 2) if r.get("tokens_per_s") else None
+    best = None
+    for r in results:
+        if r.get("batch_tokens") == 0 or not r.get("tokens_per_s") or r.get("error"):
+            continue
+        if card_mb and r.get("peak_vram_mb") and r["peak_vram_mb"] > VRAM_SHARE_LIMIT * card_mb:
+            continue
+        if base.get("first_loss") is not None and r.get("first_loss") is not None and abs(r["first_loss"] - base["first_loss"]) > LOSS_TOLERANCE * max(1.0, abs(base["first_loss"])):
+            continue
+        if best is None or r["speedup"] > best["speedup"]:
+            best = r
+    if best is None or best["speedup"] < MIN_SPEEDUP:
+        return {"value": 0, "speedup": 1.0, "why": "No token budget is clearly faster (5 % or more) within 90 % of the card's memory and with the same first loss: one row per step stays."}
+    return {"value": best["batch_tokens"], "speedup": best["speedup"], "why": f"{best['batch_tokens']} tokens per forward pass: {best['speedup']} times the speed of one row per step, peak {best.get('peak_vram_mb')} MB"
+                                                                              + (f" of {round(card_mb)} MB" if card_mb else "") + ", the same first loss."}
+
+
+def sweep(run_one, budgets=BATCH_TOKENS_SWEEP, card_mb=None) -> dict:
+    """Runs `run_one(budget) -> {"tokens_per_s", "peak_vram_mb", "first_loss", ...}` for every budget (an exception, an out-of-memory error included, is recorded for that budget and the others go on)
+    and adds the recommendation. -> {"results": [...], "recommended": {...}}."""
+    results = []
+    for b in budgets:
+        try:
+            r = {"batch_tokens": int(b), **run_one(int(b))}
+        except Exception as exc:        # noqa: BLE001 - one budget failing (memory) must not lose the others
+            r = {"batch_tokens": int(b), "tokens_per_s": None, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        results.append(r)
+    return {"results": results, "recommended": recommend_batch_tokens(results, card_mb)}
+
+
 def environment_facts() -> dict:
     """Versions and the card (never raises): torch, triton(-windows), flash-linear-attention, transformers, the GPU's name and memory."""
     import importlib.metadata as md
@@ -215,6 +268,12 @@ def verdict_lines(rep: dict) -> list:
         out.append("GatedDeltaNet runs on the slow PyTorch kernels: the fast kernels (flash-linear-attention) are the first thing to try.")
     elif kern.get("delta_rule") == "unknown":
         out.append("It is not known which GatedDeltaNet kernels run; the profile below tells (a large gdn share means the slow ones).")
+    bs = rep.get("batch_sweep") or {}
+    rec = bs.get("recommended") or {}
+    if rec.get("value"):
+        out.append(f"Several rows in one forward pass pay off here: {rec['why']} (Heal card: Use the recommended batch size; nothing is changed by itself.)")
+    elif bs.get("results"):
+        out.append(rec.get("why") or "Several rows per forward pass were measured; none was clearly better.")
     p = rep.get("heal_profile")
     if p and p.get("gdn_share_of_step") is not None:
         out.append(f"GatedDeltaNet kernels take about {p['gdn_share_of_step'] * 100:.0f} % of a step, matrix multiplications about {(p.get('gemm_share_of_step') or 0) * 100:.0f} % (by kernel names: rough).")
@@ -241,6 +300,14 @@ def markdown(rep: dict) -> str:
     if rep.get("bench"):
         b = rep["bench"]
         L += ["## Training step speed", "", f"{b.get('tokens_per_s')} tokens/s, peak {b.get('peak_vram_mb')} MB, sequence length {b.get('max_seq')}, batch {b.get('batch')}, chunk {b.get('chunk')}.", ""]
+    if rep.get("rows"):
+        r = rep["rows"]
+        L += ["## The rows measured", "", f"{r['n']} real rows: {r['mean']} tokens on average, median {r['p50']}, 90 % are at most {r['p90']}, longest {r['max']}.", ""]
+    if (rep.get("batch_sweep") or {}).get("results"):
+        L += ["## Tokens per forward pass (student micro-batches of rows of similar length)", "", "| tokens per forward | tokens/s | speed-up | peak VRAM (MB) | first loss | forward passes per update |", "|---|---|---|---|---|---|"]
+        for x in rep["batch_sweep"]["results"]:
+            L.append(f"| {x['batch_tokens'] or '0 (one row)'} | {x.get('tokens_per_s') or x.get('error')} | {x.get('speedup') or ''} | {x.get('peak_vram_mb') or ''} | {x.get('first_loss') if x.get('first_loss') is not None else ''} | {x.get('micro_batches') or ''} |")
+        L += ["", "Recommended: " + (rep["batch_sweep"].get("recommended") or {}).get("why", ""), ""]
     p = rep.get("heal_profile")
     if p:
         L += ["## Where a step goes (per step, wall seconds with synchronized borders)", "", "| forward | KL loss | backward | optimizer | GDN kernels (GPU) | matmul kernels (GPU) |", "|---|---|---|---|---|---|",

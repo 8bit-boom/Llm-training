@@ -17,6 +17,15 @@ fn the_job_adds_only_bench_keys_and_the_teacher_only_when_asked() {
 }
 
 #[test]
+fn the_report_measures_real_rows_and_every_token_budget() {
+    let base = json!({"job": "distill", "distill": {"mode": "cache", "k": 32}});
+    let d = tempfile::tempdir().unwrap();
+    let j = job_of(&base, None, d.path(), &[]);
+    assert_eq!(j["bench"]["targets"], "rows");
+    assert_eq!(j["bench"]["batch_tokens_sweep"], json!([0, 2048, 4096, 8192, 16384]));
+}
+
+#[test]
 fn the_report_is_found_where_the_worker_writes_it() {
     let d = tempfile::tempdir().unwrap();
     let p = ndforge_core::project::Project::create(d.path(), "P").unwrap();
@@ -71,4 +80,16 @@ fn the_teacher_rows_per_forward_come_from_a_token_budget_unless_it_is_zero() {
     s.save();
     assert_eq!(rows_key(&f, 1, "o/T", "4bit"), k, "the same data: the cache key does not depend on the grouping");
     std::env::remove_var("NDFORGE_CONFIG_DIR");
+}
+
+#[test]
+fn the_recommended_token_budget_is_read_from_the_report_and_never_applied() {
+    let d = tempfile::tempdir().unwrap();
+    let p = ndforge_core::project::Project::create(d.path(), "P").unwrap();
+    assert!(files(&p, "slim-1")["recommended"].is_null());
+    std::fs::create_dir_all(report_dir(&p, "slim-1")).unwrap();
+    std::fs::write(report_dir(&p, "slim-1").join("heal_speed_report.md"), "# r").unwrap();
+    std::fs::write(report_dir(&p, "slim-1").join("heal_speed_report.json"), json!({"batch_sweep": {"recommended": {"value": 4096, "speedup": 2.2, "why": "4096 tokens per forward pass"}}}).to_string()).unwrap();
+    let f = files(&p, "slim-1");
+    assert_eq!((f["recommended"]["value"].clone(), f["recommended"]["speedup"].clone()), (json!(4096), json!(2.2)));
 }

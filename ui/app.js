@@ -2319,7 +2319,7 @@ function wireTest() {
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
-const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null };
+const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -2554,6 +2554,7 @@ function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
     <label>Answers kept per token (top-k, 8 to 128)<br><input type="text" id="hl-k" value="${v(sp.k, 32)}" ${d}></label>
     <label>The original is loaded as<br>${sel("hl-tload", sp.teacher_load || "auto", [["auto", "Automatic"], ["4bit", "4-bit"], ["16bit", "16-bit"]])}</label>
     <label>Warm-up steps<br><input type="text" id="hl-warmup" value="${v(sp.warmup, 30)}" ${d}></label></div>
+    <div class="row"><label>Tokens per forward pass (Expert; 0 = one row at a time, as always)<br><input type="text" id="hl-sbt" value="${v(sp.student_batch_tokens, 0)}" ${d} title="Rows of similar length are put together in one forward pass, up to this many tokens, padded. The same learning: every row keeps its weight and the update still holds the same rows. Measure heal speed recommends a value; 512 to 65,536."></label></div>
     <label class="opt"><input type="checkbox" id="hl-upcast" ${sp.kbit_upcast === true ? "checked" : ""} ${busy || kn.qlora === false ? "disabled" : ""}> Keep the embeddings and output layer in 32-bit (the old behaviour: about <span id="hl-upcast-gb">${upcastGb != null ? upcastGb : "4 to 5"}</span> GB more memory)${kn.qlora === false ? " - only for QLoRA" : ""}</label>
     <p class="dim small">By default the two big word tables stay in 16-bit while healing: they are not changed by the learning, so a 32-bit copy only costs memory. Changing this keeps the saved answers and the learning done so far. If healing runs out of memory with this on, the program turns it off first.</p>
     ${(() => { const on = sp.head_checkpoint === "off", gb = headOff && headOff.head_off_gb != null ? headOff.head_off_gb : null, fits = headOff ? headOff.head_off_fits : null; const off = busy || (!on && fits === false);
@@ -2613,6 +2614,9 @@ function hlSpeedBox(busy) {
     <div class="row"><label class="opt"><input type="checkbox" id="hl-speed-teacher" ${hsp.teacher ? "checked" : ""}> Also time the original's answers per rows-per-forward (loads the original: slow)</label>
       <button class="secondary" id="hl-speed-go" ${busy || running ? "disabled" : ""}>Measure heal speed</button>${running ? `<button class="secondary" id="hl-speed-stop">Stop</button>` : ""}</div>
     ${running ? `<div class="stepline" aria-live="polite">${esc(hsp.run.text)}</div>` : ""}${hsp.err ? `<div class="err">${esc(hsp.err)}</div>` : ""}${hint ? `<p class="warn small" id="hl-speed-hint">${esc(hint)}</p>` : ""}
+    ${(() => { const r = f && f.recommended; if (!r) return ""; const cur = +((rs.hlSpec || {}).student_batch_tokens || 0);
+      return r.value ? `<p id="hl-speed-rec" class="ok small"><strong>Recommended: ${esc(String(r.value))} tokens per forward pass.</strong> ${esc(r.why || "")} <button class="secondary" id="hl-speed-use" ${busy || cur === +r.value ? "disabled" : ""}>Use the recommended batch size</button> <span class="dim">(never automatic)</span></p>`
+        : `<p id="hl-speed-rec" class="dim small">${esc(r.why || "No token budget is clearly faster.")}</p>`; })()}
     ${f ? vllmFilesBox({ ...f, open: false }, "hl-speed-files", "The report is saved in:") : ""}</details>`;
 }
 function onHealSpeedEvent(p) {
@@ -3030,7 +3034,7 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -3103,7 +3107,8 @@ function acSpeedBlock(pl, live) {
     ${ac.pin ? "" : `<p class="small" id="ac-searchrow">Find the best cut for <select id="ac-search" ${lock}>${[["", "no search (the classic Try first on a few cuts)"], [10, "10 minutes"], [20, "20 minutes"], [30, "30 minutes"], [60, "60 minutes"]].map(([v, l]) => `<option value="${v}" ${String(ac.sp.search == null ? "" : ac.sp.search) === String(v) ? "selected" : ""}>${l}</option>`).join("")}</select>
       <span class="dim small">It measures many cuts of the size you asked for in one go, ranks them on your own text and passes the best few on to the thinking check before healing. A low error is not proof of thinking.</span></p>`}
     <label class="opt"><input type="checkbox" id="ac-maxon" ${ac.maxOn ? "checked" : ""} ${lock}> I have at most <input type="text" id="ac-maxh" value="${esc(ac.maxH)}" placeholder="48" style="width:60px;flex:0" ${lock}> hours <span class="dim small">the least harmful settings are given up until it fits, or you are told it cannot</span></label>
-    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}</div>`;
+    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}
+    <label class="opt">Tokens per forward pass of the student <input type="text" id="ac-sbt" value="${esc(ac.sp.sbt || "")}" placeholder="0" style="width:70px;flex:0" ${lock}> <span class="dim small">off by default (0 = one row at a time). Rows of similar length share a forward pass, up to this many tokens: the same learning, usually much faster. Measure heal speed on the Heal card recommends a value (512 to 65,536).</span></label></div>`;
 }
 
 // the change one choice of a knob makes, as a small note after its label (nothing while there is no plan or for the choice that is on)
@@ -3414,6 +3419,7 @@ function wireAuto() {
   set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
+  set("ac-sbt", (e) => { const n = Math.round(+e.value || 0); ac.sp.sbt = n >= 512 && n <= 65536 ? n : null; });
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
@@ -4244,6 +4250,7 @@ function rsHealSpec() {
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
     kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null, head_checkpoint: sp.head_checkpoint === "off" ? "off" : null,
+    ...(sp.student_batch_tokens ? { student_batch_tokens: +sp.student_batch_tokens } : {}),
     ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}),
     ...(hlVllmAvailable() && sp.vllm ? { vllm: { teacher_cache: true } } : {}) };
 }
@@ -4330,6 +4337,7 @@ function wireReshape() {
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const hst = $("hl-speed-teacher"); if (hst) hst.onchange = () => { hsp.teacher = hst.checked; };
   const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), withTeacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
+  const hsu = $("hl-speed-use"); if (hsu) hsu.onclick = () => { const r = hsp.files && hsp.files.recommended; if (r && r.value) { rs.hlSpec.student_batch_tokens = +r.value; render(); rsHealEstimate(); } };
   const hss = $("hl-speed-stop"); if (hss) hss.onclick = () => { if (hsp.run) hsp.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const vpr = $("hl-vllm-probe"); if (vpr) vpr.onclick = () => { vch.probing = true; vch.probe = null; vch.probeText = "Starting…"; render(); invoke("vllm_container_probe_start").catch((e) => { vch.probing = false; vch.probe = { ok: false, text: String(e) }; render(); }); };
@@ -4348,6 +4356,7 @@ function wireReshape() {
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
   hv("hl-headkeep", (e) => { hs.head_checkpoint = e.checked ? "off" : null; });
+  hv("hl-sbt", (e) => { const n = Math.round(+e.value || 0); hs.student_batch_tokens = n >= 512 && n <= 65536 ? n : null; });
   const hbGo = $("hb-go");
   if (hbGo) hbGo.onclick = async () => {
     rs.hb = { ...(rs.hb || {}), running: true, rows: [], text: "Starting…", err: null, result: null };
