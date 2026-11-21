@@ -2368,3 +2368,41 @@ fn a_stop_a_continue_and_a_retry_leave_attempts_that_the_report_adds_up() {
     let total: i64 = st.steps.iter().filter_map(|s| s.seconds()).sum();
     assert_eq!(json["active_minutes"].as_f64().unwrap(), (total as f64 / 60.0 * 10.0).round() / 10.0, "the report's total is the accumulated seconds");
 }
+
+#[test]
+fn the_storage_page_refuses_what_a_stopped_run_still_needs_and_allows_it_when_the_run_is_done() {
+    use ndforge_core::storage::{delete, plan_delete, scan_items, Ctx, Options, Status};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    start(&p, &mut fx, spec(21.1)).unwrap_err();
+    let st = latest(&p).unwrap();
+    let name = st.stages[0].cut.as_ref().unwrap().name.clone();
+    let dir = p.folder.join("models").join(&name);
+    std::fs::create_dir_all(dir.join("model")).unwrap();
+    std::fs::write(dir.join("model").join("model.safetensors"), vec![1u8; 2048]).unwrap();
+    std::fs::write(dir.join("state.json"), "{}").unwrap();
+    let ctx = Ctx { project: Some(&p), busy: false, vllm: None };
+    let find = |ctx: &Ctx| scan_items(ctx).into_iter().find(|i| i.kind == "model_entry" && i.label.starts_with(&name)).unwrap();
+    let it = find(&ctx);
+    assert_eq!(it.status, Status::InUse, "{:?}", it.refs);
+    assert!(it.refs.iter().any(|r| r.contains("still needs it to go on")));
+    let e = plan_delete(&ctx, &[it.id.clone()], &Options { confirm: "DELETE".into(), ..Options::default() }).unwrap_err();
+    assert!(e.0.contains("is in use") && e.0.contains("still needs it"), "{}", e.0);
+    assert!(dir.is_dir());
+    // the run finishes: the model is only referenced by its report now
+    let st = resume(&p, &mut fx, &st.id).unwrap();
+    assert_eq!(st.status, "done");
+    let it = find(&ctx);
+    assert_eq!(it.status, Status::Referenced);
+    let r = delete(&ctx, &[it.id], &Options { confirm: "DELETE".into(), ..Options::default() }, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(r["deleted"].as_array().unwrap().len(), 1, "{r}");
+    assert!(!dir.exists());
+    // the run's report still builds and says so
+    let after = latest(&p).unwrap();
+    assert!(after.notes.iter().any(|n| n.contains("Deleted on") && n.contains("Storage page")), "{:?}", after.notes);
+    assert!(after.made.iter().filter(|m| m.name == name).all(|m| m.removed));
+    let md = ndforge_core::reshape::auto_report::markdown(&ndforge_core::reshape::auto_report::build(&after));
+    assert!(md.contains("Deleted on"), "{md}");
+}

@@ -593,6 +593,24 @@ pub fn remove_keeping_teacher_cache(p: &Project, name: &str) -> Result<()> {
 }
 
 fn remove_model(p: &Project, name: &str) -> Result<()> {
+    let dir = removal_checks(p, name)?;
+    unregister_model(name_dir_folders(&dir))?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// The model folders (`model`, `healed`) of a made model with the path the model list knows them by.
+fn name_dir_folders(dir: &Path) -> Vec<(PathBuf, String)> {
+    ["model", "healed"].iter().map(|sub| {
+        let f = dir.join(sub);
+        let repo = f.canonicalize().unwrap_or(f.clone()).to_string_lossy().to_string();
+        (f, repo)
+    }).collect()
+}
+
+/// What must hold before a made model may be deleted (the Storage page asks this too, before it removes the files itself): a valid name, the folder is there, it is not being made right now
+/// and no training run used it as its base. Returns the model's folder.
+pub fn removal_checks(p: &Project, name: &str) -> Result<PathBuf> {
     valid_name(name)?;
     let dir = models_dir(p).join(name);
     if !dir.is_dir() {
@@ -602,11 +620,7 @@ fn remove_model(p: &Project, name: &str) -> Result<()> {
     if live {
         return Err(Error::new("This model is being made right now. Stop it first."));
     }
-    let folders: Vec<(PathBuf, String)> = ["model", "healed"].iter().map(|sub| {
-        let f = dir.join(sub);
-        let repo = f.canonicalize().unwrap_or(f.clone()).to_string_lossy().to_string();
-        (f, repo)
-    }).collect();
+    let folders = name_dir_folders(&dir);
     if let Ok(rd) = std::fs::read_dir(crate::train::runs::runs_dir(p)) {
         for e in rd.flatten() {
             let used = read_json(&e.path().join("config.json")).is_some_and(|c| c["model"]["repo"].as_str().is_some_and(|r| folders.iter().any(|(f, repo)| r == repo || Path::new(r) == f)));
@@ -615,12 +629,20 @@ fn remove_model(p: &Project, name: &str) -> Result<()> {
             }
         }
     }
+    Ok(dir)
+}
+
+/// Takes the made model's folders out of the model list (the files stay).
+pub fn unregister_made_model(p: &Project, name: &str) -> Result<()> {
+    unregister_model(name_dir_folders(&models_dir(p).join(name)))
+}
+
+fn unregister_model(folders: Vec<(PathBuf, String)>) -> Result<()> {
     for (_, repo) in &folders {
         if let Some(id) = catalog::models().into_iter().find(|m| &m.repo == repo).map(|m| m.id) {
             catalog::remove_custom(&id)?;
         }
     }
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
