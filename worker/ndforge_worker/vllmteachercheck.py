@@ -210,6 +210,7 @@ def run(job: dict) -> int:
         inner = text_tokenizer(tok)
         pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
         ref = _hf_reference(teacher_dir, rows, k, pad, stop_file)
+        reshapejob.release_gpu("the 4-bit original")             # the engine's container needs the card: nothing of the reference run may stay on it
         ref_source = {"kind": "ran_standard_teacher", "note": f"The standard teacher (4-bit) answered the same {len(rows)} rows first; the two models were never on the card together."}
     if not rows:
         raise TeacherCheckError("There are no rows to compare (the project's heal data is empty).")

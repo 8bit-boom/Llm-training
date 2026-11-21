@@ -67,6 +67,7 @@ struct Mock {
     losses: BTreeMap<(Vec<u32>, Option<u32>), (f64, f64, f64)>,
     try_acc: BTreeMap<u32, (Vec<(u32, f64)>, BTreeMap<u32, Vec<Value>>, Vec<Value>)>,
     fail_heal_once: bool,
+    fail_text: Option<String>,
     publish_ok: bool,
     /// the measured file beats the plain file of its size in the comparison
     promote: bool,
@@ -95,6 +96,9 @@ struct Mock {
     leak_engine: bool,
     /// the vLLM checks fail (the standard engine does them: the result says so)
     vllm_checks_fail: bool,
+    /// the route the mock's vLLM serves the original with (`engine.pick.quant` of its result); later checks get the hint of the engine string unless `pick_mismatch`
+    pick_original: Option<String>,
+    pick_mismatch: bool,
     /// what a heal that was asked to use vLLM reports: `teacher_engine` of its summary
     teacher_engine: Option<Value>,
 }
@@ -103,7 +107,7 @@ impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, fail_text: None, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(), pick_original: None, pick_mismatch: false,
             hist: ndforge_core::timing::History::default(), vllm_log: Vec::new(), engine_running: false, cleanups: 0, leak_engine: false, vllm_checks_fail: false, teacher_engine: None,
         }
     }
@@ -242,6 +246,7 @@ impl Effects for Mock {
         self.hist.clone()
     }
     fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        let hint = engine.split_once('@').map(|(_, h)| h.to_string());
         if !engine.starts_with("vllm") {
             return self.think_check(name, target, quick, gguf);
         }
@@ -254,7 +259,15 @@ impl Effects for Mock {
         let r = r?;
         Ok(match r {
             Out::Done(mut v) => {
+                if let Some(orig) = self.pick_original.clone() {
+                    let (quant, like) = if target == "original" { (orig, Value::Null) } else if self.pick_mismatch { ("fp8".to_string(), json!(false)) } else { (hint.clone().unwrap_or_else(|| "fp8".into()), json!(hint.is_some())) };
+                    v["engine"] = json!({"pick": {"quant": quant, "like_for_like": like}});
+                }
                 v["engine_used"] = if self.vllm_checks_fail { json!({"engine": "hf", "fallback": true, "requested": true, "note": "vLLM did not start."}) } else { json!({"engine": "vllm", "fallback": false, "startup_seconds": 263.5}) };
+                if v["engine"]["pick"].is_object() && v["engine_used"]["engine"] == "vllm" {
+                    v["engine_used"]["route"] = v["engine"]["pick"]["quant"].clone();
+                    v["engine_used"]["like_for_like"] = v["engine"]["pick"]["like_for_like"].clone();
+                }
                 Out::Done(v)
             }
             o => o,
@@ -279,7 +292,7 @@ impl Effects for Mock {
         }
         if self.fail_heal_once {
             self.fail_heal_once = false;
-            return Err(Error::new("The graphics card ran out of memory."));
+            return Err(Error::new(self.fail_text.take().unwrap_or_else(|| "The graphics card ran out of memory.".into())));
         }
         assert!(!self.engine_running, "a training must never start while the vLLM engine runs");
         self.heals += 1;
@@ -391,6 +404,8 @@ fn shape(st: &AutoState) -> Value {
     for s in o.get_mut("steps").and_then(|s| s.as_array_mut()).unwrap() {
         s.as_object_mut().unwrap().remove("started");
         s.as_object_mut().unwrap().remove("finished");
+        s.as_object_mut().unwrap().remove("attempts");          // a stop makes another attempt: the time of the steps is not part of "the same run"
+        s.as_object_mut().unwrap().remove("spent_s");
     }
     v
 }
@@ -2171,4 +2186,288 @@ fn the_8_bit_kv_cache_is_for_the_checks_only_and_the_report_says_so() {
     // off: the key is not even written
     let off = serde_json::to_value(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, ..Default::default() }).unwrap();
     assert!(off.get("kv_fp8").is_none());
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------ change the settings and continue
+
+fn stopped_at_the_first_heal(p: &Project) -> (Mock, AutoState) {
+    let mut fx = Mock::new();
+    fx.stop_at = Some(8);          // inspect, measure, try x2, cut, check original, check cut, HEAL
+    let st = start(p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "stopped", "{:?}", st.error);
+    (fx, st)
+}
+
+#[test]
+fn the_lock_table_follows_the_state_of_the_steps() {
+    use ndforge_core::reshape::auto_change::lock_of;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (_, st) = stopped_at_the_first_heal(&p);
+    assert!(st.steps.iter().find(|s| s.id == "s1.heal").unwrap().started.is_some(), "the heal was begun");
+    for k in ["model_id", "target_b", "keep_thinking", "cut", "allow_many_blocks"] {
+        assert_eq!(lock_of(&st, k).state, "locked", "{k}");
+    }
+    for k in ["stages", "quick", "search_minutes"] {
+        assert_eq!(lock_of(&st, k).state, "locked", "{k}: the cut / Try first happened");
+    }
+    assert_eq!(lock_of(&st, "last_tokens_m").state, "free", "stage 2 has not started");
+    let a = lock_of(&st, "stage_a_tokens_m");
+    assert_eq!(a.state, "confirm");
+    assert!(a.redo.unwrap().contains("heal of stage 1 starts again") && a.reason.contains("has started"));
+    assert_eq!(lock_of(&st, "think_quick").state, "confirm", "the original was checked in the old mode");
+    for k in ["imatrix", "quants", "target_gb", "max_hours", "retry_heal", "vllm", "heal_rounds"] {
+        assert!(matches!(lock_of(&st, k).state, "free" | "confirm"), "{k}");
+    }
+    assert_eq!(lock_of(&st, "heal_rounds").state, "confirm");
+    assert_eq!(lock_of(&st, "unheard_of").state, "locked");
+}
+
+#[test]
+fn a_finished_stage_cannot_change_and_the_preview_names_what_would_be_redone_and_the_time() {
+    use ndforge_core::reshape::auto_change::{lock_of, preview};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut dry = Mock::new();
+    start(&project(tempdir().unwrap().path()), &mut dry, spec(21.1)).unwrap();
+    let second_heal = dry.all.iter().enumerate().filter(|(_, x)| x.starts_with("heal ")).nth(1).map(|(i, _)| i + 1).unwrap();
+    let mut fx = Mock::new();
+    fx.stop_at = Some(second_heal);          // stage 1 is healed and checked, stage 2's heal begins
+    let st = start(&p, &mut fx, spec(21.1)).unwrap();
+    assert_eq!(st.status, "stopped");
+    assert_eq!(lock_of(&st, "stage_a_tokens_m").state, "locked");
+    assert!(lock_of(&st, "stage_a_tokens_m").reason.contains("Stage 1 is healed already"));
+    let patch = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let h = ndforge_core::timing::History::default();
+    let pv = preview(&st, &patch(json!({"last_tokens_m": 20, "target_b": 18.0, "stage_a_tokens_m": 20})), Some(32.0), Some(900.0), &h);
+    assert_eq!(pv["ok"], false);
+    let refused: Vec<&str> = pv["refused"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+    assert!(refused.contains(&"target_b") && refused.contains(&"stage_a_tokens_m"), "{refused:?}");
+    let ok = preview(&st, &patch(json!({"last_tokens_m": 20})), Some(32.0), Some(900.0), &h);
+    assert_eq!(ok["ok"], true);
+    assert_eq!(ok["diff"][0]["text"], "you changed: heal tokens of the last stage (million) from the recipe's value to 20");
+    let (now, was) = (ok["remaining_h"].as_array().unwrap(), ok["was_remaining_h"].as_array().unwrap());
+    assert!(now[1].as_f64().unwrap() < was[1].as_f64().unwrap(), "fewer tokens: less time left: {now:?} against {was:?}");
+    assert_eq!(preview(&st, &patch(json!({"last_tokens_m": st.spec.last_tokens_m})), Some(32.0), Some(900.0), &h)["diff"], json!([]), "the same value is no change");
+}
+
+#[test]
+fn a_change_that_redoes_work_needs_the_confirmation_that_names_it() {
+    use ndforge_core::reshape::auto_change::apply;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (_, mut st) = stopped_at_the_first_heal(&p);
+    let patch = json!({"stage_a_tokens_m": 20}).as_object().unwrap().clone();
+    let h = ndforge_core::timing::History::default();
+    let err = apply(&mut st, &patch, false, Some(32.0), Some(900.0), &h, 1_800_000_000).unwrap_err().0;
+    assert!(err.contains("needs your confirmation") && err.contains("heal of stage 1 starts again") && err.contains("time left"), "{err}");
+    assert!(st.settings_changes.is_empty() && st.start_spec.is_none(), "nothing happened");
+    apply(&mut st, &patch, true, Some(32.0), Some(900.0), &h, 1_800_000_000).unwrap();
+    assert_eq!(st.settings_changes.len(), 1);
+    let c = &st.settings_changes[0];
+    assert_eq!((c["who"].clone(), c["confirmed"].clone()), (json!("person"), json!(true)));
+    assert!(c["redo"][0].as_str().unwrap().contains("heal of stage 1 starts again") && c["at"].as_str().unwrap().starts_with("2027"));
+    assert_eq!(st.spec.stage_a_tokens_m, Some(20));
+    assert_eq!(st.start_spec.as_ref().unwrap().stage_a_tokens_m, None, "the start spec is not rewritten");
+    assert_eq!(st.stages[0].plan.tokens_m, 20, "the stage whose heal is not finished takes the new number");
+    let refused = apply(&mut st, &json!({"target_b": 15.0}).as_object().unwrap().clone(), true, Some(32.0), Some(900.0), &h, 1).unwrap_err().0;
+    assert!(refused.contains("cannot change now") && refused.contains("target_b"));
+}
+
+#[test]
+fn stop_mid_way_continue_with_other_settings_and_nothing_finished_is_redone() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let (mut fx, st) = stopped_at_the_first_heal(&p);
+    let before = fx.done.clone();
+    assert_eq!(before.iter().filter(|x| x.starts_with("cut ")).count(), 1);
+    let patch = json!({"last_tokens_m": 20, "imatrix": false, "retry_heal": false}).as_object().unwrap().clone();
+    let st2 = ndforge_core::reshape::auto::resume_with(&p, &mut fx, &st.id, Some((patch, false))).unwrap();
+    assert_eq!(st2.status, "done", "{:?}", st2.error);
+    let after: Vec<String> = fx.done[before.len()..].to_vec();
+    assert!(!after.iter().any(|x| x.starts_with("inspect") || x.starts_with("measure") || x.starts_with("try ") || x == "cut cut-1 from qwen3.8-27b blocks=0 drop=None width=Some(14080) reasoning=true"), "finished steps are not run again: {after:?}");
+    assert!(after.iter().filter(|x| x.starts_with("check cut-1 original") || x.starts_with("check cut-1 cut")).count() == 0, "the checks that were done are not repeated: {after:?}");
+    assert!(after.iter().any(|x| x.starts_with("heal cut-1 ") && x.contains("tokens=40")), "stage 1 keeps its 40 M: its heal had started but its number did not change");
+    assert!(after.iter().any(|x| x.starts_with("heal cut-2 ") && x.contains("tokens=20")), "the changed number is used by stage 2: {after:?}");
+    assert_eq!(fx.imatrix, vec![false], "the changed export option is used");
+    assert_eq!(st2.settings_changes.len(), 1);
+    assert_eq!(st2.start_spec.as_ref().unwrap().last_tokens_m, None);
+    let r = ndforge_core::reshape::auto_report::build(&st2);
+    assert_eq!(r["settings_changes"].as_array().unwrap().len(), 1);
+    let md = ndforge_core::reshape::auto_report::markdown(&r);
+    assert!(md.contains("## Settings changed while the run went on") && md.contains("heal tokens of the last stage") && md.contains("time left"), "{md}");
+    let again = load(&run_dir(&p, &st2.id)).unwrap();
+    assert_eq!(again.settings_changes, st2.settings_changes);
+    // a run that is done or running cannot change
+    let late = ndforge_core::reshape::auto::resume_with(&p, &mut Mock::new(), &st2.id, Some((json!({"imatrix": true}).as_object().unwrap().clone(), false))).unwrap_err().0;
+    assert!(late.contains("only be changed on a stopped or failed run"), "{late}");
+}
+
+#[test]
+fn suggestions_after_a_failed_heal_are_offered_unless_locked() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    let _ = start(&p, &mut fx, spec(21.1));
+    let st = latest(&p).unwrap();
+    assert_eq!(st.status, "failed");
+    let pv = ndforge_core::reshape::auto::change_preview(&p, &st.id, &serde_json::Map::new(), Some(32.0)).unwrap();
+    assert_eq!((pv["can_change"].clone(), pv["failed_step"].clone()), (json!(true), json!("s1.heal")));
+    let texts: Vec<String> = pv["suggestions"].as_array().unwrap().iter().map(|x| x["text"].as_str().unwrap().to_string()).collect();
+    assert!(texts.iter().any(|t| t.contains("ran out of memory")) && texts.iter().any(|t| t.contains("rounds")) && texts.iter().any(|t| t.contains("vLLM")), "{texts:?}");
+    assert!(pv["locks"].as_array().unwrap().iter().any(|l| l["key"] == "target_b" && l["state"] == "locked"));
+}
+
+#[test]
+fn the_checks_of_a_run_are_served_the_way_the_original_was_and_the_report_says_the_route() {
+    for mismatch in [false, true] {
+        let d = tempdir().unwrap();
+        let p = project(d.path());
+        let mut fx = Mock::new();
+        fx.hist = vllm_hist();
+        fx.pick_original = Some("bnb-nf4".into());
+        fx.pick_mismatch = mismatch;
+        start(&p, &mut fx, vspec(false, true, false)).unwrap();
+        let hinted = fx.vllm_log.iter().filter(|l| l.starts_with("engine=vllm@bnb-nf4")).count();
+        assert!(fx.vllm_log.iter().any(|l| l == "engine=vllm"), "the original's own check has no hint: {:?}", fx.vllm_log);
+        assert!(hinted > 0, "the later checks carry the route of the original: {:?}", fx.vllm_log);
+        let st = latest(&p).unwrap();
+        let md = std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.md")).unwrap();
+        assert!(md.contains(", route bnb-nf4") || md.contains(", route fp8"), "the table names the route: {md}");
+        assert_eq!(md.contains("different quantization: not like-for-like"), mismatch, "{md}");
+    }
+}
+
+#[test]
+fn the_student_token_budget_of_the_run_reaches_every_heal_and_is_off_by_default() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    start(&p, &mut fx, spec(21.1)).unwrap();
+    assert!(fx.heal_specs.iter().all(|h| h.get("student_batch_tokens").is_none()), "the heal as it always was");
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    start(&p2, &mut fx2, AutoSpec { student_batch_tokens: Some(4096), ..spec(21.1) }).unwrap();
+    assert!(!fx2.heal_specs.is_empty() && fx2.heal_specs.iter().all(|h| h["student_batch_tokens"] == 4096), "{:?}", fx2.heal_specs);
+    assert!(AutoSpec { student_batch_tokens: Some(100), ..spec(21.1) }.validate().is_err());
+}
+
+#[test]
+fn a_failed_vllm_container_offers_the_teacher_cache_off_first() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    fx.fail_text = Some("vLLM was required for the teacher's answers and it did not work: Copying vllm_cache.py into the container: `wslc cp a b:/work/vllm_cache.py` failed (exit code 1): ERROR_PATH_NOT_FOUND".into());
+    let sp = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false, kv_fp8: false }), ..spec(21.1) };
+    let _ = start(&p, &mut fx, sp);
+    let st = latest(&p).unwrap();
+    let pv = ndforge_core::reshape::auto::change_preview(&p, &st.id, &serde_json::Map::new(), Some(32.0)).unwrap();
+    let first = &pv["suggestions"][0];
+    assert!(first["text"].as_str().unwrap().contains("turn the vLLM teacher cache off") && first["text"].as_str().unwrap().contains("Test the container copy"), "{first}");
+    assert_eq!(first["patch"], json!({"vllm": {"teacher_cache": false, "checks": true, "automatic": false}}), "the checks keep their own setting");
+}
+
+#[test]
+fn a_failed_step_carries_the_last_lines_of_the_tool_into_its_note_and_the_report() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    fx.fail_text = Some("The GGUF conversion failed (exit code 1). Last lines:\nINFO:hf-to-gguf:Model architecture: Qwen3_5ForConditionalGeneration\n  File \"~/llama.cpp/conversion/qwen.py\", line 323, in __init__\n    assert self.opt_num_mtp_layers != 0\nAssertionError".into());
+    start(&p, &mut fx, spec(21.1)).unwrap_err();
+    let st = latest(&p).unwrap();
+    let note = st.steps.iter().find(|s| s.id == "s1.heal").unwrap().note.clone().unwrap();
+    assert!(note.contains("failed (exit code 1)") && note.contains("AssertionError") && note.contains("qwen.py\", line 323"), "{note}");
+    let md = std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.md")).unwrap();
+    assert!(md.contains("**Failed.** The GGUF conversion failed (exit code 1). Last lines:"), "{md}");
+    assert!(md.contains("```text\nINFO:hf-to-gguf") && md.contains("assert self.opt_num_mtp_layers != 0\nAssertionError\n```"), "the tail is a block in the report: {md}");
+    let row = md.lines().find(|l| l.starts_with("| ") && l.contains("failed")).unwrap_or("");
+    assert!(!row.contains("AssertionError"), "the steps table keeps one line: {row}");
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("AssertionError"));
+}
+
+#[test]
+fn step_seconds_add_up_over_every_attempt_and_old_runs_still_load() {
+    // a step that ran three times: a stop, a cut-off by closing the program, and the one that finished
+    let mut s = StepRec::new("s1.heal", "Heal");
+    for (a, b, outcome) in [("2026-11-20T01:00:00Z", "2026-11-20T04:00:00Z", "stopped"), ("2026-11-20T05:00:00Z", "2026-11-20T06:30:00Z", "cut off"), ("2026-11-20T07:00:00Z", "2026-11-20T10:45:00Z", "done")] {
+        s.started = Some(a.into());
+        s.finished = Some(b.into());
+        s.close(b, outcome);
+    }
+    assert_eq!(s.attempts.len(), 3);
+    assert_eq!(s.seconds(), Some(3 * 3600 + 5400 + 3 * 3600 + 2700), "the total is every attempt, not the last one (13,500 s)");
+    assert_eq!(s.attempts.iter().map(|a| a.seconds).sum::<i64>(), s.spent_s);
+    // a run saved before attempts existed: only started / finished, and it loads
+    let old: StepRec = serde_json::from_value(json!({"id": "s1.heal", "label": "Heal", "status": "done", "note": null, "started": "2026-11-20T07:00:00Z", "finished": "2026-11-20T10:45:00Z"})).unwrap();
+    assert!(old.attempts.is_empty() && old.spent_s == 0);
+    assert_eq!(old.seconds(), Some(13500), "an old run keeps its last-attempt time");
+}
+
+#[test]
+fn a_stop_a_continue_and_a_retry_leave_attempts_that_the_report_adds_up() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    start(&p, &mut fx, spec(21.1)).unwrap_err();           // the heal fails: one attempt of s1.heal
+    let st = latest(&p).unwrap();
+    let st = resume(&p, &mut fx, &st.id).unwrap();         // continued: a second attempt, done
+    assert_eq!(st.status, "done");
+    let heal = st.steps.iter().find(|s| s.id == "s1.heal").unwrap();
+    assert!(heal.attempts.len() >= 2, "{:?}", heal.attempts);
+    assert_eq!(heal.attempts[0].outcome, "failed");
+    assert_eq!(heal.attempts.last().unwrap().outcome, "done");
+    assert_eq!(heal.seconds(), Some(heal.attempts.iter().map(|a| a.seconds).sum::<i64>()));
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.json")).unwrap()).unwrap();
+    let step = json["steps"].as_array().unwrap().iter().find(|s| s["id"] == "s1.heal").unwrap();
+    assert_eq!(step["seconds"].as_i64(), heal.seconds());
+    assert!(step["attempts"].as_array().unwrap().len() >= 2);
+    let total: i64 = st.steps.iter().filter_map(|s| s.seconds()).sum();
+    assert_eq!(json["active_minutes"].as_f64().unwrap(), (total as f64 / 60.0 * 10.0).round() / 10.0, "the report's total is the accumulated seconds");
+}
+
+#[test]
+fn the_storage_page_refuses_what_a_stopped_run_still_needs_and_allows_it_when_the_run_is_done() {
+    use ndforge_core::storage::{delete, plan_delete, scan_items, Ctx, Options, Status};
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    start(&p, &mut fx, spec(21.1)).unwrap_err();
+    let st = latest(&p).unwrap();
+    let name = st.stages[0].cut.as_ref().unwrap().name.clone();
+    let dir = p.folder.join("models").join(&name);
+    std::fs::create_dir_all(dir.join("model")).unwrap();
+    std::fs::write(dir.join("model").join("model.safetensors"), vec![1u8; 2048]).unwrap();
+    std::fs::write(dir.join("state.json"), "{}").unwrap();
+    let ctx = Ctx { project: Some(&p), busy: false, vllm: None };
+    let find = |ctx: &Ctx| scan_items(ctx).into_iter().find(|i| i.kind == "model_entry" && i.label.starts_with(&name)).unwrap();
+    let it = find(&ctx);
+    assert_eq!(it.status, Status::InUse, "{:?}", it.refs);
+    assert!(it.refs.iter().any(|r| r.contains("still needs it to go on")));
+    let e = plan_delete(&ctx, &[it.id.clone()], &Options { confirm: "DELETE".into(), ..Options::default() }).unwrap_err();
+    assert!(e.0.contains("is in use") && e.0.contains("still needs it"), "{}", e.0);
+    assert!(dir.is_dir());
+    // the run finishes: the model is only referenced by its report now
+    let st = resume(&p, &mut fx, &st.id).unwrap();
+    assert_eq!(st.status, "done");
+    let it = find(&ctx);
+    assert_eq!(it.status, Status::Referenced);
+    let none = std::sync::atomic::AtomicBool::new(false);
+    let tok = delete(&ctx, &[it.id.clone()], &Options { dry_run: true, ..Options::default() }, &none, &mut |_| {}).unwrap()["token"].as_str().map(String::from);
+    let r = delete(&ctx, &[it.id], &Options { confirm: "DELETE".into(), token: tok, ..Options::default() }, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(r["deleted"].as_array().unwrap().len(), 1, "{r}");
+    assert!(!dir.exists());
+    // the run's report still builds and says so
+    let after = latest(&p).unwrap();
+    assert!(after.notes.iter().any(|n| n.contains("Deleted on") && n.contains("Storage page")), "{:?}", after.notes);
+    assert!(after.made.iter().filter(|m| m.name == name).all(|m| m.removed));
+    let md = ndforge_core::reshape::auto_report::markdown(&ndforge_core::reshape::auto_report::build(&after));
+    assert!(md.contains("Deleted on"), "{md}");
 }

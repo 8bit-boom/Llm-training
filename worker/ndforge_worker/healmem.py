@@ -69,6 +69,15 @@ def next_safer(s: dict):
     """The next safer setting that keeps the maths, from {"checkpointing": bool, "batch": int, "grad_accum": int, "chunk": int, "upcast": bool (optional, default off)}.
     Returns (new settings, short label) or None when the ladder is used up. The sequences per update (batch x grad_accum) never change."""
     s = dict(s)
+    bt = int(s.get("batch_tokens") or 0)
+    if bt > 0:
+        # the token budget of the student's micro-batches comes down first: it changes how many rows are on the card at once, nothing about what is learned; below 512 it is off (one row per step)
+        new = bt // 2
+        if new < 512:
+            s.pop("batch_tokens", None)
+            return s, "one row per forward pass again (the token budget was used up)"
+        s["batch_tokens"] = new
+        return s, f"a smaller token budget per forward pass ({new})"
     if s.get("head_checkpoint") is False:
         s["head_checkpoint"] = True
         return s, "the output layer's logits made again in the backward pass (checkpointed)"
@@ -95,7 +104,8 @@ def describe(s: dict) -> str:
     return (f"sequence length {s.get('max_seq')}, batch {s.get('batch')} x {s.get('grad_accum')} steps added up, "
             f"gradient checkpointing {'on' if s.get('checkpointing') else 'off'}, LoRA rank {s.get('rank')}, KL chunk {s.get('chunk')}, {s.get('method', 'lora').upper()}"
             + (", embeddings and output layer in 32-bit" if s.get("upcast") else "")
-            + (", output-layer logits kept (not checkpointed)" if s.get("head_checkpoint") is False else ""))
+            + (", output-layer logits kept (not checkpointed)" if s.get("head_checkpoint") is False else "")
+            + (f", {int(s['batch_tokens'])} tokens per forward pass (rows of similar length together)" if int(s.get("batch_tokens") or 0) > 0 else ""))
 
 
 def advice(s: dict, tried: list) -> str:

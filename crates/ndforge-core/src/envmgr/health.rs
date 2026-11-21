@@ -119,6 +119,26 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
     out
 }
 
+/// The light for "does the installed Triton belong to the installed torch": Ok when it does, a warning with the plain sentence when it does not (never red: the heal still runs, on slower or
+/// failing kernels). None when no Triton is installed or it cannot be compared.
+pub fn triton_check(t: &super::setup::TritonStatus) -> Option<Check> {
+    t.triton.as_ref()?;
+    match t.matches? {
+        true => Some(check("triton", "Triton matches PyTorch", Light::Ok, t.line(), "")),
+        false => Some(check("triton", "Triton matches PyTorch", Light::Warn, t.line(), "Press \"Install fast kernels\" (Settings, training software): it installs the Triton this PyTorch asks for. Nothing is installed automatically.")),
+    }
+}
+
+/// `triton_check` for the environment that exists (Windows only: elsewhere Triton comes with torch). Asks its Python for metadata only; None when there is nothing to say.
+pub fn triton_check_now() -> Option<Check> {
+    let env = super::env_dir();
+    if !(cfg!(windows) || std::env::var_os("NDFORGE_TRITON_CHECK").is_some()) || !env_installed(&env) {
+        return None;
+    }
+    let py = super::python_path(&env);
+    triton_check(&super::setup::read_triton_status(&py.to_string_lossy())?)
+}
+
 /// True when nothing is red.
 pub fn can_install(checks: &[Check]) -> bool {
     checks.iter().filter(|c| matches!(c.id, "gpu" | "driver" | "vram" | "disk" | "uv")).all(|c| c.light != Light::Fail)

@@ -1518,6 +1518,28 @@ fn the_32_bit_embedding_copy_reaches_the_job_and_changing_it_keeps_the_teachers_
 
 #[cfg(unix)]
 #[test]
+fn the_student_token_budget_reaches_the_job_only_when_chosen_and_is_validated() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let _disk = PlentyOfDisk::new();
+    let d = tempdir().unwrap();
+    fake_healer(d.path());
+    let p = project_with_version(d.path());
+    thin_27b(&p, "slim");
+    std::fs::write(d.path().join("oom-train"), "").unwrap();
+    let _ = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0})).unwrap_err();
+    assert!(jobs_seen(d.path())[1]["hyper"].get("student_batch_tokens").is_none(), "a default heal sends no key for it");
+    let _ = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0, "student_batch_tokens": 4096})).unwrap_err();
+    let seen = jobs_seen(d.path());
+    assert_eq!(seen[seen.len() - 1]["hyper"]["student_batch_tokens"], 4096);
+    for bad in [100, 70_000] {
+        let e = heal_with(&p, "slim", json!({"tokens_m": 10, "general_share": 0.0, "student_batch_tokens": bad})).unwrap_err().0;
+        assert!(e.contains("tokens per forward pass"), "{e}");
+    }
+    assert!(serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 10})).unwrap().student_batch_tokens.is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn keeping_the_output_logits_reaches_the_job_is_not_in_any_key_and_the_ladder_turns_it_back_on_first() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let _disk = PlentyOfDisk::new();

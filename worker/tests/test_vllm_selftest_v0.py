@@ -51,7 +51,8 @@ def test_a_container_that_crashes_at_start_gives_a_report_with_its_logs(tmp_path
     rep = json.loads((tmp_path / "vllm_selftest.json").read_text())
     assert rep["verdict"] == "fail" and "CUDA out of memory" in rep["exit_logs"] and rep["start_command"][0] == "docker" and rep["engine_stopped"] is True
     assert "docker" in " ".join(rep["start_command"]) and "--rm" not in rep["start_command"]
-    assert [c[1] for c in calls if c[1] in ("logs", "stop", "rm")][:3] == ["logs", "stop", "rm"]
+    seq = [c[1] for c in calls if c[1] in ("logs", "stop", "rm")]
+    assert seq[0] == "logs" and seq[-2:] == ["stop", "rm"] and set(seq[:-2]) == {"logs"}, "the logs (more than one read now: the evidence) are read BEFORE the container is stopped and removed"
     assert "CUDA out of memory" in (tmp_path / "vllm_selftest.md").read_text()
 
 

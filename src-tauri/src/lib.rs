@@ -24,6 +24,15 @@ struct Tasks {
     shutdown_cancel: Arc<AtomicBool>,
 }
 
+/// The Storage page's scan: it only reads, so it does not take the one-job flag; its own cancel and "running" flags.
+#[derive(Default)]
+struct ScanTasks {
+    running: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    /// a deletion of the Storage page is the running job (its Cancel must not stop another job)
+    deleting: Arc<AtomicBool>,
+}
+
 /// The job queue (ndforge_core::queue), shared by the commands and the runner that starts the next job when one ends.
 struct QueueState(Mutex<ndforge_core::queue::Queue>);
 
@@ -1026,12 +1035,26 @@ fn trace_gen_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, sp
 /// a plain verdict; `vllm_selftest.json/.md`). Events on "reshape-event" tagged {"phase": "vllm"}; Stop is `reshape_stop`; the engine is stopped in every end.
 #[tauri::command]
 fn vllm_selftest_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
+    clean_stale_engines(&app, &tasks);
     let m = lock(&s);
     let (v, project, keep_awake) = (m.settings.vllm.clone(), m.project.clone(), m.settings.keep_awake);
     drop(m);
     let job = ndforge_core::vllm::selftest_job(&v, &spec, project.as_ref()).map_err(|e| e.to_string())?;
     let opts = JobOpts { phase: Some("vllm"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "vllm_selftest", ..JobOpts::new("reshape-event") };
     spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::vllm::selftest_run(&job, stop, emit).map_err(|e| e.to_string()))
+}
+
+/// "Test the container copy" (Heal card): the idle container, a 1 KB file in and out by every way (bind mount, cp, stdin), the container removed; says which way works on this PC. A few seconds to a minute.
+/// Events on "reshape-event" tagged {"phase": "vllm_probe"}.
+#[tauri::command]
+fn vllm_container_probe_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>) -> Out<()> {
+    clean_stale_engines(&app, &tasks);
+    let m = lock(&s);
+    let (v, keep_awake) = (m.settings.vllm.clone(), m.settings.keep_awake);
+    drop(m);
+    let job = ndforge_core::vllm::container_probe_job(&v);
+    let opts = JobOpts { phase: Some("vllm_probe"), tag_events: true, awake: if keep_awake { Awake::Quiet } else { Awake::Off }, kind: "vllm_container_probe", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::vllm::container_probe_run(&job, stop, emit).map_err(|e| e.to_string()))
 }
 
 /// "Check the vLLM teacher": compares it with the standard 4-bit teacher on 100 real rows of the heal's data (docs/VLLM.md). Events on "reshape-event" tagged {"phase": "vllm_teacher_check"}.
@@ -1050,6 +1073,14 @@ fn vllm_teacher_check_start(app: tauri::AppHandle, s: State<App>, tasks: State<T
 #[tauri::command(async)]
 fn vllm_selftest_files() -> Value {
     ndforge_core::vllm::selftest_files()
+}
+
+/// "What if I change these settings and continue?" for a stopped or failed Auto-cut run (nothing is changed): the diff, the locks, what needs a confirmation, the time left.
+#[tauri::command(async)]
+fn auto_change_preview(s: State<App>, id: String, patch: Value) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let m = match patch { Value::Object(m) => m, _ => serde_json::Map::new() };
+    ndforge_core::reshape::auto::change_preview(&p, &id, &m, card_vram_gb()).map_err(|e| e.to_string())
 }
 
 /// The report of the last vLLM self-test (null when there is none).
@@ -1111,7 +1142,11 @@ fn auto_plan(s: State<App>, spec: Value, inspect: Value) -> Out<Value> {
 /// Starts an Auto-cut (`resume` null) or continues a stopped or failed one (`resume` is its run id; `spec` is then ignored). Events on "reshape-event" tagged {"phase": "auto"}:
 /// the run's own {"kind": "auto", "auto_step", "status", "note"} and the jobs' events with "auto_step" added; the end is {"kind": "done", "data": <the run's state>} or {"kind": "error"}.
 #[tauri::command]
-fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value, resume: Option<String>) -> Out<()> {
+fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value, resume: Option<String>, changes: Option<Value>, confirmed: Option<bool>) -> Out<()> {
+    let changes: Option<(serde_json::Map<String, Value>, bool)> = match (&resume, changes) {
+        (Some(_), Some(Value::Object(m))) if !m.is_empty() => Some((m, confirmed.unwrap_or(false))),
+        _ => None,
+    };
     let spec: Option<ndforge_core::reshape::auto_plan::AutoSpec> = if resume.is_some() { None } else { Some(serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?) };
     let m = lock(&s);
     let p = m.project_clone().map_err(|e| e.to_string())?;
@@ -1134,7 +1169,7 @@ fn auto_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: V
         };
         let mut fx = ndforge_core::reshape::auto_fx::RealEffects::new(&p, stop, card_vram_gb(), &mut wrapped);
         let r = match (&resume, spec) {
-            (Some(id), _) => ndforge_core::reshape::auto::resume(&p, &mut fx, id),
+            (Some(id), _) => ndforge_core::reshape::auto::resume_with(&p, &mut fx, id, changes),
             (None, Some(sp)) => ndforge_core::reshape::auto::start(&p, &mut fx, sp),
             _ => Err(ndforge_core::error::Error::new("Nothing to start.")),
         };
@@ -1301,6 +1336,25 @@ fn heal_bench_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, n
     })
 }
 
+/// "Measure heal speed": profiles a few real steps (where the time goes), times one GatedDeltaNet forward + backward, and optionally the original's answers per rows-per-forward; the worker writes
+/// `heal_speed_report.md/.json` (docs/HEAL_SPEED.md). Events on "reshape-event" tagged {"phase": "healspeed"}.
+#[tauri::command]
+fn heal_speed_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, name: String, spec: Value, with_teacher: bool) -> Out<()> {
+    let spec: ndforge_core::reshape::runs::HealSpec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let opts = JobOpts { phase: Some("healspeed"), kind: "heal", ..JobOpts::new("reshape-event") };
+    spawn_job(app, &tasks, opts, move |stop, emit| ndforge_core::reshape::heal_speed::run(&p, &name, &spec, card_vram_gb(), with_teacher, stop, emit).map_err(|e| e.to_string()))
+}
+
+/// The saved heal speed report of a made model (the text, the folder, the Windows hints).
+#[tauri::command(async)]
+fn heal_speed_report(s: State<App>, name: String) -> Out<Value> {
+    let p = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    let mut f = ndforge_core::reshape::heal_speed::files(&p, &name);
+    f["windows_hints"] = ndforge_core::winhints::as_value(&ndforge_core::winhints::hints());
+    Ok(f)
+}
+
 /// The last speed test of the loss settings of a made model (null when there is none).
 #[tauri::command(async)]
 fn heal_bench_last(s: State<App>, name: String) -> Out<Value> {
@@ -1450,7 +1504,7 @@ fn queue_start_item(app: &tauri::AppHandle, it: &ndforge_core::queue::Item) -> O
     let text = |k: &str| a[k].as_str().unwrap_or("").to_string();
     let bad = |e: serde_json::Error| format!("The saved choice is not valid any more: {e}");
     match it.kind.as_str() {
-        "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from)),
+        "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from), a.get("changes").cloned().filter(|c| !c.is_null()), a["confirmed"].as_bool()),
         "export" => export_start(app.clone(), s, t, text("run"), text("quant"), a["num_ctx"].as_u64().or(a["numCtx"].as_u64()).unwrap_or(8192) as u32, a["what"].as_str().map(String::from),
             serde_json::from_value(a["quants"].clone()).map_err(bad)?, serde_json::from_value(a["imatrix"].clone()).map_err(bad)?, serde_json::from_value(a["mixed"].clone()).map_err(bad)?),
         "heal" => heal_start(app.clone(), s, t, text("name"), a["spec"].clone()),
@@ -1730,6 +1784,114 @@ fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
     spawn_task(app, &tasks, "env-event", |cancel, emit| ndforge_core::envmgr::tasks::selftest(cancel, emit).map_err(|e| e.to_string()))
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------ the memory panel (ndforge_core::memory, docs/MEMORY.md)
+
+fn memory_env() -> ndforge_core::memory::Real {
+    ndforge_core::memory::Real { vllm: ndforge_core::settings::Settings::load().vllm }
+}
+
+/// The numbers of the footer and the popover: graphics memory, RAM, the app's own share, the engine containers, and the other programs that hold graphics memory (cached for about a second).
+#[tauri::command(async)]
+fn memory_status(tasks: State<Tasks>) -> Value {
+    ndforge_core::memory::status(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) })
+}
+
+/// What "Free GPU" (`kind` "gpu"), "Free RAM" ("ram") or "Release WSL memory" ("wsl") would end or release: the exact list, the other programs (listed only) and a plan token. Nothing is done.
+#[tauri::command(async)]
+fn memory_free_plan(tasks: State<Tasks>, kind: String) -> Out<Value> {
+    let p = ndforge_core::memory::plan(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) }, &kind).map_err(|e| e.to_string())?;
+    serde_json::to_value(p).map_err(|e| e.to_string())
+}
+
+/// Does what the plan with `plan_token` listed (it is planned again and a token that no longer matches is refused). `stop_running`: the running job is stopped first by the normal Stop (its state is saved,
+/// Continue works) and only then is anything freed; without it the items a running job uses are left alone and reported. All three arguments are required.
+#[tauri::command(async)]
+fn memory_free(tasks: State<Tasks>, kind: String, plan_token: String, stop_running: bool) -> Out<Value> {
+    if stop_running && tasks.busy.load(Ordering::SeqCst) && !stop_and_wait(&tasks.busy, &tasks.cancel, std::time::Duration::from_secs(90)) {
+        return Err("The running job did not stop in time, so nothing was freed. Try again in a moment.".into());
+    }
+    ndforge_core::memory::free(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) }, &kind, &plan_token).map_err(|e| e.to_string())
+}
+
+/// Removes the engine containers an earlier crashed run left behind, before a new vLLM job starts (nothing while a job runs); tells the window's log.
+fn clean_stale_engines(app: &tauri::AppHandle, tasks: &State<Tasks>) {
+    let gone = ndforge_core::memory::remove_stale(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) });
+    if !gone.is_empty() {
+        let _ = app.emit("reshape-event", serde_json::json!({"kind": "log", "phase": "vllm", "text": format!("Removed the engine container(s) an earlier run left behind: {}.", gone.join(", "))}));
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------------ the Storage page (ndforge_core::storage, docs/STORAGE.md)
+
+fn storage_project(s: &State<App>) -> Option<ndforge_core::project::Project> {
+    lock(s).project_clone().ok()
+}
+
+/// Starts the scan in the background: the items arrive as `storage-event` {"kind": "item"} (no size yet), then {"kind": "size"}, then {"kind": "done", "data": the whole list}.
+#[tauri::command]
+fn storage_scan(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>) -> Out<()> {
+    if scan.running.swap(true, Ordering::SeqCst) {
+        return Err("The scan is already running.".into());
+    }
+    scan.cancel.store(false, Ordering::SeqCst);
+    let project = storage_project(&s);
+    let (busy, running, cancel) = (tasks.busy.clone(), scan.running.clone(), scan.cancel.clone());
+    std::thread::spawn(move || {
+        let vllm = ndforge_core::settings::Settings::load().vllm;
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        let emitter = app.clone();
+        let data = ndforge_core::storage::scan(&ctx, &cancel, &mut |v| {
+            let _ = emitter.emit("storage-event", v);
+        });
+        running.store(false, Ordering::SeqCst);
+        let _ = app.emit("storage-event", serde_json::json!({"kind": "done", "phase": "scan", "data": data}));
+    });
+    Ok(())
+}
+
+/// `dry_run` and `pinned` and `allow_pinned` are REQUIRED (a missing or mis-spelled key is an error, never a real deletion); `dry_run: true`: exactly what would go (nothing is touched, nothing is started) and the `token` of that plan; a real deletion needs that token. Otherwise the deletion runs as a job (one at a time; progress as `storage-event`, the result as its `done`).
+#[tauri::command]
+fn storage_delete(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>, ids: Vec<String>, dry_run: bool, confirm: Option<String>, pinned: Vec<String>, allow_pinned: bool, token: Option<String>) -> Out<Value> {
+    let project = storage_project(&s);
+    let opts = ndforge_core::storage::Options { dry_run, confirm: confirm.unwrap_or_default(), pinned, allow_pinned, token };
+    let vllm = ndforge_core::settings::Settings::load().vllm;
+    if opts.dry_run {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: tasks.busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        return ndforge_core::storage::delete(&ctx, &ids, &opts, &AtomicBool::new(false), &mut |_| {}).map_err(|e| e.to_string());
+    }
+    // checked here as well, so that a refusal comes back at once and not as the end of a job
+    {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: tasks.busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        ndforge_core::storage::plan_delete(&ctx, &ids, &opts).map_err(|e| e.to_string())?;
+    }
+    let deleting = scan.deleting.clone();
+    deleting.store(true, Ordering::SeqCst);
+    let flag = deleting.clone();
+    let started = spawn_task(app, &tasks, "storage-event", move |cancel, emit| {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: false, vllm: Some(&vllm) };
+        let r = ndforge_core::storage::delete(&ctx, &ids, &opts, cancel, emit).map_err(|e| e.to_string());
+        flag.store(false, Ordering::SeqCst);
+        let mut out = r?;
+        out["phase"] = Value::from("delete");
+        Ok(out)
+    });
+    if started.is_err() {
+        deleting.store(false, Ordering::SeqCst);
+    }
+    started?;
+    Ok(serde_json::json!({"started": true}))
+}
+
+/// Ends a scan, or a deletion between two files.
+#[tauri::command]
+fn storage_cancel(tasks: State<Tasks>, scan: State<ScanTasks>) {
+    scan.cancel.store(true, Ordering::SeqCst);
+    if scan.deleting.load(Ordering::SeqCst) {
+        tasks.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 fn env_cancel(tasks: State<Tasks>) {
     tasks.cancel.store(true, Ordering::SeqCst);
@@ -1834,7 +1996,8 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .manage(ScanTasks::default())
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

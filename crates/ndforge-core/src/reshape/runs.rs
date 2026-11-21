@@ -593,6 +593,24 @@ pub fn remove_keeping_teacher_cache(p: &Project, name: &str) -> Result<()> {
 }
 
 fn remove_model(p: &Project, name: &str) -> Result<()> {
+    let dir = removal_checks(p, name)?;
+    unregister_model(name_dir_folders(&dir))?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// The model folders (`model`, `healed`) of a made model with the path the model list knows them by.
+fn name_dir_folders(dir: &Path) -> Vec<(PathBuf, String)> {
+    ["model", "healed"].iter().map(|sub| {
+        let f = dir.join(sub);
+        let repo = f.canonicalize().unwrap_or(f.clone()).to_string_lossy().to_string();
+        (f, repo)
+    }).collect()
+}
+
+/// What must hold before a made model may be deleted (the Storage page asks this too, before it removes the files itself): a valid name, the folder is there, it is not being made right now
+/// and no training run used it as its base. Returns the model's folder.
+pub fn removal_checks(p: &Project, name: &str) -> Result<PathBuf> {
     valid_name(name)?;
     let dir = models_dir(p).join(name);
     if !dir.is_dir() {
@@ -602,11 +620,7 @@ fn remove_model(p: &Project, name: &str) -> Result<()> {
     if live {
         return Err(Error::new("This model is being made right now. Stop it first."));
     }
-    let folders: Vec<(PathBuf, String)> = ["model", "healed"].iter().map(|sub| {
-        let f = dir.join(sub);
-        let repo = f.canonicalize().unwrap_or(f.clone()).to_string_lossy().to_string();
-        (f, repo)
-    }).collect();
+    let folders = name_dir_folders(&dir);
     if let Ok(rd) = std::fs::read_dir(crate::train::runs::runs_dir(p)) {
         for e in rd.flatten() {
             let used = read_json(&e.path().join("config.json")).is_some_and(|c| c["model"]["repo"].as_str().is_some_and(|r| folders.iter().any(|(f, repo)| r == repo || Path::new(r) == f)));
@@ -615,12 +629,20 @@ fn remove_model(p: &Project, name: &str) -> Result<()> {
             }
         }
     }
+    Ok(dir)
+}
+
+/// Takes the made model's folders out of the model list (the files stay).
+pub fn unregister_made_model(p: &Project, name: &str) -> Result<()> {
+    unregister_model(name_dir_folders(&models_dir(p).join(name)))
+}
+
+fn unregister_model(folders: Vec<(PathBuf, String)>) -> Result<()> {
     for (_, repo) in &folders {
         if let Some(id) = catalog::models().into_iter().find(|m| &m.repo == repo).map(|m| m.id) {
             catalog::remove_custom(&id)?;
         }
     }
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -777,6 +799,10 @@ pub struct HealSpec {
     /// more graphics memory). Student-side only: the training key and the teacher's cache key do not include it. None = on; the job then carries no key for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_checkpoint: Option<String>,
+    /// Student micro-batching: the rows of one update are split into forward passes of at most this many tokens (rows of similar length together, padded). None or 0 = one row per forward pass,
+    /// the heal as it always was (the job then carries no key for it). 512 to 65,536. The sequences per update and the loss per row stay the same (docs/HEAL_SPEED.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub student_batch_tokens: Option<u32>,
     /// "thinking": heal so that the model keeps thinking (`plan::THINKING_RECIPE`). The window sends the recipe's numbers (`heal_options` says them: tokens, general share);
     /// what it leaves empty is filled here: the general text (the reasoning traces of Qwen3.8-27B), the sequence length, the batch and the LoRA size. Written to `heal.json`
     /// and, once merged, to the healed model's `ndforge_reshape.json` (`healed.recipe`), where the export finds it. Only for Qwen3.5 / Qwen3.8 students.
@@ -847,6 +873,9 @@ impl HealSpec {
         }
         if self.head_checkpoint.as_deref().is_some_and(|c| !["on", "off"].contains(&c)) {
             return bad("output-layer checkpointing on or off");
+        }
+        if self.student_batch_tokens.is_some_and(|n| n != 0 && !(512..=65_536).contains(&n)) {
+            return bad("tokens per forward pass 0 (one row) or 512 to 65,536");
         }
         if self.optimizer.as_deref().is_some_and(|o| !["adamw_8bit", "adamw"].contains(&o)) || self.teacher_load.as_deref().is_some_and(|l| !["auto", "4bit", "16bit"].contains(&l)) {
             return bad("optimizer adamw_8bit or adamw; original loaded auto, 4bit or 16bit");
@@ -1062,6 +1091,14 @@ fn record_teacher_engine(dir: &Path, r: &Value) {
         let mut rec = t;
         rec["requested"] = json!(true);
         set_heal(dir, json!({"teacher_engine": rec}));
+    }
+}
+
+/// The original's answers take rows by a token budget (setting `teacher_batch_tokens`, default 16,384; 0 = the fixed 4 rows): the key is only added when it is on, so a job with 0 is the job it was.
+pub fn with_teacher_batch(job: &mut Value) {
+    let n = crate::settings::Settings::load().teacher_batch_tokens;
+    if n > 0 {
+        job["teacher_batch_tokens"] = json!(n);
     }
 }
 
@@ -1312,6 +1349,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             job["engine"] = e.clone();
             set_heal(&dir, json!({"teacher_engine": {"requested": true, "identity": ident}}));
         }
+        with_teacher_batch(&mut job);
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));
@@ -1341,6 +1379,9 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
         });
         if !ch.knobs.head_ckpt {
             job["distill"]["head_checkpoint"] = json!("off");          // only an explicit "off" is sent: a default job is the job it always was
+        }
+        if let Some(n) = spec.student_batch_tokens.filter(|n| *n > 0) {
+            job["hyper"]["student_batch_tokens"] = json!(n);            // only a chosen budget is sent
         }
         std::fs::create_dir_all(&run_dir)?;
         write_json(&dir.join("heal_config.json"), &job)?;
@@ -1485,6 +1526,7 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
         if !c.general.is_null() {
             job["holdout"] = json!({"rows": HOLDOUT_ROWS});
         }
+        with_teacher_batch(&mut job);
         if let Some(e) = &c.vllm {
             job["engine"] = e.clone();          // every round's chunk starts the engine again (its start-up is paid each time: the card warns)
         }
@@ -1520,6 +1562,9 @@ impl heal_rounds::RoundJobs for RealRoundJobs<'_, '_> {
         });
         if !k.head_ckpt {
             job["distill"]["head_checkpoint"] = json!("off");
+        }
+        if let Some(n) = c.spec.student_batch_tokens.filter(|n| *n > 0) {
+            job["hyper"]["student_batch_tokens"] = json!(n);
         }
         std::fs::create_dir_all(&c.run_dir)?;
         write_json(&c.dir.join("heal_config.json"), &job)?;
@@ -2007,6 +2052,9 @@ pub fn vllm_teacher_estimate(o: &heal_source::Origin, spec: &HealSpec, h: &crate
     }
     if matches!(route["route"].as_str(), Some("bnb")) {
         warnings.push("The in-flight 4-bit route has never been run: how vLLM does it and how fast it is are unknown (the research report says only that it is much slower than the pre-quantized weights).".into());
+    }
+    if let Some(w) = crate::vllm::kv_teacher_warning(s) {
+        warnings.push(w.into());
     }
     if check.is_none_or(|c| c.is_null()) {
         warnings.push("The vLLM teacher has not been checked against the standard teacher yet: use \"Check the vLLM teacher\" first (about 100 rows).".into());

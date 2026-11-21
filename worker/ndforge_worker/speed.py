@@ -36,6 +36,37 @@ def bucket_order(lengths, batch, seed, epoch, mega=8):
     return [j for b in batches for j in b], batches
 
 
+def split_by_token_budget(lengths, budget):
+    """The rows of ONE optimizer update (their `lengths`) split into micro-batches that each hold at most `budget` tokens once padded to their longest row: the rows are taken from the longest
+    to the shortest (ties in their order), a micro-batch is closed when one more row would pass the budget; a row longer than the budget is a micro-batch of its own.
+    -> list of lists of positions (into `lengths`), every position exactly once. `budget` <= 0: one row per micro-batch, in the given order (today's way)."""
+    if budget <= 0:
+        return [[i] for i in range(len(lengths))]
+    order = sorted(range(len(lengths)), key=lambda j: (-lengths[j], j))
+    out, cur = [], []
+    for j in order:
+        if cur and (len(cur) + 1) * lengths[cur[0]] > budget:
+            out.append(cur)
+            cur = []
+        cur.append(j)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def micro_batches(lengths, budget, seed, step):
+    """`split_by_token_budget` with the order of the micro-batches shuffled by a seed and the update's number (the same update gets the same order on every run, another update another one:
+    the order does not change the sum of the gradients, it only avoids always running the longest rows first)."""
+    batches = split_by_token_budget(lengths, budget)
+    random.Random(int(seed) * 1_000_003 + int(step)).shuffle(batches)
+    return batches
+
+
+def padded_share(lengths, batches) -> float:
+    """The share of the computed tokens that is padding in these micro-batches (positions into `lengths`)."""
+    return padding_fraction(lengths, batches)
+
+
 def padding_estimate(lengths, batch, seed=1, trials=6):
     """(random batches, bucketed batches): the average padding share of each way of making batches."""
     if batch <= 1 or len(lengths) < 2:
@@ -106,31 +137,137 @@ def _origin(fn) -> str:
     return str(getattr(fn, "__module__", "") or "")
 
 
+# transformers 5.23 chooses the delta-rule implementation ONCE, at import time, inside the modeling module (there is no `chunk_gated_delta_rule` attribute on the layers any more): the
+# module's own globals, the closure of its torch reference, and the warning it logs when the fast path is not available are the evidence.
+FALLBACK_WARNINGS: list = []
+_FALLBACK_WORDS = ("fast path is not available", "falling back", "fall back", "flash-linear-attention", "causal-conv1d")
+
+
+def install_fallback_watch() -> None:
+    """Remembers the warnings transformers logs about a missing fast path (`FALLBACK_WARNINGS`); called when this module is imported, before any model is loaded."""
+    import logging
+    if any(getattr(h, "_nd_watch", False) for h in logging.getLogger("transformers").handlers):
+        return
+
+    class Watch(logging.Handler):
+        _nd_watch = True
+
+        def emit(self, record):
+            try:
+                msg = record.getMessage()
+            except Exception:       # noqa: BLE001
+                return
+            if any(w in msg.lower() for w in _FALLBACK_WORDS) and len(FALLBACK_WARNINGS) < 20:
+                FALLBACK_WARNINGS.append(msg[:300])
+
+    logging.getLogger("transformers").addHandler(Watch(level=logging.WARNING))
+
+
+try:
+    install_fallback_watch()
+except Exception:       # noqa: BLE001 - never stop an import
+    pass
+
+
+def _is_fla(fn) -> bool:
+    return _origin(fn).split(".")[0] in ("fla", "flash_linear_attention")
+
+
+def _callables_in(fn):
+    """The values a function can see besides its arguments: the cells of its closure and its module globals' callables of the same names."""
+    out = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            out.append(cell.cell_contents)
+        except ValueError:
+            pass
+    return out
+
+
+def _delta_rule(model_module) -> tuple:
+    """(\"fla\" | \"torch\" | \"unknown\", how) from the modeling module of the layers (a module object or None)."""
+    import sys
+    mod = sys.modules.get(model_module) if isinstance(model_module, str) else model_module
+    if mod is not None:
+        fn = getattr(mod, "chunk_gated_delta_rule", None)
+        if fn is not None:
+            return ("fla" if _is_fla(fn) else "torch"), "the module's chunk_gated_delta_rule"
+        flag = getattr(mod, "is_fast_path_available", None)
+        if isinstance(flag, bool):
+            return ("fla" if flag else "torch"), "the module's is_fast_path_available flag"
+        ref = getattr(mod, "torch_chunk_gated_delta_rule", None)
+        if ref is not None:
+            seen = _callables_in(ref) + [v for v in vars(mod).values() if callable(v) and not isinstance(v, type)]
+            if any(_is_fla(v) for v in seen if callable(v)):
+                return "fla", "an fla callable next to the torch reference"
+    if FALLBACK_WARNINGS:
+        return "torch", "transformers warned about a missing fast path: " + FALLBACK_WARNINGS[0][:120]
+    return "unknown", "no evidence in the module or in the warnings"
+
+
+def _conv_of(fn) -> str:
+    """Where the short-convolution function comes from, by its module: the causal-conv1d package, the kernels hub, or a plain PyTorch reference (a function that lives in transformers or anywhere else)."""
+    origin = _origin(fn)
+    top = origin.split(".")[0]
+    if top in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2]:
+        return "kernels-hub"
+    if top == "causal_conv1d":
+        return "causal_conv1d"
+    return "torch"
+
+
+def _conv_fallback_warned() -> bool:
+    """transformers logged "`causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed" (or the package cannot be found)."""
+    for w in FALLBACK_WARNINGS:
+        low = w.lower()
+        if "causal_conv1d" in low and ("falling back" in low or "not installed" in low or "reference" in low):
+            return True
+    return False
+
+
 def gdn_kernels(model):
-    """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed:
-    the first module that has `chunk_gated_delta_rule` gives {"delta_rule": "fla" | "torch", "conv": "causal_conv1d" | "kernels-hub" | "torch", "module": its class's module}.
-    None when the model has no such layer (or cannot be looked at)."""
+    """Which kernels the GatedDeltaNet (linear-attention) layers of a loaded model really use, found by looking at the model, not at what is installed: {"delta_rule": "fla" | "torch" | "unknown",
+    "conv": / "causal_conv1d": "causal_conv1d" | "kernels-hub" | "torch" | "unknown", "how": what the answer is based on, "module": the layers' module}. None when the model has no such layer (or cannot
+    be looked at). Works for the older layers that carry `chunk_gated_delta_rule` AND for transformers 5.23, where the choice sits in the modeling module."""
     try:
+        layer = None
         for m in model.modules():
-            fn = getattr(m, "chunk_gated_delta_rule", None)
-            if fn is None:
-                continue
-            delta = "fla" if _origin(fn).split(".")[0] in ("fla", "flash_linear_attention") else "torch"
-            conv_fn = getattr(m, "causal_conv1d_fn", None)
-            origin = _origin(conv_fn)
-            conv = "torch" if conv_fn is None else "kernels-hub" if origin.split(".")[0] in ("kernels", "hf_kernels") or "kernels" in origin.split(".")[:2] else "causal_conv1d"
-            return {"delta_rule": delta, "conv": conv, "module": type(m).__module__}
+            if "gateddeltanet" in type(m).__name__.lower() or getattr(m, "chunk_gated_delta_rule", None) is not None:
+                layer = m
+                break
+        if layer is None:
+            return None
+        fn = getattr(layer, "chunk_gated_delta_rule", None)
+        if fn is not None:                                  # older versions: the layer holds the function
+            delta, how = ("fla" if _is_fla(fn) else "torch"), "the layer's chunk_gated_delta_rule"
+        else:
+            delta, how = _delta_rule(type(layer).__module__)
+        conv_fn = getattr(layer, "causal_conv1d_fn", None)
+        if conv_fn is None and not hasattr(layer, "causal_conv1d_fn"):
+            import sys
+            mod = sys.modules.get(type(layer).__module__)
+            cf = getattr(mod, "causal_conv1d_fn", "missing") if mod is not None else "missing"
+            conv_fn = None if cf == "missing" else cf
+            conv = "unknown" if cf == "missing" else ("torch" if cf is None else _conv_of(cf))
+        elif conv_fn is None:
+            conv = "torch"
+        else:
+            conv = _conv_of(conv_fn)
+        if conv in ("causal_conv1d", "kernels-hub", "unknown") and _conv_fallback_warned():
+            conv = "torch"                                  # the package is not there: whatever name the function has, transformers said it runs its reference PyTorch version
+        return {"delta_rule": delta, "conv": conv, "causal_conv1d": conv, "how": how, "module": type(layer).__module__}
     except Exception:       # noqa: BLE001 - looking must never stop a job
         return None
-    return None
 
 
 def gdn_note(info) -> str:
     """A plain sentence about slow kernels, or "" when the fast ones run (or there is nothing to say)."""
     if not info:
         return ""
+    if info.get("delta_rule") == "unknown":
+        return "It could not be found out which GatedDeltaNet kernels run (" + str(info.get("how", "")) + "): measure the speed (Heal card, Measure heal speed) before trusting it."
     if info.get("delta_rule") != "fla":
-        return "GatedDeltaNet runs on the slow PyTorch kernels (flash-linear-attention not installed)."
+        return "GatedDeltaNet runs on the slow PyTorch kernels (flash-linear-attention not installed or its import failed)."
     if info.get("conv") == "torch":
         return "The short convolution of GatedDeltaNet uses the PyTorch version (causal-conv1d not installed); that is a small part of the time."
     return ""

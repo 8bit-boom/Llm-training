@@ -34,7 +34,12 @@ EXTRA_SAMPLING = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "min_p": 0
 
 def pick_of(job: dict) -> dict:
     """What the server loads and how (`vllmquant.pick`): the model (the original's pre-quantized checkpoint when the original does not fit), "none" | "fp8" | "prequant:<repo>" | "stored:<m>"."""
-    return vllmquant.pick(str(job.get("model") or ""), job.get("engine") or {})
+    e = dict(job.get("engine") or {})
+    if e.get("gpu_free_gb") in (None, ""):
+        total, used = vllmengine.gpu_mb()                # the real free memory, when nvidia-smi answers (the fit uses it instead of a fixed reserve)
+        if total and used is not None:
+            e["gpu_free_gb"] = round((float(total) - float(used)) / 1024, 1)
+    return vllmquant.pick(str(job.get("model") or ""), e)
 
 
 def quant_of(job: dict) -> str:
@@ -80,6 +85,8 @@ def make_engine(job: dict) -> "vllmengine.Engine":
     g = vllmengine.plan_gpu_util(total, used, float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
     if g["ok"] is False:
         raise ThinkCheckError(g["text"])
+    if total and used is not None:
+        protocol.log(f"GPU free before the engine start: {(float(total) - float(used)) / 1024:.1f} GB of {float(total) / 1024:.1f} GB; the engine takes {g['util'] * float(total) / 1024:.1f} GB ({g['util']:g} of the card). {g['text']}")
     job["engine"] = e = {**e, "gpu_memory_utilization": g["util"]}          # lowered when other programs use the card; the weights' fit below uses it
     job.setdefault("_engine_report", {})["gpu"] = g
     if str(e.get("kv_cache_dtype") or "auto").lower() == "fp8":
@@ -87,10 +94,10 @@ def make_engine(job: dict) -> "vllmengine.Engine":
     pick = pick_of(job)
     if pick["fits"] is False:
         raise ThinkCheckError(pick["reason"])
-    job.setdefault("_engine_report", {})["pick"] = {k: pick[k] for k in ("quant", "reason", "weights_gb", "usable_gb", "served") if k in pick}
+    job.setdefault("_engine_report", {})["pick"] = {k: pick[k] for k in ("quant", "reason", "weights_gb", "usable_gb", "served", "arith", "gpu_util", "max_seqs", "route_hint", "like_for_like") if k in pick}
     return vllmengine.Engine(cfg, pick["model"], adapter=str(job["adapter"]) if job.get("adapter") else None, quant=pick["quant"], extra_args=e.get("extra_args"),
-                             max_len=int(e.get("max_model_len") or vllmengine.DEFAULT_MAX_MODEL_LEN), max_seqs=int(e.get("max_num_seqs") or vllmengine.DEFAULT_MAX_SEQS),
-                             gpu_util=float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL), kv_cache_dtype=cfg["kv_cache_dtype"])
+                             max_len=int(e.get("max_model_len") or vllmengine.DEFAULT_MAX_MODEL_LEN), max_seqs=min(int(e.get("max_num_seqs") or vllmengine.DEFAULT_MAX_SEQS), int(pick.get("max_seqs") or vllmengine.DEFAULT_MAX_SEQS)),
+                             gpu_util=float(pick.get("gpu_util") or e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL), kv_cache_dtype=cfg["kv_cache_dtype"])
 
 
 def generate(requests: list, settings: dict, on_result, should_stop, job: dict) -> None:

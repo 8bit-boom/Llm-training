@@ -52,11 +52,13 @@ STOP_TIMEOUT = 60
 STATE_EVERY = 3.0                                       # seconds between two looks at whether the container still runs while the engine starts
 KINDS = ("docker", "docker_wsl", "wslc", "wsl", "url")
 # WSLc (WSL 3.x containers). The options below are "from the owner's `wslc --help` / `wslc run --help` (3.0.x)"; the COMBINATION is UNTESTED, and the syntax of `wslc stop`, `wslc remove`,
-# `wslc volume ...` is not yet seen. So every command line is a TEMPLATE the owner can edit (engine["wslc"] = {"run": ..., "stop": ..., ...}). wslc has no `--ipc`: the shared memory
+# `wslc volume ...` is not yet seen. VERIFIED by the owner's runs: `list -a --format json` (fields Command, CreatedAt, HealthStatus, ID, Image, Labels, LocalVolumes, Mounts, Names, Networks, Platform, Ports,
+# RunningFor, Size, State, Status; one JSON object per container, a single OBJECT and not an array when there is one container), `list -a` (table), `inspect <name>` (an array: Name, State.Running, State.Status,
+# HostConfig, Ports ...) and `logs -n N`. Still untested: `cp`, `exec`. So every command line is a TEMPLATE the owner can edit (engine["wslc"] = {"run": ..., "stop": ..., ...}). wslc has no `--ipc`: the shared memory
 # vLLM needs is `--shm-size`. Whether `-p 127.0.0.1:<port>:8000` is accepted (loopback only) is UNKNOWN: the default publishes `<port>:8000`, which may be reachable from the network,
 # which is one reason the engine always starts vLLM with a per-run API key (`--api-key`).
 WSLC_TEMPLATES = {"run": "wslc run -d --name {name} {gpu_flag} --shm-size {shm} -p {publish} -v {model_dir}:/models {env} {image} {args}",
-                  "stop": "wslc stop -t 30 {name}", "remove": "wslc remove -f {name}", "logs": "wslc logs -n 60 {name}", "inspect": "wslc list -a --format json",          # inspect: GUESS (docker-like), used to see that the container still runs
+                  "stop": "wslc stop -t 30 {name}", "remove": "wslc remove -f {name}", "logs": "wslc logs -n 60 {name}", "inspect": "wslc list -a --format json",          # VERIFIED on the owner's PC (list -a --format json, list -a, inspect <name>, logs -n N); the state check reads the list
                    "list": "wslc list", "pull": "wslc pull -q {image}",
                   "gputest": "wslc run --rm {gpu_flag} {test_image} nvidia-smi",
                   "gpu_flag": "--gpus all", "shm": "16g", "publish": "{port}:8000", "publish_loopback": "127.0.0.1:{port}:8000", "env": [], "test_image": "nvidia/cuda:13.0.0-base-ubuntu24.04",
@@ -99,7 +101,7 @@ _smi_run = subprocess.run                          # the hook of the card-memory
 
 def wsl_path(path: str) -> str:
     r"""`C:\Users\me\m` -> `/mnt/c/Users/me/m`; `\\wsl$\...` / `\\wsl.localhost\<distro>\home\x` -> `/home/x`; a path that already is POSIX stays as it is."""
-    p = str(path or "")
+    p = plain_path(str(path or ""))
     m = re.match(r"^\\\\wsl(?:\$|\.localhost)\\[^\\]+(\\.*)?$", p, re.I)
     if m:
         return (m.group(1) or "\\").replace("\\", "/")
@@ -108,6 +110,16 @@ def wsl_path(path: str) -> str:
         rest = m.group(2).replace("\\", "/").rstrip("/")
         return f"/mnt/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
     return p.replace("\\", "/") if re.match(r"^[A-Za-z]:", p) else p
+
+
+def plain_path(path: str) -> str:
+    r"""A Windows path in the plain spelling a command line tool takes: `\\?\C:\Users\x` -> `C:\Users\x`, `\\?\UNC\server\share` -> `\\server\share`; anything else stays as it is."""
+    p = str(path or "")
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    if p.startswith("\\\\?\\"):
+        return p[4:]
+    return p
 
 
 def parse_wsl_version(text: str):
@@ -212,31 +224,67 @@ def gpu_mb():
         return None, None
 
 
-def wslc_running(text: str, name: str):
-    """True / False / None from the output of `wslc list -a --format json` (the field names are UNKNOWN: read defensively, the self-test report shows one real sample): the container is looked for by
-    name in every string of the list; found with a state word -> running or not; not in the list -> False; no list could be read -> None."""
+def parse_list(text: str):
+    """The containers of `wslc list -a --format json`, as a list of dicts, whatever the shape: an array, ONE object (what wslc prints for a single container) or one object per line.
+    None when the text is not JSON at all (a table), [] for an empty list."""
+    t = (text or "").strip()
+    if not t:
+        return []
     try:
-        data = json.loads(text)
+        data = json.loads(t)
     except ValueError:
+        items = []
+        for ln in t.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except ValueError:
+                return None
+            items += obj if isinstance(obj, list) else [obj]
+        return [x for x in items if isinstance(x, dict)]
+    return [x for x in (data if isinstance(data, list) else [data]) if isinstance(x, dict)]
+
+
+def _names_of(it: dict) -> list:
+    """The names of one listed container (`Names`: a string or a list; a leading slash is dropped), lower case."""
+    v = it.get("Names", it.get("Name", it.get("names", it.get("name"))))
+    vals = v if isinstance(v, list) else [v]
+    return [str(x).lstrip("/").lower() for x in vals if x]
+
+
+def list_names(text: str, prefix: str = "") -> list:
+    """The names of the containers in a list output (JSON in any of its shapes, else a table: every `ndforge-vllm-<n>` word)."""
+    items = parse_list(text)
+    if items is None:
+        return sorted(set(re.findall(r"ndforge-vllm-\d+", text or "")))
+    return sorted({n for it in items for n in _names_of(it) if n.startswith(prefix.lower())})
+
+
+def wslc_running(text: str, name: str):
+    """True / False / None from the output of `wslc list -a --format json` (verified fields: `Names`, `State`, `Status`, `ID`; an array, one object, or one object per line): the container is looked
+    for by `Names` (or the `ID` prefix, else anywhere in the object); `State` says running or not; not in the list -> False; no list could be read -> None."""
+    if not (text or "").strip():
+        return None
+    items = parse_list(text)
+    if items is None:
         # not JSON (a table, an unknown format): the name anywhere in the raw output counts as running when the line does not say it stopped
-        for ln in text.splitlines():
+        for ln in (text or "").splitlines():
             if name.lower() in ln.lower():
                 return False if re.search(r"exited|stopped|dead|created", ln, re.I) else True
         return None
-    items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-    name = name.lower()
+    low = name.lower()
     for it in items:
-        flat = json.dumps(it).lower()
-        if name not in flat:
+        ident = str(it.get("ID") or it.get("Id") or "").lower()
+        if low not in _names_of(it) and not (ident and len(low) >= 8 and ident.startswith(low)) and low not in json.dumps(it).lower():
             continue
-        states = []
-        if isinstance(it, dict):
-            states = [str(v).lower() for k, v in it.items() if str(k).lower() in ("state", "status", "running") and not isinstance(v, (dict, list))]
-        joined = " ".join(states) or flat
+        states = [str(v).lower() for k, v in it.items() if str(k).lower() in ("state", "status", "running") and not isinstance(v, (dict, list))]
+        joined = " ".join(states) or json.dumps(it).lower()
         if any(w in joined for w in ("exited", "stopped", "dead", "created", "terminated", "false")):
             return False
-        return True                                    # listed, and nothing says it stopped (the field names are unknown): running
-    return False if items or text.strip() in ("[]", "") else None
+        return True
+    return False
 
 
 def wslc_help(limit: int = HELP_LIMIT) -> dict:
@@ -393,17 +441,54 @@ KV_CONCURRENCY = re.compile(r"Maximum concurrency for ([\d,]+) tokens per reques
 INIT_ENGINE = re.compile(r"init engine .*?took ([\d.]+) s", re.I)
 
 
+PROGRESS_BAR = re.compile(r"(it/s\]|s/it\]|Capturing CUDA graphs|Capturing CUDA graph|\d+%\|)", re.I)
+CACHE_LINES = re.compile(r"(GPU KV cache size|KV cache size|Maximum concurrency|init engine .*took|Available KV cache memory|model loading took)", re.I)
+
+
+ROOT_CAUSE = re.compile(r"(error|exception|traceback|raise |free memory|out of memory|oom|desired gpu memory|bitsandbytes|plugin|quantiz|cuda|engine core|failed|cannot|could not|not supported|no module named|invalid)", re.I)
+
+
+def root_cause(text: str, limit: int = 25) -> list:
+    """The lines of an engine's or a script's output that say WHY it failed (Error, Traceback, "Free memory", out of memory, bitsandbytes, plugin, quantization, CUDA, Engine core ...): the last `limit`
+    of them, each cut to 300 characters, secrets scrubbed, repeated lines once. A progress bar or a normal INFO line is not one of them."""
+    seen: set = set()
+    out: list = []
+    for raw in (text or "").splitlines():
+        line = raw.replace("\x00", "").strip()
+        if not line or not ROOT_CAUSE.search(line) or PROGRESS_BAR.search(line):
+            continue
+        if re.match(r"^(INFO|DEBUG)\b", line) and not re.search(r"(error|failed|free memory|out of memory)", line, re.I):
+            continue
+        short = protocol.scrub(line)[:300]
+        if short in seen:
+            continue
+        seen.add(short)
+        out.append(short)
+    return out[-limit:]
+
+
 def log_highlights(text: str, limit: int = 40) -> list:
-    """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems."""
+    """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems.
+    Progress-bar lines (`Capturing CUDA graphs ... it/s]`) are dropped before anything is counted, and the cache lines (GPU KV cache size, concurrency, init engine ... took) are never the ones the cap cuts."""
     out, seen = [], set()
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    for pat in (KERNEL_LINES, HIGHLIGHT):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip() and not PROGRESS_BAR.search(ln)]
+    for pat in (KERNEL_LINES, HIGHLIGHT, CACHE_LINES):
         for s in lines:
             if pat.search(s) and s not in seen:
                 seen.add(s)
                 out.append(protocol.scrub(s)[:300])
-                if len(out) >= limit:
-                    return out
+    if len(out) > limit:
+        keep = [x for x in out if CACHE_LINES.search(x)][:limit]
+        rest = limit - len(keep)
+        taken = 0
+        trimmed = []
+        for x in out:
+            if x in keep:
+                trimmed.append(x)
+            elif taken < rest:
+                trimmed.append(x)
+                taken += 1
+        out = trimmed
     return out
 
 
@@ -575,6 +660,18 @@ class Engine:
                 pass
         return self.tail(n)
 
+    def evidence(self, n: int = 800) -> str:
+        """The root cause of a failure, read BEFORE the container is removed: the filtered lines of its log (and the last lines) go to the job log and into the error text."""
+        try:
+            big = self.logs_big(n)
+        except Exception:                                       # noqa: BLE001 - never hide the original failure
+            big = ""
+        rc = root_cause(big)
+        if rc:
+            protocol.log("Root cause lines from the engine's log:\n" + "\n".join(rc))
+        tail = self.logs_tail(12) if not big.strip() else "\n".join([x for x in big.strip().splitlines() if x.strip()][-12:])
+        return ("Root cause: " + " | ".join(rc[-12:]) + ". " if rc else "") + "Its last lines: " + protocol.scrub(tail)
+
     def logs_big(self, n: int = 800, limit: int = 200_000) -> str:
         """Many more log lines (the kernel and the cache lines are far above the last 60): docker `logs --tail n`, wslc the `logs` template with its `-n` replaced; size-limited."""
         cmd = None
@@ -609,11 +706,11 @@ class Engine:
             if self.proc is not None and self.state_command() and time.monotonic() >= next_state:
                 next_state = time.monotonic() + STATE_EVERY
                 if self.running() is False:          # a crash at start (out of memory, a bad option): do not wait for the timeout
-                    self.exit_logs = self.logs_tail(60)
-                    raise EngineError(f"The vLLM engine's container is not running any more (it stopped while starting). Its last lines: {self.exit_logs}")
+                    self.exit_logs = self.evidence()
+                    raise EngineError(f"The vLLM engine's container is not running any more (it stopped while starting). {self.exit_logs}")
             if self.proc is not None and self.proc.poll() is not None and not (self.kind == "wslc" and self.proc.returncode == 0):     # `wslc run -d` ends at once, fine
-                self.exit_logs = self.logs_tail(60)
-                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). Its last lines: {self.exit_logs}")
+                self.exit_logs = self.evidence()
+                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). {self.exit_logs}")
             if should_stop():
                 return
             try:
@@ -624,8 +721,8 @@ class Engine:
             except (urllib.error.URLError, OSError):
                 pass                                        # not listening yet
             if time.monotonic() > deadline:
-                self.exit_logs = self.logs_tail(60)
-                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). Its last lines: {self.exit_logs}")
+                self.exit_logs = self.evidence()
+                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). {self.exit_logs}")
             sleep(0.25)
 
     def server_version(self) -> str:

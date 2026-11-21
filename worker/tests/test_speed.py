@@ -387,9 +387,23 @@ class _Model:
         return iter(self.mods)
 
 
-def test_gdn_kernels_reads_the_model_and_names_fla_or_torch():
+def test_a_conv_that_transformers_says_falls_back_is_reported_as_torch(monkeypatch):
+    # the owner's case: a function object exists, but transformers logged the fallback because causal_conv1d is not installed
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", ["`causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed."])
+    m = _Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule.chunk"), causal_conv1d_fn=_fn("causal_conv1d.cpp_functions")))
+    got = speed.gdn_kernels(m)
+    assert got["delta_rule"] == "fla" and got["conv"] == "torch" and got["causal_conv1d"] == "torch"
+    assert "PyTorch version" in speed.gdn_note(got)
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])
+    ref = speed.gdn_kernels(_Model(_Mod(chunk_gated_delta_rule=_fn("fla.ops"), causal_conv1d_fn=_fn("transformers.models.qwen3_5.modeling_qwen3_5", "torch_causal_conv1d"))))
+    assert ref["conv"] == "torch", "a reference function that lives in transformers is not the package"
+
+
+def test_gdn_kernels_reads_the_model_and_names_fla_or_torch(monkeypatch):
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])        # transformers may have logged a fallback while it was imported in this process: that is the other test
     fast = _Model(_Mod(), _Mod(chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule.chunk"), causal_conv1d_fn=_fn("causal_conv1d.cpp_functions")))
-    assert speed.gdn_kernels(fast) == {"delta_rule": "fla", "conv": "causal_conv1d", "module": _Mod.__module__}
+    got = speed.gdn_kernels(fast)
+    assert {k: got[k] for k in ("delta_rule", "conv", "module")} == {"delta_rule": "fla", "conv": "causal_conv1d", "module": _Mod.__module__}
     assert speed.gdn_note(speed.gdn_kernels(fast)) == ""
     slow = _Model(_Mod(chunk_gated_delta_rule=_fn("transformers.models.qwen3_5.modeling_qwen3_5", "torch_chunk_gated_delta_rule"), causal_conv1d_fn=None))
     info = speed.gdn_kernels(slow)
@@ -426,3 +440,48 @@ def test_report_kernels_logs_once_and_adds_the_result_key(monkeypatch):
 def test_the_unsloth_sentence_is_about_training_only():
     note = speed.kernel_notes("qwen3_5", "unsloth", True, (12, 0))[0]
     assert "Training with Unsloth" in note and "Measuring, healing and checking do not use Unsloth" in note
+
+
+# ---- transformers 5.23: the choice sits in the modeling module, not on the layer (fake modules for each case)
+
+import sys  # noqa: E402
+import types  # noqa: E402
+
+
+def _layer(modname, **module_attrs):
+    mod = types.ModuleType(modname)
+    for k, v in module_attrs.items():
+        setattr(mod, k, v)
+    sys.modules[modname] = mod
+    cls = type("Qwen3_5GatedDeltaNet", (), {"__module__": modname})
+    return _Model(cls())
+
+
+def test_the_new_transformers_layout_is_read_from_the_modeling_module(monkeypatch):
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])
+    # fla present: the module holds an fla callable under the old name
+    fla = speed.gdn_kernels(_layer("fake_modeling_a", chunk_gated_delta_rule=_fn("fla.ops.gated_delta_rule"), causal_conv1d_fn=_fn("causal_conv1d.cpp")))
+    assert fla["delta_rule"] == "fla" and "chunk_gated_delta_rule" in fla["how"] and fla["conv"] == "causal_conv1d"
+    # torch fallback: the module only has the torch reference and the fast-path flag is False
+    t = speed.gdn_kernels(_layer("fake_modeling_b", torch_chunk_gated_delta_rule=_fn("fake_modeling_b", "torch_chunk_gated_delta_rule"), is_fast_path_available=False, causal_conv1d_fn=None))
+    assert (t["delta_rule"], t["conv"]) == ("torch", "torch") and "is_fast_path_available" in t["how"]
+    assert "slow PyTorch kernels" in speed.gdn_note(t)
+    # fla found next to the torch reference (the closure / the module's callables)
+    c = speed.gdn_kernels(_layer("fake_modeling_c", torch_chunk_gated_delta_rule=_fn("fake_modeling_c", "torch_chunk_gated_delta_rule"), some_kernel=_fn("fla.ops.gated_delta_rule.chunk")))
+    assert c["delta_rule"] == "fla" and "fla callable" in c["how"]
+    # nothing to go on: unknown, said plainly, never a guess
+    u = speed.gdn_kernels(_layer("fake_modeling_d"))
+    assert u["delta_rule"] == "unknown" and "measure the speed" in speed.gdn_note(u)
+    # the warning transformers logs when it fell back is evidence
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", ["The fast path is not available because one of the required library is not installed. Falling back to torch implementation."])
+    w = speed.gdn_kernels(_layer("fake_modeling_e"))
+    assert w["delta_rule"] == "torch" and "warned" in w["how"]
+
+
+def test_the_fallback_warning_is_remembered_by_a_logging_handler(monkeypatch):
+    import logging
+    monkeypatch.setattr(speed, "FALLBACK_WARNINGS", [])
+    speed.install_fallback_watch()
+    logging.getLogger("transformers").warning("The fast path is not available because flash-linear-attention is missing. Falling back to torch implementation")
+    logging.getLogger("transformers").warning("something else entirely")
+    assert len(speed.FALLBACK_WARNINGS) == 1 and "fast path" in speed.FALLBACK_WARNINGS[0]

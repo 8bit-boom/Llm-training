@@ -18,12 +18,16 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import types
+from collections import deque
 from pathlib import Path
 
 from . import protocol, vllmengine, vllmquant
@@ -81,6 +85,10 @@ def container_config(job: dict) -> dict:
     return vllmengine.engine_config({"engine": dict((job.get("engine") or {}).get("container") or {})})
 
 
+KV_FP8_WARNING = ("8-bit KV cache for the teacher is on: measured on the owner's PC it gave 1.2x more cached tokens and no speed gain (525 against 520 tokens/s), the targets get a little numeric noise, "
+                  "and the cache is stored under its own identity. Turn it off (Settings > vLLM > \"Also use it for the original's answers\") for exact targets.")
+
+
 def wanted(job: dict) -> bool:
     e = job.get("engine")
     return isinstance(e, dict) and str(e.get("kind") or "").lower() == "vllm"
@@ -110,10 +118,29 @@ def exec_templates(cfg: dict) -> dict:
     return {**base, **{k: str(v) for k, v in over.items() if k in base}}
 
 
-class Container:
-    """The place the script runs: an idle container (docker / docker_wsl / wslc) or a WSL distro (wsl). `_popen` / `_run` are the hooks of vllmengine (tests replace them)."""
+REMEDY_OFF = ("To go on without vLLM: turn off \"Make the original's answers with vLLM\" on the Heal card, or in Auto-cut open \"Change settings and continue\" and switch the vLLM teacher cache off "
+              "(the standard teacher then answers).")
+REMEDY = REMEDY_OFF + " \"Test the container copy\" on the Heal card finds out which way of getting files into the container works on this PC."
+PROBE_TEXT = ("ndforge container copy probe 0123456789 " * 26)[:1024]             # 1 KB of plain text
+CP_IN_VARIANTS = ("file", "dir", "touch", "fwd")                                  # `cp src name:/work/f`, `cp src name:/work/` (+ mv), `touch` first, forward slashes in the source
+CP_OUT_VARIANTS = ("file", "dir", "fwd")
 
-    def __init__(self, cfg: dict, model: str, *, hf_volume_dir: str | None = None):
+
+def cmd_text(cmd: list) -> str:
+    """A command line as one readable string (words with a space in quotes), with secrets scrubbed."""
+    return protocol.scrub(" ".join(f'"{a}"' if (" " in str(a) or not str(a)) else str(a) for a in cmd))
+
+
+class Container:
+    """The place the script runs: an idle container (docker / docker_wsl / wslc) or a WSL distro (wsl). `_popen` / `_run` are the hooks of vllmengine (tests replace them).
+
+    Files go in and out by the first way that works on this PC (`start` finds out and records it in `self.route_in`, `self.route_out`, `self.tried`):
+      1. `bind`   a host work folder mounted at /work (`-v <host>:/work`): nothing is copied by a container command at all. Several spellings of the host path are tried.
+      2. `cp:*`   the `cp_in` / `cp_out` templates, in the file form, the directory form (`name:/work/`), after a `touch`, and with forward slashes in the source.
+      3. `stdin`  `exec -i name sh -c 'cat > /work/f' < file` (and `exec name cat /work/f > file` out).
+    Every failed command is reported with its exact command line, its stderr and a look inside the container (`diagnose`)."""
+
+    def __init__(self, cfg: dict, model: str, *, hf_volume_dir: str | None = None, work_dir=None):
         if cfg["kind"] == "url":
             raise VllmCacheError("The teacher cache cannot use an engine that is only an address (the url way): it needs a container or a WSL install it can copy files into.")
         self.cfg, self.model = cfg, model
@@ -125,10 +152,17 @@ class Container:
         self.commands: list = []
         self.model_arg = model                                  # what the script's --model is, as the container sees it
         self.extra_llm: dict = {}
+        self.work_dir = Path(work_dir) if work_dir is not None else None      # the host folder that is /work when the bind mount works
+        self.bound: str | None = None                           # the spelling of the host folder that the container accepted
+        self.route_in: str | None = None
+        self.route_out: str | None = None
+        self.tried: list = []                                   # [{"route", "ok", "detail"}] of every way that was tried
+        self.start_seconds: float | None = None
+        self._diagnosing = False
 
-    # --- paths: Docker inside WSL and WSL want Linux paths
+    # --- paths: Docker inside WSL and WSL want Linux paths; the others the plain Windows spelling (no \\?\ prefix)
     def host(self, p) -> str:
-        return vllmengine.wsl_path(str(p)) if self.kind in ("docker_wsl", "wsl") else str(p)
+        return vllmengine.wsl_path(str(p)) if self.kind in ("docker_wsl", "wsl") else vllmengine.plain_path(str(p))
 
     def _values(self, **kw) -> dict:
         d = {"name": self.name, "docker": vllmengine.docker_prefix(self.cfg) if self.kind in ("docker", "docker_wsl") else [],
@@ -144,56 +178,303 @@ class Container:
         self.model_arg = self.model
         return [(self.cfg["hf_volume"], "/root/.cache/huggingface", "rw")] if self.kind != "wslc" else []
 
-    def start_command(self) -> list:
+    def start_command(self, bind: str | None = None) -> list:
         if self.kind == "wsl":
             self.model_arg = vllmengine.wsl_path(self.model) if vllmengine.is_local_path(self.model) else self.model
             return []
         mounts = self.mounts()
         if self.kind == "wslc":
-            v = vllmengine.wslc_values(self.cfg, self.port, self.model if vllmengine.is_local_path(self.model) else self.cfg["hf_volume"], [])
+            v = vllmengine.wslc_values(self.cfg, self.port, self.host(self.model) if vllmengine.is_local_path(self.model) else self.cfg["hf_volume"], [])
             if not vllmengine.is_local_path(self.model):
                 self.extra_llm = {"download_dir": "/models"}
-            return vllmengine.render_template(self.t["run_idle"], v)
-        flat: list = []
-        for src, dst, mode in mounts:
-            flat += ["-v", f"{src}:{dst}:{mode}"]
-        return vllmengine.render_template(self.t["run_idle"], self._values(mounts=flat))
+            cmd = vllmengine.render_template(self.t["run_idle"], v)
+        else:
+            flat: list = []
+            for src, dst, mode in mounts:
+                flat += ["-v", f"{src}:{dst}:{mode}"]
+            cmd = vllmengine.render_template(self.t["run_idle"], self._values(mounts=flat))
+        if bind:
+            at = cmd.index("run") + 1 if "run" in cmd else 1
+            cmd = cmd[:at] + ["-v", f"{bind}:{WORK}"] + cmd[at:]       # the host work folder is /work
+        return cmd
 
-    def cp_in_command(self, src, dst) -> list:
-        return vllmengine.render_template(self.t["cp_in"], self._values(src=self.host(src), dst=dst))
+    def bind_spellings(self) -> list:
+        """The ways the host work folder can be written for the engine: as it is, with forward slashes, and the WSL form `/mnt/c/...`. The first one the engine accepts is used and logged."""
+        if self.work_dir is None or self.kind == "wsl":
+            return []
+        h = self.host(self.work_dir)
+        out = [h, h.replace("\\", "/")]
+        m = re.match(r"^([A-Za-z]):[\\/]+(.*)$", h)
+        if m:
+            out.append(f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}")
+        seen: list = []
+        for x in out:
+            if x not in seen:
+                seen.append(x)
+        return seen
 
-    def cp_out_command(self, src, dst) -> list:
-        return vllmengine.render_template(self.t["cp_out"], self._values(src=src, dst=self.host(dst)))
+    def cp_in_command(self, src, dst, *, spell: str | None = None) -> list:
+        return vllmengine.render_template(self.t["cp_in"], self._values(src=spell if spell is not None else self.host(src), dst=dst))
 
-    def exec_command(self, args: list) -> list:
-        return vllmengine.render_template(self.t["exec"], self._values(args=[str(a) for a in args]))
+    def cp_out_command(self, src, dst, *, spell: str | None = None) -> list:
+        return vllmengine.render_template(self.t["cp_out"], self._values(src=src, dst=spell if spell is not None else self.host(dst)))
+
+    def exec_command(self, args: list, *, stdin: bool = False) -> list:
+        cmd = vllmengine.render_template(self.t["exec"], self._values(args=[str(a) for a in args]))
+        if stdin and "exec" in cmd:
+            at = cmd.index("exec") + 1
+            if "-i" not in cmd[at:at + 2]:
+                cmd = cmd[:at] + ["-i"] + cmd[at:]
+        return cmd
 
     # --- running them
-    def run(self, cmd: list, timeout: float = 600, what: str = "") -> str:
+    def run(self, cmd: list, timeout: float = 600, what: str = "", *, diagnose: bool = True, stdin_path=None, stdout_path=None, quiet: bool = False) -> str:
         self.commands.append(cmd)
+        fin = fout = None
         try:
-            r = vllmengine._run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout, **vllmengine._win_kw())
+            kw: dict = {}
+            kw["stdin"] = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
+            fin = kw["stdin"] if stdin_path else None
+            if stdout_path:
+                fout = open(stdout_path, "wb")
+                kw.update(stdout=fout, stderr=subprocess.PIPE)
+            else:
+                kw["capture_output"] = True
+            r = vllmengine._run(cmd, timeout=timeout, **kw, **vllmengine._win_kw())
         except (OSError, subprocess.SubprocessError) as exc:
-            raise VllmCacheError(f"{what or cmd[0]} failed: {exc}") from exc
-        out = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace")
+            raise self._failure(cmd, what, str(exc), None, diagnose, quiet) from exc
+        finally:
+            for f in (fin, fout):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+        out = ((getattr(r, "stdout", b"") or b"") + (getattr(r, "stderr", b"") or b"")) if not stdout_path else (getattr(r, "stderr", b"") or b"")
+        out = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
         if getattr(r, "returncode", 0) != 0:
-            raise VllmCacheError(f"{what or ' '.join(cmd[:3])} failed (exit code {r.returncode}): {protocol.scrub(out.strip()[-400:])}")
+            raise self._failure(cmd, what, protocol.scrub(out.strip()[-600:]), r.returncode, diagnose, quiet)
         return out
 
-    def start(self, timeout: float = 3600) -> None:
-        cmd = self.start_command()
+    def _failure(self, cmd: list, what: str, detail: str, code, diagnose: bool, quiet: bool = False) -> VllmCacheError:
+        head = f"{what or cmd[0]}: `{cmd_text(cmd)}` failed" + (f" (exit code {code})" if code is not None else "") + (f": {detail}" if detail else "")
+        if not quiet:
+            protocol.log(head)
+        if diagnose and not quiet:
+            head += " " + self.diagnose(cmd)
+        return VllmCacheError(head)
+
+    def diagnose(self, cmd: list | None = None) -> str:
+        """Looks inside the container right after a failure: the work folder, the mounts, `cp --help` when a copy failed. Everything goes to the job log; a short form is returned for the message."""
+        if self._diagnosing or not self.started and self.kind != "wsl":
+            return ""
+        self._diagnosing = True
+        notes: list = []
+        try:
+            probes = [("ls -la /work", self.exec_command(["ls", "-la", WORK]))]
+            if self.kind in ("docker", "docker_wsl"):
+                probes.append(("mounts", vllmengine.docker_prefix(self.cfg) + ["inspect", "-f", "{{json .Mounts}}", self.name]))
+            elif self.kind == "wslc":
+                probes.append(("inspect", ["wslc", "inspect", self.name]))
+                if cmd and any(str(x) == "cp" for x in cmd[:3]):
+                    probes.append(("wslc cp --help", ["wslc", "cp", "--help"]))
+            for label, c in probes:
+                try:
+                    text = self.run(c, 30, label, diagnose=False).strip()
+                except VllmCacheError as exc:
+                    text = f"(could not run: {str(exc)[:200]})"
+                protocol.log(f"Diagnostics, {label}: `{cmd_text(c)}` ->\n{text[:1800]}")
+                notes.append(f"{label}: " + " ".join(text.split())[:300])
+        finally:
+            self._diagnosing = False
+        return ("Checked right then: " + "; ".join(notes) + ".") if notes else ""
+
+    # --- start, and finding the way files go in and out
+    def _start_once(self, timeout: float, bind: str | None) -> None:
+        cmd = self.start_command(bind)
         if cmd:
             self.started = True                                  # the container may exist even when the command fails half way: `stop` removes it either way
-            self.run(cmd, timeout, "Starting the container")
+            self.run(cmd, timeout, "Starting the container", diagnose=False)
         deadline = time.monotonic() + READY_TIMEOUT
         while True:
             try:
-                self.run(self.exec_command(["true"]), 60, "The container did not answer")
+                self.run(self.exec_command(["true"]), 60, "The container did not answer", diagnose=False)
                 return
             except VllmCacheError:
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(1.0)
+
+    def start(self, timeout: float = 3600) -> None:
+        """Starts the container and finds a working way to move files (bind mount, cp, stdin). Raises a VllmCacheError that says what was tried and what to do."""
+        t0 = time.monotonic()
+        start_errors: list = []
+        for sp in self.bind_spellings():
+            try:
+                self._start_once(timeout, sp)
+            except VllmCacheError as exc:
+                self.tried.append({"route": f"bind {sp}", "ok": False, "detail": f"the container did not start with it: {str(exc)[:300]}"})
+                protocol.log(f"The host work folder as `{sp}` was refused: {str(exc)[:300]}")
+                start_errors.append(str(exc))
+                self.stop()
+                continue
+            ok, why = self._probe_bind(sp)
+            self.tried.append({"route": f"bind {sp}", "ok": ok, "detail": why})
+            if ok:
+                self.bound = sp
+                self.route_in = self.route_out = "bind"
+                self._done_start(t0, f"the host work folder mounted as `{sp}` (no copy command is used)")
+                return
+            protocol.log(f"The host work folder as `{sp}` did not work: {why}")
+            self.stop()
+        try:
+            self._start_once(timeout, None)
+        except VllmCacheError as exc:
+            self.tried.append({"route": "start", "ok": False, "detail": str(exc)[:400]})
+            raise VllmCacheError(f"{exc} {self._summary()} {REMEDY}") from exc
+        self.run(self.exec_command(["mkdir", "-p", WORK]), 60, "Making /work", diagnose=False) if self.kind != "wsl" else None
+        self.route_in = self._probe_direction("in")
+        self.route_out = self._probe_direction("out")
+        if not self.route_in or not self.route_out:
+            diag = self.diagnose()
+            raise VllmCacheError(f"No way of moving files {'into' if not self.route_in else 'out of'} the container works. {self._summary()} {diag} {REMEDY}".replace("  ", " "))
+        self._done_start(t0, f"cp/stdin: in by {self.route_in}, out by {self.route_out}")
+
+    def _done_start(self, t0: float, how: str) -> None:
+        self.start_seconds = round(time.monotonic() - t0, 1)
+        protocol.log(f"The container is ready after {self.start_seconds} s; files go in and out by {how}.")
+
+    def _summary(self) -> str:
+        return "Tried: " + "; ".join(f"{t['route']}: {'worked' if t['ok'] else 'failed'}" + ("" if t["ok"] else f" ({' '.join(str(t['detail']).split())[:160]})") for t in self.tried) + "."
+
+    def _probe_bind(self, spelling: str) -> tuple:
+        """Writes 1 KB into the host work folder and asks the container to read it, and the other way round."""
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            (self.work_dir / "probe_in.txt").write_text(PROBE_TEXT, encoding="utf-8")
+            got = self.run(self.exec_command(["cat", f"{WORK}/probe_in.txt"]), 60, "Reading the probe file in the container", diagnose=False)
+            if got.strip() != PROBE_TEXT.strip():
+                return False, "the container does not see the file written on the host (it sees something else: " + " ".join(got.split())[:100] + ")"
+            self.run(self.exec_command(["sh", "-c", f"printf %s ok-from-container > {WORK}/probe_out.txt"]), 60, "Writing the probe file in the container", diagnose=False)
+            for _ in range(10):
+                f = self.work_dir / "probe_out.txt"
+                if f.is_file() and f.read_text(encoding="utf-8", errors="replace").strip() == "ok-from-container":
+                    return True, "1 KB went in and a line came back"
+                time.sleep(0.3)
+            return False, "the container wrote a file that does not appear in the host folder"
+        except (VllmCacheError, OSError) as exc:
+            return False, str(exc)[:300]
+
+    def _probe_direction(self, direction: str) -> str | None:
+        """Finds the first working route for one direction with a 1 KB file in /work, records every attempt."""
+        routes = [f"cp:{v}" for v in (CP_IN_VARIANTS if direction == "in" else CP_OUT_VARIANTS)] + ["stdin"]
+        tmp = Path(tempfile.mkdtemp(prefix="ndforge-probe-"))
+        try:
+            src = tmp / "probe_in.txt"
+            src.write_text(PROBE_TEXT, encoding="utf-8")
+            if direction == "out":
+                try:
+                    self.run(self.exec_command(["sh", "-c", f"printf %s '{PROBE_TEXT}' > {WORK}/probe_out.txt"]), 60, "Writing the probe file in the container", diagnose=False)
+                except VllmCacheError as exc:
+                    self.tried.append({"route": "out", "ok": False, "detail": str(exc)[:300]})
+                    return None
+            for route in routes:
+                try:
+                    if direction == "in":
+                        self._put_route(route, src, "probe_in.txt")
+                        got = self.run(self.exec_command(["cat", f"{WORK}/probe_in.txt"]), 60, "Reading the probe file in the container", diagnose=False)
+                        ok = got.strip() == PROBE_TEXT.strip()
+                    else:
+                        dst = tmp / "probe_back.txt"
+                        self._get_route(route, "probe_out.txt", dst)
+                        ok = dst.is_file() and dst.read_text(encoding="utf-8", errors="replace").strip() == PROBE_TEXT.strip()
+                    why = "1 KB went " + ("in" if direction == "in" else "out") if ok else "the file arrived changed or empty"
+                except (VllmCacheError, OSError) as exc:
+                    ok, why = False, str(exc)[:300]
+                self.tried.append({"route": f"{route} ({direction})", "ok": ok, "detail": why})
+                if ok:
+                    return route
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- moving files by the route that was found
+    def put(self, src, rel: str, timeout: float = 600, what: str = "") -> None:
+        """Copies the host file `src` to `/work/<rel>` in the container."""
+        what = what or f"Copying {Path(str(src)).name} into the container"
+        try:
+            self._put_route(self.route_in or "cp:file", src, rel, timeout, what)
+        except OSError as exc:
+            raise VllmCacheError(f"{what}: {exc}. {REMEDY}") from exc
+
+    def get(self, rel: str, dst, timeout: float = 600, what: str = "", quiet: bool = False) -> None:
+        """Copies `/work/<rel>` of the container to the host file `dst`."""
+        what = what or f"Copying {rel} out of the container"
+        try:
+            self._get_route(self.route_out or "cp:file", rel, dst, timeout, what, quiet)
+        except OSError as exc:
+            raise VllmCacheError(f"{what}: {exc}. {REMEDY}") from exc
+
+    def _put_route(self, route: str, src, rel: str, timeout: float = 120, what: str = "") -> None:
+        dst = f"{WORK}/{rel}"
+        parent = dst.rsplit("/", 1)[0]
+        if route == "bind":
+            target = self.work_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, target)
+            return
+        if route == "stdin":
+            self.run(self.exec_command(["sh", "-c", f"mkdir -p {parent} && cat > {dst}"], stdin=True), timeout, what, stdin_path=src)
+            return
+        variant = route.split(":", 1)[1]
+        base = Path(str(src)).name
+        if variant == "dir":
+            self.run(self.cp_in_command(src, parent + "/"), timeout, what)
+            if base != dst.rsplit("/", 1)[1]:
+                self.run(self.exec_command(["mv", f"{parent}/{base}", dst]), 60, what)
+        elif variant == "touch":
+            self.run(self.exec_command(["sh", "-c", f"mkdir -p {parent} && touch {dst}"]), 60, what)
+            self.run(self.cp_in_command(src, dst), timeout, what)
+        elif variant == "fwd":
+            self.run(self.cp_in_command(src, dst, spell=self.host(src).replace("\\", "/")), timeout, what)
+        else:
+            self.run(self.cp_in_command(src, dst), timeout, what)
+
+    def _get_route(self, route: str, rel: str, dst, timeout: float = 120, what: str = "", quiet: bool = False) -> None:
+        src = f"{WORK}/{rel}"
+        dst = Path(dst)
+        if route == "bind":
+            shutil.copyfile(self.work_dir / rel, dst)
+            return
+        if route == "stdin":
+            self.run(self.exec_command(["cat", src]), timeout, what, stdout_path=dst, quiet=quiet)
+            return
+        variant = route.split(":", 1)[1]
+        if variant == "dir":
+            self.run(self.cp_out_command(src, str(dst.parent) + ("\\" if "\\" in str(dst) else "/")), timeout, what, quiet=quiet)
+            got = dst.parent / src.rsplit("/", 1)[1]
+            if got != dst and got.is_file():
+                os.replace(got, dst)
+        elif variant == "fwd":
+            self.run(self.cp_out_command(src, dst, spell=self.host(dst).replace("\\", "/")), timeout, what, quiet=quiet)
+        else:
+            self.run(self.cp_out_command(src, dst), timeout, what, quiet=quiet)
+
+    def evidence(self, script_lines=()) -> str:
+        """Why a run failed, collected BEFORE the container is removed: the root-cause lines of the script's own output (every line it printed, kept by the caller) and of the container's log, written to the
+        job log, and the last ones as text for the error."""
+        lines = list(script_lines)
+        rc = vllmengine.root_cause("\n".join(lines))
+        try:
+            if self.started and self.kind != "wsl":
+                big = vllmengine.Engine.logs_big(types.SimpleNamespace(kind=self.kind, port=self.port, cfg=self.cfg, log_text=lambda: ""), 800)
+                rc = (vllmengine.root_cause(big) + rc)[-25:] if big.strip() else rc
+        except Exception:                                       # noqa: BLE001 - the evidence must never hide the failure itself
+            pass
+        if rc:
+            protocol.log("Root cause lines (script and container log):\n" + "\n".join(rc))
+        tail = [protocol.scrub(x.strip())[:300] for x in lines if x.strip()][-8:]
+        return (("Root cause: " + " | ".join(rc[-12:]) + ". ") if rc else "No line of the engine's output names a cause. ") + ("Last lines: " + " | ".join(tail) if tail else "The script printed nothing.")
 
     def stop(self) -> None:
         """Always the explicit stop and remove; never raises."""
@@ -206,6 +487,28 @@ class Container:
             except (OSError, subprocess.SubprocessError):
                 pass
         self.started = False
+
+
+def probe(job: dict) -> dict:
+    """The small test behind \"Test the container copy\" and the automatic check before a teacher cache: starts the idle container, tries every way of moving a 1 KB file in and out, removes the container.
+    -> {"ok", "route_in", "route_out", "bind", "tried", "seconds", "text"}. The container is ALWAYS removed."""
+    e = container_config(job)
+    t0 = time.monotonic()
+    tmp = tempfile.TemporaryDirectory(prefix="ndforge-vllm-probe-")
+    box = Container(e, "", work_dir=Path(tmp.name))
+    out: dict = {"ok": False, "route_in": None, "route_out": None, "bind": None, "tried": box.tried, "text": ""}
+    try:
+        box.start(float(e.get("start_timeout") or vllmengine.DEFAULT_START_TIMEOUT) + 300)
+        out.update(ok=True, route_in=box.route_in, route_out=box.route_out, bind=box.bound)
+        out["text"] = (f"Files go in and out through a mounted folder (`{box.bound}`)." if box.bound
+                       else f"Files go in by {box.route_in} and out by {box.route_out}. A mounted folder was refused here: " + box._summary())
+    except (VllmCacheError, vllmengine.EngineError) as exc:
+        out["text"] = str(exc)
+    finally:
+        box.stop()
+        tmp.cleanup()
+    out["seconds"] = round(time.monotonic() - t0, 1)
+    return out
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- the chunk
@@ -242,7 +545,7 @@ class Syncer:
         import numpy as np
         idx_path = self.tmp / "index.json"
         try:
-            self.box.run(self.box.cp_out_command(f"{WORK}/out/index.json", idx_path), 120, "Copying the index out")
+            self.box.get("out/index.json", idx_path, 120, "Copying the index out", quiet=True)
             idx = json.loads(idx_path.read_text(encoding="utf-8"))
         except (VllmCacheError, OSError, ValueError):
             return 0                                             # nothing written yet (or a copy raced the writer): the next sync tries again
@@ -252,7 +555,7 @@ class Syncer:
             if name in self.done_parts:
                 continue
             dst = self.tmp / name
-            self.box.run(self.box.cp_out_command(f"{WORK}/out/{name}", dst), 600, f"Copying {name} out")
+            self.box.get(f"out/{name}", dst, 600, f"Copying {name} out")
             with np.load(dst) as z:
                 ids, logp, resid, off = z["ids"], z["logp"], z["resid"], z["row_offsets"]
             for r in range(len(off) - 1):
@@ -277,6 +580,29 @@ def _reader(proc, q: "queue.Queue") -> None:
     q.put(None)
 
 
+def _log_gpu_before_start(g: dict, total, used) -> None:
+    """The arithmetic of the engine's memory, in the job log, before any engine starts."""
+    if total and used is not None:
+        free = (float(total) - float(used)) / 1024
+        protocol.log(f"GPU free before the engine start: {free:.1f} GB of {float(total) / 1024:.1f} GB; the engine takes {g['util'] * float(total) / 1024:.1f} GB ({g['util']:g} of the card). {g['text']}")
+    else:
+        protocol.log(f"GPU memory before the engine start is not known (nvidia-smi did not answer). {g['text']}")
+
+
+def _check_bnb_fit(origin_dir, g: dict, total, used) -> None:
+    """The in-flight 4-bit route needs its weights + overhead + a minimum cache within the engine's budget: refused early with the arithmetic when it cannot (never after the rows were staged)."""
+    from . import vllmquant
+    sizes = vllmquant.route_weights_gb(str(origin_dir))
+    if not sizes or not total or used is None:
+        return
+    free = round((float(total) - float(used)) / 1024, 1)
+    bud = vllmquant._budgets(float(total) / 1024, g["util"], free)
+    pl = vllmquant._place(sizes["nf4"], bud)
+    protocol.log(f"4-bit fit of the original ({sizes['bf16']} GB in 16 bits): {pl['arith']}.")
+    if not pl["ok"]:
+        raise VllmCacheError(f"The original does not fit in 4 bits next to the engine's needs: {pl['arith']}. Free more memory on the card (close other programs) or use the standard engine. {REMEDY_OFF}")
+
+
 def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, first: int, last: int, k: int, max_seq: int, stop_file, *, on_progress=None, sleep=time.sleep) -> dict:
     """Scores rows `first..last` of `rows_dir/rows.npz` with vLLM and writes them into `writer` (the worker's cache writer, which already holds rows before `first`).
     -> {"engine", "teacher_quant", "startup_seconds", "tokens_per_s", "tokens", "load_phases", "stopped", "rows", "seconds", "notes"}; VllmCacheError when vLLM could not do it
@@ -289,14 +615,20 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
     if g["ok"] is False:
         raise VllmCacheError(g["text"])
     job = {**job, "engine": {**(job.get("engine") or {}), "gpu_memory_utilization": g["util"]}}
-    box = Container(e, sel["model"])
+    _log_gpu_before_start(g, total, used)
+    if sel["route"] == "bnb":
+        _check_bnb_fit(origin_dir, g, total, used)
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="ndforge-vllm-")
+    tmp = Path(tmp_ctx.name)
+    work = tmp / "work"                                          # the host folder that is /work in the container when the bind mount works
+    box = Container(e, sel["model"], work_dir=work)
     t0 = time.monotonic()
+    if teacher_kv(job) == "fp8":
+        protocol.log(KV_FP8_WARNING)
     result: dict = {"engine": f"vllm-{e['version']}", "teacher_quant": sel["quant"], "route": sel["route"], "reason": sel["reason"], "stopped": False, "notes": [],
                     "load_phases": [], "gpu": g, "startup_seconds": None, "rows": 0, "tokens": 0, "tokens_per_s": 0.0}
     if sel["route"] == "bnb" and vllmengine.under_mnt(str(origin_dir)) and box.kind in ("wsl", "docker_wsl"):
         result["notes"].append("The original's folder is on a Windows drive: the engine reads it through a slow share (9p); copying it into the WSL filesystem makes the start much faster.")
-    tmp_ctx = tempfile.TemporaryDirectory(prefix="ndforge-vllm-")
-    tmp = Path(tmp_ctx.name)
     proc = None
     try:
         protocol.progress("cache", 0.0, "Starting the vLLM container (the first time an image download and a model download can take long)")
@@ -305,14 +637,16 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
             pip = str((tcfg or {}).get("bnb_pip") or BNB_PIP)
             if pip.lower() != "none":
                 protocol.log(f"Installing {pip} into the container (the in-flight 4-bit route; UNVERIFIED: how vLLM 0.34 spells it is not known).")
+                t_pip = time.monotonic()
                 box.run(box.exec_command(["pip", "install", pip]), 1800, "Installing the bitsandbytes plugin")
+                protocol.log(f"Installing {pip} took {time.monotonic() - t_pip:.0f} s (it repeats at every start: the container is new each time).")
         (tmp / "meta.json").write_text(json.dumps({**meta, "engine": result["engine"], "teacher_quant": sel["quant"]}), encoding="utf-8")
         box.run(box.exec_command(["mkdir", "-p", f"{WORK}/data", f"{WORK}/out"]), 60, "Making the work folders")
         here = Path(__file__).resolve().parent
         for f in SCRIPT_FILES:
-            box.run(box.cp_in_command(here / f, f"{WORK}/{f}"), 120, f"Copying {f} into the container")
-        box.run(box.cp_in_command(Path(rows_dir) / "rows.npz", f"{WORK}/data/rows.npz"), 1800, "Copying the rows into the container")
-        box.run(box.cp_in_command(tmp / "meta.json", f"{WORK}/meta.json"), 120, "Copying the cache description into the container")
+            box.put(here / f, f, 120, f"Copying {f} into the container")
+        box.put(Path(rows_dir) / "rows.npz", "data/rows.npz", 1800, "Copying the rows into the container")
+        box.put(tmp / "meta.json", "meta.json", 120, "Copying the cache description into the container")
         staged = time.monotonic()
         result["stage_seconds"] = round(staged - t0, 1)
         cmd = box.exec_command(script_args(job, sel, box.model_arg, box.extra_llm, first, last, max_seq, k))
@@ -325,6 +659,7 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         q: queue.Queue = queue.Queue()
         threading.Thread(target=_reader, args=(proc, q), daemon=True).start()
         syncer = Syncer(box, writer, tmp, first)
+        seen_lines: deque = deque(maxlen=800)                   # every line the script printed: the cause of a failure is among them
         last_sync = time.monotonic()
         stop_sent, script_t0, first_scoring = False, time.monotonic(), None
         failure = None
@@ -336,6 +671,7 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
             if line is None:
                 break
             if line:
+                seen_lines.append(line.rstrip())
                 obj = _parse(line)
                 if obj is None:
                     if LOAD_LINES.search(line) and len(result["load_phases"]) < 80:
@@ -376,9 +712,9 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         syncer.sync()                                            # the last parts, also after a failure: a later run goes on after them
         code = getattr(proc, "returncode", 0)
         if failure:
-            raise VllmCacheError(failure)
+            raise VllmCacheError(f"{failure} {box.evidence(seen_lines)}")
         if code not in (0, None):
-            raise VllmCacheError(f"The vLLM script ended with exit code {code}. Its last lines: " + " | ".join(x["line"] for x in result["load_phases"][-4:]))
+            raise VllmCacheError(f"The vLLM script ended with exit code {code}. {box.evidence(seen_lines)}")
         result["stopped"] = bool(result["stopped"] or (stop_sent and writer.done_rows < last))
         result["rows"] = syncer.rows
         result["seconds"] = round(time.monotonic() - t0, 1)

@@ -24,12 +24,6 @@ const METRICS: [(&str, &str); 6] = [
     ("median_think_tokens", "median thought (tokens)"),
 ];
 
-fn secs_between(a: &Option<String>, b: &Option<String>) -> Option<i64> {
-    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ").ok();
-    let (a, b) = (parse(a.as_deref()?)?, parse(b.as_deref()?)?);
-    Some((b - a).num_seconds().max(0))
-}
-
 fn r1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
@@ -99,12 +93,12 @@ pub fn build(st: &AutoState) -> Value {
     let actual_b = last.map(|s| s.plan.params_b);
     let time = plan.and_then(|p| p.time.as_ref());
     let steps: Vec<Value> = st.steps.iter().map(|s| {
-        let seconds = secs_between(&s.started, &s.finished);
+        let seconds = s.seconds();            // over every attempt (a stop and continue, a restart, a retry), not only the last
         let est = time.and_then(|t| t.steps.iter().find(|x| x.id == s.id));
-        json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": seconds,
+        json!({"id": s.id, "label": s.label, "status": s.status, "note": s.note, "seconds": seconds, "attempts": s.attempts,
                "estimated_minutes": est.map(|x| json!([x.minutes.0, x.minutes.1])), "actual_minutes": seconds.map(|n| r1(n as f64 / 60.0)), "estimate_basis": est.map(|x| x.basis.clone())})
     }).collect();
-    let active: i64 = st.steps.iter().filter_map(|s| secs_between(&s.started, &s.finished)).sum();
+    let active: i64 = st.steps.iter().filter_map(|s| s.seconds()).sum();
     let mut failed: Vec<String> = Vec::new();
     for s in &st.stages {
         if !s.passed {
@@ -132,6 +126,7 @@ pub fn build(st: &AutoState) -> Value {
         "compare": st.compare, "target_gb": st.spec.target_gb, "budget": st.budget, "speed": speed_json(st),
         "estimate": estimate_json(st, active),
         "vllm": vllm_json(st),
+        "settings_changes": st.settings_changes,
     })
 }
 
@@ -166,8 +161,10 @@ fn vllm_markdown(r: &Value) -> String {
     for e in &steps {
         let est = e["estimated_min"]["vllm"].as_array().map(|a| format!("{:.0} to {:.0} min in all", a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))).unwrap_or_else(|| "-".into());
         let startup = e["startup_seconds"].as_f64().map(|x| format!("{:.1} min", x / 60.0)).unwrap_or_else(|| "-".into());
-        s.push_str(&format!("| {} | {}{} | {} | {} ({est}) | {} | {} |\n", e["step"].as_str().unwrap_or(""), e["engine_version"].as_str().or(e["engine"].as_str()).unwrap_or("?"), if e["fallback"] == true { " (fell back to the standard engine)" } else { "" },
-                             e["teacher_quant"].as_str().unwrap_or("-"), startup, e["tokens_per_s"].as_f64().map(|x| format!("{x:.0} tokens/s")).unwrap_or_else(|| "-".into()), e["note"].as_str().or(e["problem"].as_str()).unwrap_or("")));
+        let route = if e["kind"] == "checks" { e["route"].as_str().map(|r| format!(", route {r}")).unwrap_or_default() } else { String::new() };
+        let unlike = if e["like_for_like"] == false { "different quantization: not like-for-like. " } else { "" };
+        s.push_str(&format!("| {} | {}{}{} | {} | {} ({est}) | {} | {}{} |\n", e["step"].as_str().unwrap_or(""), e["engine_version"].as_str().or(e["engine"].as_str()).unwrap_or("?"), route, if e["fallback"] == true { " (fell back to the standard engine)" } else { "" },
+                             e["teacher_quant"].as_str().unwrap_or("-"), startup, e["tokens_per_s"].as_f64().map(|x| format!("{x:.0} tokens/s")).unwrap_or_else(|| "-".into()), unlike, e["note"].as_str().or(e["problem"].as_str()).unwrap_or("")));
     }
     s.push_str("\nExperimental: built from a research report. The estimates use the numbers of your own self-test and teacher check where you have run them; the others are the report's.\n");
     s
@@ -187,7 +184,7 @@ fn estimate_json(st: &AutoState, active_seconds: i64) -> Value {
     let Some(t) = st.plan.as_ref().and_then(|p| p.time.as_ref()) else { return Value::Null };
     let rows: Vec<Value> = st.steps.iter().filter_map(|s| {
         let est = t.steps.iter().find(|x| x.id == s.id)?;
-        let actual = if s.status == "done" { secs_between(&s.started, &s.finished).map(|n| n as f64 / 60.0) } else { None };
+        let actual = if s.status == "done" { s.seconds().map(|n| n as f64 / 60.0) } else { None };
         let verdict = actual.map(|a| if a < est.minutes.0 { "faster" } else if a > est.minutes.1 { "slower" } else { "within" });
         Some(json!({"id": s.id, "label": est.label, "estimated_minutes": [est.minutes.0, est.minutes.1], "actual_minutes": actual.map(r1), "basis": est.basis, "result": verdict}))
     }).collect();
@@ -245,7 +242,7 @@ fn num(v: &Value, digits: usize) -> String {
 
 /// The section of a stage that healed in rounds: one row per round, the checks of the merged model, why it stopped, the tokens it did not need, and how the check of the model as it was
 /// trained compares with the check of the merged model (docs/HEAL_ROUNDS.md; experimental).
-fn rounds_markdown(st: &Value) -> String {
+fn rounds_markdown(st: &Value, heal_s: Option<f64>) -> String {
     let r = &st["rounds"];
     let mut s = format!("\n## Healing in rounds, stage {} (experimental)\n\n", st["index"]);
     let reason = match r["stop"]["reason"].as_str().unwrap_or("") {
@@ -265,6 +262,16 @@ fn rounds_markdown(st: &Value) -> String {
         let (c, a, l, sc) = if m.is_object() { (pct(&m["closed_rate"]), pct(&m["accuracy"]), pct(&m["loop_rate"]), num(&x["check"]["score"], 2)) } else { ("-".into(), "-".into(), "-".into(), "-".into()) };
         s.push_str(&format!("| {} | {} | {c} | {a} | {l} | {sc} | {} | {} | {} |\n", x["n"], num(&x["tokens_m"], 1), num(&x["calib_loss"], 3), x["decision"].as_str().unwrap_or("-"), x["seconds"].as_f64().map(|t| format!("{:.0}", t / 60.0)).unwrap_or_else(|| "-".into())));
     }
+    let rounds_s: f64 = r["rows"].as_array().map(|a| a.iter().filter_map(|x| x["seconds"].as_f64()).sum()).unwrap_or(0.0);
+    let final_s = r["final"]["seconds"].as_f64().unwrap_or(0.0);
+    s.push_str(&format!("\nThe minutes of a round are wall-clock time over every attempt of its phases (the original's answers, training, the check), including the time lost to a stop or a failure; the loads of the models are in them. The rounds add up to {:.0} min", rounds_s / 60.0));
+    if final_s > 0.0 {
+        s.push_str(&format!(", the merge and the check of the merged model took {:.0} min", final_s / 60.0));
+    }
+    if let Some(h) = heal_s {
+        s.push_str(&format!("; the heal step took {:.0} min in all (every attempt added up), so {:.0} min were spent outside these (starting, saving, waiting)", h / 60.0, (h - rounds_s - final_s) / 60.0));
+    }
+    s.push_str(".\n");
     for m in r["merged_checks"].as_array().cloned().unwrap_or_default() {
         s.push_str(&format!("\nThe merged model after round {} did not pass ({}); healing went on and then needed two passed checks in a row.\n", m["after_round"], m["failed"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()));
     }
@@ -294,10 +301,21 @@ pub fn markdown(r: &Value) -> String {
         _ => "Running",
     };
     s.push_str(&format!("# Auto-cut report: {} to about {} B\n\n**{headline}.** ", r["model"].as_str().unwrap_or("model"), num(&r["target_b"], 1)));
+    let mut tail_block = None;
     if let Some(e) = r["error"].as_str() {
-        s.push_str(e);
+        // a failed tool's last output lines follow the first line of the message: they go into a block of their own, not into the sentence
+        match e.split_once('\n') {
+            Some((first, rest)) => {
+                s.push_str(first);
+                tail_block = Some(rest.trim().to_string());
+            }
+            None => s.push_str(e),
+        }
     }
     s.push_str("\n\n");
+    if let Some(t) = tail_block.filter(|t| !t.is_empty()) {
+        s.push_str(&format!("```text\n{}\n```\n\n", t.replace("```", "~~~")));
+    }
     s.push_str(&format!("- Original: {} B. Result: {} B ({} blocks removed, MLP width {}).\n", num(&r["original_b"], 1), num(&r["actual_b"], 2), r["blocks_removed"].as_u64().unwrap_or(0), r["mlp_width"].as_u64().map(|x| x.to_string()).unwrap_or_else(|| "unchanged".into())));
     s.push_str(&format!("- Keep thinking: {}. Stages: {}. Retries: {}. Time (the steps added up): {} minutes.\n", if r["keep_thinking"] == true { "yes" } else { "no" }, r["stages"].as_array().map(|a| a.len()).unwrap_or(0), r["retries"].as_u64().unwrap_or(0), num(&r["active_minutes"], 1)));
     if let Some(d) = r["disk"].as_object() {
@@ -328,9 +346,26 @@ pub fn markdown(r: &Value) -> String {
         }
     }
     for st in r["stages"].as_array().cloned().unwrap_or_default().iter().filter(|st| st["rounds"].is_object()) {
-        s.push_str(&rounds_markdown(st));
+        let heal_id = format!("s{}.heal", st["index"]);
+        let heal_s = r["steps"].as_array().and_then(|a| a.iter().find(|x| x["id"] == heal_id.as_str())).and_then(|x| x["seconds"].as_f64());
+        s.push_str(&rounds_markdown(st, heal_s));
     }
     s.push_str(&vllm_markdown(r));
+    if let Some(c) = r["settings_changes"].as_array().filter(|c| !c.is_empty()) {
+        s.push_str("\n## Settings changed while the run went on\n\nThe run was started with other settings; the person changed these when continuing (finished steps were not redone).\n\n");
+        for x in c {
+            s.push_str(&format!("- {} ({}){}:\n", x["at"].as_str().unwrap_or("?"), x["who"].as_str().unwrap_or("person"), if x["confirmed"] == true { ", confirmed" } else { "" }));
+            for d in x["changes"].as_array().cloned().unwrap_or_default() {
+                s.push_str(&format!("  - {}\n", d["text"].as_str().unwrap_or("").trim_start_matches("you changed: ")));
+            }
+            if let Some(rd) = x["redo"].as_array().filter(|r| !r.is_empty()) {
+                s.push_str(&format!("  - redone because of it: {}\n", rd.iter().filter_map(|y| y.as_str()).collect::<Vec<_>>().join("; ")));
+            }
+            if let (Some(n), Some(w)) = (x["remaining_h"].as_array(), x["was_remaining_h"].as_array()) {
+                s.push_str(&format!("  - time left: about {:.1}-{:.1} h (was {:.1}-{:.1} h)\n", n[0].as_f64().unwrap_or(0.0), n[1].as_f64().unwrap_or(0.0), w[0].as_f64().unwrap_or(0.0), w[1].as_f64().unwrap_or(0.0)));
+            }
+        }
+    }
     if let Some(g) = r["guardrails"].as_array().filter(|g| !g.is_empty()) {
         s.push_str("\n**This cut is beyond what Auto-cut does by itself.**\n\n");
         for x in g.iter().filter_map(|x| x.as_str()) {
@@ -460,7 +495,7 @@ pub fn markdown(r: &Value) -> String {
     }
     s.push_str("\n## Steps\n\n| Step | Status | Seconds | Note |\n|---|---|---|---|\n");
     for x in r["steps"].as_array().cloned().unwrap_or_default() {
-        s.push_str(&format!("| {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["status"].as_str().unwrap_or(""), x["seconds"].as_i64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()), x["note"].as_str().unwrap_or("").replace('|', "/")));
+        s.push_str(&format!("| {} | {} | {} | {} |\n", x["label"].as_str().unwrap_or(""), x["status"].as_str().unwrap_or(""), x["seconds"].as_i64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()), x["note"].as_str().unwrap_or("").lines().next().unwrap_or("").replace('|', "/")));
     }
     s.push_str("\nThe numbers come from a thinking check of 32 questions per model (16 in Quick); they show a trend, not a benchmark.\n");
     s

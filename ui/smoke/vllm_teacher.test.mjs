@@ -170,7 +170,7 @@ test("Settings: the 8-bit KV cache is off by default, explained, and the teacher
   b.run(`state = ${JSON.stringify(baseState())}`);
   const html = b.run("renderVllm()");
   assert.match(html, /8-bit KV cache \(experimental, off\)/);
-  assert.match(html, /71,141 tokens now, roughly 140,000 with fp8/); assert.match(html, /only its full-attention layers have a KV cache/);
+  assert.match(html, /71,141 cached tokens with auto, 85,196 with fp8 \(only about 1\.2 times, not 2 times\)/); assert.match(html, /only its full-attention layers have a KV cache/);
   assert.match(html, /<option value="auto" selected>auto \(the default\)/); assert.doesNotMatch(html, /id="vl-kv-teacher"[^>]*checked/);
   assert.match(html, /<option value="f16" selected>f16 \(the default\)/);
   assert.match(html, /id="vl-tkv"/);
@@ -189,4 +189,50 @@ test("the Heal card can measure the cost of the 8-bit KV cache on the teacher's 
   const b = open(on);
   b.run("rs.hlSpec.vllm = true");
   assert.match(b.run("renderReshape()"), /id="hl-vllm-checkkv"[^>]*>Check with the 8-bit KV cache/);
+});
+
+// ---- Measure heal speed
+
+test("the Heal card has a Measure heal speed box: off until pressed, with the report path, buttons and the Windows hint", () => {
+  const b = open(null);
+  b.run(`hsp.name = "slim-w"; hsp.files = { exists: true, dir: "C:\\\\p\\\\benchmarks\\\\heal_speed-slim-w", markdown: "# Heal speed report\\nGatedDeltaNet kernels take about 31 % of a step", windows_hints: ["Hardware-accelerated GPU scheduling: off. Windows Settings ..."] }`);
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="hl-speed"[^>]*open/); assert.match(html, /<strong>Measure heal speed<\/strong> \(where does the time go/);
+  assert.match(html, /hypotheses until this measurement confirms them/);
+  assert.match(html, /id="hl-speed-go"/); assert.match(html, /id="hl-speed-hint">Hardware-accelerated GPU scheduling: off/);
+  assert.match(html, /heal_speed-slim-w/); assert.match(html, /Open the folder/); assert.match(html, /Copy path/);
+  assert.doesNotMatch(html, /id="hl-speed-stop"/);
+  b.run(`hsp.run = { text: "Profiling" }`);
+  assert.match(b.run("renderReshape()"), /id="hl-speed-stop"/);
+});
+
+test("Test the container copy: the button starts the probe with the real keys, shows which way worked and which failed", async () => {
+  const b = open(on);
+  b.run("rs.hlSpec.vllm = true");
+  let html = b.run("renderReshape()");
+  assert.match(html, /id="hl-vllm-probe"/);
+  b.run(`vch.probing = true; vch.probeText = "Starting…"`);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "progress", text: "Testing the vLLM container" })})`);
+  assert.match(b.run("renderReshape()"), /Testing the vLLM container/);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "done", data: { ok: true, text: "Files go in by cp:dir and out by cp:file.", tried: [{ route: "bind /p/w", ok: false, detail: "refused" }, { route: "cp:dir (in)", ok: true, detail: "1 KB went in" }] } })})`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-vllm-probe-result" class="ok"/);
+  assert.match(html, /failed: bind \/p\/w — refused/);
+  assert.match(html, /worked: cp:dir \(in\)/);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "error", text: "No way of moving files into the container works. Tried: ..." })})`);
+  assert.match(b.run("renderReshape()"), /class="err"><strong>The container copy does not work/);
+});
+
+test("the KV warning for the teacher is part of the numbers the Heal card shows", () => {
+  const b = open(on, vt({ warnings: ["8-bit KV cache for the teacher: measured 1.2x more cached tokens and no speed gain on this PC"] }));
+  b.run("rs.hlSpec.vllm = true");
+  assert.match(b.run("renderReshape()"), /8-bit KV cache for the teacher: measured 1\.2x more cached tokens and no speed gain/);
+});
+
+test("the Settings card has a button that tests the in-flight 4-bit route alone, with the real keys", async () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState({ enabled: true, kind: "auto", teacher: { enabled: true, route: "auto", pairs: {}, confirmed: {}, required: false } }) });
+  b.run(`state = ${JSON.stringify(baseState({ enabled: true, kind: "auto", teacher: { enabled: true, route: "auto", pairs: {}, confirmed: {}, required: false } }))}`);
+  const html = b.run("renderVllm()");
+  assert.match(html, /id="vl-inflight"/);
+  assert.match(html, /Test the in-flight 4-bit route on my original/);
 });

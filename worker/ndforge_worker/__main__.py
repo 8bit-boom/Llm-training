@@ -41,6 +41,8 @@ def _accelerators() -> dict:
 
 
 def _explain(exc: Exception) -> str:
+    if isinstance(getattr(exc, "tail", None), list):     # a llama.cpp tool failed: its message already holds the last output lines (scrubbed); keep them whole, user name out
+        return protocol.redact_user(protocol.scrub(str(exc)))[:4000]
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
     if "no space left" in low:
@@ -235,6 +237,17 @@ def _run(kind, job: dict) -> int:
             import traceback
             traceback.print_exc()
             protocol.error("trace_gen_failed", _explain(exc))
+            return 1
+    if kind == "vllm_container_probe":
+        from . import vllmcache
+        try:
+            r = vllmcache.probe(job)
+            protocol.result(r)
+            return 0 if r["ok"] else 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("vllm_container_probe_failed", _explain(exc))
             return 1
     if kind == "vllm_selftest":
         from . import thinkcheck, vllmselftest

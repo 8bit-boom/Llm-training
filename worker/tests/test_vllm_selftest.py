@@ -118,6 +118,26 @@ def test_a_crashing_engine_still_gets_a_report_and_the_explicit_stop(tmp_path, m
     assert rep["verdict"] == "fail" and "exit code 2" in rep["error"] and stopped(env)
 
 
+def test_the_in_flight_4_bit_route_can_be_tested_alone_and_a_failure_shows_the_root_cause(tmp_path, monkeypatch):
+    d = tmp_path / "orig"
+    d.mkdir()
+    (d / "config.json").write_text("{}")
+    header = {"model.layers.0.mlp.weight": {"dtype": "BF16", "shape": [100000, 100000], "data_offsets": [0, 1]}}          # 20 GB in 16 bits, about 5.3 GB in 4 bits
+    raw = json.dumps(header).encode()
+    (d / "model.safetensors").write_bytes(len(raw).to_bytes(8, "little") + raw)
+    env = Env(monkeypatch, 1, exit_code=1)
+    env.answers["docker"] = (0, "INFO normal line\nValueError: Free memory on device (15.1/31.8 GiB) on startup is less than desired GPU memory utilization (0.88, 28.0 GiB).\nRuntimeError: Engine core initialization failed.\n")
+    assert st.run(job(tmp_path, model=str(d), in_flight=True)) == 0
+    rep = json.loads((tmp_path / "out" / "vllm_selftest.json").read_text())
+    assert rep["in_flight"]["worked"] is False and rep["in_flight"]["flags"] == ["--quantization", "bitsandbytes"]
+    assert any("Free memory on device (15.1/31.8 GiB)" in x for x in rep["in_flight"]["root_cause"]), rep["in_flight"]
+    assert "Free memory on device" in rep["error"], "the error text itself names the cause"
+    assert any("bitsandbytes" in " ".join(c) for c in env.popen) or any("bitsandbytes" in " ".join(c) for c in env.run)
+    md = (tmp_path / "out" / "vllm_selftest.md").read_text()
+    assert "The in-flight 4-bit route on this model" in md and "FAILED" in md
+    assert stopped(env)
+
+
 def test_stop_ends_the_questions_and_the_engine_and_the_report_says_so(tmp_path, monkeypatch):
     f = ttv.Fake(delay=3.0)
     try:

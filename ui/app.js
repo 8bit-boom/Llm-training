@@ -8,6 +8,8 @@ const TITLES = {
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
   quantcheck: ["Compare quants", "Measure how far each smaller GGUF file is from the 16-bit model, as KL divergence, and see which size keeps the most."],
+  storage: ["Storage", "See where the disk went and delete what you do not need. Deleting is permanent: the files are not moved to the Recycle Bin."],
+  auto: ["Auto", "One click: measures, cuts, heals, checks and exports a model. It runs the same steps as the manual pages, one after the other."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
 
@@ -31,13 +33,19 @@ function applyTheme() {
   $("night").checked = t === "dark" || (t === "auto" && systemDark());
 }
 
+// Auto-cut shares the state of the Slim page (`rs`): what refreshes the Slim page refreshes the Auto page too.
+const onAutoPage = () => page === "auto";
+const onReshape = () => page === "reshape" || page === "auto";
+
 function setState(s) { if (s) { state = s; } }
 
 function renderSteps() {
   const items = [{ key: "welcome", label: "Welcome", unlocked: true, done: false }, ...state.steps];
+  items.push({ key: "auto", label: "🚀 Auto", unlocked: !!state.bundle, done: false });
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
   items.push({ key: "quantcheck", label: "📏 Compare quants", unlocked: !!state.bundle, done: false });
+  items.push({ key: "storage", label: "🧹 Storage", unlocked: !!state.project, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
@@ -878,7 +886,7 @@ function renderUse() {
     ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
     <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) || (us.what !== "merged" && us.quants.includes("mixed_measured") && !(+us.mm.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
-      ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
+      ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""} <button class="link" data-stdel="export|${esc(e.name)}" title="Opens the Storage page with this export ticked; nothing is deleted before you confirm.">Delete…</button></li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul>${gg.length > 1 ? `<div class="row"><button class="secondary" id="us-compare" title="Measures how far each of these files is from the 16-bit model (KL divergence)">Compare these sizes</button></div>` : ""}</div>` : "";
   const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
@@ -2077,13 +2085,13 @@ function renderVllm() {
     ${vllmTeacherCard()}
     <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
     <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
-    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}${memHint(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
 }
 // the optional 8-bit KV cache (docs/VLLM.md): off by default; the teacher's answers need a second, explicit confirmation
 function vllmKvCard(v) {
   const sel = (id, cur, opts) => `<select id="${id}">${opts.map(([k, n]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>`;
   return `<fieldset class="soft" id="vl-kv-card"><legend>8-bit KV cache (experimental, off)</legend>
-    <p class="dim small">Stores the attention cache in 8 bits: about twice as many cached tokens (the 27 B 4-bit model on a 5090: 71,141 tokens now, roughly 140,000 with fp8) so more answers run at once, and a tiny numeric change. Qwen3.8 is a hybrid: only its full-attention layers have a KV cache; the DeltaNet state is unchanged. Untested on this PC until you run the self-test with the fp8 pass. Thinking checks and trace generation may use it (the result says "kv cache fp8" and has its own key); the teacher's answers for healing do not, unless you confirm below.</p>
+    <p class="dim small">Stores the attention cache in 8 bits: a tiny numeric change. Measured on a 5090 with Qwen3.8-27B AWQ: 71,141 cached tokens with auto, 85,196 with fp8 (only about 1.2 times, not 2 times) and no speed gain (564 and 548 tokens per second on long answers): Qwen3.8 is a hybrid, only its full-attention layers have a KV cache and the page size is dominated by the DeltaNet state. A plain transformer would gain more; this is not measured. Thinking checks and trace generation may use it (the result says "kv cache fp8" and has its own key); the teacher's answers for healing do not, unless you confirm below.</p>
     <div class="row"><label>vLLM KV cache ${sel("vl-kv", v.kv_cache_dtype || "auto", [["auto", "auto (the default)"], ["fp8", "fp8 (8 bit)"]])}</label>
       <label class="opt"><input type="checkbox" id="vl-kv-teacher" ${v.kv_cache_dtype_teacher ? "checked" : ""}> Also use it for the original's answers (the training target; cached answers carry it in their identity and are never mixed with exact ones)</label></div>
     <div class="row"><label>llama.cpp KV cache (GGUF thinking check) ${sel("vl-llama-kv", v.llama_cache_type || "f16", [["f16", "f16 (the default)"], ["q8_0", "q8_0 (8 bit, needs flash attention)"]])}</label></div></fieldset>`;
@@ -2114,7 +2122,7 @@ function renderVllmTest(v) {
       <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tkv" ${vl.kv ? "checked" : ""}> Also test the 8-bit KV cache (a second engine start: reports the cache size and speed for both)</label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
-    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
+    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button><button class="secondary" id="vl-inflight" ${busy || !v.enabled ? "disabled" : ""} title="Starts the engine on the model above (a folder: your original) with the in-flight 4-bit route alone, no Hugging Face process, and says whether it worked or which lines name the cause. Minutes, not hours.">Test the in-flight 4-bit route on my original</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
     ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}${vllmFilesBox(vl.files, "vl-files", "The report is saved in:")}`;
 }
 // the report's folder as text, with Copy path / Open the folder / Copy the whole report, and the text inline (also after a failure): the owner must be able to paste it into an issue
@@ -2164,8 +2172,100 @@ function wireVllm() {
     vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
     invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null, ...(vl.kv ? { kv_fp8_test: true } : {}) } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
   };
+  const tf = $("vl-inflight"); if (tf) tf.onclick = () => {
+    vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
+    vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
+    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: null, in_flight: true } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
+  };
   const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
+
+// ------------------------------------------------------------------------------------------------ the memory panel (docs/MEMORY.md): footer numbers, a popover, "Free GPU" / "Free RAM"
+const mem = { st: null, open: false, plan: null, stop: false, run: false, result: null, err: null, timer: null };
+const memGb = (mb) => (mb / 1024).toFixed(1);
+function memLine() {
+  const s = mem.st; if (!s) return "Memory";
+  const g = s.gpu ? `GPU ${memGb(s.gpu.free_mb)} of ${memGb(s.gpu.total_mb)} GB free` : "GPU not found";
+  const r = s.ram ? `RAM ${memGb(s.ram.free_mb)} of ${memGb(s.ram.total_mb)} GB free` : "";
+  return [g, r, s.ram && s.ram.app_mb ? `this app ${memGb(s.ram.app_mb)} GB` : ""].filter(Boolean).join(" · ");
+}
+function memBar(used, total) { return `<div class="mem-bar" aria-hidden="true"><i style="width:${total ? Math.min(100, Math.round((100 * used) / total)) : 0}%"></i></div>`; }
+function memPlanHtml(p) {
+  const need = (p.items || []).some((i) => i.needs_stop && i.refused);
+  const items = (p.items || []).map((i) => `<li><strong>${esc(i.label)}</strong> <span class="dim">${esc(i.detail)}</span>${i.refused ? ` <span class="warn">Not now: ${esc(i.refused)}.</span>` : ""}</li>`).join("");
+  const others = (p.others || []).map((o) => `<li>${esc(o.name)} (pid ${esc(String(o.pid))})${o.used_mb != null ? `, ${esc(memGb(o.used_mb))} GB` : ""} <span class="dim">${esc(o.note || "")}</span></li>`).join("");
+  const wsl = p.kind === "wsl";
+  return `<div id="mem-confirm" role="alertdialog" aria-label="Confirm"><h3>${wsl ? "Release the WSL memory?" : p.kind === "gpu" ? "Free the graphics memory this program holds?" : "Free the RAM this program holds?"}</h3>
+    ${wsl ? `<p class="warn"><strong>Warning:</strong> this ends every WSL distribution on this computer, also the ones you use for other things.</p>` : ""}
+    ${items ? `<p class="small">This will end or release exactly:</p><ul class="small">${items}</ul>` : `<p>This program holds nothing that can be freed right now.</p>`}
+    ${others ? `<p class="small">Other programs hold memory too. They are only listed: close them yourself, this program never ends them.</p><ul class="small">${others}</ul>` : ""}
+    ${(p.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
+    ${need ? `<label class="opt"><input type="checkbox" id="mem-stop" ${mem.stop ? "checked" : ""}> Stop the running job too (it is stopped the normal way, its state is saved and Continue works)</label>` : ""}
+    <div class="row"><button class="primary" id="mem-go" ${mem.run || !(p.items || []).length ? "disabled" : ""}>${wsl ? "Release and end WSL" : "Free it"}</button><button class="secondary" id="mem-no">Cancel</button></div></div>`;
+}
+function memResultHtml(r) {
+  const n = (x) => (x ? `${memGb(x.free_mb)} of ${memGb(x.total_mb)} GB free` : "not known");
+  const row = (l, b, a) => `<tr><td>${l}</td><td>${n(b)}</td><td>${n(a)}</td></tr>`;
+  return `<div id="mem-result"><h3>Done</h3><table><tr><th></th><th>Before</th><th>After</th></tr>${row("GPU", r.before.gpu, r.after.gpu)}${row("RAM", r.before.ram, r.after.ram)}</table>
+    ${(r.done || []).map((d) => `<div class="small ok">✓ ${esc(d.label)}${d.freed_mb ? ` (${esc(String(d.freed_mb))} MB)` : ""}</div>`).join("")}
+    ${(r.skipped || []).map((d) => `<div class="small warn">Left alone: ${esc(d.label)} — ${esc(d.why)}</div>`).join("")}
+    ${(r.failed || []).map((d) => `<div class="small err">Could not: ${esc(d.label)} — ${esc(d.why)}</div>`).join("")}
+    ${(r.others || []).length ? `<p class="dim small">Still using memory and not ours: ${(r.others || []).map((o) => esc(o.name) + (o.used_mb != null ? " " + memGb(o.used_mb) + " GB" : "")).join(", ")}. Close them yourself.</p>` : ""}
+    <p class="dim small">The free RAM includes Windows' file cache; there is no RAM cleaner here.</p></div>`;
+}
+function memPopHtml() {
+  const s = mem.st, g = s && s.gpu, r = s && s.ram;
+  const numbers = `<table>
+    <tr><th>Graphics memory</th><td>${g ? `${esc(memGb(g.used_mb))} used, ${esc(memGb(g.free_mb))} free of ${esc(memGb(g.total_mb))} GB${g.app_mb != null ? `; this app ${esc(memGb(g.app_mb))} GB` : ""}` : "no NVIDIA card found"}</td></tr>
+    <tr><td colspan="2">${g ? memBar(g.used_mb, g.total_mb) : ""}</td></tr>
+    <tr><th>RAM</th><td>${r ? `${esc(memGb(r.used_mb))} used, ${esc(memGb(r.free_mb))} free of ${esc(memGb(r.total_mb))} GB; this app ${esc(memGb(r.app_mb))} GB` : "not known"}</td></tr>
+    <tr><td colspan="2">${r ? memBar(r.used_mb, r.total_mb) : ""}</td></tr></table>
+    ${g && !g.per_process ? `<p class="dim small" id="mem-noproc">The driver does not say which program uses how much graphics memory (usual on Windows): only the totals are shown.</p>` : ""}
+    ${s && (s.containers || []).length ? `<p class="small">Engine containers: ${(s.containers || []).map((c) => esc(c.name) + (c.running ? " (running)" : " (stopped)")).join(", ")}</p>` : ""}
+    ${g && (g.others || []).length ? `<p class="small">Other programs on the card: ${(g.others || []).map((o) => esc(o.name) + (o.used_mb != null ? " " + esc(memGb(o.used_mb)) + " GB" : "")).join(", ")} <span class="dim">(listed only)</span></p>` : ""}`;
+  const body = mem.err ? `<div class="err">${esc(mem.err)}</div>` : "";
+  return `<div class="row"><strong>Memory</strong><span class="spacer"></span><button class="link" id="mem-close">Close</button></div>${numbers}
+    <div class="row"><button class="secondary" id="mem-gpu" ${mem.run ? "disabled" : ""}>Free GPU…</button><button class="secondary" id="mem-ram" ${mem.run ? "disabled" : ""}>Free RAM…</button>${s && s.wsl ? `<button class="link" id="mem-wsl" ${mem.run ? "disabled" : ""}>Release WSL memory…</button>` : ""}</div>
+    <p class="dim small">Free GPU and Free RAM only end what this program started (its engine containers and its leftover workers). Nothing happens before you confirm.</p>
+    ${body}${mem.plan ? memPlanHtml(mem.plan) : ""}${mem.result ? memResultHtml(mem.result) : ""}`;
+}
+function renderMemory() {
+  const b = $("mem-btn"); if (b) { b.textContent = memLine(); try { b.setAttribute("aria-expanded", mem.open ? "true" : "false"); } catch (_) { /* a preview */ } }
+  const pop = $("mem-pop"); if (!pop) return;
+  pop.hidden = !mem.open;
+  if (mem.open) { pop.innerHTML = memPopHtml(); wireMemory(); }
+}
+async function memPoll() {
+  try { mem.st = await invoke("memory_status"); } catch (_) { /* no numbers: the button just says Memory */ }
+  renderMemory();
+  clearTimeout(mem.timer);
+  const t = setTimeout(memPoll, mem.st && mem.st.busy ? 2000 : 5000);          // every ~2 s while a job runs, else every few seconds
+  mem.timer = t; if (t && t.unref) t.unref();
+}
+async function memAsk(kind) {
+  mem.open = true; mem.err = null; mem.result = null; mem.plan = null; mem.stop = false; renderMemory();
+  try { const p = await invoke("memory_free_plan", { kind }); mem.plan = { ...p, kind }; } catch (e) { mem.err = String(e); }
+  renderMemory();
+}
+async function memGo() {
+  const p = mem.plan; if (!p || mem.run) return;
+  mem.run = true; renderMemory();
+  try { mem.result = await invoke("memory_free", { kind: p.kind, planToken: p.token, stopRunning: !!mem.stop }); mem.plan = null; mem.err = null; }
+  catch (e) { mem.err = String(e); }
+  mem.run = false;
+  try { mem.st = await invoke("memory_status"); } catch (_) { /* keep the old numbers */ }
+  renderMemory();
+}
+function wireMemory() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("mem-close", () => { mem.open = false; renderMemory(); });
+  on("mem-gpu", () => memAsk("gpu")); on("mem-ram", () => memAsk("ram")); on("mem-wsl", () => memAsk("wsl"));
+  on("mem-go", memGo); on("mem-no", () => { mem.plan = null; renderMemory(); });
+  const st = $("mem-stop"); if (st) st.onchange = () => { mem.stop = st.checked; };
+}
+function memHint(text) { return /free memory|out of memory|in use by other programs|desired GPU memory|graphics (card|memory)/i.test(String(text || "")) ? ` <button class="link" data-memfree="gpu">Free GPU first</button>` : ""; }
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-memfree]"); if (t) memAsk(t.dataset.memfree); }); } catch (_) { /* a preview without a window */ }
+try { const mb = document.getElementById("mem-btn"); if (mb) mb.onclick = () => { mem.open = !mem.open; if (mem.open && !mem.st) memPoll(); renderMemory(); }; } catch (_) { /* a preview */ }
 
 function renderSetup() {
   const st = env.status;
@@ -2181,7 +2281,7 @@ function renderSetup() {
       <button class="secondary" id="recheck" ${busy ? "disabled" : ""}>Check again</button>
       <button class="primary" id="install" ${busy || !st || !st.can_install ? "disabled" : ""}>Install the training software</button>
       <button class="primary" id="selftest" ${busy || !st || !st.env_installed ? "disabled" : ""}>Test the graphics card</button>
-      ${st && st.env_installed && (st.checks || []).some((c) => c.id === "kernels" && c.light !== "ok") ? `<button class="secondary" id="kernels" ${busy ? "disabled" : ""} title="Installs flash-linear-attention (and causal-conv1d where a ready-made package exists) so that Qwen3.5's linear-attention layers run fast. Nothing else is changed.">Install the fast kernels</button>` : ""}
+      ${st && st.env_installed && (st.checks || []).some((c) => (c.id === "kernels" || c.id === "triton") && c.light !== "ok") ? `<button class="secondary" id="kernels" ${busy ? "disabled" : ""} title="Installs flash-linear-attention (and causal-conv1d where a ready-made package exists) so that Qwen3.5's linear-attention layers run fast. Nothing else is changed.">Install the fast kernels</button>` : ""}
       <button class="secondary" id="cancelenv" ${busy ? "" : "disabled"}>Cancel</button>
     </div>
     ${env.step ? `<div class="stepline" aria-live="polite">${esc(env.step)}</div>` : ""}
@@ -2306,7 +2406,7 @@ function wireTest() {
 
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
-const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null };
+const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -2520,7 +2620,7 @@ function onHealBenchEvent(p) {
   if (p.kind === "heal_bench") { hb.text = `Setting ${p.index + 1} of ${p.total}: ${p.name}`; if (p.row) (hb.rows || (hb.rows = [])).push(p.row); }
   else if (p.kind === "error") { hb.running = false; hb.err = p.text; }
   else if (p.kind === "done") { hb.running = false; hb.err = null; if (p.data) { hb.result = p.data; hb.last = p.data; } }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
@@ -2541,6 +2641,7 @@ function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
     <label>Answers kept per token (top-k, 8 to 128)<br><input type="text" id="hl-k" value="${v(sp.k, 32)}" ${d}></label>
     <label>The original is loaded as<br>${sel("hl-tload", sp.teacher_load || "auto", [["auto", "Automatic"], ["4bit", "4-bit"], ["16bit", "16-bit"]])}</label>
     <label>Warm-up steps<br><input type="text" id="hl-warmup" value="${v(sp.warmup, 30)}" ${d}></label></div>
+    <div class="row"><label>Tokens per forward pass (Expert; 0 = one row at a time, as always)<br><input type="text" id="hl-sbt" value="${v(sp.student_batch_tokens, 0)}" ${d} title="Rows of similar length are put together in one forward pass, up to this many tokens, padded. The same learning: every row keeps its weight and the update still holds the same rows. Measure heal speed recommends a value; 512 to 65,536."></label></div>
     <label class="opt"><input type="checkbox" id="hl-upcast" ${sp.kbit_upcast === true ? "checked" : ""} ${busy || kn.qlora === false ? "disabled" : ""}> Keep the embeddings and output layer in 32-bit (the old behaviour: about <span id="hl-upcast-gb">${upcastGb != null ? upcastGb : "4 to 5"}</span> GB more memory)${kn.qlora === false ? " - only for QLoRA" : ""}</label>
     <p class="dim small">By default the two big word tables stay in 16-bit while healing: they are not changed by the learning, so a 32-bit copy only costs memory. Changing this keeps the saved answers and the learning done so far. If healing runs out of memory with this on, the program turns it off first.</p>
     ${(() => { const on = sp.head_checkpoint === "off", gb = headOff && headOff.head_off_gb != null ? headOff.head_off_gb : null, fits = headOff ? headOff.head_off_fits : null; const off = busy || (!on && fits === false);
@@ -2587,8 +2688,32 @@ function hlRoundsTable(h, run) {
 }
 // the controls of the card
 // "Make the original's answers with vLLM (experimental)": only offered when Settings switch it on; the numbers are the person's own where they exist (docs/VLLM.md)
+// "Measure heal speed" (docs/HEAL_SPEED.md): where the time of a heal goes on this computer; nothing runs unless the button is pressed
+const hsp = { run: null, err: null, files: undefined, name: null, teacher: false };
+function hlSpeedBox(busy) {
+  const name = rs.hl && rs.hl.name;
+  if (name && hsp.name !== name) { hsp.name = name; hsp.files = undefined; }
+  if (name && hsp.files === undefined) { hsp.files = null; Promise.resolve(invoke("heal_speed_report", { name })).then((f) => { hsp.files = f || null; try { render(); } catch (_) { /* a preview without a window */ } }).catch(() => {}); }
+  const f = hsp.files, hint = f && (f.windows_hints || []).find((h) => /: off|A display is attached|never changes/.test(h));
+  const running = hsp.run !== null;
+  return `<details id="hl-speed" ${f && f.exists ? "open" : ""}><summary class="small"><strong>Measure heal speed</strong> (where does the time go on this computer?)</summary>
+    <p class="dim small">Profiles a few real steps of the healing step (forward, loss, backward, optimizer, the GatedDeltaNet and matrix-multiplication kernels), times one GatedDeltaNet forward + backward, and writes a report you can read or paste. Nothing runs unless you press the button; it takes a few minutes. The research report's speed claims are hypotheses until this measurement confirms them.</p>
+    <div class="row"><label class="opt"><input type="checkbox" id="hl-speed-teacher" ${hsp.teacher ? "checked" : ""}> Also time the original's answers per rows-per-forward (loads the original: slow)</label>
+      <button class="secondary" id="hl-speed-go" ${busy || running ? "disabled" : ""}>Measure heal speed</button>${running ? `<button class="secondary" id="hl-speed-stop">Stop</button>` : ""}</div>
+    ${running ? `<div class="stepline" aria-live="polite">${esc(hsp.run.text)}</div>` : ""}${hsp.err ? `<div class="err">${esc(hsp.err)}</div>` : ""}${hint ? `<p class="warn small" id="hl-speed-hint">${esc(hint)}</p>` : ""}
+    ${(() => { const r = f && f.recommended; if (!r) return ""; const cur = +((rs.hlSpec || {}).student_batch_tokens || 0);
+      return r.value ? `<p id="hl-speed-rec" class="ok small"><strong>Recommended: ${esc(String(r.value))} tokens per forward pass.</strong> ${esc(r.why || "")} <button class="secondary" id="hl-speed-use" ${busy || cur === +r.value ? "disabled" : ""}>Use the recommended batch size</button> <span class="dim">(never automatic)</span></p>`
+        : `<p id="hl-speed-rec" class="dim small">${esc(r.why || "No token budget is clearly faster.")}</p>`; })()}
+    ${f ? vllmFilesBox({ ...f, open: false }, "hl-speed-files", "The report is saved in:") : ""}</details>`;
+}
+function onHealSpeedEvent(p) {
+  if (p.kind === "heal_speed" || p.kind === "progress") { if (hsp.run) hsp.run.text = p.text || p.step || hsp.run.text; }
+  else if (p.kind === "error") { hsp.run = null; hsp.err = p.text; hsp.files = undefined; }
+  else if (p.kind === "done") { hsp.run = null; hsp.err = p.data && p.data.error ? p.data.error : null; hsp.files = undefined; }
+  if (onReshape()) render();
+}
 const hlVllmAvailable = () => !!(vllmSettings().enabled && vllmTeacher().enabled);
-const vch = { run: null, err: null };
+const vch = { run: null, err: null, probe: null, probing: false };
 function hlVllmBox(sp, est, busy) {
   if (!hlVllmAvailable()) return "";
   const v = est && est.vllm_teacher, ck = v && v.check && v.check.verdict ? v.check : null;
@@ -2602,18 +2727,31 @@ function hlVllmBox(sp, est, busy) {
     html += (v.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("");
     html += `<details><summary class="small">Where these numbers come from</summary><ul class="small dim">${(v.basis || []).map((b) => `<li>${esc(b)}</li>`).join("")}</ul></details>`;
   }
+  html += vprobeBox();
   html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
   const running = vch.run !== null;
   html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkkv" ${busy || running ? "disabled" : ""} title="Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
-    ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}</div>` : ""}</div>`;
+    ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}${memHint(vch.err)}</div>` : ""}</div>`;
   return html;
+}
+// "Test the container copy": which way of moving a 1 KB file into and out of the vLLM container works on this PC
+function onVprobeEvent(p) {
+  if (p.kind === "progress") vch.probeText = p.text || p.step;
+  else if (p.kind === "error") { vch.probing = false; vch.probe = { ok: false, text: p.text }; }
+  else if (p.kind === "done") { vch.probing = false; vch.probe = p.data || { ok: false, text: "No answer." }; }
+  if (onReshape()) render();
+}
+function vprobeBox() {
+  const r = vch.probe;
+  const res = vch.probing ? `<div class="stepline" aria-live="polite">${esc(vch.probeText || "Testing…")}</div>` : r ? `<div id="hl-vllm-probe-result" class="${r.ok ? "ok" : "err"}"><strong>${r.ok ? "The container copy works" : "The container copy does not work"}</strong> — ${esc(r.text || "")}${r.tried ? `<ul class="small dim">${r.tried.map((t) => `<li>${t.ok ? "worked" : "failed"}: ${esc(t.route)} — ${esc(t.detail || "")}</li>`).join("")}</ul>` : ""}</div>` : "";
+  return `<div class="row"><button class="secondary" id="hl-vllm-probe" ${vch.probing || vch.run ? "disabled" : ""} title="Starts the idle container, writes 1 KB in and reads it back by every way (a mounted folder, cp, stdin), removes the container. A minute at most.">Test the container copy</button><span class="dim small">Finds out in a minute how files get into the vLLM container on this PC, before a long cache job.</span></div>${res}`;
 }
 function onVcheckEvent(p) {
   if (p.kind === "progress") { if (vch.run) { vch.run.text = p.text || p.step; vch.run.progress = p.value; } }
   else if (p.kind === "error") { vch.run = null; vch.err = p.text; }
   else if (p.kind === "done") { vch.run = null; vch.err = null; try { rsHealEstimate(); } catch (_) { /* a preview without a window */ } }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function hlRoundsBox(h, sp, kn, est, busy, thinks, cap) {
   const d = busy ? "disabled" : "", rt = est && est.rounds ? est.rounds : null, tm = rt && rt.time;
@@ -2716,6 +2854,7 @@ function healCard(m, pair) {
       <span class="dim small">${t.hours ? `about ${t.hours[0]}–${t.hours[1]} hours (an estimate until this card has been measured) · ` : ""}${t.cache_gb != null && plan.mode === "cache" ? `${t.cache_gb} GB of disk for the original's saved answers` : ""}</span></div>
     ${hlRoundsBox(h, sp, kn, est, busy, recipeOn, tk)}${sp.rounds ? hlRoundsTable(h, run) : ""}
     ${hlVllmBox(sp, est, busy)}
+    ${hlSpeedBox(busy)}
     ${mem}${loss}${note}
     ${expert ? `<details><summary>Expert settings</summary><div class="grid">
       <label>General share<input type="text" id="hl-share" value="${sp.share}"></label>
@@ -2768,7 +2907,7 @@ function hsPassed() { const h = rs.hs; return !!(h.check && h.check.ok && h.chec
 
 async function hsLoadCand() {
   try { rs.hs.cand = await invoke("heal_candidates"); } catch (_) { rs.hs.cand = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // the choice changed: the Check no longer belongs to it, and the card that was bound to the old pair goes
 function hsChanged() {
@@ -2911,7 +3050,7 @@ function madeCard(m) {
     <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
-      <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
+      <button class="secondary" data-stdel="model_entry|${esc(m.name)}" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete…</button></div>
     ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}${traceCard(m)}</div>`;
 }
 
@@ -2982,15 +3121,15 @@ function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // keeps the plan in step with the choices; asks the program only when the request changed
 function acRefresh() {
-  if (page !== "reshape" || !rs.state) return;
+  if (!onAutoPage() || !rs.state) return;
   if (!ac.loaded) { ac.loaded = true; acLoad(); }
   const ins = acIns(); acDefaults();
   if (!ins || ac.target == null) return;
@@ -2998,8 +3137,8 @@ function acRefresh() {
   if (sig === ac.planFor) return;
   ac.planFor = sig; ac.plan = null; ac.planErr = null;
   const token = ++ac.planTok;
-  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (page === "reshape") render(); } })
-    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (page === "reshape") render(); } });
+  invoke("auto_plan", { spec: acSpec(), inspect: ins }).then((r) => { if (token === ac.planTok) { ac.plan = r.plan; acRememberSpeed(r.plan); if (onReshape()) render(); } })
+    .catch((e) => { if (token === ac.planTok) { ac.planErr = String(e); if (onReshape()) render(); } });
 }
 
 // a change of the total in hours: "−6 h to −11 h" (minutes in)
@@ -3055,7 +3194,8 @@ function acSpeedBlock(pl, live) {
     ${ac.pin ? "" : `<p class="small" id="ac-searchrow">Find the best cut for <select id="ac-search" ${lock}>${[["", "no search (the classic Try first on a few cuts)"], [10, "10 minutes"], [20, "20 minutes"], [30, "30 minutes"], [60, "60 minutes"]].map(([v, l]) => `<option value="${v}" ${String(ac.sp.search == null ? "" : ac.sp.search) === String(v) ? "selected" : ""}>${l}</option>`).join("")}</select>
       <span class="dim small">It measures many cuts of the size you asked for in one go, ranks them on your own text and passes the best few on to the thinking check before healing. A low error is not proof of thinking.</span></p>`}
     <label class="opt"><input type="checkbox" id="ac-maxon" ${ac.maxOn ? "checked" : ""} ${lock}> I have at most <input type="text" id="ac-maxh" value="${esc(ac.maxH)}" placeholder="48" style="width:60px;flex:0" ${lock}> hours <span class="dim small">the least harmful settings are given up until it fits, or you are told it cannot</span></label>
-    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}</div>`;
+    ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}
+    <label class="opt">Tokens per forward pass of the student <input type="text" id="ac-sbt" value="${esc(ac.sp.sbt || "")}" placeholder="0" style="width:70px;flex:0" ${lock}> <span class="dim small">off by default (0 = one row at a time). Rows of similar length share a forward pass, up to this many tokens: the same learning, usually much faster. Measure heal speed on the Heal card recommends a value (512 to 65,536).</span></label></div>`;
 }
 
 // the change one choice of a knob makes, as a small note after its label (nothing while there is no plan or for the choice that is on)
@@ -3103,6 +3243,58 @@ function acRoundChips(st) {
   return `<div class="ac-rchips small" id="ac-rchips">${chips}</div>`;
 }
 
+// "Change settings and continue" for a stopped or failed run: the same knobs as the start screen, locked ones greyed with the reason, the diff, the time left, a confirmation for what would be redone
+const acc = { open: false, patch: {}, pv: null, busy: false, err: null, confirmed: false, id: null };
+const ACC_ROWS = [
+  ["last_tokens_m", "Heal tokens of the last stage (million)", "num", [null, 10, 20, 40, 80]], ["stage_a_tokens_m", "Heal tokens of the first stage (million)", "num", [null, 10, 20, 40, 80]],
+  ["think_quick", "Quick thinking checks (16 questions)", "bool"], ["check_cut", "Check the unhealed cut", "bool"], ["retry_heal", "Heal again when a check fails", "bool"], ["back_off", "Cut one step less after a second failed check", "bool"],
+  ["heal_rounds", "Heal in rounds of 5 M with a quick check after each (experimental)", "rounds"], ["share_teacher_cache", "Same sequence length in both stages", "bool"], ["imatrix", "Importance matrix for the export", "bool"],
+  ["vllm.teacher_cache", "vLLM for the original's answers (experimental)", "vl"], ["vllm.checks", "vLLM for the thinking checks (experimental)", "vl"], ["vllm.kv_fp8", "8-bit KV cache for the checks (experimental)", "vl"],
+];
+const accCur = (k) => { const c = (acc.pv && acc.pv.current) || {}, [a, b] = k.split("."); return b ? ((c[a] || {})[b] ?? false) : c[a]; };
+const accVal = (k) => { const [a, b] = k.split("."); if (b) { const cur = acc.patch[a] !== undefined ? acc.patch[a] : ((acc.pv && acc.pv.current) || {})[a]; return !!(cur || {})[b]; } return acc.patch[a] !== undefined ? acc.patch[a] : accCur(k); };
+async function accPreview() {
+  acc.busy = true; render();
+  try { acc.pv = await invoke("auto_change_preview", { id: acc.id, patch: acc.patch }); acc.err = null; } catch (e) { acc.err = String(e); }
+  acc.busy = false; render();
+}
+function accSet(k, v) {
+  const [a, b] = k.split(".");
+  if (b) { const cur = { ...(acc.patch[a] !== undefined ? acc.patch[a] : (((acc.pv || {}).current || {})[a] || {})) }; cur[b] = v; if (cur.kv_fp8 === false) delete cur.kv_fp8; acc.patch[a] = cur.teacher_cache || cur.checks || cur.kv_fp8 || cur.automatic ? { teacher_cache: !!cur.teacher_cache, checks: !!cur.checks, automatic: !!cur.automatic, ...(cur.kv_fp8 ? { kv_fp8: true } : {}) } : null; }
+  else acc.patch[a] = v;
+  acc.confirmed = false; accPreview();
+}
+function accPanel() {
+  const pv = acc.pv; if (!acc.open) return "";
+  const lock = (k) => ((pv && pv.locks) || []).find((l) => l.key === k.split(".")[0]) || { state: "free", reason: "" };
+  const rows = ACC_ROWS.map(([k, label, kind, opts]) => {
+    const l = lock(k), off = l.state === "locked" || acc.busy, v = accVal(k);
+    const input = kind === "num" ? `<select data-acc="${k}" ${off ? "disabled" : ""}>${opts.map((o) => `<option value="${o ?? ""}" ${(v ?? null) === o ? "selected" : ""}>${o == null ? "the recipe's" : o}</option>`).join("")}</select>`
+      : kind === "rounds" ? `<input type="checkbox" data-acc="${k}" ${v ? "checked" : ""} ${off ? "disabled" : ""}>` : `<input type="checkbox" data-acc="${k}" ${v ? "checked" : ""} ${off ? "disabled" : ""}>`;
+    return `<li class="${l.state === "locked" ? "dim" : ""}" data-acc-row="${esc(k)}"><label>${input} ${esc(label)}</label> ${l.state === "locked" ? `<span class="small">🔒 ${esc(l.reason)}</span>` : l.state === "confirm" ? `<span class="small warn">needs your confirmation: ${esc(l.redo || l.reason)}</span>` : ""}</li>`;
+  }).join("");
+  const sug = pv && pv.suggestions && pv.suggestions.length ? `<p class="small"><strong>Suggestions for the step that stopped${pv.failed_step ? ` (${esc(pv.failed_step)})` : ""}:</strong></p><ul class="small" id="acc-suggest">${pv.suggestions.map((x, i) => `<li>${esc(x.text)} <button class="secondary" data-acc-sug="${i}">Use</button></li>`).join("")}</ul>` : "";
+  const diff = pv && pv.diff && pv.diff.length ? `<ul id="acc-diff">${pv.diff.map((d) => `<li>${esc(d.text)}</li>`).join("")}</ul>` : `<p class="dim small" id="acc-diff">Nothing changed yet.</p>`;
+  const rem = pv && pv.remaining_h && pv.was_remaining_h ? `<p id="acc-remaining">Time left: about ${pv.remaining_h[0]}-${pv.remaining_h[1]} h (was ${pv.was_remaining_h[0]}-${pv.was_remaining_h[1]} h).</p>` : "";
+  const refused = pv && pv.refused && pv.refused.length ? pv.refused.map((r) => `<div class="err">${esc(r.key)}: ${esc(r.reason)}</div>`).join("") : "";
+  const conf = pv && pv.confirm && pv.confirm.length ? `<div class="warn" id="acc-confirm"><label class="opt"><input type="checkbox" id="acc-confirmed" ${acc.confirmed ? "checked" : ""}> I understand that this redoes: ${pv.confirm.map((c) => esc(c.redo || c.reason)).join("; ")}.</label></div>` : "";
+  const can = pv && pv.ok && !acc.busy && Object.keys(acc.patch).length && (!(pv.confirm || []).length || acc.confirmed);
+  return `<div class="card-in" id="acc-panel"><h3>Change settings and continue</h3>
+    <p class="dim small">Only settings that have not taken effect yet can change. The steps that are done are not run again, and the changes are kept in the run's report.</p>
+    ${sug}<ul class="plain">${rows}</ul>${diff}${rem}${refused}${conf}${acc.err ? `<div class="err">${esc(acc.err)}</div>` : ""}
+    <div class="row"><button class="primary" id="acc-go" ${can ? "" : "disabled"}>Continue with these settings</button><button class="secondary" id="acc-close">Cancel</button></div></div>`;
+}
+function wireAcc() {
+  const op = $("ac-change"); if (op) op.onclick = () => { acc.open = !acc.open; acc.id = ac.run && ac.run.id; acc.patch = {}; acc.pv = null; acc.confirmed = false; if (acc.open) accPreview(); else render(); };
+  document.querySelectorAll("[data-acc]").forEach((e) => e.onchange = () => { const k = e.dataset.acc; if (e.tagName === "SELECT") accSet(k, e.value === "" ? null : +e.value); else if (k === "heal_rounds") accSet(k, e.checked ? { round_m: 5, check: "quick" } : null); else accSet(k, e.checked); });
+  document.querySelectorAll("[data-acc-sug]").forEach((b) => b.onclick = () => { const x = acc.pv.suggestions[+b.dataset.accSug]; Object.assign(acc.patch, x.patch); acc.confirmed = false; accPreview(); });
+  const cf = $("acc-confirmed"); if (cf) cf.onchange = () => { acc.confirmed = cf.checked; render(); };
+  const cl = $("acc-close"); if (cl) cl.onclick = () => { acc.open = false; render(); };
+  const go = $("acc-go"); if (go) go.onclick = async () => {
+    ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing with the changed settings…"; acc.open = false; render();
+    try { await invoke("auto_start", { spec: null, resume: acc.id, changes: acc.patch, confirmed: acc.confirmed }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
+  };
+}
 function autoCard() {
   const ins = acIns();
   if (!rs.state) return "";
@@ -3130,7 +3322,7 @@ function autoCard() {
   const rep = ac.report ? `<details open id="ac-report"><summary>Report</summary><pre class="log">${esc(ac.report)}</pre></details>` : "";
   return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
     <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
-    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “1 · Start from”.</p>` : `
+    ${!ins ? `<p class="dim">Choose a model that can be slimmed in “Start from” above.</p>` : `
     <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
     <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
     ${ac.pin ? `<div class="ac-pin" id="ac-pin"><strong>Chosen cut:</strong> ${ac.pin.blocks.length ? `blocks ${esc(ranges(ac.pin.blocks))} out` : "no blocks out"}${ac.pin.intermediate ? `, MLP ${thou(ac.pin.intermediate)}` : ""}${ac.pin.loss != null ? `, text-prediction error ${(+ac.pin.loss).toFixed(3)}` : ""} <span class="dim small">found by the search on the Try first card${ac.pin.think ? " (its thinking was checked)" : ""}; Auto-cut does not search or try again${ac.pin.think ? " and skips the thinking check before healing" : ""}.</span> <button class="secondary" id="ac-pin-remove" ${lock}>Remove</button></div>` : ""}
@@ -3149,9 +3341,10 @@ function autoCard() {
     ${pfBox("auto", { studio_publish: !!acSpec().studio_publish, need_gb: pl && pl.disk ? pl.disk.peak_gb : null })}
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
-      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button>` : ""}
-      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
+      ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button><button class="secondary" id="ac-change">Change settings and continue</button>` : ""}
+      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}${ac.run ? `<button class="link" id="ac-free" title="Opens the Storage page: the models, the teacher's answers and the files this run made.">Free the disk space of this run…</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
+    ${accPanel()}
     ${acProgressBlock(run, live)}
     ${live && !acProg(run) && acEtaText(run, ac.eta) ? `<p class="dim small" id="ac-eta" aria-live="polite">${esc(acEtaText(run, ac.eta))} (${run.plan && run.plan.time ? "an estimate, step by step" : "an estimate; the checks and the export are counted at a fixed time"})</p>` : ""}
     ${live ? `<div class="stepline" aria-live="polite" id="ac-text">${esc(ac.text)}</div>${ac.progress != null ? `<progress max="1" value="${ac.progress}"></progress>` : ""}` : ""}
@@ -3283,13 +3476,13 @@ function acStepFig(x) {
 }
 
 function onAutoEvent(p) {
-  if (p.kind === "auto_progress") { ac.prog = p; if (page === "reshape" || page === "welcome") render(); return; }
+  if (p.kind === "auto_progress") { ac.prog = p; if (onReshape() || page === "welcome") render(); return; }
   if (p.eta_s != null && p.auto_step) ac.eta = { s: +p.eta_s, step: p.auto_step, at: Date.now() };
   if (p.kind === "auto") { ac.text = p.note || ""; acLoad(); return; }
   if (p.kind === "progress") { ac.text = p.text || p.step || ""; ac.progress = p.value == null ? null : p.value; }
   else if (p.kind === "error") { ac.running = false; ac.err = p.text; ac.progress = null; acLoad(); return; }
   else if (p.kind === "done") { ac.running = false; ac.progress = null; ac.text = ""; if (p.data) ac.run = p.data; acLoad(); return; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function wireAuto() {
@@ -3313,6 +3506,7 @@ function wireAuto() {
   set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
+  set("ac-sbt", (e) => { const n = Math.round(+e.value || 0); ac.sp.sbt = n >= 512 && n <= 65536 ? n : null; });
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
   document.querySelectorAll("input[name=ac-quick]").forEach((r) => r.onchange = () => { ac.quick = r.value === "quick"; render(); });
@@ -3324,12 +3518,14 @@ function wireAuto() {
     ac.err = null; ac.report = null; ac.running = true; ac.text = "Starting…"; ac.progress = null; render();
     try { await invoke("auto_start", { spec: acSpec(), resume: null }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
   };
+  wireAcc();
   const co = $("ac-continue");
   if (co) co.onclick = async () => {
     ac.err = null; ac.report = null; ac.running = true; ac.text = "Continuing…"; render();
     try { await invoke("auto_start", { spec: null, resume: ac.run.id }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
   };
   const st = $("ac-stop"); if (st) st.onclick = () => { ac.text = "Stopping…"; invoke("auto_stop"); render(); };
+  const fr = $("ac-free"); if (fr) fr.onclick = () => go("storage");
   const rp = $("ac-report-btn");
   if (rp) rp.onclick = async () => { try { const r = await invoke("auto_report", { run: ac.run ? ac.run.id : null }); ac.report = r.markdown; } catch (e) { ac.err = String(e); } render(); };
   acRefresh();
@@ -3396,7 +3592,7 @@ function thinkCard(m) {
 async function tkLoad(name) {
   rs.tk.name = name;
   try { rs.tk.data = await invoke("think_check_results", { name }); } catch (e) { rs.tk.data = null; rs.tk.err = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function tkStart(m, target) {
@@ -3417,7 +3613,7 @@ function onThinkEvent(p) {
     tk.ok = p.data && p.data.stopped ? "Stopped. Nothing was saved from this check." : p.data && p.data.cached ? "Done (the saved numbers of this model were used)." : "Done. The numbers are in the table.";
     if (name) { tkLoad(name); return; }
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 // "Make thinking answers with the original model" (worker job trace_gen, docs/VLLM.md): the original writes thinking answers for prompts; they are filtered and kept in a jsonl file that a
@@ -3442,7 +3638,7 @@ function traceCard(m) {
 async function tgLoad(name) {
   tg.name = name;
   try { tg.state = await invoke("trace_gen_state", { name }); } catch (_) { tg.state = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function onTraceEvent(p) {
   if (p.kind === "progress") { if (tg.run) { tg.run.text = p.text || p.step; tg.run.progress = p.value; } }
@@ -3453,7 +3649,7 @@ function onTraceEvent(p) {
     tg.ok = `${d.stopped ? "Stopped. " : "Done. "}${d.kept || 0} of ${d.attempted || 0} answers kept${d.backend ? " (way: " + d.backend + ")" : ""}${(d.notes || []).length ? ". " + d.notes.join(" ") : ""}${d.note ? " " + d.note : ""}`;
     if (name) { tgLoad(name); return; }
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 function wireTrace() {
   const m = rs.state && rs.state.made.find((x) => x.name === rs.tk.name);
@@ -3544,14 +3740,14 @@ function tryRefresh() {
     tr.planFor = sig; tr.plan = null; tr.planErr = null;
     if (spec && !tryNeedsMeasure(spec)) {
       const token = ++tr.planTok;
-      invoke("reshape_try_plan", { spec }).then((p) => { if (token === tr.planTok) { tr.plan = p; if (page === "reshape") render(); } })
-        .catch((e) => { if (token === tr.planTok) { tr.planErr = String(e); if (page === "reshape") render(); } });
+      invoke("reshape_try_plan", { spec }).then((p) => { if (token === tr.planTok) { tr.plan = p; if (onReshape()) render(); } })
+        .catch((e) => { if (token === tr.planTok) { tr.planErr = String(e); if (onReshape()) render(); } });
     }
   }
   const rsig = rs.model + "|" + trySamples() + "|" + rs.load;
   if (rsig !== tr.resFor && rs.state.dataset_version) {
     tr.resFor = rsig;
-    invoke("reshape_try_results", { model: rs.model, samples: trySamples(), len: 512, load: rs.load }).then((r) => { if (rsig === tr.resFor && !tr.running) { tr.analysis = r && r.exists ? r.analysis : null; tr.sps = r && r.exists ? r.seconds_per_pass : null; if (page === "reshape") render(); } })
+    invoke("reshape_try_results", { model: rs.model, samples: trySamples(), len: 512, load: rs.load }).then((r) => { if (rsig === tr.resFor && !tr.running) { tr.analysis = r && r.exists ? r.analysis : null; tr.sps = r && r.exists ? r.seconds_per_pass : null; if (onReshape()) render(); } })
       .catch(() => {});
   }
 }
@@ -3788,8 +3984,8 @@ function seRefresh() {
   se.planFor = sig; se.plan = null; se.planErr = null;
   if (!spec) return;
   const token = ++se.planTok;
-  invoke("reshape_search_plan", { spec, inspect: rs.options.inspect }).then((p) => { if (token === se.planTok) { se.plan = p; if (page === "reshape") render(); } })
-    .catch((e) => { if (token === se.planTok) { se.planErr = String(e); if (page === "reshape") render(); } });
+  invoke("reshape_search_plan", { spec, inspect: rs.options.inspect }).then((p) => { if (token === se.planTok) { se.plan = p; if (onReshape()) render(); } })
+    .catch((e) => { if (token === se.planTok) { se.planErr = String(e); if (onReshape()) render(); } });
 }
 function onSearchEvent(p) {
   const se = rs.tr.se;
@@ -3807,10 +4003,10 @@ function onSearchEvent(p) {
     if (p.data && p.data.status === "stopped") {
       rs.ok = "Stopped. What was measured is kept; Find the best cut goes on from there.";
       const spec = seSpec();
-      if (spec) invoke("reshape_search_status", { spec, inspect: rs.options.inspect }).then((r) => { se.partial = r && r.partial && r.partial.rows && r.partial.rows.length ? r.partial : null; se.result = null; if (page === "reshape") render(); }).catch(() => {});
+      if (spec) invoke("reshape_search_status", { spec, inspect: rs.options.inspect }).then((r) => { se.partial = r && r.partial && r.partial.rows && r.partial.rows.length ? r.partial : null; se.result = null; if (onReshape()) render(); }).catch(() => {});
     } else rs.ok = "The search is done. The answers are kept: another search over the same text costs nothing for the cuts it has.";
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 // what a recommended cut says to the rest of the program
 function seChosen() {
@@ -3821,8 +4017,10 @@ function sePin(stages) {
   const c = seChosen(); if (!c) return;
   ac.pin = { blocks: c.blocks, intermediate: c.intermediate, loss: c.loss, search_id: c.search_id, think: c.think };
   if (stages) ac.stages = stages;
+  go("auto");          // Auto-cut lives on its own page: the pinned cut is shown there
   rs.ok = `This cut is pinned for Auto-cut: ${c.blocks.length ? "blocks " + ranges(c.blocks) : "no blocks"}${c.intermediate ? `, MLP ${thou(c.intermediate)}` : ""}. Auto-cut will not search again.`;
-  const el = document.getElementById("ac-card"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
+  render();
+  const el = document.getElementById("ac-pin") || document.getElementById("ac-card"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
 }
 function seCutNow() {
   const c = seChosen(), ins = rs.options.inspect; if (!c) return;
@@ -3851,9 +4049,9 @@ function wireSearch() {
   on("se-go", () => start(null));
   on("se-think-go", () => start(se.id || (se.result && se.result.id) || null));
   on("se-stop", () => { se.text = "Stopping…"; invoke("reshape_stop"); render(); });
-  on("se-use-ac", () => { sePin(null); render(); });
+  on("se-use-ac", () => sePin(null));
   on("se-cut-now", () => { seCutNow(); render(); });
-  on("se-cut-heal", () => { sePin(1); render(); });
+  on("se-cut-heal", () => sePin(1));
   seRefresh();
 }
 
@@ -3889,7 +4087,7 @@ function onTryEvent(p) {
     if (p.data && p.data.analysis) tr.analysis = p.data.analysis;
     rs.ok = p.data && p.data.stopped ? `Stopped. ${p.data.passes_done} of ${p.data.passes_total} cuts are kept; Try goes on from there.` : "Tried. The answers are kept; trying the same again costs nothing.";
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function wireTry() {
@@ -3977,7 +4175,26 @@ function renderReshape() {
   const list = st.made.length ? `<div class="card wide"><h2>Models made so far</h2><table class="tbl"><tr><th>Name</th><th>Status</th><th>Layers</th><th>Size</th><th>Tested</th><th></th></tr>${st.made.map((m) =>
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
-  return head + msg + intro + autoCard() + pick + size + tryCard() + make + healSection() + result + list;
+  const toAuto = `<div class="card wide"><p style="margin:0">Want it all in one click? <button class="link" id="rs-open-auto">Open Auto</button> <span class="dim small">(measures, cuts, heals, checks and exports, one step after the other)</span></p></div>`;
+  return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list;
+}
+
+// The Auto page: the Auto-cut card (and what it needs: the model it starts from, the pinned cut, the run's panels) on a page of its own. It reads the Slim page's state (`rs`).
+function renderAuto() {
+  const head = `<h1>🚀 ${TITLES.auto[0]}</h1><p class="lead">${TITLES.auto[1]}</p>`;
+  if (!state.bundle) return head + `<p class="lead">Import your world data first (Step 1).</p>`;
+  const st = rs.state;
+  if (!st) return head + `<p class="lead">Loading…</p>`;
+  const msg = (rs.error ? errDiv(rs.error) : "") + (rs.ok ? `<div class="ok">${esc(rs.ok)}</div>` : "");
+  const modelOpts = st.models.map((m) => `<option value="${esc(m.id)}" ${m.id === rs.model ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.reshape ? " · " + esc(m.reshape) : ""}</option>`).join("");
+  const ins = rs.options && rs.options.inspect;
+  let info = "";
+  if (rs.loadingOpts) info = `<p class="dim">Looking at the model… (the first time this can take a moment; nothing is downloaded)</p>`;
+  else if (rs.optErr) info = `<div class="err">${esc(rs.optErr)}</div>`;
+  else if (ins && !ins.supported) info = `<div class="err">${esc(ins.why || "This model cannot be slimmed or grown.")}</div>`;
+  const busy = rs.running || rs.testing || (ac && ac.running);
+  const pick = `<div class="card wide"><h2>Start from</h2><div class="row"><select id="ac-model" ${busy ? "disabled" : ""}>${modelOpts}</select></div>${info}</div>`;
+  return head + msg + pick + autoCard();
 }
 
 async function rsRefresh(stale) {
@@ -3985,7 +4202,7 @@ async function rsRefresh(stale) {
     rs.state = await invoke("reshape_state");
     if (!rs.model && rs.state.models.length) rs.model = (rs.state.models.find((m) => m.id === "qwen3.5-9b") || rs.state.models[0]).id;
   } catch (e) { rs.error = String(e); }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
   if (stale && rs.hl) rs.hl.stale = true;
   hsLoadCand();
@@ -4000,7 +4217,7 @@ async function rsOptions() {
     const args = { model: rs.model, mode: rs.mode };
     if (shape !== "depth") {
       args.shape = shape;
-      if (rs.lv) args.lin_v_heads = rsAxis("lin_v_heads");
+      if (rs.lv) args.linVHeads = rsAxis("lin_v_heads");
       if (rs.hh) args.heads = rs.hh;
     }
     const o = await invoke("reshape_options", args);
@@ -4011,7 +4228,7 @@ async function rsOptions() {
     rsPickWidth();
   } catch (e) { if (token !== rs.token) return; rs.optErr = String(e); }
   rs.loadingOpts = false;
-  if (page === "reshape") render();
+  if (onReshape()) render();
   rsMeasInfo();
 }
 
@@ -4025,7 +4242,7 @@ async function rsMeasInfo() {
     const meas = await invoke("reshape_measurement", { model: rs.model, samples: rs.wsamples, len: 512, load: rs.load });
     rs.meas = meas || null;
   } catch (_) { rs.meas = null; }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 // the person's Heal card needs the options of the model that is shown
@@ -4043,7 +4260,7 @@ async function rsLoadHeal(name) {
   rs.hl = { name, opts: null };
   try { rs.hl = { name, opts: await invoke("heal_options", { name }) }; } catch (e) { rs.hl = { name, opts: null, error: String(e) }; }
   try { const last = await invoke("heal_bench_last", { name }); rs.hb = { ...(rs.hb || {}), last: last || null }; } catch (e) { /* no earlier speed test */ }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   if (rs.hl && rs.hl.opts) rsHealEstimate();
 }
 
@@ -4060,7 +4277,7 @@ function onHealEvent(p) {
     else if (p.data) rs.ok = `Healed: ${p.data.name} now has a healed version, and it is in the model list of Step 3.`;
     setState_(); rsRefresh(true); return;
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
 }
 
 function onReshapeEvent(p) {
@@ -4068,6 +4285,8 @@ function onReshapeEvent(p) {
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
   if (p.phase === "vllm_teacher_check") return onVcheckEvent(p);
+  if (p.phase === "vllm_probe") return onVprobeEvent(p);
+  if (p.phase === "healspeed") return onHealSpeedEvent(p);
   if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
   if (p.phase === "healbench") return onHealBenchEvent(p);
@@ -4089,7 +4308,7 @@ function onReshapeEvent(p) {
     else if (p.data) { rs.ok = `Done: ${p.data.name} is ready and is in the model list of Step 3.`; rs.view = p.data.name; }
     setState_(); rsRefresh(); return;
   }
-  if (page === "reshape") render();
+  if (onReshape()) render();
   const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight;
 }
 
@@ -4118,6 +4337,7 @@ function rsHealSpec() {
     general: sp.general ? gcSource("heal") : null, alpha: +sp.alpha, lr: +sp.lr, mode: sp.mode || null,
     rank: sp.rank, seq: sp.seq, batch: sp.batch, per_update: sp.per_update, checkpointing: sp.checkpointing || "auto", method: sp.method || null, optimizer: sp.optimizer || null,
     kl_chunk: sp.kl_chunk, k: sp.k, teacher_load: sp.teacher_load || null, warmup: sp.warmup, kbit_upcast: sp.kbit_upcast === true ? true : null, head_checkpoint: sp.head_checkpoint === "off" ? "off" : null,
+    ...(sp.student_batch_tokens ? { student_batch_tokens: +sp.student_batch_tokens } : {}),
     ...(sp.rounds ? { rounds: hlRoundsSpec(sp.tokens_m || (rc ? rc.tokens_m : o && o.default_tokens_m) || 20, null), mode: null } : {}),
     ...(hlVllmAvailable() && sp.vllm ? { vllm: { teacher_cache: true } } : {}) };
 }
@@ -4143,6 +4363,12 @@ function wireHealSection() {
     try { rs.state = await invoke("reshape_remove", { name }); h.studentPick = ""; rs.hl = null; rs.ok = "Deleted."; } catch (e) { rs.error = String(e); }
     hsLoadCand(); render();
   });
+}
+
+function wireAutoPage() {
+  if (!onAutoPage() || !rs.state) return;
+  const m = $("ac-model"); if (m) m.onchange = () => { rs.model = m.value; rs.tr.sel = []; rs.tr.analysis = null; rs.tr.planFor = null; rs.tr.resFor = null; rs.dropText = ""; rs.blocks = null; rs.options = null; rs.ok = null; rs.error = null; rsOptions(); };
+  wireAuto();
 }
 
 function wireReshape() {
@@ -4196,7 +4422,12 @@ function wireReshape() {
   hv("hl-vllm", (e) => { hs.vllm = e.checked; });
   wireVllmFiles();
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const hst = $("hl-speed-teacher"); if (hst) hst.onchange = () => { hsp.teacher = hst.checked; };
+  const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), withTeacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
+  const hsu = $("hl-speed-use"); if (hsu) hsu.onclick = () => { const r = hsp.files && hsp.files.recommended; if (r && r.value) { rs.hlSpec.student_batch_tokens = +r.value; render(); rsHealEstimate(); } };
+  const hss = $("hl-speed-stop"); if (hss) hss.onclick = () => { if (hsp.run) hsp.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const vpr = $("hl-vllm-probe"); if (vpr) vpr.onclick = () => { vch.probing = true; vch.probe = null; vch.probeText = "Starting…"; render(); invoke("vllm_container_probe_start").catch((e) => { vch.probing = false; vch.probe = { ok: false, text: String(e) }; render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
   hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again
@@ -4212,6 +4443,7 @@ function wireReshape() {
   hv("hl-optim", (e) => { hs.optimizer = e.value; }); hv("hl-tload", (e) => { hs.teacher_load = e.value === "auto" ? null : e.value; });
   hv("hl-upcast", (e) => { hs.kbit_upcast = e.checked ? true : null; });
   hv("hl-headkeep", (e) => { hs.head_checkpoint = e.checked ? "off" : null; });
+  hv("hl-sbt", (e) => { const n = Math.round(+e.value || 0); hs.student_batch_tokens = n >= 512 && n <= 65536 ? n : null; });
   const hbGo = $("hb-go");
   if (hbGo) hbGo.onclick = async () => {
     rs.hb = { ...(rs.hb || {}), running: true, rows: [], text: "Starting…", err: null, result: null };
@@ -4253,13 +4485,9 @@ function wireReshape() {
   wireThink();
   wireTrace();
   wireAuto();
+  on("rs-open-auto", () => go("auto"));
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
-  document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
-    if (!confirm("Delete this model and its files? A training run that used it must be deleted first.")) return;
-    try { rs.state = await invoke("reshape_remove", { name: b.dataset.rsdelete }); rs.error = null; rs.ok = "Deleted."; if (rs.view === b.dataset.rsdelete) rs.view = null; } catch (e) { rs.error = String(e); }
-    render();
-  });
 }
 
 // ------------------------------------------------------------------------------------------------------------ guide
@@ -4290,11 +4518,146 @@ function renderSoon(key) {
   return `<h1>${t}</h1><p class="lead">${lead}</p><span class="soon">Coming in a later version. The help panel shows what this step will do.</span>`;
 }
 
+
+// ------------------------------------------------------------------------------------------------------------ Storage (docs/STORAGE.md)
+// Where the disk went and a guarded way to give it back. The window only ever holds OPAQUE ids from the latest scan and sends those; the program checks every one again against a fresh scan.
+const sg = { items: [], scanning: false, scanned: false, sel: {}, sized: {}, free: null, busy: false, sug: null, err: null, conf: null, run: null, result: null, want: null, total: null };
+const stGroups = [["models", "Models in this project"], ["exports", "Exports"], ["heal", "Heal data and caches"], ["downloads", "Downloaded models"], ["leftovers", "Old logs and leftovers of failed jobs"]];
+function stBytes(n) {
+  if (n == null) return "";
+  const u = [["GB", 1e9], ["MB", 1e6], ["KB", 1e3]];
+  for (const [l, d] of u) if (n >= d) return (n / d).toFixed(n >= 1e10 ? 0 : 1) + " " + l;
+  return n + " B";
+}
+function stSize(it) { return it.size != null ? stBytes(it.size) + (it.size_cached && !sg.sized[it.id] ? " (earlier measurement)" : "") : sg.sized[it.id] ? "size not available" : "size not measured yet"; }
+// the ticked items without the ones that lie inside another ticked item (an export and its 16-bit file): what goes, and how much
+function stChosen() {
+  const picked = sg.items.filter((i) => sg.sel[i.id] && i.status !== "in_use");
+  const inside = (a, b) => a !== b && a.path_short.startsWith(b.path_short) && /[\\/]/.test(a.path_short.charAt(b.path_short.length));
+  return picked.filter((a) => !picked.some((b) => inside(a, b)));
+}
+function stTotals() {
+  const ch = stChosen();
+  const bytes = ch.reduce((a, i) => a + (i.size || 0), 0);
+  return { n: ch.length, bytes, unmeasured: ch.filter((i) => i.size == null).length, model: ch.some((i) => i.model), free: sg.free };
+}
+function stRefresh() {
+  sg.scanning = true; sg.err = null; sg.items = []; sg.sized = {}; sg.sel = {}; sg.conf = null;
+  Promise.resolve(invoke("storage_scan")).catch((e) => { sg.scanning = false; sg.err = String(e); if (page === "storage") render(); });
+  if (page === "storage") render();
+}
+function onStorageEvent(p) {
+  if (!p) return;
+  if (p.kind === "item") { sg.items.push(p.item); }
+  else if (p.kind === "size") { const it = sg.items.find((i) => i.id === p.id); if (it) { it.size = p.size; sg.sized[p.id] = true; } }
+  else if (p.kind === "progress") { sg.run = { text: p.text, value: p.value }; }
+  else if (p.kind === "done" && p.phase === "scan") {
+    const d = p.data || {};
+    sg.items = d.items || sg.items; sg.sug = d.suggestions || null; sg.free = d.free_gb; sg.busy = !!d.busy; sg.scanning = false; sg.scanned = true; sg.total = d.total_bytes;
+    sg.items.forEach((i) => { sg.sized[i.id] = true; });
+    if (sg.want) { const w = sg.want; sg.want = null; const it = sg.items.find((i) => i.kind === w.kind && i.label.startsWith(w.name) && i.status !== "in_use"); if (it) { sg.sel[it.id] = true; if (page === "storage") { stAsk(); return; } } else sg.err = `${w.name} was not found (it may be deleted already) or it is in use right now.`; }
+  }
+  else if (p.kind === "done") { sg.run = null; sg.result = p.data || null; sg.conf = null; sg.sel = {}; if (page === "storage") stRefresh(); return; }
+  else if (p.kind === "error") { sg.run = null; sg.err = p.text; sg.conf = null; }
+  if (page === "storage") render();
+}
+function stPinned() {
+  const m = rs.state && rs.state.models && rs.state.models.find((x) => x.id === rs.model);
+  return m && m.repo ? [m.repo] : [];
+}
+// asks the program what exactly would go (a dry run) and shows it in the confirmation
+async function stAsk(allowPinned) {
+  const ids = stChosen().map((i) => i.id);
+  if (!ids.length) return;
+  sg.err = null;
+  try {
+    const dry = await invoke("storage_delete", { ids, dryRun: true, confirm: null, pinned: stPinned(), allowPinned: !!allowPinned, token: null });
+    sg.conf = { ids, dry, typed: "", allowPinned: !!allowPinned };
+  } catch (e) {
+    const t = String(e);
+    if (/chosen on the Slim or Auto page/.test(t) && !allowPinned && confirm(t + "\n\nDelete it anyway?")) return stAsk(true);
+    sg.err = t; sg.conf = null;
+  }
+  render();
+}
+async function stGo() {
+  const c = sg.conf; if (!c) return;
+  const need = c.dry.needs_delete_word;
+  if (need && c.typed !== "DELETE") return;
+  sg.run = { text: "Starting…", value: 0 };
+  try { await invoke("storage_delete", { ids: c.ids, dryRun: false, confirm: c.typed, pinned: stPinned(), allowPinned: c.allowPinned, token: c.dry.token || null }); sg.conf = null; }
+  catch (e) { sg.run = null; sg.err = String(e); }
+  render();
+}
+function stRow(it) {
+  const chip = { in_use: ["in use", "err"], referenced: ["referenced", "warn"], safe: ["safe", "ok"] }[it.status] || ["", ""];
+  const off = it.status === "in_use" || sg.run || sg.busy;
+  return `<tr class="st-row st-${esc(it.status)}"><td><input type="checkbox" data-stsel="${esc(it.id)}" ${sg.sel[it.id] ? "checked" : ""} ${off ? "disabled" : ""} aria-label="Delete ${esc(it.label)}"></td>
+    <td><strong>${esc(it.label)}</strong> <span class="tag st-chip st-chip-${esc(it.status)}">${chip[0]}</span>${it.link ? ` <span class="tag" title="It is a link: only the link is removed, never what it points to.">link</span>` : ""}
+      ${it.from ? `<div class="dim small">${esc(it.from)}</div>` : ""}${it.note ? `<div class="dim small">${esc(it.note)}</div>` : ""}${(it.refs || []).map((r) => `<div class="${it.status === "in_use" ? "warn" : "dim"} small">${esc(r)}</div>`).join("")}
+      ${it.suggest ? `<div class="small st-why">Safe to delete: ${esc(it.suggest)}</div>` : ""}<div class="dim small st-path">${esc(it.path_short)}</div></td>
+    <td class="num">${esc(stSize(it))}</td><td class="dim small">${esc(it.modified || "")}</td></tr>`;
+}
+function stConfirm() {
+  const c = sg.conf; if (!c) return "";
+  const d = c.dry;
+  const rows = (d.items || []).map((i) => `<li><strong>${esc(i.label)}</strong> · ${esc(stBytes(i.size) || "size not available")}<div class="dim small">${esc(i.path_short)}</div></li>`).join("");
+  return `<div class="card wide st-confirm" id="st-confirm" role="alertdialog" aria-label="Confirm the deletion"><h2>Delete ${(d.items || []).length} item${(d.items || []).length === 1 ? "" : "s"} (${esc(stBytes(d.total_bytes))})?</h2>
+    <p class="err"><strong>This is permanent.</strong> The files are not moved to the Recycle Bin (a bin would not free the space). They cannot be brought back.</p>
+    <ul>${rows}</ul>${(d.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("")}
+    ${d.needs_delete_word ? `<p>Type <strong>DELETE</strong> to confirm: <input type="text" id="st-typed" value="${esc(c.typed)}" autocomplete="off" spellcheck="false" style="width:10em"></p>` : ""}
+    <div class="row"><button class="primary" id="st-go" ${d.needs_delete_word && c.typed !== "DELETE" ? "disabled" : ""}>Delete permanently</button><button class="secondary" id="st-no">Cancel</button></div></div>`;
+}
+function renderStorage() {
+  const head = `<h1>🧹 ${TITLES.storage[0]}</h1><p class="lead">${TITLES.storage[1]}</p>`;
+  if (!state.project) return head + `<p class="lead">Open a project first.</p>`;
+  const t = stTotals();
+  const msg = sg.err ? errDiv(sg.err) : "";
+  const busy = sg.busy ? `<div class="warn">A job is running. Nothing can be deleted until it has ended.</div>` : "";
+  const res = sg.result ? `<div class="card wide st-result" id="st-result"><h2>${sg.result.cancelled ? "Stopped" : "Done"}: ${esc(stBytes(sg.result.freed_bytes))} freed</h2>
+      ${(sg.result.deleted || []).map((d) => `<div class="small">✓ ${esc(d.label)} (${esc(stBytes(d.freed))})</div>`).join("")}
+      ${(sg.result.failed || []).map((f) => `<div class="err small">✕ ${esc(f.label)}: ${(f.errors || []).map((e) => esc(e.path) + " - " + esc(e.error)).join("; ")}</div>`).join("")}
+      ${sg.result.free_gb != null ? `<div class="dim small">Free on this drive now: ${(+sg.result.free_gb).toFixed(1)} GB</div>` : ""}<button class="link" id="st-close-result">Close</button></div>` : "";
+  const sug = sg.sug && sg.sug.ids && sg.sug.ids.length ? `<div class="card wide st-sug" id="st-sug"><h2>Safe to delete</h2>
+      <p>These are only the steps between your models and files (nothing is ticked until you do it). Together they free about <strong>${esc(stBytes(sg.sug.total_bytes))}</strong>.</p>
+      ${sg.items.filter((i) => sg.sug.ids.includes(i.id)).map((i) => `<div class="small"><label><input type="checkbox" data-stsel="${esc(i.id)}" ${sg.sel[i.id] ? "checked" : ""} ${sg.run || sg.busy ? "disabled" : ""}> <strong>${esc(i.label)}</strong> (${esc(stSize(i))}): ${esc(i.suggest)}</label></div>`).join("")}
+      <div class="row"><button class="secondary" id="st-preset" ${sg.run || sg.busy || !sg.sug.preset.ids.length ? "disabled" : ""} title="Ticks the steps between: the cuts before healing, the teacher's answers, the 16-bit GGUF, the merged models and leftovers. The final healed model and the GGUF files are not ticked.">${esc(sg.sug.preset.label)}</button></div></div>` : "";
+  const groups = stGroups.map(([k, name]) => {
+    const rows = sg.items.filter((i) => i.group === k);
+    if (!rows.length) return "";
+    const tot = rows.reduce((a, i) => a + (i.size || 0), 0);
+    return `<div class="card wide st-group" data-stgroup="${k}"><h2>${esc(name)} <span class="dim small">${rows.length} · ${esc(stBytes(tot))}</span></h2><table class="tbl st-tbl">${rows.map(stRow).join("")}</table></div>`;
+  }).join("");
+  const bar = `<div class="card wide st-bar" id="st-bar"><div id="st-total">${t.n ? `Frees <strong>${esc(stBytes(t.bytes))}</strong>${t.unmeasured ? ` (and ${t.unmeasured} not measured yet)` : ""}${t.free != null ? ` · disk free now ${(+t.free).toFixed(1)} GB → ${(+t.free + t.bytes / 1e9).toFixed(1)} GB` : ""}` : "Nothing is ticked."}</div>
+      <div class="row"><button class="primary" id="st-del" ${!t.n || sg.run || sg.busy ? "disabled" : ""}>Delete the ticked items…</button><button class="secondary" id="st-rescan" ${sg.scanning || sg.run ? "disabled" : ""}>Scan again</button>
+      ${sg.scanning ? `<button class="secondary" id="st-cancel-scan">Stop scanning</button>` : ""}</div>
+      ${sg.scanning ? `<div class="stepline" aria-live="polite">Looking at the disk… ${sg.items.length} found; sizes appear as they are measured.</div>` : ""}
+      ${sg.run ? `<div class="stepline" aria-live="polite">${esc(sg.run.text)}</div><progress max="1" value="${sg.run.value || 0}"></progress><div class="row"><button class="secondary" id="st-cancel">Cancel the deletion</button></div>` : ""}</div>`;
+  return head + msg + busy + res + stConfirm() + bar + sug + groups + (sg.scanned && !sg.items.length ? `<p class="dim">Nothing found.</p>` : "");
+}
+function wireStorage() {
+  if (page !== "storage") return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  document.querySelectorAll("[data-stsel]").forEach((b) => b.onchange = () => { if (b.checked) sg.sel[b.dataset.stsel] = true; else delete sg.sel[b.dataset.stsel]; render(); });
+  on("st-del", () => stAsk(false));
+  on("st-rescan", () => stRefresh());
+  on("st-cancel-scan", () => invoke("storage_cancel"));
+  on("st-cancel", () => invoke("storage_cancel"));
+  on("st-no", () => { sg.conf = null; render(); });
+  on("st-go", () => stGo());
+  on("st-close-result", () => { sg.result = null; render(); });
+  on("st-preset", () => { sg.sel = {}; (sg.sug.preset.ids || []).forEach((id) => { sg.sel[id] = true; }); render(); });
+  const ty = $("st-typed"); if (ty) ty.oninput = () => { sg.conf.typed = ty.value; const g = $("st-go"); if (g) g.disabled = ty.value !== "DELETE"; };
+}
+// a "Delete…" button on another page opens the Storage page with that model or export ticked; nothing goes before the confirmation
+function stDeleteFor(kind, name) { sg.want = { kind, name }; sg.result = null; go("storage"); }
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-stdel]"); if (t) { const [kind, ...rest] = String(t.dataset.stdel).split("|"); stDeleteFor(kind, rest.join("|")); } }); } catch (_) { /* a preview without a window */ }
+
 function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -4329,6 +4692,8 @@ function wire() {
   wireQuantcheck();
   wireTest();
   wireReshape();
+  wireAutoPage();
+  wireStorage();
   wireGuide();
   wireRetrain();
   wireUnsloth();
@@ -4443,7 +4808,8 @@ async function go(key) {
   if (key === "guide") gdLoad();
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
-  if (key === "reshape" && state.bundle) { rs.ok = null; rs.error = null; rsRefresh(); }
+  if ((key === "reshape" || key === "auto") && state.bundle) { rs.ok = null; rs.error = null; if (key === "auto") ac.loaded = false; rsRefresh(); }
+  if (key === "storage" && state.project) stRefresh();
   if (key === "use" && state.bundle) usRefresh();
   if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
   if (key === "quantcheck" && state.bundle) { qk.ok = null; qk.error = null; qkRefresh(); }
@@ -4497,8 +4863,10 @@ async function init() {
   try { await tauri.event.listen("quantfit-event", (e) => onQuantfitEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("storage-event", (e) => onStorageEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
   quLoad();
+  memPoll();
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   for (const ch of STALL_CHANNELS) { try { await tauri.event.listen(ch, (e) => onStallEvent(e.payload)); } catch (_) { /* previews */ } }
   go("welcome");

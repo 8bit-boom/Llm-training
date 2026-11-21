@@ -764,6 +764,22 @@ WINDOW_ROWS = 64            # rows answered together in length order before they
 SPEED_LOG_EVERY = 60.0      # seconds between the "cache_speed" lines
 
 
+TEACHER_MAX_ROWS = 16               # the most rows of one forward pass when the rows are taken by a token budget
+
+
+def rows_in_budget(lengths_longest_first: list, budget: int, cap: int = TEACHER_MAX_ROWS) -> int:
+    """How many of the rows (sorted from the longest, as `length_order` gives them) go through the original together: as many as fit `budget` tokens when each is padded to the longest of the batch
+    (the first), at least 1, at most `cap`. A budget of 0 is "the fixed number of rows" (the caller's)."""
+    if not lengths_longest_first:
+        return 0
+    return max(1, min(cap, int(budget) // max(1, int(lengths_longest_first[0]))))
+
+
+def shrink_budget(budget: int, longest: int) -> int:
+    """After an out-of-memory error: half the token budget (a budget below the longest row means one row at a time)."""
+    return max(int(budget) // 2, 0) if int(budget) // 2 >= longest else 0
+
+
 def length_order(window: list) -> list:
     """The positions of `window` from the longest row to the shortest (equal lengths keep their order): the order the teacher answers them in."""
     return sorted(range(len(window)), key=lambda j: -len(window[j]["input_ids"]))
@@ -842,6 +858,18 @@ def _write_coverage(folder, cov: dict) -> None:
     os.replace(tmp, Path(folder) / "coverage.json")
 
 
+def _early_vllm_probe(cfg: dict) -> None:
+    """vLLM is required: find out NOW (seconds, before the model is read and the rows are made) whether files can be moved into the container, not after an hour of preparation."""
+    from . import vllmcache as _vc
+    if not (_vc.wanted(cfg) and (cfg.get("engine") or {}).get("required")):
+        return
+    protocol.progress("cache", 0.0, "Testing the vLLM container: can files go in and out?")
+    pr = _vc.probe(cfg)
+    protocol.log(f"Container copy test: {'ok' if pr['ok'] else 'FAILED'} after {pr.get('seconds')} s. {pr['text']}")
+    if not pr["ok"]:
+        raise ReshapeError(f"vLLM was required for the teacher's answers but the container cannot be used: {pr['text']}" + ("" if _vc.REMEDY_OFF in pr["text"] else " " + _vc.REMEDY_OFF))
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
@@ -857,6 +885,7 @@ def run_cache(cfg: dict) -> int:
     stop_file = Path(cfg.get("stop_file") or out.parent / "STOP")
     k, max_seq = int(cfg.get("k", 32)), int(cfg.get("max_seq", 2048))
     student = Path(cfg["student"])
+    _early_vllm_probe(cfg)
     teacher_dir = reshapejob._resolve_source(cfg["teacher"]["repo"])
     _require_same_ids(teacher_dir, student)
     from transformers import AutoTokenizer
@@ -876,7 +905,7 @@ def run_cache(cfg: dict) -> int:
             veng = vllmcache.identity(cfg, cfg["teacher"]["repo"], teacher_dir)
         except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
             if (cfg.get("engine") or {}).get("required"):
-                raise ReshapeError(f"vLLM was required for the teacher's answers but cannot be used: {exc}") from None
+                raise ReshapeError(f"vLLM was required for the teacher's answers but cannot be used: {exc} {vllmcache.REMEDY}") from None
             protocol.log(f"vLLM is not used for the teacher's answers: {exc} The standard teacher is used.")
     meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir, veng)
     upto = cfg.get("upto_general_tokens")
@@ -964,6 +993,7 @@ def run_cache(cfg: dict) -> int:
     inner = text_tokenizer(tok)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
     batch, chunk = max(1, int(cfg.get("batch", 4))), int(cfg.get("chunk", 256))
+    budget = max(0, int(cfg.get("teacher_batch_tokens") or 0))          # 0 / absent: today's fixed number of rows per forward pass; the cache's rows, identity and rows_key do not depend on it
     window_rows = max(WINDOW_ROWS, batch)
     held = _read_holdout_meta(out)
     if held is not None and held.get("teacher_loss") is None and (out / "holdout.npz").is_file():
@@ -995,15 +1025,24 @@ def run_cache(cfg: dict) -> int:
                 if stop_file.exists():
                     cut_short = True
                     break
-                idx = order[pos:pos + batch]
+                if budget > 0:
+                    idx = order[pos:pos + rows_in_budget([len(window[j]["input_ids"]) for j in order[pos:pos + TEACHER_MAX_ROWS]], budget)]
+                else:
+                    idx = order[pos:pos + batch]
                 try:
                     got = _teacher_answers(model, [window[j] for j in idx], k, chunk, pad_id)
                 except RuntimeError as exc:
                     if not reshapejob._is_oom(exc) or len(idx) == 1:
                         raise
-                    protocol.log("Out of memory; the original model answers one text at a time.")
                     reshapejob._free()
-                    batch = 1
+                    if budget > 0:
+                        budget = shrink_budget(budget, len(window[idx[0]]["input_ids"]))
+                        protocol.log(f"Out of memory; the original model takes {'about half as many tokens' if budget else 'one text'} per pass.")
+                        if budget == 0:
+                            batch = 1
+                    else:
+                        protocol.log("Out of memory; the original model answers one text at a time.")
+                        batch = 1
                     continue
                 for j, a in zip(idx, got):
                     answers[j] = a
@@ -1071,7 +1110,7 @@ def _vllm_teacher(cfg: dict, writer, rows: list, out, meta: dict, teacher_dir, k
             problem = str(exc)
     rec.update(used=False, fallback=True, problem=problem)
     if eng.get("required"):
-        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}")
+        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}" + ("" if vllmcache.REMEDY_OFF in problem else " " + vllmcache.REMEDY_OFF))
     return "fallback", f"vLLM could not make the teacher's answers ({problem}) The standard teacher makes them instead."
 
 
@@ -1158,8 +1197,9 @@ def _trim() -> None:
         pass
 
 
-def _distill_collator(pad_id: int, reader):
-    """Batches of rows: ids, attention mask, labels (as in training) and, with a cache, the teacher's answers for every real position, in row order."""
+def _distill_collator(pad_id: int, reader, synth=None):
+    """Batches of rows: ids, attention mask, labels (as in training) and, with a cache, the teacher's answers for every real position, in row order. `synth` = (k, vocab, seed): without a cache the
+    answers are seeded synthetic ones of the right shapes, a function of the ROW (so every way of grouping the same rows gets the same targets)."""
     import numpy as np
     import torch
 
@@ -1183,7 +1223,33 @@ def _distill_collator(pad_id: int, reader):
             out["t_ids"] = torch.from_numpy(np.concatenate([p[0] for p in parts]))
             out["t_logp"] = torch.from_numpy(np.concatenate([p[1] for p in parts]).astype("float32"))
             out["t_resid"] = torch.from_numpy(np.concatenate([p[2] for p in parts]))
+        elif synth is not None:
+            k, vocab, seed = synth
+            ids_l, lp_l, rs_l = [], [], []
+            for b in batch:
+                g = torch.Generator().manual_seed(int(seed) * 1_000_003 + int(b.get("row", 0)))
+                n_b = len(b["input_ids"])
+                ids_l.append(torch.randint(0, vocab, (n_b, k), generator=g))
+                lp_l.append(torch.log_softmax(torch.randn(n_b, k, generator=g), dim=-1) + math.log(0.9))
+                rs_l.append(torch.full((n_b,), 0.1))
+            out["t_ids"], out["t_logp"], out["t_resid"] = torch.cat(ids_l), torch.cat(lp_l), torch.cat(rs_l)
         return out
+    return collate
+
+
+def _group_collator(pad_id: int, reader, budget: int, seed: int, synth=None):
+    """The collator of `student_batch_tokens`: the rows of one update arrive together and leave as micro-batches (`speed.micro_batches`: similar lengths together, at most `budget` tokens each once padded,
+    right-padded with an attention mask). -> {"groups": [micro-batch dicts as `_distill_collator` makes them], "n_rows", "input_ids" (the first micro-batch's, for the trainer's FLOP count)}."""
+    from . import speed
+    inner = _distill_collator(pad_id, reader, synth)
+    counter = {"n": 0}
+
+    def collate(batch):
+        lengths = [len(b["input_ids"]) for b in batch]
+        parts = speed.micro_batches(lengths, budget, seed, counter["n"])
+        counter["n"] += 1
+        groups = [inner([batch[i] for i in part]) for part in parts]
+        return {"groups": groups, "n_rows": len(batch), "input_ids": groups[0]["input_ids"]}
     return collate
 
 
@@ -1219,6 +1285,22 @@ def student_loss(model, inputs, targets_fn, alpha: float, chunk: int, checkpoint
     return loss, kd_mean, ce_mean
 
 
+def student_loss_rows(model, inputs, targets_fn, chunk: int, checkpoint_head: bool = True):
+    """(sum over the rows of each row's mean KL, number of rows) of a PADDED batch of rows. Every row keeps the weight it has when it is a batch of its own (the mean of its own tokens), whatever
+    the other rows' lengths are: the per-token weight is 1 / the row's length. KL term only (alpha = 1)."""
+    import torch
+    att = inputs["attention_mask"]
+    hidden, _ = forward_hidden(model, inputs["input_ids"], att)
+    sel = att.bool().to(hidden.device)
+    h = hidden[sel]
+    lens = att.sum(dim=1).clamp(min=1).to(h.device)
+    w = (1.0 / lens.float()).unsqueeze(1).expand(att.shape).to(h.device)[sel]
+    weight = model.get_output_embeddings().weight
+    targets = tuple(t.to(h.device) for t in targets_fn(inputs))
+    kd, n_rows, _, _ = chunked_kd_loss(h, weight, targets, w, chunk, None, None, checkpoint_head)
+    return kd, n_rows
+
+
 UNSTABLE = "Healing stopped: the training became unstable (the error went to infinity). Lower the learning rate (Expert) and continue."
 
 
@@ -1239,6 +1321,32 @@ def _trainer_class(base):
                 self.lr_scheduler = LambdaLR(optimizer if optimizer is not None else self.optimizer, lambda st: round_lr_factor(st + rl["shift"], rl["s_start"], rl["steps"], rl["index"], rl["warmup"], rl["sch"]))
                 self._created_lr_scheduler = True
             return self.lr_scheduler
+
+        def training_step(self, model, inputs, num_items_in_batch=None):
+            """With `student_batch_tokens` the batch of one update is a GROUP of rows (`inputs["groups"]`: micro-batches of similar length, padded to their longest). Each micro-batch is run and
+            back-propagated at once with its rows' share of the update's loss (the sum of the rows' mean losses / the rows of the update), so the gradient equals the sum of today's single-row
+            steps, and only one micro-batch is in memory."""
+            groups = inputs.get("groups") if isinstance(inputs, dict) else None
+            if not groups:
+                return super().training_step(model, inputs, num_items_in_batch)
+            import torch
+            d = self.distill
+            model.train()
+            n_rows = max(1, int(inputs["n_rows"]))
+            total = None
+            for g in groups:
+                with self.compute_loss_context_manager():
+                    kd, rows = student_loss_rows(model, g, d["targets"], d["chunk"], d.get("head_checkpoint", True))
+                    loss = kd / n_rows
+                if not torch.isfinite(loss):
+                    raise ReshapeError(UNSTABLE)
+                self.accelerator.backward(loss)
+                total = loss.detach() if total is None else total + loss.detach()
+                r_n = max(1, int(round(float(rows))))
+                d["kd"].extend([float(kd) / r_n] * r_n)          # one value per row, so the logged mean is the mean of the rows' means, as with one row per step
+                d["ce"].extend([0.0] * r_n)
+                d["tokens"] += int(g["attention_mask"].sum())
+            return total
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             import torch
@@ -1377,7 +1485,92 @@ def _bench_targets(k: int, vocab: int, seed: int):
     return targets
 
 
+def _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budget: int, per_update: int, updates: int, warm: int, order: list, cuda: bool) -> dict:
+    """`warm + updates` optimizer updates of `per_update` real rows each (the same rows for every budget), the rows of an update split into micro-batches of at most `budget` tokens (0: one row each).
+    -> {"tokens_per_s", "peak_vram_mb", "first_loss" (the mean of the rows' mean losses of the first update, before any weight changed), "micro_batches" (forward passes per update), "padded_share"}."""
+    import torch
+    from . import speed
+    synth = None if reader is not None else (k, vocab, int(h["seed"]))
+    collate = _group_collator(pad_id, reader, budget, int(h["seed"]), synth)
+    targets = lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])      # noqa: E731
+    opt = torch.optim.AdamW(params, lr=0.0)                                  # the weights never move: every budget sees the same model
+    model.train()
+    first, tokens, started, n_mb, pad_share = None, 0, None, 0, 0.0
+    if cuda:
+        torch.cuda.empty_cache()
+    for u in range(warm + updates):
+        if u == warm:
+            if cuda:
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            started = time.monotonic()
+        idx = [order[(u * per_update + j) % len(order)] for j in range(per_update)]
+        sel = [{**rows[i], "row": i} for i in idx]
+        out = collate(sel)
+        total = 0.0
+        for g in out["groups"]:
+            g = {kk: v.to(dev) for kk, v in g.items()}
+            kd, _ = student_loss_rows(model, g, targets, chunk, head_ckpt)
+            (kd / per_update).backward()
+            total += float(kd.detach()) / per_update
+            if u >= warm:
+                tokens += int(g["attention_mask"].sum())
+        if first is None:
+            first = total
+        n_mb = len(out["groups"])
+        if u == 0:
+            lens = [len(r["input_ids"]) for r in sel]
+            pad_share = speed.padded_share(lens, speed.split_by_token_budget(lens, budget))
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    if cuda:
+        torch.cuda.synchronize()
+    secs = max(time.monotonic() - started, 1e-6)
+    return {"tokens_per_s": round(tokens / secs, 2), "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 1e6) if cuda else None, "first_loss": round(first, 6) if first is not None else None,
+            "micro_batches": n_mb, "padded_share": round(pad_share, 3), "seconds": round(secs, 2), "tokens": tokens}
+
+
+def _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budgets: list, b: dict, cuda: bool) -> dict:
+    """The speed for every `student_batch_tokens` in `budgets` on REAL rows (a seeded random sample of the project's rows, their true lengths), the same rows and the same targets for each, with the
+    recommendation (`healspeed.recommend_batch_tokens`). A budget that runs out of memory is recorded and the others go on."""
+    import random
+    import torch
+    from . import healspeed
+    per_update = max(1, int(h["batch"]) * int(h["grad_accum"]))
+    updates, warm = max(1, int(b.get("sweep_updates", 2))), max(0, int(b.get("sweep_warmup", 1)))
+    order = list(range(len(rows)))
+    random.Random(int(h["seed"])).shuffle(order)
+    card = torch.cuda.mem_get_info()[1] / 1e6 if cuda else None
+
+    def run_one(budget: int) -> dict:
+        protocol.progress("bench", 0.9, f"Measuring {budget or 'one row per forward pass'}")
+        try:
+            return _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budget, per_update, updates, warm, order, cuda)
+        except RuntimeError as exc:
+            if healmem.is_oom(exc):
+                import gc
+                gc.collect()
+                if cuda:
+                    torch.cuda.empty_cache()
+                return {"tokens_per_s": None, "error": "out of memory"}
+            raise
+    out = healspeed.sweep(run_one, budgets, card)
+    out["per_update_rows"], out["updates"], out["card_mb"] = per_update, updates, round(card) if card else None
+    return out
+
+
 def run_bench(cfg: dict) -> int:
+    """job distill with `bench` (see `_run_bench`); with `bench.out_dir` the heal speed report is written on EVERY end, a failure included."""
+    box: dict = {}
+    try:
+        return _run_bench(cfg, box)
+    except BaseException as exc:        # noqa: BLE001 - the report first, then the failure goes on its way
+        if box.get("write"):
+            box["write"]("failed", f"{type(exc).__name__}: {protocol.scrub(str(exc))[:300]}")
+        raise
+
+
+def _run_bench(cfg: dict, box: dict) -> int:
     """job distill with "bench": {"steps": 12, "warmup": 3, "targets": "cache" | "synthetic"}: the speed of the healing step at the chosen settings, nothing is saved (no checkpoint,
     no adapter, no evaluation, no output folder). Real rows of the project at the chosen sequence length; the teacher's answers from the complete cache when it is there and asked
     for, else seeded synthetic ones with the same shapes (no teacher is loaded). Plain training steps (forward, the KL loss, backward, the optimizer): the first `warmup` are not
@@ -1392,6 +1585,17 @@ def run_bench(cfg: dict) -> int:
     from . import data
     b = cfg["bench"] if isinstance(cfg.get("bench"), dict) else {}
     steps, warm = max(1, int(b.get("steps", BENCH_STEPS))), max(0, int(b.get("warmup", BENCH_WARMUP)))
+    from . import healspeed
+    report = {"created": healspeed.now(), "status": "running", "environment": healspeed.environment_facts(), "windows_hints": b.get("windows_hints") or [], "notes": []} if b.get("out_dir") else None
+
+    def write_report(status: str, error: str | None = None) -> None:
+        """the heal speed report (only when the Heal card's "Measure heal speed" asked for it): written on EVERY end"""
+        if report is not None:
+            report.update(status=status, error=error)
+            try:
+                protocol.add_extra("heal_speed_report", healspeed.write_report(b["out_dir"], report))
+            except Exception as exc:        # noqa: BLE001 - the report must never hide the job's own result
+                protocol.log(f"The heal speed report could not be written: {type(exc).__name__}: {exc}")
     d = cfg.get("distill") or {}
     student_dir = cfg["model"]["repo"]
     h = resolve_hyper(cfg, student_dir)
@@ -1403,11 +1607,16 @@ def run_bench(cfg: dict) -> int:
     protocol.progress("bench", 0.0, "Loading the model")
     model, tokenizer, _ = backends.load(lcfg, "hf")
     cuda = torch.cuda.is_available()
+    from . import speed
+    kern = speed.report_kernels(model)
+    box["write"] = write_report
+    if report is not None:
+        report["kernels"] = kern
     free_gb = torch.cuda.mem_get_info()[0] / 1e9 if cuda else None
     _apply_checkpointing(model, _decide_checkpointing(h, student_dir, free_gb))
     reader, use = None, "synthetic"
     cache = d.get("cache")
-    if b.get("targets", "cache") == "cache" and cache:
+    if b.get("targets", "cache") in ("cache", "rows") and cache:
         idx = read_cache_index(cache)
         if idx and idx.get("complete") and idx.get("max_len") == int(h["max_seq"]):
             try:
@@ -1415,7 +1624,9 @@ def run_bench(cfg: dict) -> int:
             except ReshapeError:
                 reader = None
     if reader is None:
-        rows, _ = build_rows(tokenizer, {"train": cfg["dataset"]["train"], "tokens": int(h["max_seq"]) * int(h["batch"]) * (steps + warm), "general": None},
+        # "rows": a sample big enough to show the true length distribution (about a thousand rows), real targets when a cache exists, else seeded synthetic ones of the right shapes
+        want = int(b.get("rows_tokens") or 1_500_000) if b.get("targets") == "rows" else int(h["max_seq"]) * int(h["batch"]) * (steps + warm)
+        rows, _ = build_rows(tokenizer, {"train": cfg["dataset"]["train"], "tokens": want, "general": None},
                              cfg["model"].get("family", "generic"), int(h["max_seq"]), int(h["seed"]))
     if not rows:
         raise ReshapeError("There is nothing to measure the speed on: the training data is empty.")
@@ -1453,6 +1664,7 @@ def run_bench(cfg: dict) -> int:
             torch.cuda.synchronize()
     except RuntimeError as exc:
         if healmem.is_oom(exc):
+            write_report("failed", "out of memory")
             protocol.error("distill_oom", f"The graphics card ran out of memory at sequence length {h['max_seq']}, batch {batch}, KL chunk {chunk}, output-layer checkpointing {'on' if head_ckpt else 'off'}.")
             return 1
         raise
@@ -1461,6 +1673,42 @@ def run_bench(cfg: dict) -> int:
     res = {"tokens_per_s": round(tokens / secs, 2), "peak_vram_mb": peak, "chunk": chunk, "head_checkpoint": head_ckpt, "student_b": h["student_b"], "steps": steps, "warmup": warm,
            "tokens": tokens, "seconds": round(secs, 2), "targets": use, "max_seq": int(h["max_seq"]), "batch": batch, "stopped": False}
     protocol.timing("heal_bench", secs, tokens=tokens, tokens_per_s=res["tokens_per_s"], peak_vram_mb=peak, chunk=chunk, head_checkpoint=head_ckpt, student_b=h["student_b"])
+    res["rows"] = healspeed.length_stats([len(r["input_ids"]) for r in rows])          # the true length distribution of the rows the measurement used
+    protocol.log("Rows measured: " + json.dumps(res["rows"]))
+    if report is not None:
+        report["rows"] = res["rows"]
+        report["bench"] = {k_: res[k_] for k_ in ("tokens_per_s", "peak_vram_mb", "chunk", "max_seq", "batch", "student_b", "targets")}
+        sweep_values = b.get("batch_tokens_sweep")
+        if sweep_values:
+            try:
+                protocol.progress("bench", 0.9, "Measuring several rows per forward pass")
+                report["batch_sweep"] = res["batch_sweep"] = _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, [int(x) for x in sweep_values], b, cuda)
+            except Exception as exc:        # noqa: BLE001 - the plain speed number is still a result
+                report["notes"].append(f"The token-budget measurement failed: {type(exc).__name__}: {protocol.scrub(str(exc))[:240]}")
+        try:
+            if b.get("profile"):
+                protocol.progress("bench", 0.97, "Profiling two steps")
+                res["heal_profile"] = report["heal_profile"] = healspeed.profile_steps(model, rows, collate, targets, chunk, head_ckpt, opt, batch, dev, 2, (warm + steps) * batch)
+            if b.get("microbench"):
+                report["microbench"] = healspeed.gdn_microbench()
+            if b.get("teacher_bench") and (d.get("teacher") or {}).get("repo"):
+                del opt
+                model = None
+                import gc
+                gc.collect()
+                if cuda:
+                    torch.cuda.empty_cache()
+                from . import reshapejob
+                tdir = reshapejob._resolve_source(d["teacher"]["repo"])
+                tmodel = reshapejob._load(tdir, reshapejob._choose_load(d["teacher"].get("load", "auto"), sum(r.nbytes for r in safetensors_io.list_tensors(tdir).values())), "load_teacher")
+                try:
+                    report["teacher_bench"] = healspeed.teacher_bench(rows, lambda br: _teacher_answers(tmodel, br, k, 256, pad_id), sync=torch.cuda.synchronize if cuda else (lambda: None))
+                finally:
+                    del tmodel
+                    reshapejob._free()
+        except Exception as exc:        # noqa: BLE001 - the plain speed number is still a result; the report says what failed
+            report["notes"].append(f"An extra measurement failed: {type(exc).__name__}: {protocol.scrub(str(exc))[:240]}")
+        write_report("done")
     protocol.progress("bench", 1.0, "")
     protocol.result(res)
     return 0
@@ -1624,6 +1872,12 @@ def run(cfg: dict) -> int:
     head_ckpt = str(d.get("head_checkpoint", "on")).lower() not in ("off", "false", "0")        # job key distill.head_checkpoint "on" (default) | "off"
     if not head_ckpt:
         settings["head_checkpoint"] = False                  # only an explicit "off" is part of the settings: a default job's settings are unchanged
+    bt0 = max(0, int(h.get("student_batch_tokens") or 0))      # job key hyper.student_batch_tokens: 0 / absent = one row per step, as always
+    if bt0 and alpha < 1.0:
+        protocol.log("student_batch_tokens is not used with a cross-entropy term (alpha below 1): one row per step.")
+        bt0 = 0
+    if bt0:
+        settings["batch_tokens"] = bt0                       # only a chosen budget is part of the settings
     protocol.log("Healing settings: " + healmem.describe(settings) + f", optimizer {optim}.")
     protocol.emit("heal_settings", settings=settings, optimizer=optim)
 
@@ -1648,7 +1902,10 @@ def run(cfg: dict) -> int:
                         shutil.copy2(ckpts[-1] / name, target_dir / name)
             return {"after": None, "steps": ckpt.step_of(ckpts[-1]), "tokens": 0, "stopped": False, "vram": 0, "target": out / "adapter"}
         _apply_checkpointing(mdl, bool(s["checkpointing"]))
-        kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=int(s["batch"]), gradient_accumulation_steps=int(s["grad_accum"]), learning_rate=float(h["lr"]),
+        bt = max(0, int(s.get("batch_tokens") or 0))
+        # with a token budget one update's rows arrive together (batch x accumulation rows) and are split into micro-batches by `_group_collator`; the trainer then accumulates nothing itself
+        rows_per_batch, accum = (int(s["batch"]) * int(s["grad_accum"]), 1) if bt else (int(s["batch"]), int(s["grad_accum"]))
+        kwargs = dict(output_dir=str(ckdir), per_device_train_batch_size=rows_per_batch, gradient_accumulation_steps=accum, learning_rate=float(h["lr"]),
                       warmup_steps=int(h["warmup"]), weight_decay=float(h["weight_decay"]), lr_scheduler_type=h["scheduler"], logging_steps=int(h["logging_steps"]),
                       save_strategy="steps", save_steps=int(h["save_steps"]), save_total_limit=2, optim=optim, seed=int(h["seed"]), report_to="none", disable_tqdm=True,
                       bf16=bf16, fp16=cuda and not bf16, remove_unused_columns=False, gradient_checkpointing=bool(s["checkpointing"]), dataloader_num_workers=0,
@@ -1668,7 +1925,7 @@ def run(cfg: dict) -> int:
         state = {"kd": [], "ce": [], "tokens": 0}
         lr_at = (lambda st: float(h["lr"]) * round_lr_factor(st + shift, r_start, steps, r_index, int(h["warmup"]), sch)) if rd else None   # noqa: E731
         live = Heal(str(stop_file), None, [], 0, offset=shift if rd else 0, eval_fn=eval_fn, eval_every=int(d.get("eval_every", 0)), distill=state, lr_at=lr_at, save_at=max_steps if rd else 0, hold_fn=hold_fn)
-        trainer_kw = {"model": mdl, "args": args, "train_dataset": make_ds(round_slice(order, done_steps, per_step)) if rd else ds, "data_collator": _distill_collator(pad_id, reader), "callbacks": [live]}
+        trainer_kw = {"model": mdl, "args": args, "train_dataset": make_ds(round_slice(order, done_steps, per_step)) if rd else ds, "data_collator": _group_collator(pad_id, reader, bt, int(h["seed"])) if bt else _distill_collator(pad_id, reader), "callbacks": [live]}
         trainer_kw["processing_class" if "processing_class" in SFTTrainer.__init__.__code__.co_varnames else "tokenizer"] = tokenizer
         trainer = _trainer_class(SFTTrainer)(**trainer_kw)
         trainer.model_accepts_loss_kwargs = False           # the trainer then divides the loss by the gradient accumulation itself

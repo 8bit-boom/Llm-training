@@ -272,7 +272,7 @@ the registration is not checked against that list.
 
 ## The page (`ui/app.js`, "Auto-cut (one click)")
 
-A card at the top of the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
+A page of its own, **🚀 Auto** (left list, between the steps and "Slim or grow a model"); it reads the same state as the Slim page. It shows: a size slider (3 B or 30 % of the model up to 95 %, steps of 0.5 B; the default is 76 %), *Keep it able to think* (on for Qwen3.5 / 3.8, off and disabled otherwise), one or two stages,
 Full or Quick, **How careful, how fast** (the presets with their totals, the heal tokens and the sequence length of the stages with the hours each choice changes, More speed settings, "I have at most N hours"), *keep the intermediate files*, the confirmation of more than 4 blocks (only when the plan says it is needed), and the Studio publish box with the share fields (Save and Check). Under them the plan: blockers (red, Start
 disabled), warnings, the stages (size, cut, healing tokens and hours, card), the disk and **How long this will take** (see "How long it takes"). Start / Stop / Continue / Show the report, then a **stepper** of the run's steps (done, running, pending, skipped, failed, with the note of the step), the live text
 and bar of the running job, and the report as text.
@@ -334,3 +334,20 @@ The choices of "How careful, how fast" (the levers and "More speed settings") ar
 - **Heals in rounds** (`early` preset or a custom rounds setting) keep the standard teacher: the engine would start every round.
 - **Fallback**: a failing vLLM step goes on with the standard engine, with a note in the run's notes and the report.
 - **Report**: "Steps that used vLLM": per step the engine, teacher quantization and identity, measured start-up and speed against the estimate, fallbacks. `AutoState.engines` and `check_engine` are additive; old run files load.
+
+
+## Change settings and continue
+
+A stopped or failed run has a second button next to Continue: **Change settings and continue**. It opens the same knobs as the start screen (the common ones), pre-filled from the run:
+
+- **Locks** (`auto_change::lock_of`, decided by the state of the steps): a setting is `free` (it has not taken effect: speed knobs of steps not started, heal tokens of a stage whose heal has not begun, the time limit, retry and back-off, export options before the export, vLLM options, quick/full checks before the first check), `confirm` (it would redo work that was begun or the yardstick: the heal of a stage that has started, the original's thinking check in another mode or engine) or `locked` with a plain reason (the model, the target size, thinking on/off, the cut, the number of stages once the first cut is made, a stage that is healed already, Try first once it started, the export once it started). A refused change is an error that names the setting and the reason.
+- **Confirmation**: a `confirm` change is applied only after the person ticks "I understand that this redoes: ..." naming what is redone; the original's saved answers are made again for a changed amount of tokens or sequence length by the heal's own cache rule (nothing is deleted by hand).
+- **Time**: the estimate is made again for the REMAINING steps with the changed settings ("Time left: about X-Y h (was A-B h)").
+- **Record**: the run keeps `settings_changes` (when, who, each change from -> to, the confirmation, what was redone, the time left before and after) and `start_spec` (the spec it was started with); the report prints "Settings changed while the run went on". The start spec is never rewritten silently.
+- **Steps**: done steps are kept as they are and never run again; steps the new settings add or drop are reconciled; stages whose heal is not finished take their new numbers.
+- **Suggestions** for the step that stopped (a failed heal is the common case): fewer tokens after an out-of-memory error, healing in rounds, vLLM off or on, quick checks, retry; locked ones are left out.
+- The same works through `auto_start {resume, changes, confirmed}`; `auto_change_preview {id, patch}` shows the diff, the locks and the time without touching the run.
+
+## Time totals after a stop, a restart or a retry
+
+A step's `started` / `finished` only describe its last attempt. The state now keeps every attempt (`attempts`: started, finished, seconds, outcome) and their sum (`spent_s`); the report's step seconds, "Time (the steps added up)", the "actual" column and the progress actuals use the sum. A run saved before this keeps its old numbers (the last attempt only). In a heal in rounds, a round's minutes are wall-clock over every attempt of its phases (`lost_s` holds the time of a phase that was stopped or failed), and the report says how the rounds, the merge and the final check add up to the heal step's time.

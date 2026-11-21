@@ -2,6 +2,8 @@
 import contextlib
 import hashlib
 import io
+import re
+import subprocess
 import json
 import shutil
 import types
@@ -181,59 +183,157 @@ def test_the_selftest_captures_cp_and_exec_help():
 # ------------------------------------------------------------------------------------------------------------------------- a fake container
 
 class FakeWorld:
-    """Stands in for `docker`: keeps a folder per container, answers run/exec/cp/stop/rm, and runs vllm_cache.py in this process when the script is exec'ed."""
+    """Stands in for `docker` (and, with `exe="wslc"`, for `wslc`): keeps a folder per container, answers run/exec/cp/stop/rm, and runs vllm_cache.py in this process when the script is exec'ed.
+    `bind`: "ok" (a `-v host:/work` mount shows the host folder as /work), "refuse" (the run command is refused) or "invisible" (accepted, but the container sees another folder).
+    `cp`: "docker" (any destination), "dir_only" (a file destination that does not exist is ERROR_PATH_NOT_FOUND, `name:/work/` works), "none" (every cp fails), "drive_letter"
+    (a source `C:\\...` is taken for `container:path`; `C:/...` works). `stdin_ok`: `exec -i ... cat > f` works. Existing tests keep the old behaviour: no bind, plain docker cp."""
 
-    def __init__(self, tmp_path, monkeypatch, scorer=None, fail_script=None, folder="container"):
+    def __init__(self, tmp_path, monkeypatch, scorer=None, fail_script=None, folder="container", bind="refuse", cp="docker", stdin_ok=True, exe="docker"):
         self.root = tmp_path / folder
         self.root.mkdir()
         self.calls: list = []
         self.running: set = set()
         self.scorer = scorer or FakeScorer()
         self.fail_script = fail_script
+        self.bind, self.cp_mode, self.stdin_ok, self.exe = bind, cp, stdin_ok, exe
+        self.bound: dict = {}
         monkeypatch.setattr(ve, "_run", self.run)
         monkeypatch.setattr(ve, "_popen", self.popen)
         monkeypatch.setattr(vc, "build_scorer", lambda args: (self.scorer, []))
         monkeypatch.setattr(vllmcache, "SYNC_SECONDS", 0.0)
+        monkeypatch.setattr(vllmcache.time, "sleep", lambda s: None)
 
-    def local(self, p: str) -> Path:
+    def local(self, p: str, name: str = "") -> Path:
+        if p.startswith("/work") and name in self.bound:
+            return Path(self.bound[name]) / p[len("/work"):].lstrip("/")
         return self.root / p.lstrip("/")
+
+    def _res(self, code=0, out=b"", err=b""):
+        return types.SimpleNamespace(returncode=code, stdout=out, stderr=err)
 
     def run(self, cmd, **kw):
         self.calls.append(list(cmd))
         c = list(cmd)
-        out = types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-        if c[0] != "docker":
-            return out
+        if c[0] != self.exe:
+            return self._res()
+        if self.exe == "wslc" and c[1] == "list":
+            return self._res()
         sub = c[1]
         if sub == "run":
             name = c[c.index("--name") + 1]
+            mounts = [c[i + 1] for i, x in enumerate(c) if x == "-v" and c[i + 1].endswith(":/work")]
+            if mounts:
+                if self.bind == "refuse":
+                    return self._res(125, err=b"invalid mount path: the work folder is not accepted")
+                host = mounts[0][:-len(":/work")]
+                if self.bind == "ok":
+                    self.bound[name] = host
+                    Path(host).mkdir(parents=True, exist_ok=True)
             self.running.add(name)
-            self.local("x").parent.mkdir(exist_ok=True)
-        elif sub in ("stop", "rm"):
+            self.root.mkdir(exist_ok=True)
+        elif sub in ("stop", "rm", "remove"):
             self.running.discard(c[-1])
+        elif sub == "inspect":
+            return self._res(out=b'[{"Mounts": []}]')
         elif sub == "exec":
-            args = c[3:]
-            if args[0] == "mkdir":
-                for d in args[2:]:
-                    self.local(d).mkdir(parents=True, exist_ok=True)
-            elif args[0] == "touch":
-                self.local(args[1]).write_text("1")
+            return self._exec(c, kw)
         elif sub == "cp":
-            a, b = c[2], c[3]
-            if ":" in a and not a[1:2] == ":" and a.split(":", 1)[0].startswith("ndforge-vllm-"):
-                src = self.local(a.split(":", 1)[1])
-                if not src.exists():
-                    return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"no such file")
-                shutil.copy(src, b)
-            else:
-                dst = self.local(b.split(":", 1)[1])
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(a, dst)
-        return out
+            return self._cp(c)
+        return self._res()
+
+    def _name(self, c):
+        return next((x for x in c if x.startswith("ndforge-vllm-")), "")
+
+    def _exec(self, c, kw):
+        i = 2
+        if c[i] == "-i":
+            i += 1
+        name = c[i]
+        args = c[i + 1:]
+        stdin = kw.get("stdin")
+        if args[:1] == ["true"]:
+            return self._res()
+        if args[:1] == ["mkdir"]:
+            for d in args[2:]:
+                self.local(d, name).mkdir(parents=True, exist_ok=True)
+        elif args[:1] == ["touch"]:
+            self.local(args[1], name).write_text("1")
+        elif args[:1] == ["ls"]:
+            return self._res(out=b"total 0\n")
+        elif args[:1] == ["mv"]:
+            self.local(args[1], name).replace(self.local(args[2], name))
+        elif args[:1] == ["cat"]:
+            f = self.local(args[1], name)
+            if not f.is_file():
+                return self._res(1, err=b"cat: no such file")
+            data = f.read_bytes()
+            if kw.get("stdout") not in (None, subprocess.PIPE) and hasattr(kw["stdout"], "write"):
+                kw["stdout"].write(data)
+                return self._res()
+            return self._res(out=data)
+        elif args[:2] == ["sh", "-c"]:
+            for part in args[2].split("&&"):
+                part = part.strip()
+                if part.startswith("mkdir -p "):
+                    self.local(part.split()[-1], name).mkdir(parents=True, exist_ok=True)
+                elif part.startswith("touch "):
+                    self.local(part.split()[-1], name).write_text("1")
+                elif part.startswith("cat > "):
+                    if not (self.stdin_ok and "-i" in c[:4]) or stdin is None or stdin is subprocess.DEVNULL:
+                        return self._res(1, err=b"stdin is not connected")
+                    f = self.local(part.split("> ", 1)[1].strip(), name)
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_bytes(stdin.read())
+                elif part.startswith("printf "):
+                    m = re.match(r"printf %s '?(.*?)'? > (\S+)$", part)
+                    f = self.local(m.group(2), name)
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(m.group(1))
+        return self._res()
+
+    def _cp(self, c):
+        if "--help" in c:
+            return self._res(out=b"Usage: cp SRC CONTAINER:DST")
+        a, b = c[2], c[3]
+        if self.cp_mode == "none":
+            return self._res(1, err=b"Could not find the file in container. Error code: ERROR_PATH_NOT_FOUND")
+        into = a.startswith("ndforge-vllm-") or (":" in a and a.split(":", 1)[0].startswith("ndforge-vllm-"))
+        if not into:                                                        # host -> container
+            if self.cp_mode == "drive_letter":
+                if re.match(r"^[A-Za-z]:\\", a):
+                    return self._res(1, err=b"no such container: C")
+                if a.startswith("C:/fakehost/"):
+                    a = "/" + a[len("C:/fakehost/"):]
+            name, dst = b.split(":", 1)
+            f = self.local(dst, name)
+            if self.cp_mode == "dir_only":
+                if dst.endswith("/"):
+                    f = f / Path(a).name
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                elif not f.exists():
+                    return self._res(1, err=b"Could not find the file " + dst.encode() + b" in container. Error code: ERROR_PATH_NOT_FOUND")
+            f.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(a, f)
+            return self._res()
+        name, srcp = a.split(":", 1)
+        src = self.local(srcp, name)
+        if not src.exists():
+            return self._res(1, err=b"no such file")
+        if self.cp_mode == "drive_letter":
+            if re.match(r"^[A-Za-z]:\\", b):
+                return self._res(1, err=b"no such container: C")
+            if b.startswith("C:/fakehost/"):
+                b = "/" + b[len("C:/fakehost/"):]
+        dst = Path(b)
+        if b.endswith("/") or dst.is_dir():
+            dst = dst / src.name
+        shutil.copy(src, dst)
+        return self._res()
 
     def popen(self, cmd, **kw):
         self.calls.append(list(cmd))
-        args = [a.replace("/work", str(self.local("/work"))) if a.startswith("/work") else a for a in cmd[5:]]
+        name = cmd[2]
+        args = [a.replace("/work", str(self.local("/work", name))) if a.startswith("/work") else a for a in cmd[5:]]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             if self.fail_script:
@@ -276,10 +376,11 @@ def test_a_chunk_is_staged_scored_copied_out_and_the_container_removed(tmp_path,
     cps = [c for c in world.calls if c[:2] == ["docker", "cp"]]
     assert any(c[-1].endswith(":/work/data/rows.npz") for c in cps) and any(c[-1].endswith(":/work/vllm_cache.py") for c in cps) and any(c[-1].endswith(":/work/cachewrite.py") for c in cps)
     runs = [c for c in world.calls if c[:2] == ["docker", "run"]]
-    assert len(runs) == 1 and [x for x in runs[0] if x.startswith("-v")] == ["-v"] and not any("rows" in x for x in runs[0])
+    assert len(runs) == 2 and [x for x in runs[0] if x.startswith("-v")] == ["-v", "-v"], "first the host work folder is tried as /work, then the plain container"
+    assert [x for x in runs[1] if x.startswith("-v")] == ["-v"] and not any(":/work" in x for x in runs[1]) and not any("rows" in x for x in runs[1])
     assert any(c[:3] == ["docker", "exec", c[2]] and c[3:5] == ["pip", "install"] and "vllm-bnb-plugin" in c[5] for c in world.calls), "the bnb plugin is installed for the in-flight route"
     assert not world.running, "the container is stopped and removed"
-    assert [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"]
+    assert [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"] * 2, "the refused attempt is removed too"
     rd = dj.CacheReader(tmp_path / "cache")
     assert rd.done_rows == 5
     for i, t in enumerate(toks):
@@ -346,7 +447,7 @@ def test_a_failing_script_keeps_the_parts_and_still_removes_the_container(tmp_pa
     w = new_writer(tmp_path, 2)
     with pytest.raises(vllmcache.VllmCacheError, match="CUDA out of memory"):
         run_it(tmp_path, world, w, rows, 0, 2)
-    assert not world.running and [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"]
+    assert not world.running and [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"] * 2
 
 
 def test_a_container_that_cannot_start_is_a_plain_error_and_is_cleaned(tmp_path, monkeypatch):
@@ -365,7 +466,7 @@ def test_a_container_that_cannot_start_is_a_plain_error_and_is_cleaned(tmp_path,
     monkeypatch.setattr(ve, "_run", bad)
     with pytest.raises(vllmcache.VllmCacheError, match="device driver"):
         run_it(tmp_path, world, new_writer(tmp_path, 1), rows, 0, 1)
-    assert [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"]
+    assert [c[1] for c in world.calls if c[1] in ("stop", "rm")] == ["stop", "rm"] * 2, "the refused work-folder attempt and the plain one are both removed"
 
 
 # ------------------------------------------------------------------------------------------- run_cache's decision: used, fallback, required, refused

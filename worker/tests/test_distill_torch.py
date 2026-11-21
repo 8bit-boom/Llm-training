@@ -736,3 +736,51 @@ def test_a_round_without_its_checkpoint_starts_from_the_previous_adapter_and_a_f
     r2 = ev2[-1]["data"]["round"]
     assert r2["s_start"] == r1["s_end"] and r2["s_end"] == r2["s_start"] + r2["steps"] and min(e["step"] for e in metrics(ev2)) == r1["s_end"] + 1
     assert (run / "rounds" / "r2" / "adapter" / "adapter_config.json").is_file()
+
+
+def _cache_arrays(folder):
+    rd = dj.CacheReader(folder)
+    return [rd.get(i) for i in range(rd.done_rows)]
+
+
+def test_the_cache_made_with_a_token_budget_equals_the_cache_with_four_rows_per_forward(tmp_path, base, monkeypatch):
+    """The same rows, the same top-k indices and probabilities (within float tolerance), the same identity and rows_key: the budget only changes how rows are grouped."""
+    import copy
+    a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+    a_dir.mkdir(), b_dir.mkdir()
+    cfg_a = cache_cfg(a_dir, base, batch=4, rows_key="same-key")
+    cfg_b = cache_cfg(b_dir, base, batch=4, rows_key="same-key", teacher_batch_tokens=400)
+    sizes = []
+    real = dj._teacher_answers
+    monkeypatch.setattr(dj, "_teacher_answers", lambda model, part, *a: sizes.append(len(part)) or real(model, part, *a))
+    assert run_in_process(monkeypatch, dj.run_cache, copy.deepcopy(cfg_a))[0] == 0
+    fixed = list(sizes)
+    sizes.clear()
+    assert run_in_process(monkeypatch, dj.run_cache, copy.deepcopy(cfg_b))[0] == 0
+    assert max(fixed) <= 4 and sizes != fixed and max(sizes) <= dj.TEACHER_MAX_ROWS, (fixed, sizes)
+    ia = json.loads((a_dir / "distill" / "cache" / "index.json").read_text())
+    ib = json.loads((b_dir / "distill" / "cache" / "index.json").read_text())
+    for key in ("rows", "tokens", "k", "max_len", "data_hash", "tokenizer_hash", "teacher_weights", "rows_key"):
+        assert ia[key] == ib[key], key
+    ra, rb = _cache_arrays(a_dir / "distill" / "cache"), _cache_arrays(b_dir / "distill" / "cache")
+    assert len(ra) == len(rb)
+    for (ids_a, lp_a, rs_a), (ids_b, lp_b, rs_b) in zip(ra, rb):
+        assert ids_a.shape == ids_b.shape
+        assert np.allclose(lp_a.astype(np.float32), lp_b.astype(np.float32), atol=3e-2) and np.allclose(rs_a, rs_b, atol=3e-2)
+        assert (ids_a[:, 0] == ids_b[:, 0]).mean() > 0.97, "the most likely token is the same (up to rounding ties)"
+
+
+def test_an_out_of_memory_error_in_the_teacher_pass_shrinks_the_token_budget(tmp_path, base, monkeypatch):
+    cfg = cache_cfg(tmp_path, base, teacher_batch_tokens=100000)
+    real, state = dj._teacher_answers, {"failed": False}
+
+    def flaky(model, part, *a):
+        if len(part) > 2 and not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return real(model, part, *a)
+
+    monkeypatch.setattr(dj, "_teacher_answers", flaky)
+    code, ev = run_in_process(monkeypatch, dj.run_cache, cfg)
+    assert code == 0 and state["failed"] and ev[-1]["data"]["done_rows"] == ev[-1]["data"]["rows"]
+    assert any("Out of memory" in e.get("text", "") and "half as many tokens" in e.get("text", "") for e in ev if e["type"] == "log")

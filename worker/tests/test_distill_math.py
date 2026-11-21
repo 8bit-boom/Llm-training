@@ -127,3 +127,25 @@ def test_the_hidden_states_through_the_final_norm_hook_reproduce_the_logits(tmp_
     assert out.logits.shape[1] == 1                                          # only the last position went through the output layer
     w = model.get_output_embeddings().weight
     assert torch.allclose(hidden @ w.t(), full, atol=1e-4)
+
+
+# ---- the teacher's rows per forward by a token budget (docs/HEAL_SPEED.md)
+
+def test_rows_in_budget_fill_the_budget_with_the_longest_row_as_the_padding():
+    from ndforge_worker import distilljob as dj
+    assert dj.rows_in_budget([800, 700, 100], 16384) == 16, "short rows: up to the cap"
+    assert dj.rows_in_budget([4000, 3900, 100], 16384) == 4
+    assert dj.rows_in_budget([8192, 8000], 16384) == 2
+    assert dj.rows_in_budget([20000, 100], 16384) == 1, "a row longer than the budget goes alone"
+    assert dj.rows_in_budget([], 100) == 0
+    assert dj.rows_in_budget([10, 9, 8], 16384, cap=2) == 2
+
+
+def test_an_out_of_memory_error_shrinks_the_budget_and_ends_at_one_row():
+    from ndforge_worker import distilljob as dj
+    b = 16384
+    steps = []
+    while b:
+        b = dj.shrink_budget(b, 1000)
+        steps.append(b)
+    assert steps == [8192, 4096, 2048, 1024, 0] and dj.shrink_budget(1500, 1000) == 0

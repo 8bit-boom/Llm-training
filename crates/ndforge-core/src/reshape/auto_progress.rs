@@ -497,10 +497,6 @@ pub struct ProgressTracker {
     rounds_left: Option<(f64, f64)>,
 }
 
-fn parse_stamp(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
-}
-
 impl ProgressTracker {
     pub fn new() -> Self {
         ProgressTracker::default()
@@ -518,10 +514,7 @@ impl ProgressTracker {
         self.steps = st.steps.iter().map(|r| TStep {
             id: r.id.clone(), label: r.label.clone(), status: r.status.clone(), est: r.est, parts: r.est_parts.clone(),
             rounds: st.plan.as_ref().and_then(|p| p.time.as_ref()).and_then(|t| t.steps.iter().find(|x| x.id == r.id)).and_then(|x| x.rounds.clone()),
-            actual_min: (r.status == "done").then(|| match (r.started.as_deref().and_then(parse_stamp), r.finished.as_deref().and_then(parse_stamp)) {
-                (Some(a), Some(b)) if b > a => Some((b - a) as f64 / 60.0),
-                _ => None,
-            }).flatten(),
+            actual_min: (r.status == "done").then(|| r.seconds().filter(|n| *n > 0).map(|n| n as f64 / 60.0)).flatten(),
         }).collect();
         // a step that was done and is pending again: a retry; its weight comes back into the total
         let reopened: f64 = self.steps.iter().filter(|s| s.status == "pending" && old.iter().any(|o| o.0 == s.id && o.1 == "done")).map(|s| weight(s.est.unwrap_or((1.0, 1.0)))).sum();

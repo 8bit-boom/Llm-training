@@ -172,11 +172,48 @@ pub struct StepRec {
     /// the estimated minutes (middle) of the parts of the step in the order they run (`start`, `load`, `cache`, `train`, `merge` ...)
     #[serde(default)]
     pub est_parts: Vec<(String, f64)>,
+    /// the seconds of every finished attempt of this step added up (a stop and continue, a restart of the program or a retry each start another attempt: `started` / `finished` only hold the last one)
+    #[serde(default)]
+    pub spent_s: i64,
+    /// one entry per attempt that ran; a run saved before this existed has none (its time is `finished - started`)
+    #[serde(default)]
+    pub attempts: Vec<Attempt>,
+}
+
+/// One go at a step: from the moment it was marked running to the moment it ended (done, failed, stopped, taken up again, or cut off by closing the program).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub started: String,
+    pub finished: String,
+    pub seconds: i64,
+    pub outcome: String,
+}
+
+/// Seconds between two stamps of the state (`2026-11-20T01:19:00Z`); None when one cannot be read.
+pub(crate) fn stamp_secs(a: &str, b: &str) -> Option<i64> {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ").ok();
+    Some((parse(b)? - parse(a)?).num_seconds().max(0))
 }
 
 impl StepRec {
-    fn new(id: &str, label: &str) -> Self {
-        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None, est: None, est_parts: Vec::new() }
+    pub fn new(id: &str, label: &str) -> Self {
+        StepRec { id: id.into(), label: label.into(), status: "pending".into(), note: None, started: None, finished: None, est: None, est_parts: Vec::new(), spent_s: 0, attempts: Vec::new() }
+    }
+
+    /// Ends the attempt that is open (the step was running) at `end`.
+    pub fn close(&mut self, end: &str, outcome: &str) {
+        let Some(start) = self.started.clone() else { return };
+        let seconds = stamp_secs(&start, end).unwrap_or(0);
+        self.spent_s += seconds;
+        self.attempts.push(Attempt { started: start, finished: end.to_string(), seconds, outcome: outcome.to_string() });
+    }
+
+    /// The time the step took over ALL its attempts; a run saved before attempts were kept has only the last one (`finished - started`).
+    pub fn seconds(&self) -> Option<i64> {
+        if !self.attempts.is_empty() {
+            return Some(self.spent_s);
+        }
+        stamp_secs(self.started.as_deref()?, self.finished.as_deref()?)
     }
 }
 
@@ -269,6 +306,12 @@ pub struct AutoState {
     /// the engine the baseline (the original's check) was made with: every later check of the run uses the same one ("vllm" | "hf"); None until the first check
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_engine: Option<String>,
+    /// settings the person changed when continuing (`auto_change`): `{at, who: "person", changes: [{key, from, to, text}], confirmed, redo, remaining_h, was_remaining_h}`; the start spec of the run is not rewritten silently
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings_changes: Vec<Value>,
+    /// the spec the run was STARTED with (kept once, the first time a change is made)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_spec: Option<AutoSpec>,
 }
 
 impl AutoState {
@@ -276,7 +319,7 @@ impl AutoState {
         AutoState {
             format: FORMAT, id: id.into(), interrupted: false, spec, status: "running".into(), step: "plan".into(), error: None, created: now(), updated: now(), original: None, inspect: None, plan: None,
             steps: vec![StepRec::new("plan", "Check the model, the card and the disk")], chosen: None, drop_blocks: None, try_result: None, try_scan: None, measure: None, baseline: None,
-            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None, try_cands: None, engines: Vec::new(), check_engine: None,
+            stages: Vec::new(), made: Vec::new(), export: None, gguf_check: None, publish: None, report: None, notes: Vec::new(), think_gate: None, compare: None, budget: None, progress: None, try_cands: None, engines: Vec::new(), check_engine: None, settings_changes: Vec::new(), start_spec: None,
         }
     }
 
@@ -360,7 +403,7 @@ fn stage_steps(n: u32, of: u32, thinking: bool, check_cut: bool) -> Vec<StepRec>
 }
 
 /// The steps after the plan, for `stages` stages.
-fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec> {
+pub(crate) fn steps_after_plan(spec: &AutoSpec, stages: u32, with_try: bool) -> Vec<StepRec> {
     let mut v = vec![StepRec::new("measure", "Measure the model")];
     if with_try {
         v.push(StepRec::new("try", if spec.search_minutes.is_some() { "Find the best cut" } else { "Try the cuts" }));
@@ -409,12 +452,18 @@ enum Flow {
 fn mark(st: &mut AutoState, id: &str, status: &str, note: Option<String>) {
     let now = now();
     if let Some(s) = st.step_mut(id) {
+        let was_running = s.status == "running";
         s.status = status.into();
         if status == "running" {
             s.started = Some(now.clone());
             s.finished = None;
-        } else if status != "pending" {
-            s.finished = Some(now);
+        } else {
+            if was_running {
+                s.close(&now, if status == "pending" { "stopped or taken up again" } else { status });
+            }
+            if status != "pending" {
+                s.finished = Some(now);
+            }
         }
         if note.is_some() {
             s.note = note;
@@ -444,8 +493,20 @@ pub fn start(p: &Project, fx: &mut dyn Effects, spec: AutoSpec) -> Result<AutoSt
 
 /// Continues a stopped or failed run where it was.
 pub fn resume(p: &Project, fx: &mut dyn Effects, id: &str) -> Result<AutoState> {
+    resume_with(p, fx, id, None)
+}
+
+/// `resume` with settings the person changed on the way (`changes`: `(patch, confirmed)`, see `auto_change`): only settings that have not taken effect yet may change, what would redo
+/// finished work needs the confirmation, and every change is kept in the run's `settings_changes`. The steps that are done are never run again.
+pub fn resume_with(p: &Project, fx: &mut dyn Effects, id: &str, changes: Option<(serde_json::Map<String, Value>, bool)>) -> Result<AutoState> {
     let dir = run_dir(p, id);
     let mut st = load(&dir).ok_or_else(|| Error::new("That Auto-cut run was not found."))?;
+    if let Some((patch, confirmed)) = &changes {
+        if !matches!(st.status.as_str(), "stopped" | "failed") {
+            return Err(Error::new("Settings can only be changed on a stopped or failed run."));
+        }
+        super::auto_change::apply(&mut st, patch, *confirmed, fx.vram_gb(), fx.free_disk_gb(), &fx.history(), fx.now_secs())?;
+    }
     match st.status.as_str() {
         "stopped" | "failed" => {}
         "running" => return Err(Error::new("This Auto-cut run is running (or was cut off by closing the program: use Continue after the program has marked it stopped).")),
@@ -456,11 +517,30 @@ pub fn resume(p: &Project, fx: &mut dyn Effects, id: &str) -> Result<AutoState> 
     st.status = "running".into();
     st.interrupted = false;
     st.error = None;
+    let last_seen = st.updated.clone();
     for s in st.steps.iter_mut().filter(|s| s.status == "failed" || s.status == "stopped" || s.status == "running") {
+        if s.status == "running" && s.finished.is_none() {
+            s.close(&last_seen, "cut off (the program was closed)");          // the attempt ended when the state was last saved
+        }
         s.status = "pending".into();
     }
     save(&dir, &mut st)?;
     drive(p, &dir, st, fx)
+}
+
+/// "What if I change these settings and continue?" for a stopped or failed run: the diff, the locks, what needs a confirmation and the time left (`auto_change::preview`). Nothing is touched.
+pub fn change_preview(p: &Project, id: &str, patch: &serde_json::Map<String, Value>, vram_gb: Option<f64>) -> Result<Value> {
+    let st = load(&run_dir(p, id)).ok_or_else(|| Error::new("That Auto-cut run was not found."))?;
+    let history = crate::vllm::history_with_measured(crate::timing::History::recent(HISTORY_LOGS), Some(p));
+    let free = crate::envmgr::health::free_disk_gb(&super::runs::models_dir(p));
+    let mut out = super::auto_change::preview(&st, patch, vram_gb, free, &history);
+    out["status"] = json!(st.status);
+    out["can_change"] = json!(matches!(st.status.as_str(), "stopped" | "failed"));
+    out["current"] = serde_json::to_value(&st.spec).unwrap_or(Value::Null);
+    out["failed_step"] = json!(st.steps.iter().find(|s| matches!(s.status.as_str(), "failed" | "stopped")).map(|s| s.id.clone()));
+    out["error"] = json!(st.error);
+    out["suggestions"] = json!(super::auto_change::suggestions(&st));
+    Ok(out)
 }
 
 /// A run that was `running` when the program closed is marked stopped, so that it can be continued (the step that was cut off is run again).
@@ -472,7 +552,9 @@ pub fn mark_interrupted(p: &Project) -> usize {
             if let Some(mut s) = load(&dir) {
                 s.status = "stopped".into();
                 s.interrupted = true;
+                let last_seen = s.updated.clone();
                 for r in s.steps.iter_mut().filter(|r| r.status == "running") {
+                    r.close(&last_seen, "cut off (the program was closed)");          // the attempt lasted until the state was last saved
                     r.status = "pending".into();
                 }
                 if save(&dir, &mut s).is_ok() {
@@ -644,7 +726,7 @@ fn record_engine(st: &mut AutoState, key: &str, kind: &str, used: Option<&Value>
         rec["kv_cache"] = json!("fp8");          // "kv cache fp8" in the report
     }
     if let Some(u) = used {
-        for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "engine_version", "teacher_check", "problem", "unchecked"] {
+        for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "like_for_like", "engine_version", "teacher_check", "problem", "unchecked"] {
             if !u[k].is_null() {
                 rec[k] = u[k].clone();
             }
@@ -683,7 +765,10 @@ fn run_check(st: &mut AutoState, fx: &mut dyn Effects, step: &str, name: &str, t
     }
     fx.engine_cleanup();          // a vLLM job starts on a free card
     let kv8 = st.spec.vllm.as_ref().is_some_and(|v| v.kv_fp8);          // the 8-bit KV cache for the CHECKS only (never the teacher's answers)
-    let r = fx.think_check_with(name, target, quick, None, if kv8 { "vllm_fp8kv" } else { "vllm" })?;
+    // the route the original of this run was served with (its check result says): a later check of the same run is served the same way when it fits, so the numbers can be compared
+    let hint = if target != "original" { st.baseline.as_ref().and_then(|b| b["engine"]["pick"]["quant"].as_str()).filter(|_| st.check_engine.as_deref() == Some("vllm")).map(String::from) } else { None };
+    let base_engine = if kv8 { "vllm_fp8kv" } else { "vllm" };
+    let r = fx.think_check_with(name, target, quick, None, &match &hint { Some(h) => format!("{base_engine}@{h}"), None => base_engine.to_string() })?;
     let Out::Done(v) = r else { return Ok(Out::Stopped) };
     let used = v.get("engine_used").cloned();
     let fell = used.as_ref().is_some_and(|u| u["engine"] != "vllm");
@@ -1166,6 +1251,7 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
         None => Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name),
     };
     let mut spec = st.stages[idx].plan.heal_spec(st.keep_thinking());
+    spec.student_batch_tokens = st.spec.student_batch_tokens.filter(|n| *n > 0);          // chosen on the Auto page (off by default)
     let rounds = rounds_for(st, idx, fx.now_secs());
     let student = if rounds.is_some() { Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name) } else { student };
     match rounds {
