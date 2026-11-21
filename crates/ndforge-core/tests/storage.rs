@@ -169,7 +169,46 @@ fn the_guard_refuses_what_is_outside_the_folders_this_program_owns() {
     assert!(roots.guard(&w.p.folder.join("models").join("nope")).is_err(), "a path that is not there");
     roots.add(w.d.path().join("extra"));
     std::fs::create_dir_all(w.d.path().join("extra").join("x")).unwrap();
-    assert!(roots.guard(&w.d.path().join("extra").join("x")).is_ok());
+    assert!(roots.guard(&w.d.path().join("extra").join("x")).is_ok(), "a root added before it existed has the same spelling as one that exists");
+}
+
+#[test]
+fn a_root_spelled_in_another_equivalent_way_still_guards_the_same() {
+    let w = world();
+    let models = w.p.folder.join("models");
+    put(models.join("m").join("f"), 1);
+    let base = w.p.folder.to_string_lossy().to_string();
+    let m = models.join("m");
+    // `..` segments, a trailing separator, a `.` segment, the other kind of separator
+    let dotdot = w.p.folder.join("exports").join("..").join("models").join("m");
+    let dotted = w.p.folder.join(".").join("models").join("m");
+    let trailing = PathBuf::from(format!("{}{}", m.to_string_lossy(), std::path::MAIN_SEPARATOR));
+    let mut spellings = vec![m.clone(), dotted, trailing];
+    spellings.push(PathBuf::from(m.to_string_lossy().replace('\\', "/")));
+    let roots = Roots::new(Some(&w.p));
+    for sp in &spellings {
+        assert!(roots.guard(sp).is_ok(), "{sp:?} should be inside models/");
+    }
+    assert!(roots.guard(&dotdot).unwrap_err().0.contains(".."), "a `..` in the path itself is still refused");
+    // a root spelled with a trailing separator, `.` and `..`, or a different drive-letter case
+    let mut extra = Roots::default();
+    let e = w.d.path().join("spelled");
+    extra.add(PathBuf::from(format!("{}{}", w.d.path().join("x").join("..").join("spelled").to_string_lossy(), std::path::MAIN_SEPARATOR)));
+    put(e.join("a").join("f"), 1);
+    assert!(extra.guard(&e.join("a")).is_ok());
+    assert!(extra.guard(&e).is_err(), "the root itself is never deleted");
+    #[cfg(windows)]
+    {
+        let flipped: String = {
+            let s = e.join("a").to_string_lossy().to_string();
+            let mut c = s.chars();
+            let first = c.next().unwrap();
+            let f = if first.is_ascii_uppercase() { first.to_ascii_lowercase() } else { first.to_ascii_uppercase() };
+            format!("{f}{}", c.as_str())
+        };
+        assert!(extra.guard(Path::new(&flipped)).is_ok(), "the drive letter's case does not matter");
+    }
+    let _ = base;
 }
 
 #[cfg(unix)]
@@ -210,6 +249,18 @@ fn nothing_is_deleted_while_a_job_runs() {
     assert!(dir.is_dir());
 }
 
+/// Sets the modification time of a folder. Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS and write access for the attributes.
+fn set_dir_mtime(dir: &Path, t: std::time::SystemTime) {
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).custom_flags(0x0200_0000).open(dir).unwrap()
+    };
+    #[cfg(not(windows))]
+    let f = std::fs::File::open(dir).unwrap();
+    f.set_modified(t).unwrap();
+}
+
 #[test]
 fn an_id_that_is_not_in_a_fresh_scan_is_refused() {
     let w = world();
@@ -218,8 +269,7 @@ fn an_id_that_is_not_in_a_fresh_scan_is_refused() {
     // a made-up id
     assert!(plan_delete(&ctx(&w), &["s0000000000000000".into()], &opts("")).unwrap_err().0.contains("changed since"));
     // the folder changed after the scan (another modification time): the old id is refused
-    let f = std::fs::File::open(&dir).unwrap();
-    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120)).unwrap();
+    set_dir_mtime(&dir, std::time::SystemTime::now() + std::time::Duration::from_secs(600));
     let e = plan_delete(&ctx(&w), &[it.id.clone()], &opts("")).unwrap_err();
     assert!(e.0.contains("changed since"), "{}", e.0);
     assert!(dir.is_dir());

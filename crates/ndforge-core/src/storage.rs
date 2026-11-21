@@ -224,8 +224,36 @@ impl Roots {
     }
 }
 
-fn canon(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+/// One spelling for a path, used for every root and every path that is compared with one: the deepest part that exists is canonicalized (real letters of the drive and the names,
+/// no short `RUNNER~1` names, no links, the same verbatim prefix on both sides), the part that does not exist yet is added lexically (`.` and `..` resolved, a trailing
+/// slash and mixed `/` and `\` do not matter). A root that is created later therefore has the same spelling as one that is there already.
+pub fn canon(p: &Path) -> PathBuf {
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for part in rest.iter().rev() {
+                if part == ".." {
+                    out.pop();
+                } else if part != "." {
+                    out.push(part);
+                }
+            }
+            return out;
+        }
+        match (cur.file_name().map(|n| n.to_os_string()), cur.parent().map(Path::to_path_buf)) {
+            (Some(n), Some(parent)) => {
+                rest.push(n);
+                cur = parent;
+            }
+            (None, Some(parent)) if cur.ends_with("..") => {
+                rest.push("..".into());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// The Hugging Face hub folders the program and its worker use (`HF_HUB_CACHE`, `HF_HOME/hub`, `~/.cache/huggingface/hub`).
@@ -702,7 +730,7 @@ pub fn plan_delete(ctx: &Ctx, ids: &[String], opts: &Options) -> Result<Vec<Item
         } else if !matches!(it.exec, Exec::Volume(_)) {
             roots.guard(&it.path).map_err(|e| Error::new(format!("{}: {}", it.label, e.0)))?;
         }
-        if !opts.allow_pinned && it.model_repo.as_ref().is_some_and(|r| opts.pinned.iter().any(|p| !p.is_empty() && (p == r || Path::new(r).starts_with(p) || Path::new(p).starts_with(r)))) {
+        if !opts.allow_pinned && it.model_repo.as_ref().is_some_and(|r| opts.pinned.iter().any(|p| !p.is_empty() && (p == r || canon(Path::new(r)).starts_with(canon(Path::new(p))) || canon(Path::new(p)).starts_with(canon(Path::new(r)))))) {
             return Err(Error::new(format!("{} is the model chosen on the Slim or Auto page right now. Confirm that you want it deleted.", it.label)));
         }
         chosen.push(it.clone());
