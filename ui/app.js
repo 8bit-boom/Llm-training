@@ -2122,7 +2122,7 @@ function renderVllmTest(v) {
       <label>LoRA folder (optional: agreement check) <input type="text" id="vl-tadapter" value="${esc(vl.adapter)}" style="min-width:220px"></label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tkv" ${vl.kv ? "checked" : ""}> Also test the 8-bit KV cache (a second engine start: reports the cache size and speed for both)</label></div>
     <div class="row"><label class="opt"><input type="checkbox" id="vl-tconfirm" ${vl.confirm ? "checked" : ""}> I agree to the download: the default model is about 21 GB (plus the engine's image, several GB)</label></div>
-    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
+    <div class="row"><button class="primary" id="vl-test" ${busy || !v.enabled ? "disabled" : ""} title="${v.enabled ? "" : "Switch the engine on above first"}">Run the vLLM self-test</button><button class="secondary" id="vl-inflight" ${busy || !v.enabled ? "disabled" : ""} title="Starts the engine on the model above (a folder: your original) with the in-flight 4-bit route alone, no Hugging Face process, and says whether it worked or which lines name the cause. Minutes, not hours.">Test the in-flight 4-bit route on my original</button>${vl.run ? `<button class="secondary" id="vl-teststop">Stop</button>` : ""}</div>
     ${vl.run ? `<div class="stepline" aria-live="polite">${esc(vl.run.text)}</div>${vl.run.progress != null ? `<progress max="1" value="${vl.run.progress}"></progress>` : ""}` : ""}${rep}${vllmFilesBox(vl.files, "vl-files", "The report is saved in:")}`;
 }
 // the report's folder as text, with Copy path / Open the folder / Copy the whole report, and the text inline (also after a failure): the owner must be able to paste it into an issue
@@ -2171,6 +2171,11 @@ function wireVllm() {
     vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.adapter = (($("vl-tadapter") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
     vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
     invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: vl.adapter || null, ...(vl.kv ? { kv_fp8_test: true } : {}) } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
+  };
+  const tf = $("vl-inflight"); if (tf) tf.onclick = () => {
+    vl.model = (($("vl-tmodel") || {}).value || "").trim(); vl.confirm = !!($("vl-tconfirm") || {}).checked;
+    vl.run = { text: "Starting…", progress: null }; vl.err = null; render();
+    invoke("vllm_selftest_start", { spec: { model: vl.model, confirm_download: vl.confirm, adapter: null, in_flight: true } }).catch((e) => { vl.run = null; vl.err = String(e); render(); });
   };
   const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }

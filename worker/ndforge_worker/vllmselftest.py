@@ -21,7 +21,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import protocol, thinkcheck, thinkcheck_vllm, vllmengine
+from . import protocol, thinkcheck, thinkcheck_vllm, vllmengine, vllmquant
 from .thinkcheck import ThinkCheckError
 
 REPORT_VERSION = 1
@@ -293,6 +293,12 @@ def markdown(rep: dict) -> str:
         L += ["## Start command (the API key is replaced)", "", f"KV cache type passed to this engine: {kr.get('first', 'auto')}.", "", "    " + " ".join(str(x) for x in rep["start_command"]), ""]
     if rep.get("start_command_fp8"):
         L += ["## Start command of the fp8 engine (the API key is replaced)", "", "KV cache type passed to this engine: fp8.", "", "    " + " ".join(str(x) for x in rep["start_command_fp8"]), ""]
+    if rep.get("in_flight"):
+        f = rep["in_flight"]
+        L += ["## The in-flight 4-bit route on this model", "", f"Flags: `{' '.join(f.get('flags') or [])}`. Result: {'WORKED' if f.get('worked') else 'FAILED' if f.get('worked') is False else 'not reached'}" + (f" (ready after {f['startup_seconds']} s)" if f.get("startup_seconds") else "") + ".", ""]
+        L += [f"    {x}" for x in (f.get("root_cause") or [])] + ([""] if f.get("root_cause") else [])
+    if rep.get("root_cause") and not (rep.get("in_flight") or {}).get("root_cause"):
+        L += ["## Lines that name the cause", ""] + [f"    {x}" for x in rep["root_cause"]] + [""]
     if rep.get("exit_logs"):
         L += ["## Last lines of the container's log (read before it was removed)", ""] + [f"    {x}" for x in str(rep["exit_logs"]).splitlines()[-60:]] + [""]
     if rep.get("timings"):
@@ -598,8 +604,14 @@ def run(job: dict) -> int:
         cfg = vllmengine.engine_config(job)
     except vllmengine.EngineError as exc:
         raise ThinkCheckError(str(exc), "vllm_selftest_failed") from exc
+    in_flight = bool(job.get("in_flight"))
+    if in_flight:
+        job = {**job, "engine": {**(job.get("engine") or {}), "quant": "bnb-nf4"}}          # the in-flight 4-bit route on this model, alone: no Hugging Face process, no cache job
     rep: dict = {"generic_test": generic_note(model), "version": REPORT_VERSION, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "note": NOTE, "model": model, "adapter": adapter, "download_note": download_note(model),
                  "engine": {k: cfg.get(k) for k in ("kind", "image", "distro", "venv", "url", "version")}, "prerequisites": [], "comparisons": [], "hints": [], "commands": [], "stopped": False}
+    if in_flight:
+        rep["in_flight"] = {"route": "bnb-nf4", "flags": list(vllmquant.BNB_ARGS), "pip_plugin": None, "worked": None,
+                            "note": "The in-flight 4-bit route (bitsandbytes) on this model, alone and in minutes: UNVERIFIED how vLLM 0.34 spells it. The report says which flags were used and, when it fails, the lines that name the cause."}
     engine = None
     try:
         protocol.progress("selftest", 0.05, "Checking the prerequisites")
@@ -653,12 +665,17 @@ def run(job: dict) -> int:
             list_sample(rep, cfg, "in the failure path, before the container is removed", vllmengine.container_name(engine.port))
             rep["exit_logs"] = engine.exit_logs or engine.logs_tail(60)       # read before `_finish` removes the container
             rep["highlights"] = vllmengine.log_highlights(rep["exit_logs"] + "\n" + engine.log_text())
+            rep["root_cause"] = vllmengine.root_cause(engine.logs_big(800) + "\n" + rep["exit_logs"] + "\n" + engine.log_text())
+            if in_flight:
+                rep["in_flight"].update(worked=False, root_cause=rep["root_cause"])
             return _finish(rep, out_dir, t_start, engine)
         full_log = engine.logs_big(800) + "\n" + engine.log_text()
         rep["_full_log"] = full_log
         rep.update(startup_seconds=engine.ready_seconds, server_version=engine.server_version(), highlights=vllmengine.log_highlights(full_log, 60))
         rep.update(startup_parts(engine.ready_seconds, full_log))
         list_sample(rep, cfg, "right after /health answered", vllmengine.container_name(engine.port))
+        if in_flight:
+            rep["in_flight"].update(worked=True, startup_seconds=engine.ready_seconds, quant=thinkcheck_vllm.quant_of(job))
         rep["reachability"] = reachability(engine)
         if should_stop():
             rep["stopped"] = True

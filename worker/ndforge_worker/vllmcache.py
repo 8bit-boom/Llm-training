@@ -26,6 +26,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
+from collections import deque
 from pathlib import Path
 
 from . import protocol, vllmengine, vllmquant
@@ -116,8 +118,9 @@ def exec_templates(cfg: dict) -> dict:
     return {**base, **{k: str(v) for k, v in over.items() if k in base}}
 
 
-REMEDY = ("To go on without vLLM: turn off \"Make the original's answers with vLLM\" on the Heal card, or in Auto-cut open \"Change settings and continue\" and switch the vLLM teacher cache off "
-          "(the standard teacher then answers). \"Test the container copy\" on the Heal card finds out which way of getting files into the container works on this PC.")
+REMEDY_OFF = ("To go on without vLLM: turn off \"Make the original's answers with vLLM\" on the Heal card, or in Auto-cut open \"Change settings and continue\" and switch the vLLM teacher cache off "
+              "(the standard teacher then answers).")
+REMEDY = REMEDY_OFF + " \"Test the container copy\" on the Heal card finds out which way of getting files into the container works on this PC."
 PROBE_TEXT = ("ndforge container copy probe 0123456789 " * 26)[:1024]             # 1 KB of plain text
 CP_IN_VARIANTS = ("file", "dir", "touch", "fwd")                                  # `cp src name:/work/f`, `cp src name:/work/` (+ mv), `touch` first, forward slashes in the source
 CP_OUT_VARIANTS = ("file", "dir", "fwd")
@@ -457,6 +460,22 @@ class Container:
         else:
             self.run(self.cp_out_command(src, dst), timeout, what, quiet=quiet)
 
+    def evidence(self, script_lines=()) -> str:
+        """Why a run failed, collected BEFORE the container is removed: the root-cause lines of the script's own output (every line it printed, kept by the caller) and of the container's log, written to the
+        job log, and the last ones as text for the error."""
+        lines = list(script_lines)
+        rc = vllmengine.root_cause("\n".join(lines))
+        try:
+            if self.started and self.kind != "wsl":
+                big = vllmengine.Engine.logs_big(types.SimpleNamespace(kind=self.kind, port=self.port, cfg=self.cfg, log_text=lambda: ""), 800)
+                rc = (vllmengine.root_cause(big) + rc)[-25:] if big.strip() else rc
+        except Exception:                                       # noqa: BLE001 - the evidence must never hide the failure itself
+            pass
+        if rc:
+            protocol.log("Root cause lines (script and container log):\n" + "\n".join(rc))
+        tail = [protocol.scrub(x.strip())[:300] for x in lines if x.strip()][-8:]
+        return (("Root cause: " + " | ".join(rc[-12:]) + ". ") if rc else "No line of the engine's output names a cause. ") + ("Last lines: " + " | ".join(tail) if tail else "The script printed nothing.")
+
     def stop(self) -> None:
         """Always the explicit stop and remove; never raises."""
         if self.kind in ("wsl",) and not self.started:
@@ -561,6 +580,29 @@ def _reader(proc, q: "queue.Queue") -> None:
     q.put(None)
 
 
+def _log_gpu_before_start(g: dict, total, used) -> None:
+    """The arithmetic of the engine's memory, in the job log, before any engine starts."""
+    if total and used is not None:
+        free = (float(total) - float(used)) / 1024
+        protocol.log(f"GPU free before the engine start: {free:.1f} GB of {float(total) / 1024:.1f} GB; the engine takes {g['util'] * float(total) / 1024:.1f} GB ({g['util']:g} of the card). {g['text']}")
+    else:
+        protocol.log(f"GPU memory before the engine start is not known (nvidia-smi did not answer). {g['text']}")
+
+
+def _check_bnb_fit(origin_dir, g: dict, total, used) -> None:
+    """The in-flight 4-bit route needs its weights + overhead + a minimum cache within the engine's budget: refused early with the arithmetic when it cannot (never after the rows were staged)."""
+    from . import vllmquant
+    sizes = vllmquant.route_weights_gb(str(origin_dir))
+    if not sizes or not total or used is None:
+        return
+    free = round((float(total) - float(used)) / 1024, 1)
+    bud = vllmquant._budgets(float(total) / 1024, g["util"], free)
+    pl = vllmquant._place(sizes["nf4"], bud)
+    protocol.log(f"4-bit fit of the original ({sizes['bf16']} GB in 16 bits): {pl['arith']}.")
+    if not pl["ok"]:
+        raise VllmCacheError(f"The original does not fit in 4 bits next to the engine's needs: {pl['arith']}. Free more memory on the card (close other programs) or use the standard engine. {REMEDY_OFF}")
+
+
 def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, first: int, last: int, k: int, max_seq: int, stop_file, *, on_progress=None, sleep=time.sleep) -> dict:
     """Scores rows `first..last` of `rows_dir/rows.npz` with vLLM and writes them into `writer` (the worker's cache writer, which already holds rows before `first`).
     -> {"engine", "teacher_quant", "startup_seconds", "tokens_per_s", "tokens", "load_phases", "stopped", "rows", "seconds", "notes"}; VllmCacheError when vLLM could not do it
@@ -573,6 +615,9 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
     if g["ok"] is False:
         raise VllmCacheError(g["text"])
     job = {**job, "engine": {**(job.get("engine") or {}), "gpu_memory_utilization": g["util"]}}
+    _log_gpu_before_start(g, total, used)
+    if sel["route"] == "bnb":
+        _check_bnb_fit(origin_dir, g, total, used)
     tmp_ctx = tempfile.TemporaryDirectory(prefix="ndforge-vllm-")
     tmp = Path(tmp_ctx.name)
     work = tmp / "work"                                          # the host folder that is /work in the container when the bind mount works
@@ -614,6 +659,7 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         q: queue.Queue = queue.Queue()
         threading.Thread(target=_reader, args=(proc, q), daemon=True).start()
         syncer = Syncer(box, writer, tmp, first)
+        seen_lines: deque = deque(maxlen=800)                   # every line the script printed: the cause of a failure is among them
         last_sync = time.monotonic()
         stop_sent, script_t0, first_scoring = False, time.monotonic(), None
         failure = None
@@ -625,6 +671,7 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
             if line is None:
                 break
             if line:
+                seen_lines.append(line.rstrip())
                 obj = _parse(line)
                 if obj is None:
                     if LOAD_LINES.search(line) and len(result["load_phases"]) < 80:
@@ -665,9 +712,9 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         syncer.sync()                                            # the last parts, also after a failure: a later run goes on after them
         code = getattr(proc, "returncode", 0)
         if failure:
-            raise VllmCacheError(failure)
+            raise VllmCacheError(f"{failure} {box.evidence(seen_lines)}")
         if code not in (0, None):
-            raise VllmCacheError(f"The vLLM script ended with exit code {code}. Its last lines: " + " | ".join(x["line"] for x in result["load_phases"][-4:]))
+            raise VllmCacheError(f"The vLLM script ended with exit code {code}. {box.evidence(seen_lines)}")
         result["stopped"] = bool(result["stopped"] or (stop_sent and writer.done_rows < last))
         result["rows"] = syncer.rows
         result["seconds"] = round(time.monotonic() - t0, 1)

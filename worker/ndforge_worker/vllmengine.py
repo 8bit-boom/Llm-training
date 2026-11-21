@@ -445,6 +445,28 @@ PROGRESS_BAR = re.compile(r"(it/s\]|s/it\]|Capturing CUDA graphs|Capturing CUDA 
 CACHE_LINES = re.compile(r"(GPU KV cache size|KV cache size|Maximum concurrency|init engine .*took|Available KV cache memory|model loading took)", re.I)
 
 
+ROOT_CAUSE = re.compile(r"(error|exception|traceback|raise |free memory|out of memory|oom|desired gpu memory|bitsandbytes|plugin|quantiz|cuda|engine core|failed|cannot|could not|not supported|no module named|invalid)", re.I)
+
+
+def root_cause(text: str, limit: int = 25) -> list:
+    """The lines of an engine's or a script's output that say WHY it failed (Error, Traceback, "Free memory", out of memory, bitsandbytes, plugin, quantization, CUDA, Engine core ...): the last `limit`
+    of them, each cut to 300 characters, secrets scrubbed, repeated lines once. A progress bar or a normal INFO line is not one of them."""
+    seen: set = set()
+    out: list = []
+    for raw in (text or "").splitlines():
+        line = raw.replace("\x00", "").strip()
+        if not line or not ROOT_CAUSE.search(line) or PROGRESS_BAR.search(line):
+            continue
+        if re.match(r"^(INFO|DEBUG)\b", line) and not re.search(r"(error|failed|free memory|out of memory)", line, re.I):
+            continue
+        short = protocol.scrub(line)[:300]
+        if short in seen:
+            continue
+        seen.add(short)
+        out.append(short)
+    return out[-limit:]
+
+
 def log_highlights(text: str, limit: int = 40) -> list:
     """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems.
     Progress-bar lines (`Capturing CUDA graphs ... it/s]`) are dropped before anything is counted, and the cache lines (GPU KV cache size, concurrency, init engine ... took) are never the ones the cap cuts."""
@@ -638,6 +660,18 @@ class Engine:
                 pass
         return self.tail(n)
 
+    def evidence(self, n: int = 800) -> str:
+        """The root cause of a failure, read BEFORE the container is removed: the filtered lines of its log (and the last lines) go to the job log and into the error text."""
+        try:
+            big = self.logs_big(n)
+        except Exception:                                       # noqa: BLE001 - never hide the original failure
+            big = ""
+        rc = root_cause(big)
+        if rc:
+            protocol.log("Root cause lines from the engine's log:\n" + "\n".join(rc))
+        tail = self.logs_tail(12) if not big.strip() else "\n".join([x for x in big.strip().splitlines() if x.strip()][-12:])
+        return ("Root cause: " + " | ".join(rc[-12:]) + ". " if rc else "") + "Its last lines: " + protocol.scrub(tail)
+
     def logs_big(self, n: int = 800, limit: int = 200_000) -> str:
         """Many more log lines (the kernel and the cache lines are far above the last 60): docker `logs --tail n`, wslc the `logs` template with its `-n` replaced; size-limited."""
         cmd = None
@@ -672,11 +706,11 @@ class Engine:
             if self.proc is not None and self.state_command() and time.monotonic() >= next_state:
                 next_state = time.monotonic() + STATE_EVERY
                 if self.running() is False:          # a crash at start (out of memory, a bad option): do not wait for the timeout
-                    self.exit_logs = self.logs_tail(60)
-                    raise EngineError(f"The vLLM engine's container is not running any more (it stopped while starting). Its last lines: {self.exit_logs}")
+                    self.exit_logs = self.evidence()
+                    raise EngineError(f"The vLLM engine's container is not running any more (it stopped while starting). {self.exit_logs}")
             if self.proc is not None and self.proc.poll() is not None and not (self.kind == "wslc" and self.proc.returncode == 0):     # `wslc run -d` ends at once, fine
-                self.exit_logs = self.logs_tail(60)
-                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). Its last lines: {self.exit_logs}")
+                self.exit_logs = self.evidence()
+                raise EngineError(f"The vLLM engine stopped while starting (exit code {self.proc.returncode}). {self.exit_logs}")
             if should_stop():
                 return
             try:
@@ -687,8 +721,8 @@ class Engine:
             except (urllib.error.URLError, OSError):
                 pass                                        # not listening yet
             if time.monotonic() > deadline:
-                self.exit_logs = self.logs_tail(60)
-                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). Its last lines: {self.exit_logs}")
+                self.exit_logs = self.evidence()
+                raise EngineError(f"The vLLM engine did not become ready within {int(timeout)} seconds (an image pull or a model download can take that long the first time). {self.exit_logs}")
             sleep(0.25)
 
     def server_version(self) -> str:

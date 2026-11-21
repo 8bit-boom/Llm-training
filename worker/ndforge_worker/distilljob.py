@@ -867,7 +867,7 @@ def _early_vllm_probe(cfg: dict) -> None:
     pr = _vc.probe(cfg)
     protocol.log(f"Container copy test: {'ok' if pr['ok'] else 'FAILED'} after {pr.get('seconds')} s. {pr['text']}")
     if not pr["ok"]:
-        raise ReshapeError(f"vLLM was required for the teacher's answers but the container cannot be used: {pr['text']}" + ("" if _vc.REMEDY in pr["text"] else " " + _vc.REMEDY))
+        raise ReshapeError(f"vLLM was required for the teacher's answers but the container cannot be used: {pr['text']}" + ("" if _vc.REMEDY_OFF in pr["text"] else " " + _vc.REMEDY_OFF))
 
 
 def run_cache(cfg: dict) -> int:
@@ -1110,7 +1110,7 @@ def _vllm_teacher(cfg: dict, writer, rows: list, out, meta: dict, teacher_dir, k
             problem = str(exc)
     rec.update(used=False, fallback=True, problem=problem)
     if eng.get("required"):
-        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}" + ("" if vllmcache.REMEDY in problem else " " + vllmcache.REMEDY))
+        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}" + ("" if vllmcache.REMEDY_OFF in problem else " " + vllmcache.REMEDY_OFF))
     return "fallback", f"vLLM could not make the teacher's answers ({problem}) The standard teacher makes them instead."
 
 

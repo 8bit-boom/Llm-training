@@ -228,3 +228,11 @@ test("the KV warning for the teacher is part of the numbers the Heal card shows"
   b.run("rs.hlSpec.vllm = true");
   assert.match(b.run("renderReshape()"), /8-bit KV cache for the teacher: measured 1\.2x more cached tokens and no speed gain/);
 });
+
+test("the Settings card has a button that tests the in-flight 4-bit route alone, with the real keys", async () => {
+  const b = makeBrowser({ answers: {}, state: () => baseState({ enabled: true, kind: "auto", teacher: { enabled: true, route: "auto", pairs: {}, confirmed: {}, required: false } }) });
+  b.run(`state = ${JSON.stringify(baseState({ enabled: true, kind: "auto", teacher: { enabled: true, route: "auto", pairs: {}, confirmed: {}, required: false } }))}`);
+  const html = b.run("renderVllm()");
+  assert.match(html, /id="vl-inflight"/);
+  assert.match(html, /Test the in-flight 4-bit route on my original/);
+});

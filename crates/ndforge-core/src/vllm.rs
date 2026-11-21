@@ -320,6 +320,9 @@ pub fn selftest_job(s: &VllmSettings, spec: &Value, p: Option<&crate::project::P
     if let Some(a) = spec["adapter"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
         job["adapter"] = json!(a);
     }
+    if spec["in_flight"].as_bool() == Some(true) {
+        job["in_flight"] = json!(true);          // the in-flight 4-bit route on this model alone (the worker forces `--quantization bitsandbytes` and reports the flags and the root-cause lines)
+    }
     if spec["kv_fp8_test"].as_bool() == Some(true) {
         job["kv_fp8_test"] = json!(true);          // the optional second pass: the same test with the 8-bit KV cache
     }

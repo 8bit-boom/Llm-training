@@ -160,6 +160,13 @@ def pick(model: str, engine: dict | None = None) -> dict:
     sizes = None if e.get("weights_gb") else route_weights_gb(model)
     gb = float(e["weights_gb"]) if e.get("weights_gb") else (sizes["bf16"] if sizes else weights_gb(model))
     base = {"model": model, "weights_gb": gb, "usable_gb": usable}
+    if given == "bnb-nf4":
+        # asked for: the in-flight 4-bit route on THIS model (the self-test "Test the in-flight 4-bit route"): the fit is calculated, nothing else is decided
+        if gb is None:
+            return {**base, "quant": "bnb-nf4", "fits": None, "reason": "As you chose: the in-flight 4-bit route (UNVERIFIED); the size of the weights is not known, so the fit is not checked."}
+        w4_ = sizes["nf4"] if sizes else round(gb * BNB_SHARE, 1)
+        pl = _place(w4_, bud)
+        return _fitted(base, "bnb-nf4", pl, f"As you chose: the in-flight 4-bit route (UNVERIFIED): {pl['arith']}.", served=f"{model} (4-bit on the fly)")
     if given != "auto":
         if given in ("none", "fp8"):
             return {**base, "quant": given, "fits": None, "reason": f"As you chose: {given}."}

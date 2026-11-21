@@ -264,6 +264,28 @@ def _free() -> None:
         torch.cuda.empty_cache()
 
 
+def release_gpu(what: str = "the model") -> str:
+    """Gives ALL the graphics memory of this process back before a container takes the card: garbage collection (twice), a synchronize, the allocator's cache and the shared-memory handles. Logs how much
+    this process still holds and how much of the card is free, and returns that sentence (a CUDA context itself, about half a GB, stays until the process ends). Never raises."""
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if not torch.cuda.is_available():
+            return ""
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        free, total = torch.cuda.mem_get_info()
+        text = (f"After releasing {what}: this process holds {torch.cuda.memory_reserved() / 1e9:.1f} GB of graphics memory; {free / 1024 ** 3:.1f} GB of {total / 1024 ** 3:.1f} GB of the card are free.")
+        protocol.log(text)
+        return text
+    except Exception as exc:                                    # noqa: BLE001 - a report, never a failure
+        protocol.log(f"The graphics memory could not be measured after releasing {what} ({type(exc).__name__}).")
+        return ""
+
+
 def _find_layers(model, n: int):
     """The nn.ModuleList of exactly n decoder layers."""
     import torch

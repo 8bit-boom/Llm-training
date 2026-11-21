@@ -85,6 +85,8 @@ def make_engine(job: dict) -> "vllmengine.Engine":
     g = vllmengine.plan_gpu_util(total, used, float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL))
     if g["ok"] is False:
         raise ThinkCheckError(g["text"])
+    if total and used is not None:
+        protocol.log(f"GPU free before the engine start: {(float(total) - float(used)) / 1024:.1f} GB of {float(total) / 1024:.1f} GB; the engine takes {g['util'] * float(total) / 1024:.1f} GB ({g['util']:g} of the card). {g['text']}")
     job["engine"] = e = {**e, "gpu_memory_utilization": g["util"]}          # lowered when other programs use the card; the weights' fit below uses it
     job.setdefault("_engine_report", {})["gpu"] = g
     if str(e.get("kv_cache_dtype") or "auto").lower() == "fp8":

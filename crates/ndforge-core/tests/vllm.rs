@@ -184,3 +184,13 @@ fn the_container_probe_job_carries_the_container_settings_of_the_other_vllm_jobs
     assert_eq!(j["engine"]["container"]["kind"], "wslc");
     assert_eq!(j["engine"]["container"]["wslc"]["cp_in"], "wslc cp {src} {name}:{dst}");
 }
+
+#[test]
+fn the_in_flight_test_is_a_self_test_with_a_flag() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let j = selftest_job(&VllmSettings::default(), &json!({"model": "D:/models/original", "in_flight": true}), None).unwrap();
+    assert_eq!((j["job"].as_str(), j["model"].as_str(), j["in_flight"].as_bool()), (Some("vllm_selftest"), Some("D:/models/original"), Some(true)));
+    assert!(selftest_job(&VllmSettings::default(), &json!({}), None).unwrap().get("in_flight").is_none());
+}
