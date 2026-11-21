@@ -170,6 +170,8 @@ impl Effects for RealEffects<'_> {
     }
 
     fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        // "vllm@bnb-nf4": the route the original of this run was served with, so that the worker serves this model the same way when it fits (a like-for-like comparison)
+        let (engine, route_hint) = match engine.split_once('@') { Some((e, h)) => (e, Some(h.to_string())), None => (engine, None) };
         if !engine.starts_with("vllm") || gguf.is_some() || target == "gguf" {
             return self.think_check(name, target, quick, gguf);
         }
@@ -200,6 +202,9 @@ impl Effects for RealEffects<'_> {
                 e["kv_cache_dtype"] = json!("fp8");
             }
         }
+        if let (Some(h), Some(e)) = (route_hint.as_ref().filter(|_| target != "original"), spec.engine.as_mut()) {
+            e["route_hint"] = json!(h);
+        }
         let stop = self.stop.clone();
         let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
         let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);
@@ -208,7 +213,8 @@ impl Effects for RealEffects<'_> {
         }
         match r {
             Ok(mut v) => {
-                v["engine_used"] = json!({"engine": "vllm", "fallback": false, "engine_version": v["engine"]["vllm"], "startup_seconds": v["engine"]["startup_seconds"], "tokens_per_s": v["tokens_per_s"]});
+                v["engine_used"] = json!({"engine": "vllm", "fallback": false, "engine_version": v["engine"]["vllm"], "startup_seconds": v["engine"]["startup_seconds"], "tokens_per_s": v["tokens_per_s"],
+                                         "route": v["engine"]["pick"]["quant"], "like_for_like": v["engine"]["pick"]["like_for_like"]});
                 Ok(Out::Done(v))
             }
             Err(e) => fall(self, format!("vLLM did not work ({}).", e.0.chars().take(200).collect::<String>())),

@@ -726,7 +726,7 @@ fn record_engine(st: &mut AutoState, key: &str, kind: &str, used: Option<&Value>
         rec["kv_cache"] = json!("fp8");          // "kv cache fp8" in the report
     }
     if let Some(u) = used {
-        for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "engine_version", "teacher_check", "problem", "unchecked"] {
+        for k in ["note", "startup_seconds", "load_seconds", "tokens_per_s", "teacher_quant", "route", "like_for_like", "engine_version", "teacher_check", "problem", "unchecked"] {
             if !u[k].is_null() {
                 rec[k] = u[k].clone();
             }
@@ -765,7 +765,10 @@ fn run_check(st: &mut AutoState, fx: &mut dyn Effects, step: &str, name: &str, t
     }
     fx.engine_cleanup();          // a vLLM job starts on a free card
     let kv8 = st.spec.vllm.as_ref().is_some_and(|v| v.kv_fp8);          // the 8-bit KV cache for the CHECKS only (never the teacher's answers)
-    let r = fx.think_check_with(name, target, quick, None, if kv8 { "vllm_fp8kv" } else { "vllm" })?;
+    // the route the original of this run was served with (its check result says): a later check of the same run is served the same way when it fits, so the numbers can be compared
+    let hint = if target != "original" { st.baseline.as_ref().and_then(|b| b["engine"]["pick"]["quant"].as_str()).filter(|_| st.check_engine.as_deref() == Some("vllm")).map(String::from) } else { None };
+    let base_engine = if kv8 { "vllm_fp8kv" } else { "vllm" };
+    let r = fx.think_check_with(name, target, quick, None, &match &hint { Some(h) => format!("{base_engine}@{h}"), None => base_engine.to_string() })?;
     let Out::Done(v) = r else { return Ok(Out::Stopped) };
     let used = v.get("engine_used").cloned();
     let fell = used.as_ref().is_some_and(|u| u["engine"] != "vllm");

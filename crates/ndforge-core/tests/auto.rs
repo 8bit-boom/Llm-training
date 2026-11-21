@@ -96,6 +96,9 @@ struct Mock {
     leak_engine: bool,
     /// the vLLM checks fail (the standard engine does them: the result says so)
     vllm_checks_fail: bool,
+    /// the route the mock's vLLM serves the original with (`engine.pick.quant` of its result); later checks get the hint of the engine string unless `pick_mismatch`
+    pick_original: Option<String>,
+    pick_mismatch: bool,
     /// what a heal that was asked to use vLLM reports: `teacher_engine` of its summary
     teacher_engine: Option<Value>,
 }
@@ -104,7 +107,7 @@ impl Mock {
     fn new() -> Self {
         Mock {
             ins: qwen27(), n: 0, stop_at: None, stop_flag: false, done: Vec::new(), all: Vec::new(), events: Vec::new(), cuts: 0, heals: 0, made: BTreeSet::new(), removed: Vec::new(), dropped: Vec::new(), specs: Vec::new(),
-            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, fail_text: None, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(),
+            free_gb: Some(900.0), vram: Some(32.0), data: true, checks: BTreeMap::new(), asked: BTreeMap::new(), losses: BTreeMap::new(), try_acc: BTreeMap::new(), fail_heal_once: false, fail_text: None, publish_ok: true, promote: false, compare_error: None, exports_made: BTreeSet::new(), heal_specs: Vec::new(), imatrix: Vec::new(), clock: None, tracker: None, searches: Vec::new(), search_budget_stop: false, rounds_stops: std::collections::VecDeque::new(), pick_original: None, pick_mismatch: false,
             hist: ndforge_core::timing::History::default(), vllm_log: Vec::new(), engine_running: false, cleanups: 0, leak_engine: false, vllm_checks_fail: false, teacher_engine: None,
         }
     }
@@ -243,6 +246,7 @@ impl Effects for Mock {
         self.hist.clone()
     }
     fn think_check_with(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>, engine: &str) -> Result<Out<Value>> {
+        let hint = engine.split_once('@').map(|(_, h)| h.to_string());
         if !engine.starts_with("vllm") {
             return self.think_check(name, target, quick, gguf);
         }
@@ -255,7 +259,15 @@ impl Effects for Mock {
         let r = r?;
         Ok(match r {
             Out::Done(mut v) => {
+                if let Some(orig) = self.pick_original.clone() {
+                    let (quant, like) = if target == "original" { (orig, Value::Null) } else if self.pick_mismatch { ("fp8".to_string(), json!(false)) } else { (hint.clone().unwrap_or_else(|| "fp8".into()), json!(hint.is_some())) };
+                    v["engine"] = json!({"pick": {"quant": quant, "like_for_like": like}});
+                }
                 v["engine_used"] = if self.vllm_checks_fail { json!({"engine": "hf", "fallback": true, "requested": true, "note": "vLLM did not start."}) } else { json!({"engine": "vllm", "fallback": false, "startup_seconds": 263.5}) };
+                if v["engine"]["pick"].is_object() && v["engine_used"]["engine"] == "vllm" {
+                    v["engine_used"]["route"] = v["engine"]["pick"]["quant"].clone();
+                    v["engine_used"]["like_for_like"] = v["engine"]["pick"]["like_for_like"].clone();
+                }
                 Out::Done(v)
             }
             o => o,
@@ -2306,6 +2318,26 @@ fn suggestions_after_a_failed_heal_are_offered_unless_locked() {
     let texts: Vec<String> = pv["suggestions"].as_array().unwrap().iter().map(|x| x["text"].as_str().unwrap().to_string()).collect();
     assert!(texts.iter().any(|t| t.contains("ran out of memory")) && texts.iter().any(|t| t.contains("rounds")) && texts.iter().any(|t| t.contains("vLLM")), "{texts:?}");
     assert!(pv["locks"].as_array().unwrap().iter().any(|l| l["key"] == "target_b" && l["state"] == "locked"));
+}
+
+#[test]
+fn the_checks_of_a_run_are_served_the_way_the_original_was_and_the_report_says_the_route() {
+    for mismatch in [false, true] {
+        let d = tempdir().unwrap();
+        let p = project(d.path());
+        let mut fx = Mock::new();
+        fx.hist = vllm_hist();
+        fx.pick_original = Some("bnb-nf4".into());
+        fx.pick_mismatch = mismatch;
+        start(&p, &mut fx, vspec(false, true, false)).unwrap();
+        let hinted = fx.vllm_log.iter().filter(|l| l.starts_with("engine=vllm@bnb-nf4")).count();
+        assert!(fx.vllm_log.iter().any(|l| l == "engine=vllm"), "the original's own check has no hint: {:?}", fx.vllm_log);
+        assert!(hinted > 0, "the later checks carry the route of the original: {:?}", fx.vllm_log);
+        let st = latest(&p).unwrap();
+        let md = std::fs::read_to_string(run_dir(&p, &st.id).join("auto_report.md")).unwrap();
+        assert!(md.contains(", route bnb-nf4") || md.contains(", route fp8"), "the table names the route: {md}");
+        assert_eq!(md.contains("different quantization: not like-for-like"), mismatch, "{md}");
+    }
 }
 
 #[test]

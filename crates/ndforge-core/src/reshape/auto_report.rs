@@ -161,8 +161,10 @@ fn vllm_markdown(r: &Value) -> String {
     for e in &steps {
         let est = e["estimated_min"]["vllm"].as_array().map(|a| format!("{:.0} to {:.0} min in all", a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))).unwrap_or_else(|| "-".into());
         let startup = e["startup_seconds"].as_f64().map(|x| format!("{:.1} min", x / 60.0)).unwrap_or_else(|| "-".into());
-        s.push_str(&format!("| {} | {}{} | {} | {} ({est}) | {} | {} |\n", e["step"].as_str().unwrap_or(""), e["engine_version"].as_str().or(e["engine"].as_str()).unwrap_or("?"), if e["fallback"] == true { " (fell back to the standard engine)" } else { "" },
-                             e["teacher_quant"].as_str().unwrap_or("-"), startup, e["tokens_per_s"].as_f64().map(|x| format!("{x:.0} tokens/s")).unwrap_or_else(|| "-".into()), e["note"].as_str().or(e["problem"].as_str()).unwrap_or("")));
+        let route = if e["kind"] == "checks" { e["route"].as_str().map(|r| format!(", route {r}")).unwrap_or_default() } else { String::new() };
+        let unlike = if e["like_for_like"] == false { "different quantization: not like-for-like. " } else { "" };
+        s.push_str(&format!("| {} | {}{}{} | {} | {} ({est}) | {} | {}{} |\n", e["step"].as_str().unwrap_or(""), e["engine_version"].as_str().or(e["engine"].as_str()).unwrap_or("?"), route, if e["fallback"] == true { " (fell back to the standard engine)" } else { "" },
+                             e["teacher_quant"].as_str().unwrap_or("-"), startup, e["tokens_per_s"].as_f64().map(|x| format!("{x:.0} tokens/s")).unwrap_or_else(|| "-".into()), unlike, e["note"].as_str().or(e["problem"].as_str()).unwrap_or("")));
     }
     s.push_str("\nExperimental: built from a research report. The estimates use the numbers of your own self-test and teacher check where you have run them; the others are the report's.\n");
     s
