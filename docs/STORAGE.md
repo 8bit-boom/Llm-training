@@ -22,6 +22,7 @@ Only intermediates, with a reason, never ticked by themselves: the 16-bit GGUF w
 * Links (symbolic links, Windows junctions and other reparse points) are never followed: a link is removed itself.
 * Nothing is deleted while a job runs (the one-job flag), while an Auto-cut run is running, or when a stopped or failed Auto-cut run that still has steps to do uses the model; the teacher's answers and heal checkpoints are kept while a heal or run can be continued.
 * A model, or more than 5 GB, needs the typed word `DELETE`. The model chosen on the Slim or Auto page needs a second confirmation.
+* A real deletion needs the `token` of the preview (dry run) of the same list (a hash of the ids and stamps): `storage_delete` has `dryRun`, `pinned` and `allowPinned` as REQUIRED parameters (Tauri 2 names: camelCase), so a missing or mis-spelled key is an error and never a deletion. `ui/smoke/invoke_keys.test.mjs` checks every invoke call of the window against the Rust signatures.
 * Dry run: `storage_delete {ids, dry_run: true}` returns exactly what a real call removes (items inside another chosen item are not listed twice).
 * Permanent: no Recycle Bin (it would not free the space). Windows: `\\?\` for long paths, read-only attributes cleared, a file in use is tried six times, then reported with the program to close. A failure of one item does not stop the others; Cancel stops between two files.
 

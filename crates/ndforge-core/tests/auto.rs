@@ -2396,7 +2396,9 @@ fn the_storage_page_refuses_what_a_stopped_run_still_needs_and_allows_it_when_th
     assert_eq!(st.status, "done");
     let it = find(&ctx);
     assert_eq!(it.status, Status::Referenced);
-    let r = delete(&ctx, &[it.id], &Options { confirm: "DELETE".into(), ..Options::default() }, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).unwrap();
+    let none = std::sync::atomic::AtomicBool::new(false);
+    let tok = delete(&ctx, &[it.id.clone()], &Options { dry_run: true, ..Options::default() }, &none, &mut |_| {}).unwrap()["token"].as_str().map(String::from);
+    let r = delete(&ctx, &[it.id], &Options { confirm: "DELETE".into(), token: tok, ..Options::default() }, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).unwrap();
     assert_eq!(r["deleted"].as_array().unwrap().len(), 1, "{r}");
     assert!(!dir.exists());
     // the run's report still builds and says so

@@ -1799,11 +1799,11 @@ fn storage_scan(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan:
     Ok(())
 }
 
-/// `dry_run`: exactly what would go (nothing is touched, nothing is started). Otherwise the deletion runs as a job (one at a time; progress as `storage-event`, the result as its `done`).
+/// `dry_run` and `pinned` and `allow_pinned` are REQUIRED (a missing or mis-spelled key is an error, never a real deletion); `dry_run: true`: exactly what would go (nothing is touched, nothing is started) and the `token` of that plan; a real deletion needs that token. Otherwise the deletion runs as a job (one at a time; progress as `storage-event`, the result as its `done`).
 #[tauri::command]
-fn storage_delete(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>, ids: Vec<String>, dry_run: Option<bool>, confirm: Option<String>, pinned: Option<Vec<String>>, allow_pinned: Option<bool>) -> Out<Value> {
+fn storage_delete(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>, ids: Vec<String>, dry_run: bool, confirm: Option<String>, pinned: Vec<String>, allow_pinned: bool, token: Option<String>) -> Out<Value> {
     let project = storage_project(&s);
-    let opts = ndforge_core::storage::Options { dry_run: dry_run.unwrap_or(false), confirm: confirm.unwrap_or_default(), pinned: pinned.unwrap_or_default(), allow_pinned: allow_pinned.unwrap_or(false) };
+    let opts = ndforge_core::storage::Options { dry_run, confirm: confirm.unwrap_or_default(), pinned, allow_pinned, token };
     let vllm = ndforge_core::settings::Settings::load().vllm;
     if opts.dry_run {
         let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: tasks.busy.load(Ordering::SeqCst), vllm: Some(&vllm) };

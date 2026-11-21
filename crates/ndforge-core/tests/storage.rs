@@ -31,6 +31,15 @@ fn world() -> World {
     World { _lock: lock, d, p }
 }
 
+/// A real deletion the way the program does it: the preview of the same list first, then the deletion with the preview's token (the command refuses one without).
+fn delete(ctx: &Ctx, ids: &[String], o: &Options, cancel: &AtomicBool, emit: &mut dyn FnMut(Value)) -> ndforge_core::error::Result<Value> {
+    if o.dry_run {
+        return ndforge_core::storage::delete(ctx, ids, o, cancel, emit);
+    }
+    let dry = ndforge_core::storage::delete(ctx, ids, &Options { dry_run: true, ..o.clone() }, &AtomicBool::new(false), &mut |_| {})?;
+    ndforge_core::storage::delete(ctx, ids, &Options { token: dry["token"].as_str().map(String::from), ..o.clone() }, cancel, emit)
+}
+
 fn put(path: impl AsRef<Path>, bytes: usize) {
     let path = path.as_ref();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -466,4 +475,29 @@ fn the_cache_folders_listed_as_one_item_can_be_emptied_and_the_folder_stays() {
     assert_eq!(r["deleted"].as_array().unwrap().len(), 5, "{r}");
     assert!(w.p.folder.join("quantfit").is_dir() && std::fs::read_dir(w.p.folder.join("quantfit")).unwrap().next().is_none(), "the folder stays, empty");
     assert!(cfg.join("general_cache").is_dir() && std::fs::read_dir(cfg.join("general_cache")).unwrap().next().is_none());
+}
+
+#[test]
+fn a_deletion_without_the_preview_token_removes_nothing() {
+    use ndforge_core::storage as st;
+    let w = world();
+    let dir = export_dir(&w, "run1-Q4_K_M", true);
+    put(w.p.folder.join("quantfit").join("a.json"), 10);
+    let its = items(&w);
+    let ids = vec![find(&its, "export", "run1").id.clone()];
+    // what a call with a missing or mis-spelled key becomes in the command: no dry run flag set, no token
+    let none = Options { confirm: "DELETE".into(), ..Options::default() };
+    let e = st::delete(&ctx(&w), &ids, &none, &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+    assert!(e.0.contains("Nothing was deleted") && dir.is_dir(), "{}", e.0);
+    // a made-up token, and the token of ANOTHER list
+    let wrong = Options { token: Some("p0000000000000000".into()), ..none.clone() };
+    assert!(st::delete(&ctx(&w), &ids, &wrong, &AtomicBool::new(false), &mut |_| {}).is_err() && dir.is_dir());
+    let other = vec![find(&its, "cache_dir", "Fitting").id.clone()];
+    let t_other = st::delete(&ctx(&w), &other, &Options { dry_run: true, ..Options::default() }, &AtomicBool::new(false), &mut |_| {}).unwrap()["token"].as_str().unwrap().to_string();
+    assert!(st::delete(&ctx(&w), &ids, &Options { token: Some(t_other), ..none.clone() }, &AtomicBool::new(false), &mut |_| {}).is_err() && dir.is_dir());
+    // the token of the same list works once the folder is unchanged, and not after it changed
+    let t = st::delete(&ctx(&w), &ids, &Options { dry_run: true, ..Options::default() }, &AtomicBool::new(false), &mut |_| {}).unwrap()["token"].as_str().unwrap().to_string();
+    set_dir_mtime(&dir, std::time::SystemTime::now() + std::time::Duration::from_secs(900));
+    let stale = st::delete(&ctx(&w), &ids, &Options { token: Some(t), ..none.clone() }, &AtomicBool::new(false), &mut |_| {});
+    assert!(stale.is_err() && dir.is_dir(), "a preview of an older state is refused");
 }

@@ -51,13 +51,13 @@ test("the total follows the ticks, shows the disk before and after, and leaves o
 });
 
 test("the confirmation says it is permanent, lists the items and needs the typed word for a model", async () => {
-  const dry = { dry_run: true, items: [{ id: "m", label: "cut-a (cut and healed)", size: 7e9, path_short: "~/P/models/cut-a" }], total_bytes: 7e9, needs_delete_word: true, warnings: ["cut-a: the export run1 was made from it"] };
-  const b = makeBrowser({ state: baseState, answers: { storage_delete: (a) => (a.dry_run ? dry : { started: true }) } });
+  const dry = { dry_run: true, items: [{ id: "m", label: "cut-a (cut and healed)", size: 7e9, path_short: "~/P/models/cut-a" }], total_bytes: 7e9, needs_delete_word: true, token: "p1", warnings: ["cut-a: the export run1 was made from it"] };
+  const b = makeBrowser({ state: baseState, answers: { storage_delete: (a) => (a.dryRun ? dry : (a.token === dry.token ? { started: true } : (() => { throw new Error("no matching preview token"); })())) } });
   open(b);
   ev(b, { kind: "item", item: model("m") }); ev(b, { kind: "size", id: "m", size: 7e9 });
   b.run(`sg.sel = { m: true }`);
   await b.run("stAsk(false)");
-  assert.ok(b.calls.some((c) => c[0] === "storage_delete" && c[1].dry_run === true && c[1].ids[0] === "m"), "the dry run asks what would go");
+  assert.ok(b.calls.some((c) => c[0] === "storage_delete" && c[1].dryRun === true && c[1].ids[0] === "m"), "the dry run asks what would go");
   let html = b.run("renderStorage()");
   assert.match(html, /id="st-confirm"/); assert.match(html, /This is permanent\./); assert.match(html, /Recycle Bin/); assert.match(html, /~\/P\/models\/cut-a/); assert.match(html, /the export run1 was made from it/);
   assert.match(html, /id="st-typed"/); assert.match(html, /id="st-go" disabled/);
@@ -68,13 +68,13 @@ test("the confirmation says it is permanent, lists the items and needs the typed
   assert.equal(b.els["st-go"].disabled, false);
   await b.run("stGo()");
   const real = b.calls.filter((c) => c[0] === "storage_delete").pop();
-  assert.equal(real[1].dry_run, false); assert.equal(real[1].confirm, "DELETE"); assert.deepEqual(JSON.parse(JSON.stringify(real[1].ids)), ["m"]);
+  assert.equal(real[1].dryRun, false); assert.equal(real[1].token, "p1", "the real call carries the preview token"); assert.equal(real[1].confirm, "DELETE"); assert.deepEqual(JSON.parse(JSON.stringify(real[1].ids)), ["m"]);
   assert.ok(real[1].ids.every((i) => typeof i === "string" && !/[\\/]/.test(i)), "only opaque ids are sent, never a path");
 });
 
 test("a small plain item needs no typed word; a typed word that is wrong sends nothing", async () => {
-  const dry = { dry_run: true, items: [{ id: "f", label: "x", size: 1e6, path_short: "~/x" }], total_bytes: 1e6, needs_delete_word: false, warnings: [] };
-  const b = makeBrowser({ state: baseState, answers: { storage_delete: (a) => (a.dry_run ? dry : { started: true }) } });
+  const dry = { dry_run: true, items: [{ id: "f", label: "x", size: 1e6, path_short: "~/x" }], total_bytes: 1e6, needs_delete_word: false, token: "p2", warnings: [] };
+  const b = makeBrowser({ state: baseState, answers: { storage_delete: (a) => (a.dryRun ? dry : (a.token === dry.token ? { started: true } : (() => { throw new Error("no matching preview token"); })())) } });
   open(b);
   ev(b, { kind: "item", item: item("f") }); b.run(`sg.sel = { f: true }`);
   await b.run("stAsk(false)");
@@ -122,7 +122,7 @@ test("while a job runs the page says nothing can be deleted", () => {
 });
 
 test("the Delete buttons of the other pages open the Storage page with that model or export ticked, and delete nothing", async () => {
-  const b = makeBrowser({ state: baseState, answers: { help: "<p>h</p>", storage_scan: null, storage_delete: { dry_run: true, items: [], total_bytes: 0, needs_delete_word: true, warnings: [] } } });
+  const b = makeBrowser({ state: baseState, answers: { help: "<p>h</p>", storage_scan: null, storage_delete: { dry_run: true, items: [], total_bytes: 0, needs_delete_word: true, token: "p1", warnings: [] } } });
   b.run(`state = ${JSON.stringify(baseState())}; page = "reshape"; rs.state = { models: [], made: [], dataset_version: 3, env_ready: true }`);
   b.run(`stDeleteFor("model_entry", "cut-a")`);
   assert.equal(b.run("page"), "storage");
@@ -130,8 +130,8 @@ test("the Delete buttons of the other pages open the Storage page with that mode
   b.run(`onStorageEvent(${JSON.stringify({ kind: "done", phase: "scan", data: { items: [model("m")], suggestions: null, free_gb: 10, busy: false } })})`);
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(JSON.parse(b.run("JSON.stringify(sg.sel)")), { m: true }, "the model is ticked");
-  assert.ok(b.calls.some((c) => c[0] === "storage_delete" && c[1].dry_run === true), "only a dry run so far");
-  assert.ok(!b.calls.some((c) => c[0] === "storage_delete" && c[1].dry_run === false));
+  assert.ok(b.calls.some((c) => c[0] === "storage_delete" && c[1].dryRun === true), "only a dry run so far");
+  assert.ok(!b.calls.some((c) => c[0] === "storage_delete" && c[1].dryRun === false));
   // the Slim page's list and the export list carry the button
   b.run(`page = "reshape"`);
   assert.match(source, /data-stdel="model_entry\|/); assert.match(source, /data-stdel="export\|/);

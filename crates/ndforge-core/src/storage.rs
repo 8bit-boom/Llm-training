@@ -704,6 +704,18 @@ pub struct Options {
     /// repos / model folders the open Slim or Auto page has chosen; deleting one needs `allow_pinned`
     pub pinned: Vec<String>,
     pub allow_pinned: bool,
+    /// the token of the preview (dry run) this deletion was confirmed from: a real deletion without it, or with one that no longer matches the plan, is refused
+    pub token: Option<String>,
+}
+
+/// A fingerprint of a plan: the ids (which hold the kind, path, modification time and way of deleting) and the stamps, in a fixed order. A deletion needs the token of the preview of the SAME plan,
+/// so a call that skipped the preview (a missing or mis-spelled argument, an old window) can never remove anything.
+pub fn plan_token(plan: &[Item]) -> String {
+    let mut parts: Vec<String> = plan.iter().map(|i| format!("{}|{}|{}", i.id, i.modified.clone().unwrap_or_default(), i.path.to_string_lossy())).collect();
+    parts.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parts.hash(&mut h);
+    format!("p{:016x}", h.finish())
 }
 
 /// What a request would remove, after every check. Returns the items in the order they go.
@@ -837,11 +849,15 @@ pub fn delete(ctx: &Ctx, ids: &[String], opts: &Options, cancel: &AtomicBool, em
     let sizes: Vec<u64> = plan.iter().map(|i| i.size.unwrap_or_else(|| if matches!(i.exec, Exec::Volume(_)) { 0 } else { dir_size(&i.path, &none) })).collect();
     let total: u64 = sizes.iter().sum();
     let needs_word = plan.iter().any(|c| c.model) || total > TYPE_ABOVE_BYTES;
+    let token = plan_token(&plan);
+    if !opts.dry_run && opts.token.as_deref() != Some(token.as_str()) {
+        return Err(Error::new("Nothing was deleted: this deletion does not come from a preview of the same list (the preview is missing or the folders changed since). Choose again and confirm again."));
+    }
     if !opts.dry_run && needs_word && opts.confirm != "DELETE" {
         return Err(Error::new("The word DELETE has to be typed to delete a model or more than 5 GB."));
     }
     if opts.dry_run {
-        return Ok(json!({"dry_run": true, "items": plan.iter().zip(&sizes).map(|(i, s)| { let mut j = i.json(); j["size"] = json!(s); j }).collect::<Vec<_>>(), "total_bytes": total, "needs_delete_word": needs_word,
+        return Ok(json!({"dry_run": true, "items": plan.iter().zip(&sizes).map(|(i, s)| { let mut j = i.json(); j["size"] = json!(s); j }).collect::<Vec<_>>(), "total_bytes": total, "needs_delete_word": needs_word, "token": token,
                          "warnings": plan.iter().filter(|i| !i.refs.is_empty()).map(|i| format!("{}: {}", i.label, i.refs.join("; "))).collect::<Vec<_>>()}));
     }
     let mut freed = 0u64;

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkArgs } from "./_tauri_check.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const source = fs.readFileSync(path.join(here, "..", "app.js"), "utf8");
@@ -21,6 +22,8 @@ export function makeBrowser({ answers = {}, state = baseState, code = source, di
   const calls = [];
   const listeners = {};
   const invoke = async (cmd, args) => {
+    const bad = checkArgs(cmd, args);           // what Tauri 2 would do with these keys: a wrong key or a missing required one is an error here too
+    if (bad.length) throw new Error("invalid args: " + bad.join("; "));
     calls.push([cmd, cloneArgs ? JSON.parse(JSON.stringify(args ?? {})) : args]);
     if (cmd in answers) {
       const a = answers[cmd];

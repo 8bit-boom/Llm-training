@@ -4106,7 +4106,7 @@ async function rsOptions() {
     const args = { model: rs.model, mode: rs.mode };
     if (shape !== "depth") {
       args.shape = shape;
-      if (rs.lv) args.lin_v_heads = rsAxis("lin_v_heads");
+      if (rs.lv) args.linVHeads = rsAxis("lin_v_heads");
       if (rs.hh) args.heads = rs.hh;
     }
     const o = await invoke("reshape_options", args);
@@ -4310,7 +4310,7 @@ function wireReshape() {
   wireVllmFiles();
   const vck = $("hl-vllm-check"); if (vck) vck.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: rsHealSpec() }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const hst = $("hl-speed-teacher"); if (hst) hst.onchange = () => { hsp.teacher = hst.checked; };
-  const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), with_teacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
+  const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), withTeacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
   const hss = $("hl-speed-stop"); if (hss) hss.onclick = () => { if (hsp.run) hsp.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
@@ -4455,7 +4455,7 @@ async function stAsk(allowPinned) {
   if (!ids.length) return;
   sg.err = null;
   try {
-    const dry = await invoke("storage_delete", { ids, dry_run: true, pinned: stPinned(), allow_pinned: !!allowPinned });
+    const dry = await invoke("storage_delete", { ids, dryRun: true, confirm: null, pinned: stPinned(), allowPinned: !!allowPinned, token: null });
     sg.conf = { ids, dry, typed: "", allowPinned: !!allowPinned };
   } catch (e) {
     const t = String(e);
@@ -4469,7 +4469,7 @@ async function stGo() {
   const need = c.dry.needs_delete_word;
   if (need && c.typed !== "DELETE") return;
   sg.run = { text: "Starting…", value: 0 };
-  try { await invoke("storage_delete", { ids: c.ids, dry_run: false, confirm: c.typed, pinned: stPinned(), allow_pinned: c.allowPinned }); sg.conf = null; }
+  try { await invoke("storage_delete", { ids: c.ids, dryRun: false, confirm: c.typed, pinned: stPinned(), allowPinned: c.allowPinned, token: c.dry.token || null }); sg.conf = null; }
   catch (e) { sg.run = null; sg.err = String(e); }
   render();
 }
