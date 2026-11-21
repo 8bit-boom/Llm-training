@@ -52,7 +52,7 @@ def test_a_drive_letter_source_is_tried_with_forward_slashes(tmp_path, monkeypat
     world = FakeWorld(tmp_path, monkeypatch, bind="refuse", cp="drive_letter")
     monkeypatch.setattr(vllmcache.Container, "host", lambda self, p: "C:\\fakehost\\" + str(p).lstrip("/").replace("/", "\\"))
     r = vllmcache.probe(job())
-    assert r["route_in"] == "cp:fwd", r
+    assert r["route_in"] == "cp:fwd" and r["route_out"] == "cp:fwd", r
     assert any("no such container" in t["detail"] for t in r["tried"] if not t["ok"])
 
 

@@ -319,6 +319,11 @@ class FakeWorld:
         src = self.local(srcp, name)
         if not src.exists():
             return self._res(1, err=b"no such file")
+        if self.cp_mode == "drive_letter":
+            if re.match(r"^[A-Za-z]:\\", b):
+                return self._res(1, err=b"no such container: C")
+            if b.startswith("C:/fakehost/"):
+                b = "/" + b[len("C:/fakehost/"):]
         dst = Path(b)
         if b.endswith("/") or dst.is_dir():
             dst = dst / src.name
