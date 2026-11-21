@@ -306,7 +306,13 @@ fn the_8_bit_kv_cache_is_off_by_default_and_the_teacher_needs_its_own_confirmati
     let d2 = tempfile::tempdir().unwrap();
     let common = json!({"teacher": {"repo": "o/T"}, "student": "/s", "model": {"family": "g"}, "data": {}, "k": 32, "max_seq": 64, "seed": 1});
     assert_eq!(teacher_check_job(&d, &common, d2.path(), None, Some("fp8"))["kv_cache_dtype"], "fp8");
-    assert!(teacher_check_job(&d, &common, d2.path(), None, None).get("kv_cache_dtype").is_none());
+    let plain = teacher_check_job(&d, &common, d2.path(), None, None);
+    assert_eq!(plain["kv_cache_dtype"], "auto", "always explicit: the job overrides the engine settings, an auto check never runs with an 8-bit cache");
+    assert!(plain.get("compare_kv").is_none());
+    let both_set = teacher_check_job(&VllmSettings { kv_cache_dtype: "fp8".into(), kv_cache_dtype_teacher: true, ..Default::default() }, &common, d2.path(), None, None);
+    assert_eq!(both_set["kv_cache_dtype"], "auto", "the owner's settings do not turn an auto check into an fp8 one");
+    let cmp = teacher_check_job(&d, &common, d2.path(), None, Some("compare"));
+    assert_eq!((cmp["compare_kv"].clone(), cmp["kv_cache_dtype"].clone()), (json!(true), json!("auto")));
     // the cache key of the answers
     let f = d2.path().join("t.jsonl");
     std::fs::write(&f, "{}\n").unwrap();

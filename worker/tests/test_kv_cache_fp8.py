@@ -60,10 +60,10 @@ def test_the_teachers_cache_needs_the_second_confirmation_and_carries_it_in_its_
     assert dj.shared_store_id(cfg, teacher, student, 8, 64, 1, 2, exact) != dj.shared_store_id(cfg, teacher, student, 8, 64, 1, 2, fp8)
 
 
-def test_the_script_passes_the_flag_only_when_asked_and_never_drops_it():
+def test_the_script_passes_the_type_explicitly_fp8_only_when_asked_and_never_drops_it():
     args = vc.parse_args(["--model", "m", "--data", "d", "--out", "o", "--kv-cache-dtype", "fp8"])
     assert vc.llm_kwargs(args)["kv_cache_dtype"] == "fp8"
-    assert "kv_cache_dtype" not in vc.llm_kwargs(vc.parse_args(["--model", "m", "--data", "d", "--out", "o"]))
+    assert vc.llm_kwargs(vc.parse_args(["--model", "m", "--data", "d", "--out", "o"]))["kv_cache_dtype"] == "auto", "explicit for auto as well: nothing else may decide the type"
     assert "kv_cache_dtype" not in vc.OPTIONAL_LLM, "an identity that says fp8 must really be fp8"
 
 

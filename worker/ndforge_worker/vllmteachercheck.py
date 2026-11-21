@@ -114,6 +114,47 @@ def verdict_of(overall: dict) -> dict:
                                                      "note": "Heuristics chosen for this program, not measured or published values."}}
 
 
+def effective_job(job: dict, kvd: str) -> dict:
+    """The job with the KV cache type of THIS measurement and no other: "fp8" turns both switches on (asking for the measurement is the confirmation); "auto" turns them OFF, whatever the owner's engine settings
+    say (the settings had made an "auto" check run with an 8-bit cache: the owner's log)."""
+    e = {**(job.get("engine") or {}), "kv_cache_dtype": kvd, "kv_cache_dtype_teacher": kvd == "fp8"}
+    return {**job, "engine": e}
+
+
+def kv_confirmation(requested: str, res: dict) -> dict:
+    """{"requested", "seen" (from the engine's own log: fp8 / auto / None), "evidence", "agrees": True | False | None (the log said nothing)}."""
+    seen = (res.get("kv_cache_seen") or {})
+    s = seen.get("seen")
+    return {"requested": requested, "seen": s, "evidence": seen.get("evidence") or [], "agrees": None if s is None else s == requested}
+
+
+def tail_note(overall: dict, k: int) -> str:
+    """The systematic tail difference, said plainly (the owner's runs: about -0.028 at every position range)."""
+    t = overall.get("tail_diff_mean")
+    if t is None or t > -0.01:
+        return ""
+    return (f" The vLLM teacher puts about {abs(t) * 100:.1f} % less probability outside its top {k} than the standard teacher does; the heal's tail term is affected a little; the cause is not known.")
+
+
+def with_kv(v: dict, conf: dict, overall: dict, k: int) -> dict:
+    """The verdict with the KV cache type it measured in its text; INVALID when the engine's log and the request disagree (the numbers then measure the other cache type)."""
+    kvd = conf["requested"]
+    if conf["agrees"] is False:
+        return {**v, "verdict": "invalid", "valid": False,
+                "text": f"INVALID: this check asked for the {kvd} KV cache, but the engine's own log says it used {conf['seen']}. The numbers measure the {conf['seen']} cache, not the {kvd} one: do not trust the verdict ({v['verdict']}) for the {kvd} cache."}
+    how = "confirmed by the engine's log" if conf["agrees"] else "the engine's log did not say; taken as asked"
+    return {**v, "valid": True, "text": v["text"] + f" Measured with the {kvd} KV cache ({how})." + tail_note(overall, k)}
+
+
+def kv_difference(a: dict, b: dict) -> dict:
+    """fp8 minus auto for the numbers that matter (None where one is missing)."""
+    out = {}
+    for key in ("top1", "jaccard", "kl", "tail_diff_mean", "tail_diff_abs", "shared_mass", "no_overlap"):
+        x, y = a.get(key), b.get(key)
+        out[key] = None if x is None or y is None else round(y - x, 6)
+    return out
+
+
 def pick_rows(n_available: int, n: int, np) -> list:
     """`n` indices spread evenly over `n_available` rows (all of them when fewer)."""
     if n_available <= 0:
@@ -177,8 +218,10 @@ def run(job: dict) -> int:
     kv = str(job.get("kv_cache_dtype") or "auto").lower()
     if kv not in ("auto", "fp8"):
         raise TeacherCheckError("kv_cache_dtype must be auto or fp8.")
-    if kv == "fp8":                                              # measuring the cost of an 8-bit KV cache on the teacher's logits: the explicit confirmation is given by asking for the measurement
-        job = {**job, "engine": {**job["engine"], "kv_cache_dtype": "fp8", "kv_cache_dtype_teacher": True}}
+    compare_kv = bool(job.get("compare_kv"))
+    if compare_kv:
+        kv = "auto"                                              # the comparison measures both: exact first, then 8-bit
+    job = effective_job(job, kv)                                 # the job's own choice overrides the engine settings, in both directions
     teacher_dir = reshapejob._resolve_source(repo)
     weights = safetensors_io.weights_manifest(teacher_dir)
     try:
@@ -215,33 +258,62 @@ def run(job: dict) -> int:
     if not rows:
         raise TeacherCheckError("There are no rows to compare (the project's heal data is empty).")
     tokens = sum(len(r["input_ids"]) for r in rows)
-    # 2. vLLM on the same rows
-    vin, vout = work / "vllm_in", work / "vllm_out"
+    # 2. vLLM on the same rows (once, or twice with compare_kv: the exact cache, then the 8-bit one)
+    vin = work / "vllm_in"
     vin.mkdir(parents=True, exist_ok=True)
     distilljob.save_rows(vin, rows)
-    meta = {"teacher": repo, "k": k, "rows": len(rows), "data_hash": distilljob.data_hash(rows), "tokenizer_hash": "", "max_len": max_seq, "general_key": {}, "general_rows": 0, **ident}
-    for f in vout.glob("*"):
-        f.unlink()
-    writer = cachewrite.CacheWriter(vout, meta, 262144)
-    try:
-        res = vllmcache.run_chunk({**job, "part_tokens": 262144}, writer, vin, meta, repo, teacher_dir, 0, len(rows), k, max_seq, stop_file)
-    except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
-        raise TeacherCheckError(f"vLLM could not score the rows: {exc}") from None
-    writer.close()
-    if res.get("stopped") or writer.done_rows < len(rows):
-        raise TeacherCheckError("The check was stopped before vLLM had scored all the rows.")
-    rv = distilljob.CacheReader(vout)
-    got = [rv.get(i) for i in range(len(rows))]
-    # 3. compare
-    cmp_ = compare(ref, got, np)
-    v = verdict_of(cmp_["overall"])
+
+    def score(kvd: str):
+        j = effective_job(job, kvd)
+        try:
+            ident_v = vllmcache.identity(j, repo, teacher_dir)
+        except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
+            raise TeacherCheckError(str(exc)) from None
+        vout = work / ("vllm_out" if not compare_kv else f"vllm_out_{kvd}")
+        vout.mkdir(parents=True, exist_ok=True)
+        for f in vout.glob("*"):
+            f.unlink()
+        meta = {"teacher": repo, "k": k, "rows": len(rows), "data_hash": distilljob.data_hash(rows), "tokenizer_hash": "", "max_len": max_seq, "general_key": {}, "general_rows": 0, **ident_v}
+        writer = cachewrite.CacheWriter(vout, meta, 262144)
+        protocol.log(f"Scoring the rows with vLLM and the {kvd} KV cache.")
+        try:
+            res = vllmcache.run_chunk({**j, "part_tokens": 262144}, writer, vin, meta, repo, teacher_dir, 0, len(rows), k, max_seq, stop_file)
+        except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
+            raise TeacherCheckError(f"vLLM could not score the rows: {exc}") from None
+        writer.close()
+        if res.get("stopped") or writer.done_rows < len(rows):
+            raise TeacherCheckError("The check was stopped before vLLM had scored all the rows.")
+        rv = distilljob.CacheReader(vout)
+        got = [rv.get(i) for i in range(len(rows))]
+        conf = kv_confirmation(kvd, res)
+        if conf["agrees"] is False:
+            protocol.log(f"The engine's log says the {conf['seen']} KV cache, but {kvd} was asked for: this measurement is invalid.")
+        cmp_ = compare(ref, got, np)
+        return res, cmp_, conf, ident_v
+
+    VLLM_KEYS = ("engine", "teacher_quant", "route", "reason", "startup_seconds", "load_seconds", "stage_seconds", "tokens_per_s", "tokens", "load_phases", "timings", "seconds")
+    res, cmp_, conf, ident = score(kv)
+    v = with_kv(verdict_of(cmp_["overall"]), conf, cmp_["overall"], k)
     report = {"v": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **v, "rows": len(rows), "tokens": tokens, "k": k, "max_seq": max_seq, "metrics": cmp_["overall"],
-              "by_position": cmp_["by_position"], "reference": ref_source, "identity": ident, "kv_cache_dtype": kv,
-              "vllm": {kk: res.get(kk) for kk in ("engine", "teacher_quant", "route", "reason", "startup_seconds", "load_seconds", "stage_seconds", "tokens_per_s", "tokens", "load_phases", "timings", "seconds")},
+              "by_position": cmp_["by_position"], "reference": ref_source, "identity": ident, "kv_cache_dtype": kv, "kv_cache_confirmed": conf,
+              "vllm": {kk: res.get(kk) for kk in VLLM_KEYS},
               "seconds": round(time.monotonic() - started, 1)}
+    if compare_kv:
+        res8, cmp8, conf8, ident8 = score("fp8")
+        v8 = with_kv(verdict_of(cmp8["overall"]), conf8, cmp8["overall"], k)
+        diff = kv_difference(cmp_["overall"], cmp8["overall"])
+        both_valid = bool(v["valid"] and v8["valid"])
+        report["compare_kv"] = {"auto": {"metrics": cmp_["overall"], "by_position": cmp_["by_position"], "verdict": v["verdict"], "text": v["text"], "kv_cache_confirmed": conf, "vllm": {kk: res.get(kk) for kk in VLLM_KEYS}},
+                                "fp8": {"metrics": cmp8["overall"], "by_position": cmp8["by_position"], "verdict": v8["verdict"], "text": v8["text"], "kv_cache_confirmed": conf8, "identity": ident8, "vllm": {kk: res8.get(kk) for kk in VLLM_KEYS}},
+                                "difference": diff, "valid": both_valid,
+                                "text": ((f"The 8-bit KV cache against the exact one, on the same {len(rows)} rows: top-1 agreement {diff['top1'] * 100:+.2f} points, mean KL {diff['kl']:+.5f}, tail difference {diff['tail_diff_mean']:+.4f}, speed "
+                                          f"{res.get('tokens_per_s') or 'n/a'} against {res8.get('tokens_per_s') or 'n/a'} tokens/s (exact against 8-bit).") if both_valid and None not in (diff["top1"], diff["kl"], diff["tail_diff_mean"])
+                                         else "The comparison is not valid: at least one of the two runs did not use the KV cache type that was asked for (see the confirmation of each).")}
+        report["text"] = report["text"] + " " + report["compare_kv"]["text"]
+        report["seconds"] = round(time.monotonic() - started, 1)
     tmp = out_file.with_name(out_file.name + ".partial")
     out_file.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, out_file)
-    protocol.result({**{kk: report[kk] for kk in ("verdict", "text", "rows", "tokens", "k", "max_seq", "metrics", "by_position", "reference", "identity", "vllm", "thresholds", "seconds", "kv_cache_dtype")}, "report": str(out_file)})
+    protocol.result({**{kk: report.get(kk) for kk in ("verdict", "text", "rows", "tokens", "k", "max_seq", "metrics", "by_position", "reference", "identity", "vllm", "thresholds", "seconds", "kv_cache_dtype", "kv_cache_confirmed", "compare_kv", "valid")}, "report": str(out_file)})
     return 0

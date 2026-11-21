@@ -484,6 +484,24 @@ ENGINE_HINTS = [
 ]
 
 
+# What the engine's own log says about the KV cache type (the owner's log: `'kv_cache_dtype': 'fp8'` in the config line, "Using fp8 data type to store kv cache", `kv_cache_dtype=torch.float8_e4m3fn` in the attention backend's line)
+KV_FP8_LOG = re.compile(r"(Using fp8 data type to store kv cache|kv_cache_dtype\W{0,3}\s*[:=]\s*\W{0,3}(?:fp8|torch\.float8)|kv.cache.dtype\W{0,3}\s*[:=]\s*\W{0,3}float8)", re.I)
+KV_AUTO_LOG = re.compile(r"(kv_cache_dtype\W{0,3}\s*[:=]\s*\W{0,3}(?:auto\b|torch\.(?:bfloat16|float16))|Using auto data type to store kv cache)", re.I)
+
+
+def kv_cache_from_log(text: str) -> dict:
+    """The KV cache type an engine's log shows: {"seen": "fp8" | "auto" | None (the log says nothing), "evidence": [up to 3 lines]}. Any fp8 line wins (a config summary can print `auto` as a default
+    next to a line that says fp8 was used); `auto` needs an explicit auto / bfloat16 / float16 line."""
+    lines = [ln.strip()[:240] for ln in (text or "").splitlines() if ln.strip()]
+    fp8 = [ln for ln in lines if KV_FP8_LOG.search(ln)]
+    if fp8:
+        return {"seen": "fp8", "evidence": fp8[:3]}
+    auto = [ln for ln in lines if KV_AUTO_LOG.search(ln)]
+    if auto:
+        return {"seen": "auto", "evidence": auto[:3]}
+    return {"seen": None, "evidence": []}
+
+
 def hints_for(text: str, limit: int = 3) -> list:
     """The plain-language hints (`ENGINE_HINTS`) that match a failure's text, at most `limit`, each once."""
     out: list = []

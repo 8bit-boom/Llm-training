@@ -528,8 +528,7 @@ def script_args(job: dict, sel: dict, model_arg: str, extra_llm: dict, first: in
         quant = tail[tail.index("--quantization") + 1] if "--quantization" in tail and tail.index("--quantization") + 1 < len(tail) else "bitsandbytes"
         a += ["--quantization", quant]
     kw = {**extra_llm, **(e.get("llm_kwargs") or {})}
-    if teacher_kv(job) == "fp8":
-        a += ["--kv-cache-dtype", "fp8"]
+    a += ["--kv-cache-dtype", teacher_kv(job)]                          # explicit for "auto" too: the script must not leave it to a default
     if kw:
         a += ["--llm-kwargs", json.dumps(kw)]
     return a
@@ -724,6 +723,10 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         if code not in (0, None):
             raise VllmCacheError(f"The vLLM script ended with exit code {code}. {box.evidence(seen_lines)}")
         result["stopped"] = bool(result["stopped"] or (stop_sent and writer.done_rows < last))
+        seen = vllmengine.kv_cache_from_log("\n".join(seen_lines))
+        result["kv_cache_requested"] = teacher_kv(job)
+        result["kv_cache_seen"] = seen
+        protocol.log(f"KV cache type: asked for {teacher_kv(job)}; the engine's log says {seen['seen'] or 'nothing about it'}." + ("" if not seen["evidence"] else " (" + seen["evidence"][0][:160] + ")"))
         result["rows"] = syncer.rows
         result["seconds"] = round(time.monotonic() - t0, 1)
         return result

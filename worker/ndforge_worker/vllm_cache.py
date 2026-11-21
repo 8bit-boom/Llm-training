@@ -200,8 +200,8 @@ def llm_kwargs(args) -> dict:
           "language_model_only": True, "generation_config": "vllm", "disable_log_stats": True, "logprobs_mode": "raw_logprobs", "enable_prefix_caching": False}
     if args.quantization:
         kw["quantization"] = args.quantization
-    if getattr(args, "kv_cache_dtype", "auto") == "fp8":
-        kw["kv_cache_dtype"] = "fp8"          # an unknown keyword is NOT dropped: the identity says fp8, so it must really be fp8
+    # ALWAYS explicit, "auto" as well: the engine must not take the type from anywhere else. An unknown keyword is NOT dropped: the identity and the result say which type this is
+    kw["kv_cache_dtype"] = "fp8" if getattr(args, "kv_cache_dtype", "auto") == "fp8" else "auto"
     if args.max_num_batched_tokens:
         kw["max_num_batched_tokens"] = int(args.max_num_batched_tokens)
     if int(getattr(args, "max_num_seqs", 0) or 0) > 0:

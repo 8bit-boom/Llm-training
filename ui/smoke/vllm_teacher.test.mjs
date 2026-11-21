@@ -236,3 +236,9 @@ test("the Settings card has a button that tests the in-flight 4-bit route alone,
   assert.match(html, /id="vl-inflight"/);
   assert.match(html, /Test the in-flight 4-bit route on my original/);
 });
+
+test("the Heal card has a button for the auto against 8-bit KV cache comparison", () => {
+  const b = open(on);
+  b.run("rs.hlSpec.vllm = true");
+  assert.match(b.run("renderReshape()"), /id="hl-vllm-checkcmp"[^>]*>Check auto and 8-bit cache/);
+});

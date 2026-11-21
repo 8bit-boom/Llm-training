@@ -443,9 +443,12 @@ pub fn teacher_check_job(s: &VllmSettings, common: &Value, model_dir: &std::path
     if let Some(r) = reference_cache {
         job["reference_cache"] = json!(r);
     }
-    if kv_cache_dtype == Some("fp8") {
-        job["kv_cache_dtype"] = json!("fp8");          // measure the cost of the 8-bit KV cache on the teacher's answers (mean KL, top-1 agreement against the exact reference)
+    match kv_cache_dtype {
+        Some("fp8") => job["kv_cache_dtype"] = json!("fp8"),          // measure the 8-bit KV cache on the teacher's answers (mean KL, top-1 agreement against the exact reference)
+        Some("compare") => job["compare_kv"] = json!(true),           // one job: the reference once, then the exact cache and the 8-bit one on the same rows, both reported with the difference
+        _ => {}
     }
+    job["kv_cache_dtype"] = job.get("kv_cache_dtype").cloned().unwrap_or(json!("auto"));          // always explicit: the job's choice overrides the engine settings (an "auto" check once ran with an 8-bit cache)
     job
 }
 
