@@ -173,3 +173,15 @@ p.hs-warn { color: #8a5a00; }
 .ac-speed .ac-choice { display: inline-block; margin: 2px 14px 2px 0; }
 .ac-speed .ac-delta { margin-left: 4px; }
 .ac-speed details > summary { cursor: pointer; margin: 8px 0; }
+
+/* Storage page */
+.st-tbl td { vertical-align: top; padding: 6px 8px; }
+.st-tbl td.num { white-space: nowrap; text-align: right; }
+.st-chip-in_use { background: var(--err); color: #fff; }
+.st-chip-referenced { background: var(--warn, #b7791f); color: #fff; }
+.st-chip-safe { background: var(--ok, #2f855a); color: #fff; }
+.st-row.st-in_use { opacity: .75; }
+.st-path { word-break: break-all; }
+.st-why { color: var(--ok, #2f855a); }
+.st-bar { position: sticky; bottom: 8px; z-index: 2; }
+.st-confirm { border: 2px solid var(--err); }

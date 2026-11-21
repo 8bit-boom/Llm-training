@@ -24,6 +24,15 @@ struct Tasks {
     shutdown_cancel: Arc<AtomicBool>,
 }
 
+/// The Storage page's scan: it only reads, so it does not take the one-job flag; its own cancel and "running" flags.
+#[derive(Default)]
+struct ScanTasks {
+    running: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    /// a deletion of the Storage page is the running job (its Cancel must not stop another job)
+    deleting: Arc<AtomicBool>,
+}
+
 /// The job queue (ndforge_core::queue), shared by the commands and the runner that starts the next job when one ends.
 struct QueueState(Mutex<ndforge_core::queue::Queue>);
 
@@ -1761,6 +1770,77 @@ fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
     spawn_task(app, &tasks, "env-event", |cancel, emit| ndforge_core::envmgr::tasks::selftest(cancel, emit).map_err(|e| e.to_string()))
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------ the Storage page (ndforge_core::storage, docs/STORAGE.md)
+
+fn storage_project(s: &State<App>) -> Option<ndforge_core::project::Project> {
+    lock(s).project_clone().ok()
+}
+
+/// Starts the scan in the background: the items arrive as `storage-event` {"kind": "item"} (no size yet), then {"kind": "size"}, then {"kind": "done", "data": the whole list}.
+#[tauri::command]
+fn storage_scan(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>) -> Out<()> {
+    if scan.running.swap(true, Ordering::SeqCst) {
+        return Err("The scan is already running.".into());
+    }
+    scan.cancel.store(false, Ordering::SeqCst);
+    let project = storage_project(&s);
+    let (busy, running, cancel) = (tasks.busy.clone(), scan.running.clone(), scan.cancel.clone());
+    std::thread::spawn(move || {
+        let vllm = ndforge_core::settings::Settings::load().vllm;
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        let emitter = app.clone();
+        let data = ndforge_core::storage::scan(&ctx, &cancel, &mut |v| {
+            let _ = emitter.emit("storage-event", v);
+        });
+        running.store(false, Ordering::SeqCst);
+        let _ = app.emit("storage-event", serde_json::json!({"kind": "done", "phase": "scan", "data": data}));
+    });
+    Ok(())
+}
+
+/// `dry_run`: exactly what would go (nothing is touched, nothing is started). Otherwise the deletion runs as a job (one at a time; progress as `storage-event`, the result as its `done`).
+#[tauri::command]
+fn storage_delete(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, scan: State<ScanTasks>, ids: Vec<String>, dry_run: Option<bool>, confirm: Option<String>, pinned: Option<Vec<String>>, allow_pinned: Option<bool>) -> Out<Value> {
+    let project = storage_project(&s);
+    let opts = ndforge_core::storage::Options { dry_run: dry_run.unwrap_or(false), confirm: confirm.unwrap_or_default(), pinned: pinned.unwrap_or_default(), allow_pinned: allow_pinned.unwrap_or(false) };
+    let vllm = ndforge_core::settings::Settings::load().vllm;
+    if opts.dry_run {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: tasks.busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        return ndforge_core::storage::delete(&ctx, &ids, &opts, &AtomicBool::new(false), &mut |_| {}).map_err(|e| e.to_string());
+    }
+    // checked here as well, so that a refusal comes back at once and not as the end of a job
+    {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: tasks.busy.load(Ordering::SeqCst), vllm: Some(&vllm) };
+        ndforge_core::storage::plan_delete(&ctx, &ids, &opts).map_err(|e| e.to_string())?;
+    }
+    let deleting = scan.deleting.clone();
+    deleting.store(true, Ordering::SeqCst);
+    let flag = deleting.clone();
+    let started = spawn_task(app, &tasks, "storage-event", move |cancel, emit| {
+        let ctx = ndforge_core::storage::Ctx { project: project.as_ref(), busy: false, vllm: Some(&vllm) };
+        let r = ndforge_core::storage::delete(&ctx, &ids, &opts, cancel, emit).map_err(|e| e.to_string());
+        flag.store(false, Ordering::SeqCst);
+        let mut out = r?;
+        out["phase"] = Value::from("delete");
+        Ok(out)
+    });
+    if started.is_err() {
+        deleting.store(false, Ordering::SeqCst);
+    }
+    started?;
+    Ok(serde_json::json!({"started": true}))
+}
+
+/// Ends a scan, or a deletion between two files.
+#[tauri::command]
+fn storage_cancel(tasks: State<Tasks>, scan: State<ScanTasks>) {
+    scan.cancel.store(true, Ordering::SeqCst);
+    if scan.deleting.load(Ordering::SeqCst) {
+        tasks.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 fn env_cancel(tasks: State<Tasks>) {
     tasks.cancel.store(true, Ordering::SeqCst);
@@ -1865,7 +1945,8 @@ pub fn run() {
         })))
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check])
+        .manage(ScanTasks::default())
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

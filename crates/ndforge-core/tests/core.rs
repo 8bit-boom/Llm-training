@@ -432,3 +432,9 @@ fn the_auto_page_has_its_own_help_and_the_slim_page_points_to_it() {
     let r = help_markdown("reshape");
     assert!(r.contains("**🚀 Auto**") && !r.contains("Move the slider to the size you want"));
 }
+
+#[test]
+fn the_storage_page_has_its_own_help() {
+    let s = help_markdown("storage");
+    assert!(s.contains("permanent") && s.contains("DELETE") && s.contains("Recycle Bin") && !s.contains("No help text"));
+}

@@ -8,6 +8,7 @@ const TITLES = {
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
   quantcheck: ["Compare quants", "Measure how far each smaller GGUF file is from the 16-bit model, as KL divergence, and see which size keeps the most."],
+  storage: ["Storage", "See where the disk went and delete what you do not need. Deleting is permanent: the files are not moved to the Recycle Bin."],
   auto: ["Auto", "One click: measures, cuts, heals, checks and exports a model. It runs the same steps as the manual pages, one after the other."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
 };
@@ -44,6 +45,7 @@ function renderSteps() {
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
   items.push({ key: "quantcheck", label: "📏 Compare quants", unlocked: !!state.bundle, done: false });
+  items.push({ key: "storage", label: "🧹 Storage", unlocked: !!state.project, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
   $("steps").innerHTML = items.map((s) =>
@@ -884,7 +886,7 @@ function renderUse() {
     ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
     <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) || (us.what !== "merged" && us.quants.includes("mixed_measured") && !(+us.mm.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
   const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
-      ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""}</li>`).join("") : "";
+      ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""} <button class="link" data-stdel="export|${esc(e.name)}" title="Opens the Storage page with this export ticked; nothing is deleted before you confirm.">Delete…</button></li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul>${gg.length > 1 ? `<div class="row"><button class="secondary" id="us-compare" title="Measures how far each of these files is from the 16-bit model (KL divergence)">Compare these sizes</button></div>` : ""}</div>` : "";
   const srvOpts = st.servers.map((x) => `<option value="${esc(x.url)}" ${us.server === x.url ? "selected" : ""}>${esc(x.name)} (${esc(x.url)})</option>`).join("");
@@ -2939,7 +2941,7 @@ function madeCard(m) {
     <div class="row"><button class="primary" data-rstest="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""} title="${rs.state.dataset_version ? "" : "Save a training-data version in Step 2 first: the questions come from it."}">Test against the original</button>
       ${m.healed ? `<button class="primary" data-rstest-healed="${esc(m.name)}" ${busy || !rs.state.env_ready || !rs.state.dataset_version ? "disabled" : ""}>Test the healed model</button>` : ""}
       <button class="secondary" data-rstrain="${esc(m.healed ? m.healed_model_id || "" : m.model_id || "")}" ${(m.healed ? m.healed_model_id : m.model_id) ? "" : "disabled"}>Train ${m.healed ? "the healed model" : "it"} on your world (Step 3)</button>
-      <button class="secondary" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete</button></div>
+      <button class="secondary" data-stdel="model_entry|${esc(m.name)}" data-rsdelete="${esc(m.name)}" ${busy ? "disabled" : ""}>Delete…</button></div>
     ${rs.testing === m.name ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}${test}${sideBySide(m)}${healCard(m)}${thinkCard(m)}${traceCard(m)}</div>`;
 }
 
@@ -3230,7 +3232,7 @@ function autoCard() {
     <div class="row"><button class="primary" id="ac-go" ${!pl || !pl.ok || live || rs.running || rs.testing || (rs.hlRun && rs.hlRun.running) || !rs.state.env_ready || pfBlocked("auto") ? "disabled" : ""}>Start Auto-cut</button>${quBtn("auto", `${!pl || !pl.ok ? "disabled" : ""}`)}
       ${live ? `<button class="secondary" id="ac-stop">Stop</button>` : ""}
       ${run && !live && (run.status === "stopped" || run.status === "failed") ? `<button class="primary" id="ac-continue">Continue</button><button class="secondary" id="ac-change">Change settings and continue</button>` : ""}
-      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}</div>
+      ${ended ? `<button class="secondary" id="ac-report-btn">Show the report</button>` : ""}${ac.run ? `<button class="link" id="ac-free" title="Opens the Storage page: the models, the teacher's answers and the files this run made.">Free the disk space of this run…</button>` : ""}</div>
     ${!rs.state.env_ready ? `<div class="err">The training software is not installed yet (Training setup).</div>` : ""}
     ${accPanel()}
     ${acProgressBlock(run, live)}
@@ -3412,6 +3414,7 @@ function wireAuto() {
     try { await invoke("auto_start", { spec: null, resume: ac.run.id }); } catch (e) { ac.running = false; ac.err = String(e); render(); }
   };
   const st = $("ac-stop"); if (st) st.onclick = () => { ac.text = "Stopping…"; invoke("auto_stop"); render(); };
+  const fr = $("ac-free"); if (fr) fr.onclick = () => go("storage");
   const rp = $("ac-report-btn");
   if (rp) rp.onclick = async () => { try { const r = await invoke("auto_report", { run: ac.run ? ac.run.id : null }); ac.report = r.markdown; } catch (e) { ac.err = String(e); } render(); };
   acRefresh();
@@ -4369,11 +4372,6 @@ function wireReshape() {
   on("rs-open-auto", () => go("auto"));
   wireTry();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
-  document.querySelectorAll("[data-rsdelete]").forEach((b) => b.onclick = async () => {
-    if (!confirm("Delete this model and its files? A training run that used it must be deleted first.")) return;
-    try { rs.state = await invoke("reshape_remove", { name: b.dataset.rsdelete }); rs.error = null; rs.ok = "Deleted."; if (rs.view === b.dataset.rsdelete) rs.view = null; } catch (e) { rs.error = String(e); }
-    render();
-  });
 }
 
 // ------------------------------------------------------------------------------------------------------------ guide
@@ -4404,11 +4402,146 @@ function renderSoon(key) {
   return `<h1>${t}</h1><p class="lead">${lead}</p><span class="soon">Coming in a later version. The help panel shows what this step will do.</span>`;
 }
 
+
+// ------------------------------------------------------------------------------------------------------------ Storage (docs/STORAGE.md)
+// Where the disk went and a guarded way to give it back. The window only ever holds OPAQUE ids from the latest scan and sends those; the program checks every one again against a fresh scan.
+const sg = { items: [], scanning: false, scanned: false, sel: {}, sized: {}, free: null, busy: false, sug: null, err: null, conf: null, run: null, result: null, want: null, total: null };
+const stGroups = [["models", "Models in this project"], ["exports", "Exports"], ["heal", "Heal data and caches"], ["downloads", "Downloaded models"], ["leftovers", "Old logs and leftovers of failed jobs"]];
+function stBytes(n) {
+  if (n == null) return "";
+  const u = [["GB", 1e9], ["MB", 1e6], ["KB", 1e3]];
+  for (const [l, d] of u) if (n >= d) return (n / d).toFixed(n >= 1e10 ? 0 : 1) + " " + l;
+  return n + " B";
+}
+function stSize(it) { return it.size != null ? stBytes(it.size) + (it.size_cached && !sg.sized[it.id] ? " (earlier measurement)" : "") : sg.sized[it.id] ? "size not available" : "size not measured yet"; }
+// the ticked items without the ones that lie inside another ticked item (an export and its 16-bit file): what goes, and how much
+function stChosen() {
+  const picked = sg.items.filter((i) => sg.sel[i.id] && i.status !== "in_use");
+  const inside = (a, b) => a !== b && a.path_short.startsWith(b.path_short) && /[\\/]/.test(a.path_short.charAt(b.path_short.length));
+  return picked.filter((a) => !picked.some((b) => inside(a, b)));
+}
+function stTotals() {
+  const ch = stChosen();
+  const bytes = ch.reduce((a, i) => a + (i.size || 0), 0);
+  return { n: ch.length, bytes, unmeasured: ch.filter((i) => i.size == null).length, model: ch.some((i) => i.model), free: sg.free };
+}
+function stRefresh() {
+  sg.scanning = true; sg.err = null; sg.items = []; sg.sized = {}; sg.sel = {}; sg.conf = null;
+  Promise.resolve(invoke("storage_scan")).catch((e) => { sg.scanning = false; sg.err = String(e); if (page === "storage") render(); });
+  if (page === "storage") render();
+}
+function onStorageEvent(p) {
+  if (!p) return;
+  if (p.kind === "item") { sg.items.push(p.item); }
+  else if (p.kind === "size") { const it = sg.items.find((i) => i.id === p.id); if (it) { it.size = p.size; sg.sized[p.id] = true; } }
+  else if (p.kind === "progress") { sg.run = { text: p.text, value: p.value }; }
+  else if (p.kind === "done" && p.phase === "scan") {
+    const d = p.data || {};
+    sg.items = d.items || sg.items; sg.sug = d.suggestions || null; sg.free = d.free_gb; sg.busy = !!d.busy; sg.scanning = false; sg.scanned = true; sg.total = d.total_bytes;
+    sg.items.forEach((i) => { sg.sized[i.id] = true; });
+    if (sg.want) { const w = sg.want; sg.want = null; const it = sg.items.find((i) => i.kind === w.kind && i.label.startsWith(w.name) && i.status !== "in_use"); if (it) { sg.sel[it.id] = true; if (page === "storage") { stAsk(); return; } } else sg.err = `${w.name} was not found (it may be deleted already) or it is in use right now.`; }
+  }
+  else if (p.kind === "done") { sg.run = null; sg.result = p.data || null; sg.conf = null; sg.sel = {}; if (page === "storage") stRefresh(); return; }
+  else if (p.kind === "error") { sg.run = null; sg.err = p.text; sg.conf = null; }
+  if (page === "storage") render();
+}
+function stPinned() {
+  const m = rs.state && rs.state.models && rs.state.models.find((x) => x.id === rs.model);
+  return m && m.repo ? [m.repo] : [];
+}
+// asks the program what exactly would go (a dry run) and shows it in the confirmation
+async function stAsk(allowPinned) {
+  const ids = stChosen().map((i) => i.id);
+  if (!ids.length) return;
+  sg.err = null;
+  try {
+    const dry = await invoke("storage_delete", { ids, dry_run: true, pinned: stPinned(), allow_pinned: !!allowPinned });
+    sg.conf = { ids, dry, typed: "", allowPinned: !!allowPinned };
+  } catch (e) {
+    const t = String(e);
+    if (/chosen on the Slim or Auto page/.test(t) && !allowPinned && confirm(t + "\n\nDelete it anyway?")) return stAsk(true);
+    sg.err = t; sg.conf = null;
+  }
+  render();
+}
+async function stGo() {
+  const c = sg.conf; if (!c) return;
+  const need = c.dry.needs_delete_word;
+  if (need && c.typed !== "DELETE") return;
+  sg.run = { text: "Starting…", value: 0 };
+  try { await invoke("storage_delete", { ids: c.ids, dry_run: false, confirm: c.typed, pinned: stPinned(), allow_pinned: c.allowPinned }); sg.conf = null; }
+  catch (e) { sg.run = null; sg.err = String(e); }
+  render();
+}
+function stRow(it) {
+  const chip = { in_use: ["in use", "err"], referenced: ["referenced", "warn"], safe: ["safe", "ok"] }[it.status] || ["", ""];
+  const off = it.status === "in_use" || sg.run || sg.busy;
+  return `<tr class="st-row st-${esc(it.status)}"><td><input type="checkbox" data-stsel="${esc(it.id)}" ${sg.sel[it.id] ? "checked" : ""} ${off ? "disabled" : ""} aria-label="Delete ${esc(it.label)}"></td>
+    <td><strong>${esc(it.label)}</strong> <span class="tag st-chip st-chip-${esc(it.status)}">${chip[0]}</span>${it.link ? ` <span class="tag" title="It is a link: only the link is removed, never what it points to.">link</span>` : ""}
+      ${it.from ? `<div class="dim small">${esc(it.from)}</div>` : ""}${it.note ? `<div class="dim small">${esc(it.note)}</div>` : ""}${(it.refs || []).map((r) => `<div class="${it.status === "in_use" ? "warn" : "dim"} small">${esc(r)}</div>`).join("")}
+      ${it.suggest ? `<div class="small st-why">Safe to delete: ${esc(it.suggest)}</div>` : ""}<div class="dim small st-path">${esc(it.path_short)}</div></td>
+    <td class="num">${esc(stSize(it))}</td><td class="dim small">${esc(it.modified || "")}</td></tr>`;
+}
+function stConfirm() {
+  const c = sg.conf; if (!c) return "";
+  const d = c.dry;
+  const rows = (d.items || []).map((i) => `<li><strong>${esc(i.label)}</strong> · ${esc(stBytes(i.size) || "size not available")}<div class="dim small">${esc(i.path_short)}</div></li>`).join("");
+  return `<div class="card wide st-confirm" id="st-confirm" role="alertdialog" aria-label="Confirm the deletion"><h2>Delete ${(d.items || []).length} item${(d.items || []).length === 1 ? "" : "s"} (${esc(stBytes(d.total_bytes))})?</h2>
+    <p class="err"><strong>This is permanent.</strong> The files are not moved to the Recycle Bin (a bin would not free the space). They cannot be brought back.</p>
+    <ul>${rows}</ul>${(d.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("")}
+    ${d.needs_delete_word ? `<p>Type <strong>DELETE</strong> to confirm: <input type="text" id="st-typed" value="${esc(c.typed)}" autocomplete="off" spellcheck="false" style="width:10em"></p>` : ""}
+    <div class="row"><button class="primary" id="st-go" ${d.needs_delete_word && c.typed !== "DELETE" ? "disabled" : ""}>Delete permanently</button><button class="secondary" id="st-no">Cancel</button></div></div>`;
+}
+function renderStorage() {
+  const head = `<h1>🧹 ${TITLES.storage[0]}</h1><p class="lead">${TITLES.storage[1]}</p>`;
+  if (!state.project) return head + `<p class="lead">Open a project first.</p>`;
+  const t = stTotals();
+  const msg = sg.err ? errDiv(sg.err) : "";
+  const busy = sg.busy ? `<div class="warn">A job is running. Nothing can be deleted until it has ended.</div>` : "";
+  const res = sg.result ? `<div class="card wide st-result" id="st-result"><h2>${sg.result.cancelled ? "Stopped" : "Done"}: ${esc(stBytes(sg.result.freed_bytes))} freed</h2>
+      ${(sg.result.deleted || []).map((d) => `<div class="small">✓ ${esc(d.label)} (${esc(stBytes(d.freed))})</div>`).join("")}
+      ${(sg.result.failed || []).map((f) => `<div class="err small">✕ ${esc(f.label)}: ${(f.errors || []).map((e) => esc(e.path) + " - " + esc(e.error)).join("; ")}</div>`).join("")}
+      ${sg.result.free_gb != null ? `<div class="dim small">Free on this drive now: ${(+sg.result.free_gb).toFixed(1)} GB</div>` : ""}<button class="link" id="st-close-result">Close</button></div>` : "";
+  const sug = sg.sug && sg.sug.ids && sg.sug.ids.length ? `<div class="card wide st-sug" id="st-sug"><h2>Safe to delete</h2>
+      <p>These are only the steps between your models and files (nothing is ticked until you do it). Together they free about <strong>${esc(stBytes(sg.sug.total_bytes))}</strong>.</p>
+      ${sg.items.filter((i) => sg.sug.ids.includes(i.id)).map((i) => `<div class="small"><label><input type="checkbox" data-stsel="${esc(i.id)}" ${sg.sel[i.id] ? "checked" : ""} ${sg.run || sg.busy ? "disabled" : ""}> <strong>${esc(i.label)}</strong> (${esc(stSize(i))}): ${esc(i.suggest)}</label></div>`).join("")}
+      <div class="row"><button class="secondary" id="st-preset" ${sg.run || sg.busy || !sg.sug.preset.ids.length ? "disabled" : ""} title="Ticks the steps between: the cuts before healing, the teacher's answers, the 16-bit GGUF, the merged models and leftovers. The final healed model and the GGUF files are not ticked.">${esc(sg.sug.preset.label)}</button></div></div>` : "";
+  const groups = stGroups.map(([k, name]) => {
+    const rows = sg.items.filter((i) => i.group === k);
+    if (!rows.length) return "";
+    const tot = rows.reduce((a, i) => a + (i.size || 0), 0);
+    return `<div class="card wide st-group" data-stgroup="${k}"><h2>${esc(name)} <span class="dim small">${rows.length} · ${esc(stBytes(tot))}</span></h2><table class="tbl st-tbl">${rows.map(stRow).join("")}</table></div>`;
+  }).join("");
+  const bar = `<div class="card wide st-bar" id="st-bar"><div id="st-total">${t.n ? `Frees <strong>${esc(stBytes(t.bytes))}</strong>${t.unmeasured ? ` (and ${t.unmeasured} not measured yet)` : ""}${t.free != null ? ` · disk free now ${(+t.free).toFixed(1)} GB → ${(+t.free + t.bytes / 1e9).toFixed(1)} GB` : ""}` : "Nothing is ticked."}</div>
+      <div class="row"><button class="primary" id="st-del" ${!t.n || sg.run || sg.busy ? "disabled" : ""}>Delete the ticked items…</button><button class="secondary" id="st-rescan" ${sg.scanning || sg.run ? "disabled" : ""}>Scan again</button>
+      ${sg.scanning ? `<button class="secondary" id="st-cancel-scan">Stop scanning</button>` : ""}</div>
+      ${sg.scanning ? `<div class="stepline" aria-live="polite">Looking at the disk… ${sg.items.length} found; sizes appear as they are measured.</div>` : ""}
+      ${sg.run ? `<div class="stepline" aria-live="polite">${esc(sg.run.text)}</div><progress max="1" value="${sg.run.value || 0}"></progress><div class="row"><button class="secondary" id="st-cancel">Cancel the deletion</button></div>` : ""}</div>`;
+  return head + msg + busy + res + stConfirm() + bar + sug + groups + (sg.scanned && !sg.items.length ? `<p class="dim">Nothing found.</p>` : "");
+}
+function wireStorage() {
+  if (page !== "storage") return;
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  document.querySelectorAll("[data-stsel]").forEach((b) => b.onchange = () => { if (b.checked) sg.sel[b.dataset.stsel] = true; else delete sg.sel[b.dataset.stsel]; render(); });
+  on("st-del", () => stAsk(false));
+  on("st-rescan", () => stRefresh());
+  on("st-cancel-scan", () => invoke("storage_cancel"));
+  on("st-cancel", () => invoke("storage_cancel"));
+  on("st-no", () => { sg.conf = null; render(); });
+  on("st-go", () => stGo());
+  on("st-close-result", () => { sg.result = null; render(); });
+  on("st-preset", () => { sg.sel = {}; (sg.sug.preset.ids || []).forEach((id) => { sg.sel[id] = true; }); render(); });
+  const ty = $("st-typed"); if (ty) ty.oninput = () => { sg.conf.typed = ty.value; const g = $("st-go"); if (g) g.disabled = ty.value !== "DELETE"; };
+}
+// a "Delete…" button on another page opens the Storage page with that model or export ticked; nothing goes before the confirmation
+function stDeleteFor(kind, name) { sg.want = { kind, name }; sg.result = null; go("storage"); }
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-stdel]"); if (t) { const [kind, ...rest] = String(t.dataset.stdel).split("|"); stDeleteFor(kind, rest.join("|")); } }); } catch (_) { /* a preview without a window */ }
+
 function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
@@ -4444,6 +4577,7 @@ function wire() {
   wireTest();
   wireReshape();
   wireAutoPage();
+  wireStorage();
   wireGuide();
   wireRetrain();
   wireUnsloth();
@@ -4559,6 +4693,7 @@ async function go(key) {
   if (key === "dataset" && state.bundle) { ds.ok = null; dsRefresh(false); }
   if (key === "train" && state.bundle) trRefresh();
   if ((key === "reshape" || key === "auto") && state.bundle) { rs.ok = null; rs.error = null; if (key === "auto") ac.loaded = false; rsRefresh(); }
+  if (key === "storage" && state.project) stRefresh();
   if (key === "use" && state.bundle) usRefresh();
   if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
   if (key === "quantcheck" && state.bundle) { qk.ok = null; qk.error = null; qkRefresh(); }
@@ -4612,6 +4747,7 @@ async function init() {
   try { await tauri.event.listen("quantfit-event", (e) => onQuantfitEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("storage-event", (e) => onStorageEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
   quLoad();
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
