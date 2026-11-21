@@ -473,8 +473,11 @@ class Container:
             pass
         if rc:
             protocol.log("Root cause lines (script and container log):\n" + "\n".join(rc))
+        hints = vllmengine.hints_for("\n".join(rc) + "\n" + "\n".join(lines))
+        for h in hints:
+            protocol.log("Known cause: " + h)
         tail = [protocol.scrub(x.strip())[:300] for x in lines if x.strip()][-8:]
-        return (("Root cause: " + " | ".join(rc[-12:]) + ". ") if rc else "No line of the engine's output names a cause. ") + ("Last lines: " + " | ".join(tail) if tail else "The script printed nothing.")
+        return (("Root cause: " + " | ".join(rc[-12:]) + ". ") if rc else "No line of the engine's output names a cause. ") + (("What it probably means: " + " ".join(hints) + " ") if hints else "") + ("Last lines: " + " | ".join(tail) if tail else "The script printed nothing.")
 
     def stop(self) -> None:
         """Always the explicit stop and remove; never raises."""
@@ -513,12 +516,13 @@ def probe(job: dict) -> dict:
 
 # ----------------------------------------------------------------------------------------------------------------------------- the chunk
 
-def script_args(job: dict, sel: dict, model_arg: str, extra_llm: dict, first: int, last: int, max_seq: int, k: int) -> list:
+def script_args(job: dict, sel: dict, model_arg: str, extra_llm: dict, first: int, last: int, max_seq: int, k: int, max_seqs: int | None = None) -> list:
     """The command line of vllm_cache.py inside the container."""
     e = job.get("engine") or {}
     a = ["python3", f"{WORK}/vllm_cache.py", "--model", model_arg, "--data", f"{WORK}/data", "--out", f"{WORK}/out", "--meta", f"{WORK}/meta.json", "--k", str(k), "--max-seq", str(max_seq),
          "--first-row", str(first), "--last-row", str(last), "--part-tokens", str(int(job.get("part_tokens", 262144))), "--stop-file", f"{WORK}/STOP",
-         "--gpu-util", str(float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL)), "--batch-tokens", str(int(e.get("batch_tokens") or 32768))]
+         "--gpu-util", str(float(e.get("gpu_memory_utilization") or vllmengine.DEFAULT_GPU_UTIL)), "--batch-tokens", str(int(e.get("batch_tokens") or 32768)),
+         "--max-num-seqs", str(int(e.get("max_num_seqs") or max_seqs or 32))]
     if sel["route"] == "bnb":
         tail = list((e.get("teacher") or {}).get("bnb_args") or BNB_ARGS)
         quant = tail[tail.index("--quantization") + 1] if "--quantization" in tail and tail.index("--quantization") + 1 < len(tail) else "bitsandbytes"
@@ -589,18 +593,21 @@ def _log_gpu_before_start(g: dict, total, used) -> None:
         protocol.log(f"GPU memory before the engine start is not known (nvidia-smi did not answer). {g['text']}")
 
 
-def _check_bnb_fit(origin_dir, g: dict, total, used) -> None:
+def _check_bnb_fit(origin_dir, g: dict, total, used, max_seq: int = 2048):
     """The in-flight 4-bit route needs its weights + overhead + a minimum cache within the engine's budget: refused early with the arithmetic when it cannot (never after the rows were staged)."""
     from . import vllmquant
     sizes = vllmquant.route_weights_gb(str(origin_dir))
     if not sizes or not total or used is None:
-        return
+        return None
     free = round((float(total) - float(used)) / 1024, 1)
     bud = vllmquant._budgets(float(total) / 1024, g["util"], free)
     pl = vllmquant._place(sizes["nf4"], bud)
     protocol.log(f"4-bit fit of the original ({sizes['bf16']} GB in 16 bits): {pl['arith']}.")
     if not pl["ok"]:
         raise VllmCacheError(f"The original does not fit in 4 bits next to the engine's needs: {pl['arith']}. Free more memory on the card (close other programs) or use the standard engine. {REMEDY_OFF}")
+    n, text = vllmquant.seq_cap(sizes["nf4"], float(total) / 1024, g["util"], free, max_seq)
+    protocol.log(text)
+    return n
 
 
 def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, first: int, last: int, k: int, max_seq: int, stop_file, *, on_progress=None, sleep=time.sleep) -> dict:
@@ -616,8 +623,9 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         raise VllmCacheError(g["text"])
     job = {**job, "engine": {**(job.get("engine") or {}), "gpu_memory_utilization": g["util"]}}
     _log_gpu_before_start(g, total, used)
+    seq_cap = None
     if sel["route"] == "bnb":
-        _check_bnb_fit(origin_dir, g, total, used)
+        seq_cap = _check_bnb_fit(origin_dir, g, total, used, max_seq)
     tmp_ctx = tempfile.TemporaryDirectory(prefix="ndforge-vllm-")
     tmp = Path(tmp_ctx.name)
     work = tmp / "work"                                          # the host folder that is /work in the container when the bind mount works
@@ -649,7 +657,7 @@ def run_chunk(job: dict, writer, rows_dir, meta: dict, origin: str, origin_dir, 
         box.put(tmp / "meta.json", "meta.json", 120, "Copying the cache description into the container")
         staged = time.monotonic()
         result["stage_seconds"] = round(staged - t0, 1)
-        cmd = box.exec_command(script_args(job, sel, box.model_arg, box.extra_llm, first, last, max_seq, k))
+        cmd = box.exec_command(script_args(job, sel, box.model_arg, box.extra_llm, first, last, max_seq, k, seq_cap))
         box.commands.append(cmd)
         protocol.progress("cache", 0.0, "Loading the model into vLLM")
         try:

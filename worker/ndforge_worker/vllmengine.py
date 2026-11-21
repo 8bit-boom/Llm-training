@@ -467,6 +467,32 @@ def root_cause(text: str, limit: int = 25) -> list:
     return out[-limit:]
 
 
+# Plain-language hints for startup errors we know, shown under the root-cause lines with what the program already did about it: (regex, hint)
+ENGINE_HINTS = [
+    (re.compile(r"max_num_seqs .*exceeds available Mamba cache blocks|lower max_num_seqs to at most", re.I),
+     "vLLM needs a smaller max_num_seqs: a hybrid (Mamba) model has a limited number of cache blocks and each sequence in flight needs one. The scoring script passes max_num_seqs itself (32 or less, from the cache that is left) and retries once with the number vLLM names."),
+    (re.compile(r"Free memory on device .* is less than desired GPU memory utilization|less than desired GPU memory", re.I),
+     "Not enough free graphics memory for the share of the card the engine asked for. The program lowers the share to what is free (never below 0.70); close other programs that use the card, or use Free GPU in the Memory panel."),
+    (re.compile(r"max_model_len|model's max seq len .* larger than the maximum number of tokens that can be stored in KV cache|KV cache.*(is needed|too small)", re.I),
+     "The sequence length does not fit the engine's KV cache. The program sets it from the rows (longest row + 8); a shorter sequence length for the heal, or more free memory, helps."),
+    (re.compile(r"Mamba cache|mamba.*block", re.I),
+     "The hybrid model's recurrent-state cache is too small for this many sequences or this memory budget: fewer sequences at once (max_num_seqs) or more memory."),
+    (re.compile(r"Unknown quantization method|quantization method .* not supported|bitsandbytes.*(not installed|No module)|No module named .bitsandbytes|vllm-bnb-plugin|Cannot find any model weights|quantization.*(plugin|not registered)", re.I),
+     "vLLM does not know this quantization: the in-flight 4-bit route needs the bitsandbytes plugin (the program installs vllm-bnb-plugin into the container first; UNVERIFIED for this model). Check the lines above for the plugin's own error."),
+    (re.compile(r"CUDA out of memory|OutOfMemoryError", re.I),
+     "The card ran out of memory while the engine started. The share of the card is set from the free memory; close other programs or use Free GPU, or use the standard engine."),
+]
+
+
+def hints_for(text: str, limit: int = 3) -> list:
+    """The plain-language hints (`ENGINE_HINTS`) that match a failure's text, at most `limit`, each once."""
+    out: list = []
+    for rx, hint in ENGINE_HINTS:
+        if rx.search(text or "") and hint not in out:
+            out.append(hint)
+    return out[:limit]
+
+
 def log_highlights(text: str, limit: int = 40) -> list:
     """The lines of the server log for the self-test report: FIRST the ones naming the attention / GDN kernel, the backend and the quantization, then the cache, memory and problems.
     Progress-bar lines (`Capturing CUDA graphs ... it/s]`) are dropped before anything is counted, and the cache lines (GPU KV cache size, concurrency, init engine ... took) are never the ones the cap cuts."""
@@ -669,8 +695,11 @@ class Engine:
         rc = root_cause(big)
         if rc:
             protocol.log("Root cause lines from the engine's log:\n" + "\n".join(rc))
+        hints = hints_for("\n".join(rc) + "\n" + big)
+        for h in hints:
+            protocol.log("Known cause: " + h)
         tail = self.logs_tail(12) if not big.strip() else "\n".join([x for x in big.strip().splitlines() if x.strip()][-12:])
-        return ("Root cause: " + " | ".join(rc[-12:]) + ". " if rc else "") + "Its last lines: " + protocol.scrub(tail)
+        return ("Root cause: " + " | ".join(rc[-12:]) + ". " if rc else "") + ("What it probably means: " + " ".join(hints) + " " if hints else "") + "Its last lines: " + protocol.scrub(tail)
 
     def logs_big(self, n: int = 800, limit: int = 200_000) -> str:
         """Many more log lines (the kernel and the cache lines are far above the last 60): docker `logs --tail n`, wslc the `logs` template with its `-n` replaced; size-limited."""

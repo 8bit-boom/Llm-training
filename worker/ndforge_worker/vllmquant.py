@@ -146,6 +146,20 @@ def _fitted(base: dict, quant: str, pl: dict, reason: str, **more) -> dict:
     return out
 
 
+def seq_cap(weights_gb: float, vram_gb: float, util: float, free_gb, tokens_per_row: int, default: int = 32) -> tuple:
+    """(max_num_seqs, a plain sentence) for the in-container scoring script: `default` rows at once, at most what the cache left after the weights and the overhead can hold at `tokens_per_row` tokens
+    each (about 0.118 GB per 1000 tokens, measured; a hybrid model needs less for its attention layers and has its own block limit, which the engine reports and the script then retries with), never
+    below 1. The sentence goes to the job log before the engine starts."""
+    bud = _budgets(float(vram_gb), float(util), None if free_gb is None else float(free_gb))
+    b = bud["normal"]["gb"]                                  # the engine's own budget (the configured share, lowered to what is free), not the raised one
+    cache = max(0.0, b - float(weights_gb) - OVERHEAD_GB)
+    per_row = KV_GB_PER_1K * max(1, int(tokens_per_row)) / 1000
+    fit = max(1, int(cache / per_row)) if per_row else default
+    n = max(1, min(int(default), fit))
+    return n, (f"Rows scored at once: {n} (cache left after the weights and overhead about {cache:.1f} GB of the {b} GB budget, about {per_row:.2f} GB per row of {int(tokens_per_row)} tokens; "
+               "a hybrid Mamba/attention model also has a block limit of its own that the engine reports at its start, and the script then retries once with that number).")
+
+
 def pick(model: str, engine: dict | None = None) -> dict:
     """{"model": what the server loads, "quant": "none" | "fp8" | "bnb-nf4" | "prequant:<repo>" | "stored:<method>", "fits": bool | None, "weights_gb", "usable_gb", "reason": a plain sentence,
     and where a fit was calculated: "gpu_util", "max_seqs", "arith", "route_hint", "like_for_like"}. The engine keys read here: `vram_gb`, `gpu_memory_utilization`, `gpu_free_gb` (the real free

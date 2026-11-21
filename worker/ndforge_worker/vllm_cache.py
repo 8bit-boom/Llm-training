@@ -204,8 +204,28 @@ def llm_kwargs(args) -> dict:
         kw["kv_cache_dtype"] = "fp8"          # an unknown keyword is NOT dropped: the identity says fp8, so it must really be fp8
     if args.max_num_batched_tokens:
         kw["max_num_batched_tokens"] = int(args.max_num_batched_tokens)
+    if int(getattr(args, "max_num_seqs", 0) or 0) > 0:
+        kw["max_num_seqs"] = int(args.max_num_seqs)           # vLLM's own default is 256: a hybrid (Mamba) model has far fewer cache blocks than that and refuses to start (the owner's log)
     kw.update(json.loads(args.llm_kwargs or "{}"))
     return kw
+
+
+# vLLM refuses to start when max_num_seqs is more than its cache can hold: "max_num_seqs (256) exceeds available Mamba cache blocks (171) ... Please lower max_num_seqs to at most 171"
+SEQS_LIMIT = re.compile(r"(?:lower max_num_seqs to at most|available Mamba cache blocks \()\s*(\d+)", re.I)
+
+
+def seqs_limit(text: str):
+    """The number N from vLLM's "max_num_seqs (256) exceeds available Mamba cache blocks (N)" / "lower max_num_seqs to at most N" error, or None for any other error."""
+    m = SEQS_LIMIT.search(str(text or ""))
+    return int(m.group(1)) if m and "max_num_seqs" in str(text) else None
+
+
+def retry_seqs(limit: int, previous) -> int:
+    """The value to try again with: at most what vLLM said, and at most half of what failed (so the second start does not land exactly on a limit that moves with the memory), never below 1."""
+    cands = [int(limit)]
+    if previous:
+        cands.append(max(1, int(previous) // 2))
+    return max(1, min(cands))
 
 
 def sampling_kwargs(args) -> dict:
@@ -242,7 +262,8 @@ def build_scorer(args):
     kw = llm_kwargs(args)
     t1 = time.monotonic()
     llm = None
-    for _ in range(len(OPTIONAL_LLM) + 1):
+    retried = False
+    for _ in range(len(OPTIONAL_LLM) + 3):
         try:
             llm = LLM(**kw)
             break
@@ -252,6 +273,17 @@ def build_scorer(args):
                 raise
             notes.append(f"This vLLM does not know LLM({bad}=...): left out.")
             kw.pop(bad)
+        except (ValueError, RuntimeError) as exc:
+            limit = seqs_limit(str(exc))
+            if limit is None or retried:
+                if limit is not None:
+                    raise CacheScriptError(f"vLLM needs a smaller max_num_seqs; the program already retried once (with {kw.get('max_num_seqs')}) and it still failed: {str(exc)[:300]}") from exc
+                raise
+            retried = True
+            new = retry_seqs(limit, kw.get("max_num_seqs"))
+            log(f"vLLM said at most {limit} sequences fit its cache (max_num_seqs was {kw.get('max_num_seqs', 'its default 256')}): trying again with max_num_seqs={new}.")
+            notes.append(f"vLLM needs a smaller max_num_seqs; the program retried with {new}.")
+            kw["max_num_seqs"] = new
     timing("engine_start_and_model_load", time.monotonic() - t1, **{key: kw[key] for key in ("quantization", "max_model_len") if key in kw})
     for n in notes:
         log(n)
@@ -349,6 +381,7 @@ def parse_args(argv=None):
     p.add_argument("--gpu-util", type=float, default=0.88)
     p.add_argument("--quantization", default="", help="passed to LLM(quantization=...), e.g. the bitsandbytes route (UNVERIFIED)")
     p.add_argument("--max-num-batched-tokens", type=int, default=0)
+    p.add_argument("--max-num-seqs", type=int, default=32, help="LLM(max_num_seqs=...): rows scored at once; 0 = vLLM's default (256, too many for a hybrid model's cache)")
     p.add_argument("--llm-kwargs", default="", help="JSON object of more LLM(...) arguments")
     p.add_argument("--stop-file", default="")
     p.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8"])
