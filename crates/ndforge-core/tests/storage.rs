@@ -398,3 +398,22 @@ fn the_other_screens_do_not_fail_on_a_deleted_model_or_export() {
     assert!(ndforge_core::reshape::auto::latest(&w.p).is_none());
     assert_eq!(deleted_ledger(&w.p).len(), 2);
 }
+
+#[test]
+fn the_cache_folders_listed_as_one_item_can_be_emptied_and_the_folder_stays() {
+    let w = world();
+    let cfg = ndforge_core::paths::config_dir();
+    put(w.p.folder.join("quantfit").join("a.json"), 100);
+    put(w.p.folder.join("benchmarks").join("b.json"), 100);
+    put(w.p.folder.join("imatrix_downloads").join("c.dat"), 100);
+    put(cfg.join("general_cache").join("g.txt"), 100);
+    put(cfg.join("vllm_selftest").join("r.json"), 100);
+    let its = items(&w);
+    let ids: Vec<String> = its.iter().filter(|i| i.kind == "cache_dir").map(|i| i.id.clone()).collect();
+    assert_eq!(ids.len(), 5, "{:?}", its.iter().map(|i| i.label.clone()).collect::<Vec<_>>());
+    let r = delete(&ctx(&w), &ids, &opts(""), &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert!(r["failed"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["deleted"].as_array().unwrap().len(), 5, "{r}");
+    assert!(w.p.folder.join("quantfit").is_dir() && std::fs::read_dir(w.p.folder.join("quantfit")).unwrap().next().is_none(), "the folder stays, empty");
+    assert!(cfg.join("general_cache").is_dir() && std::fs::read_dir(cfg.join("general_cache")).unwrap().next().is_none());
+}

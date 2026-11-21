@@ -35,6 +35,8 @@ pub enum Exec {
     CutOnly(String),
     /// the big file of a quant comparison: `export::quantcheck::delete_logits`
     QuantLogits(String),
+    /// everything inside a folder of a kind of data (the folder itself stays): each part is guarded on its own
+    Contents,
     /// job logs older than `OLD_LOG_DAYS` days in the folder
     OldLogs,
     /// the vLLM engine's model volume (a container tool call, not a path)
@@ -183,6 +185,19 @@ impl Roots {
         let c = canon(&p);
         self.keep.push(c.clone());
         self.list.push(c);
+    }
+
+    /// A folder of a kind of data itself, for removing what is inside it (never the folder): it must be one of the roots, with no link in the way.
+    pub fn guard_contents(&self, path: &Path) -> Result<PathBuf> {
+        let meta = std::fs::symlink_metadata(path).map_err(|_| Error::new("That folder is not there any more."))?;
+        if is_link(&meta) {
+            return Err(Error::new("A link is not emptied."));
+        }
+        let c = path.canonicalize().map_err(|_| Error::new("That folder is not there any more."))?;
+        if !self.list.iter().any(|r| *r == c) {
+            return Err(Error::new("That is not one of the folders this program owns, so it is not touched."));
+        }
+        Ok(c)
     }
 
     /// The path, if it lies strictly below one of the roots: no `..`, no root itself, no link in the way (the last part may be a link: it is removed itself).
@@ -539,7 +554,7 @@ fn project_items(p: &Project, out: &mut Vec<Item>) {
     for (sub, label) in [("quantfit", "Fitting of mixed quants"), ("imatrix_downloads", "Downloaded importance matrices"), ("benchmarks", "Speed measurements")] {
         let d = p.folder.join(sub);
         if d.is_dir() && read_dir_sorted(&d).iter().next().is_some() {
-            out.push(Item::new("heal", "cache_dir", label.to_string(), d, true, Exec::Tree));
+            out.push(Item::new("heal", "cache_dir", label.to_string(), d, true, Exec::Contents));
         }
     }
     for e in read_dir_sorted(&p.folder.join("runs")) {
@@ -557,13 +572,13 @@ fn app_items(ctx: &Ctx, out: &mut Vec<Item>) {
     let known: BTreeSet<String> = crate::train::catalog::models().into_iter().map(|m| m.repo.to_lowercase()).collect();
     let general = cfg.join("general_cache");
     if general.is_dir() && read_dir_sorted(&general).iter().next().is_some() {
-        let mut c = Item::new("heal", "cache_dir", "General text kept for healing (all projects)".to_string(), general, false, Exec::Tree);
+        let mut c = Item::new("heal", "cache_dir", "General text kept for healing (all projects)".to_string(), general, false, Exec::Contents);
         c.note = Some("It is downloaded again when a heal needs it.".into());
         out.push(c);
     }
     let st = cfg.join("vllm_selftest");
     if st.is_dir() && read_dir_sorted(&st).iter().next().is_some() {
-        out.push(Item::new("heal", "cache_dir", "vLLM self-test reports and files".to_string(), st, false, Exec::Tree));
+        out.push(Item::new("heal", "cache_dir", "vLLM self-test reports and files".to_string(), st, false, Exec::Contents));
     }
     let logs = cfg.join("logs").join("jobs");
     if logs.is_dir() {
@@ -682,7 +697,9 @@ pub fn plan_delete(ctx: &Ctx, ids: &[String], opts: &Options) -> Result<Vec<Item
         if it.status == Status::InUse {
             return Err(Error::new(format!("{} is in use and is not deleted: {}.", it.label, it.refs.join("; "))));
         }
-        if !matches!(it.exec, Exec::Volume(_)) {
+        if matches!(it.exec, Exec::Contents) {
+            roots.guard_contents(&it.path).map_err(|e| Error::new(format!("{}: {}", it.label, e.0)))?;
+        } else if !matches!(it.exec, Exec::Volume(_)) {
             roots.guard(&it.path).map_err(|e| Error::new(format!("{}: {}", it.label, e.0)))?;
         }
         if !opts.allow_pinned && it.model_repo.as_ref().is_some_and(|r| opts.pinned.iter().any(|p| !p.is_empty() && (p == r || Path::new(r).starts_with(p) || Path::new(p).starts_with(r)))) {
@@ -832,6 +849,21 @@ fn delete_one(ctx: &Ctx, it: &Item, cancel: &AtomicBool, failures: &mut Vec<Fail
         Exec::Tree => {
             Roots::new(ctx.project).guard(&it.path)?;
             remove_tree(&it.path, cancel, failures);
+        }
+        Exec::Contents => {
+            let roots = Roots::new(ctx.project);
+            roots.guard_contents(&it.path)?;
+            for e in read_dir_sorted(&it.path) {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                match roots.guard(&e.path()) {
+                    Ok(_) => {
+                        remove_tree(&e.path(), cancel, failures);
+                    }
+                    Err(err) => failures.push(fail(&e.path(), &std::io::Error::other(err.0))),
+                }
+            }
         }
         Exec::ModelEntry(name) => {
             let p = ctx.project.ok_or_else(|| Error::new("No project is open."))?;

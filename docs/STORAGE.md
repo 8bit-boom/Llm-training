@@ -34,5 +34,5 @@ The project keeps `storage_deleted.json` (kind, label, date, bytes). An Auto-cut
 ## Not built (follow-up)
 Deleting intermediates automatically when an Auto-cut run ends (an option) is not built.
 
-## Tests
+## Tests (cache folders such as quantfit and the general cache are emptied, the folder stays: `Exec::Contents`)
 `crates/ndforge-core/tests/storage.rs` (guards, link, id revalidation, dry run = real, failures, cancel, sizes, suggestions, logs, Hugging Face cache, "deleted" screens), `tests/auto.rs` (a stopped run's model is in use, a finished run's is referenced, the report says it was deleted), `ui/smoke/storage.test.mjs`. Not tested on a real Windows disk: junctions, long paths, files in use.
