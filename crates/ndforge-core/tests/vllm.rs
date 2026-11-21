@@ -174,3 +174,13 @@ fn the_self_test_job_asks_for_the_fp8_pass_only_when_ticked() {
     assert_eq!(selftest_job(&s, &json!({"kv_fp8_test": true}), None).unwrap()["kv_fp8_test"], true);
     std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
+
+#[test]
+fn the_container_probe_job_carries_the_container_settings_of_the_other_vllm_jobs() {
+    let s = VllmSettings { kind: "wslc".into(), wslc: serde_json::json!({"cp_in": "wslc cp {src} {name}:{dst}"}), ..VllmSettings::default() };
+    let j = container_probe_job(&s);
+    assert_eq!(j["job"], "vllm_container_probe");
+    assert_eq!(j["engine"]["kind"], "vllm");
+    assert_eq!(j["engine"]["container"]["kind"], "wslc");
+    assert_eq!(j["engine"]["container"]["wslc"]["cp_in"], "wslc cp {src} {name}:{dst}");
+}

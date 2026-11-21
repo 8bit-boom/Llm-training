@@ -12,6 +12,7 @@ pub fn job_name(kind: &str) -> &'static str {
         "try" => "Trying the cuts",
         "think_check" => "The thinking check",
         "vllm_selftest" => "The vLLM self-test",
+        "vllm_container_probe" => "The vLLM container copy test",
         "vllm_teacher_check" => "The check of the vLLM teacher",
         "trace_gen" => "Making thinking answers",
         "auto" => "Auto-cut",

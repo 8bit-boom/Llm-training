@@ -2309,6 +2309,22 @@ fn suggestions_after_a_failed_heal_are_offered_unless_locked() {
 }
 
 #[test]
+fn a_failed_vllm_container_offers_the_teacher_cache_off_first() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    fx.fail_heal_once = true;
+    fx.fail_text = Some("vLLM was required for the teacher's answers and it did not work: Copying vllm_cache.py into the container: `wslc cp a b:/work/vllm_cache.py` failed (exit code 1): ERROR_PATH_NOT_FOUND".into());
+    let sp = AutoSpec { vllm: Some(ndforge_core::vllm_plan::AutoVllm { teacher_cache: true, checks: true, automatic: false, kv_fp8: false }), ..spec(21.1) };
+    let _ = start(&p, &mut fx, sp);
+    let st = latest(&p).unwrap();
+    let pv = ndforge_core::reshape::auto::change_preview(&p, &st.id, &serde_json::Map::new(), Some(32.0)).unwrap();
+    let first = &pv["suggestions"][0];
+    assert!(first["text"].as_str().unwrap().contains("turn the vLLM teacher cache off") && first["text"].as_str().unwrap().contains("Test the container copy"), "{first}");
+    assert_eq!(first["patch"], json!({"vllm": {"teacher_cache": false, "checks": true, "automatic": false}}), "the checks keep their own setting");
+}
+
+#[test]
 fn a_failed_step_carries_the_last_lines_of_the_tool_into_its_note_and_the_report() {
     let d = tempdir().unwrap();
     let p = project(d.path());

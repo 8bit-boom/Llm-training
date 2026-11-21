@@ -326,6 +326,23 @@ pub fn selftest_job(s: &VllmSettings, spec: &Value, p: Option<&crate::project::P
     Ok(job)
 }
 
+/// Said on the Heal card, in the Auto-cut plan and in the job log when the teacher's answers are about to be made with the 8-bit KV cache (measured on the owner's PC; nothing is changed silently).
+pub const KV_TEACHER_WARNING: &str = "8-bit KV cache for the teacher: measured 1.2x more cached tokens and no speed gain on this PC (525 against 520 tokens/s); the targets get a little numeric noise; the cache is stored under its own identity. Turn it off under Settings > vLLM (\"Also use it for the original's answers\") for exact targets.";
+
+pub fn kv_teacher_warning(s: &VllmSettings) -> Option<&'static str> {
+    (s.kv_cache_dtype == "fp8" && s.kv_cache_dtype_teacher).then_some(KV_TEACHER_WARNING)
+}
+
+/// The worker job `vllm_container_probe` (docs/WORKER_CONTRACT.md): starts the idle container, moves a 1 KB file in and out by every way, removes the container. "Test the container copy" on the Heal card.
+pub fn container_probe_job(s: &VllmSettings) -> Value {
+    json!({"job": "vllm_container_probe", "engine": {"kind": "vllm", "container": engine_job_with_card(s)}})
+}
+
+/// Runs the container probe (a few seconds to a minute; Stop writes the STOP file of the self-test folder).
+pub fn container_probe_run(job: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>, on_event: &mut dyn FnMut(Value)) -> crate::Result<Value> {
+    selftest_run(job, stop, on_event)
+}
+
 /// Runs the self-test to the end (events as JSON `{"kind": ...}`); the worker stops the engine in every end, and Stop writes the STOP file.
 pub fn selftest_run(job: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>, on_event: &mut dyn FnMut(Value)) -> crate::Result<Value> {
     let py = crate::envmgr::python_path(&crate::envmgr::env_dir());

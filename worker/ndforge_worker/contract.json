@@ -29,6 +29,7 @@
   "think_check_plan",
   "trace_gen",
   "train",
+  "vllm_container_probe",
   "vllm_selftest",
   "vllm_teacher_check"
  ],
@@ -79,6 +80,7 @@
   "train_failed",
   "unknown_job",
   "usage",
+  "vllm_container_probe_failed",
   "vllm_selftest_failed",
   "vllm_teacher_check_failed"
  ]

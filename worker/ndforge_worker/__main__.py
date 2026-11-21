@@ -238,6 +238,17 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error("trace_gen_failed", _explain(exc))
             return 1
+    if kind == "vllm_container_probe":
+        from . import vllmcache
+        try:
+            r = vllmcache.probe(job)
+            protocol.result(r)
+            return 0 if r["ok"] else 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("vllm_container_probe_failed", _explain(exc))
+            return 1
     if kind == "vllm_selftest":
         from . import thinkcheck, vllmselftest
         try:

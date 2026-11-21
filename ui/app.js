@@ -2617,7 +2617,7 @@ function onHealSpeedEvent(p) {
   if (onReshape()) render();
 }
 const hlVllmAvailable = () => !!(vllmSettings().enabled && vllmTeacher().enabled);
-const vch = { run: null, err: null };
+const vch = { run: null, err: null, probe: null, probing: false };
 function hlVllmBox(sp, est, busy) {
   if (!hlVllmAvailable()) return "";
   const v = est && est.vllm_teacher, ck = v && v.check && v.check.verdict ? v.check : null;
@@ -2631,12 +2631,25 @@ function hlVllmBox(sp, est, busy) {
     html += (v.warnings || []).map((w) => `<p class="warn small">${esc(w)}</p>`).join("");
     html += `<details><summary class="small">Where these numbers come from</summary><ul class="small dim">${(v.basis || []).map((b) => `<li>${esc(b)}</li>`).join("")}</ul></details>`;
   }
+  html += vprobeBox();
   html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
   const running = vch.run !== null;
   html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkkv" ${busy || running ? "disabled" : ""} title="Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
     ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}</div>` : ""}</div>`;
   return html;
+}
+// "Test the container copy": which way of moving a 1 KB file into and out of the vLLM container works on this PC
+function onVprobeEvent(p) {
+  if (p.kind === "progress") vch.probeText = p.text || p.step;
+  else if (p.kind === "error") { vch.probing = false; vch.probe = { ok: false, text: p.text }; }
+  else if (p.kind === "done") { vch.probing = false; vch.probe = p.data || { ok: false, text: "No answer." }; }
+  if (onReshape()) render();
+}
+function vprobeBox() {
+  const r = vch.probe;
+  const res = vch.probing ? `<div class="stepline" aria-live="polite">${esc(vch.probeText || "Testing…")}</div>` : r ? `<div id="hl-vllm-probe-result" class="${r.ok ? "ok" : "err"}"><strong>${r.ok ? "The container copy works" : "The container copy does not work"}</strong> — ${esc(r.text || "")}${r.tried ? `<ul class="small dim">${r.tried.map((t) => `<li>${t.ok ? "worked" : "failed"}: ${esc(t.route)} — ${esc(t.detail || "")}</li>`).join("")}</ul>` : ""}</div>` : "";
+  return `<div class="row"><button class="secondary" id="hl-vllm-probe" ${vch.probing || vch.run ? "disabled" : ""} title="Starts the idle container, writes 1 KB in and reads it back by every way (a mounted folder, cp, stdin), removes the container. A minute at most.">Test the container copy</button><span class="dim small">Finds out in a minute how files get into the vLLM container on this PC, before a long cache job.</span></div>${res}`;
 }
 function onVcheckEvent(p) {
   if (p.kind === "progress") { if (vch.run) { vch.run.text = p.text || p.step; vch.run.progress = p.value; } }
@@ -4174,6 +4187,7 @@ function onReshapeEvent(p) {
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
   if (p.phase === "vllm_teacher_check") return onVcheckEvent(p);
+  if (p.phase === "vllm_probe") return onVprobeEvent(p);
   if (p.phase === "healspeed") return onHealSpeedEvent(p);
   if (p.phase === "trace") return onTraceEvent(p);
   if (p.phase === "heal") return onHealEvent(p);
@@ -4313,6 +4327,7 @@ function wireReshape() {
   const hsg = $("hl-speed-go"); if (hsg) hsg.onclick = () => { hsp.teacher = !!($("hl-speed-teacher") || {}).checked; hsp.run = { text: "Starting…" }; hsp.err = null; render(); invoke("heal_speed_start", { name: rs.hl.name, spec: rsHealSpec(), withTeacher: hsp.teacher }).catch((e) => { hsp.run = null; hsp.err = String(e); render(); }); };
   const hss = $("hl-speed-stop"); if (hss) hss.onclick = () => { if (hsp.run) hsp.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   const vkv = $("hl-vllm-checkkv"); if (vkv) vkv.onclick = () => { vch.run = { text: "Starting…", progress: null }; vch.err = null; render(); invoke("vllm_teacher_check_start", { name: rs.hl.name, spec: { ...rsHealSpec(), vllm: { teacher_cache: true, kv_cache_dtype: "fp8" } } }).catch((e) => { vch.run = null; vch.err = String(e); render(); }); };
+  const vpr = $("hl-vllm-probe"); if (vpr) vpr.onclick = () => { vch.probing = true; vch.probe = null; vch.probeText = "Starting…"; render(); invoke("vllm_container_probe_start").catch((e) => { vch.probing = false; vch.probe = { ok: false, text: String(e) }; render(); }); };
   const vcs = $("hl-vllm-checkstop"); if (vcs) vcs.onclick = () => { if (vch.run) vch.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
   hv("hl-general", (e) => { hs.general = e.checked; }); hv("hl-tokens", (e) => { hs.tokens_m = +e.value; });
   hv("hl-recipe", (e) => {                                                                // the recipe's reasoning text, or the program's default text again

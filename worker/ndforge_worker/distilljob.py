@@ -858,6 +858,18 @@ def _write_coverage(folder, cov: dict) -> None:
     os.replace(tmp, Path(folder) / "coverage.json")
 
 
+def _early_vllm_probe(cfg: dict) -> None:
+    """vLLM is required: find out NOW (seconds, before the model is read and the rows are made) whether files can be moved into the container, not after an hour of preparation."""
+    from . import vllmcache as _vc
+    if not (_vc.wanted(cfg) and (cfg.get("engine") or {}).get("required")):
+        return
+    protocol.progress("cache", 0.0, "Testing the vLLM container: can files go in and out?")
+    pr = _vc.probe(cfg)
+    protocol.log(f"Container copy test: {'ok' if pr['ok'] else 'FAILED'} after {pr.get('seconds')} s. {pr['text']}")
+    if not pr["ok"]:
+        raise ReshapeError(f"vLLM was required for the teacher's answers but the container cannot be used: {pr['text']}" + ("" if _vc.REMEDY in pr["text"] else " " + _vc.REMEDY))
+
+
 def run_cache(cfg: dict) -> int:
     """job distill_cache: {"teacher": {"repo", "load": "auto|4bit|16bit|offload"}, "student": folder of the thinned model (its tokenizer is used),
     "model": {"family"}, "data": {"train", "tokens", "general": {...}}, "k": 32, "max_seq": 2048, "batch": 4, "chunk": 256, "part_tokens": 262144,
@@ -873,6 +885,7 @@ def run_cache(cfg: dict) -> int:
     stop_file = Path(cfg.get("stop_file") or out.parent / "STOP")
     k, max_seq = int(cfg.get("k", 32)), int(cfg.get("max_seq", 2048))
     student = Path(cfg["student"])
+    _early_vllm_probe(cfg)
     teacher_dir = reshapejob._resolve_source(cfg["teacher"]["repo"])
     _require_same_ids(teacher_dir, student)
     from transformers import AutoTokenizer
@@ -892,7 +905,7 @@ def run_cache(cfg: dict) -> int:
             veng = vllmcache.identity(cfg, cfg["teacher"]["repo"], teacher_dir)
         except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
             if (cfg.get("engine") or {}).get("required"):
-                raise ReshapeError(f"vLLM was required for the teacher's answers but cannot be used: {exc}") from None
+                raise ReshapeError(f"vLLM was required for the teacher's answers but cannot be used: {exc} {vllmcache.REMEDY}") from None
             protocol.log(f"vLLM is not used for the teacher's answers: {exc} The standard teacher is used.")
     meta = cache_meta(cfg, rows, stats, student, k, max_seq, teacher_dir, veng)
     upto = cfg.get("upto_general_tokens")
@@ -1097,7 +1110,7 @@ def _vllm_teacher(cfg: dict, writer, rows: list, out, meta: dict, teacher_dir, k
             problem = str(exc)
     rec.update(used=False, fallback=True, problem=problem)
     if eng.get("required"):
-        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}")
+        raise ReshapeError(f"vLLM was required for the teacher's answers and it did not work: {problem}" + ("" if vllmcache.REMEDY in problem else " " + vllmcache.REMEDY))
     return "fallback", f"vLLM could not make the teacher's answers ({problem}) The standard teacher makes them instead."
 
 

@@ -870,6 +870,11 @@ pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Optio
     out.stages = stage_plans(ins, spec, &steps, vram_gb);
     let natural: Vec<u32> = if spec.share_teacher_cache { stage_plans(ins, &AutoSpec { share_teacher_cache: false, ..spec.clone() }, &steps, vram_gb).iter().map(|s| s.seq).collect() } else { out.stages.iter().map(|s| s.seq).collect() };
     out.warnings.extend(super::auto_speed::speed_warnings(spec, &out.stages, &natural, original_b));
+    if spec.vllm.as_ref().is_some_and(|v| v.teacher_cache || v.automatic) {
+        if let Some(w) = crate::vllm::kv_teacher_warning(&crate::settings::Settings::load().vllm) {
+            out.warnings.push(w.into());
+        }
+    }
     for s in &out.stages {
         if s.verdict == "over" {
             out.blockers.push(format!("Healing stage {} ({:.1} B) needs about {:.0} GB on the card (an estimate); this card has {:.0} GB.", s.index, s.params_b, s.heal_gb, vram_gb.unwrap_or(0.0)));

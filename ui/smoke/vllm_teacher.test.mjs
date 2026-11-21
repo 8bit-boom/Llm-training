@@ -205,3 +205,26 @@ test("the Heal card has a Measure heal speed box: off until pressed, with the re
   b.run(`hsp.run = { text: "Profiling" }`);
   assert.match(b.run("renderReshape()"), /id="hl-speed-stop"/);
 });
+
+test("Test the container copy: the button starts the probe with the real keys, shows which way worked and which failed", async () => {
+  const b = open(on);
+  b.run("rs.hlSpec.vllm = true");
+  let html = b.run("renderReshape()");
+  assert.match(html, /id="hl-vllm-probe"/);
+  b.run(`vch.probing = true; vch.probeText = "Starting…"`);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "progress", text: "Testing the vLLM container" })})`);
+  assert.match(b.run("renderReshape()"), /Testing the vLLM container/);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "done", data: { ok: true, text: "Files go in by cp:dir and out by cp:file.", tried: [{ route: "bind /p/w", ok: false, detail: "refused" }, { route: "cp:dir (in)", ok: true, detail: "1 KB went in" }] } })})`);
+  html = b.run("renderReshape()");
+  assert.match(html, /id="hl-vllm-probe-result" class="ok"/);
+  assert.match(html, /failed: bind \/p\/w — refused/);
+  assert.match(html, /worked: cp:dir \(in\)/);
+  b.run(`onVprobeEvent(${JSON.stringify({ phase: "vllm_probe", kind: "error", text: "No way of moving files into the container works. Tried: ..." })})`);
+  assert.match(b.run("renderReshape()"), /class="err"><strong>The container copy does not work/);
+});
+
+test("the KV warning for the teacher is part of the numbers the Heal card shows", () => {
+  const b = open(on, vt({ warnings: ["8-bit KV cache for the teacher: measured 1.2x more cached tokens and no speed gain on this PC"] }));
+  b.run("rs.hlSpec.vllm = true");
+  assert.match(b.run("renderReshape()"), /8-bit KV cache for the teacher: measured 1\.2x more cached tokens and no speed gain/);
+});

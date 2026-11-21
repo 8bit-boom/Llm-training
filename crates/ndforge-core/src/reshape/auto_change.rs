@@ -260,6 +260,12 @@ pub fn suggestions(st: &AutoState) -> Vec<Value> {
             out.push(json!({"text": text, "patch": patch}));
         }
     };
+    if failed.ends_with(".heal") && why.contains("vllm") && (why.contains("container") || why.contains("was required")) && st.spec.vllm.as_ref().is_some_and(|v| v.teacher_cache || v.automatic) {
+        // the vLLM container route failed and vLLM was required: the first suggestion is to switch the vLLM teacher cache off (the thinking checks keep their own setting)
+        let checks = st.spec.vllm.as_ref().is_some_and(|v| v.checks);
+        add("vllm", "vLLM was required for the original's answers and the container did not work: turn the vLLM teacher cache off and go on with the standard teacher (use \"Test the container copy\" on the Heal card to see which way of copying files works here).",
+            if checks { json!({"vllm": {"teacher_cache": false, "checks": true, "automatic": false}}) } else { json!({"vllm": Value::Null}) });
+    }
     if failed.ends_with(".heal") {
         if why.contains("out of memory") {
             add("share_teacher_cache", "The graphics card ran out of memory in the heal: the same sequence length in both stages is not the cause, but a shorter heal is cheaper; try fewer tokens for the last stage.", json!({"last_tokens_m": 20}));

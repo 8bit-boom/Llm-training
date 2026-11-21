@@ -101,7 +101,7 @@ _smi_run = subprocess.run                          # the hook of the card-memory
 
 def wsl_path(path: str) -> str:
     r"""`C:\Users\me\m` -> `/mnt/c/Users/me/m`; `\\wsl$\...` / `\\wsl.localhost\<distro>\home\x` -> `/home/x`; a path that already is POSIX stays as it is."""
-    p = str(path or "")
+    p = plain_path(str(path or ""))
     m = re.match(r"^\\\\wsl(?:\$|\.localhost)\\[^\\]+(\\.*)?$", p, re.I)
     if m:
         return (m.group(1) or "\\").replace("\\", "/")
@@ -110,6 +110,16 @@ def wsl_path(path: str) -> str:
         rest = m.group(2).replace("\\", "/").rstrip("/")
         return f"/mnt/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
     return p.replace("\\", "/") if re.match(r"^[A-Za-z]:", p) else p
+
+
+def plain_path(path: str) -> str:
+    r"""A Windows path in the plain spelling a command line tool takes: `\\?\C:\Users\x` -> `C:\Users\x`, `\\?\UNC\server\share` -> `\\server\share`; anything else stays as it is."""
+    p = str(path or "")
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    if p.startswith("\\\\?\\"):
+        return p[4:]
+    return p
 
 
 def parse_wsl_version(text: str):

@@ -2040,6 +2040,9 @@ pub fn vllm_teacher_estimate(o: &heal_source::Origin, spec: &HealSpec, h: &crate
     if matches!(route["route"].as_str(), Some("bnb")) {
         warnings.push("The in-flight 4-bit route has never been run: how vLLM does it and how fast it is are unknown (the research report says only that it is much slower than the pre-quantized weights).".into());
     }
+    if let Some(w) = crate::vllm::kv_teacher_warning(s) {
+        warnings.push(w.into());
+    }
     if check.is_none_or(|c| c.is_null()) {
         warnings.push("The vLLM teacher has not been checked against the standard teacher yet: use \"Check the vLLM teacher\" first (about 100 rows).".into());
     } else if check.is_some_and(|c| c["current"] == false) {
