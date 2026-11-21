@@ -1035,6 +1035,7 @@ fn trace_gen_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, sp
 /// a plain verdict; `vllm_selftest.json/.md`). Events on "reshape-event" tagged {"phase": "vllm"}; Stop is `reshape_stop`; the engine is stopped in every end.
 #[tauri::command]
 fn vllm_selftest_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<()> {
+    clean_stale_engines(&app, &tasks);
     let m = lock(&s);
     let (v, project, keep_awake) = (m.settings.vllm.clone(), m.project.clone(), m.settings.keep_awake);
     drop(m);
@@ -1047,6 +1048,7 @@ fn vllm_selftest_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>
 /// Events on "reshape-event" tagged {"phase": "vllm_probe"}.
 #[tauri::command]
 fn vllm_container_probe_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>) -> Out<()> {
+    clean_stale_engines(&app, &tasks);
     let m = lock(&s);
     let (v, keep_awake) = (m.settings.vllm.clone(), m.settings.keep_awake);
     drop(m);
@@ -1783,6 +1785,43 @@ fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
 }
 
 
+// ------------------------------------------------------------------------------------------------------------------ the memory panel (ndforge_core::memory, docs/MEMORY.md)
+
+fn memory_env() -> ndforge_core::memory::Real {
+    ndforge_core::memory::Real { vllm: ndforge_core::settings::Settings::load().vllm }
+}
+
+/// The numbers of the footer and the popover: graphics memory, RAM, the app's own share, the engine containers, and the other programs that hold graphics memory (cached for about a second).
+#[tauri::command(async)]
+fn memory_status(tasks: State<Tasks>) -> Value {
+    ndforge_core::memory::status(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) })
+}
+
+/// What "Free GPU" (`kind` "gpu"), "Free RAM" ("ram") or "Release WSL memory" ("wsl") would end or release: the exact list, the other programs (listed only) and a plan token. Nothing is done.
+#[tauri::command(async)]
+fn memory_free_plan(tasks: State<Tasks>, kind: String) -> Out<Value> {
+    let p = ndforge_core::memory::plan(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) }, &kind).map_err(|e| e.to_string())?;
+    serde_json::to_value(p).map_err(|e| e.to_string())
+}
+
+/// Does what the plan with `plan_token` listed (it is planned again and a token that no longer matches is refused). `stop_running`: the running job is stopped first by the normal Stop (its state is saved,
+/// Continue works) and only then is anything freed; without it the items a running job uses are left alone and reported. All three arguments are required.
+#[tauri::command(async)]
+fn memory_free(tasks: State<Tasks>, kind: String, plan_token: String, stop_running: bool) -> Out<Value> {
+    if stop_running && tasks.busy.load(Ordering::SeqCst) && !stop_and_wait(&tasks.busy, &tasks.cancel, std::time::Duration::from_secs(90)) {
+        return Err("The running job did not stop in time, so nothing was freed. Try again in a moment.".into());
+    }
+    ndforge_core::memory::free(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) }, &kind, &plan_token).map_err(|e| e.to_string())
+}
+
+/// Removes the engine containers an earlier crashed run left behind, before a new vLLM job starts (nothing while a job runs); tells the window's log.
+fn clean_stale_engines(app: &tauri::AppHandle, tasks: &State<Tasks>) {
+    let gone = ndforge_core::memory::remove_stale(&memory_env(), &ndforge_core::memory::Ctx { busy: tasks.busy.load(Ordering::SeqCst) });
+    if !gone.is_empty() {
+        let _ = app.emit("reshape-event", serde_json::json!({"kind": "log", "phase": "vllm", "text": format!("Removed the engine container(s) an earlier run left behind: {}.", gone.join(", "))}));
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------ the Storage page (ndforge_core::storage, docs/STORAGE.md)
 
 fn storage_project(s: &State<App>) -> Option<ndforge_core::project::Project> {
@@ -1958,7 +1997,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -185,3 +185,12 @@ p.hs-warn { color: #8a5a00; }
 .st-why { color: var(--ok, #2f855a); }
 .st-bar { position: sticky; bottom: 8px; z-index: 2; }
 .st-confirm { border: 2px solid var(--err); }
+
+.statusbar { display: flex; gap: 12px; align-items: center; }
+.statusbar #status { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.statusbar #mem-btn { flex: none; font-size: 13px; }
+.mem-pop { position: fixed; right: 16px; bottom: 40px; width: min(560px, calc(100vw - 32px)); max-height: 70vh; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; box-shadow: 0 6px 24px rgba(0,0,0,.25); z-index: 20; }
+.mem-pop table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mem-pop td, .mem-pop th { text-align: left; padding: 2px 8px 2px 0; }
+.mem-pop .mem-bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 2px 0 6px; }
+.mem-pop .mem-bar > i { display: block; height: 100%; background: var(--accent, #4a7); }

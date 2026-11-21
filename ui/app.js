@@ -2085,7 +2085,7 @@ function renderVllm() {
     ${vllmTeacherCard()}
     <details><summary>WSLc command templates (advanced, JSON)</summary><textarea id="vl-wslc" rows="4" style="width:100%">${esc(JSON.stringify(v.wslc || {}, null, 1))}</textarea><p class="dim small">Keys: run, stop, remove, logs, list, pull, gputest, gpu_flag, shm, publish, env, test_image. See docs/VLLM.md.</p></details>
     <div class="row"><button class="secondary" id="vl-save">Save</button><button class="secondary" id="vl-detect" ${vl.busy ? "disabled" : ""}>Look for the engine</button></div>
-    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
+    ${vl.saved ? `<p class="ok">${esc(vl.saved)}</p>` : ""}${vl.err ? `<div class="err">${esc(vl.err)}${memHint(vl.err)}</div>` : ""}${lines}${renderVllmTest(v)}</div>`;
 }
 // the optional 8-bit KV cache (docs/VLLM.md): off by default; the teacher's answers need a second, explicit confirmation
 function vllmKvCard(v) {
@@ -2179,6 +2179,93 @@ function wireVllm() {
   };
   const ts = $("vl-teststop"); if (ts) ts.onclick = () => { if (vl.run) vl.run.text = "Stopping…"; invoke("reshape_stop"); render(); };
 }
+
+// ------------------------------------------------------------------------------------------------ the memory panel (docs/MEMORY.md): footer numbers, a popover, "Free GPU" / "Free RAM"
+const mem = { st: null, open: false, plan: null, stop: false, run: false, result: null, err: null, timer: null };
+const memGb = (mb) => (mb / 1024).toFixed(1);
+function memLine() {
+  const s = mem.st; if (!s) return "Memory";
+  const g = s.gpu ? `GPU ${memGb(s.gpu.free_mb)} of ${memGb(s.gpu.total_mb)} GB free` : "GPU not found";
+  const r = s.ram ? `RAM ${memGb(s.ram.free_mb)} of ${memGb(s.ram.total_mb)} GB free` : "";
+  return [g, r, s.ram && s.ram.app_mb ? `this app ${memGb(s.ram.app_mb)} GB` : ""].filter(Boolean).join(" · ");
+}
+function memBar(used, total) { return `<div class="mem-bar" aria-hidden="true"><i style="width:${total ? Math.min(100, Math.round((100 * used) / total)) : 0}%"></i></div>`; }
+function memPlanHtml(p) {
+  const need = (p.items || []).some((i) => i.needs_stop && i.refused);
+  const items = (p.items || []).map((i) => `<li><strong>${esc(i.label)}</strong> <span class="dim">${esc(i.detail)}</span>${i.refused ? ` <span class="warn">Not now: ${esc(i.refused)}.</span>` : ""}</li>`).join("");
+  const others = (p.others || []).map((o) => `<li>${esc(o.name)} (pid ${esc(String(o.pid))})${o.used_mb != null ? `, ${esc(memGb(o.used_mb))} GB` : ""} <span class="dim">${esc(o.note || "")}</span></li>`).join("");
+  const wsl = p.kind === "wsl";
+  return `<div id="mem-confirm" role="alertdialog" aria-label="Confirm"><h3>${wsl ? "Release the WSL memory?" : p.kind === "gpu" ? "Free the graphics memory this program holds?" : "Free the RAM this program holds?"}</h3>
+    ${wsl ? `<p class="warn"><strong>Warning:</strong> this ends every WSL distribution on this computer, also the ones you use for other things.</p>` : ""}
+    ${items ? `<p class="small">This will end or release exactly:</p><ul class="small">${items}</ul>` : `<p>This program holds nothing that can be freed right now.</p>`}
+    ${others ? `<p class="small">Other programs hold memory too. They are only listed: close them yourself, this program never ends them.</p><ul class="small">${others}</ul>` : ""}
+    ${(p.notes || []).map((n) => `<p class="dim small">${esc(n)}</p>`).join("")}
+    ${need ? `<label class="opt"><input type="checkbox" id="mem-stop" ${mem.stop ? "checked" : ""}> Stop the running job too (it is stopped the normal way, its state is saved and Continue works)</label>` : ""}
+    <div class="row"><button class="primary" id="mem-go" ${mem.run || !(p.items || []).length ? "disabled" : ""}>${wsl ? "Release and end WSL" : "Free it"}</button><button class="secondary" id="mem-no">Cancel</button></div></div>`;
+}
+function memResultHtml(r) {
+  const n = (x) => (x ? `${memGb(x.free_mb)} of ${memGb(x.total_mb)} GB free` : "not known");
+  const row = (l, b, a) => `<tr><td>${l}</td><td>${n(b)}</td><td>${n(a)}</td></tr>`;
+  return `<div id="mem-result"><h3>Done</h3><table><tr><th></th><th>Before</th><th>After</th></tr>${row("GPU", r.before.gpu, r.after.gpu)}${row("RAM", r.before.ram, r.after.ram)}</table>
+    ${(r.done || []).map((d) => `<div class="small ok">✓ ${esc(d.label)}${d.freed_mb ? ` (${esc(String(d.freed_mb))} MB)` : ""}</div>`).join("")}
+    ${(r.skipped || []).map((d) => `<div class="small warn">Left alone: ${esc(d.label)} — ${esc(d.why)}</div>`).join("")}
+    ${(r.failed || []).map((d) => `<div class="small err">Could not: ${esc(d.label)} — ${esc(d.why)}</div>`).join("")}
+    ${(r.others || []).length ? `<p class="dim small">Still using memory and not ours: ${(r.others || []).map((o) => esc(o.name) + (o.used_mb != null ? " " + memGb(o.used_mb) + " GB" : "")).join(", ")}. Close them yourself.</p>` : ""}
+    <p class="dim small">The free RAM includes Windows' file cache; there is no RAM cleaner here.</p></div>`;
+}
+function memPopHtml() {
+  const s = mem.st, g = s && s.gpu, r = s && s.ram;
+  const numbers = `<table>
+    <tr><th>Graphics memory</th><td>${g ? `${esc(memGb(g.used_mb))} used, ${esc(memGb(g.free_mb))} free of ${esc(memGb(g.total_mb))} GB${g.app_mb != null ? `; this app ${esc(memGb(g.app_mb))} GB` : ""}` : "no NVIDIA card found"}</td></tr>
+    <tr><td colspan="2">${g ? memBar(g.used_mb, g.total_mb) : ""}</td></tr>
+    <tr><th>RAM</th><td>${r ? `${esc(memGb(r.used_mb))} used, ${esc(memGb(r.free_mb))} free of ${esc(memGb(r.total_mb))} GB; this app ${esc(memGb(r.app_mb))} GB` : "not known"}</td></tr>
+    <tr><td colspan="2">${r ? memBar(r.used_mb, r.total_mb) : ""}</td></tr></table>
+    ${g && !g.per_process ? `<p class="dim small" id="mem-noproc">The driver does not say which program uses how much graphics memory (usual on Windows): only the totals are shown.</p>` : ""}
+    ${s && (s.containers || []).length ? `<p class="small">Engine containers: ${(s.containers || []).map((c) => esc(c.name) + (c.running ? " (running)" : " (stopped)")).join(", ")}</p>` : ""}
+    ${g && (g.others || []).length ? `<p class="small">Other programs on the card: ${(g.others || []).map((o) => esc(o.name) + (o.used_mb != null ? " " + esc(memGb(o.used_mb)) + " GB" : "")).join(", ")} <span class="dim">(listed only)</span></p>` : ""}`;
+  const body = mem.err ? `<div class="err">${esc(mem.err)}</div>` : "";
+  return `<div class="row"><strong>Memory</strong><span class="spacer"></span><button class="link" id="mem-close">Close</button></div>${numbers}
+    <div class="row"><button class="secondary" id="mem-gpu" ${mem.run ? "disabled" : ""}>Free GPU…</button><button class="secondary" id="mem-ram" ${mem.run ? "disabled" : ""}>Free RAM…</button>${s && s.wsl ? `<button class="link" id="mem-wsl" ${mem.run ? "disabled" : ""}>Release WSL memory…</button>` : ""}</div>
+    <p class="dim small">Free GPU and Free RAM only end what this program started (its engine containers and its leftover workers). Nothing happens before you confirm.</p>
+    ${body}${mem.plan ? memPlanHtml(mem.plan) : ""}${mem.result ? memResultHtml(mem.result) : ""}`;
+}
+function renderMemory() {
+  const b = $("mem-btn"); if (b) { b.textContent = memLine(); try { b.setAttribute("aria-expanded", mem.open ? "true" : "false"); } catch (_) { /* a preview */ } }
+  const pop = $("mem-pop"); if (!pop) return;
+  pop.hidden = !mem.open;
+  if (mem.open) { pop.innerHTML = memPopHtml(); wireMemory(); }
+}
+async function memPoll() {
+  try { mem.st = await invoke("memory_status"); } catch (_) { /* no numbers: the button just says Memory */ }
+  renderMemory();
+  clearTimeout(mem.timer);
+  const t = setTimeout(memPoll, mem.st && mem.st.busy ? 2000 : 5000);          // every ~2 s while a job runs, else every few seconds
+  mem.timer = t; if (t && t.unref) t.unref();
+}
+async function memAsk(kind) {
+  mem.open = true; mem.err = null; mem.result = null; mem.plan = null; mem.stop = false; renderMemory();
+  try { const p = await invoke("memory_free_plan", { kind }); mem.plan = { ...p, kind }; } catch (e) { mem.err = String(e); }
+  renderMemory();
+}
+async function memGo() {
+  const p = mem.plan; if (!p || mem.run) return;
+  mem.run = true; renderMemory();
+  try { mem.result = await invoke("memory_free", { kind: p.kind, planToken: p.token, stopRunning: !!mem.stop }); mem.plan = null; mem.err = null; }
+  catch (e) { mem.err = String(e); }
+  mem.run = false;
+  try { mem.st = await invoke("memory_status"); } catch (_) { /* keep the old numbers */ }
+  renderMemory();
+}
+function wireMemory() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("mem-close", () => { mem.open = false; renderMemory(); });
+  on("mem-gpu", () => memAsk("gpu")); on("mem-ram", () => memAsk("ram")); on("mem-wsl", () => memAsk("wsl"));
+  on("mem-go", memGo); on("mem-no", () => { mem.plan = null; renderMemory(); });
+  const st = $("mem-stop"); if (st) st.onchange = () => { mem.stop = st.checked; };
+}
+function memHint(text) { return /free memory|out of memory|in use by other programs|desired GPU memory|graphics (card|memory)/i.test(String(text || "")) ? ` <button class="link" data-memfree="gpu">Free GPU first</button>` : ""; }
+try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-memfree]"); if (t) memAsk(t.dataset.memfree); }); } catch (_) { /* a preview without a window */ }
+try { const mb = document.getElementById("mem-btn"); if (mb) mb.onclick = () => { mem.open = !mem.open; if (mem.open && !mem.st) memPoll(); renderMemory(); }; } catch (_) { /* a preview */ }
 
 function renderSetup() {
   const st = env.status;
@@ -2645,7 +2732,7 @@ function hlVllmBox(sp, est, busy) {
   const running = vch.run !== null;
   html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkkv" ${busy || running ? "disabled" : ""} title="Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
-    ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}</div>` : ""}</div>`;
+    ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}${memHint(vch.err)}</div>` : ""}</div>`;
   return html;
 }
 // "Test the container copy": which way of moving a 1 KB file into and out of the vLLM container works on this PC
@@ -4779,6 +4866,7 @@ async function init() {
   try { await tauri.event.listen("storage-event", (e) => onStorageEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
   quLoad();
+  memPoll();
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   for (const ch of STALL_CHANNELS) { try { await tauri.event.listen(ch, (e) => onStallEvent(e.payload)); } catch (_) { /* previews */ } }
   go("welcome");

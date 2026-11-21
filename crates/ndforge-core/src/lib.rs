@@ -33,5 +33,6 @@ pub mod winhints;
 pub mod vllm_plan;
 pub mod settings;
 pub mod storage;
+pub mod memory;
 
 pub use error::{Error, Result};

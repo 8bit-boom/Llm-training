@@ -1538,6 +1538,7 @@ fn the_student_token_budget_reaches_the_job_only_when_chosen_and_is_validated() 
     assert!(serde_json::from_value::<rruns::HealSpec>(json!({"tokens_m": 10})).unwrap().student_batch_tokens.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn keeping_the_output_logits_reaches_the_job_is_not_in_any_key_and_the_ladder_turns_it_back_on_first() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());

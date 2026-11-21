@@ -56,5 +56,8 @@ Optional: see `docs/TRUENAS_WORKER.md`. In Step 3 choose the server under **Wher
 ## If something goes wrong
 Open **Troubleshooting** (the help panel of this page) or press **Make a problem report** below and send the text.
 
+## Free graphics memory and RAM (the line at the bottom)
+The status line shows the free graphics memory and RAM. **Free GPU** and **Free RAM** end only what this program started (its engine containers and leftover workers), after a confirmation that lists exactly what goes; other programs are only listed. A separate extra can release the memory WSL keeps (it ends every WSL distribution). Details: help topic *Memory*.
+
 ## Free disk space (🧹 Storage)
 Models, exports and the original model's saved answers are big. The **🧹 Storage** page (left list, after *Compare quants*) shows where the disk went, suggests what is safe to delete, and deletes what you tick after you confirm (permanent, no Recycle Bin; a model or more than 5 GB needs the word DELETE). Nothing is deleted while a job runs.
