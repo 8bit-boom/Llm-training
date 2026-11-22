@@ -34,5 +34,6 @@ pub mod vllm_plan;
 pub mod settings;
 pub mod storage;
 pub mod memory;
+pub mod tune;
 
 pub use error::{Error, Result};
