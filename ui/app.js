@@ -8,6 +8,7 @@ const TITLES = {
   test: ["Step 4 · Test", "Checks that the trained model knows your world better than the original."],
   imatrix: ["Importance matrices", "Measure which weights of a model matter most, keep the result, use it in exports and copy it elsewhere."],
   quantcheck: ["Compare quants", "Measure how far each smaller GGUF file is from the 16-bit model, as KL divergence, and see which size keeps the most."],
+  tune: ["Tune this PC for a model", "Find the fastest settings for a model on this computer, test by test, and keep them as a preset you can select again."],
   storage: ["Storage", "See where the disk went and delete what you do not need. Deleting is permanent: the files are not moved to the Recycle Bin."],
   auto: ["Auto", "One click: measures, cuts, heals, checks and exports a model. It runs the same steps as the manual pages, one after the other."],
   reshape: ["Slim or grow a model", "Make a smaller or a bigger version of a model by taking whole blocks of layers out or copying some in."],
@@ -45,6 +46,7 @@ function renderSteps() {
   items.push({ key: "reshape", label: "🧬 Slim or grow a model", unlocked: !!state.bundle, done: false });
   items.push({ key: "imatrix", label: "🧮 Importance matrices", unlocked: !!state.bundle, done: false });
   items.push({ key: "quantcheck", label: "📏 Compare quants", unlocked: !!state.bundle, done: false });
+  items.push({ key: "tune", label: "🎛 Tune", unlocked: !!state.bundle, done: false });
   items.push({ key: "storage", label: "🧹 Storage", unlocked: !!state.project, done: false });
   items.push({ key: "setup", label: "⚙ Training setup", unlocked: true, done: false });
   items.push({ key: "guide", label: "📖 Guide & troubleshooting", unlocked: true, done: false });
@@ -2267,6 +2269,138 @@ function memHint(text) { return /free memory|out of memory|in use by other progr
 try { document.addEventListener("click", (ev) => { const t = ev.target && ev.target.closest && ev.target.closest("[data-memfree]"); if (t) memAsk(t.dataset.memfree); }); } catch (_) { /* a preview without a window */ }
 try { const mb = document.getElementById("mem-btn"); if (mb) mb.onclick = () => { mem.open = !mem.open; if (mem.open && !mem.st) memPoll(); renderMemory(); }; } catch (_) { /* a preview */ }
 
+// ------------------------------------------------------------------------------------------------ Tune: tested settings kept as presets you can see and select (docs/TUNE.md)
+const tn = { model: "", view: null, sel: "", err: null, ok: null, ask: null, preview: null, busy: false, loadingFor: null };
+const TN_KINDS = { exact: "tested for this model", same_shape: "same shape", lineage: "from the original", nearest: "nearest size", other_pc: "another PC" };
+function jobWhy() {
+  const parts = [];
+  if (rs.running) parts.push("a Slim, heal or check job");
+  if (rs.testing) parts.push("a model test");
+  if (typeof hsp !== "undefined" && hsp.run) parts.push("Measure heal speed");
+  if (typeof hb !== "undefined" && rs.hb && rs.hb.running) parts.push("Find the fastest loss settings");
+  if (vch.run) parts.push("a vLLM check");
+  if (ac && ac.running) parts.push("an Auto-cut run");
+  if (mem.st && mem.st.busy && !parts.length) parts.push("a job");
+  return parts.length ? `${parts.join(" and ")} is running` : "";
+}
+const tnBusy = () => !!jobWhy();
+function tuneCard() {
+  const sp = rs.hlSpec || {}, kn = (rs.hlEst && rs.hlEst.est && rs.hlEst.est.knobs) || {};
+  const pick = (v, a) => (v !== undefined && v !== null ? v : a !== undefined ? a : null);
+  return { seq: pick(sp.seq, kn.seq), batch: pick(sp.batch, kn.batch), per_update: pick(sp.per_update, kn.batch && kn.grad_accum ? kn.batch * kn.grad_accum : null), checkpointing: sp.checkpointing || "auto",
+    rank: pick(sp.rank, kn.rank), method: sp.method || (kn.qlora === true ? "qlora" : kn.qlora === false ? "lora" : null), optimizer: sp.optimizer || null, kl_chunk: pick(sp.kl_chunk, kn.kl_chunk), k: pick(sp.k, null),
+    teacher_load: sp.teacher_load || null, warmup: pick(sp.warmup, null), head_checkpoint: sp.head_checkpoint === "off" ? "off" : "on", student_batch_tokens: +(sp.student_batch_tokens || 0) };
+}
+function tuneApplyToCard(changes) {
+  const hs = rs.hlSpec; if (!hs) return;
+  for (const c of changes) {
+    const k = c.setting, v = c.to;
+    if (k === "head_checkpoint") hs.head_checkpoint = v === "off" ? "off" : null;
+    else if (k === "student_batch_tokens") hs.student_batch_tokens = +v >= 512 ? +v : null;
+    else if (k === "checkpointing") hs.checkpointing = v;
+    else hs[k] = v;
+  }
+}
+async function tuneLoad(model) {
+  if (!model) return;
+  tn.loadingFor = model; tn.err = null;
+  try { const v = await invoke("tune_presets", { model }); if (tn.loadingFor === model) { tn.view = v; tn.model = model; if (!v.presets.some((x) => x.id === tn.sel)) tn.sel = ""; } }
+  catch (e) { tn.view = null; tn.model = model; tn.err = String(e); }
+  try { render(); } catch (_) { /* a preview without a window */ }
+}
+function tuneEnsure(model) { if (model && tn.model !== model && tn.loadingFor !== model) tuneLoad(model); }
+const tnSelected = () => (tn.view && tn.view.presets.find((x) => x.id === tn.sel)) || null;
+function tuneGainText(p) { const g = (p.gains || []).filter((x) => x.gain > 1.0).map((x) => `${esc(x.function.replace(/^.*\./, ""))} ×${(+x.gain).toFixed(2)}`); return g.join(", "); }
+function tuneBar(where, model) {
+  tuneEnsure(model);
+  const v = tn.view, off = tnBusy(), why = jobWhy();
+  const list = v && v.presets || [];
+  const opts = [`<option value="">${list.length ? "Choose a preset…" : "No preset for this model yet"}</option>`].concat(list.map((p) => `<option value="${esc(p.id)}" ${p.id === tn.sel ? "selected" : ""} ${p.kind === "other_pc" ? "disabled" : ""}>${esc(p.name)} · ${esc(TN_KINDS[p.kind] || p.kind)}${p.stale.length ? " · stale, re-test?" : ""}${p.scope === "library" ? " · library" : ""}</option>`)).join("");
+  const sel = tnSelected();
+  const b = (id, label, extra = "", tip = "") => `<button class="secondary" id="tn-${id}-${where}" data-tn="${id}" ${extra}${tip ? ` title="${esc(tip)}"` : ""}>${label}</button>`;
+  const noSel = sel ? "" : "disabled";
+  const ask = tn.ask && tn.ask.where === where ? tuneAskHtml(where) : "";
+  return `<div class="tn-bar" id="tn-bar-${where}"><div class="row"><strong>Preset</strong> <select id="tn-sel-${where}" data-tn-sel="${where}">${opts}</select>
+    ${b("use", "Use…", noSel + (off ? " disabled" : ""), off ? `Off because ${why}` : "Shows what would change on the card, and what it is worth, before anything is applied")}
+    ${b("save", "Save current as preset…", off ? "disabled" : "", off ? `Off because ${why}` : "Keeps the settings of this card as a preset you can select again")}
+    ${b("rename", "Rename", noSel)}${b("dup", "Duplicate", noSel)}${b("del", "Delete", noSel)}${b("export", "Export", noSel)}${b("import", "Import", "")}</div>
+    ${sel ? `<p class="small dim" id="tn-note-${where}">${esc(sel.note || "")}${tuneGainText(sel) ? ` · measured: ${tuneGainText(sel)}` : ""}${sel.stale.length ? ` · <span class="warn">stale: ${esc(sel.stale.map((x) => x.reasons.join("; ")).join("; "))} (re-test)</span>` : ""}</p>` : ""}
+    ${off ? `<p class="dim small" id="tn-why-${where}">Some buttons are off because ${esc(why)}. Wait for it or press its Stop.</p>` : ""}
+    ${tn.err && where !== "tune" ? `<p class="err small">${esc(tn.err)}</p>` : ""}${tn.ok ? `<p class="ok small">${esc(tn.ok)}</p>` : ""}${ask}${tn.preview && tn.preview.where === where ? tuneStageHtml(where) : ""}</div>`;
+}
+function tuneAskHtml(where) {
+  const a = tn.ask, sel = tnSelected();
+  const label = { save: "Name of the new preset", rename: "New name", dup: "Name of the copy", del: `Type the preset's exact name (${sel ? esc(sel.name) : ""}) to delete it`, import: "" }[a.kind] || "";
+  return `<div class="row" id="tn-ask-${where}"><label>${label}<br><input type="text" id="tn-ask-input-${where}" value="${esc(a.value || "")}" style="min-width:320px"></label>
+    <button class="primary" id="tn-ask-ok-${where}">${a.kind === "del" ? "Delete permanently" : "OK"}</button><button class="secondary" id="tn-ask-no-${where}">Cancel</button></div>`;
+}
+function tuneStageHtml(where) {
+  const pv = tn.preview.data;
+  const rows = pv.changes.map((c) => `<tr><td>${esc(c.label)}</td><td>${esc(String(c.from ?? "automatic"))}</td><td><strong>${esc(String(c.to))}</strong></td><td>${c.gain && c.gain > 1.0 ? "×" + (+c.gain).toFixed(2) : ""}</td><td class="dim small">${esc(c.class === "quality" ? "quality knob: based on a short trial, not a full heal" : c.class === "tol" ? "same results within tolerance" : c.class === "exact" ? "same results" : c.class || "")}</td></tr>`).join("");
+  return `<div class="card" id="tn-preview-${where}"><h3>Use “${esc(pv.name)}”?</h3>
+    <p class="small ${pv.whole ? "dim" : "warn"}">${esc(pv.note)}${pv.whole ? "" : " Only the settings that carry over to another model are offered."}</p>
+    ${pv.stale.length ? `<p class="warn small">Stale: ${esc(pv.stale.map((x) => x.reasons.join("; ")).join("; "))}. You can still use it; re-testing takes about a quarter of an hour.</p>` : ""}
+    ${rows ? `<table class="tbl"><tr><th>Setting</th><th>Now</th><th>Becomes</th><th>Measured gain</th><th></th></tr>${rows}</table>` : `<p>The card already has these settings. Nothing would change.</p>`}
+    <div class="row"><button class="primary" id="tn-apply-${where}" ${rows ? "" : "disabled"}>Apply all</button><button class="secondary" id="tn-apply-no-${where}">Cancel</button></div></div>`;
+}
+function tuneName(sel) { return (sel && sel.name) || ""; }
+async function tuneAction(where, kind) {
+  const sel = tnSelected(), model = where === "tune" ? tn.pick : (rs.hl && rs.hl.name);
+  tn.err = null; tn.ok = null;
+  if (kind === "use") {
+    if (!sel) return;
+    try { tn.preview = { where, data: await invoke("tune_apply_preview", { presetId: sel.id, scope: sel.scope, model, current: tuneCard() }) }; } catch (e) { tn.err = String(e); }
+  } else if (kind === "save") tn.ask = { where, kind, value: "" };
+  else if (kind === "rename" || kind === "dup") tn.ask = { where, kind, value: kind === "rename" ? tuneName(sel) : tuneName(sel) + " copy" };
+  else if (kind === "del") tn.ask = { where, kind, value: "" };
+  else if (kind === "export" && sel) {
+    try { const dir = await tauri.dialog.open({ directory: true, title: "Choose the folder for the preset file" }); if (dir) { const f = String(dir).replace(/[\\/]+$/, "") + "/" + tuneName(sel).replace(/[^A-Za-z0-9._ -]+/g, "_") + ".ndtune.json"; await invoke("tune_preset_export", { id: sel.id, scope: sel.scope, path: f }); tn.ok = `Exported to ${f}`; } } catch (e) { tn.err = String(e); }
+  } else if (kind === "import") {
+    try { const f = await tauri.dialog.open({ multiple: false, title: "Choose a preset file", filters: [{ name: "Preset", extensions: ["json"] }] }); if (f) { tn.lastImport = String(f); await invoke("tune_preset_import", { path: String(f), overwrite: false }); tn.ok = "Imported into the library."; await tuneLoad(model); } }
+    catch (e) { const t = String(e); if (/already in the library/.test(t) && confirm(t + "\n\nReplace it?")) { try { await invoke("tune_preset_import", { path: tn.lastImport, overwrite: true }); } catch (e2) { tn.err = String(e2); } } else tn.err = t; }
+  }
+  render();
+}
+async function tuneAskOk(where) {
+  const a = tn.ask, sel = tnSelected(), model = where === "tune" ? tn.pick : (rs.hl && rs.hl.name);
+  const input = $(`tn-ask-input-${where}`), val = (input ? input.value : a.value || "").trim();
+  tn.err = null; tn.ok = null;
+  try {
+    if (a.kind === "save") { const r = await invoke("tune_preset_save", { model, name: val, scope: "project", card: tuneCard() }); tn.sel = r.id; tn.ok = `Saved “${r.name}”.`; }
+    else if (a.kind === "rename" && sel) { await invoke("tune_preset_rename", { id: sel.id, scope: sel.scope, name: val }); tn.ok = "Renamed."; }
+    else if (a.kind === "dup" && sel) { const r = await invoke("tune_preset_duplicate", { id: sel.id, scope: sel.scope, name: val }); tn.sel = r.id; tn.ok = `Copied as “${r.name}”.`; }
+    else if (a.kind === "del" && sel) { await invoke("tune_preset_delete", { id: sel.id, scope: sel.scope, confirm: val }); tn.sel = ""; tn.ok = "Deleted."; }
+    tn.ask = null; await tuneLoad(model);
+  } catch (e) { tn.err = String(e); render(); }
+}
+function wireTune() {
+  const tm = $("tn-model"); if (tm) tm.onchange = () => { tn.pick = tm.value; tn.sel = ""; tn.preview = null; tn.view = null; tn.model = ""; tuneLoad(tn.pick); render(); };
+  document.querySelectorAll("[data-tn]").forEach((b) => { b.onclick = () => tuneAction(b.id.split("-").pop(), b.dataset.tn); });
+  document.querySelectorAll("[data-tn-sel]").forEach((e) => { e.onchange = () => { tn.sel = e.value; tn.preview = null; tn.ok = null; render(); }; });
+  for (const where of ["heal", "tune", "auto"]) {
+    const ok = $(`tn-ask-ok-${where}`); if (ok) ok.onclick = () => tuneAskOk(where);
+    const no = $(`tn-ask-no-${where}`); if (no) no.onclick = () => { tn.ask = null; render(); };
+    const ap = $(`tn-apply-${where}`); if (ap) ap.onclick = () => { if (where === "tune") { tn.ok = "Open the Heal card of the model to use a preset."; } else tuneApplyToCard(tn.preview.data.changes); tn.preview = null; tn.ok = tn.ok || "Applied to the card. Nothing is saved until you start a heal."; render(); try { rsHealEstimate(); } catch (_) { /* a preview */ } };
+    const an = $(`tn-apply-no-${where}`); if (an) an.onclick = () => { tn.preview = null; render(); };
+  }
+}
+function renderTune() {
+  const head = `<h1>🎛 ${TITLES.tune[0]}</h1><p class="lead">${TITLES.tune[1]}</p>`;
+  const made = ((rs.state && rs.state.made) || []).filter((m) => m.status === "done");
+  if (!tn.pick && made.length) tn.pick = made[0].name;
+  const picker = made.length ? `<div class="card wide"><h2>Model</h2><div class="row"><select id="tn-model">${made.map((m) => `<option value="${esc(m.name)}" ${m.name === tn.pick ? "selected" : ""}>${esc(m.name)}${m.size_gb ? ` · ${esc(String(m.size_gb))} GB` : ""}</option>`).join("")}</select></div>
+      ${tn.view && tn.model === tn.pick ? `<p class="dim small">${esc(String(tn.view.model.layers))} layers, hidden size ${esc(String(tn.view.model.hidden))}, ${(tn.view.model.params / 1e9).toFixed(1)} B parameters on ${esc(tn.view.machine.gpu)} (${Math.round(tn.view.machine.vram_mb / 1024)} GB).</p>` : ""}</div>`
+    : `<div class="card wide"><p>There is no finished model to tune yet: make one on the Slim page, or run Auto.</p></div>`;
+  const bar = tn.pick ? `<div class="card wide"><h2>Tested settings for this model</h2>${tuneBar("tune", tn.pick)}${tuneListHtml()}</div>` : "";
+  return head + picker + bar;
+}
+function tuneListHtml() {
+  const v = tn.view; if (!v || tn.model !== tn.pick) return `<p class="dim">Looking…</p>`;
+  if (v.unreadable && v.unreadable.length) var bad = `<p class="warn small">${v.unreadable.map((u) => esc(u.file) + (u.kept_as ? ` (kept as ${esc(u.kept_as)})` : "") + ": " + esc(u.why)).join("; ")}</p>`;
+  const rows = v.presets.map((p) => `<tr class="${p.id === tn.sel ? "best" : ""}"><td>${esc(p.name)}</td><td>${esc(TN_KINDS[p.kind] || p.kind)}${p.scope === "library" ? " (library)" : ""}</td><td>${esc(String(p.created).slice(0, 10))}</td><td>${tuneGainText(p)}</td><td>${p.stale.length ? `<span class="warn">stale</span>` : ""}</td></tr>`).join("");
+  return `${rows ? `<table class="tbl" id="tn-list"><tr><th>Preset</th><th>Match</th><th>Date</th><th>Measured</th><th></th></tr>${rows}</table>` : `<p class="dim" id="tn-empty">No preset yet. Save the settings of the Heal card as one, or let Auto test this PC.</p>`}${bad || ""}`;
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -2628,6 +2762,7 @@ function healSettings(sp, kn, plan, busy, upcastGb, headOff) {
   const sel = (id, cur, opts) => `<select id="${id}" ${d}>${opts.map(([val, label]) => `<option value="${val}" ${String(cur) === String(val) ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const pu = v(sp.per_update, (kn.batch || 1) * (kn.grad_accum || 1)), bt = v(sp.batch, kn.batch || 1);
   return `<details id="hl-settings" open><summary>Healing settings</summary>
+    ${tuneBar("heal", rs.hl && rs.hl.name)}
     <p class="dim small">The safe settings for this model and card are already chosen. If healing runs out of memory, the program tries again by itself with safer ones.</p>
     <div class="grid">
     <label>Sequence length<br>${sel("hl-seq", v(sp.seq, kn.seq), [[512, "512"], [1024, "1024"], [2048, "2048"], [4096, "4096"], [8192, "8192 (long reasoning rows; needs a lot of memory)"]])}</label>
@@ -2730,8 +2865,11 @@ function hlVllmBox(sp, est, busy) {
   html += vprobeBox();
   html += verdict + vllmFilesBox(v && v.files && v.files.exists ? v.files : null, "hl-vllm-files", "The check is saved in:");
   const running = vch.run !== null;
-  html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${busy || running ? "disabled" : ""}>Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkcmp" ${busy || running ? "disabled" : ""} title="Scores the same 100 rows twice with vLLM, once with the exact KV cache and once with the 8-bit one, against the standard teacher's answers (made once), and prints both and the difference">Check auto and 8-bit cache</button><button class="secondary" id="hl-vllm-checkkv" ${busy || running ? "disabled" : ""} title="Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
+  const offWhy = busy || running || tnBusy() ? (jobWhy() || "a job is running") : "";
+  const offTip = offWhy ? `Off because ${offWhy}. ` : "";
+  html += `<div class="row"><button class="secondary" id="hl-vllm-check" ${offWhy ? "disabled" : ""} title="${esc(offTip)}">Check the vLLM teacher</button><button class="secondary" id="hl-vllm-checkcmp" ${offWhy ? "disabled" : ""} title="${esc(offTip)}Scores the same 100 rows twice with vLLM, once with the exact KV cache and once with the 8-bit one, against the standard teacher's answers (made once), and prints both and the difference">Check auto and 8-bit cache</button><button class="secondary" id="hl-vllm-checkkv" ${offWhy ? "disabled" : ""} title="${esc(offTip)}Measures how much the 8-bit KV cache changes the teacher's answers (mean KL, top-1 agreement against the exact reference)">Check with the 8-bit KV cache</button>${running ? `<button class="secondary" id="hl-vllm-checkstop">Stop</button>` : ""}
     <span class="dim small">Compares its answers with the standard teacher's on 100 of your rows (uses an existing saved answer set as the reference when there is one).</span></div>
+    ${offWhy ? `<p class="warn small" id="hl-vllm-why">These buttons are off because ${esc(offWhy)}. Wait for it to end, or press its Stop.</p>` : ""}
     ${running ? `<div class="stepline" aria-live="polite">${esc(vch.run.text)}</div>${vch.run.progress != null ? `<progress max="1" value="${vch.run.progress}"></progress>` : ""}` : ""}${vch.err ? `<div class="err">${esc(vch.err)}${memHint(vch.err)}</div>` : ""}</div>`;
   return html;
 }
@@ -4658,13 +4796,14 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "tune" ? renderTune() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
   $("helptoggle").checked = state.settings.show_help_panel;
   $("layout").classList.toggle("nohelp", !state.settings.show_help_panel);
   wire();
+  wireTune();
 }
 
 function wire() {
@@ -4811,6 +4950,7 @@ async function go(key) {
   if (key === "train" && state.bundle) trRefresh();
   if ((key === "reshape" || key === "auto") && state.bundle) { rs.ok = null; rs.error = null; if (key === "auto") ac.loaded = false; rsRefresh(); }
   if (key === "storage" && state.project) stRefresh();
+  if (key === "tune" && state.bundle) { rsRefresh(); tn.ok = null; tn.err = null; tn.view = null; tn.model = ""; }
   if (key === "use" && state.bundle) usRefresh();
   if (key === "imatrix" && state.bundle) { im.ok = null; im.error = null; imRefresh(); }
   if (key === "quantcheck" && state.bundle) { qk.ok = null; qk.error = null; qkRefresh(); }

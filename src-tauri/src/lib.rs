@@ -1785,6 +1785,81 @@ fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
 }
 
 
+// ------------------------------------------------------------------------------------------------------------------ Tune: tested settings and presets (ndforge_core::tune, docs/TUNE.md)
+
+fn tune_project(s: &State<App>) -> Out<ndforge_core::project::Project> {
+    lock(s).project_clone().map_err(|e| e.to_string())
+}
+
+fn tune_now() -> String {
+    ndforge_core::tune::api::now()
+}
+
+fn tune_store(s: &State<App>) -> ndforge_core::tune::store::Store {
+    ndforge_core::tune::store::Store::new(lock(s).project_clone().ok().as_ref().map(|p| p.folder.as_path()))
+}
+
+/// The presets that fit a made model on this PC (exact, same shape, from a parent, nearest, another PC), with gains and what is stale, and the machine's facts.
+#[tauri::command(async)]
+fn tune_presets(s: State<App>, model: String) -> Out<Value> {
+    let p = tune_project(&s)?;
+    ndforge_core::tune::api::presets_view(&p, &model).map_err(|e| e.to_string())
+}
+
+/// "Save current settings as preset": the Heal card's values (`card`) become a preset of this model on this machine (`scope` "project" or "library").
+#[tauri::command(async)]
+fn tune_preset_save(s: State<App>, model: String, name: String, scope: String, card: Value) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    let card = card.as_object().cloned().ok_or_else(|| "The card's settings are missing.".to_string())?;
+    let preset = ndforge_core::tune::api::save_card(&p, &model, &name, scope, card, &tune_now()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"id": preset.id, "name": preset.name}))
+}
+
+#[tauri::command(async)]
+fn tune_preset_rename(s: State<App>, id: String, scope: String, name: String) -> Out<Value> {
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    let p = tune_store(&s).rename(scope, &id, &name).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"id": p.id, "name": p.name}))
+}
+
+#[tauri::command(async)]
+fn tune_preset_duplicate(s: State<App>, id: String, scope: String, name: String) -> Out<Value> {
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    let p = tune_store(&s).duplicate(scope, &id, &name, &tune_now()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"id": p.id, "name": p.name}))
+}
+
+/// Deletes a preset; `confirm` must be its exact name (all three arguments are required: a missing one is an error, never a deletion).
+#[tauri::command(async)]
+fn tune_preset_delete(s: State<App>, id: String, scope: String, confirm: String) -> Out<()> {
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    tune_store(&s).delete(scope, &id, &confirm).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn tune_preset_export(s: State<App>, id: String, scope: String, path: String) -> Out<()> {
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    tune_store(&s).export(scope, &id, std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+/// Reads an exported preset into the app-wide library; `overwrite` is required (an existing id is replaced only when it is true).
+#[tauri::command(async)]
+fn tune_preset_import(s: State<App>, path: String, overwrite: bool) -> Out<Value> {
+    let p = tune_store(&s).import(std::path::Path::new(&path), overwrite).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"id": p.id, "name": p.name}))
+}
+
+/// What using a preset would change on the card (`current` = the card's values now): every change with the measured gain, whether the whole preset or only what carries over is offered, what is stale.
+/// Nothing is changed here; the page fills its own settings from the answer and only its own Start saves anything.
+#[tauri::command(async)]
+fn tune_apply_preview(s: State<App>, preset_id: String, scope: String, model: String, current: Value) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    let current = current.as_object().cloned().ok_or_else(|| "The card's settings are missing.".to_string())?;
+    ndforge_core::tune::api::apply_preview(&p, scope, &preset_id, &model, &current).map_err(|e| e.to_string())
+}
+
 // ------------------------------------------------------------------------------------------------------------------ the memory panel (ndforge_core::memory, docs/MEMORY.md)
 
 fn memory_env() -> ndforge_core::memory::Real {
@@ -1997,7 +2072,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
