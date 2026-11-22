@@ -138,6 +138,48 @@ pub struct AutoSpec {
     /// Student micro-batching for every heal of the run (tokens per forward pass, 512 to 65,536; docs/HEAL_SPEED.md); None = one row per forward pass, the heal as it always was (the key is then not written)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub student_batch_tokens: Option<u32>,
+    /// a tested preset for this PC (a snapshot, docs/TUNE.md); None = the heals as they always were (the key is then not written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuned: Option<TunedUse>,
+}
+
+/// A tested preset used by an Auto-cut run: a SNAPSHOT of the values and the measured numbers at Start, so a later edit of the preset never changes a running run (docs/TUNE.md).
+/// Only the speed knobs are applied to the heals (`student_batch_tokens`, `kl_chunk`, `head_checkpoint`, `checkpointing`); the quality knobs of a preset are for the Heal card.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TunedUse {
+    pub preset_id: String,
+    pub scope: String,
+    pub name: String,
+    /// "exact" | "same_shape" | "lineage" | "nearest": only the knobs that carry over are used for the last two
+    #[serde(default)]
+    pub match_kind: String,
+    /// the knobs and their values
+    #[serde(default)]
+    pub values: serde_json::Map<String, serde_json::Value>,
+    /// the speed the test measured for the student (tokens per second), the size of the model it was measured on (billions) and the speed of the default settings: the time estimate uses them
+    #[serde(default)]
+    pub tokens_per_s: Option<f64>,
+    #[serde(default)]
+    pub measured_student_b: Option<f64>,
+    #[serde(default)]
+    pub default_tokens_per_s: Option<f64>,
+}
+
+impl TunedUse {
+    /// The speed knobs of the snapshot as a heal spec's fields.
+    pub fn apply_to(&self, spec: &mut HealSpec) {
+        let n = |k: &str| self.values.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
+        spec.student_batch_tokens = n("student_batch_tokens").filter(|v| *v > 0);
+        if let Some(c) = n("kl_chunk").filter(|c| (64..=512).contains(c)) {
+            spec.kl_chunk = Some(c);
+        }
+        if self.values.get("head_checkpoint").and_then(|v| v.as_str()) == Some("off") {
+            spec.head_checkpoint = Some("off".into());
+        }
+        if let Some(c) = self.values.get("checkpointing").and_then(|v| v.as_str()).filter(|c| ["on", "off"].contains(c)) {
+            spec.checkpointing = Some(c.to_string());
+        }
+    }
 }
 
 /// Auto-cut's settings of a heal in rounds; the rest (the cap = the stage's recipe, baseline, final check mode, deadline) is filled in by the run.
@@ -184,7 +226,7 @@ impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None, vllm: None, student_batch_tokens: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None, vllm: None, student_batch_tokens: None, tuned: None,
         }
     }
 

@@ -2356,6 +2356,22 @@ fn the_student_token_budget_of_the_run_reaches_every_heal_and_is_off_by_default(
 }
 
 #[test]
+fn a_tuned_preset_of_the_run_sends_its_speed_knobs_into_every_heal() {
+    use ndforge_core::reshape::auto_plan::TunedUse;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let tuned = TunedUse { preset_id: "t-1".into(), name: "Tested".into(), match_kind: "exact".into(), tokens_per_s: Some(780.0), measured_student_b: Some(20.1),
+                           values: json!({"student_batch_tokens": 8192, "kl_chunk": 256, "head_checkpoint": "off", "seq": 8192, "rank": 8}).as_object().unwrap().clone(), ..Default::default() };
+    start(&p, &mut fx, AutoSpec { tuned: Some(tuned), ..spec(21.1) }).unwrap();
+    assert!(!fx.heal_specs.is_empty());
+    for h in &fx.heal_specs {
+        assert_eq!((h["student_batch_tokens"].clone(), h["kl_chunk"].clone(), h["head_checkpoint"].clone()), (json!(8192), json!(256), json!("off")), "{h}");
+        assert!(h.get("rank").is_none() || h["rank"] != json!(8), "a quality knob of the preset never reaches an Auto heal: {h}");
+    }
+}
+
+#[test]
 fn a_failed_vllm_container_offers_the_teacher_cache_off_first() {
     let d = tempdir().unwrap();
     let p = project(d.path());

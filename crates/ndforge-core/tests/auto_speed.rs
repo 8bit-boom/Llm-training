@@ -404,3 +404,30 @@ fn vllm_is_a_knob_with_times_and_a_risk_and_every_preset_but_custom_switches_it_
     assert!(speed_warnings(&on, &[], &[], 27.8).iter().any(|w| w.contains("Experimental: vLLM makes the original's answers")));
     assert!(!speed_warnings(&owner(), &[], &[], 27.8).iter().any(|w| w.contains("vLLM")));
 }
+
+#[test]
+fn a_tested_preset_changes_the_heals_knobs_and_the_estimate_uses_its_measured_speed() {
+    use ndforge_core::reshape::auto_plan::TunedUse;
+    use ndforge_core::reshape::runs::HealSpec;
+    let base = owner();
+    let slow = TunedUse { tokens_per_s: Some(324.0), measured_student_b: Some(20.1), ..Default::default() };
+    let (_, t0) = run(&AutoSpec { tuned: Some(slow), ..base.clone() }, 32.0);
+    let tuned = TunedUse { preset_id: "t-1".into(), scope: "project".into(), name: "Tested".into(), match_kind: "exact".into(), tokens_per_s: Some(780.0), measured_student_b: Some(20.1), default_tokens_per_s: Some(324.0),
+                           values: serde_json::json!({"student_batch_tokens": 8192, "kl_chunk": 256, "head_checkpoint": "off", "checkpointing": "on", "seq": 8192, "rank": 16}).as_object().unwrap().clone() };
+    let spec = AutoSpec { tuned: Some(tuned.clone()), ..base.clone() };
+    let (_, t1) = run(&spec, 32.0);
+    let train = |t: &TimeEstimate| t.steps.iter().filter(|s| s.id.ends_with(".heal")).flat_map(|s| s.parts.iter()).filter(|x| x.id == "train").fold(0.0, |a, x| a + x.minutes.1);
+    let ratio = train(&t1) / train(&t0);
+    assert!((ratio - 324.0 / 780.0).abs() < 0.03, "the training time follows the measured speed (324 against 780 tokens/s): {ratio}");
+    assert!(t1.steps.iter().filter(|s| s.id.ends_with(".heal")).flat_map(|s| s.parts.iter()).any(|x| x.id == "train" && x.basis == "your_history"));
+    assert_eq!(serde_json::to_value(&base).unwrap().get("tuned"), None, "a legacy spec carries no key");
+    // only the speed knobs reach a heal; a quality knob of the preset (sequence length, rank) does not
+    let mut h: HealSpec = serde_json::from_value(serde_json::json!({"tokens_m": 40})).unwrap();
+    tuned.apply_to(&mut h);
+    assert_eq!((h.student_batch_tokens, h.kl_chunk, h.head_checkpoint.as_deref(), h.checkpointing.as_deref()), (Some(8192), Some(256), Some("off"), Some("on")));
+    assert!(h.seq.is_none() && h.rank.is_none());
+    let mut plain: HealSpec = serde_json::from_value(serde_json::json!({"tokens_m": 40})).unwrap();
+    TunedUse::default().apply_to(&mut plain);
+    assert_eq!(plain, serde_json::from_value::<HealSpec>(serde_json::json!({"tokens_m": 40})).unwrap(), "an empty snapshot changes nothing");
+}
+

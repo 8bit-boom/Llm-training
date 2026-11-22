@@ -195,6 +195,73 @@
     "head_checkpoint": true
    },
    "label": "the output layer's logits made again in the backward pass (checkpointed)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 8192
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 4096
+   },
+   "label": "a smaller token budget per forward pass (4096)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 1024
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 512
+   },
+   "label": "a smaller token budget per forward pass (512)"
+  },
+  {
+   "from": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 512
+   },
+   "to": {
+    "checkpointing": true,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128
+   },
+   "label": "one row per forward pass again (the token budget was used up)"
+  },
+  {
+   "from": {
+    "checkpointing": false,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 2048
+   },
+   "to": {
+    "checkpointing": false,
+    "batch": 1,
+    "grad_accum": 32,
+    "chunk": 128,
+    "batch_tokens": 1024
+   },
+   "label": "a smaller token budget per forward pass (1024)"
   }
  ],
  "activation": [

@@ -112,6 +112,51 @@ pub fn save_card(p: &Project, model: &str, name: &str, scope: Scope, card: Map<S
     Ok(preset)
 }
 
+/// The knobs each target of "Use" takes from a preset (None: the page takes whatever the preset sets).
+fn target_keys(target: &str) -> Option<&'static [&'static str]> {
+    match target {
+        "settings_teacher" => Some(&["teacher_batch_tokens"]),
+        "settings_vllm" => Some(&["max_num_seqs", "vllm_batch_tokens", "gpu_util_pct"]),
+        _ => None,
+    }
+}
+
+/// The values of the saved settings a settings target compares with.
+pub fn settings_current(s: &crate::settings::Settings) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("teacher_batch_tokens".into(), json!(s.teacher_batch_tokens));
+    m.insert("max_num_seqs".into(), json!(s.vllm.teacher.max_num_seqs));
+    m.insert("vllm_batch_tokens".into(), json!(s.vllm.teacher.batch_tokens));
+    m.insert("gpu_util_pct".into(), json!(s.vllm.teacher.gpu_util_pct));
+    m
+}
+
+/// Applies a previewed change to the saved settings; the token must be the one of a fresh preview of the same preset against the settings as they are now (a stale or missing token changes nothing).
+pub fn apply_settings(p: &Project, scope: Scope, id: &str, model: &str, target: &str, token: &str) -> Result<Value> {
+    if !matches!(target, "settings_teacher" | "settings_vllm") {
+        return Err(Error::new("Only the settings targets are applied here; the pages fill their own settings."));
+    }
+    let pv = apply_preview(p, scope, id, model, target, &Map::new())?;
+    if token.is_empty() || pv["token"].as_str() != Some(token) {
+        return Err(Error::new("The settings or the preset changed since the preview. Look at the new preview and confirm again. Nothing was changed."));
+    }
+    let mut s = crate::settings::Settings::load();
+    let mut done = Vec::new();
+    for c in pv["changes"].as_array().cloned().unwrap_or_default() {
+        let (k, to) = (c["setting"].as_str().unwrap_or(""), c["to"].as_u64().unwrap_or(0) as u32);
+        match k {
+            "teacher_batch_tokens" => s.teacher_batch_tokens = to,
+            "max_num_seqs" => s.vllm.teacher.max_num_seqs = to,
+            "vllm_batch_tokens" => s.vllm.teacher.batch_tokens = to,
+            "gpu_util_pct" => s.vllm.teacher.gpu_util_pct = to,
+            _ => continue,
+        }
+        done.push(c);
+    }
+    s.save();
+    Ok(json!({"applied": done}))
+}
+
 /// A readable label and a short reason for the knobs a preset sets.
 fn label(knob: &str) -> &str {
     match knob {
@@ -130,6 +175,9 @@ fn label(knob: &str) -> &str {
         "head_checkpoint" => "Output-layer logits",
         "student_batch_tokens" => "Tokens per forward pass",
         "teacher_batch_tokens" => "Teacher tokens per forward pass",
+        "max_num_seqs" => "vLLM rows scored at once",
+        "vllm_batch_tokens" => "vLLM tokens per batch",
+        "gpu_util_pct" => "vLLM share of the card (%)",
         other => other,
     }
 }
@@ -137,7 +185,16 @@ fn label(knob: &str) -> &str {
 /// What using a preset would change, against `current` (the card's values as the window has them): `{changes: [{setting, label, from, to, gain, function, class, why}], whole, kind, note, stale, token, gain}`.
 /// An exact or same-shape match offers the whole preset; a parent or nearest match only the knobs that carry over; another PC is refused. The token is a hash of the preset and the changes
 /// (`tune_apply` of a settings target must carry it back).
-pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, current: &Map<String, Value>) -> Result<Value> {
+pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, target: &str, current: &Map<String, Value>) -> Result<Value> {
+    let settings_now;
+    let current = match target {
+        "settings_teacher" | "settings_vllm" => {
+            settings_now = settings_current(&crate::settings::Settings::load());
+            &settings_now
+        }
+        "heal_card" | "auto" | "try" | "think" | "imatrix" => current,
+        _ => return Err(Error::new("Apply to what? heal_card, auto, settings_teacher, settings_vllm, try, think or imatrix.")),
+    };
     let store = Store::new(Some(&p.folder));
     let preset = store.get(scope, id)?;
     let mid = model_for(p, model)?;
@@ -146,7 +203,10 @@ pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, current: 
     if kind == MatchKind::OtherPc {
         return Err(Error::new(format!("That preset was measured on another PC ({}): it is listed but never applied here.", preset.machine.gpu)));
     }
-    let values = if kind.whole() { preset.values() } else { preset.transferable_values() };
+    let mut values = if kind.whole() { preset.values() } else { preset.transferable_values() };
+    if let Some(keys) = target_keys(target) {
+        values.retain(|k, _| keys.contains(&k.as_str()));          // a settings target only takes its own knobs
+    }
     let mut changes = Vec::new();
     for (k, from, to) in diff(current, &values) {
         let f = preset.functions.iter().find(|(_, f)| f.chosen.contains_key(&k));

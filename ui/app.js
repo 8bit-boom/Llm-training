@@ -2349,7 +2349,7 @@ async function tuneAction(where, kind) {
   tn.err = null; tn.ok = null;
   if (kind === "use") {
     if (!sel) return;
-    try { tn.preview = { where, data: await invoke("tune_apply_preview", { presetId: sel.id, scope: sel.scope, model, current: tuneCard() }) }; } catch (e) { tn.err = String(e); }
+    try { tn.preview = { where, data: await invoke("tune_apply_preview", { presetId: sel.id, scope: sel.scope, model, target: "heal_card", current: tuneCard() }) }; } catch (e) { tn.err = String(e); }
   } else if (kind === "save") tn.ask = { where, kind, value: "" };
   else if (kind === "rename" || kind === "dup") tn.ask = { where, kind, value: kind === "rename" ? tuneName(sel) : tuneName(sel) + " copy" };
   else if (kind === "del") tn.ask = { where, kind, value: "" };

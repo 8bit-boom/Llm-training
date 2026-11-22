@@ -1252,6 +1252,12 @@ fn step_heal(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flo
     };
     let mut spec = st.stages[idx].plan.heal_spec(st.keep_thinking());
     spec.student_batch_tokens = st.spec.student_batch_tokens.filter(|n| *n > 0);          // chosen on the Auto page (off by default)
+    if let Some(t) = &st.spec.tuned {
+        t.apply_to(&mut spec);                                                           // a tested preset: its speed knobs (a value chosen by hand above is replaced only when the preset sets it)
+        if st.spec.student_batch_tokens.is_some() && t.values.get("student_batch_tokens").is_none() {
+            spec.student_batch_tokens = st.spec.student_batch_tokens.filter(|n| *n > 0);
+        }
+    }
     let rounds = rounds_for(st, idx, fx.now_secs());
     let student = if rounds.is_some() { Student::Made(st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to heal."))?.name) } else { student };
     match rounds {

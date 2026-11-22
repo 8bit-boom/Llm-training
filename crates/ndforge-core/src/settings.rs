@@ -80,11 +80,19 @@ pub struct VllmTeacherSettings {
     pub confirmed: std::collections::BTreeMap<String, String>,
     /// true: a heal stops when vLLM does not work; false: it goes on with the standard teacher and says so
     pub required: bool,
+    /// tested engine settings (docs/TUNE.md); 0 = the program's own value (32 rows at once, capped by the cache; 32,768 tokens per batch; 0.88 of the card). They are not part of the cache identity.
+    #[serde(default)]
+    pub max_num_seqs: u32,
+    #[serde(default)]
+    pub batch_tokens: u32,
+    /// the share of the card in percent (0 = 88)
+    #[serde(default)]
+    pub gpu_util_pct: u32,
 }
 
 impl Default for VllmTeacherSettings {
     fn default() -> Self {
-        VllmTeacherSettings { enabled: false, route: "auto".into(), pairs: [("Qwen/Qwen3.8-27B".to_string(), "cyankiwi/Qwen3.8-27B-AWQ-INT4".to_string())].into(), confirmed: Default::default(), required: false }
+        VllmTeacherSettings { enabled: false, route: "auto".into(), pairs: [("Qwen/Qwen3.8-27B".to_string(), "cyankiwi/Qwen3.8-27B-AWQ-INT4".to_string())].into(), confirmed: Default::default(), required: false, max_num_seqs: 0, batch_tokens: 0, gpu_util_pct: 0 }
     }
 }
 

@@ -404,6 +404,16 @@ pub fn teacher_engine_job(s: &VllmSettings, check: Option<&Value>) -> Value {
         e["kv_cache_dtype"] = json!("fp8");          // both switches: the 8-bit KV cache for the teacher's answers (its identity records it)
         e["kv_cache_dtype_teacher"] = json!(true);
     }
+    // tested engine settings (docs/TUNE.md), sent ONLY when set: a job without them is byte-identical to the job it always was
+    if t.max_num_seqs > 0 {
+        e["max_num_seqs"] = json!(t.max_num_seqs);
+    }
+    if t.batch_tokens > 0 {
+        e["batch_tokens"] = json!(t.batch_tokens);
+    }
+    if (50..=95).contains(&t.gpu_util_pct) {
+        e["gpu_memory_utilization"] = json!(t.gpu_util_pct as f64 / 100.0);
+    }
     if let Some(v) = check.and_then(|c| c["verdict"].as_str()) {
         e["teacher_check"] = json!({"verdict": v});
     }

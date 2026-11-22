@@ -929,7 +929,7 @@ pub fn heal_choice(spec: &HealSpec, student_b: f64, vram_gb: Option<f64>, d: &pl
     let mut knobs = plan::HealKnobs {
         seq: spec.seq.unwrap_or(rseq), batch, grad_accum: per_update.div_ceil(batch).max(1), checkpointing: def.checkpointing, rank: spec.rank.unwrap_or(rrank),
         kl_chunk: spec.kl_chunk.unwrap_or(def.kl_chunk), qlora: match spec.method.as_deref() { Some("qlora") => true, Some("lora") => false, _ => def.qlora }, upcast: false,
-        head_ckpt: spec.head_checkpoint.as_deref() != Some("off"),
+        head_ckpt: spec.head_checkpoint.as_deref() != Some("off"), batch_tokens: spec.student_batch_tokens.unwrap_or(0),
     };
     knobs.upcast = knobs.qlora && spec.kbit_upcast.unwrap_or(false);      // 16-bit LoRA has no such copy
     knobs.checkpointing = match spec.checkpointing.as_deref() {
@@ -959,7 +959,7 @@ pub fn heal_train_key(spec: &HealSpec, c: &HealChoice, tokens: u64) -> Value {
 fn knobs_from_worker(s: &Value) -> Option<plan::HealKnobs> {
     let n = |k: &str| s[k].as_u64().map(|v| v as u32);
     Some(plan::HealKnobs { seq: n("max_seq")?, batch: n("batch")?, grad_accum: n("grad_accum")?, checkpointing: s["checkpointing"].as_bool()?, rank: n("rank")?, kl_chunk: n("chunk")?, qlora: s["method"] == "qlora", upcast: s["upcast"].as_bool().unwrap_or(false),
-                            head_ckpt: s["head_checkpoint"].as_bool().unwrap_or(true) })
+                            head_ckpt: s["head_checkpoint"].as_bool().unwrap_or(true), batch_tokens: n("batch_tokens").unwrap_or(0) })
 }
 
 /// After an out-of-memory failure: the next safer setting from the settings of the last try, as what the page sets in the Heal card. `Null` when there is nothing
@@ -967,7 +967,7 @@ fn knobs_from_worker(s: &Value) -> Option<plan::HealKnobs> {
 fn heal_safer(h: &Value) -> Value {
     let last = knobs_from_worker(&h["knobs_now"]).or_else(|| serde_json::from_value::<plan::HealKnobs>(h["knobs"].clone()).ok());
     match last.and_then(|k| plan::heal_next_safer(&k)) {
-        Some((k, label)) => json!({"label": label, "kbit_upcast": k.upcast, "head_checkpoint": if k.head_ckpt { "on" } else { "off" }, "checkpointing": if k.checkpointing { "on" } else { "off" }, "batch": k.batch, "per_update": k.batch * k.grad_accum, "kl_chunk": k.kl_chunk}),
+        Some((k, label)) => json!({"label": label, "kbit_upcast": k.upcast, "head_checkpoint": if k.head_ckpt { "on" } else { "off" }, "checkpointing": if k.checkpointing { "on" } else { "off" }, "batch": k.batch, "per_update": k.batch * k.grad_accum, "kl_chunk": k.kl_chunk, "student_batch_tokens": k.batch_tokens}),
         None => Value::Null,
     }
 }

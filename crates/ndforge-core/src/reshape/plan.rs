@@ -831,6 +831,9 @@ pub struct HealKnobs {
     /// tokens x vocabulary x 10 bytes more graphics memory. Student-side only: not in the training key and not in the teacher's cache key. Older saved settings have none: on.
     #[serde(default = "yes")]
     pub head_ckpt: bool,
+    /// Student micro-batching (`HealSpec.student_batch_tokens`): the tokens per forward pass; 0 = one row per forward pass (today's way). Older saved settings have none: 0.
+    #[serde(default)]
+    pub batch_tokens: u32,
 }
 
 fn yes() -> bool {
@@ -931,7 +934,7 @@ pub fn heal_verdict_text(est_gb: f64, vram_gb: Option<f64>) -> String {
 pub fn heal_defaults(student_b: f64, vram_gb: Option<f64>, d: &HealDims) -> HealKnobs {
     let big = student_b >= 15.0;
     let batch = if student_b >= 25.0 { 1 } else if big { 2 } else { 4 };
-    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false, head_ckpt: true };
+    let mut k = HealKnobs { seq: if big { 1024 } else { 2048 }, batch, grad_accum: 32 / batch, checkpointing: true, rank: if big { 32 } else { 64 }, kl_chunk: if big { 128 } else { 256 }, qlora: big, upcast: false, head_ckpt: true, batch_tokens: 0 };
     if !big && vram_gb.is_some_and(|v| heal_memory_gb(student_b, d, &HealKnobs { qlora: false, ..k.clone() }) > v * 0.85) {
         k.qlora = true;
     }
@@ -955,6 +958,16 @@ pub fn heal_checkpointing_auto(student_b: f64, d: &HealDims, k: &HealKnobs, vram
 /// label, or None when the ladder is used up. Changes that alter the maths (sequence length, rank) are never made here.
 pub fn heal_next_safer(k: &HealKnobs) -> Option<(HealKnobs, String)> {
     let mut s = k.clone();
+    if s.batch_tokens > 0 {
+        // the token budget of the student's micro-batches comes down first (the worker's ladder does the same): it changes how many rows are on the card at once and nothing about what is learned
+        let new = s.batch_tokens / 2;
+        if new < 512 {
+            s.batch_tokens = 0;
+            return Some((s, "one row per forward pass again (the token budget was used up)".to_string()));
+        }
+        s.batch_tokens = new;
+        return Some((s, format!("a smaller token budget per forward pass ({new})")));
+    }
     if !s.head_ckpt {
         s.head_ckpt = true;
         return Some((s, "the output layer's logits made again in the backward pass (checkpointed)".to_string()));

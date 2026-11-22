@@ -514,7 +514,19 @@ pub fn rounds_estimate(h: &History, i: &RoundsIn) -> (Vec<StepPart>, RoundsTime)
 
 /// The time of the whole run for `plan` (an `ok` plan) and `spec`. `history` is what this computer's own saved job logs say (`History::default()`: nothing, every step is a formula).
 pub fn time_estimate(ins: &Inspect, spec: &AutoSpec, plan: &AutoPlan, history: &History) -> TimeEstimate {
-    let h = history;
+    let tuned_history;
+    let h = match spec.tuned.as_ref().and_then(|t| Some((t.tokens_per_s?, t.measured_student_b?))) {
+        // a tested preset (or a student batch size) was measured faster: the estimate uses the measured speed, a tenth less for saving and checking, as for a speed test of the loss settings
+        Some((tps, b)) if tps > 0.0 && b > 0.0 => {
+            let mut th = history.clone();
+            for _ in 0..crate::timing::HISTORY_RECENT {
+                th.push("train_tok_b_s", b, tps * b * TRAIN_BENCH_FACTOR);
+            }
+            tuned_history = th;
+            &tuned_history
+        }
+        _ => history,
+    };
     let ob = ins.total_params as f64 / 1e9;
     let orig_gb = ins.total_params as f64 * if ins.bytes_per_param > 0.0 { ins.bytes_per_param } else { 2.0 } / 1e9;
     let mode = plan.measure_load.as_str();
