@@ -37,7 +37,7 @@ pub const CATALOG: [TestDef; 5] = [
     TestDef { id: "heal.loss", label: "Loss chunk and output-layer logits", what: "The KL chunk (64 to 512) and keeping the output layer's logits: the same maths, different speed and memory.",
               tier: 1, class: "exact", default_on: true, knobs: &["kl_chunk", "head_checkpoint"], built: true, need_share: 0.55 },
     TestDef { id: "heal.quality", label: "Quality settings (short trial heals)", what: "LoRA size, optimizer, warm-up and learning rate, each tried alone from your settings in a short real heal on your rows with the same seed; the held-out loss decides. A short trial, not a full heal.",
-              tier: 2, class: "quality", default_on: true, knobs: &["rank", "optimizer", "warmup", "lr"], built: false, need_share: 0.6 },
+              tier: 2, class: "quality", default_on: true, knobs: &["rank", "optimizer", "warmup", "lr"], built: true, need_share: 0.6 },
     TestDef { id: "teacher.standard", label: "The original's answers: tokens per forward pass", what: "How many tokens of rows the original answers in one forward pass (the standard engine).",
               tier: 1, class: "tol", default_on: true, knobs: &["teacher_batch_tokens"], built: false, need_share: 0.7 },
     TestDef { id: "disk", label: "Disk speed", what: "Writes and reads a few GB on the drive that holds the models, to tell how long a cut or a merge will take.",
@@ -240,6 +240,34 @@ fn result_of(d: &TestDef, ctx: &TestCtx, out: &TestOut) -> (Value, Option<Functi
                 tried: out.rows.clone(), depends_on: deps, transferable: vec![], context, note: dec.why.clone(), ..Default::default()
             };
             (json!({"chunk": dec.chunk, "head_checkpoint": dec.head_checkpoint, "gain": dec.gain, "changed": dec.changed, "why": dec.why}), Some(fr))
+        }
+        "heal.quality" => {
+            let (decisions, noise, base) = super::quality::decide_quality(&out.rows, ctx.card_mb);
+            if decisions.is_empty() {
+                return (json!({"changed": false, "why": "The trials did not give a baseline, so nothing was decided."}), None);
+            }
+            let mut chosen = Map::new();
+            let mut default = Map::new();
+            let mut notes = Vec::new();
+            let mut best_gain = 0.0f64;
+            for k in decisions.iter().filter(|k| k.changed) {
+                chosen.insert(k.knob.clone(), k.chosen.clone());
+                default.insert(k.knob.clone(), ctx.card.get(&k.knob).cloned().unwrap_or(Value::Null));
+                best_gain += k.gain_loss;
+            }
+            for k in &decisions {
+                notes.push(format!("{}: {}", k.knob, k.why));
+            }
+            let note = format!("Quality knob: based on a short trial, not a full heal. {}", notes.join(" "));
+            let gain = if base > 0.0 { base / (base - best_gain).max(1e-6) } else { 1.0 };
+            let fr = FunctionResult {
+                chosen: chosen.clone(), default, gain, spread: if base > 0.0 { noise / base } else { 0.0 }, class: d.class.into(), tier: d.tier,
+                guards: vec![Guard { name: "peak_vram_below_90_percent".into(), ok: true, value: None, limit: Some(0.9) }],
+                measured: json!({"held_out_loss": base, "noise": noise, "trial_tokens_k": ctx.trial_tokens_k, "student_b": ctx.student_b}),
+                tried: out.rows.clone(), depends_on: deps, transferable: vec![], context, note: note.clone(), ..Default::default()
+            };
+            let changed = !chosen.is_empty();
+            (json!({"changed": changed, "chosen": chosen, "noise": noise, "baseline_loss": base, "why": note, "knobs": decisions.iter().map(|k| json!({"knob": k.knob, "changed": k.changed, "chosen": k.chosen, "gain_loss": k.gain_loss, "why": k.why})).collect::<Vec<_>>()}), if changed { Some(fr) } else { None })
         }
         _ => (json!({"why": "not built"}), None),
     }

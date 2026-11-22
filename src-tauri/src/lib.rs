@@ -1895,6 +1895,12 @@ fn tune_plan(s: State<App>, spec: Value) -> Out<Value> {
             notes.insert(t.into(), "Save a training-data version in Step 2 first: the tests use your real rows.".into());
         }
     }
+    if !notes.contains_key("heal.quality") {
+        let ready = ndforge_core::tune::real::heal_spec_of(&spec.card).ok().and_then(|h| ndforge_core::reshape::heal_bench::trial_ready(&p, &spec.model, &h, card_vram_gb()).ok());
+        if ready == Some(false) {
+            notes.insert("heal.quality".into(), "Heal this model once first (or run Try first): the quality trials need the original's saved answers for this sequence length.".into());
+        }
+    }
     let now = chrono_secs();
     let mut v = ndforge_core::tune::runner::plan_view(&spec, id.params as f64 / 1e9, now, &notes);
     v["model"] = serde_json::json!({"name": id.name, "params_b": id.params as f64 / 1e9, "layers": id.layers, "hidden": id.hidden});

@@ -65,6 +65,38 @@ impl TuneFx for Real<'_> {
                 let res = crate::reshape::heal_bench::run(self.project, ctx.model, &spec, self.vram_gb, crate::reshape::heal_bench::STEPS, self.stop.clone(), &mut forward)?;
                 Ok(TestOut { rows: res["rows"].as_array().cloned().unwrap_or_default(), raw: res.clone(), stopped: res["stopped"] == true || self.stopped(), note: String::new() })
             }
+            "heal.quality" => {
+                let tokens = (if ctx.trial_tokens_k == 0 { 400 } else { ctx.trial_tokens_k } as u64) * 1000;
+                let mut rows: Vec<Value> = Vec::new();
+                let mut stopped = false;
+                for (i, v) in super::quality::variants(ctx.card).into_iter().enumerate() {
+                    if self.stopped() {
+                        stopped = true;
+                        break;
+                    }
+                    let seed = if v.id == "baseline2" { 2 } else { 1 };
+                    let ov = super::quality::overrides(&v, seed);
+                    (self.emit_fn)(json!({"kind": "tune_progress", "id": d.id, "event": {"trial": v.id, "label": v.label, "n": i}}));
+                    let dir = ctx.dir.join(format!("trial-{i}"));
+                    let r = match crate::reshape::heal_bench::trial(self.project, ctx.model, &spec, self.vram_gb, &ov, tokens, &dir, &self.stop) {
+                        Ok(r) => r,
+                        Err(_) if self.stopped() => {
+                            stopped = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let mut row = json!({"id": v.id, "knob": v.knob, "value": v.value, "label": v.label, "seed": seed});
+                    if let (Some(a), Some(b)) = (row.as_object_mut(), r.as_object()) {
+                        for (k, x) in b {
+                            a.insert(k.clone(), x.clone());
+                        }
+                    }
+                    (self.emit_fn)(json!({"kind": "tune_row", "id": d.id, "row": row}));
+                    rows.push(row);
+                }
+                Ok(TestOut { rows, raw: json!({"trial_tokens": tokens}), stopped, note: String::new() })
+            }
             other => Err(Error::new(format!("The test {other} is not built in this version."))),
         }
     }

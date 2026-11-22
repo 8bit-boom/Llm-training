@@ -194,10 +194,10 @@ fn the_hours_cap_drops_the_tail_and_a_test_this_version_cannot_run_is_not_planne
     let t = tempfile::tempdir().unwrap();
     let (_, st, _) = setup(&t, &["heal.student_batch", "heal.loss", "heal.quality", "disk"], Some(0.6));
     assert_eq!(st.tests.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), vec!["heal.student_batch"], "36 minutes cover the first test only; the others are not built or do not fit");
-    let spec = Spec { model: "m".into(), tests: vec!["heal.student_batch".into(), "heal.quality".into()], ..Default::default() };
+    let spec = Spec { model: "m".into(), tests: vec!["heal.student_batch".into(), "teacher.standard".into()], ..Default::default() };
     let v = plan_view(&spec, 20.1, 1_000_000, &BTreeMapNotes::new());
-    let q = v["tests"].as_array().unwrap().iter().find(|x| x["id"] == "heal.quality").unwrap();
-    assert!(q["unavailable"].as_str().unwrap().contains("not built") && q["tier"] == 2);
+    let q = v["tests"].as_array().unwrap().iter().find(|x| x["id"] == "teacher.standard").unwrap();
+    assert!(q["unavailable"].as_str().unwrap().contains("not built") && q["tier"] == 1);
     let total = v["total_minutes"].as_array().unwrap();
     assert!(total[0].as_f64().unwrap() >= 15.0 && total[1].as_f64().unwrap() <= 26.0, "only the test that can run counts: {total:?}");
     assert!(v["done_between"][1].as_i64().unwrap() > v["done_between"][0].as_i64().unwrap());
@@ -227,4 +227,20 @@ fn the_cards_values_become_a_heal_spec_and_automatic_values_are_left_out() {
     let t = heal_spec_of(&tuned).unwrap();
     assert_eq!((t.student_batch_tokens, t.head_checkpoint.as_deref()), (Some(8192), Some("off")));
     assert!(heal_spec_of(&json!({"seq": "wide"}).as_object().unwrap().clone()).is_err());
+}
+
+#[test]
+fn the_quality_trials_become_a_quality_class_result_that_says_short_trial_and_changes_only_what_beats_the_noise() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["heal.quality"], None);
+    let q = |id: &str, knob: &str, value: Value, after: f64| json!({"id": id, "knob": knob, "value": value, "label": id, "ok": true, "held_after": after, "peak_vram_mb": 20000.0});
+    let mut f = fx();
+    f.outs.insert("heal.quality".into(), Ok(TestOut { rows: vec![q("baseline", "", Value::Null, 2.0), q("baseline2", "", Value::Null, 2.02), q("rank=32", "rank", json!(32), 1.8), q("warmup=0", "warmup", json!(0), 2.005)], ..Default::default() }));
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    assert_eq!(st.status, "done");
+    let preset = store.get(Scope::Project, st.preset_id.as_ref().unwrap()).unwrap();
+    let fr = &preset.functions["heal.quality"];
+    assert_eq!((fr.class.as_str(), fr.tier), ("quality", 2));
+    assert_eq!(fr.chosen.get("rank"), Some(&json!(32)));
+    assert!(!fr.chosen.contains_key("warmup") && fr.note.contains("short trial, not a full heal"), "{}", fr.note);
 }
