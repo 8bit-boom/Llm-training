@@ -191,3 +191,32 @@ def test_the_sweep_can_repeat_the_baseline_and_the_best_and_reports_the_spread(t
     assert len(base["repeats"]) == 2 and "spread" in sw and sw["spread"] >= 0
     assert any(len(r.get("repeats", [])) == 2 for r in sw["results"] if r["batch_tokens"] != 0), "the fastest candidate is repeated too"
     assert sw["recommended"]["spread"] == sw["spread"]
+
+
+def test_a_trial_heal_learns_on_real_rows_and_reports_the_held_out_loss_and_the_same_seed_gives_the_same_start(tmp_path, teacher, monkeypatch):
+    from test_distill_torch import bench_run
+    student = thin_student(tmp_path, teacher)
+    make_cache(tmp_path, student, teacher, monkeypatch)
+    out = {}
+    for name, rank in (("a", 8), ("b", 8), ("c", 4)):
+        cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / f"no-output-{name}"), hyper={"batch": 1, "grad_accum": 4, "max_steps": 1, "rank": rank, "alpha": rank, "lr": 3e-3, "warmup": 2})
+        cfg["distill"]["chunk"] = 32
+        cfg["bench"] = {"targets": "cache", "trial": {"tokens": 2500}}
+        code, ev, res = bench_run(monkeypatch, cfg)
+        assert code == 0 and res, ev[-1]
+        out[name] = res[0]["data"]
+    a = out["a"]
+    assert a["trial"] is True and a["targets"] == "cache" and a["updates"] >= 4 and a["tokens"] > 0 and a["optimizer"] == "adamw_torch"
+    assert a["held_after"] < a["held_before"], "the model learned on rows it did not see held out"
+    assert a["improvement"] == pytest.approx(a["held_before"] - a["held_after"], abs=1e-5)
+    assert out["b"]["held_before"] == pytest.approx(a["held_before"], abs=1e-6), "the same seed and rows start from the same held-out loss"
+    assert out["c"]["rank"] == 4 and out["c"]["held_before"] == pytest.approx(a["held_before"], abs=0.05)
+
+
+def test_a_trial_without_the_originals_saved_answers_is_refused_in_plain_words(tmp_path, teacher, monkeypatch):
+    from test_distill_torch import bench_run
+    student = thin_student(tmp_path, teacher)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "no-output"), hyper={"batch": 1, "grad_accum": 2, "max_steps": 1})
+    cfg["bench"] = {"targets": "synthetic", "trial": {"tokens": 1000}}
+    with pytest.raises(Exception, match="saved answers"):
+        bench_run(monkeypatch, cfg)

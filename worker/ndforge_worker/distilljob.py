@@ -1530,6 +1530,97 @@ def _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, para
             "micro_batches": n_mb, "padded_share": round(pad_share, 3), "seconds": round(secs, 2), "tokens": tokens}
 
 
+def _make_optimizer(params, name: str, lr: float, cuda: bool):
+    """The optimizer of the heal for a trial: the 8-bit AdamW of bitsandbytes when asked for and available, else torch's AdamW (the same choice the heal makes)."""
+    import torch
+    want = str(name or "auto").lower()
+    if want in ("adamw", "adamw_torch") or not cuda:
+        return torch.optim.AdamW(params, lr=lr), "adamw_torch"
+    try:
+        import bitsandbytes as bnb
+        return bnb.optim.AdamW8bit(params, lr=lr), "adamw_8bit"
+    except Exception:           # noqa: BLE001 - the heal falls back the same way
+        return torch.optim.AdamW(params, lr=lr), "adamw_torch"
+
+
+def _lr_factor(step: int, warmup: int, total: int) -> float:
+    """The heal's schedule in short: linear warm-up, then a cosine down to 10 % over the rest of the trial."""
+    import math as _m
+    if warmup > 0 and step < warmup:
+        return (step + 1) / warmup
+    rest = max(1, total - warmup)
+    return 0.1 + 0.9 * 0.5 * (1.0 + _m.cos(_m.pi * min(1.0, (step - warmup) / rest)))
+
+
+def _bench_trial(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params_fn, dev, h: dict, trial: dict, cuda: bool) -> dict:
+    """A SHORT REAL HEAL on real rows (docs/TUNE.md, tier 2): the same seeded rows for every setting, `trial["tokens"]` tokens of learning with the heal's optimizer, learning rate and warm-up, and the loss on rows
+    that were held out of the learning before and after. -> {"held_before", "held_after", "train_last", "updates", "tokens", "tokens_per_s", "peak_vram_mb", "seconds", "improvement"}. Needs the original's saved answers
+    (a cache): with synthetic answers the loss would mean nothing."""
+    import random
+    import torch
+    from . import speed
+    if reader is None:
+        raise ReshapeError("The quality trials need the original's saved answers for this sequence length: heal once, or let the tuner make them first.")
+    per_update = max(1, int(h["batch"]) * int(h["grad_accum"]))
+    budget = max(0, int(h.get("student_batch_tokens") or 0))
+    order = list(range(len(rows)))
+    random.Random(int(trial.get("data_seed", 3407))).shuffle(order)
+    n_hold = min(48, max(8, len(order) // 10))
+    hold, train = order[:n_hold], order[n_hold:] or order
+    mean_len = max(1.0, sum(len(rows[i]["input_ids"]) for i in train) / len(train))
+    updates = max(4, int(round(int(trial["tokens"]) / (per_update * mean_len))))
+    collate = _group_collator(pad_id, reader, budget, int(h["seed"]), None)
+    targets = lambda inp: (inp["t_ids"], inp["t_logp"], inp["t_resid"])      # noqa: E731
+    plist = params_fn()
+    opt, used = _make_optimizer(plist, h.get("optimizer"), float(h["lr"]), cuda)
+    warm = int(h.get("warmup", 30))
+
+    def held() -> float:
+        model.eval()
+        tot, n = 0.0, 0.0
+        with torch.no_grad():
+            for a in range(0, len(hold), 4):
+                sel = [{**rows[i], "row": i} for i in hold[a:a + 4]]
+                out = _group_collator(pad_id, reader, 0, 1, None)(sel)
+                for g in out["groups"]:
+                    g = {kk: v.to(dev) for kk, v in g.items()}
+                    kd, nr = student_loss_rows(model, g, targets, chunk, head_ckpt)
+                    tot += float(kd)
+                    n += float(nr)
+        model.train()
+        return tot / max(n, 1.0)
+    before = held()
+    model.train()
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    t0, tokens, last = time.monotonic(), 0, None
+    for u in range(updates):
+        for g_ in opt.param_groups:
+            g_["lr"] = float(h["lr"]) * _lr_factor(u, warm, updates)
+        sel = [{**rows[i], "row": i} for i in (train[(u * per_update + j) % len(train)] for j in range(per_update))]
+        out = collate(sel)
+        total = 0.0
+        for g in out["groups"]:
+            g = {kk: v.to(dev) for kk, v in g.items()}
+            kd, _ = student_loss_rows(model, g, targets, chunk, head_ckpt)
+            (kd / per_update).backward()
+            total += float(kd.detach()) / per_update
+            tokens += int(g["attention_mask"].sum())
+        last = total
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        protocol.progress("bench", 0.1 + 0.8 * (u + 1) / updates, f"Trial update {u + 1} of {updates}")
+    if cuda:
+        torch.cuda.synchronize()
+    secs = max(time.monotonic() - t0, 1e-6)
+    peak = round(torch.cuda.max_memory_allocated() / 1e6) if cuda else None
+    after = held()
+    return {"held_before": round(before, 6), "held_after": round(after, 6), "improvement": round(before - after, 6), "train_last": round(last, 6) if last is not None else None, "updates": updates, "tokens": tokens,
+            "tokens_per_s": round(tokens / secs, 2), "peak_vram_mb": peak, "seconds": round(secs, 1), "optimizer": used, "rank": int(h["rank"]), "warmup": warm, "lr": float(h["lr"]),
+            "per_gain_per_minute": round((before - after) / (secs / 60.0), 6)}
+
+
 def _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budgets: list, b: dict, cuda: bool) -> dict:
     """The speed for every `student_batch_tokens` in `budgets` on REAL rows (a seeded random sample of the project's rows, their true lengths), the same rows and the same targets for each, with the
     recommendation (`healspeed.recommend_batch_tokens`). A budget that runs out of memory is recorded and the others go on."""
@@ -1647,9 +1738,23 @@ def _run_bench(cfg: dict, box: dict) -> int:
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
         raise ReshapeError("The student has no trainable weights, so its speed cannot be measured.")
+    dev = next(model.parameters()).device
+    if isinstance(b.get("trial"), dict):
+        # a short trial heal instead of the timing steps: the held-out loss before and after (tier 2 of the tuner)
+        try:
+            res = _bench_trial(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, lambda: [p for p in model.parameters() if p.requires_grad], dev, h, b["trial"], cuda)
+        except RuntimeError as exc:
+            if healmem.is_oom(exc):
+                write_report("failed", "out of memory")
+                protocol.error("distill_oom", f"The graphics card ran out of memory in the trial at sequence length {h['max_seq']}, rank {h['rank']}.")
+                return 1
+            raise
+        res.update(targets=use, student_b=h["student_b"], max_seq=int(h["max_seq"]), trial=True)
+        protocol.progress("bench", 1.0, "")
+        protocol.result(res)
+        return 0
     opt = torch.optim.AdamW(params, lr=1e-6)
     model.train()
-    dev = next(model.parameters()).device
     tokens, started = 0, None
     try:
         for step in range(warm + steps):
