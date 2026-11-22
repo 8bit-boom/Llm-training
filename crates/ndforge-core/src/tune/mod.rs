@@ -3,6 +3,7 @@ pub mod api;
 pub mod decide;
 pub mod identity;
 pub mod preset;
+pub mod quality;
 pub mod real;
 pub mod runner;
 pub mod store;

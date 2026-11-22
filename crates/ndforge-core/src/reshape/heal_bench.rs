@@ -176,3 +176,38 @@ pub fn file(p: &Project, name: &str) -> std::path::PathBuf {
 pub fn last(p: &Project, name: &str) -> Option<Value> {
     std::fs::read(file(p, name)).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
+
+
+/// Whether the original's saved answers for this model's heal are complete (the quality trials need them: with synthetic answers the loss would mean nothing).
+pub fn trial_ready(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>) -> Result<bool> {
+    Ok(bench_base(p, name, spec, vram_gb)?.cache.is_some())
+}
+
+/// A short REAL heal for the tuner's quality tests (docs/TUNE.md): the heal's job with `hyper` replaced by `overrides` (rank, alpha, optimizer, warmup, lr, seed) and the bench key `trial` (tokens of learning;
+/// the loss on held-out rows before and after). One worker process per setting. Returns the worker's result with `ok: true`, or `{"ok": false, "error", "oom"}`; Err when stopped.
+pub fn trial(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, overrides: &serde_json::Map<String, Value>, tokens: u64, dir: &Path, stop: &Arc<AtomicBool>) -> Result<Value> {
+    let b = bench_base(p, name, spec, vram_gb)?;
+    if b.cache.is_none() {
+        return Err(Error::new("The quality trials need the original's saved answers for this sequence length: heal this model once, or let the tuner make them first."));
+    }
+    if stop.load(Ordering::SeqCst) {
+        return Err(Error::new("Stopped."));
+    }
+    let mut job = b.job_base(STEPS, WARMUP).job;
+    for (k, v) in overrides {
+        job["hyper"][k] = v.clone();
+    }
+    job["bench"] = json!({"targets": "cache", "trial": {"tokens": tokens}});
+    let _ = std::fs::create_dir_all(dir);
+    let outcome = run_with_grace(&b.py, &job, &dir.join("STOP"), stop, Duration::from_secs(60), &mut |_e: WorkerEvent| {});
+    if stop.load(Ordering::SeqCst) {
+        return Err(Error::new("Stopped."));
+    }
+    Ok(match outcome {
+        Ok(mut r) => {
+            r["ok"] = json!(true);
+            r
+        }
+        Err(e) => json!({"ok": false, "error": e.0, "oom": e.0.to_lowercase().contains("out of memory")}),
+    })
+}
