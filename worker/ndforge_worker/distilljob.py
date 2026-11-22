@@ -1542,10 +1542,17 @@ def _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, 
     random.Random(int(h["seed"])).shuffle(order)
     card = torch.cuda.mem_get_info()[1] / 1e6 if cuda else None
 
+    longest = sorted(range(len(rows)), key=lambda i: -len(rows[i]["input_ids"]))[:per_update]       # the worst case: the update made of the longest rows
+
     def run_one(budget: int) -> dict:
         protocol.progress("bench", 0.9, f"Measuring {budget or 'one row per forward pass'}")
         try:
-            return _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budget, per_update, updates, warm, order, cuda)
+            r = _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budget, per_update, updates, warm, order, cuda)
+            if b.get("worst_case") and cuda:
+                torch.cuda.reset_peak_memory_stats()
+                _bench_updates(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, params, dev, h, budget, per_update, 1, 0, longest, cuda)
+                r["worst_peak_mb"] = round(torch.cuda.max_memory_allocated() / 1e6)
+            return r
         except RuntimeError as exc:
             if healmem.is_oom(exc):
                 import gc
@@ -1554,7 +1561,7 @@ def _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, 
                     torch.cuda.empty_cache()
                 return {"tokens_per_s": None, "error": "out of memory"}
             raise
-    out = healspeed.sweep(run_one, budgets, card)
+    out = healspeed.sweep(run_one, budgets, card, int(b.get("sweep_repeat") or 0) or None)
     out["per_update_rows"], out["updates"], out["card_mb"] = per_update, updates, round(card) if card else None
     return out
 

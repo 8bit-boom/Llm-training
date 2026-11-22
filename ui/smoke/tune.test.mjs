@@ -91,3 +91,91 @@ test("the Tune page has the model picker, the bar and the list", async () => {
   assert.match(again, /id="tn-list"/); assert.match(again, /48 layers, hidden size 5120, 20\.1 B parameters on NVIDIA GeForce RTX 5090 \(32 GB\)/);
   assert.match(b.run("renderSteps(), $('steps').innerHTML"), /🎛 Tune/);
 });
+
+// ---- Auto: test and choose the best settings
+const plan = { tests: [
+  { id: "heal.student_batch", label: "Tokens per forward pass", what: "w1", tier: 1, class: "tol", default_on: true, chosen: true, built: true, unavailable: null, minutes: [15, 25], knobs: ["student_batch_tokens"] },
+  { id: "heal.loss", label: "Loss chunk and output-layer logits", what: "w2", tier: 1, class: "exact", default_on: true, chosen: true, built: true, unavailable: null, minutes: [20, 35], knobs: ["kl_chunk"] },
+  { id: "heal.quality", label: "Quality settings (short trial heals)", what: "w3", tier: 2, class: "quality", default_on: true, chosen: false, built: false, unavailable: "not built in this version yet", minutes: [60, 100], knobs: [] },
+  { id: "disk", label: "Disk speed", what: "w4", tier: 3, class: "exact", default_on: false, chosen: false, built: false, unavailable: "not built in this version yet", minutes: [2, 3], knobs: [] }],
+  total_minutes: [35, 60], done_between: [1000, 4600], model: { name: "slim-w", params_b: 20.1, layers: 48, hidden: 5120 }, card_mb: 32768 };
+const stateOf = (over = {}) => ({ id: "20261122-1000", status: "done", preset_id: "t-new", note: "", spec: { model: "slim-w" }, tests: [
+  { id: "heal.student_batch", status: "done", decision: { why: "4096 tokens per forward pass is 2.41 times as fast as one row" }, note: "", result: { gain: 2.41, class: "tol" } },
+  { id: "heal.loss", status: "done", decision: { why: "Within noise (±3.0 %): your loss settings stay." }, note: "", result: null }], ...over });
+
+function tunePage(answers = {}) {
+  const b = makeBrowser({ answers: { tune_presets: view(), tune_plan: plan, memory_status: { gpu: null, ram: null, containers: [], busy: false, wsl: false }, tune_start: { run: "20261122-1000" }, tune_state: stateOf(), ...answers } });
+  b.run(`state = ${JSON.stringify({ project: { name: "P", folder: "/p" }, steps: [], bundle: { world: "W" }, settings: { theme: "light", expert_mode: false, show_help_panel: true }, worlds: [], recent: [] })}; rs.state = { made: [{ name: "slim-w", status: "done", size_gb: 43 }], models: [] }; page = "tune"; tn.pick = "slim-w"; rs.hlSpec = { seq: 4096 };`);
+  return b;
+}
+
+test("the Tune page lists every test in its tier with the class, the estimate and why one is not available, and one big button", async () => {
+  const b = tunePage();
+  await b.run("tuLoadPlan()");
+  const html = b.run("tuAutoHtml()");
+  assert.match(html, /Auto: test and choose the best settings/);
+  assert.match(html, /Speed and memory: the same results, tested in minutes/); assert.match(html, /Quality settings: short trial heals on your rows \(a short trial, not a full heal\)/);
+  assert.match(html, /same results within tolerance/); assert.match(html, /quality knob: based on a short trial, not a full heal/);
+  assert.match(html, /not available: not built in this version yet/);
+  assert.match(html, /About 35 to 60 min/); assert.match(html, /id="tu-go"(?![^>]*disabled)/);
+  assert.match(html, /data-tu-test="heal.student_batch" checked/); assert.match(html, /data-tu-test="heal.quality"\s+disabled/);
+});
+
+test("one click starts the run with the ticked tests, the cap and the card's settings, with the real keys", async () => {
+  const b = tunePage();
+  await b.run("tuLoadPlan()");
+  b.run("tu.maxH = '2'");
+  await b.run("tuGo()");
+  const call = plain(b.calls.find((c) => c[0] === "tune_start")[1]);
+  assert.deepEqual(Object.keys(call), ["spec"]);
+  assert.deepEqual(call.spec.tests, ["heal.student_batch", "heal.loss"]);
+  assert.equal(call.spec.model, "slim-w"); assert.equal(call.spec.max_hours, 2); assert.equal(call.spec.trial_tokens_k, 400);
+  assert.equal(b.run("tu.running"), true);
+});
+
+test("the events fill the progress and the live rows, and the end shows Apply and save preset with every change and its gain", async () => {
+  const b = tunePage({ tune_apply_preview: pv });
+  await b.run("tuLoadPlan()");
+  await b.run("tuGo()");
+  await b.run(`onTuneEvent({ kind: "tune_test", index: 0, total: 2, id: "heal.student_batch", label: "Tokens per forward pass", status: "running" })`);
+  await b.run(`onTuneEvent({ kind: "tune_row", id: "heal.student_batch", row: { batch_tokens: 4096, tokens_per_s: 780, peak_vram_mb: 24576 } })`);
+  let html = b.run("tuAutoHtml()");
+  assert.match(html, /Test 1 of 2: Tokens per forward pass \(running\)/); assert.match(html, /780 tokens\/s/); assert.match(html, /24\.0 GB/);
+  assert.match(html, /4096 tokens per forward pass is 2\.41 times as fast as one row/);
+  await b.run(`onTuneEvent({ kind: "done", data: { run: "20261122-1000", status: "done", preset_id: "t-new" } })`);
+  html = b.run("tuAutoHtml()");
+  assert.match(html, /Apply and save preset/); assert.match(html, /already saved/); assert.match(html, /Tokens per forward pass<\/td><td>0<\/td><td><strong>8192<\/strong><\/td><td>×2\.41/);
+  assert.match(html, /id="tu-apply-all"(?![^>]*disabled)/);
+  const prev = plain(b.calls.filter((c) => c[0] === "tune_apply_preview").pop()[1]);
+  assert.deepEqual([prev.presetId, prev.scope, prev.target], ["t-new", "project", "heal_card"]);
+  b.run("wireTune()");
+  b.els["tu-apply-all"].onclick();
+  assert.equal(b.run("rs.hlSpec.student_batch_tokens"), 8192); assert.equal(b.run("rs.hlSpec.kl_chunk"), 256);
+  assert.match(b.run("renderTune()"), /Applied 2 changes to the Heal card/);
+});
+
+test("a stopped run offers Continue, a run that waits for the card says why, and a running job switches the button off with the reason", async () => {
+  const b = tunePage({ tune_state: stateOf({ status: "waiting_gpu", preset_id: null, note: "Tokens per forward pass needs about 17.9 GB of the card and only 9.0 GB are free. Held by: chrome.exe 900 MB. Free the memory (Memory panel, Free GPU), then Continue." }) });
+  await b.run("tuLoadPlan()");
+  b.run(`tu.runId = "20261122-1000"`);
+  await b.run("tuRefreshState()");
+  const html = b.run("tuAutoHtml()");
+  assert.match(html, /Continue the tests/); assert.match(html, /Held by: chrome\.exe 900 MB/);
+  await b.run("tuGo()");
+  assert.ok(b.calls.some((c) => c[0] === "tune_continue" && plain(c[1]).runId === "20261122-1000"));
+  const busy = tunePage({ memory_status: { gpu: null, ram: null, containers: [], busy: true, wsl: false } });
+  await busy.run("memPoll()");
+  await busy.run("tuLoadPlan()");
+  const off = busy.run("tuAutoHtml()");
+  assert.match(off, /id="tu-go"[^>]*disabled[^>]*title="Off because a job is running"/); assert.match(off, /The button is off because a job is running/);
+});
+
+test("the Heal card and the Auto page have the Auto button, and Auto can use a tested preset as a snapshot", async () => {
+  const b = heal();
+  await b.run(`tuneLoad("slim-w")`);
+  assert.match(b.run(`tuneBar("heal", "slim-w")`), /id="tn-auto-heal"[^>]*>Auto: test and choose the best settings/);
+  const a = makeBrowser({ answers: { tune_presets_here: [{ id: "t-aaa", scope: "project", name: "Tested", model: "slim-w", created: "x", gains: [] }], tune_snapshot: { preset_id: "t-aaa", scope: "project", name: "Tested", values: { student_batch_tokens: 8192, kl_chunk: 256, seq: 4096 }, tokens_per_s: 780, measured_student_b: 20.1 } } });
+  a.run(`ac.tunedList = [{ id: "t-aaa", scope: "project", name: "Tested", model: "slim-w" }]; ac.tunedSnap = ${JSON.stringify({ preset_id: "t-aaa", values: { student_batch_tokens: 8192, kl_chunk: 256, seq: 4096 }, tokens_per_s: 780 })}`);
+  const html = a.run(`acTunedHtml("")`);
+  assert.match(html, /Use tested settings for this PC/); assert.match(html, /student batch tokens 8192, kl chunk 256/); assert.doesNotMatch(html, /seq 4096/); assert.match(html, /measured 780 tokens\/s/);
+});

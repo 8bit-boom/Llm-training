@@ -174,3 +174,20 @@ def test_the_speed_report_measures_real_rows_and_every_token_budget_with_the_sam
     assert all(r["speedup"] for r in sw["results"]) and "value" in sw["recommended"]
     md = (out / "heal_speed_report.md").read_text()
     assert "Tokens per forward pass" in md and "The rows measured" in md
+
+
+def test_the_sweep_can_repeat_the_baseline_and_the_best_and_reports_the_spread(tmp_path, teacher, monkeypatch):
+    import json
+    from test_distill_torch import bench_run
+    student = thin_student(tmp_path, teacher)
+    out = tmp_path / "speed"
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "no-output"), hyper={"batch": 1, "grad_accum": 4, "max_steps": 1})
+    cfg["distill"]["chunk"] = 32
+    cfg["bench"] = {"steps": 2, "warmup": 1, "targets": "rows", "rows_tokens": 20000, "out_dir": str(out), "batch_tokens_sweep": [0, 128, 512], "sweep_updates": 1, "sweep_warmup": 1, "sweep_repeat": 2, "worst_case": True}
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res, ev[-1]
+    sw = json.loads((out / "heal_speed_report.json").read_text())["batch_sweep"]
+    base = next(r for r in sw["results"] if r["batch_tokens"] == 0)
+    assert len(base["repeats"]) == 2 and "spread" in sw and sw["spread"] >= 0
+    assert any(len(r.get("repeats", [])) == 2 for r in sw["results"] if r["batch_tokens"] != 0), "the fastest candidate is repeated too"
+    assert sw["recommended"]["spread"] == sw["spread"]

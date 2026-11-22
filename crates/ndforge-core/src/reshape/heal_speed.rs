@@ -39,6 +39,28 @@ pub fn job_of(base_job: &Value, teacher: Option<(&str, &str)>, out_dir: &std::pa
     job
 }
 
+/// The token-budget sweep for the tuner (docs/TUNE.md): the same bench job as the speed report, without the profile and the micro-benchmark, with the repeats that measure the noise and the worst-case update
+/// that guards the memory. The report is written to `dir`; its JSON is returned.
+pub fn tune_sweep(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, dir: &std::path::Path, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> Result<Value> {
+    let b = bench_base(p, name, spec, vram_gb)?;
+    let _ = std::fs::create_dir_all(dir);
+    let mut job = b.job_base(STEPS, WARMUP).job;
+    job["bench"] = json!({"steps": 3, "warmup": 1, "targets": "rows", "rows_tokens": 600_000, "out_dir": dir, "batch_tokens_sweep": BATCH_TOKENS_SWEEP, "sweep_repeat": 2, "worst_case": true, "sweep_updates": 2, "sweep_warmup": 1});
+    let outcome = run_with_grace(&b.py, &job, &dir.join("STOP"), &stop, Duration::from_secs(60), &mut |e: WorkerEvent| emit(super::runs::event_json(e)));
+    let report: Value = std::fs::read(dir.join("heal_speed_report.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    match outcome {
+        Ok(_) if report["batch_sweep"]["results"].is_array() => Ok(report),
+        Ok(_) => Err(crate::error::Error::new("The speed test ended without the token-budget measurement.")),
+        Err(e) if stop.load(std::sync::atomic::Ordering::SeqCst) => {
+            let mut r = report;
+            r["stopped"] = json!(true);
+            let _ = e;
+            Ok(r)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Runs it. Returns `{"report", "report_md", "dir", "result"}`; a failed worker still leaves the report the worker wrote (and its path is returned with `error`).
 pub fn run(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, with_teacher: bool, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> Result<Value> {
     let b = bench_base(p, name, spec, vram_gb)?;

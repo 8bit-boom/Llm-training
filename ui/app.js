@@ -2323,7 +2323,7 @@ function tuneBar(where, model) {
   return `<div class="tn-bar" id="tn-bar-${where}"><div class="row"><strong>Preset</strong> <select id="tn-sel-${where}" data-tn-sel="${where}">${opts}</select>
     ${b("use", "Use…", noSel + (off ? " disabled" : ""), off ? `Off because ${why}` : "Shows what would change on the card, and what it is worth, before anything is applied")}
     ${b("save", "Save current as preset…", off ? "disabled" : "", off ? `Off because ${why}` : "Keeps the settings of this card as a preset you can select again")}
-    ${b("rename", "Rename", noSel)}${b("dup", "Duplicate", noSel)}${b("del", "Delete", noSel)}${b("export", "Export", noSel)}${b("import", "Import", "")}</div>
+    ${where !== "tune" ? `<button class="primary" id="tn-auto-${where}" data-tn="auto" ${off ? "disabled" : ""} title="${off ? esc(`Off because ${why}`) : "Tests every setting of this card for this model on this PC, one after the other, then shows what to change and saves a preset"}">Auto: test and choose the best settings</button>` : ""}${b("rename", "Rename", noSel)}${b("dup", "Duplicate", noSel)}${b("del", "Delete", noSel)}${b("export", "Export", noSel)}${b("import", "Import", "")}</div>
     ${sel ? `<p class="small dim" id="tn-note-${where}">${esc(sel.note || "")}${tuneGainText(sel) ? ` · measured: ${tuneGainText(sel)}` : ""}${sel.stale.length ? ` · <span class="warn">stale: ${esc(sel.stale.map((x) => x.reasons.join("; ")).join("; "))} (re-test)</span>` : ""}</p>` : ""}
     ${off ? `<p class="dim small" id="tn-why-${where}">Some buttons are off because ${esc(why)}. Wait for it or press its Stop.</p>` : ""}
     ${tn.err && where !== "tune" ? `<p class="err small">${esc(tn.err)}</p>` : ""}${tn.ok ? `<p class="ok small">${esc(tn.ok)}</p>` : ""}${ask}${tn.preview && tn.preview.where === where ? tuneStageHtml(where) : ""}</div>`;
@@ -2347,6 +2347,12 @@ function tuneName(sel) { return (sel && sel.name) || ""; }
 async function tuneAction(where, kind) {
   const sel = tnSelected(), model = where === "tune" ? tn.pick : (rs.hl && rs.hl.name);
   tn.err = null; tn.ok = null;
+  if (kind === "auto") {
+    if (!model) return;
+    tn.pick = model; tu.plan = null; tu.state = null; tu.preview = null; tu.applied = null; tn.view = null; tn.model = "";
+    await go("tune"); await tuLoadPlan(); await tuGo();
+    return;
+  }
   if (kind === "use") {
     if (!sel) return;
     try { tn.preview = { where, data: await invoke("tune_apply_preview", { presetId: sel.id, scope: sel.scope, model, target: "heal_card", current: tuneCard() }) }; } catch (e) { tn.err = String(e); }
@@ -2374,7 +2380,8 @@ async function tuneAskOk(where) {
   } catch (e) { tn.err = String(e); render(); }
 }
 function wireTune() {
-  const tm = $("tn-model"); if (tm) tm.onchange = () => { tn.pick = tm.value; tn.sel = ""; tn.preview = null; tn.view = null; tn.model = ""; tuneLoad(tn.pick); render(); };
+  const tm = $("tn-model"); if (tm) tm.onchange = () => { tn.pick = tm.value; tn.sel = ""; tn.preview = null; tn.view = null; tn.model = ""; tu.plan = null; tu.state = null; tu.preview = null; tu.applied = null; tuneLoad(tn.pick); render(); };
+  wireTuneAuto();
   document.querySelectorAll("[data-tn]").forEach((b) => { b.onclick = () => tuneAction(b.id.split("-").pop(), b.dataset.tn); });
   document.querySelectorAll("[data-tn-sel]").forEach((e) => { e.onchange = () => { tn.sel = e.value; tn.preview = null; tn.ok = null; render(); }; });
   for (const where of ["heal", "tune", "auto"]) {
@@ -2384,6 +2391,113 @@ function wireTune() {
     const an = $(`tn-apply-no-${where}`); if (an) an.onclick = () => { tn.preview = null; render(); };
   }
 }
+// ---- "Auto: test and choose the best settings": the runner of the Tune page (docs/TUNE.md)
+const tu = { plan: null, ticked: null, maxH: "", trialK: 400, state: null, running: false, text: "", err: null, rows: {}, preview: null, runId: null, applied: null };
+const TU_CLASS = { exact: "same results", tol: "same results within tolerance", stat: "same on average", quality: "quality knob: based on a short trial, not a full heal" };
+const TU_TIER = { 1: "Speed and memory: the same results, tested in minutes", 2: "Quality settings: short trial heals on your rows (a short trial, not a full heal)", 3: "Other functions" };
+function tuSpec() {
+  const model = tn.pick;
+  const ticked = tu.ticked || {};
+  return { model, tests: Object.keys(ticked).filter((k) => ticked[k]), card: rs.hl && rs.hl.name === model ? tuneCard() : {}, max_hours: +tu.maxH > 0 ? +tu.maxH : null, trial_tokens_k: +tu.trialK || 400 };
+}
+async function tuLoadPlan() {
+  if (!tn.pick) return;
+  try {
+    if (!tu.ticked) { tu.ticked = {}; }
+    const first = !tu.plan;
+    const plan = await invoke("tune_plan", { spec: tuSpec() });
+    if (first || !tu.plan) for (const t of plan.tests) if (!(t.id in tu.ticked)) tu.ticked[t.id] = !!t.default_on && t.built && !t.unavailable;
+    tu.plan = plan; tu.err = null;
+  } catch (e) { tu.err = String(e); tu.plan = null; }
+  try { render(); } catch (_) { /* a preview */ }
+}
+const tuMin = (m) => (m[1] >= 90 ? `${(m[0] / 60).toFixed(1)} to ${(m[1] / 60).toFixed(1)} h` : `${m[0]} to ${m[1]} min`);
+function tuTierHtml(tier, locked) {
+  const tests = tu.plan.tests.filter((t) => t.tier === tier);
+  if (!tests.length) return "";
+  const sum = tests.filter((t) => tu.ticked[t.id] && t.built && !t.unavailable).reduce((a, t) => [a[0] + t.minutes[0], a[1] + t.minutes[1]], [0, 0]);
+  const rows = tests.map((t) => `<li class="${t.unavailable ? "dim" : ""}"><label class="opt"><input type="checkbox" data-tu-test="${esc(t.id)}" ${tu.ticked[t.id] ? "checked" : ""} ${t.unavailable || locked ? "disabled" : ""}> <strong>${esc(t.label)}</strong> <span class="tag">${esc(TU_CLASS[t.class] || t.class)}</span> <span class="dim small">${t.unavailable ? "not available: " + esc(t.unavailable) : tuMin(t.minutes)}</span></label><div class="dim small">${esc(t.what)}</div></li>`).join("");
+  return `<h3>${esc(TU_TIER[tier])}${sum[1] ? ` <span class="dim small">(${tuMin(sum)})</span>` : ""}</h3><ul class="plain">${rows}</ul>`;
+}
+function tuLiveHtml() {
+  const st = tu.state;
+  if (!st) return tu.running ? `<div class="stepline" aria-live="polite">${esc(tu.text || "Starting…")}</div>` : "";
+  const rows = st.tests.map((t) => `<tr class="${t.status === "done" ? "" : "dim"}"><td>${esc((tu.plan && (tu.plan.tests.find((x) => x.id === t.id) || {}).label) || t.id)}</td><td>${esc(t.status.replace("_", " "))}</td><td>${esc((t.decision && t.decision.why) || t.note || "")}</td><td>${t.result && t.result.gain > 1 ? "×" + (+t.result.gain).toFixed(2) : ""}</td><td class="dim small">${esc(t.result ? TU_CLASS[t.result.class] || t.result.class : "")}</td></tr>`).join("");
+  const live = Object.values(tu.rows).flat().slice(-12).map((r) => `<tr><td>${esc(String(r.batch_tokens ?? r.label ?? r.id ?? ""))}</td><td>${r.tokens_per_s ? Math.round(r.tokens_per_s).toLocaleString("en-US") + " tokens/s" : esc(String(r.error || ""))}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td></tr>`).join("");
+  return `${tu.running ? `<div class="stepline" aria-live="polite" id="tu-text">${esc(tu.text || "Running…")}</div>` : ""}${st.note ? `<p class="warn" id="tu-wait">${esc(st.note)}</p>` : ""}
+    <table class="tbl" id="tu-table"><tr><th>Test</th><th>State</th><th>Decision</th><th>Gain</th><th>Kind</th></tr>${rows}</table>${live ? `<table class="tbl small" id="tu-live"><tr><th>Candidate</th><th>Speed</th><th>Peak memory</th></tr>${live}</table>` : ""}`;
+}
+function tuApplyHtml() {
+  const pv = tu.preview; if (!pv) return "";
+  const rows = pv.changes.map((c) => `<tr><td>${esc(c.label)}</td><td>${esc(String(c.from ?? "automatic"))}</td><td><strong>${esc(String(c.to))}</strong></td><td>${c.gain && c.gain > 1 ? "×" + (+c.gain).toFixed(2) : ""}</td><td class="dim small">${esc(TU_CLASS[c.class] || c.class || "")}</td></tr>`).join("");
+  return `<div class="card" id="tu-apply"><h3>Apply and save preset</h3><p class="dim small">The preset “${esc(pv.name)}” is already saved (you can select it later on the Heal card, the Auto page and here). Applying fills the Heal card's settings; nothing else changes until you start something.</p>
+    ${rows ? `<table class="tbl"><tr><th>Setting</th><th>Now</th><th>Becomes</th><th>Measured gain</th><th></th></tr>${rows}</table>` : `<p>Your settings are already the best that was found. Nothing would change.</p>`}
+    <div class="row"><button class="primary" id="tu-apply-all" ${rows ? "" : "disabled"}>Apply all</button><button class="secondary" id="tu-apply-no">Not now</button></div></div>`;
+}
+function tuAutoHtml() {
+  if (!tn.pick) return "";
+  if (!tu.plan && !tu.err) { tuLoadPlan(); return `<div class="card wide"><p class="dim">Planning…</p></div>`; }
+  const off = tnBusy() && !tu.running;
+  const why = off ? jobWhy() : "";
+  const p = tu.plan;
+  const locked = tu.running;
+  const total = p ? tuMin(p.total_minutes) : "";
+  const done = p && p.done_between ? `${new Date(p.done_between[0] * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} to ${new Date(p.done_between[1] * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  const resume = tu.state && ["stopped", "waiting_gpu"].includes(tu.state.status) && !tu.running;
+  return `<div class="card wide" id="tu-auto"><h2>Auto: test and choose the best settings</h2>
+    <p class="dim small">One click runs every test below, one after the other, for this model on this PC, and at the end shows every change with its measured gain. It is saved as a preset; applying it is one confirmation. Everything is ticked by default; the most valuable tests run first, so a run that is stopped still gives a useful preset.</p>
+    ${tu.err ? `<p class="err">${esc(tu.err)}</p>` : ""}
+    ${p ? [1, 2, 3].map((t) => tuTierHtml(t, locked)).join("") : ""}
+    <div class="row"><label>I have at most <input type="text" id="tu-hours" value="${esc(tu.maxH)}" placeholder="no limit" style="width:70px;flex:0" ${locked ? "disabled" : ""}> hours</label>
+      <label>Trial budget of a quality test <select id="tu-trial" ${locked ? "disabled" : ""}>${[300, 400, 500].map((k) => `<option value="${k}" ${+tu.trialK === k ? "selected" : ""}>${k} thousand tokens each</option>`).join("")}</select></label></div>
+    ${p ? `<p id="tu-total"><strong>About ${esc(total)}</strong>${done ? `, done around ${esc(done)}` : ""} for the ticked tests.</p>` : ""}
+    <div class="row"><button class="primary big" id="tu-go" ${off || tu.running || !p || !p.total_minutes[1] ? "disabled" : ""} title="${off ? esc(`Off because ${why}`) : "Runs the ticked tests, then shows what to change"}">${resume ? "Continue the tests" : "Auto: test and choose the best settings"}</button>${tu.running ? `<button class="secondary" id="tu-stop">Stop</button>` : ""}</div>
+    ${off ? `<p class="dim small" id="tu-why">The button is off because ${esc(why)}.</p>` : ""}
+    ${tuLiveHtml()}${tuApplyHtml()}</div>`;
+}
+async function tuGo() {
+  const resume = tu.state && ["stopped", "waiting_gpu"].includes(tu.state.status);
+  if (!resume) {
+    const p = tu.plan; if (!p) return;
+    if (!confirm(`Test this PC for this model?\n\nAbout ${tuMin(p.total_minutes)} for the ticked tests. You can stop at any time; a stopped run still saves what it found.`)) return;
+  }
+  tu.err = null; tu.preview = null; tu.running = true; tu.text = "Starting…"; tu.rows = {}; render();
+  try {
+    if (resume) { await invoke("tune_continue", { runId: tu.state.id }); tu.runId = tu.state.id; }
+    else { const r = await invoke("tune_start", { spec: tuSpec() }); tu.runId = r.run; tu.state = null; }
+  } catch (e) { tu.running = false; tu.err = String(e); }
+  render();
+}
+async function tuRefreshState() {
+  if (!tu.runId) return;
+  try { tu.state = await invoke("tune_state", { runId: tu.runId }); } catch (_) { /* the run is not saved yet */ }
+}
+async function onTuneEvent(p) {
+  if (p.kind === "tune_test") { tu.text = `Test ${p.index + 1} of ${p.total}: ${p.label || p.id} (${p.status})`; await tuRefreshState(); }
+  else if (p.kind === "tune_row") { if (p.row) (tu.rows[p.id] || (tu.rows[p.id] = [])).push(p.row); }
+  else if (p.kind === "tune_progress") { const e = p.event || {}; if (e.text || e.step) tu.text = e.text || e.step; }
+  else if (p.kind === "tune_wait") { tu.running = false; await tuRefreshState(); }
+  else if (p.kind === "error") { tu.running = false; tu.err = p.text; }
+  else if (p.kind === "done") {
+    tu.running = false; await tuRefreshState();
+    if (p.data && p.data.status === "stopped") { /* a stopped run: Continue is offered */ }
+    else if (tu.state && tu.state.preset_id) {
+      try { tu.preview = await invoke("tune_apply_preview", { presetId: tu.state.preset_id, scope: "project", model: tn.pick, target: "heal_card", current: rs.hl && rs.hl.name === tn.pick ? tuneCard() : {} }); } catch (e) { tu.err = String(e); }
+      tn.model = ""; tuneLoad(tn.pick);
+    }
+  }
+  if (page === "tune") render();
+}
+function wireTuneAuto() {
+  document.querySelectorAll("[data-tu-test]").forEach((c) => { c.onchange = () => { tu.ticked[c.dataset.tuTest] = c.checked; tu.plan = null; tuLoadPlan(); }; });
+  const h = $("tu-hours"); if (h) h.onchange = () => { tu.maxH = h.value.trim(); tu.plan = null; tuLoadPlan(); };
+  const t = $("tu-trial"); if (t) t.onchange = () => { tu.trialK = +t.value; tu.plan = null; tuLoadPlan(); };
+  const g = $("tu-go"); if (g) g.onclick = tuGo;
+  const st = $("tu-stop"); if (st) st.onclick = () => { tu.text = "Stopping…"; invoke("tune_stop"); render(); };
+  const all = $("tu-apply-all"); if (all) all.onclick = () => { tuneApplyToCard(tu.preview.changes); tu.applied = `Applied ${tu.preview.changes.length} change${tu.preview.changes.length === 1 ? "" : "s"} to the Heal card.`; tu.preview = null; try { rsHealEstimate(); } catch (_) { /* a preview */ } render(); };
+  const no = $("tu-apply-no"); if (no) no.onclick = () => { tu.preview = null; render(); };
+}
+
 function renderTune() {
   const head = `<h1>🎛 ${TITLES.tune[0]}</h1><p class="lead">${TITLES.tune[1]}</p>`;
   const made = ((rs.state && rs.state.made) || []).filter((m) => m.status === "done");
@@ -2392,7 +2506,7 @@ function renderTune() {
       ${tn.view && tn.model === tn.pick ? `<p class="dim small">${esc(String(tn.view.model.layers))} layers, hidden size ${esc(String(tn.view.model.hidden))}, ${(tn.view.model.params / 1e9).toFixed(1)} B parameters on ${esc(tn.view.machine.gpu)} (${Math.round(tn.view.machine.vram_mb / 1024)} GB).</p>` : ""}</div>`
     : `<div class="card wide"><p>There is no finished model to tune yet: make one on the Slim page, or run Auto.</p></div>`;
   const bar = tn.pick ? `<div class="card wide"><h2>Tested settings for this model</h2>${tuneBar("tune", tn.pick)}${tuneListHtml()}</div>` : "";
-  return head + picker + bar;
+  return head + picker + tuAutoHtml() + (tu.applied ? `<p class="ok" id="tu-applied">${esc(tu.applied)}</p>` : "") + bar;
 }
 function tuneListHtml() {
   const v = tn.view; if (!v || tn.model !== tn.pick) return `<p class="dim">Looking…</p>`;
@@ -3255,11 +3369,20 @@ function acApplySet(set) {
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
+function acTunedHtml(lock) {
+  if (ac.tunedList === undefined) { ac.tunedList = null; Promise.resolve(invoke("tune_presets_here")).then((l) => { ac.tunedList = l || []; try { render(); } catch (_) { /* a preview */ } }).catch(() => { ac.tunedList = []; }); }
+  const list = ac.tunedList || [];
+  const sn = ac.tunedSnap;
+  const vals = sn ? ["student_batch_tokens", "kl_chunk", "head_checkpoint", "checkpointing"].filter((k) => sn.values && sn.values[k] !== undefined && sn.values[k] !== null && sn.values[k] !== 0 && sn.values[k] !== "on" && sn.values[k] !== "auto").map((k) => `${k.replace(/_/g, " ")} ${sn.values[k]}`) : [];
+  return `<div class="row"><button class="link" id="ac-tune-go" title="Tests every setting of a model on this PC and saves a preset">Test this PC for a model (Tune)…</button></div>
+    <label class="opt" id="ac-tuned-row">Use tested settings for this PC <select id="ac-tuned" ${lock}><option value="">none (the heals as they always were)</option>${list.map((p) => `<option value="${esc(p.id)}|${esc(p.scope)}" ${sn && sn.preset_id === p.id ? "selected" : ""}>${esc(p.name)} · ${esc(p.model)}</option>`).join("")}</select></label>
+    ${sn ? `<p class="small dim" id="ac-tuned-note">The heals use: ${esc(vals.join(", ") || "your own settings (nothing differs)")}${sn.tokens_per_s ? `; the time estimate uses the measured ${Math.round(sn.tokens_per_s)} tokens/s` : ""}. A snapshot: later edits of the preset do not change this run.</p>` : ""}`;
+}
 function acSpec() {
   const sp = ac.sp;
   return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
-    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
+    share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.tunedSnap ? { tuned: ac.tunedSnap } : {}), ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
 async function acLoad() {
   try { const r = (await invoke("auto_status")) || {}; ac.run = r.run || null; ac.running = !!r.running; ac.loaded = true; } catch (e) { ac.err = String(e); }
@@ -3333,6 +3456,7 @@ function acSpeedBlock(pl, live) {
       <span class="dim small">It measures many cuts of the size you asked for in one go, ranks them on your own text and passes the best few on to the thinking check before healing. A low error is not proof of thinking.</span></p>`}
     <label class="opt"><input type="checkbox" id="ac-maxon" ${ac.maxOn ? "checked" : ""} ${lock}> I have at most <input type="text" id="ac-maxh" value="${esc(ac.maxH)}" placeholder="48" style="width:60px;flex:0" ${lock}> hours <span class="dim small">the least harmful settings are given up until it fits, or you are told it cannot</span></label>
     ${ac.maxOn && !(+ac.maxH >= 1) ? `<p class="warn" id="ac-maxwhy">Give the hours (1 or more).</p>` : ""}${ac.maxOn ? budList : ""}
+    ${acTunedHtml(lock)}
     <label class="opt">Tokens per forward pass of the student <input type="text" id="ac-sbt" value="${esc(ac.sp.sbt || "")}" placeholder="0" style="width:70px;flex:0" ${lock}> <span class="dim small">off by default (0 = one row at a time). Rows of similar length share a forward pass, up to this many tokens: the same learning, usually much faster. Measure heal speed on the Heal card recommends a value (512 to 65,536).</span></label></div>`;
 }
 
@@ -3644,6 +3768,8 @@ function wireAuto() {
   set("ac-vl-t", vlset("teacher_cache")); set("ac-vl-c", vlset("checks")); set("ac-vl-a", vlset("automatic"));
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
+  const tg = $("ac-tune-go"); if (tg) tg.onclick = () => go("tune");
+  const tuned = $("ac-tuned"); if (tuned) tuned.onchange = async () => { if (!tuned.value) { ac.tunedSnap = null; render(); return; } const [id, scope] = tuned.value.split("|"); try { ac.tunedSnap = await invoke("tune_snapshot", { presetId: id, scope }); } catch (e) { ac.tunedSnap = null; rs.error = String(e); } render(); };
   set("ac-sbt", (e) => { const n = Math.round(+e.value || 0); ac.sp.sbt = n >= 512 && n <= 65536 ? n : null; });
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });
   document.querySelectorAll("input[name=ac-stages]").forEach((r) => r.onchange = () => { ac.stages = +r.value; render(); });
@@ -5005,6 +5131,7 @@ async function init() {
   try { await tauri.event.listen("train-event", (e) => onTrainEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("reshape-event", (e) => onReshapeEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("storage-event", (e) => onStorageEvent(e.payload)); } catch (_) { /* previews */ }
+  try { await tauri.event.listen("tune-event", (e) => onTuneEvent(e.payload)); } catch (_) { /* previews */ }
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
   quLoad();
   memPoll();

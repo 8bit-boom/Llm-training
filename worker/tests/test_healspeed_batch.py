@@ -1,4 +1,6 @@
 """The token-budget part of the heal speed report: the length statistics, the sweep with a failing budget, and the recommendation rules (pure functions, no torch)."""
+import pytest
+
 from ndforge_worker import healspeed
 
 
@@ -45,3 +47,38 @@ def test_the_report_shows_the_rows_the_table_and_the_recommendation():
     md = healspeed.markdown(rep)
     assert "## The rows measured" in md and "3 real rows" in md and "| 0 (one row) |" in md and "| 16384 |" in md and "Recommended: 16384 tokens per forward pass" in md
     assert any("Several rows in one forward pass pay off" in v for v in rep["verdict"])
+
+
+def test_an_out_of_memory_prunes_the_larger_budgets_and_is_recorded():
+    def run_one(b):
+        if b >= 8192:
+            raise RuntimeError("CUDA out of memory. Tried to allocate")
+        return {"tokens_per_s": 400 + b / 10, "peak_vram_mb": 1000, "first_loss": 1.0}
+    out = healspeed.sweep(run_one, (0, 2048, 8192, 16384), 32000)
+    r = {x["batch_tokens"]: x for x in out["results"]}
+    assert r[8192]["oom"] is True and r[16384]["skipped"] is True and "already ran out of memory" in r[16384]["error"]
+    assert out["recommended"]["value"] == 2048
+
+
+def test_the_measured_noise_decides_how_big_a_gain_has_to_be():
+    assert healspeed.spread_of([400, 400]) == 0.0 and healspeed.spread_of([400, 440]) == pytest.approx(0.0952, abs=1e-3) and healspeed.spread_of([400]) == 0.0
+    base, fast = {"batch_tokens": 0, "tokens_per_s": 400.0, "peak_vram_mb": 1000, "first_loss": 1.0}, {"batch_tokens": 2048, "tokens_per_s": 440.0, "peak_vram_mb": 1000, "first_loss": 1.0}
+    assert healspeed.recommend_batch_tokens([dict(base), dict(fast)], 32000, 0.0)["value"] == 2048, "10 % with no noise"
+    noisy = healspeed.recommend_batch_tokens([dict(base), dict(fast)], 32000, 0.08)
+    assert noisy["value"] == 0 and "noise of 8.0 %" in noisy["why"], "10 % is inside twice an 8 % spread"
+    # the worst-case update counts for the memory guard
+    big = {"batch_tokens": 4096, "tokens_per_s": 900.0, "peak_vram_mb": 10000, "worst_peak_mb": 30000, "first_loss": 1.0}
+    assert healspeed.recommend_batch_tokens([dict(base), big], 32000, 0.0)["value"] == 0
+
+
+def test_repeats_make_the_mean_the_number_and_the_spread_the_noise():
+    calls = {"n": 0}
+
+    def run_one(b):
+        calls["n"] += 1
+        return {"tokens_per_s": (400.0 if b == 0 else 800.0) * (1.0 + 0.01 * calls["n"]), "peak_vram_mb": 1000, "first_loss": 1.0}
+    out = healspeed.sweep(run_one, (0, 2048), 32000, repeat=2)
+    r = {x["batch_tokens"]: x for x in out["results"]}
+    assert len(r[0]["repeats"]) == 2 and len(r[2048]["repeats"]) == 2 and out["spread"] > 0
+    assert r[0]["tokens_per_s"] == pytest.approx(sum(r[0]["repeats"]) / 2, abs=0.01)
+    assert out["recommended"]["value"] == 2048 and out["recommended"]["spread"] == out["spread"]

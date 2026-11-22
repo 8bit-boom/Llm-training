@@ -190,7 +190,19 @@ def length_stats(lengths) -> dict:
     return {"n": len(t), "mean": round(sum(t) / len(t), 1), "p50": q(0.5), "p90": q(0.9), "max": t[-1]}
 
 
-def recommend_batch_tokens(results: list, card_mb) -> dict:
+NOISE_FACTOR = 2.0               # a gain must exceed this many times the measured run-to-run spread to count
+
+
+def spread_of(values) -> float:
+    """|a - b| / mean of the repeated measurements of one candidate (the largest relative distance from the mean for more than two); 0 for fewer than two."""
+    v = [float(x) for x in values if x]
+    if len(v) < 2:
+        return 0.0
+    m = sum(v) / len(v)
+    return round(max(abs(x - m) for x in v) / m * (2.0 if len(v) == 2 else 1.0), 4) if m else 0.0
+
+
+def recommend_batch_tokens(results: list, card_mb, spread: float = 0.0) -> dict:
     """`results`: [{"batch_tokens", "tokens_per_s", "peak_vram_mb", "first_loss", "error"?}] with 0 (one row per step) as the baseline. The recommendation is the value with the largest speedup whose peak
     stays below 90 % of the card and whose first-update loss equals the baseline's within a relative 1e-3; None (value 0) when nothing is faster by 5 %. Adds `speedup` to every result.
     -> {"value", "speedup", "why"}."""
@@ -203,29 +215,54 @@ def recommend_batch_tokens(results: list, card_mb) -> dict:
     for r in results:
         if r.get("batch_tokens") == 0 or not r.get("tokens_per_s") or r.get("error"):
             continue
-        if card_mb and r.get("peak_vram_mb") and r["peak_vram_mb"] > VRAM_SHARE_LIMIT * card_mb:
+        peak = max(r.get("peak_vram_mb") or 0, r.get("worst_peak_mb") or 0)
+        if card_mb and peak and peak > VRAM_SHARE_LIMIT * card_mb:
             continue
         if base.get("first_loss") is not None and r.get("first_loss") is not None and abs(r["first_loss"] - base["first_loss"]) > LOSS_TOLERANCE * max(1.0, abs(base["first_loss"])):
             continue
         if best is None or r["speedup"] > best["speedup"]:
             best = r
-    if best is None or best["speedup"] < MIN_SPEEDUP:
-        return {"value": 0, "speedup": 1.0, "why": "No token budget is clearly faster (5 % or more) within 90 % of the card's memory and with the same first loss: one row per step stays."}
-    return {"value": best["batch_tokens"], "speedup": best["speedup"], "why": f"{best['batch_tokens']} tokens per forward pass: {best['speedup']} times the speed of one row per step, peak {best.get('peak_vram_mb')} MB"
+    need = max(MIN_SPEEDUP, 1.0 + NOISE_FACTOR * float(spread or 0.0))
+    if best is None or best["speedup"] < need:
+        return {"value": 0, "speedup": 1.0, "spread": spread, "why": f"No token budget is clearly faster (at least {round((need - 1) * 100)} %, above twice the measured noise of {round(float(spread or 0.0) * 100, 1)} %) within 90 % of the card's memory and with the same first loss: one row per step stays."}
+    return {"value": best["batch_tokens"], "speedup": best["speedup"], "spread": spread, "why": f"{best['batch_tokens']} tokens per forward pass: {best['speedup']} times the speed of one row per step, peak {best.get('peak_vram_mb')} MB"
                                                                               + (f" of {round(card_mb)} MB" if card_mb else "") + ", the same first loss."}
 
 
-def sweep(run_one, budgets=BATCH_TOKENS_SWEEP, card_mb=None) -> dict:
+def sweep(run_one, budgets=BATCH_TOKENS_SWEEP, card_mb=None, repeat=None) -> dict:
     """Runs `run_one(budget) -> {"tokens_per_s", "peak_vram_mb", "first_loss", ...}` for every budget (an exception, an out-of-memory error included, is recorded for that budget and the others go on)
     and adds the recommendation. -> {"results": [...], "recommended": {...}}."""
     results = []
+    oom_at = None
     for b in budgets:
+        if oom_at is not None and int(b) > oom_at:
+            results.append({"batch_tokens": int(b), "tokens_per_s": None, "error": f"skipped: {oom_at} already ran out of memory", "skipped": True})
+            continue
         try:
             r = {"batch_tokens": int(b), **run_one(int(b))}
         except Exception as exc:        # noqa: BLE001 - one budget failing (memory) must not lose the others
             r = {"batch_tokens": int(b), "tokens_per_s": None, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        if r.get("error") and "out of memory" in str(r["error"]).lower():
+            oom_at = int(b) if oom_at is None else min(oom_at, int(b))
+            r["oom"] = True
         results.append(r)
-    return {"results": results, "recommended": recommend_batch_tokens(results, card_mb)}
+    spread = 0.0
+    if repeat and int(repeat) > 1:
+        # the baseline and the fastest candidate are measured again (the same process, the same rows): the run-to-run noise decides how big a gain has to be
+        ok = [r for r in results if r.get("tokens_per_s") and not r.get("error")]
+        again = [r for r in ok if r["batch_tokens"] == 0] + sorted([r for r in ok if r["batch_tokens"] != 0], key=lambda r: -r["tokens_per_s"])[:1]
+        for r in again:
+            vals = [r["tokens_per_s"]]
+            for _ in range(int(repeat) - 1):
+                try:
+                    vals.append(run_one(r["batch_tokens"]).get("tokens_per_s"))
+                except Exception:        # noqa: BLE001
+                    break
+            r["repeats"] = [v for v in vals if v]
+            spread = max(spread, spread_of(r["repeats"]))
+            if len(r["repeats"]) > 1:
+                r["tokens_per_s"] = round(sum(r["repeats"]) / len(r["repeats"]), 2)       # the mean of the repeats is the number the comparison uses
+    return {"results": results, "spread": spread, "recommended": recommend_batch_tokens(results, card_mb, spread)}
 
 
 def environment_facts() -> dict:

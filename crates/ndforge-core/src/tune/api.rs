@@ -220,3 +220,36 @@ pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, target: &
     let gain = preset.functions.values().filter(|f| f.gain > 0.0 && f.tier == 1).map(|f| f.gain).fold(0.0, f64::max);
     Ok(json!({"changes": changes, "whole": kind.whole(), "kind": kind, "note": note, "stale": stale, "token": token, "gain": gain, "name": preset.name, "context": preset.functions.values().map(|f| f.context.clone()).collect::<Vec<_>>()}))
 }
+
+/// Every preset of this PC (project and library), for the Auto page's "Use tested settings": the ones measured on another card are left out. `[{id, scope, name, model, created, gains}]`.
+pub fn presets_here(p: Option<&Project>) -> Vec<Value> {
+    let machine = machine_now();
+    let store = Store::new(p.map(|p| p.folder.as_path()));
+    let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+    let mut out = Vec::new();
+    for scope in [Scope::Project, Scope::Library] {
+        for pr in store.list(scope).0 {
+            if pr.machine.key != machine.key || seen.insert(pr.id.clone(), ()).is_some() {
+                continue;
+            }
+            out.push(json!({"id": pr.id, "scope": scope, "name": pr.name, "model": pr.model.name, "created": pr.created, "gains": pr.gains().iter().map(|(k, g)| json!({"function": k, "gain": g})).collect::<Vec<_>>()}));
+        }
+    }
+    out
+}
+
+/// A preset as an Auto-cut snapshot (`AutoSpec.tuned`): its values and the measured speed of the student heal.
+pub fn tuned_snapshot(p: &Project, scope: Scope, id: &str) -> Result<crate::reshape::auto_plan::TunedUse> {
+    let preset = Store::new(Some(&p.folder)).get(scope, id)?;
+    let machine = machine_now();
+    if preset.machine.key != machine.key {
+        return Err(Error::new("That preset was measured on another PC: it is not used here."));
+    }
+    let sb = preset.functions.get("heal.student_batch");
+    let m = sb.map(|f| &f.measured);
+    Ok(crate::reshape::auto_plan::TunedUse {
+        preset_id: preset.id.clone(), scope: format!("{}", match scope { Scope::Project => "project", Scope::Library => "library" }), name: preset.name.clone(), match_kind: "chosen".into(), values: preset.values(),
+        tokens_per_s: m.and_then(|m| m["tokens_per_s"].as_f64()), measured_student_b: m.and_then(|m| m["student_b"].as_f64()).or(Some(preset.model.params as f64 / 1e9).filter(|b| *b > 0.0)),
+        default_tokens_per_s: m.and_then(|m| m["default_tokens_per_s"].as_f64()),
+    })
+}

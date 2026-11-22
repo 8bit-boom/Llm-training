@@ -1869,6 +1869,104 @@ fn tune_apply(s: State<App>, preset_id: String, scope: String, model: String, ta
     ndforge_core::tune::api::apply_settings(&p, scope, &preset_id, &model, &target, &token).map_err(|e| e.to_string())
 }
 
+/// The presets of this PC for the Auto page ("Use tested settings"); another card's are left out.
+#[tauri::command(async)]
+fn tune_presets_here(s: State<App>) -> Value {
+    Value::Array(ndforge_core::tune::api::presets_here(lock(&s).project_clone().ok().as_ref()))
+}
+
+/// A preset as the snapshot an Auto-cut run keeps (`AutoSpec.tuned`): the values and the measured speed at this moment.
+#[tauri::command(async)]
+fn tune_snapshot(s: State<App>, preset_id: String, scope: String) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let scope = ndforge_core::tune::store::Scope::parse(&scope).map_err(|e| e.to_string())?;
+    serde_json::to_value(ndforge_core::tune::api::tuned_snapshot(&p, scope, &preset_id).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// The runner's plan before Start: the model's facts, the checklist (each test ready or why not, its estimate), the total and "done around", and the presets that already fit. No side effects.
+#[tauri::command(async)]
+fn tune_plan(s: State<App>, spec: Value) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let id = ndforge_core::tune::api::model_for(&p, &spec.model).map_err(|e| e.to_string())?;
+    let mut notes = ndforge_core::tune::runner::BTreeMapNotes::new();
+    if ndforge_core::train::runs::latest_version(&p).is_none() {
+        for t in ["heal.student_batch", "heal.loss", "heal.quality"] {
+            notes.insert(t.into(), "Save a training-data version in Step 2 first: the tests use your real rows.".into());
+        }
+    }
+    let now = chrono_secs();
+    let mut v = ndforge_core::tune::runner::plan_view(&spec, id.params as f64 / 1e9, now, &notes);
+    v["model"] = serde_json::json!({"name": id.name, "params_b": id.params as f64 / 1e9, "layers": id.layers, "hidden": id.hidden});
+    v["card_mb"] = serde_json::json!(card_vram_gb().map(|g| g * 1024.0));
+    Ok(v)
+}
+
+fn chrono_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Starts a tuning run as a job (one at a time, like every job): the checklist runs test after test and ends with a saved preset. Events on "tune-event" tagged {"phase": "tune"}.
+#[tauri::command]
+fn tune_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    if spec.tests.is_empty() {
+        return Err("Tick at least one test.".into());
+    }
+    let identity = ndforge_core::tune::api::model_for(&p, &spec.model).map_err(|e| e.to_string())?;
+    let machine = ndforge_core::tune::api::machine_now();
+    let st = ndforge_core::tune::runner::new_run(spec, identity.clone(), machine, identity.params as f64 / 1e9, &tune_now());
+    if st.tests.is_empty() {
+        return Err("None of the ticked tests can run in this version.".into());
+    }
+    ndforge_core::tune::runner::save_state(&p.folder, &st).map_err(|e| e.to_string())?;
+    let id = st.id.clone();
+    tune_job(app, &tasks, p, st)?;
+    Ok(serde_json::json!({"run": id}))
+}
+
+/// Goes on with a stopped, waiting or interrupted run: the tests that are done are not run again, a test that was running starts from its beginning.
+#[tauri::command]
+fn tune_continue(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run_id: String) -> Out<()> {
+    let p = tune_project(&s)?;
+    let mut st = ndforge_core::tune::runner::load_state(&p.folder, &run_id).map_err(|e| e.to_string())?;
+    for t in st.tests.iter_mut().filter(|t| matches!(t.status.as_str(), "running" | "stopped" | "waiting_gpu")) {
+        t.status = "queued".into();
+    }
+    st.note.clear();
+    tune_job(app, &tasks, p, st)
+}
+
+fn tune_job(app: tauri::AppHandle, tasks: &Tasks, p: ndforge_core::project::Project, mut st: ndforge_core::tune::runner::RunState) -> Out<()> {
+    let opts = JobOpts { phase: Some("tune"), tag_events: true, awake: Awake::Quiet, kind: "tune", ..JobOpts::new("tune-event") };
+    spawn_job(app, tasks, opts, move |stop, emit| {
+        let store = ndforge_core::tune::store::Store::new(Some(&p.folder));
+        let card_mb = card_vram_gb().map(|g| g * 1024.0);
+        let mut fx = ndforge_core::tune::real::Real { project: &p, vram_gb: card_vram_gb(), stop, emit_fn: emit };
+        ndforge_core::tune::runner::run(&mut fx, &p.folder, &mut st, card_mb, &store).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"run": st.id, "status": st.status, "preset_id": st.preset_id}))
+    })
+}
+
+#[tauri::command]
+fn tune_stop(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command(async)]
+fn tune_state(s: State<App>, run_id: String) -> Out<Value> {
+    let p = tune_project(&s)?;
+    let st = ndforge_core::tune::runner::load_state(&p.folder, &run_id).map_err(|e| e.to_string())?;
+    serde_json::to_value(st).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn tune_runs(s: State<App>) -> Out<Value> {
+    let p = tune_project(&s)?;
+    Ok(Value::Array(ndforge_core::tune::runner::list_runs(&p.folder)))
+}
+
 // ------------------------------------------------------------------------------------------------------------------ the memory panel (ndforge_core::memory, docs/MEMORY.md)
 
 fn memory_env() -> ndforge_core::memory::Real {
@@ -2081,7 +2179,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }
