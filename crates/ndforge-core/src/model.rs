@@ -593,6 +593,28 @@ impl AppModel {
         }))
     }
 
+    /// What the "Save a model as GGUF (no training needed)" card of the Slim or grow page shows: the models made there (with the copy to export and what its template
+    /// should do about thinking), every model of the list (with whether it is on this computer and what its download would need), and the same sizes and matrix state
+    /// as the export of a training run.
+    pub fn export_model_state(&self) -> Result<Value> {
+        let p = self.project_ref()?;
+        Ok(json!({
+            "made": exports::exportable_models(p),
+            "models": crate::train::catalog::models().iter().map(|m| {
+                let local = exports::hub_model_local(&m.repo);
+                json!({"id": m.id, "name": m.name, "family": m.family, "params_b": m.params_b, "local": local,
+                       "download_gb": if local { json!(0.0) } else { json!(((m.params_b * 2.0) * 10.0).round() / 10.0) },
+                       "source": {"kind": "hub", "repo": m.repo}})
+            }).collect::<Vec<_>>(),
+            "quants": exports::QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name, "label": exports::quant_label(id, name)})).collect::<Vec<_>>(),
+            "mixed_quants": exports::MIXED_QUANTS.iter().map(|(id, name)| json!({"id": id, "name": name, "label": exports::quant_label(id, name), "mixed": true})).collect::<Vec<_>>(),
+            "imatrix": exports::imatrix_state(p),
+            "mixed": crate::export::mixed::state(p),
+            "env_ready": crate::envmgr::health::env_installed(&crate::envmgr::env_dir()),
+            "world": p.display_name(),
+        }))
+    }
+
     // ------------------------------------------------------------------ step 4: test
     /// Runs that can be tested (they saved a model), the newest test of each, and the comparison table.
     pub fn test_state(&self) -> Result<Value> {
@@ -695,10 +717,13 @@ impl AppModel {
         Ok(())
     }
 
-    /// (path of the GGUF, family, context length) of an export, for installing it.
-    pub fn export_for_install(&self, export: &str) -> Result<(std::path::PathBuf, String, u32)> {
+    /// (path of the GGUF, path of its vision file when the export has one, family, context length) of an export, for installing it.
+    pub fn export_for_install(&self, export: &str) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>, String, u32)> {
         let (gguf, meta) = exports::find_export(self.project_ref()?, export)?;
-        Ok((gguf, meta["family"].as_str().unwrap_or("generic").to_string(), meta["num_ctx"].as_u64().unwrap_or(8192) as u32))
+        let mmproj = meta["mmproj_file"].as_str()
+            .map(|f| gguf.parent().unwrap_or(std::path::Path::new(".")).join(f))
+            .filter(|p| p.is_file());
+        Ok((gguf, mmproj, meta["family"].as_str().unwrap_or("generic").to_string(), meta["num_ctx"].as_u64().unwrap_or(8192) as u32))
     }
 
     pub fn record_install(&self, export: &str, url: &str, model: &str) -> Result<()> {
