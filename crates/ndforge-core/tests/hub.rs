@@ -156,14 +156,14 @@ fn added_models_are_kept_listed_planned_and_removable() {
 #[test]
 fn a_model_of_an_unknown_family_is_installed_with_the_template_inside_its_file() {
     let g = spec_for("generic", 8192);
-    let mf = modelfile_text("model-q4_k_m.gguf", &g);
+    let mf = modelfile_text("model-q4_k_m.gguf", &g, None);
     assert!(mf.starts_with("FROM ./model-q4_k_m.gguf") && !mf.contains("TEMPLATE") && mf.contains("PARAMETER num_ctx 8192") && !mf.contains("PARAMETER stop"), "{mf}");
-    let body = create_body("x-gm", "model.gguf", "sha256:abc", &g);
+    let body = create_body("x-gm", "model.gguf", "sha256:abc", &g, None);
     assert!(body.get("template").is_none() && body["parameters"].get("stop").is_none() && body["parameters"]["num_ctx"] == 8192, "{body}");
     // the tested families keep their hand-written templates
     for fam in ["qwen3_5", "gemma4"] {
         let s = spec_for(fam, 8192);
-        assert!(modelfile_text("m.gguf", &s).contains("TEMPLATE") && create_body("x", "m.gguf", "d", &s)["template"].is_string());
+        assert!(modelfile_text("m.gguf", &s, None).contains("TEMPLATE") && create_body("x", "m.gguf", "d", &s, None)["template"].is_string());
     }
 }
 
