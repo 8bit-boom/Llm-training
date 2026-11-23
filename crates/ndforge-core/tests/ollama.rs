@@ -93,7 +93,7 @@ fn install_uploads_creates_and_lists_then_a_probe_answers() {
     std::fs::write(&gguf, vec![7u8; 300_000]).unwrap();
     let m = happy_server(false);
     let mut events = Vec::new();
-    install(&m.url, "w-gm", &gguf, "qwen3_5", 8192, &mut |e| events.push(e)).unwrap();
+    install(&m.url, "w-gm", &gguf, "qwen3_5", 8192, &mut |e| events.push(e), None).unwrap();
     let log = m.log.lock().unwrap().clone();
     let paths: Vec<String> = log.iter().map(|r| format!("{} {}", r.method, r.path.split("sha256:").next().unwrap())).collect();
     assert_eq!(paths, ["GET /api/version", "HEAD /api/blobs/", "POST /api/blobs/", "POST /api/create", "GET /api/tags"]);
@@ -118,8 +118,27 @@ fn a_blob_the_server_already_has_is_not_sent_again() {
     let gguf = d.path().join("m.gguf");
     std::fs::write(&gguf, b"xyz").unwrap();
     let m = happy_server(true);
-    install(&m.url, "w-gm", &gguf, "gemma4", 4096, &mut |_| {}).unwrap();
+    install(&m.url, "w-gm", &gguf, "gemma4", 4096, &mut |_| {}, None).unwrap();
     assert!(!m.log.lock().unwrap().iter().any(|r| r.method == "POST" && r.path.starts_with("/api/blobs/")));
+}
+
+#[test]
+fn an_export_with_a_vision_file_sends_it_along() {
+    let d = tempdir().unwrap();
+    let gguf = d.path().join("model-q4_k_m.gguf");
+    std::fs::write(&gguf, vec![7u8; 100_000]).unwrap();
+    let mmproj = d.path().join("mmproj-F16.gguf");
+    std::fs::write(&mmproj, vec![9u8; 50_000]).unwrap();
+    let m = happy_server(false);
+    install(&m.url, "w-gm", &gguf, "qwen3_5", 8192, &mut |_| {}, Some(&mmproj)).unwrap();
+    let log = m.log.lock().unwrap().clone();
+    let paths: Vec<String> = log.iter().map(|r| format!("{} {}", r.method, r.path.split("sha256:").next().unwrap())).collect();
+    assert_eq!(paths, ["GET /api/version", "HEAD /api/blobs/", "POST /api/blobs/", "HEAD /api/blobs/", "POST /api/blobs/", "POST /api/create", "GET /api/tags"]);
+    let body: Value = serde_json::from_slice(&log[5].body).unwrap();
+    let mdigest = file_digest(&mmproj, &mut |_| {}).unwrap();
+    assert_eq!(body["files"]["mmproj-F16.gguf"].as_str(), Some(mdigest.as_str()), "the create call names both files: Ollama uses the second as the projector");
+    assert!(log[3].path.ends_with(&mdigest));
+    assert_eq!(log[4].body.len(), 50_000);                            // the vision file was sent whole
 }
 
 #[test]
@@ -137,7 +156,7 @@ fn problems_are_explained() {
     let d = tempdir().unwrap();
     let f = d.path().join("m.gguf");
     std::fs::write(&f, b"x").unwrap();
-    let e = install(&m.url, "w-gm", &f, "qwen3_5", 4096, &mut |_| {}).unwrap_err();
+    let e = install(&m.url, "w-gm", &f, "qwen3_5", 4096, &mut |_| {}, None).unwrap_err();
     assert!(e.0.contains("refused") && e.0.contains("unsupported architecture"), "{e}");
     // created but not listed
     let m2 = mock(|r| match (r.method.as_str(), r.path.as_str()) {
@@ -147,7 +166,7 @@ fn problems_are_explained() {
         ("GET", "/api/tags") => (200, json!({"models": []})),
         _ => (404, json!({})),
     });
-    assert!(install(&m2.url, "w-gm", &f, "qwen3_5", 4096, &mut |_| {}).unwrap_err().0.contains("does not list it"));
+    assert!(install(&m2.url, "w-gm", &f, "qwen3_5", 4096, &mut |_| {}, None).unwrap_err().0.contains("does not list it"));
     // a chat error
     let m3 = mock(|_| (200, json!({"error": "model not found"})));
     assert!(probe(&m3.url, "x", "s", "q").unwrap_err().0.contains("model not found"));

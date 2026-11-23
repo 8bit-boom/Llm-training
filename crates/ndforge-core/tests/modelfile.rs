@@ -61,17 +61,21 @@ fn gemma_template_matches_the_prompt_the_model_was_trained_on() {
 #[test]
 fn modelfile_and_create_body() {
     let spec = spec_for("gemma4", 4096);
-    let mf = modelfile_text("model-q4_k_m.gguf", &spec);
+    let mf = modelfile_text("model-q4_k_m.gguf", &spec, None);
     assert!(mf.starts_with("FROM ./model-q4_k_m.gguf\n\nTEMPLATE \"\"\"{{- range"));
     assert!(mf.contains("PARAMETER stop \"<turn|>\"\n") && mf.contains("PARAMETER temperature 1\n") && mf.contains("PARAMETER top_p 0.95\n") && mf.contains("PARAMETER num_ctx 4096\n"));
-    let b = create_body("w-gm", "model-q4_k_m.gguf", "sha256:abc", &spec);
+    // the vision file sits next to the GGUF: a second FROM, which Ollama's importer uses as the projector
+    let mv = modelfile_text("model-q4_k_m.gguf", &spec, Some("mmproj-F16.gguf"));
+    assert!(mv.starts_with("FROM ./model-q4_k_m.gguf\nFROM ./mmproj-F16.gguf\n\n"), "{mv}");
+    let b = create_body("w-gm", "model-q4_k_m.gguf", "sha256:abc", &spec, Some(("mmproj-F16.gguf", "sha256:def")));
     assert_eq!(b["files"]["model-q4_k_m.gguf"], "sha256:abc");
+    assert_eq!(b["files"]["mmproj-F16.gguf"], "sha256:def");
     assert_eq!((b["model"].as_str(), b["stream"].as_bool()), (Some("w-gm"), Some(false)));
     assert_eq!(b["parameters"]["stop"], json!(["<turn|>"]));
     assert_eq!(b["parameters"]["num_ctx"], 4096);
     assert_eq!(b["parameters"]["top_p"], 0.95);
     let q = spec_for("qwen3_5", 8192);
-    assert!(modelfile_text("m.gguf", &q).contains("PARAMETER stop \"<|im_end|>\"") && q.options.iter().any(|(k, v)| *k == "top_k" && *v == 20.0));
+    assert!(modelfile_text("m.gguf", &q, None).contains("PARAMETER stop \"<|im_end|>\"") && q.options.iter().any(|(k, v)| *k == "top_k" && *v == 20.0));
 }
 
 #[test]
