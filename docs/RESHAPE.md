@@ -202,7 +202,9 @@ or closing the program goes on where it was):
    gets `config.json`, the tokenizer files, `ndforge_reshape.json` (the thinned model's, with `healed: {...}`) and `width_kept.npz`. Only a plain LoRA is merged (no DoRA, no per-layer ranks).
 
 The healed model is added to the model list as `custom-local-<name>-healed`; Step 3 trains on it, Step 4 compares original, thinner and healed (`compare()` rows `model:<name>` with method `slim`
-(layers), `slim-width` or `slim-both`, and `model:<name>-healed` with method `healed`), Step 5 exports it with the original's vision file (the hidden size is unchanged).
+(layers), `slim-width` or `slim-both`, and `model:<name>-healed` with method `healed`), Step 5 exports it with the original's vision file (the hidden size is unchanged; the Modelfile
+lists that vision file as a second `FROM` and **Install into Ollama** sends it along, so the exported model keeps its pictures when the Ollama build can load the family's projector —
+healing is text only, so its image understanding can be weaker than the original's).
 
 ### File formats (version 2)
 
@@ -297,6 +299,18 @@ optional `calibration.reasoning` = `{"source": {"id" | "file"}, "share": 0.5, "m
 
 A "Try first" card on the page finds out what a cut will cost before any model folder is written (job `reshape_try`: the loss of the original, of every block skipped on its own, of every run of blocks, of every width, of a chosen combination, on the project's calibration text, with the cut imitated by hooks; kept in `reshape_try.json` next to the measurements). Everything about it, including the colour bands, the deviations and its own "not verified yet" list, is in `docs/TRY_FIRST.md`. The predicted loss equals the calibration loss of the folder the `reshape` job writes, on a tiny model (`worker/tests/test_reshape_try_torch.py`); nothing is known yet about how it relates to the quality after healing.
 
+## Save a model as GGUF without a training run
+
+A card on the Slim or grow page ("Save a model as GGUF (no training needed)") makes the same files as the export of a training run (Step 5) from a model that was never trained here. The machinery existed before for Auto-cut alone (`export::runs::execute_model_folder_full`); it is now generalised (`export::runs::execute_no_train`) and reachable by hand, for three sources (`ModelSource`):
+
+- **Made** (`models/<name>/model` or `/healed`): the cut or grown model, or its healed copy. The healed copy is exported as `<name>-healed-<size>`, so the two copies never collide. The family and size come from the model list entry (`custom-local-<name>`), the chat template's thinking default from `ndforge_reshape.json` (`thinking_default`, the same rule Step 5 uses). meta.json records `"source": {"kind": "made", ...}` instead of Auto-cut's `"auto_cut": true`, which stays only on Auto-cut's own exports.
+- **Folder**: any local folder with `config.json` and 16-bit `.safetensors` files. Family and size come from the model list, else from a local lookup, else `generic` and the file sizes.
+- **Hub**: every model of the list (`catalog::models`, built-in or added). The job names **no** `full_model` and **no** adapter — the worker resolves `base.repo` itself (`exportjob.resolve_full_model`): a local folder as it is, else the copy in the Hugging Face cache (`snapshot_download` with `local_files_only` first), else it downloads it there (the same cache training reads from). A repo without `.safetensors` weights (a GGUF-only repo) is refused in plain words. The disk check adds the download (`download_gb`, about 2 bytes per parameter) and the card says "downloads first" while the model is not local (`hub_model_local`).
+
+Everything else is the run-based export's own machinery: the sizes Q4_K_M…F16, the mixed-precision sizes and their fits, the importance matrix (which needs a saved data version, as on Step 5), the Modelfile, the Ollama install and the exports list. The window gets its progress on "reshape-event" tagged `{"phase": "export"}`; the card's job can be queued (`export_model` in `queue::KINDS`, with the preflight checklist reading `paramsB` / `downloadGb` from the start arguments). New commands: `export_model_state` (what the card shows) and `export_model_start` (the job).
+
+Tests: `tests/export.rs` (a made model and its healed copy, any folder, a model of the list with the job captured through the fake worker), `worker/tests/test_export_no_train.py` (local folder, cached copy without downloading, download into the cache, GGUF-only and config-less refusals), `ui/smoke/reshape_export.test.mjs` (the card's sources, arguments, queue button and end events).
+
 ## Not verified yet (needs a GPU run)
 
 Everything below is **implemented as the plan says and has not been seen working**. None of it should be described as working.
@@ -313,6 +327,10 @@ Everything below is **implemented as the plan says and has not been seen working
 - `layers_to_transform` in Unsloth's `get_peft_model` (the code tries it and falls back with a log line); `layers_to_transform` together with
   `target_modules="all-linear"` in PEFT on the plain-libraries path.
 - A real Hugging Face download (`snapshot_download` with the allow-list) and `get_safetensors_metadata` (both are stubbed in tests).
+- The GGUF export without a training run against a real model and a real converter: the job reaching the worker is tested with the fake worker, and
+  `exportjob.resolve_full_model` is tested against a stubbed `snapshot_download` (`worker/tests/test_export_no_train.py`), but nobody has exported a made,
+  local-folder or list model to a real GGUF file yet. The first real run should record: the download size the card shows against the real one, the disk the
+  export needs, and that the exported chat template of a healed model keeps its thinking.
 - The window in a real Tauri window: the page, the slider and the buttons are tested with a stand-in browser (`ui/smoke/`), and the Rust side builds
   (`cargo build -p nd-lore-forge` succeeds here), but nobody has clicked through the real window. The fake-worker tests of the Rust side run on unix only.
 

@@ -466,6 +466,29 @@ fn export_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, run: 
     })
 }
 
+/// What the "Save a model as GGUF (no training needed)" card of the Slim or grow page shows (crates/ndforge-core/src/export/runs.rs `exportable_models`).
+#[tauri::command(async)]
+fn export_model_state(s: State<App>) -> Out<Value> {
+    lock(&s).export_model_state().map_err(|e| e.to_string())
+}
+
+/// Makes the GGUF + Modelfile of a model without a training run (a model the Slim or grow page made, a folder on this computer, or a model of the list — that one the
+/// worker fetches first when it is not on this computer yet); progress goes to the window as "reshape-event" events tagged {"phase": "export"}. `params_b` and
+/// `download_gb` say nothing to this command (they are for the queue's checklist); the source is what the card chose.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn export_model_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, source: Value, quant: String, num_ctx: u32, quants: Option<Vec<String>>, thinking: Option<bool>, imatrix: Option<ndforge_core::export::runs::ImatrixOptions>, mixed: Option<ndforge_core::export::runs::MixedOptions>, params_b: Option<f64>, download_gb: Option<f64>) -> Out<()> {
+    let _ = (params_b, download_gb);
+    let src: ndforge_core::export::runs::ModelSource = serde_json::from_value(source).map_err(|e| format!("The choice of model is not valid: {e}"))?;
+    let project = lock(&s).project_clone().map_err(|e| e.to_string())?;
+    spawn_job(app, &tasks, JobOpts { phase: Some("export"), tag_events: true, awake: awake_if_set(), kind: "export", ..JobOpts::new("reshape-event") }, move |cancel, emit| {
+        let list = quants.filter(|q| !q.is_empty()).unwrap_or_else(|| vec![quant]);
+        let mut metas = ndforge_core::export::runs::execute_no_train(&project, &src, &list, num_ctx, thinking.unwrap_or(false), &imatrix.unwrap_or_default(), &mixed.unwrap_or_default(), &cancel, emit).map_err(|e| e.to_string())?;
+        // one size: its export; several: a summary naming them all
+        Ok(if metas.len() == 1 { metas.remove(0) } else { serde_json::json!({"name": metas.iter().filter_map(|m| m["name"].as_str()).collect::<Vec<_>>().join(", "), "run": metas.first().and_then(|m| m["run"].as_str()).unwrap_or_default(), "exports": metas}) })
+    })
+}
+
 /// The mixed-precision plan (docs/MIXED_QUANTS.md): every recipe's rules and estimated size from the tensor shapes of `gguf` (any GGUF of the model), and the "Fit to a size"
 /// proposal when `target_gb` and a saved matrix (`matrix`, a library id) are given.
 #[tauri::command(async)]
@@ -672,11 +695,11 @@ fn copy_adapter(s: State<App>, run: String, dest: String) -> Out<String> {
 #[tauri::command]
 fn ollama_install(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, export: String, url: String, name: String) -> Out<()> {
     let m = lock(&s);
-    let (gguf, family, num_ctx) = m.export_for_install(&export).map_err(|e| e.to_string())?;
+    let (gguf, mmproj, family, num_ctx) = m.export_for_install(&export).map_err(|e| e.to_string())?;
     let project = m.project_clone().map_err(|e| e.to_string())?;
     drop(m);
     spawn_task(app, &tasks, "export-event", move |_cancel, emit| {
-        ndforge_core::export::install::install(&url, &name, &gguf, &family, num_ctx, emit).map_err(|e| e.to_string())?;
+        ndforge_core::export::install::install(&url, &name, &gguf, &family, num_ctx, emit, mmproj.as_deref()).map_err(|e| e.to_string())?;
         ndforge_core::export::runs::record_install(&project, &export, &url, &name).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"installed": name, "url": url}))
     })
@@ -743,7 +766,8 @@ fn retrain_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, from
                         let export = meta["name"].as_str().unwrap_or("").to_string();
                         let name = ollama_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| meta["ollama_name"].as_str().unwrap_or("world-gm").to_string());
                         let gguf = job.project.folder.join("exports").join(&export).join(meta["gguf_file"].as_str().unwrap_or("model.gguf"));
-                        ndforge_core::export::install::install(&url, &name, &gguf, &job.model.family, 8192, emit).map_err(|e| e.to_string())?;
+                        let mmproj = meta["mmproj_file"].as_str().map(|f| gguf.parent().unwrap_or(&job.project.folder).join(f)).filter(|p| p.is_file());
+                        ndforge_core::export::install::install(&url, &name, &gguf, &job.model.family, 8192, emit, mmproj.as_deref()).map_err(|e| e.to_string())?;
                         ndforge_core::export::runs::record_install(&job.project, &export, &url, &name).map_err(|e| e.to_string())?;
                     }
                 }
@@ -1507,6 +1531,10 @@ fn queue_start_item(app: &tauri::AppHandle, it: &ndforge_core::queue::Item) -> O
         "auto" => auto_start(app.clone(), s, t, a["spec"].clone(), a["resume"].as_str().map(String::from), a.get("changes").cloned().filter(|c| !c.is_null()), a["confirmed"].as_bool()),
         "export" => export_start(app.clone(), s, t, text("run"), text("quant"), a["num_ctx"].as_u64().or(a["numCtx"].as_u64()).unwrap_or(8192) as u32, a["what"].as_str().map(String::from),
             serde_json::from_value(a["quants"].clone()).map_err(bad)?, serde_json::from_value(a["imatrix"].clone()).map_err(bad)?, serde_json::from_value(a["mixed"].clone()).map_err(bad)?),
+        "export_model" => export_model_start(app.clone(), s, t, a["source"].clone(), text("quant"), a["num_ctx"].as_u64().or(a["numCtx"].as_u64()).unwrap_or(8192) as u32,
+            serde_json::from_value(a["quants"].clone()).map_err(bad)?, Some(a["thinking"].as_bool().unwrap_or(false)),
+            serde_json::from_value(a["imatrix"].clone()).map_err(bad)?, serde_json::from_value(a["mixed"].clone()).map_err(bad)?,
+            a["paramsB"].as_f64(), a["downloadGb"].as_f64()),
         "heal" => heal_start(app.clone(), s, t, text("name"), a["spec"].clone()),
         "think_check" => think_check_start(app.clone(), s, t, a["spec"].clone()),
         "quantcheck" => quantcheck_start(app.clone(), s, t, a["spec"].clone()),
@@ -2185,7 +2213,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, export_model_state, export_model_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -301,12 +301,13 @@ echo "{\"type\":\"result\",\"data\":{\"ggufs\":{${map%,}},\"merged_dir\":$m,\"mm
         assert!(std::fs::read_to_string(dir.join("Modelfile")).unwrap().starts_with(&format!("FROM ./model-{quant}.gguf")), "{name}");
         assert!(dir.join("MODEL_CARD.md").is_file() && dir.join("meta.json").is_file());
     }
-    // every size gets the base model's vision file and a note on how to use it (one move, the others copies); Ollama is told it is text only
+    // every size gets the base model's vision file and a note on how to use it (one move, the others copies); the Modelfile lists it for Ollama
     for name in ["run1-q8_0", "run1-q6_k", "run1-q4_k_m"] {
         let dir = p.folder.join("exports").join(name);
         assert_eq!(std::fs::read_to_string(dir.join("mmproj-F16.gguf")).unwrap(), "MMPROJ", "{name}");
         let v = std::fs::read_to_string(dir.join("VISION.md")).unwrap();
-        assert!(v.contains("--mmproj mmproj-F16.gguf") && v.contains("Ollama (text only)") && v.contains("Unsloth Studio"), "{v}");
+        assert!(v.contains("--mmproj mmproj-F16.gguf") && v.contains("Ollama (pictures when the build takes the projector)") && v.contains("Unsloth Studio"), "{v}");
+        assert!(std::fs::read_to_string(dir.join("Modelfile")).unwrap().contains("\nFROM ./mmproj-F16.gguf\n"), "{name}");
     }
     assert!(metas.iter().all(|m| m["mmproj_file"] == "mmproj-F16.gguf" && m["modalities"] == json!(["image"])));
     assert!(exports::list_exports(&p).iter().all(|e| e["has_vision"] == true));
@@ -675,4 +676,126 @@ echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant
     exports::execute(&p, "run1", "q4_k_m", 8192, &AtomicBool::new(false), &mut |_| {}).unwrap();
     assert_eq!(sent(), json!("off"));
     assert_eq!(exports::thinking_default(&d.path().join("nowhere")), "off");
+}
+
+// ------------------------------------------------------------------------------------ save a model as GGUF without a training run (the Slim or grow page)
+
+/// A made model on disk (what a finished cut leaves behind): `models/<name>/model` with a config and the folder's state.
+fn fake_made_model(p: &Project, name: &str) {
+    let dir = p.folder.join("models").join(name);
+    std::fs::create_dir_all(dir.join("model")).unwrap();
+    std::fs::write(dir.join("model/config.json"), "{}").unwrap();
+    std::fs::write(dir.join("state.json"), json!({"name": name, "status": "done"}).to_string()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_made_model_is_listed_for_the_card_and_can_be_saved_as_gguf_without_a_training_run() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"printf 'GGUF' > "$out/model-$quant.gguf"
+echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    assert!(exports::exportable_models(&p).is_empty());
+    fake_made_model(&p, "mycut");
+    std::fs::create_dir_all(p.folder.join("models/mycut/healed")).unwrap();
+    std::fs::write(p.folder.join("models/mycut/healed/config.json"), "{}").unwrap();
+    std::fs::write(p.folder.join("models/mycut/healed/ndforge_reshape.json"), json!({"healed": {"recipe": "thinking"}}).to_string()).unwrap();
+    let made = exports::exportable_models(&p);
+    assert_eq!(made.len(), 2);
+    assert_eq!((made[0]["export_name"].as_str(), made[0]["sub"].as_str(), made[0]["thinking"].clone()), (Some("mycut"), Some("model"), json!(false)));
+    assert_eq!((made[1]["export_name"].as_str(), made[1]["thinking"].clone()), (Some("mycut-healed"), json!(true)));
+    // the made copy: files, meta with the source, no auto_cut, installable like any export
+    let metas = exports::execute_no_train(&p, &exports::ModelSource::Made { name: "mycut".into(), sub: "model".into() }, &["q4_k_m".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!((metas[0]["name"].as_str(), metas[0]["family"].as_str()), (Some("mycut-q4_k_m"), Some("generic")));
+    assert_eq!(metas[0]["source"]["kind"].as_str(), Some("made"));
+    assert!(metas[0]["auto_cut"].is_null(), "only Auto-cut's own exports say auto_cut");
+    assert!(p.folder.join("exports/mycut-q4_k_m/model-q4_k_m.gguf").is_file());
+    assert!(p.folder.join("exports/mycut-q4_k_m/Modelfile").is_file());
+    assert!(exports::list_exports(&p).iter().any(|e| e["name"] == "mycut-q4_k_m" && e["gguf_exists"] == true));
+    let mut app = AppModel::load();
+    app.open_project(p.folder.to_str().unwrap()).unwrap();
+    let (gguf, mmproj, family, ctx) = app.export_for_install("mycut-q4_k_m").unwrap();
+    assert!(gguf.ends_with("model-q4_k_m.gguf") && family == "generic" && ctx == 8192);
+    assert!(mmproj.is_none(), "no vision file was made for this export (the fake worker has none)");
+    // an export with a vision file hands it to the installer: the file sits next to the GGUF and meta.json names it
+    std::fs::write(p.folder.join("exports/mycut-q4_k_m/mmproj-F16.gguf"), "MMPROJ").unwrap();
+    let meta_path = p.folder.join("exports/mycut-q4_k_m/meta.json");
+    let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["mmproj_file"] = json!("mmproj-F16.gguf");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    let (gguf, mmproj, _, _) = app.export_for_install("mycut-q4_k_m").unwrap();
+    assert!(mmproj.as_ref().is_some_and(|m| m.ends_with("mmproj-F16.gguf") && m.is_file()) && gguf.is_file());
+    // the healed copy exports under its own name so the two never collide
+    let metas = exports::execute_no_train(&p, &exports::ModelSource::Made { name: "mycut".into(), sub: "healed".into() }, &["q8_0".into()], 8192, true,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(metas[0]["name"].as_str(), Some("mycut-healed-q8_0"));
+    let modelfile = std::fs::read_to_string(p.folder.join("exports/mycut-healed-q8_0/Modelfile")).unwrap();
+    assert!(modelfile.contains("num_ctx 8192"));
+    // bad choices say so in plain words
+    let err = exports::execute_no_train(&p, &exports::ModelSource::Made { name: "mycut".into(), sub: "nope".into() }, &["q4_k_m".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("made copy or the healed copy"), "{err}");
+    let err = exports::execute_no_train(&p, &exports::ModelSource::Made { name: "ghost".into(), sub: "model".into() }, &["q4_k_m".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("not there any more"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn any_folder_on_this_computer_can_be_saved_as_gguf_without_a_training_run() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"printf 'GGUF' > "$out/model-$quant.gguf"
+echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    let dir = d.path().join("My Cut 17B");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), "{}").unwrap();
+    let metas = exports::execute_no_train(&p, &exports::ModelSource::Folder { dir: dir.to_string_lossy().to_string(), name: None }, &["q4_k_m".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(metas[0]["name"].as_str(), Some("My Cut 17B-q4_k_m"));
+    assert_eq!(metas[0]["source"]["kind"].as_str(), Some("folder"));
+    assert!(metas[0]["base_repo"].as_str().is_some_and(|r| r.contains("My Cut 17B")));
+    let err = exports::execute_no_train(&p, &exports::ModelSource::Folder { dir: d.path().join("empty").to_string_lossy().to_string(), name: None }, &["q4_k_m".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("no config.json"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_model_of_the_list_is_exported_without_a_training_run_by_letting_the_worker_fetch_it() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"cp "$5" "$NDFORGE_JOB_CAPTURE"
+printf 'GGUF' > "$out/model-$quant.gguf"
+echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant\":\"$quant\"}}""#);
+    std::env::set_var("NDFORGE_JOB_CAPTURE", d.path().join("job.json"));
+    std::env::set_var("HF_HUB_CACHE", d.path().join("hfhub"));          // the cache check looks here first; the tempdir takes the fake copy away
+    let p = project_with_world(d.path(), 1);
+    let m = ndforge_core::train::catalog::find("qwen3.5-2b").unwrap();
+    // a copy in the Hugging Face cache counts as "on this computer" (the card's "downloads first" rule): a fake one, so no download is counted here
+    assert!(!exports::hub_model_local(&m.repo));
+    let fake_snap = d.path().join("hfhub").join(format!("models--{}", m.repo.replace('/', "--"))).join("snapshots/testfake");
+    std::fs::create_dir_all(&fake_snap).unwrap();
+    std::fs::write(fake_snap.join("config.json"), "{}").unwrap();
+    assert!(exports::hub_model_local(&m.repo));
+    let metas = exports::execute_no_train(&p, &exports::ModelSource::Hub { repo: "qwen3.5-2b".into() }, &["f16".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(metas[0]["name"].as_str(), Some("Qwen3.5-2B-f16"));
+    assert_eq!(metas[0]["family"].as_str(), Some(m.family.as_str()));
+    let job: Value = serde_json::from_slice(&std::fs::read(d.path().join("job.json")).unwrap()).unwrap();
+    assert_eq!(job["base"]["repo"].as_str(), Some(m.repo.as_str()), "the worker is sent the model of the list itself");
+    assert!(job["full_model"].is_null(), "no local folder is named: the worker fetches the model when it is not here");
+    let want = ((exports::export_need_gb(m.params_b, false, &["f16".to_string()], false) * 10.0).round() / 10.0, job["need_gb"].as_f64().unwrap());
+    assert_eq!(want.0, want.1, "a model that is already here adds no download to the disk check");
+    assert_eq!(job["thinking_default"].as_str(), Some("off"));
+    std::fs::remove_dir_all(d.path().join("hfhub")).unwrap();
+    assert!(!exports::hub_model_local(&m.repo));
+    // a model that is not in the list is refused with a hint
+    let err = exports::execute_no_train(&p, &exports::ModelSource::Hub { repo: "someone/secret-model".into() }, &["f16".into()], 8192, false,
+        &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("not in the model list"), "{err}");
 }

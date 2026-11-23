@@ -887,7 +887,7 @@ function renderUse() {
     <p class="dim">Joins the trained add-on into the model. ${us.what === "merged" ? "Makes the <strong>merged 16-bit model</strong> as ordinary safetensors files (10 to 20 GB for the bigger models), which loads anywhere without the add-on." : "Makes a <strong>GGUF</strong> file with a <strong>Modelfile</strong> (a few minutes; each file is 1 to 6 GB). Tick several sizes to make them all from one conversion; each becomes its own entry below." + (us.what === "gguf_merged" ? " Also keeps the merged 16-bit model (10 to 20 GB more)." : "")}</p>
     ${pfBox("export", { run: us.run, what: us.what, quants: us.what === "merged" ? [] : us.quants, imatrix: us.what !== "merged" && !!us.im })}
     <div class="row"><button class="primary" id="us-make" ${busy || !st.env_ready || pfBlocked("export") || (us.what !== "merged" && !us.quants.length) || (us.what !== "merged" && us.im && !us.imSaved && gcBlocked("imatrix")) || (us.what !== "merged" && us.quants.includes("mixed_fit") && !(+us.mx.target > 0)) || (us.what !== "merged" && us.quants.includes("mixed_measured") && !(+us.mm.target > 0)) ? "disabled" : ""}>Make the files</button>${quBtn("export", `${us.what !== "merged" && !us.quants.length ? "disabled" : ""}`)}<button class="secondary" id="us-lora" ${busy ? "disabled" : ""} title="Copies the small LoRA add-on, with a README on how to load it in Unsloth or PEFT or merge it yourself">Save the LoRA add-on…</button>${!st.env_ready ? ` <span class="err">Open "⚙ Training setup" first (not needed to copy the LoRA add-on).</span>` : ""}</div>${us.what !== "merged" && us.im && gcBlocked("imatrix") ? `<p class="warn small">${esc(gcBlocked("imatrix"))}</p>` : ""}</div>`;
-  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; Ollama uses the text only, see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
+  const ex = st.exports.length ? st.exports.map((e) => `<li><strong>${esc(e.name)}</strong> · ${e.gguf_file === null ? "merged model only" : e.size_mb != null ? e.size_mb + " MB" : "file missing"}${e.merged_exists ? ` · merged model kept` : ""}${e.has_vision ? ` · <span title="${esc(e.vision_note || "")}">vision file included</span> (pictures work in Unsloth Studio and llama.cpp; the Modelfile lists the vision file, so Ollama keeps pictures when its build loads this family's projector — see VISION.md in the folder)` : (e.modalities && e.modalities.length ? ` · <span class="dim" title="${esc(e.vision_note || "")}">no vision file</span>` : "")}${e.mixed ? ` · <span title="${esc((e.mixed.note || "") + " " + (e.mixed.notes || []).join(" "))}"><strong>${esc(e.mixed.recipe || "Mixed precision (our own recipe)")}</strong>: ${esc(e.mixed.label || "")}${e.mixed.estimate && e.mixed.estimate.gb ? `, estimated ${e.mixed.estimate.gb} GB` : ""}${e.mixed.fit ? ", fitted to " + (e.mixed.fit.target_bytes / 1e9).toFixed(2) + " GB (experimental)" : ""}${e.mixed.fell_back_to ? `, the fit fell back to ${esc(e.mixed.fell_back_to)}` : ""}</span>` : ""}${e.imatrix && e.imatrix.requested && e.via ? ` · <span class="dim">GGUF made by ${e.via === "unsloth" ? "Unsloth" : "llama.cpp"}</span>` : ""}${e.imatrix && e.imatrix.requested ? (e.imatrix.applied ? ` · <span title="${esc(e.imatrix.note || "")}">importance matrix used (${e.imatrix.chunks} chunks${e.imatrix.reused ? ", saved one" : ""}${e.imatrix.nextn ? ", with the speculative-decoding head" : ""})</span>` : ` · <span class="dim" title="${esc(e.imatrix.reason || e.imatrix.note || "")}">no importance matrix${e.imatrix.reason ? " (" + esc(e.imatrix.reason) + ")" : ""}</span>`) : ""}${e.imatrix && e.imatrix.note ? `<br><span class="dim">Importance matrix: ${esc(e.imatrix.note)}</span>` : ""}<br><span class="dim">${esc(e.dir)}</span> ${copyBtn(e.dir)}
       ${e.installed && e.installed.length ? `<br><span class="dim">Installed: ${e.installed.map((i) => esc(i.model) + " @ " + esc(i.url)).join(", ")}</span>` : ""} <button class="link" data-stdel="export|${esc(e.name)}" title="Opens the Storage page with this export ticked; nothing is deleted before you confirm.">Delete…</button></li>`).join("") : "";
   const gg = st.exports.filter((e) => e.gguf_file !== null && e.run === us.run);
   const list = ex ? `<div class="card wide"><h2>Your files</h2><ul class="exlist">${ex}</ul>${gg.length > 1 ? `<div class="row"><button class="secondary" id="us-compare" title="Measures how far each of these files is from the 16-bit model (KL divergence)">Compare these sizes</button></div>` : ""}</div>` : "";
@@ -1753,6 +1753,7 @@ const quBtn = (kind, extra) => `<button class="secondary" data-quadd="${kind}" $
 const QU_ARGS = {
   auto: () => ({ spec: acSpec(), resume: null }),
   export: () => usMakeArgs(),
+  export_model: () => rsxMakeArgs(),
   heal: () => ({ name: rs.hl.name, spec: rsHealSpec() }),
   quantcheck: () => ({ spec: qkSpec() }),
   think_check: (b) => { const m = (rs.state.made || []).find((x) => x.name === rs.tk.name); return { spec: { name: rs.tk.name, target: b.dataset.target, quick: m ? tkQuick(m) : true, gguf: b.dataset.target === "gguf" ? rs.tk.gguf : null, ...tkSpecExtra() } }; },
@@ -2665,6 +2666,12 @@ let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, l
   hl: null, hlRun: null, hlSpec: { general: true, tokens_m: null, dataset: "", share: 0.5, shareSet: false, recipe: null, alpha: 1, lr: 0.0001, mode: "", rounds: false, roundM: 5, firstCheck: 10, roundCheck: "quick", stopRule: "pass", ...HEAL_AUTO }, hlEst: null, hlSeed: {},
   // the thinking check of the shown model: its saved numbers, the choice of quick or full, the GGUF to check, and a check in progress
   tk: { name: null, data: null, quick: null, gguf: "", run: null, err: null, ok: null } };
+
+// the "Save a model as GGUF (no training needed)" card of this page (docs/RESHAPE.md): the model to save (a made one, one of the list, or a folder on this computer),
+// the same sizes and options as the export of a training run (Step 5), and the run in progress. Events come on "reshape-event" tagged {"phase": "export"}.
+let rsx = { state: null, src: "made", pick: "", folder: "", quants: ["q4_k_m"], numCtx: 8192, thinking: false,
+  im: false, imChunks: 128, imReuse: null, imNextn: true, imSaved: "", mx: { target: "", matrix: "" }, mm: { target: "", matrix: "" },
+  running: false, pending: null, text: "", progress: null, log: [], error: null, ok: null };
 
 // Thinning the linear-attention value heads and the attention heads has no published precedent for this kind of model. It is offered in Expert mode only,
 // labelled experimental, and stays switched off until the measurements on a real graphics card (docs/RESHAPE.md, "Not verified yet") are done:
@@ -4440,7 +4447,7 @@ function renderReshape() {
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
   const toAuto = `<div class="card wide"><p style="margin:0">Want it all in one click? <button class="link" id="rs-open-auto">Open Auto</button> <span class="dim small">(measures, cuts, heals, checks and exports, one step after the other)</span></p></div>`;
-  return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list;
+  return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list + rsxCard(st);
 }
 
 // The Auto page: the Auto-cut card (and what it needs: the model it starts from, the pinned cut, the run's panels) on a page of its own. It reads the Slim page's state (`rs`).
@@ -4466,6 +4473,7 @@ async function rsRefresh(stale) {
     rs.state = await invoke("reshape_state");
     if (!rs.model && rs.state.models.length) rs.model = (rs.state.models.find((m) => m.id === "qwen3.5-9b") || rs.state.models[0]).id;
   } catch (e) { rs.error = String(e); }
+  try { rsx.state = await invoke("export_model_state"); rsxEnsurePick(); } catch (e) { /* the card says what is missing */ }
   if (onReshape()) render();
   if (rs.state && rs.model && !rs.options && !rs.loadingOpts) rsOptions();
   if (stale && rs.hl) rs.hl.stale = true;
@@ -4545,6 +4553,7 @@ function onHealEvent(p) {
 }
 
 function onReshapeEvent(p) {
+  if (p.phase === "export") return onRsxEvent(p);
   if (p.phase === "auto") return onAutoEvent(p);
   if (p.phase === "think") return onThinkEvent(p);
   if (p.phase === "vllm") return onVllmEvent(p);
@@ -4574,6 +4583,177 @@ function onReshapeEvent(p) {
   }
   if (onReshape()) render();
   const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight;
+}
+
+// ----------------------------------------------------------------------------------------------------------------- save a model as GGUF without training (docs/RESHAPE.md)
+// The "Save a model as GGUF (no training needed)" card: the same files, sizes and options as the export of a training run (Step 5), but from a model that was never
+// trained here: one this page made (cut, grow or healed), any model of the list, or a folder on this computer. The core does the work (export::runs::execute_no_train);
+// a model of the list that is not on this computer yet is fetched by the worker first. Events: "reshape-event" tagged {"phase": "export"} (onRsxEvent).
+
+// the entry the current pick resolves to (the same shapes export_model_state gives)
+function rsxEntry() {
+  const st = rsx.state;
+  if (!st) return null;
+  if (rsx.src === "made") { const [n, sub] = (rsx.pick || "").split("||"); return (st.made || []).find((x) => x.name === n && x.sub === sub) || null; }
+  if (rsx.src === "hub") return (st.models || []).find((x) => x.source && x.source.repo === rsx.pick) || null;
+  return null;
+}
+
+// a pick that exists (the first one of the chosen kind), so the select never shows an option the args do not name
+function rsxEnsurePick() {
+  const st = rsx.state;
+  if (!st) return;
+  const ok = rsxEntry() || rsx.src === "folder";
+  if (ok) return;
+  if (rsx.src === "made") { const e = (st.made || [])[0]; rsx.pick = e ? `${e.name}||${e.sub}` : ""; if (e) rsx.thinking = !!e.thinking; }
+  else if (rsx.src === "hub") { const m = (st.models || [])[0]; rsx.pick = m ? m.source.repo : ""; }
+}
+
+// the export name: every size becomes exports/<name>-<size>/ (a healed copy becomes <name>-healed, so the two copies never collide)
+function rsxExportName() {
+  const e = rsxEntry();
+  if (e) return e.export_name;
+  if (rsx.src === "folder") { const parts = rsx.folder.trim().replace(/[\\/]+$/, "").split(/[\\/]/); return parts[parts.length - 1] || "model"; }
+  if (rsx.src === "hub") return (rsx.pick || "").split("/").pop() || "";
+  return "";
+}
+
+function rsxSource() {
+  if (rsx.src === "folder") return { kind: "folder", dir: rsx.folder.trim(), name: null };
+  if (rsx.src === "hub") return { kind: "hub", repo: rsx.pick };
+  const [name, sub] = (rsx.pick || "").split("||");
+  return { kind: "made", name, sub };
+}
+
+// what "Save the GGUF" sends to export_model_start (the queue keeps the same); paramsB / downloadGb say nothing to the command (the queue's checklist reads them)
+function rsxMakeArgs() {
+  const e = rsxEntry(), saved = ((rsx.state || {}).imatrix || {}).saved || {};
+  return { source: rsxSource(), quant: rsx.quants[0] || "q4_k_m", quants: rsx.quants, numCtx: rsx.numCtx, thinking: !!rsx.thinking,
+    paramsB: e ? e.params_b : null, downloadGb: e ? (e.download_gb || 0) : 0,
+    imatrix: rsx.im ? { enabled: true, chunks: rsx.imChunks, reuse: rsx.imReuse === null ? !!saved[rsxExportName()] : rsx.imReuse, nextn: rsxNextn((rsx.state || {}).imatrix).on, general: gcSource("imatrix"), ...(rsx.imSaved ? { use_saved: rsx.imSaved } : {}) } : null,
+    mixed: (rsx.quants.includes("mixed_fit") || rsx.quants.includes("mixed_measured"))
+      ? { ...(rsx.quants.includes("mixed_fit") ? { fit: { target_gb: Number(rsx.mx.target), matrix: rsx.mx.matrix || null } } : {}),
+          ...(rsx.quants.includes("mixed_measured") ? { measured: { target_gb: Number(rsx.mm.target), matrix: rsx.mm.matrix || null } } : {}) }
+      : null };
+}
+
+function rsxPfSpec() {
+  const e = rsxEntry();
+  return { what: "gguf", quants: rsx.quants, imatrix: rsx.im, params_b: e ? e.params_b : null, download_gb: e ? (e.download_gb || 0) : 0 };
+}
+
+// the speculative-decoding (MTP) head of the model being saved (the same rule as the export page, keyed by the export name)
+function rsxNextn(im) {
+  const head = ((im && im.mtp) || {})[rsxExportName()] === true;
+  const unsupported = head && im.nextn_supported === false;
+  return { head, unsupported, on: head && !unsupported && rsx.imNextn };
+}
+
+async function rsxRun(kind, cmd, args) {
+  rsx.running = true; rsx.error = null; rsx.ok = null; rsx.log = []; rsx.text = "Starting…"; rsx.progress = null; rsx.pending = kind;
+  render();
+  try { await invoke(cmd, args); } catch (e) { rsx.running = false; rsx.error = String(e); rsx.text = ""; render(); }
+}
+
+function onRsxEvent(p) {
+  if (p.kind === "progress") { rsx.text = p.text || p.step; rsx.progress = p.value; }
+  else if (p.kind === "log") rsx.log.push(p.text);
+  else if (p.kind === "error") { rsx.running = false; rsx.text = ""; rsx.progress = null; rsx.error = p.text; render(); return; }
+  else if (p.kind === "done") {
+    rsx.running = false; rsx.text = ""; rsx.progress = null;
+    const d = p.data || {};
+    const names = d.exports && d.exports.length ? d.exports.map((m) => m.name).join(", ") : d.name || "the files";
+    rsx.ok = d.stopped ? "Stopped. Nothing was kept."
+      : `Saved: ${names}. The files are in the exports list on Step 5, next to a Modelfile for Ollama.`;
+    render();
+    return;
+  }
+  if (onReshape()) render();
+  const l = document.querySelector("details .log"); if (l) l.scrollTop = l.scrollHeight;
+}
+
+const rsxQuantBox = (q) => `<label class="opt" title="${esc(q.name)}"><input type="checkbox" class="rsx-q" value="${q.id}" ${rsx.quants.includes(q.id) ? "checked" : ""}> ${esc(q.label || q.name.split(":")[0])}</label>`;
+
+function rsxCard(st) {
+  const stx = rsx.state;
+  const head = `<h2>Save a model as GGUF (no training needed)</h2>
+    <p class="dim">Makes the GGUF files of a model that was never trained here, with a Modelfile for Ollama: a model this page made (a cut or a grow, or its healed copy), any model of the list, or a folder on this computer. The files join the same exports list as Step 5, and the sizes and options are the ones the export of a training run has. Nothing is merged (there is no trained add-on): the model is converted as it is.</p>`;
+  if (!stx) return `<div class="card wide">${head}<p class="dim">Loading…</p></div>`;
+  const made = stx.made || [], catalog = stx.models || [];
+  const key = (e) => `${e.name}||${e.sub}`;
+  const madeOpts = made.map((e) => `<option value="${esc(key(e))}" ${rsx.pick === key(e) ? "selected" : ""}>${esc(e.label)} · ${(+e.params_b).toFixed(1)} B${e.size_gb ? " · " + e.size_gb + " GB" : ""}</option>`).join("");
+  const hubOpts = catalog.map((m) => `<option value="${esc(m.source.repo)}" ${rsx.pick === m.source.repo ? "selected" : ""}>${esc(m.name)} · ${(+m.params_b).toFixed(1)} B${m.local ? "" : " · downloads first (≈ " + m.download_gb + " GB)"}</option>`).join("");
+  const radio = (id, label, extra) => `<label class="opt"><input type="radio" name="rsx-src" value="${id}" ${rsx.src === id ? "checked" : ""} ${extra || ""}> ${label}</label>`;
+  const pickRow = rsx.src === "made" ? (made.length ? `<div class="row"><label>Model made here <select id="rsx-pick">${madeOpts}</select></label></div>`
+      : `<p class="dim">No models made here yet: make one above (or choose one of the list, or a folder).</p>`)
+    : rsx.src === "hub" ? `<div class="row"><label>Model of the list <select id="rsx-pick">${hubOpts}</select></label></div>`
+    : `<div class="row"><label>Folder with config.json <input type="text" id="rsx-folder" value="${esc(rsx.folder)}" placeholder="C:\\models\\Qwen3.5-4B or /home/me/models/Qwen3.5-4B" style="min-width:320px"></label></div>`;
+  const e = rsxEntry(), name = rsxExportName();
+  const mixed = stx.mixed_quants || [], lib = ((stx.imatrix || {}).library) || [], saved = ((stx.imatrix || {}).saved) || {};
+  const busy = rsx.running || rs.running;
+  const mixedOn = rsx.quants.includes("mixed_fit") || rsx.quants.includes("mixed_measured");
+  const imSavedOpts = lib.map((x) => `<option value="${esc(x.id)}" ${rsx.imSaved === x.id ? "selected" : ""}>${esc(x.label || x.id)} · ${esc(x.model || "other model")} · ${x.chunks != null ? x.chunks + " chunks" : "unknown amount"}</option>`).join("");
+  const savedOne = saved[name];
+  const why = !stx.env_ready ? "The training software is not installed yet (Training setup)."
+    : rsx.src === "folder" && !rsx.folder.trim() ? "Type the folder of the model first."
+    : rsx.src !== "folder" && !rsx.pick ? "Choose a model first."
+    : rsx.src === "made" && !made.length ? "No models made here yet."
+    : !rsx.quants.length ? "Choose at least one file size."
+    : rsx.quants.includes("mixed_fit") && !(+rsx.mx.target > 0) ? "Give the size the fit should aim for."
+    : rsx.quants.includes("mixed_measured") && !(+rsx.mm.target > 0) ? "Give the size the measured fit should aim for."
+    : rsx.im && !rsx.imSaved && gcBlocked("imatrix") ? gcBlocked("imatrix") : "";
+  const matRow = (who, st2) => `<label>Statistics from <select id="rsx-m${st2}matrix"><option value="">the matrix of this export</option>${lib.map((x) => `<option value="${esc(x.id)}" ${st2 === "x" ? rsx.mx.matrix === x.id : rsx.mm.matrix === x.id ? "selected" : ""}>${esc(x.label || x.id)}</option>`).join("")}</select></label>`;
+  const mixedDetail = mixedOn ? `<p class="dim small">Made with llama.cpp (<code>llama-quantize</code> gives single tensors their own types), the same recipes as Step 5. The importance matrix, when you use one, is applied to these sizes too.</p>
+    ${rsx.quants.includes("mixed_fit") ? `<div class="row"><strong>Fit to a size (experimental)</strong> <label>Target size <input type="text" id="rsx-mxtarget" value="${esc(rsx.mx.target)}" placeholder="12.5" style="min-width:80px;flex:0"> GB</label>${matRow("fit", "x")}</div>${!(+rsx.mx.target > 0) ? `<p class="warn small">Give the size in GB that the fit should aim for.</p>` : ""}` : ""}
+    ${rsx.quants.includes("mixed_measured") ? `<div class="row"><strong>Mixed: measured fit to a size</strong> <label>Target size <input type="text" id="rsx-mmtarget" value="${esc(rsx.mm.target)}" placeholder="10.6" style="min-width:80px;flex:0"> GB</label>${matRow("measured", "m")}</div>${!(+rsx.mm.target > 0) ? `<p class="warn small">Give the size in GB that the measured fit should aim for.</p>` : ""}` : ""}` : "";
+  const imatrixDetail = !rsx.im ? "" : rsx.imSaved ? `<div class="row"><label>Use a saved matrix <select id="rsx-imsaved"><option value="">Measure a new one now</option>${imSavedOpts}</select></label><button class="link" id="rsx-imlib">Open the matrix library</button></div>
+      <p class="dim small">Nothing is measured: this matrix is copied into the export and given to <code>llama-quantize</code> (or Unsloth) as it is, for the sizes below Q8_0. It should have been made from the same model.</p>`
+    : `<div class="row"><label>Calibration text <select id="rsx-imchunks">${(stx.imatrix.chunks || [64, 128, 256]).map((n) => `<option value="${n}" ${rsx.imChunks === n ? "selected" : ""}>${n} chunks${n === 128 ? " (recommended)" : ""}</option>`).join("")}</select></label>
+      ${rsxNextn(stx.imatrix).head ? `<label class="opt ${rsxNextn(stx.imatrix).unsupported ? "dim" : ""}"><input type="checkbox" id="rsx-imnextn" ${rsxNextn(stx.imatrix).on ? "checked" : ""} ${rsxNextn(stx.imatrix).unsupported ? "disabled" : ""}> Include the speculative-decoding head (MTP) in the matrix</label>` : ""}
+      ${savedOne ? `<label class="opt"><input type="checkbox" id="rsx-imreuse" ${rsx.imReuse === null ? "checked" : ""}> Reuse the saved matrix (${savedOne.chunks} chunks, made ${esc(String(savedOne.created || "").slice(0, 10))})</label>` : ""}</div>
+      ${gcHtml("imatrix")}`;
+  const prog = (rsx.running || rsx.text) ? `<div class="stepline" aria-live="polite">${esc(rsx.text)}</div>${rsx.progress != null ? `<progress max="1" value="${rsx.progress}"></progress>` : ""}` : "";
+  return `<div class="card wide" id="rsx-card">${head}
+    <div class="row">${radio("made", `A model made here (${made.length})`, rsx.running || rs.running ? "disabled" : "")}${radio("hub", "A model of the list", rsx.running || rs.running ? "disabled" : "")}${radio("folder", "A folder on this computer", rsx.running || rs.running ? "disabled" : "")}</div>
+    ${pickRow}
+    ${rsx.src === "hub" && e && !e.local ? `<p class="warn small">This model is not on this computer yet: the export downloads it first (about ${e.download_gb} GB into the Hugging Face cache), then makes the sizes. Needs an internet connection.</p>` : ""}
+    <div class="row"><span class="quants">File sizes: ${stx.quants.concat(stx.mixed_quants).map(rsxQuantBox).join(" ")}</span>
+      <label>Context <select id="rsx-ctx">${[4096, 8192, 16384, 32768].map((n) => `<option ${rsx.numCtx === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
+    <div class="row"><label class="opt" title="${rsx.thinking ? "The exported chat template keeps the model's own thinking (a model healed with the thinking recipe)" : "The exported chat template answers without thinking unless asked"}"><input type="checkbox" id="rsx-thinking" ${rsx.thinking ? "checked" : ""} ${busy ? "disabled" : ""}> The exported file keeps the model's own thinking</label></div>
+    <div class="row"><label class="opt"><input type="checkbox" id="rsx-im" ${rsx.im ? "checked" : ""} ${busy ? "disabled" : ""}> Better small sizes (importance matrix)</label>
+      <span class="dim small">Makes Q6_K, Q5_K_M and Q4_K_M lose less quality; needs a saved training-data version (Step 2) and llama.cpp, and adds a few minutes.</span></div>
+    ${imatrixDetail}
+    ${mixed.length ? `<div class="row"><span class="quants"><strong>Mixed precision (our own recipe):</strong> ${mixed.map(rsxQuantBox).join(" ")}</span></div>${mixedDetail}` : ""}
+    ${pfBox("export", rsxPfSpec())}
+    <div class="row"><button class="primary" id="rsx-go" ${busy || !stx.env_ready || why || pfBlocked("export") ? "disabled" : ""}>Save the GGUF</button>${quBtn("export_model", why || busy ? "disabled" : "")}${rsx.running ? `<button class="secondary" id="rsx-cancel" title="Stops the export; while the importance matrix is made, llama.cpp is stopped at once">Cancel</button>` : ""}</div>
+    ${why && !busy ? `<div class="err">${esc(why)}</div>` : ""}
+    ${name ? `<p class="dim small">Saves as <code>exports/${esc(name)}-&lt;size&gt;/</code> (every ticked size of its own).</p>` : ""}
+    ${prog}${rsx.log.length ? `<details><summary>Log</summary><pre class="log">${rsx.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}
+    ${rsx.error ? errDiv(rsx.error) : ""}${rsx.ok ? `<div class="ok">${esc(rsx.ok)}</div>` : ""}</div>`;
+}
+
+function rsxWire() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  const bind = (id, key, num) => { const e = $(id); if (e) e.onchange = () => { rsx[key] = num ? Number(e.value) : e.value; }; };
+  document.querySelectorAll('input[name="rsx-src"]').forEach((r) => r.onchange = () => { rsx.src = r.value; rsx.pick = ""; rsx.imSaved = ""; rsx.imReuse = null; rsxEnsurePick(); render(); });
+  const pk = $("rsx-pick"); if (pk) pk.onchange = () => { rsx.pick = pk.value; rsx.imSaved = ""; rsx.imReuse = null; const e = rsxEntry(); if (e && e.thinking != null) rsx.thinking = !!e.thinking; render(); };
+  const fd = $("rsx-folder"); if (fd) fd.onchange = () => { rsx.folder = fd.value; render(); };
+  document.querySelectorAll(".rsx-q").forEach((c) => c.onchange = () => { rsx.quants = [...document.querySelectorAll(".rsx-q")].filter((x) => x.checked).map((x) => x.value); render(); });
+  bind("rsx-ctx", "numCtx", true);
+  const th = $("rsx-thinking"); if (th) th.onchange = () => { rsx.thinking = th.checked; render(); };
+  const imc = $("rsx-im"); if (imc) imc.onchange = () => { rsx.im = imc.checked; rsx.imSaved = ""; render(); };
+  const imch = $("rsx-imchunks"); if (imch) imch.onchange = () => { rsx.imChunks = Number(imch.value); render(); };
+  const imn = $("rsx-imnextn"); if (imn) imn.onchange = () => { rsx.imNextn = imn.checked; render(); };
+  const imr = $("rsx-imreuse"); if (imr) imr.onchange = () => { rsx.imReuse = imr.checked; render(); };
+  const ims = $("rsx-imsaved"); if (ims) ims.onchange = () => { rsx.imSaved = ims.value; render(); };
+  const mxt = $("rsx-mxtarget"); if (mxt) mxt.onchange = () => { rsx.mx.target = mxt.value.trim(); render(); };
+  const mxm = $("rsx-mxmatrix"); if (mxm) mxm.onchange = () => { rsx.mx.matrix = mxm.value; };
+  const mmt = $("rsx-mmtarget"); if (mmt) mmt.onchange = () => { rsx.mm.target = mmt.value.trim(); render(); };
+  const mmm = $("rsx-mmmatrix"); if (mmm) mmm.onchange = () => { rsx.mm.matrix = mmm.value; };
+  if (rsx.im) gcWire("imatrix", render);
+  on("rsx-imlib", () => go("imatrix"));
+  on("rsx-go", () => rsxRun("make", "export_model_start", rsxMakeArgs()));
+  on("rsx-cancel", () => invoke("env_cancel"));
 }
 
 function rsSpec() {
@@ -4752,6 +4932,7 @@ function wireReshape() {
   wireAuto();
   on("rs-open-auto", () => go("auto"));
   wireTry();
+  rsxWire();
   document.querySelectorAll("[data-rstrain]").forEach((b) => b.onclick = () => { tr.model = b.dataset.rstrain; tr.over = {}; tr.plan = null; go("train"); });
 }
 

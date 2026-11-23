@@ -584,7 +584,7 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
             }
             None => None,
         };
-        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx)))?;
+        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx), mmproj_file.as_deref()))?;
         let quant_shown = if is_mixed(quant) { format!("{} ({MIXED_RECIPE})", MIXED_QUANTS.iter().find(|(id, _)| id == quant).map(|(id, n)| quant_label(id, n)).unwrap_or_default()) } else { quant.clone() };
         std::fs::write(dir.join("MODEL_CARD.md"), model_card(&CardInfo {
             world: &p.display_name(), model_name: &oname, base_repo: &repo, license: &license, method: cfg["method"].as_str().unwrap_or("lora"), quant: &quant_shown,
@@ -612,6 +612,139 @@ pub fn execute_many_full(p: &Project, run: &str, quants: &[String], num_ctx: u32
     Ok(metas)
 }
 
+/// Where a model to export without a training run comes from. The Slim or grow page's "Save a model as GGUF" card offers all three: a model it made (the cut or grown one,
+/// or its healed copy), any folder on this computer that holds a model, and every model of the list (built-in or added) — that one the worker downloads first when it is
+/// not on this computer yet. None of them needs a training run: there is no adapter, so there is nothing to merge.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelSource {
+    /// `models/<name>/` of this project, and which copy: "model" (as cut or grown) or "healed" (after a heal).
+    Made { name: String, sub: String },
+    /// A folder on this computer with config.json and the 16-bit .safetensors files in it.
+    Folder { dir: String, name: Option<String> },
+    /// A model of the list: its id (for example `qwen3.5-4b`) or its `repo` (a Hugging Face id, or the folder a custom model points at).
+    Hub { repo: String },
+}
+
+/// What one no-training export is made of, once its source is found on disk (or known to be fetched by the worker): the export name, what the job names as its base model,
+/// the family for the Modelfile, the size for the disk check, and what meta.json should remember.
+struct FolderJob {
+    /// The export name: every size becomes `exports/<name>-<size>/`.
+    name: String,
+    /// The model's folder on this computer; None for a model of the list that is not here (the worker resolves and downloads `base_repo` itself).
+    model_dir: Option<std::path::PathBuf>,
+    /// What meta.json and the worker's job name as the base: the folder path, or the Hugging Face id.
+    base_repo: String,
+    family: String,
+    /// Billions of weights, for the disk check.
+    params_b: f64,
+    /// The model whose vision file the export keeps (a made model keeps its origin's).
+    vision_repo: Option<String>,
+    /// Extra disk for fetching the model itself (a Hugging Face download), on top of the sizes.
+    download_gb: f64,
+    /// Goes into meta.json as "source" (what the files were made from, when not from a training run).
+    source: Value,
+    /// The one-click Auto-cut writes `auto_cut: true` as it always did; the card's exports say "source" instead.
+    auto_cut: bool,
+}
+
+/// Family and size of a made model: its entry in the model list of Step 3 knows both; the reshape meta or the folder itself are the fallback.
+fn made_family_params(sub: &str, dir: &std::path::Path) -> (String, f64) {
+    let state = read_json(&dir.parent().unwrap_or(dir).join("state.json")).unwrap_or(Value::Null);
+    let id = state[if sub == "healed" { "healed_model_id" } else { "model_id" }].as_str().map(String::from);
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).to_string_lossy().to_string();
+    let entry = id.and_then(|i| crate::train::catalog::find(&i))
+        .or_else(|| crate::train::catalog::models().into_iter().find(|m| m.repo == canonical));
+    let meta_params = read_json(&dir.join("ndforge_reshape.json")).and_then(|m| m["params"].as_u64()).filter(|t| *t > 0).map(|t| t as f64 / 1e9);
+    let params_b = entry.as_ref().map(|m| m.params_b).filter(|b| *b > 0.0).or(meta_params).unwrap_or_else(|| folder_params_b(dir));
+    (entry.map(|m| m.family).unwrap_or_else(|| "generic".into()), params_b)
+}
+
+/// The models the Slim or grow page can save as GGUF without a training run: every made model that still has its cut or grown copy (`model`) or its healed copy, newest
+/// first. `source` is exactly what `execute_no_train` takes back, and `thinking` is what the exported chat template should do about the model's own thinking
+/// (`thinking_default`): the checkbox of the card starts here.
+pub fn exportable_models(p: &Project) -> Vec<Value> {
+    crate::reshape::runs::list(p).into_iter().filter_map(|m| {
+        let name = m["name"].as_str()?.to_string();
+        let mut out: Vec<Value> = Vec::new();
+        for (sub, size_gb) in [("model", m["size_gb"].as_f64().unwrap_or(0.0)), ("healed", m["healed_size_gb"].as_f64().unwrap_or(0.0))] {
+            let dir = crate::reshape::runs::models_dir(p).join(&name).join(sub);
+            if !dir.join("config.json").is_file() {
+                continue;
+            }
+            let (family, params_b) = made_family_params(sub, &dir);
+            let export_name = if sub == "healed" { format!("{name}-healed") } else { name.clone() };
+            out.push(json!({"kind": "made", "name": name, "sub": sub, "label": format!("{name} · {}", if sub == "healed" { "healed copy" } else { "as made" }),
+                            "export_name": export_name, "family": family, "params_b": params_b, "size_gb": size_gb, "thinking": thinking_default(&dir) == "keep",
+                            "source": {"kind": "made", "name": name, "sub": sub}}));
+        }
+        (!out.is_empty()).then_some(out)
+    }).flatten().collect()
+}
+
+/// Is a model of the list already on this computer (a local folder, or a snapshot in the Hugging Face cache)? The card says "downloads first" for the others.
+pub fn hub_model_local(repo: &str) -> bool {
+    std::path::Path::new(repo).is_dir() || !hf_cache_snapshots(repo).is_empty()
+}
+
+/// Works out what one source of the card means on disk, and what the export needs from it.
+fn resolve_source(p: &Project, src: &ModelSource) -> Result<FolderJob> {
+    Ok(match src {
+        ModelSource::Made { name, sub } => {
+            if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+                return Err(Error::new("That is not the name of a model made here."));
+            }
+            if sub != "model" && sub != "healed" {
+                return Err(Error::new("Choose the made copy or the healed copy."));
+            }
+            let dir = crate::reshape::runs::models_dir(p).join(name).join(sub);
+            if !dir.join("config.json").is_file() {
+                return Err(Error::new(if sub == "healed" { format!("The healed copy of {name} is not there (it was never healed, or it was deleted).") } else { format!("The model {name} is not there any more.") }));
+            }
+            let (family, params_b) = made_family_params(sub, &dir);
+            let vision = read_json(&dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
+            FolderJob {
+                name: if sub == "healed" { format!("{name}-healed") } else { name.clone() },
+                model_dir: Some(dir.clone()), base_repo: dir.to_string_lossy().to_string(), family, params_b, vision_repo: vision, download_gb: 0.0,
+                source: json!({"kind": "made", "name": name, "sub": sub}), auto_cut: false,
+            }
+        }
+        ModelSource::Folder { dir, name } => {
+            let path = std::path::PathBuf::from(dir.trim().trim_matches(|c| c == '"' || c == '\''));
+            if !path.join("config.json").is_file() {
+                return Err(Error::new(format!("There is no config.json in {}. Choose the model's own folder (the one that holds config.json and the .safetensors files).", path.display())));
+            }
+            let export_name = name.clone().filter(|n| !n.trim().is_empty()).map(|n| n.trim().to_string())
+                .or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "model".into());
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone()).to_string_lossy().to_string();
+            let entry = crate::train::catalog::models().into_iter().find(|m| m.repo == canonical)
+                .or_else(|| crate::train::hub::lookup(dir.trim()).ok().map(|f| f.entry));
+            let params_b = entry.as_ref().map(|m| m.params_b).filter(|b| *b > 0.0).unwrap_or_else(|| folder_params_b(&path));
+            let family = entry.map(|m| m.family).unwrap_or_else(|| "generic".into());
+            let vision = read_json(&path.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
+            FolderJob {
+                name: export_name, model_dir: Some(path), base_repo: canonical, family, params_b, vision_repo: vision, download_gb: 0.0,
+                source: json!({"kind": "folder", "dir": dir.trim()}), auto_cut: false,
+            }
+        }
+        ModelSource::Hub { repo } => {
+            let repo_t = repo.trim();
+            let entry = crate::train::catalog::find(repo_t).or_else(|| crate::train::catalog::models().into_iter().find(|m| m.repo == repo_t));
+            let Some(entry) = entry else { return Err(Error::new(format!("{repo_t} is not in the model list. Add it in Step 3 first, or choose one of the models there."))); };
+            let name = entry.repo.rsplit('/').next().unwrap_or(&entry.repo).to_string();
+            if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+                return Err(Error::new("That is not a name for an export."));
+            }
+            let local = hub_model_local(&entry.repo);
+            FolderJob {
+                name, model_dir: None, base_repo: entry.repo.clone(), family: entry.family.clone(), params_b: entry.params_b, vision_repo: None,
+                download_gb: if local { 0.0 } else { (entry.params_b * 2.0 * 10.0).round() / 10.0 },
+                source: json!({"kind": "hub", "repo": entry.repo}), auto_cut: false,
+            }
+        }
+    })
+}
+
 /// The GGUF files of a model folder that is not a training run (the healed model of Auto-cut): the whole model is converted once and shrunk to every size, then each size
 /// becomes an export (`exports/<name>-<size>/` with its Modelfile and meta.json, which names the folder as its base). `thinking`: the exported chat template keeps the
 /// model's own thinking (a model healed with the thinking recipe), else it answers without thinking unless asked (`thinking_default`). Returns the metas.
@@ -623,10 +756,31 @@ pub fn execute_model_folder(p: &Project, name: &str, model_dir: &std::path::Path
 /// `execute_model_folder` that also makes the mixed-precision sizes (the plain ones and `mixed_4` .. `mixed_measured`), with their options.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path::Path, family: &str, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, mixed: &MixedOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
-    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+    let vision = read_json(&model_dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
+    let job = FolderJob {
+        name: name.to_string(), model_dir: Some(model_dir.to_path_buf()), base_repo: model_dir.to_string_lossy().to_string(), family: family.to_string(),
+        params_b: folder_params_b(model_dir), vision_repo: vision, download_gb: 0.0, source: json!({"made_by": "auto_cut"}), auto_cut: true,
+    };
+    execute_folder(p, &job, quants, num_ctx, thinking, imatrix, mixed, kill, on_event)
+}
+
+/// The GGUF files of a model without a training run (the "Save a model as GGUF" card of the Slim or grow page): a model made there (cut, grown or healed), a folder on this
+/// computer, or a model of the list — that one the worker fetches first when it is not on this computer yet. The same files and options as the export of a training run:
+/// every size becomes its own export (`exports/<name>-<size>/` with its Modelfile and meta.json). Returns the metas.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_no_train(p: &Project, src: &ModelSource, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, mixed: &MixedOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    let job = resolve_source(p, src)?;
+    execute_folder(p, &job, quants, num_ctx, thinking, imatrix, mixed, kill, on_event)
+}
+
+/// The shared body of the folder exports (`execute_model_folder_full`, `execute_no_train`): the model is converted once and shrunk to every size, then each size becomes
+/// an export with its Modelfile and meta.json. A job without `model_dir` (a model of the list that is not on this computer) is resolved and fetched by the worker itself.
+#[allow(clippy::too_many_arguments)]
+fn execute_folder(p: &Project, j: &FolderJob, quants: &[String], num_ctx: u32, thinking: bool, imatrix: &ImatrixOptions, mixed: &MixedOptions, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Vec<Value>> {
+    if j.name.is_empty() || j.name.contains(['/', '\\']) || j.name.contains("..") {
         return Err(Error::new("That is not a name for an export."));
     }
-    if !model_dir.join("config.json").is_file() {
+    if j.model_dir.as_ref().is_some_and(|dir| !dir.join("config.json").is_file()) {
         return Err(Error::new("The model to export is missing."));
     }
     let mut list: Vec<String> = Vec::new();
@@ -645,17 +799,18 @@ pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path:
     if !py.is_file() {
         return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
     }
-    let work = exports_dir(p).join(format!("{name}-gguf-work"));
+    let work = exports_dir(p).join(format!("{}-gguf-work", j.name));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
-    let repo = model_dir.to_string_lossy().to_string();
-    let origin = read_json(&model_dir.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from));
-    let mut job = json!({"job": "export", "base": {"repo": repo, "family": family}, "out": work, "quant": list[0], "quants": list, "backend": "auto", "gguf": true, "keep_merged": false,
-                         "max_seq": 4096, "thinking_default": if thinking { "keep" } else { "off" }, "full_model": model_dir});
-    let need = export_need_gb(folder_params_b(model_dir), false, &list, false);
+    let mut job = json!({"job": "export", "base": {"repo": j.base_repo, "family": j.family}, "out": work, "quant": list[0], "quants": list, "backend": "auto", "gguf": true, "keep_merged": false,
+                         "max_seq": 4096, "thinking_default": if thinking { "keep" } else { "off" }});
+    if let Some(dir) = &j.model_dir {
+        job["full_model"] = json!(dir);
+    }
+    let need = export_need_gb(j.params_b, false, &list, false) + j.download_gb;
     check_export_disk(need, crate::envmgr::health::free_disk_gb(&exports_dir(p)), &exports_dir(p))?;
     job["need_gb"] = json!((need * 10.0).round() / 10.0);
-    if let Some(o) = &origin {
+    if let Some(o) = &j.vision_repo {
         job["base"]["vision_repo"] = json!(o);
     }
     add_mixed_blocks(p, &list, mixed, &mut job)?;
@@ -664,7 +819,7 @@ pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path:
             Some((v, _)) => (v, p.folder.join("datasets").join(format!("v{v}")).join("train.jsonl")),
             None => return Err(Error::new("Save a training-data version in Step 2 first: the importance matrix is measured on your world's text too.")),
         };
-        imatrix_block(p, name, &json!({"dataset": {"version": version, "train": train}}), imatrix, &work)?
+        imatrix_block(p, &j.name, &json!({"dataset": {"version": version, "train": train}}), imatrix, &work)?
     } else {
         None
     };
@@ -687,7 +842,7 @@ pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path:
     for (i, quant) in list.iter().enumerate() {
         let gguf = result["ggufs"][quant.as_str()].as_str().or_else(|| if list.len() == 1 { result["gguf"].as_str() } else { None }).map(PathBuf::from)
             .ok_or_else(|| Error::new(format!("No GGUF file was made for {quant}.")))?;
-        let dir = exports_dir(p).join(format!("{name}-{quant}"));
+        let dir = exports_dir(p).join(format!("{}-{}", j.name, quant));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let gguf_file = gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf").to_string();
@@ -700,10 +855,17 @@ pub fn execute_model_folder_full(p: &Project, name: &str, model_dir: &std::path:
             }
             None => None,
         };
-        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(family, num_ctx)))?;
-        let mut meta = json!({"name": format!("{name}-{quant}"), "run": name, "quant": quant, "family": family, "base_repo": repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file,
+        if let Some(m) = &mmproj_file {
+            std::fs::write(dir.join("VISION.md"), vision_readme(&gguf_file, m))?;
+        }
+        std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&j.family, num_ctx), mmproj_file.as_deref()))?;
+        let mut meta = json!({"name": format!("{}-{}", j.name, quant), "run": j.name, "quant": quant, "family": j.family, "base_repo": j.base_repo, "gguf_file": gguf_file, "mmproj_file": mmproj_file,
                               "modalities": result["modalities"], "vision_note": result["vision_note"], "merged_dir": null, "ollama_name": oname, "num_ctx": num_ctx,
-                              "created": created, "world": p.display_name(), "installed": [], "via": result["via"], "auto_cut": true});
+                              "created": created, "world": p.display_name(), "installed": [], "via": result["via"]});
+        if j.auto_cut {
+            meta["auto_cut"] = json!(true);
+        }
+        meta["source"] = j.source.clone();
         meta["imatrix"] = imatrix_meta(matrix.as_ref(), &result["imatrix"], quant, None);
         if is_mixed(quant) {
             let mut m = result["mixed"][quant.as_str()].clone();
@@ -802,8 +964,8 @@ Ask questions the way the training did: the same kind of system message, and for
 fn vision_readme(gguf: &str, mmproj: &str) -> String {
     format!("# Images with this model\n\nThis folder holds the fine-tuned text model (`{gguf}`) and the vision file of its base model (`{mmproj}`). Training only changed the language layers, so the base model's vision part still fits.\n\n\
 ## Unsloth Studio / llama.cpp (images work)\n- **Unsloth Studio**: load this folder (or the GGUF; Studio finds the `mmproj` file next to it) and attach pictures in the chat.\n- **llama.cpp**: `llama-server -m {gguf} --mmproj {mmproj}`, or `llama-mtmd-cli -m {gguf} --mmproj {mmproj} --image picture.png -p \"What is in this picture?\"`.\n\n\
-## Ollama (text only)\nOllama's GGUF import takes one file, so the program installs only `{gguf}` and the model answers text. Keep using Unsloth Studio or llama.cpp for pictures, or run a normal vision model next to it in Ollama for the photo tools.\n\n\
-Pictures are not part of the training: the model will not know your world's maps or art, only what it could read from a picture before.\n")
+## Ollama (pictures when the build takes the projector)\nThe Modelfile lists the vision file as a second `FROM`, so `ollama create <name> -f Modelfile` keeps pictures when your Ollama build can load this family's projector. If it answers but ignores pictures, or refuses to load, your build does not: keep Ollama for text and use llama.cpp or Unsloth Studio for pictures. (Installing through the app sends the vision file along automatically, the same way.)\n\n\
+Pictures are not part of the training: the model will not know your world's maps or art, only what it could read from a picture before. A base model that was slimmed and healed on text only can be weaker with pictures than its original; the vision part itself is unchanged.\n")
 }
 
 #[cfg(all(test, unix))]
