@@ -70,9 +70,15 @@ fn num(v: f64) -> String {
     if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{v}") }
 }
 
-/// The Modelfile to keep next to the GGUF (works with `ollama create <name> -f Modelfile`).
-pub fn modelfile_text(gguf_file: &str, spec: &OllamaSpec) -> String {
-    let mut t = format!("FROM ./{gguf_file}\n\n");
+/// The Modelfile to keep next to the GGUF (works with `ollama create <name> -f Modelfile`). `mmproj_file` is the vision file of the base model
+/// that sits next to the GGUF; it is listed as a second `FROM`, which Ollama's importer picks up as the projector for pictures. Not every
+/// Ollama build loads every family's projector (older ones take one file only): when `ollama run` refuses pictures, VISION.md says what to do.
+pub fn modelfile_text(gguf_file: &str, spec: &OllamaSpec, mmproj_file: Option<&str>) -> String {
+    let mut t = format!("FROM ./{gguf_file}\n");
+    if let Some(m) = mmproj_file {
+        t += &format!("FROM ./{m}\n");
+    }
+    t += "\n";
     if !spec.template.is_empty() {
         t += &format!("TEMPLATE \"\"\"{}\"\"\"\n\n", spec.template);
     }
@@ -85,8 +91,9 @@ pub fn modelfile_text(gguf_file: &str, spec: &OllamaSpec) -> String {
     t
 }
 
-/// The JSON body of Ollama's `POST /api/create` for a GGUF already uploaded as a blob.
-pub fn create_body(model: &str, gguf_file: &str, digest: &str, spec: &OllamaSpec) -> Value {
+/// The JSON body of Ollama's `POST /api/create` for GGUF files already uploaded as blobs. `projector` is the mmproj vision file
+/// (file name, blob digest): the importer uses it for pictures, the same way the second `FROM` of a Modelfile.
+pub fn create_body(model: &str, gguf_file: &str, digest: &str, spec: &OllamaSpec, projector: Option<(&str, &str)>) -> Value {
     let mut params = serde_json::Map::new();
     if !spec.stop.is_empty() {
         params.insert("stop".into(), json!(spec.stop));
@@ -94,7 +101,11 @@ pub fn create_body(model: &str, gguf_file: &str, digest: &str, spec: &OllamaSpec
     for (k, v) in &spec.options {
         params.insert((*k).into(), if v.fract() == 0.0 { json!(*v as i64) } else { json!(*v) });
     }
-    let mut body = json!({"model": model, "files": {gguf_file: digest}, "parameters": params, "stream": false});
+    let mut files = json!({gguf_file: digest});
+    if let Some((name, pdigest)) = projector {
+        files[name] = json!(pdigest);
+    }
+    let mut body = json!({"model": model, "files": files, "parameters": params, "stream": false});
     if !spec.template.is_empty() {
         body["template"] = json!(spec.template);
     }
@@ -126,8 +137,7 @@ pub struct CardInfo<'a> {
 /// A short README that travels with the model files.
 pub fn model_card(c: &CardInfo) -> String {
     format!(
-"# {name} - a GM model for \"{world}\"
-
+"# {name} - a GM model for \"{world}\"\n
 Made with ND Lore Forge.
 
 - Base model: {base} ({license}; the tuned model keeps that licence){derived}

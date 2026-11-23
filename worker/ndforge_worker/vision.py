@@ -101,6 +101,16 @@ def copy_processor_files(repo: str, target: Path, hub_download=None) -> list:
     return copied
 
 
+def made_model_note(cfg: dict) -> str | None:
+    """A sentence about the image ability of a model made by "Slim or grow a model": the job's base names the original as `vision_repo`, which
+    differs from the model itself. None for a normal base model (or a full fine-tune of one)."""
+    base = cfg.get("base") or {}
+    if base.get("vision_repo") and base.get("vision_repo") != base.get("repo"):
+        return (" The language model was slimmed and healed on text only: the vision part itself is the original's and unchanged, "
+                "but its image understanding may be weaker than the original model's.")
+    return None
+
+
 def adapter_is_for_full_model(adapter_dir: Path) -> bool:
     """True when an adapter was trained on the whole image+text model (its layer names say "language_model"), so that it must be merged into that model."""
     f = Path(adapter_dir) / "adapter_model.safetensors"
