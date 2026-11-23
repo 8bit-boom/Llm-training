@@ -128,7 +128,7 @@ The rest of this guide describes removing whole layers (version 1), which stays 
 7. **Test again** against the original (Step 4, with *compare with the original* chosen). A slim model is good enough when its numbers are close to the original's **on your world and on the general questions**.
    The program cannot tell you "close enough": it is your call. A sensible habit is to stop at the smallest model whose general score you still accept, and to go back one block count if it is below that.
 8. **If it is not good enough**: go back to step 3 with one block fewer removed. Do not heal for longer on the same data hoping it will recover: if the general numbers do not move after a full run, more of the same data will not help.
-9. **Export (Step 5)** like any model: *Merged model* or *GGUF* (Q4_K_M is the usual size; several at once are possible). The picture (vision) file is taken from the original, because the vision part is unchanged.
+9. **Export (Step 5)** like any model: *Merged model* or *GGUF* (Q4_K_M is the usual size; several at once are possible). The picture (vision) file is taken from the original, because the vision part is unchanged; it sits next to the GGUF (`mmproj-F16.gguf`), the Modelfile lists it, and **Install into Ollama** sends it along (see the "lost vision" row of the table below).
    **Then press Test it**: a model with 48 layers instead of 64 is something llama.cpp and Ollama may or may not load. This is not verified yet.
 
 ## 7. Time and cost (rough, estimates)
@@ -147,6 +147,7 @@ The rest of this guide describes removing whole layers (version 1), which stays 
 | Slim model repeats itself / answers in another language | Too many blocks removed or the wrong ones. Remove fewer and re-measure. |
 | Healing loss does not go down | Check the data version (is it the one you measured on?), lower the learning rate to 1e-4, and make sure *QLoRA* and the right base were chosen. |
 | llama.cpp / Ollama refuses the GGUF | Export the merged 16-bit model instead and report the message; this is one of the things not yet verified. |
+| The GGUF answers (thinking works) but it ignores pictures, or Ollama says it cannot read images | The vision file was not part of what Ollama got. The export folder has it (`mmproj-F16.gguf`) and the Modelfile lists it as a second `FROM`: make the model in Ollama again from that folder (`ollama create <name> -f Modelfile`), update Ollama if it is old, and install again. If pictures still do not work, your Ollama build cannot load this family's projector: use llama.cpp for pictures — `llama-server -m model-q4_k_m.gguf --mmproj mmproj-F16.gguf` (or `llama-mtmd-cli --image photo.png …`, see `VISION.md` in the export folder). Remember also that healing teaches text only: the vision part itself is the original's and unchanged, but image understanding can be weaker than the original's — try one image question with `llama-mtmd-cli` before judging the model. |
 | Healing says it does not fit this card | Take the milder cut or a smaller model; healing needs about 19 GB in the one-after-the-other mode (a 21 B student in QLoRA). |
 | The general text could not be downloaded | Healing carries on with your world's text only; try *Continue healing* with a connection later for better general ability. |
 | Healing stopped: the training became unstable | Expert mode, lower the learning rate (0.00005), *Continue healing*. |
@@ -155,7 +156,10 @@ The rest of this guide describes removing whole layers (version 1), which stays 
 ## 9. Not verified yet (needs a GPU run)
 
 Everything about a real 27B: that 4-bit measuring picks the same blocks (and the same MLP neurons) as 16-bit, the time and memory figures above, the quality after healing (layers and, above all, thinner
-layers: 20 million words is a small part of what NVIDIA used), whether Unsloth loads a 48-layer or a thinned folder, and whether llama.cpp and Ollama run its GGUF. The full checklist is in `docs/RESHAPE.md`. After your first real run, please write the actual numbers into `docs/RESHAPE.md` (section "Not verified yet") so the next person starts from facts.
+layers: 20 million words is a small part of what NVIDIA used), whether Unsloth loads a 48-layer or a thinned folder, and whether llama.cpp and Ollama run its GGUF. Two more about the vision file that
+travels with the export: whether your Ollama build loads the projector (the Modelfile's second `FROM`; other families have had bugs there — if it refuses, llama.cpp with `--mmproj` is the fallback), and
+how much image understanding survives a cut and a text-only heal (one `llama-mtmd-cli --image` question answers it). The full checklist is in `docs/RESHAPE.md`. After your first real run, please write the
+actual numbers into `docs/RESHAPE.md` (section "Not verified yet") so the next person starts from facts.
 
 ## 10. What comes next
 
