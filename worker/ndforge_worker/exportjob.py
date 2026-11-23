@@ -1,6 +1,7 @@
 """The export job: a trained LoRA adapter -> a merged 16-bit model -> a GGUF file (and a Modelfile is written by the Rust program).
 
-Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
+Config keys: adapter (folder) OR full_model (the whole model of a full fine-tune: nothing to merge) OR NEITHER (an export straight from a model of the list, no training
+run: the model in base.repo is used, and downloaded from Hugging Face into the HF cache first when it is not on this computer yet), base {repo, family, vision_repo (optional: the model whose vision file is used; see _vision_source)}, out (folder), quant ("q4_k_m", "q5_k_m", "q6_k", "q8_0", "f16"), quants (optional list: several sizes from one conversion; result.ggufs maps each to its file), backend (auto|unsloth|hf), gguf (bool),
 mixed_fit (optional {"target_gb", "matrix": a matrix file}: the target of the size "mixed_fit", see mixedquant.py),
 mixed_measured (optional {"target_gb", "matrix": a matrix file | null (then the export's own matrix), "floor", "ceiling", "sample_rows", "engine": "auto" | "llama" | "reference", "cache_dir"}: the target
 of the size "mixed_measured", see quantfit.py; the entry of `mixed` in the result gains `measured` {"engine", "sample_rows", "predicted", "simulated", "fits", "measure_key"}), keep_merged (bool, default false: the merged 16-bit copy is large and only needed to make the GGUF; with gguf false the merged model is always kept),
@@ -52,6 +53,34 @@ def _vision_source(cfg: dict) -> str:
     """Whose picture abilities (and official vision file) the exported model keeps. Normally the base model itself; for a base that was made by
     "Slim or grow a model" (vision part copied unchanged) it is the original model it was made from (`base.vision_repo`), which has the official GGUF repo."""
     return cfg["base"].get("vision_repo") or cfg["base"]["repo"]
+
+
+def resolve_full_model(cfg: dict) -> str:
+    """The folder the GGUF is made from when the job names no `full_model` and no `adapter` (an export straight from a model of the list, no training run): a folder on
+    this computer is used as it is; otherwise the copy in the Hugging Face cache, else the model is downloaded there first (the same cache training reads from).
+    Raises ValueError for a repo that has no 16-bit safetensors weights (a GGUF-only repo cannot be read here)."""
+    repo = cfg["base"]["repo"]
+    if Path(repo).joinpath("config.json").is_file():
+        return repo
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:    # noqa: BLE001 - the cache check and the download both need it
+        raise ValueError(f"The export of {repo} needs the huggingface_hub package to fetch the model: {exc}") from exc
+    try:
+        path = snapshot_download(repo, local_files_only=True)
+        if Path(path, "config.json").is_file():
+            protocol.log(f"{repo} is already in the Hugging Face cache on this computer; that copy is exported as it is.")
+            return str(path)
+    except Exception:       # noqa: BLE001 - not in the cache (or no config.json in the cached copy): download it below
+        pass
+    protocol.progress("merge", 0.02, f"Downloading {repo} from Hugging Face (the export needs the model itself)")
+    protocol.log(f"Downloading {repo} from Hugging Face into the Hugging Face cache; the sizes come after it.")
+    path = snapshot_download(repo)
+    if not Path(path, "config.json").is_file():
+        raise ValueError(f"{repo} has no config.json after downloading; it is probably not a transformers model that this export can read.")
+    if not list(Path(path).rglob("*.safetensors")):
+        raise ValueError(f"{repo} holds no .safetensors weights (only GGUF or other files). This export needs the 16-bit original of the model, not its GGUF files.")
+    return str(path)
 
 
 _JOB = {"cfg": None}      # the export job being run: `_run` looks for its stop file here (the tools are started from many places)
@@ -457,6 +486,8 @@ def run(cfg: dict) -> int:
     check_disk(cfg, out)
     backend = backends.prepare(cfg.get("backend", "auto"))
     full_model = cfg.get("full_model")
+    if not full_model and not cfg.get("adapter"):
+        full_model = resolve_full_model(cfg)       # an export without a training run: the model of base.repo, fetched first when it is not here
     merged = Path(full_model) if full_model else out / "merged"
     gguf_path = None
     ggufs = {}
@@ -566,6 +597,8 @@ def run(cfg: dict) -> int:
                         mmproj, vnote = target, "Vision file converted from the base model with llama.cpp."
         except Exception as exc:   # the vision file is a bonus: the export itself is done
             mmproj, vnote = None, f"The vision file could not be added ({type(exc).__name__}: {str(exc)[:200]}). The GGUF understands text only."
+        if mmproj is not None:
+            vnote += vision.made_model_note(cfg) or ""
         if vnote:
             protocol.log(vnote)
     if gguf_path and not cfg.get("keep_merged") and not full_model and merged.exists():
