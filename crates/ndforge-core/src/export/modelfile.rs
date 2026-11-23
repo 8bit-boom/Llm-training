@@ -137,19 +137,7 @@ pub struct CardInfo<'a> {
 /// A short README that travels with the model files.
 pub fn model_card(c: &CardInfo) -> String {
     format!(
-"# {name} - a GM model for \"{world}\"\n
-Made with ND Lore Forge.
-
-- Base model: {base} ({license}; the tuned model keeps that licence){derived}
-- Training: {method}, SFT on saved data version {ver}{steps}{loss}
-- Format: GGUF {quant}
-- Audience: **the game master only**. It was trained on ALL of the world's text, including GM secrets, and it repeats them.
-
-## Use it
-- Ollama: `ollama create {oname} -f Modelfile`, then set `OLLAMA_MODEL={oname}` in nd-world.
-- Keep nd-world's lore search switched on: the model was trained to use the context nd-world gives it.
-- Do not let players use AI chat with this model.
-",
+"# {name} - a GM model for \"{world}\"\n\nMade with ND Lore Forge.\n\n- Base model: {base} ({license}; the tuned model keeps that licence){derived}\n- Training: {method}, SFT on saved data version {ver}{steps}{loss}\n- Format: GGUF {quant}\n- Audience: **the game master only**. It was trained on ALL of the world's text, including GM secrets, and it repeats them.\n\n## Use it\n- Ollama: `ollama create {oname} -f Modelfile`, then set `OLLAMA_MODEL={oname}` in nd-world.\n- Keep nd-world's lore search switched on: the model was trained to use the context nd-world gives it.\n- Do not let players use AI chat with this model.\n",
         name = c.model_name, world = c.world, base = c.base_repo, license = c.license, method = c.method, ver = c.dataset_version, quant = c.quant, oname = c.ollama_name,
         derived = c.derived_from.map(|o| format!("\n- The base model was made from {o} by removing or adding layers (ND Lore Forge, Slim or grow a model)")).unwrap_or_default(),
         steps = c.steps.map(|s| format!(", {s} steps")).unwrap_or_default(),
