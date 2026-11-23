@@ -89,6 +89,18 @@ A step-by-step guide is in the program's folder under `docs/PRUNE_QWEN38_27B.md`
 - **Test the original first**, write down its three numbers, and compare every step against them.
 - You need about 200 GB of free disk for thinning and healing (the original, the thinned model, the healed model and the teacher's answers).
 
+## Save a model as GGUF (no training needed)
+
+The card at the bottom of this page makes the GGUF files of a model that was never trained here, with a Modelfile for Ollama. Step 5 needs a trained run; this card does not — there is no trained add-on, so there is nothing to merge: the model is converted as it is. Three kinds of model can be saved:
+
+- **A model made here** — a cut or grown model, or its healed copy (the better one). The healed copy is exported under its own name (`<model>-healed-<size>`), so both copies can be saved.
+- **A model of the list** — the same models Step 3 trains, including the ones you added from Hugging Face. A model that is not on this computer yet is **downloaded first** (into the Hugging Face cache, the same place training reads it from; the page says how big that is).
+- **A folder on this computer** — any folder that holds a model (`config.json` and the 16-bit `.safetensors` files).
+
+The files, sizes and options are the ones the export of a training run has: every ticked size becomes its own export (`exports/<name>-<size>/` with a Modelfile), the small sizes can use an **importance matrix** (needs a saved training-data version from Step 2 and llama.cpp), and the **mixed sizes** are made the same way. The files join the same exports list as Step 5, where **Install into Ollama** works for them like for any other export.
+
+What the exported chat template does about thinking follows the model: a model healed with the thinking recipe keeps its thinking; the others answer without thinking unless asked (the checkbox starts where the model points). For a model made here nothing else is measured — a cut or grown model answers worse than the original until it has been healed and trained; saving it as GGUF does not change that.
+
 ## Auto-cut (one click)
 
 It has its own page now: **🚀 Auto** in the list on the left, before this page. It does everything on this page for you, one step after the other.
