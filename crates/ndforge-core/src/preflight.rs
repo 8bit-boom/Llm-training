@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::envmgr::health::{Check, Light};
 use crate::project::Project;
 
-pub const KINDS: [&str; 10] = ["auto", "heal", "export", "think_check", "trace_gen", "quantcheck", "quantfit", "imatrix_make", "cut", "train"];
+pub const KINDS: [&str; 11] = ["auto", "heal", "export", "export_model", "think_check", "trace_gen", "quantcheck", "quantfit", "imatrix_make", "cut", "train"];
 
 /// How much a job needs llama.cpp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,19 +177,25 @@ fn strs(v: &Value) -> Vec<String> {
     v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
-/// The disk an export of a training run needs, from the run's model (None when the run or its model is not known).
+/// The disk an export needs: of a training run (from the model in its config), or of the "Save a model as GGUF" card (the model's `params_b`, plus `download_gb` when the
+/// model itself is fetched first). None when neither is known.
 fn export_need_gb(p: &Project, spec: &Value) -> Option<f64> {
-    let run = spec["run"].as_str()?;
-    let rdir = crate::train::runs::runs_dir(p).join(run);
-    let cfg: Value = serde_json::from_slice(&std::fs::read(rdir.join("config.json")).ok()?).ok()?;
-    let m = crate::train::catalog::find(cfg["model"]["id"].as_str()?)?;
+    let (params_b, has_adapter) = match spec["run"].as_str() {
+        Some(run) => {
+            let rdir = crate::train::runs::runs_dir(p).join(run);
+            let cfg: Value = serde_json::from_slice(&std::fs::read(rdir.join("config.json")).ok()?).ok()?;
+            let m = crate::train::catalog::find(cfg["model"]["id"].as_str()?)?;
+            (m.params_b, !rdir.join("model").join("config.json").is_file())
+        }
+        None => (spec["params_b"].as_f64()?, false),
+    };
     let what = spec["what"].as_str().unwrap_or("gguf");
     let mut quants = strs(&spec["quants"]);
     if quants.is_empty() {
         quants = spec["quant"].as_str().map(|q| vec![q.to_string()]).unwrap_or_default();
     }
-    let is_full = rdir.join("model").join("config.json").is_file();
-    Some(crate::export::runs::export_need_gb(m.params_b, !is_full, if what == "merged" { &[] } else { &quants }, what != "gguf"))
+    let base = crate::export::runs::export_need_gb(params_b, has_adapter, if what == "merged" { &[] } else { &quants }, what != "gguf");
+    Some(base + spec["download_gb"].as_f64().unwrap_or(0.0))
 }
 
 /// What a heal's teacher answers need on disk (the cache mode only; online healing keeps none).
@@ -207,8 +213,8 @@ pub fn gather(p: Option<&Project>, kind: &str, spec: &Value) -> Inputs {
     let llama = match kind {
         "quantcheck" | "imatrix_make" | "auto" => Need::Yes,
         "quantfit" if spec["make"].as_bool() == Some(true) => Need::Yes,
-        "export" if exports_gguf && (mixed || spec["imatrix"].as_bool() == Some(true)) => Need::Yes,
-        "export" if exports_gguf => Need::Maybe,
+        "export" | "export_model" if exports_gguf && (mixed || spec["imatrix"].as_bool() == Some(true)) => Need::Yes,
+        "export" | "export_model" if exports_gguf => Need::Maybe,
         _ => Need::No,
     };
     let status = if llama == Need::No { Value::Null } else { crate::envmgr::llamacpp::status(&crate::envmgr::llamacpp::Config::from_env()) };
@@ -220,7 +226,7 @@ pub fn gather(p: Option<&Project>, kind: &str, spec: &Value) -> Inputs {
     };
     let dir = p.map(|p| p.folder.clone()).unwrap_or_else(|| env.clone());
     let need_gb = spec["need_gb"].as_f64().filter(|n| *n > 0.0).or_else(|| match kind {
-        "export" => p.and_then(|p| export_need_gb(p, spec)),
+        "export" | "export_model" => p.and_then(|p| export_need_gb(p, spec)),
         "heal" => heal_need_gb(spec),
         _ => None,
     });

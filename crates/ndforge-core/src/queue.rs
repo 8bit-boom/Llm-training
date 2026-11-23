@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::error::{Error, Result};
 
 /// What can be queued: the jobs that have a Start button with a preflight checklist.
-pub const KINDS: [&str; 7] = ["auto", "export", "heal", "think_check", "quantcheck", "imatrix_make", "train"];
+pub const KINDS: [&str; 8] = ["auto", "export", "export_model", "heal", "think_check", "quantcheck", "imatrix_make", "train"];
 pub const STATUSES: [&str; 6] = ["queued", "running", "done", "failed", "stopped", "skipped"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +174,16 @@ pub fn label_of(kind: &str, a: &Value) -> String {
             let q = a["quants"].as_array().map(|l| l.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).filter(|x| !x.is_empty()).unwrap_or_else(|| s(a, "quant"));
             format!("Export {} as {}", s(a, "run"), q)
         }
+        "export_model" => {
+            let src = &a["source"];
+            let who = match src["kind"].as_str() {
+                Some("made") => format!("{}{}", s(src, "name"), if src["sub"].as_str() == Some("healed") { " (healed)" } else { "" }),
+                Some("folder") => std::path::Path::new(&s(src, "dir")).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| s(src, "dir")),
+                _ => s(src, "repo"),
+            };
+            let q = a["quants"].as_array().map(|l| l.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).filter(|x| !x.is_empty()).unwrap_or_else(|| s(a, "quant"));
+            format!("Export {who} as {q}")
+        }
         "heal" => format!("Heal {}", s(a, "name")),
         "think_check" => format!("Thinking check of {}", s(&a["spec"], "name")),
         "quantcheck" => "Compare quants".to_string(),
@@ -191,6 +201,7 @@ pub fn preflight_spec(kind: &str, a: &Value) -> Value {
             let quants = if what == "merged" { json!([]) } else { a["quants"].clone() };
             json!({"run": a["run"], "quant": a["quant"], "what": what, "quants": quants, "imatrix": what != "merged" && a["imatrix"]["enabled"] == true})
         }
+        "export_model" => json!({"what": "gguf", "quant": a["quant"], "quants": a["quants"].clone(), "imatrix": a["imatrix"]["enabled"] == true, "params_b": a["paramsB"], "download_gb": a["downloadGb"]}),
         "heal" => json!({"name": a["name"], "tokens_m": a["spec"]["tokens_m"], "mode": a["spec"]["mode"]}),
         "auto" => json!({"studio_publish": a["spec"]["studio_publish"]}),
         "train" => json!({"server": a["server"]}),
