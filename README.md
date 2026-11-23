@@ -34,6 +34,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | llama.cpp installed by the program (the build that fits the graphics card and driver, the converter's source files, a check that it starts; one button wherever llama.cpp is needed) | built and tested with a stand-in GitHub, stand-in programs and the page in a stand-in browser; **not run against the real GitHub releases, a real GPU or a real converter** (docs/LLAMA_CPP_INSTALL.md, "Not verified yet") |
 | Thinking check (does a cut or healed model still think before it answers: 32 short questions with thinking on, a table original / cut / healed / GGUF, pass-warn-fail gates; the transformers way or llama-server on a GGUF) | built and tested with a stand-in llama-server, a tiny random model, a fake worker and a stand-in browser; not run on a real model (docs/THINKING_CHECK.md, "Not verified yet") |
 | Auto-cut (one click: size slider, plan, measure, try, cut and heal in stages, thinking checks with retry and back-off, GGUF export, optional copy into Unsloth Studio's share, report; stop and continue) | built and tested with stand-ins for every job, a stand-in Studio and a stand-in browser; not run on a real model, card or Studio (docs/AUTO_CUT.md, "Not verified yet") |
+| Save a model as GGUF without a training run (the Slim or grow page: a model it made — cut, grown or healed —, any model of the list, or a folder on this computer; same sizes, importance matrix and mixed sizes as the export of a training run; a model of the list that is not on the computer is fetched by the worker first) | built and tested with a fake worker, worker tests for the fetch, a stand-in browser and Rust tests; not run on a real model or a real Hugging Face download |
 | Several worlds in one project (train on all at once) | built and tested on small sample worlds (datasets, teacher examples, test probes); not tried with real worlds or a real training run |
 
 ### About Unsloth Dynamic quants
@@ -225,7 +226,7 @@ records and the graphics card. Every text goes through `secrets::redact`, and th
 
 The worker's `hello` job answers `{"worker", "protocol": 1, "packages": {torch, transformers, peft, trl, accelerate, bitsandbytes, unsloth, datasets}}` (versions from the installed metadata, nothing is imported).
 `worker/constraints.txt` holds upper bounds taken from the versions the CI's worker tests passed with; the setup passes it as a second constraint file (Unsloth and PyTorch are not pinned there). The setup writes
-`"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
+"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
 (`envmgr/health.rs`) together with the bounds when a program version needs another environment.
 
 ## Before you start
