@@ -226,7 +226,7 @@ records and the graphics card. Every text goes through `secrets::redact`, and th
 
 The worker's `hello` job answers `{"worker", "protocol": 1, "packages": {torch, transformers, peft, trl, accelerate, bitsandbytes, unsloth, datasets}}` (versions from the installed metadata, nothing is imported).
 `worker/constraints.txt` holds upper bounds taken from the versions the CI's worker tests passed with; the setup passes it as a second constraint file (Unsloth and PyTorch are not pinned there). The setup writes
-"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
+`"requirements": ENV_REQUIREMENTS_VERSION` into `ndforge_env.json`; an environment with a lower number (or none) gets a yellow "made by an older version of this program" light on the setup page. Raise the number
 (`envmgr/health.rs`) together with the bounds when a program version needs another environment.
 
 ## Before you start
