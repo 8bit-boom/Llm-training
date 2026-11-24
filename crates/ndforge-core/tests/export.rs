@@ -799,3 +799,56 @@ echo "{\"type\":\"result\",\"data\":{\"gguf\":\"$out/model-$quant.gguf\",\"quant
         &exports::ImatrixOptions::default(), &exports::MixedOptions::default(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
     assert!(err.contains("not in the model list"), "{err}");
 }
+
+// ------------------------------------------------------------------------------------ restore vision (an export whose origin was deleted)
+#[cfg(unix)]
+#[test]
+fn an_export_without_a_projector_can_restore_vision_from_its_own_model() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), r#"printf 'MMPROJ' > "$out/mmproj-F16.gguf"
+echo "{\"type\":\"result\",\"data\":{\"mmproj\":\"$out/mmproj-F16.gguf\",\"modalities\":[\"image\"],\"vision_note\":\"converted\"}}""#);
+    let p = project_with_world(d.path(), 1);
+    // a vision-capable base model folder (the export's own model, still on disk)
+    let base = d.path().join("mymodel");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("config.json"), json!({"architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": {}}).to_string()).unwrap();
+    // an export that lost its projector: meta names the base but mmproj_file is null
+    let dir = p.folder.join("exports/myexp-q4_k_m");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model-q4_k_m.gguf"), "GGUF").unwrap();
+    std::fs::write(dir.join("meta.json"), json!({"name": "myexp-q4_k_m", "base_repo": base.to_string_lossy(), "gguf_file": "model-q4_k_m.gguf",
+        "family": "qwen3_5", "num_ctx": 8192, "mmproj_file": null, "modalities": [], "vision_note": ""}).to_string()).unwrap();
+    assert!(exports::list_exports(&p).iter().any(|e| e["name"] == "myexp-q4_k_m" && e["can_restore_vision"] == true));
+    let meta = exports::restore_vision(&p, "myexp-q4_k_m", &AtomicBool::new(false), &mut |_| {}).unwrap();
+    assert_eq!(meta["mmproj_file"].as_str(), Some("mmproj-F16.gguf"));
+    assert_eq!(meta["modalities"], json!(["image"]));
+    assert!(dir.join("mmproj-F16.gguf").is_file() && dir.join("VISION.md").is_file());
+    let mf = std::fs::read_to_string(dir.join("Modelfile")).unwrap();
+    assert!(mf.contains("\nFROM ./mmproj-F16.gguf\n"), "{mf}");
+    // now it has vision, so the restore button goes away and a second restore is refused
+    assert!(exports::list_exports(&p).iter().any(|e| e["name"] == "myexp-q4_k_m" && e["has_vision"] == true && e["can_restore_vision"] == false));
+    let err = exports::restore_vision(&p, "myexp-q4_k_m", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("already has a vision file"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_vision_refuses_a_text_only_model_and_a_missing_base() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    fake_worker(d.path(), "echo '{\"type\":\"result\",\"data\":{}}'");
+    let p = project_with_world(d.path(), 1);
+    let base = d.path().join("textmodel");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("config.json"), json!({"architectures": ["Qwen3_5ForCausalLM"]}).to_string()).unwrap();
+    let dir = p.folder.join("exports/t-q4_k_m");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("meta.json"), json!({"name": "t-q4_k_m", "base_repo": base.to_string_lossy(), "gguf_file": "m.gguf", "mmproj_file": null}).to_string()).unwrap();
+    let err = exports::restore_vision(&p, "t-q4_k_m", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("no vision part"), "{err}");
+    // base folder gone -> plain message
+    std::fs::write(dir.join("meta.json"), json!({"name": "t-q4_k_m", "base_repo": d.path().join("gone").to_string_lossy(), "gguf_file": "m.gguf", "mmproj_file": null}).to_string()).unwrap();
+    let err = exports::restore_vision(&p, "t-q4_k_m", &AtomicBool::new(false), &mut |_| {}).unwrap_err().0;
+    assert!(err.contains("base model folder is missing"), "{err}");
+}

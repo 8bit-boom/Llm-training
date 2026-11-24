@@ -116,6 +116,15 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error(_code(exc, "export_failed"), str(exc) if _code(exc, "") else _explain(exc))
             return 1
+    if kind == "restore_vision":
+        from . import exportjob
+        try:
+            return exportjob.restore_vision(job)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error(_code(exc, "restore_vision_failed"), str(exc) if _code(exc, "") else _explain(exc))
+            return 1
     if kind in ("imatrix_make", "imatrix_dat", "imatrix_merge", "imatrix_published", "imatrix_adapt", "imatrix_adapt_preview"):
         from . import imatrix, imatrixadapt, imatrixjob, imatrixmerge
         try:

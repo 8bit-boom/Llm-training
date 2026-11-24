@@ -583,12 +583,19 @@ def run(cfg: dict) -> int:
     mmproj, vnote, mods = None, "", []
     if gguf_path and cfg.get("vision", True):
         try:
-            mods = vision.base_modalities(_vision_source(cfg))
+            vsrc = _vision_source(cfg)
+            mods = vision.base_modalities(vsrc)
+            if not mods and cfg["base"]["repo"] != vsrc and Path(cfg["base"]["repo"]).is_dir():
+                # The recorded origin can be an intermediate cut that was deleted after a later cut
+                # or heal. The model being exported still carries the unchanged vision tower, so
+                # detect vision (and convert the projector) from it instead of the gone origin.
+                vsrc = cfg["base"]["repo"]
+                mods = vision.base_modalities(vsrc)
             if mods and full_model:
                 vnote = "Full fine-tuning changed the vision part of the model too, so the base model's vision file does not fit it. The GGUF understands text only."
             elif mods:
                 protocol.progress("vision", 0.95, "Adding the vision file")
-                mmproj, vnote = vision.fetch_mmproj(_vision_source(cfg), out)
+                mmproj, vnote = vision.fetch_mmproj(vsrc, out)
                 if mmproj is None and Path(cfg["base"]["repo"]).is_dir():
                     conv, _ = find_llama_cpp()
                     if conv:
@@ -614,4 +621,33 @@ def run(cfg: dict) -> int:
                "imatrix": dict(report, note=" ".join(report["notes"])) if report is not None else None, "mixed": mixed_info or None, "mixed_notes": mixed_notes}
     (out / "export.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     protocol.result(summary)
+    return 0
+
+
+def restore_vision(cfg: dict) -> int:
+    """job restore_vision: {"base": {"repo", "family", "vision_repo"?}, "out": the export folder}.
+
+    Regenerates the vision projector (mmproj) of an export whose model carries an intact vision tower
+    but no mmproj file — for example when the recorded origin was an intermediate cut that was deleted
+    after a later cut or heal, so the export skipped the vision file. Converts the projector from the
+    model's OWN folder (the vision part is copied unchanged through cuts) and returns
+    {mmproj, modalities, vision_note}; the caller re-wires meta.json, the Modelfile and VISION.md."""
+    protocol.reserve_stdout()
+    out = Path(cfg["out"])
+    out.mkdir(parents=True, exist_ok=True)
+    base = cfg["base"]["repo"]
+    mods = vision.base_modalities(base)
+    if not mods:
+        protocol.error("no_vision", "The base model has no vision part, so there is nothing to restore.")
+        return 1
+    conv, _ = find_llama_cpp()
+    if not conv:
+        protocol.error("llama_cpp_missing", "llama.cpp is needed to convert the vision file. Install it first (Training setup).")
+        return 1
+    target = out / "mmproj-F16.gguf"
+    protocol.progress("vision", 0.1, "Converting the vision file from the model")
+    convert_to(conv, base, target, "The vision conversion", ["--mmproj"])
+    vnote = "Vision file converted from the base model with llama.cpp." + (vision.made_model_note(cfg) or "")
+    protocol.progress("vision", 1.0, "")
+    protocol.result({"mmproj": str(target), "modalities": mods, "vision_note": vnote})
     return 0

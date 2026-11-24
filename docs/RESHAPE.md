@@ -311,6 +311,15 @@ Everything else is the run-based export's own machinery: the sizes Q4_K_M…F16,
 
 Tests: `tests/export.rs` (a made model and its healed copy, any folder, a model of the list with the job captured through the fake worker), `worker/tests/test_export_no_train.py` (local folder, cached copy without downloading, download into the cache, GGUF-only and config-less refusals), `ui/smoke/reshape_export.test.mjs` (the card's sources, arguments, queue button and end events).
 
+### Restore vision (an export that lost its projector)
+
+A cut keeps the vision tower byte-for-byte, but the export reads the *origin* (`ndforge_reshape.json` → `origin.repo`) as the vision source. When that origin is an intermediate cut that was **deleted** after a later cut or heal, `vision.base_modalities` reads a gone folder, returns `[]`, and the export skips the mmproj — the GGUF then refuses pictures even though the model itself is vision-capable. Two guards:
+
+- The export's vision detection falls back to the model being exported (`base.repo`) when the recorded origin yields no modalities (`exportjob.run`), so a fresh export of a chained cut keeps its projector.
+- **Restore vision** (`export::runs::restore_vision`, command `export_restore_vision`, worker job `restore_vision`): a per-export action on the Step 5 list, shown when `can_restore_vision` (the base config has a vision part, the export has a GGUF, but no mmproj). It converts `mmproj-F16.gguf` from the export's **own** base folder with llama.cpp `--mmproj` and re-wires `meta.json` (`mmproj_file` / `modalities` / `vision_note`), the `Modelfile` (second `FROM`) and `VISION.md`, exactly as a fresh export would. A text-only base or a missing base folder is refused in plain words; an export that already has a projector is left alone.
+
+Tests: `worker/tests/test_restore_vision.py` (converts from the model's own folder; refuses a text-only model), `tests/export.rs` (restore re-wires meta/Modelfile/VISION.md and clears the button; refuses text-only and missing base).
+
 ## Not verified yet (needs a GPU run)
 
 Everything below is **implemented as the plan says and has not been seen working**. None of it should be described as working.

@@ -405,6 +405,9 @@ pub fn list_exports(p: &Project) -> Vec<Value> {
         meta["size_mb"] = json!(gguf.as_ref().and_then(|g| std::fs::metadata(g).ok()).map(|m| (m.len() as f64 / 1048576.0 * 10.0).round() / 10.0));
         meta["has_vision"] = json!(meta["mmproj_file"].as_str().is_some_and(|f| e.path().join(f).is_file()));
         meta["merged_exists"] = json!(meta["merged_dir"].as_str().is_some_and(|d| std::path::Path::new(d).join("config.json").is_file()));
+        // a GGUF export whose model has a vision tower but no projector can get one back via "Restore vision"
+        let base_vision = meta["base_repo"].as_str().is_some_and(|r| config_has_vision(&read_json(&std::path::Path::new(r).join("config.json")).unwrap_or(Value::Null)));
+        meta["can_restore_vision"] = json!(base_vision && meta["has_vision"] == false && meta["gguf_exists"] == true);
         Some(meta)
     }).collect()).unwrap_or_default();
     out.sort_by(|a, b| b["name"].as_str().cmp(&a["name"].as_str()));
@@ -419,6 +422,59 @@ pub fn thinking_default(base: &std::path::Path) -> &'static str {
         Some(m) if m["healed"]["recipe"].as_str() == Some("thinking") => "keep",
         _ => "off",
     }
+}
+
+/// Whether a model config describes a vision-capable model (a vision tower, or a multimodal
+/// architecture). The same rule the worker's `vision.base_modalities` uses for "image".
+fn config_has_vision(cfg: &Value) -> bool {
+    let archs = cfg["architectures"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    cfg.get("vision_config").is_some() || archs.contains("ConditionalGeneration") || archs.contains("VL")
+}
+
+/// Regenerate the vision projector of an export whose model has an intact vision tower but no mmproj
+/// file — for example when the recorded origin was an intermediate cut that was deleted after a later
+/// cut or heal, so the export skipped the vision file. Converts the projector from the export's OWN
+/// base model folder (the vision part is copied unchanged through cuts) and re-wires meta.json, the
+/// Modelfile and VISION.md exactly as a fresh export would. Returns the updated meta.
+pub fn restore_vision(p: &Project, export: &str, kill: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let dir = exports_dir(p).join(export);
+    let mut meta = read_json(&dir.join("meta.json")).ok_or_else(|| Error::new("That export is not there any more."))?;
+    if meta["mmproj_file"].as_str().is_some_and(|f| dir.join(f).is_file()) {
+        return Err(Error::new("This export already has a vision file; there is nothing to restore."));
+    }
+    let base = meta["base_repo"].as_str().map(PathBuf::from).filter(|d| d.join("config.json").is_file())
+        .ok_or_else(|| Error::new("The export's base model folder is missing, so its vision part cannot be read."))?;
+    if !config_has_vision(&read_json(&base.join("config.json")).unwrap_or(Value::Null)) {
+        return Err(Error::new("The base model has no vision part, so there is nothing to restore."));
+    }
+    let py = python_path(&env_dir());
+    if !py.is_file() {
+        return Err(Error::new("The training software is not installed yet. Open \"Training setup\" first."));
+    }
+    let vision_repo = read_json(&base.join("ndforge_reshape.json")).and_then(|m| m["origin"]["repo"].as_str().map(String::from))
+        .unwrap_or_else(|| base.to_string_lossy().to_string());
+    let job = json!({"job": "restore_vision", "base": {"repo": base.to_string_lossy(), "family": meta["family"].as_str().unwrap_or("generic"), "vision_repo": vision_repo}, "out": dir});
+    let result = run_export_job(&py, &job, &dir, None, kill, &mut |e| on_event(match e {
+        WorkerEvent::Log(l) => json!({"kind": "log", "text": l}),
+        WorkerEvent::Progress { step, value, text } => json!({"kind": "progress", "step": step, "value": value, "text": text}),
+        WorkerEvent::Other(v) => v,
+    }))?;
+    let mmproj = result["mmproj"].as_str().map(PathBuf::from).filter(|m| m.is_file())
+        .ok_or_else(|| Error::new("The vision file was not made. See the log."))?;
+    let file = mmproj.file_name().and_then(|n| n.to_str()).unwrap_or("mmproj-F16.gguf").to_string();
+    if mmproj != dir.join(&file) {
+        std::fs::copy(&mmproj, dir.join(&file))?;
+    }
+    let gguf_file = meta["gguf_file"].as_str().unwrap_or("model.gguf").to_string();
+    let family = meta["family"].as_str().unwrap_or("generic").to_string();
+    let num_ctx = meta["num_ctx"].as_u64().unwrap_or(8192) as u32;
+    meta["mmproj_file"] = json!(file);
+    meta["modalities"] = result["modalities"].clone();
+    meta["vision_note"] = result["vision_note"].clone();
+    std::fs::write(dir.join("VISION.md"), vision_readme(&gguf_file, &file))?;
+    std::fs::write(dir.join("Modelfile"), modelfile_text(&gguf_file, &spec_for(&family, num_ctx), Some(&file)))?;
+    write_json(&dir.join("meta.json"), &meta)?;
+    Ok(meta)
 }
 
 /// Makes the GGUF of a run in the worker and writes the Modelfile and the model card next to it.
