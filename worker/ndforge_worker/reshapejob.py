@@ -12,7 +12,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import fsutil, generaltext, protocol, reshape, reshape_width, safetensors_io, slice_io, speed, vision
+from . import fsutil, generaltext, moe_layout, protocol, reshape, reshape_width, safetensors_io, slice_io, speed, vision
 from .families import family
 from .reshape import ReshapeError
 
@@ -85,16 +85,35 @@ def inspect_model(repo: str, divisor: int = reshape_width.FFN_DIVISOR) -> dict:
         else:
             tensors = _hub_tensors(repo)
             source_bytes = sum(reshape_numel(s) * safetensors_io.DTYPE_BYTES.get(d, 2) for d, s in tensors.values())
+        if moe_layout.is_inkling(cfg):
+            return _inspect_inkling(cfg, tensors, n, mt, local, source_bytes, divisor)
         types = reshape.layer_types_of(tc)
         period = check_period(cfg, types)
         groups = reshape.group_params(tensors, n)
-    except ReshapeError as exc:
+    except (ReshapeError, moe_layout.MoeError) as exc:
         return _empty(mt, str(exc), n, local)
-    return {"model_type": mt, "supported": True, "why": None, "layers": n, "layer_types": types, "period": period, "blocks": n // period,
+    moe = moe_layout.describe_per_expert(cfg, tensors, groups) if moe_layout.arch_of(cfg) and moe_layout.has_moe_config(cfg) else None
+    return {**({"moe": moe} if moe else {}), "model_type": mt, "supported": True, "why": None, "layers": n, "layer_types": types, "period": period, "blocks": n // period,
             "layer_params": groups["layers"], "embed_params": groups["embed"], "lm_head_params": groups["lm_head"], "vision_params": groups["vision"],
             "mtp_params": groups["mtp"], "other_params": groups["other"], "total_params": groups["total"], "bytes_per_param": groups["bytes_per_param"],
             "has_vision": groups["vision"] > 0 or cfg.get("vision_config") is not None, "tied": groups["lm_head"] == 0,
             "source_bytes": source_bytes, "local": local, **_width_info(cfg, divisor)}
+
+
+def _inspect_inkling(cfg: dict, tensors: dict, n: int, mt: str, local: bool, source_bytes: int, divisor: int) -> dict:
+    """inspect result of an Inkling-2-Mini folder or repo: the usual keys (layers, blocks, parameters per layer) plus "moe" (moe_layout.describe)"""
+    moe_layout.check_inkling_config(cfg)
+    types = moe_layout.layer_kinds(cfg)
+    period = moe_layout.block_size_of(cfg)
+    if reshape.pattern_period(types) not in (period, n):
+        raise ReshapeError("The attention pattern of this model does not repeat every attention-residual block.")
+    groups = moe_layout.group_params_moe(cfg, tensors, n)
+    why = "Thinning the layers' width does not apply to a mixture of experts; remove experts instead."
+    return {"model_type": mt, "supported": True, "why": None, "layers": n, "layer_types": types, "period": period, "blocks": n // period,
+            "layer_params": groups["layers"], "embed_params": groups["embed"], "lm_head_params": groups["lm_head"], "vision_params": groups["vision"],
+            "mtp_params": groups["mtp"], "other_params": groups["other"], "total_params": groups["total"], "bytes_per_param": groups["bytes_per_param"],
+            "has_vision": groups["vision"] > 0 or cfg.get("vision_config") is not None, "tied": groups["lm_head"] == 0, "source_bytes": source_bytes, "local": local,
+            "width_dims": None, "width_supported": False, "width_why": why, "width_choices": None, "moe": moe_layout.describe(cfg, groups, tensors, source_bytes)}
 
 
 def reshape_numel(shape) -> int:
