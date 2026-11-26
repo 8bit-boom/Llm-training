@@ -79,6 +79,9 @@ pub struct Inspect {
     pub width_why: Option<String>,
     #[serde(default)]
     pub width_choices: Option<WidthChoices>,
+    /// a mixture-of-experts model: its experts, loop and sizes (None for a dense model); see `reshape::moe`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<super::moe::MoeInfo>,
 }
 
 /// The sizes of a Qwen3.5-style model that width pruning works on (the worker's `reshape_width.width_dims`).

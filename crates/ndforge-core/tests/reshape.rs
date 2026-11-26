@@ -3035,3 +3035,22 @@ fn the_variants_are_pure_and_round_two_only_offers_what_fits() {
     assert!(second_round(&rows, &HealKnobs { head_ckpt: false, ..k.clone() }, 16.0, &d, Some(32.0)).is_empty(), "already kept");
     assert!(best_row(&[json!({"ok": false})]).is_none());
 }
+
+#[test]
+fn moe_expert_count_rules_agree_with_the_worker() {
+    use ndforge_core::reshape::moe::{check_experts_kept, expert_counts_allowed, MoeInfo};
+    let cases: serde_json::Value = serde_json::from_slice(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker/tests/data/moe_cases.json")).unwrap()).unwrap();
+    for c in cases["counts"].as_array().unwrap() {
+        let got = expert_counts_allowed(c["experts"].as_u64().unwrap() as u32, c["top_k"].as_u64().unwrap() as u32);
+        assert_eq!(serde_json::to_value(got).unwrap(), c["allowed"], "{c}");
+    }
+    for c in cases["checks"].as_array().unwrap() {
+        let r = check_experts_kept(c["experts"].as_u64().unwrap() as u32, c["top_k"].as_u64().unwrap() as u32, c["keep"].as_u64().unwrap() as u32);
+        assert_eq!(r.is_none(), c["ok"].as_bool().unwrap(), "{c}: {r:?}");
+    }
+    // an inspect without "moe" (every dense model, every old worker) still reads, and one with it keeps its loop numbers
+    let old: Inspect = serde_json::from_value(json!({"supported": true, "layers": 4, "period": 2, "blocks": 2, "total_params": 10})).unwrap();
+    assert!(old.moe.is_none() && !serde_json::to_value(&old).unwrap().as_object().unwrap().contains_key("moe"));
+    let m: MoeInfo = serde_json::from_value(json!({"experts": 128, "top_k": 8, "core": [6, 18], "passes": 3, "future_key": 1})).unwrap();
+    assert!(m.looped() && m.core_layers() == 12 && m.visits_for(24, 3) == 48 && m.visits_for(24, 2) == 36);
+}

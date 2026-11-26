@@ -13,6 +13,7 @@ pub mod heal_bench;
 pub mod heal_speed;
 pub mod heal_rounds;
 pub mod heal_source;
+pub mod moe;
 pub mod plan;
 pub mod runs;
 pub mod search;
