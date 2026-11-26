@@ -49,7 +49,7 @@ const GEMMA_TEMPLATE: &str = r#"{{- range $i, $_ := .Messages }}
 {{ end }}
 {{- end }}"#;
 
-/// `family` is the catalog's family ("qwen3_5", "gemma4"); `num_ctx` the context length Ollama should use.
+/// `family` is the catalog's family ("qwen3_5", "gemma4", "inkling2"); `num_ctx` the context length Ollama should use.
 pub fn spec_for(family: &str, num_ctx: u32) -> OllamaSpec {
     match family {
         "gemma4" => OllamaSpec {
@@ -57,6 +57,8 @@ pub fn spec_for(family: &str, num_ctx: u32) -> OllamaSpec {
             // Gemma 4's recommended sampling (Unsloth guide)
             options: vec![("temperature", 1.0), ("top_p", 0.95), ("top_k", 64.0), ("num_ctx", num_ctx as f64)],
         },
+        // Inkling-2-Mini: the template stored in the GGUF is used (the model opens its own turn); the authors' sampling: temperature 1, top-p 1, no top-k
+        "inkling2" => OllamaSpec { template: String::new(), stop: vec![], options: vec![("temperature", 1.0), ("top_p", 1.0), ("num_ctx", num_ctx as f64)] },
         // a model the program has no hand-written template for: no TEMPLATE at all, so Ollama uses the chat template stored inside the GGUF
         "generic" => OllamaSpec { template: String::new(), stop: vec![], options: vec![("temperature", 0.7), ("num_ctx", num_ctx as f64)] },
         _ => OllamaSpec {

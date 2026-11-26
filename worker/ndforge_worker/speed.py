@@ -348,7 +348,7 @@ def padding_free_status(family: str, backend: str, cuda: bool, capability):
         return False, "padding-free batching needs a graphics card of the RTX 30 series or newer"
     if not _have("flash_attn"):
         return False, "padding-free batching needs the flash-attn package, which is not installed (on Windows only community builds exist)"
-    if family in ("qwen3_5", "gemma4"):
+    if family in ("qwen3_5", "gemma4", "inkling2"):
         return False, "padding-free batching has not been checked for this model family's attention layers, so it stays off"
     return True, ""
 

@@ -1005,7 +1005,7 @@ pub fn copy_adapter(p: &Project, run: &str, dest: &std::path::Path) -> Result<Pa
     copy_dir(&adapter, &to)?;
     let cfg = read_json(&rdir.join("config.json")).unwrap_or(Value::Null);
     let (repo, family) = (cfg["model"]["repo"].as_str().unwrap_or("(see adapter_config.json)"), cfg["model"]["family"].as_str().unwrap_or("generic"));
-    let loader = if family == "qwen3_5" || family == "gemma4" { "FastModel" } else { "FastLanguageModel" };
+    let loader = if family == "qwen3_5" || family == "gemma4" || family == "inkling2" { "FastModel" } else { "FastLanguageModel" };
     let readme = format!("# LoRA add-on of {run}\n\nTrained for the world \"{world}\" on **{repo}** (use exactly this base model, not a different one).\n\n\
 ## Unsloth\n```python\nfrom unsloth import {loader}\nmodel, tokenizer = {loader}.from_pretrained(model_name=\"{path}\", max_seq_length=4096, load_in_4bit=False)\n{loader}.for_inference(model)\n```\n\n\
 ## Plain PEFT\n```python\nfrom transformers import AutoModelForCausalLM, AutoTokenizer\nfrom peft import PeftModel\nbase = AutoModelForCausalLM.from_pretrained(\"{repo}\", dtype=\"auto\")\nmodel = PeftModel.from_pretrained(base, \"{path}\")\ntokenizer = AutoTokenizer.from_pretrained(\"{path}\")\n```\n\n\

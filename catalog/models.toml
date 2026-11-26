@@ -1,4 +1,4 @@
-# The six models ND Lore Forge trains. Repos checked on Hugging Face (2026-11-07): all exist, are not gated and are Apache-2.0.
+# The seven models ND Lore Forge trains. Repos checked on Hugging Face (2026-11-07, Inkling-2-Mini 2026-11-26): all exist, are not gated and are Apache-2.0.
 # vram_*: GB for training at about 2048 tokens, from Unsloth's guides (bf16 LoRA: Qwen3.5 2B 5 / 4B 10 / 9B 22, Qwen3.8 27B over 36 with QLoRA on 24; Gemma 4 E2B 8-10, E4B 17 / 10 with 4-bit);
 # values marked "estimate" are ours. The window shows the peak memory MEASURED on this PC once a run has finished, and prefers it.
 # params_b = parameters in the checkpoint (Gemma 4 "E" sizes count their per-layer embeddings, so E2B is 5.1B and E4B 8.0B on disk).
@@ -80,3 +80,18 @@ vram_lora_gb = 60.0                # 16-bit weights alone are about 56 GB (Unslo
 vram_qlora_gb = 20.0               # estimate; Unsloth: QLoRA works with 24 GB
 good_for = "The strongest model here: a dense 27B with images. Needs a big card (QLoRA from 24 GB, 16-bit LoRA needs about 60 GB)."
 note = "Unsloth recommends 4-bit QLoRA for this one (unsloth/Qwen3.8-27B-unsloth-bnb-4bit), then export to GGUF or NVFP4. If it should keep reasoning, mix reasoning-style examples with direct answers and keep at least 75 % reasoning data."
+
+# Added 2026-11-26 (owner's decision D1). Mixture of experts: 128 experts per layer, 8 used per token, 24 layers of which the middle 12 run 3 times. The checkpoint is stored packed
+# (NVFP4 / MXFP8, 19.5 GB); training needs the experts kept packed or in 4 bit (Unsloth: QLoRA from 22 GB, 16-bit LoRA about 59 GB). vram_* are Unsloth's figures, not ours.
+[[model]]
+id = "inkling-2-mini"
+name = "Inkling-2-Mini"
+family = "inkling2"
+repo = "thinkingmachines/Inkling-2-Mini"
+official = "thinkingmachines/Inkling-2-Mini"
+params_b = 26.39
+license = "Apache-2.0"
+vram_lora_gb = 60.0
+vram_qlora_gb = 22.0
+good_for = "A big mixture-of-experts model with images that runs on one 32 GB card when packed. Meant for cutting (fewer experts), healing and growing on the Slim or grow page."
+note = "MoE: 128 experts x 24 layers, middle 12 layers run 3 times; stored in NVFP4/MXFP8 (20 GB). Needs transformers 5.24 or newer, llama.cpp b12611 or newer and vLLM 0.35 or a nightly build. Read docs/MOE_GUIDE.md first."

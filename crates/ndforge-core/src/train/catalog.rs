@@ -1,4 +1,4 @@
-//! The six models (catalog/models.toml, compiled in) and the ones the user adds from Hugging Face (`hub.rs` looks them up).
+//! The seven models (catalog/models.toml, compiled in) and the ones the user adds from Hugging Face (`hub.rs` looks them up).
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ struct File {
     model: Vec<ModelEntry>,
 }
 
-/// The six models that ship with the program.
+/// The seven models that ship with the program.
 pub fn builtin_models() -> Vec<ModelEntry> {
     toml::from_str::<File>(include_str!("../../../../catalog/models.toml")).expect("catalog/models.toml is valid").model
 }
