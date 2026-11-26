@@ -98,6 +98,32 @@ pub fn decide_batch(results: &[Value], card_mb: Option<f64>, spread: f64) -> Dec
     }
 }
 
+/// `teacher.standard`: the same sweep rows as `decide_batch` (budget 0 = the fixed rows per pass), but the comparison that counts is with the budget the person has NOW (`current`; Settings default 16,384): the
+/// winner must beat that by `needed_gain(spread)`, else the current value stays (changed: false). A current value that is clearly slower than the fixed rows goes back to 0.
+pub fn decide_teacher(results: &[Value], card_mb: Option<f64>, spread: f64, current: u32) -> Decision {
+    decide_sized(results, card_mb, spread, current, "tokens per forward pass")
+}
+
+/// The same rule for any batch-size sweep (`batch_tokens` = the size, 0 = the program's own number): `unit` is what the number counts, for the words ("rows together", "questions together").
+pub fn decide_sized(results: &[Value], card_mb: Option<f64>, spread: f64, current: u32, unit: &str) -> Decision {
+    let dec = decide_batch(results, card_mb, spread);
+    let tps_of = |b: u32| results.iter().find(|r| r["batch_tokens"].as_u64() == Some(b as u64) && r["error"].is_null()).and_then(|r| f(r, "tokens_per_s")).filter(|t| *t > 0.0);
+    let (Some(base), cur) = (tps_of(0), tps_of(current)) else { return dec };
+    let need = needed_gain(spread, MIN_GAIN);
+    let cur_tps = cur.unwrap_or(base);
+    let best_tps = tps_of(dec.chosen).unwrap_or(base);
+    let now = if current == 0 { "program's own number".to_string() } else { format!("{current} {unit}") };
+    if dec.chosen != current && best_tps / cur_tps >= need {
+        let gain = (best_tps / cur_tps * 100.0).round() / 100.0;
+        return Decision { gain, why: format!("{} {unit} is {gain} times as fast as your {now} (needed {need:.2}, noise {:.1} %).", dec.chosen, spread * 100.0), changed: true, ..dec };
+    }
+    let mut why = format!("Within noise (±{:.1} %) of your {now}: it stays.", spread * 100.0);
+    if let Some(e) = dec.why.split(" Excluded: ").nth(1) {
+        why += &format!(" Excluded: {e}");
+    }
+    Decision { chosen: current, gain: 1.0, spread, why, guards: dec.guards, changed: false }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LossDecision {
     pub chunk: u32,

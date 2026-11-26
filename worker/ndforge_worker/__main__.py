@@ -282,6 +282,45 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error("vllm_teacher_check_failed", _explain(exc))
             return 1
+    if kind == "vllm_teacher_tune":
+        from . import vllmteachercheck, vllmteachertune
+        try:
+            return vllmteachertune.run(job)
+        except vllmteachercheck.TeacherCheckError as exc:   # a plain-language failure: no traceback text
+            protocol.error("vllm_teacher_tune_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("vllm_teacher_tune_failed", _explain(exc))
+            return 1
+    if kind == "tune_batch_bench":
+        from . import tunebatch
+        try:
+            return tunebatch.run(job)
+        except tunebatch.BenchError as exc:   # a plain-language failure: no traceback text
+            protocol.error("tune_batch_bench_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("tune_batch_bench_failed", _explain(exc))
+            return 1
+    if kind == "llama_offload_tune":
+        from . import imatrix, llamaoffload
+        try:
+            return llamaoffload.run(job)
+        except imatrix.Stopped:   # the Stop button (the STOP file): the same word as a killed worker
+            protocol.error("llama_offload_tune_stopped", "Cancelled.")
+            return 1
+        except llamaoffload.OffloadError as exc:   # a plain-language failure: no traceback text
+            protocol.error("llama_offload_tune_failed", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("llama_offload_tune_failed", _explain(exc))
+            return 1
     if kind == "general_check":
         from . import generaltext
         return generaltext.run_check(job)

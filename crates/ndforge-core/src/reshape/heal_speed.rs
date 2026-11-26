@@ -17,6 +17,8 @@ pub const STEPS: u32 = 6;
 pub const WARMUP: u32 = 3;
 /// The token budgets of the student's micro-batches the report measures on real rows (0 = one row per forward pass, today's way).
 pub const BATCH_TOKENS_SWEEP: [u32; 5] = [0, 2048, 4096, 8192, 16384];
+/// The token budgets of the original's answers the tuner measures (0 = the fixed number of rows per forward pass; the Settings default is 16,384).
+pub const TEACHER_BUDGETS: [u32; 6] = [0, 4096, 8192, 16384, 32768, 65536];
 
 /// Where the report of a made model is kept: `benchmarks/heal_speed-<model>/`.
 pub fn report_dir(p: &Project, name: &str) -> PathBuf {
@@ -56,6 +58,28 @@ pub fn tune_sweep(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>
             r["stopped"] = json!(true);
             let _ = e;
             Ok(r)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The original's tokens per forward pass for the tuner (docs/TUNE.md): the worker loads the original as the heal does and answers the same real rows at several token budgets (0 = the fixed rows per pass),
+/// with repeats for the noise. Returns the worker's result (`batch_sweep.results` shaped like the student's sweep); `stopped: true` when Stop was pressed.
+pub fn tune_teacher_sweep(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, dir: &std::path::Path, stop: Arc<AtomicBool>, emit: &mut dyn FnMut(Value)) -> Result<Value> {
+    let b = bench_base(p, name, spec, vram_gb)?;
+    let _ = std::fs::create_dir_all(dir);
+    let o = super::heal_source::read_origin(&p.folder.join("models").join(name))?;
+    let load = b.ch.teacher_load.clone().unwrap_or_else(|| "4bit".into());
+    let mut job = b.job_base(STEPS, WARMUP).job;
+    job["distill"]["teacher"] = json!({"repo": o.teacher, "load": load});
+    job["bench"] = json!({"steps": 1, "warmup": 0, "targets": "rows", "rows_tokens": 600_000, "teacher_sweep": TEACHER_BUDGETS, "sweep_repeat": 2});
+    let outcome = run_with_grace(&b.py, &job, &dir.join("STOP"), &stop, Duration::from_secs(60), &mut |e: WorkerEvent| emit(super::runs::event_json(e)));
+    match outcome {
+        Ok(r) if r["batch_sweep"]["results"].is_array() => Ok(r),
+        Ok(_) => Err(crate::error::Error::new("The test of the original's batch ended without a measurement.")),
+        Err(e) if stop.load(std::sync::atomic::Ordering::SeqCst) => {
+            let _ = e;
+            Ok(json!({"stopped": true, "batch_sweep": {"results": []}}))
         }
         Err(e) => Err(e),
     }

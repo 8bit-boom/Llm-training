@@ -2372,6 +2372,24 @@ fn a_tuned_preset_of_the_run_sends_its_speed_knobs_into_every_heal() {
 }
 
 #[test]
+fn a_tuned_preset_that_chose_the_originals_batch_sends_it_into_every_heal_and_an_untested_copy_does_not() {
+    use ndforge_core::reshape::auto_plan::TunedUse;
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Mock::new();
+    let values = json!({"student_batch_tokens": 8192, "teacher_batch_tokens": 32768}).as_object().unwrap().clone();
+    let tuned = TunedUse { preset_id: "t-1".into(), name: "Tested".into(), match_kind: "exact".into(), values: values.clone(), chosen_keys: vec!["teacher_batch_tokens".into()], ..Default::default() };
+    start(&p, &mut fx, AutoSpec { tuned: Some(tuned), ..spec(21.1) }).unwrap();
+    assert!(!fx.heal_specs.is_empty() && fx.heal_specs.iter().all(|h| h["teacher_batch_tokens"] == json!(32768)), "{:?}", fx.heal_specs);
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut fx2 = Mock::new();
+    let untested = TunedUse { preset_id: "t-2".into(), name: "Saved card".into(), match_kind: "exact".into(), values, ..Default::default() };
+    start(&p2, &mut fx2, AutoSpec { tuned: Some(untested), ..spec(21.1) }).unwrap();
+    assert!(fx2.heal_specs.iter().all(|h| h.get("teacher_batch_tokens").is_none()), "{:?}", fx2.heal_specs);
+}
+
+#[test]
 fn a_failed_vllm_container_offers_the_teacher_cache_off_first() {
     let d = tempdir().unwrap();
     let p = project(d.path());

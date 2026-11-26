@@ -413,7 +413,8 @@ fn a_tested_preset_changes_the_heals_knobs_and_the_estimate_uses_its_measured_sp
     let slow = TunedUse { tokens_per_s: Some(324.0), measured_student_b: Some(20.1), ..Default::default() };
     let (_, t0) = run(&AutoSpec { tuned: Some(slow), ..base.clone() }, 32.0);
     let tuned = TunedUse { preset_id: "t-1".into(), scope: "project".into(), name: "Tested".into(), match_kind: "exact".into(), tokens_per_s: Some(780.0), measured_student_b: Some(20.1), default_tokens_per_s: Some(324.0),
-                           values: serde_json::json!({"student_batch_tokens": 8192, "kl_chunk": 256, "head_checkpoint": "off", "checkpointing": "on", "seq": 8192, "rank": 16}).as_object().unwrap().clone() };
+                           values: serde_json::json!({"student_batch_tokens": 8192, "kl_chunk": 256, "head_checkpoint": "off", "checkpointing": "on", "seq": 8192, "rank": 16, "teacher_batch_tokens": 32768}).as_object().unwrap().clone(),
+                           chosen_keys: vec!["teacher_batch_tokens".into(), "student_batch_tokens".into()] };
     let spec = AutoSpec { tuned: Some(tuned.clone()), ..base.clone() };
     let (_, t1) = run(&spec, 32.0);
     let train = |t: &TimeEstimate| t.steps.iter().filter(|s| s.id.ends_with(".heal")).flat_map(|s| s.parts.iter()).filter(|x| x.id == "train").fold(0.0, |a, x| a + x.minutes.1);
@@ -426,6 +427,13 @@ fn a_tested_preset_changes_the_heals_knobs_and_the_estimate_uses_its_measured_sp
     tuned.apply_to(&mut h);
     assert_eq!((h.student_batch_tokens, h.kl_chunk, h.head_checkpoint.as_deref(), h.checkpointing.as_deref()), (Some(8192), Some(256), Some("off"), Some("on")));
     assert!(h.seq.is_none() && h.rank.is_none());
+    assert_eq!(h.teacher_batch_tokens, Some(32768), "the original's batch a test chose drives the cache step of every heal");
+    let (drives, not) = tuned.drives();
+    assert_eq!(drives, vec!["student_batch_tokens", "kl_chunk", "head_checkpoint", "checkpointing", "teacher_batch_tokens"]);
+    assert!(not.contains(&"seq".to_string()) && not.contains(&"rank".to_string()), "what a preset holds but an Auto run never takes: {not:?}");
+    let mut untested: HealSpec = serde_json::from_value(serde_json::json!({"tokens_m": 40})).unwrap();
+    TunedUse { chosen_keys: vec![], ..tuned.clone() }.apply_to(&mut untested);
+    assert_eq!(untested.teacher_batch_tokens, None, "the card's untouched copy of the setting is not a test result");
     let mut plain: HealSpec = serde_json::from_value(serde_json::json!({"tokens_m": 40})).unwrap();
     TunedUse::default().apply_to(&mut plain);
     assert_eq!(plain, serde_json::from_value::<HealSpec>(serde_json::json!({"tokens_m": 40})).unwrap(), "an empty snapshot changes nothing");

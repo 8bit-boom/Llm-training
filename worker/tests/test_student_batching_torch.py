@@ -220,3 +220,21 @@ def test_a_trial_without_the_originals_saved_answers_is_refused_in_plain_words(t
     cfg["bench"] = {"targets": "synthetic", "trial": {"tokens": 1000}}
     with pytest.raises(Exception, match="saved answers"):
         bench_run(monkeypatch, cfg)
+
+
+def test_the_teacher_sweep_runs_the_original_on_real_rows_at_every_token_budget_and_the_answers_stay_the_same(tmp_path, teacher, monkeypatch):
+    from test_distill_torch import bench_run
+    student = thin_student(tmp_path, teacher)
+    cfg = distill_cfg(tmp_path, student, teacher, "cache", out=str(tmp_path / "no-output"), hyper={"batch": 2, "grad_accum": 2, "max_steps": 1})
+    cfg["distill"]["chunk"] = 32
+    cfg["distill"]["teacher"] = {"repo": str(teacher), "load": "16bit"}
+    cfg["bench"] = {"steps": 1, "warmup": 0, "targets": "rows", "rows_tokens": 3000, "teacher_sweep": [0, 64, 256], "sweep_repeat": 2}
+    code, ev, res = bench_run(monkeypatch, cfg)
+    assert code == 0 and res, ev[-1]
+    data = res[0]["data"]
+    sw = data["batch_sweep"]
+    assert data["teacher_sweep"] is True and [r["batch_tokens"] for r in sw["results"]] == [0, 64, 256]
+    assert all(r["tokens_per_s"] and r["first_loss"] is not None for r in sw["results"]), sw["results"]
+    base = sw["results"][0]["first_loss"]
+    assert all(abs(r["first_loss"] - base) <= 1e-3 * max(1.0, abs(base)) for r in sw["results"]), "padding does not change the original's answers"
+    assert sw["rows"] >= 4 and sw["tokens"] > 0 and "spread" in sw and "value" in sw["recommended"]

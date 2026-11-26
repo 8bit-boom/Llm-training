@@ -53,6 +53,9 @@ On the first page, import the newer export and press **Retrain with the new expo
 ## Training on the TrueNAS server
 Optional: see `docs/TRUENAS_WORKER.md`. In Step 3 choose the server under **Where to train**.
 
+## Find the best settings for this PC (🎛 Tune)
+Press **Auto: test and choose the best settings** (on the Tune page, the Heal card or the Auto page). It tests the speed and memory settings and, as short trial heals, the quality settings of your model on this computer, shows every change with its measured gain, and saves a preset you can select again. See the help panel of the Tune page for what is and is not tested.
+
 ## If something goes wrong
 Open **Troubleshooting** (the help panel of this page) or press **Make a problem report** below and send the text.
 

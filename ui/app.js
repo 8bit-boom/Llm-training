@@ -2347,15 +2347,17 @@ function tuneStageHtml(where) {
     <div class="row"><button class="primary" id="tn-apply-${where}" ${rows ? "" : "disabled"}>Apply all</button><button class="secondary" id="tn-apply-no-${where}">Cancel</button></div></div>`;
 }
 function tuneName(sel) { return (sel && sel.name) || ""; }
+// the one-click Auto for a model, from any page (the Heal card, the Auto page, the Tune page): the same plan, the same confirmation, the same run
+async function tuneAutoFor(model) {
+  if (!model) return;
+  tn.pick = model; tu.plan = null; tu.state = null; tu.preview = null; tu.spv = {}; tu.applied = null; tn.view = null; tn.model = "";
+  await go("tune"); await tuLoadPlan(); await tuGo();
+}
+const acTuneModel = () => { const made = ((rs.state && rs.state.made) || []).filter((m) => m.status === "done"); return (made.find((m) => m.name === tn.pick) || made[0] || {}).name || ""; };
 async function tuneAction(where, kind) {
   const sel = tnSelected(), model = where === "tune" ? tn.pick : (rs.hl && rs.hl.name);
   tn.err = null; tn.ok = null;
-  if (kind === "auto") {
-    if (!model) return;
-    tn.pick = model; tu.plan = null; tu.state = null; tu.preview = null; tu.applied = null; tn.view = null; tn.model = "";
-    await go("tune"); await tuLoadPlan(); await tuGo();
-    return;
-  }
+  if (kind === "auto") { await tuneAutoFor(model); return; }
   if (kind === "use") {
     if (!sel) return;
     try { tn.preview = { where, data: await invoke("tune_apply_preview", { presetId: sel.id, scope: sel.scope, model, target: "heal_card", current: tuneCard() }) }; } catch (e) { tn.err = String(e); }
@@ -2395,7 +2397,7 @@ function wireTune() {
   }
 }
 // ---- "Auto: test and choose the best settings": the runner of the Tune page (docs/TUNE.md)
-const tu = { plan: null, ticked: null, maxH: "", trialK: 400, state: null, running: false, text: "", err: null, rows: {}, preview: null, runId: null, applied: null };
+const tu = { spv: {}, plan: null, ticked: null, maxH: "", trialK: 400, state: null, running: false, text: "", err: null, rows: {}, preview: null, runId: null, applied: null };
 const TU_CLASS = { exact: "same results", tol: "same results within tolerance", stat: "same on average", quality: "quality knob: based on a short trial, not a full heal" };
 const TU_TIER = { 1: "Speed and memory: the same results, tested in minutes", 2: "Quality settings: short trial heals on your rows (a short trial, not a full heal)", 3: "Other functions" };
 function tuSpec() {
@@ -2426,15 +2428,21 @@ function tuLiveHtml() {
   const st = tu.state;
   if (!st) return tu.running ? `<div class="stepline" aria-live="polite">${esc(tu.text || "Starting…")}</div>` : "";
   const rows = st.tests.map((t) => `<tr class="${t.status === "done" ? "" : "dim"}"><td>${esc((tu.plan && (tu.plan.tests.find((x) => x.id === t.id) || {}).label) || t.id)}</td><td>${esc(t.status.replace("_", " "))}</td><td>${esc((t.decision && t.decision.why) || t.note || "")}</td><td>${t.result && t.result.gain > 1 ? "×" + (+t.result.gain).toFixed(2) : ""}</td><td class="dim small">${esc(t.result ? TU_CLASS[t.result.class] || t.result.class : "")}</td></tr>`).join("");
-  const live = Object.values(tu.rows).flat().slice(-12).map((r) => `<tr><td>${esc(String(r.batch_tokens ?? r.label ?? r.id ?? ""))}</td><td>${r.tokens_per_s ? Math.round(r.tokens_per_s).toLocaleString("en-US") + " tokens/s" : esc(String(r.error || ""))}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td></tr>`).join("");
+  const cand = (r) => (r.ngl !== undefined ? `${r.ngl} layers on the card` : r.write_mb_s !== undefined ? "Disk" : String(r.batch_tokens ?? r.label ?? r.id ?? ""));
+  const result = (r) => (r.tokens_per_s ? Math.round(r.tokens_per_s).toLocaleString("en-US") + " tokens/s" : r.held_after != null ? `held-out loss ${(+r.held_after).toFixed(4)} (short trial)` : r.write_mb_s !== undefined ? `writes ${r.write_mb_s} MB/s, reads ${r.read_mb_s} MB/s` : String(r.error || ""));
+  const live = Object.values(tu.rows).flat().slice(-12).map((r) => `<tr><td>${esc(cand(r))}</td><td>${esc(result(r))}</td><td>${r.peak_vram_mb ? (r.peak_vram_mb / 1024).toFixed(1) + " GB" : ""}</td></tr>`).join("");
   return `${tu.running ? `<div class="stepline" aria-live="polite" id="tu-text">${esc(tu.text || "Running…")}</div>` : ""}${st.note ? `<p class="warn" id="tu-wait">${esc(st.note)}</p>` : ""}
     <table class="tbl" id="tu-table"><tr><th>Test</th><th>State</th><th>Decision</th><th>Gain</th><th>Kind</th></tr>${rows}</table>${live ? `<table class="tbl small" id="tu-live"><tr><th>Candidate</th><th>Speed</th><th>Peak memory</th></tr>${live}</table>` : ""}`;
 }
+const TU_SETTINGS_TARGETS = ["settings_teacher", "settings_vllm", "settings_llama", "settings_forward"];
+const tuSettingsRows = () => TU_SETTINGS_TARGETS.flatMap((t) => (tu.spv && tu.spv[t] ? tu.spv[t].changes : []));
 function tuApplyHtml() {
   const pv = tu.preview; if (!pv) return "";
-  const rows = pv.changes.map((c) => `<tr><td>${esc(c.label)}</td><td>${esc(String(c.from ?? "automatic"))}</td><td><strong>${esc(String(c.to))}</strong></td><td>${c.gain && c.gain > 1 ? "×" + (+c.gain).toFixed(2) : ""}</td><td class="dim small">${esc(TU_CLASS[c.class] || c.class || "")}</td></tr>`).join("");
-  return `<div class="card" id="tu-apply"><h3>Apply and save preset</h3><p class="dim small">The preset “${esc(pv.name)}” is already saved (you can select it later on the Heal card, the Auto page and here). Applying fills the Heal card's settings; nothing else changes until you start something.</p>
-    ${rows ? `<table class="tbl"><tr><th>Setting</th><th>Now</th><th>Becomes</th><th>Measured gain</th><th></th></tr>${rows}</table>` : `<p>Your settings are already the best that was found. Nothing would change.</p>`}
+  const row = (c, where) => `<tr><td>${esc(c.label)}</td><td class="dim small">${where}</td><td>${esc(String(c.from ?? "automatic"))}</td><td><strong>${esc(String(c.to))}</strong></td><td>${c.gain && c.gain > 1 ? "×" + (+c.gain).toFixed(2) : ""}</td><td class="dim small">${esc(TU_CLASS[c.class] || c.class || "")}</td></tr>`;
+  const sets = tuSettingsRows();
+  const rows = pv.changes.map((c) => row(c, "Heal card")).join("") + sets.map((c) => row(c, "Settings")).join("");
+  return `<div class="card" id="tu-apply"><h3>Apply and save preset</h3><p class="dim small">The preset “${esc(pv.name)}” is already saved (you can select it later on the Heal card, the Auto page and here). Applying fills the Heal card's settings${sets.length ? " and saves the listed program settings (the original's batch, the vLLM engine, llama.cpp's layers)" : ""}; nothing else changes until you start something.</p>
+    ${rows ? `<table class="tbl" id="tu-apply-table"><tr><th>Setting</th><th>Where</th><th>Now</th><th>Becomes</th><th>Measured gain</th><th></th></tr>${rows}</table>` : `<p>Your settings are already the best that was found. Nothing would change.</p>`}
     <div class="row"><button class="primary" id="tu-apply-all" ${rows ? "" : "disabled"}>Apply all</button><button class="secondary" id="tu-apply-no">Not now</button></div></div>`;
 }
 function tuAutoHtml() {
@@ -2486,6 +2494,9 @@ async function onTuneEvent(p) {
     if (p.data && p.data.status === "stopped") { /* a stopped run: Continue is offered */ }
     else if (tu.state && tu.state.preset_id) {
       try { tu.preview = await invoke("tune_apply_preview", { presetId: tu.state.preset_id, scope: "project", model: tn.pick, target: "heal_card", current: rs.hl && rs.hl.name === tn.pick ? tuneCard() : {} }); } catch (e) { tu.err = String(e); }
+      // the saved settings a test may have decided (the original's batch, the vLLM engine, llama.cpp's layers): the same confirmation lists them, each applied with the token of its own fresh preview
+      tu.spv = {};
+      for (const target of TU_SETTINGS_TARGETS) { try { const pv = await invoke("tune_apply_preview", { presetId: tu.state.preset_id, scope: "project", model: tn.pick, target, current: {} }); if (pv && pv.changes && pv.changes.length) tu.spv[target] = pv; } catch (_) { /* nothing for this target */ } }
       tn.model = ""; tuneLoad(tn.pick);
     }
   }
@@ -2497,7 +2508,14 @@ function wireTuneAuto() {
   const t = $("tu-trial"); if (t) t.onchange = () => { tu.trialK = +t.value; tu.plan = null; tuLoadPlan(); };
   const g = $("tu-go"); if (g) g.onclick = tuGo;
   const st = $("tu-stop"); if (st) st.onclick = () => { tu.text = "Stopping…"; invoke("tune_stop"); render(); };
-  const all = $("tu-apply-all"); if (all) all.onclick = () => { tuneApplyToCard(tu.preview.changes); tu.applied = `Applied ${tu.preview.changes.length} change${tu.preview.changes.length === 1 ? "" : "s"} to the Heal card.`; tu.preview = null; try { rsHealEstimate(); } catch (_) { /* a preview */ } render(); };
+  const all = $("tu-apply-all"); if (all) all.onclick = async () => {
+    const card = tu.preview.changes, sets = tuSettingsRows();
+    tuneApplyToCard(card);
+    let saved = 0;
+    for (const target of TU_SETTINGS_TARGETS) { const pv = tu.spv && tu.spv[target]; if (!pv) continue; try { await invoke("tune_apply", { presetId: tu.state.preset_id, scope: "project", model: tn.pick, target, token: pv.token }); saved += pv.changes.length; } catch (e) { tu.err = String(e); } }
+    tu.applied = `Applied ${card.length} change${card.length === 1 ? "" : "s"} to the Heal card${sets.length ? ` and saved ${saved} program setting${saved === 1 ? "" : "s"}` : ""}.`; tu.preview = null; tu.spv = {};
+    try { rsHealEstimate(); } catch (_) { /* a preview */ } render();
+  };
   const no = $("tu-apply-no"); if (no) no.onclick = () => { tu.preview = null; render(); };
 }
 
@@ -3378,14 +3396,32 @@ function acApplySet(set) {
     else if (k === "share_teacher_cache") ac.sp.share = !!v; else if (k in ac.sp) ac.sp[k] = !!v;
   }
 }
+const AC_SPEED_KEYS = ["student_batch_tokens", "kl_chunk", "head_checkpoint", "checkpointing", "teacher_batch_tokens"];
+const AC_QUALITY_KEYS = ["rank", "optimizer", "warmup", "lr"];
+const AC_PROGRAM_KEYS = ["max_num_seqs", "vllm_batch_tokens", "gpu_util_pct", "llama_ngl", "try_calib_batch", "think_batch"];
+// what a snapshot drives in an Auto-cut run, what it holds but an Auto run never takes (the quality knobs of a short trial are for the Heal card), and the program settings that are saved from the Tune page
+function acTunedSplit(sn) {
+  const v = (sn && sn.values) || {}, chosen = (sn && sn.chosen_keys) || [];
+  const set = (k) => v[k] !== undefined && v[k] !== null && v[k] !== 0 && v[k] !== "on" && v[k] !== "auto";
+  const drives = AC_SPEED_KEYS.filter((k) => set(k) && (k !== "teacher_batch_tokens" || chosen.includes(k)));
+  const quality = AC_QUALITY_KEYS.filter((k) => chosen.includes(k) && v[k] !== undefined);
+  const program = AC_PROGRAM_KEYS.filter((k) => chosen.includes(k));
+  return { drives, quality, program, v };
+}
 function acTunedHtml(lock) {
   if (ac.tunedList === undefined) { ac.tunedList = null; Promise.resolve(invoke("tune_presets_here")).then((l) => { ac.tunedList = l || []; try { render(); } catch (_) { /* a preview */ } }).catch(() => { ac.tunedList = []; }); }
   const list = ac.tunedList || [];
   const sn = ac.tunedSnap;
-  const vals = sn ? ["student_batch_tokens", "kl_chunk", "head_checkpoint", "checkpointing"].filter((k) => sn.values && sn.values[k] !== undefined && sn.values[k] !== null && sn.values[k] !== 0 && sn.values[k] !== "on" && sn.values[k] !== "auto").map((k) => `${k.replace(/_/g, " ")} ${sn.values[k]}`) : [];
-  return `<div class="row"><button class="link" id="ac-tune-go" title="Tests every setting of a model on this PC and saves a preset">Test this PC for a model (Tune)…</button></div>
-    <label class="opt" id="ac-tuned-row">Use tested settings for this PC <select id="ac-tuned" ${lock}><option value="">none (the heals as they always were)</option>${list.map((p) => `<option value="${esc(p.id)}|${esc(p.scope)}" ${sn && sn.preset_id === p.id ? "selected" : ""}>${esc(p.name)} · ${esc(p.model)}</option>`).join("")}</select></label>
-    ${sn ? `<p class="small dim" id="ac-tuned-note">The heals use: ${esc(vals.join(", ") || "your own settings (nothing differs)")}${sn.tokens_per_s ? `; the time estimate uses the measured ${Math.round(sn.tokens_per_s)} tokens/s` : ""}. A snapshot: later edits of the preset do not change this run.</p>` : ""}`;
+  const sp = acTunedSplit(sn), name = (k) => k.replace(/_/g, " ");
+  const gains = (p) => (p.gains || []).filter((g) => g.gain > 1.0).map((g) => `${g.function.replace(/^.*\./, "")} ×${(+g.gain).toFixed(2)}`).join(", ");
+  const model = acTuneModel(), off = tnBusy() || !model, why = tnBusy() ? jobWhy() : "there is no finished model to test yet (run Auto once or make a cut)";
+  return `<div class="row"><button class="primary" id="ac-tune-auto" ${off ? "disabled" : ""} title="${off ? esc(`Off because ${why}`) : `Tests this PC for ${esc(model)} (the Tune page's one click), then shows what to change and saves a preset`}">Auto: test and choose the best settings${model ? ` for ${esc(model)}` : ""}</button>
+      <button class="link" id="ac-tune-go" title="Open the Tune page: the checklist, the results and every preset of a model">Open the Tune page…</button></div>
+    ${off ? `<p class="dim small" id="ac-tune-why">The test button is off because ${esc(why)}.</p>` : ""}
+    <label class="opt" id="ac-tuned-row">Use tested settings for this PC <select id="ac-tuned" ${lock}><option value="">none (the heals as they always were)</option>${list.map((p) => `<option value="${esc(p.id)}|${esc(p.scope)}" ${sn && sn.preset_id === p.id ? "selected" : ""}>${esc(p.name)} · ${esc(p.model)}${gains(p) ? ` · ${esc(gains(p))}` : ""}</option>`).join("")}</select></label>
+    ${sn ? `<div class="small dim" id="ac-tuned-note"><p>The heals of this run use: ${esc(sp.drives.map((k) => `${name(k)} ${sp.v[k]}`).join(", ") || "your own settings (nothing differs)")}${sn.tokens_per_s ? `; the time estimate uses the measured ${Math.round(sn.tokens_per_s)} tokens/s of the student` : ""}. A snapshot: later edits of the preset do not change this run.</p>
+      ${sp.quality.length ? `<p id="ac-tuned-quality">Not taken by Auto-cut: ${esc(sp.quality.map((k) => `${name(k)} ${sp.v[k]}`).join(", "))}. These came from short trial heals, not a full heal; use them from the Heal card if you want them.</p>` : ""}
+      ${sp.program.length ? `<p id="ac-tuned-program">Program settings in this preset (${esc(sp.program.map(name).join(", "))}) are saved from the Tune page's Apply, not from here.</p>` : ""}</div>` : ""}`;
 }
 function acSpec() {
   const sp = ac.sp;
@@ -3778,6 +3814,7 @@ function wireAuto() {
   set("ac-search", (e) => { ac.sp.search = e.value === "" ? null : +e.value; });
   const adv = $("ac-adv"); if (adv) adv.ontoggle = () => { ac.advOpen = adv.open; };
   const tg = $("ac-tune-go"); if (tg) tg.onclick = () => go("tune");
+  const ta = $("ac-tune-auto"); if (ta) ta.onclick = () => tuneAutoFor(acTuneModel());
   const tuned = $("ac-tuned"); if (tuned) tuned.onchange = async () => { if (!tuned.value) { ac.tunedSnap = null; render(); return; } const [id, scope] = tuned.value.split("|"); try { ac.tunedSnap = await invoke("tune_snapshot", { presetId: id, scope }); } catch (e) { ac.tunedSnap = null; rs.error = String(e); } render(); };
   set("ac-sbt", (e) => { const n = Math.round(+e.value || 0); ac.sp.sbt = n >= 512 && n <= 65536 ? n : null; });
   set("ac-maxon", (e) => { ac.maxOn = e.checked; }); set("ac-maxh", (e) => { ac.maxH = e.value.trim(); });

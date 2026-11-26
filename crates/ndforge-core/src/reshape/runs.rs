@@ -204,6 +204,10 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
 /// The `calibration` of a worker job: the project's training file, how many samples of which length and, when asked, the reasoning part.
 fn calibration_json(train: Option<&Path>, samples: u32, len: u32, version: Option<u32>, reasoning: Option<&ReasoningCalib>) -> Value {
     let mut c = json!({"train": train, "samples": samples, "max_len": len, "seed": 3407, "version": version});
+    let batch = crate::settings::Settings::load().try_calib_batch;
+    if (1..=64).contains(&batch) {
+        c["batch"] = json!(batch);          // a tested number of rows through the original together (docs/TUNE.md); without it the worker's own 4
+    }
     if let Some(r) = reasoning {
         c["reasoning"] = r.json();
     }
@@ -814,6 +818,9 @@ pub struct HealSpec {
     /// Make the original's answers with vLLM (experimental, docs/VLLM.md; needs the settings' switches too). None = the heal as it always was (the key is then not even written).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm: Option<HealVllm>,
+    /// The original's answers by a token budget for THIS heal (an Auto-cut run that uses a tested preset): None = the saved setting `teacher_batch_tokens` (the key is then not even written). Not part of any cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_batch_tokens: Option<u32>,
 }
 
 /// The Heal card's vLLM option.
@@ -1046,7 +1053,9 @@ pub fn vllm_teacher_gate(dir: &Path, spec: &HealSpec, origin: &str, mode: &str) 
 /// "Check the vLLM teacher" (docs/VLLM.md): the worker job `vllm_teacher_check` compares the vLLM teacher's top answers with the standard 4-bit teacher's on 100 real rows of the heal's data at
 /// the heal's sequence length (an existing complete standard cache of this original is the reference when there is one; else the standard teacher runs first, never both on the card at once)
 /// and writes `models/<name>/vllm_teacher_check.json`. Returns the worker's result (verdict, metrics, start-up phases, speed).
-pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+/// What the vLLM checks and the tuner's vLLM test share: the model's folder, the vLLM settings, the `common` part of the worker job (the heal's cache job keys) and the reference cache (a complete standard
+/// cache of this model's heal, when there is one).
+fn vllm_check_context(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>) -> Result<(PathBuf, crate::settings::VllmSettings, Value, Option<PathBuf>)> {
     valid_name(name)?;
     spec.validate()?;
     let dir = models_dir(p).join(name);
@@ -1070,6 +1079,11 @@ pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Opt
                         "data": {"train": train, "tokens": spec.tokens(), "general": general}, "k": ch.k, "max_seq": ch.knobs.seq, "seed": crate::general::SEED});
     let cache = dir.join("distill").join("cache");
     let reference = read_json(&cache.join("index.json")).filter(|i| i["complete"] == true && i["engine"].is_null()).map(|_| cache);
+    Ok((dir, s, common, reference))
+}
+
+pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let (dir, s, common, reference) = vllm_check_context(p, name, spec, vram_gb)?;
     let job = crate::vllm::teacher_check_job(&s, &common, &dir, reference.as_deref(), spec.vllm.as_ref().and_then(|v| v.kv_cache_dtype.as_deref()));
     let py = python()?;
     let _active = Active::begin(&dir)?;
@@ -1084,6 +1098,71 @@ pub fn vllm_teacher_check(p: &Project, name: &str, spec: &HealSpec, vram_gb: Opt
     r
 }
 
+/// The tuner's test of the vLLM teacher's engine settings (docs/TUNE.md): the worker job `vllm_teacher_tune` makes one reference and scores the same rows once per variant (`variants`: `[{id, knob, value, label,
+/// engine}]`). Engine containers left behind by an earlier run are removed first (the memory module's rule: never while a job holds one) and every container this job started is removed at the end, also when it
+/// failed or was stopped. Returns the worker's result (`rows`, `reference`, `stopped`).
+pub fn vllm_teacher_tune(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, variants: &[Value], work: &Path, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let (dir, s, common, reference) = vllm_check_context(p, name, spec, vram_gb)?;
+    let env = crate::memory::Real { vllm: s.clone() };
+    let _ = crate::memory::remove_stale(&env, &crate::memory::Ctx { busy: false });
+    let mut job = crate::vllm::teacher_check_job(&s, &common, &dir, reference.as_deref(), None);
+    job["job"] = json!("vllm_teacher_tune");
+    job["work"] = json!(work);
+    job["stop_file"] = json!(work.join("STOP"));
+    job["rows"] = json!(128);
+    job["variants"] = json!(variants);
+    if let Some(o) = job.as_object_mut() {
+        o.remove("out");
+        o.remove("kv_cache_dtype");          // the engine object decides (the person's own KV cache settings), as the heal's cache job does
+    }
+    let _ = std::fs::create_dir_all(work);
+    let py = python()?;
+    let _active = Active::begin(&dir)?;
+    let _ = std::fs::remove_file(work.join("STOP"));
+    let r = crate::train::runs::drive(&py, work, &job, stop, grace, &mut |e| {
+        let mut ev = event_json(e);
+        ev["phase"] = json!("vllm_teacher_tune");
+        on_event(ev);
+    });
+    let _ = crate::vllm::stop_leftovers(&s, &crate::vllm::real_runner);
+    r
+}
+
+/// The tuner's batch tests (docs/TUNE.md): the worker job `tune_batch_bench` loads ONE model and runs the same work at several batch sizes (`sizes`, 0 = the program's own number). `what` "calib" measures the
+/// Try-first calibration on the ORIGINAL; "think" asks the thinking check's questions of the made model (the cut). Returns the worker's result (`batch_sweep.results`, shaped like the student's sweep).
+pub fn tune_batch_bench(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, what: &str, sizes: &[u32], work: &Path, stop: Arc<AtomicBool>, grace: Duration, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    valid_name(name)?;
+    spec.validate()?;
+    let dir = models_dir(p).join(name);
+    let o = heal_source::read_origin(&dir)?;
+    let student = heal_source::student_folder(&dir)?.ok_or_else(|| Error::new("The model's folder is missing."))?;
+    let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the tests use your real rows."))?;
+    let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
+    let _ = vram_gb;
+    let mut job = json!({"job": "tune_batch_bench", "what": what, "sizes": sizes, "family": o.family, "repeat": 2, "load": "auto"});
+    match what {
+        "calib" => {
+            job["model"] = json!(o.teacher);
+            job["calibration"] = calibration_json(Some(&train), 48, 512, Some(version), None);
+            job["calibration"].as_object_mut().map(|c| c.remove("batch"));
+        }
+        "think" => {
+            job["model"] = json!(student);
+            job["max_new"] = json!(96);
+        }
+        other => return Err(Error::new(format!("Unknown batch test {other}."))),
+    }
+    let py = python()?;
+    let _active = Active::begin(&dir)?;
+    std::fs::create_dir_all(work)?;
+    let _ = std::fs::remove_file(work.join("STOP"));
+    crate::train::runs::drive(&py, work, &job, stop, grace, &mut |e| {
+        let mut ev = event_json(e);
+        ev["phase"] = json!("tune_batch_bench");
+        on_event(ev);
+    })
+}
+
 /// Keeps what the worker says about the vLLM teacher (`teacher_engine` of the cache result: engine, quantization, start-up, speed, fallback) in heal.json for the card and the report.
 fn record_teacher_engine(dir: &Path, r: &Value) {
     let t = r["teacher_engine"].clone();
@@ -1096,7 +1175,12 @@ fn record_teacher_engine(dir: &Path, r: &Value) {
 
 /// The original's answers take rows by a token budget (setting `teacher_batch_tokens`, default 16,384; 0 = the fixed 4 rows): the key is only added when it is on, so a job with 0 is the job it was.
 pub fn with_teacher_batch(job: &mut Value) {
-    let n = crate::settings::Settings::load().teacher_batch_tokens;
+    with_teacher_batch_of(job, None)
+}
+
+/// The same with the heal's own number (`HealSpec.teacher_batch_tokens`, from a tested preset) instead of the saved setting; 0 turns the budget off for this heal.
+pub fn with_teacher_batch_of(job: &mut Value, own: Option<u32>) {
+    let n = own.unwrap_or_else(|| crate::settings::Settings::load().teacher_batch_tokens);
     if n > 0 {
         job["teacher_batch_tokens"] = json!(n);
     }
@@ -1349,7 +1433,7 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
             job["engine"] = e.clone();
             set_heal(&dir, json!({"teacher_engine": {"requested": true, "identity": ident}}));
         }
-        with_teacher_batch(&mut job);
+        with_teacher_batch_of(&mut job, spec.teacher_batch_tokens);
         let r = heal_job(&py, &dir, &job, "cache", &stop, grace, on_event).map_err(failed)?;
         if r["stopped"].as_bool().unwrap_or(false) {
             return Ok(stopped("cache"));

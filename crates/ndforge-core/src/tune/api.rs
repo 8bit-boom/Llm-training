@@ -117,6 +117,8 @@ fn target_keys(target: &str) -> Option<&'static [&'static str]> {
     match target {
         "settings_teacher" => Some(&["teacher_batch_tokens"]),
         "settings_vllm" => Some(&["max_num_seqs", "vllm_batch_tokens", "gpu_util_pct"]),
+        "settings_llama" => Some(&["llama_ngl"]),
+        "settings_forward" => Some(&["try_calib_batch", "think_batch"]),
         _ => None,
     }
 }
@@ -128,12 +130,22 @@ pub fn settings_current(s: &crate::settings::Settings) -> Map<String, Value> {
     m.insert("max_num_seqs".into(), json!(s.vllm.teacher.max_num_seqs));
     m.insert("vllm_batch_tokens".into(), json!(s.vllm.teacher.batch_tokens));
     m.insert("gpu_util_pct".into(), json!(s.vllm.teacher.gpu_util_pct));
+    m.insert("llama_ngl".into(), json!(s.llama_ngl.unwrap_or(super::llama::ALL)));
+    m.insert("try_calib_batch".into(), json!(s.try_calib_batch));
+    m.insert("think_batch".into(), json!(s.think_batch));
     m
+}
+
+/// Adds the saved settings the tests start from (the original's tokens per forward pass, the vLLM teacher's engine settings) to a run's card where the window did not send them.
+pub fn with_settings(card: &mut Map<String, Value>) {
+    for (k, v) in settings_current(&crate::settings::Settings::load()) {
+        card.entry(k).or_insert(v);
+    }
 }
 
 /// Applies a previewed change to the saved settings; the token must be the one of a fresh preview of the same preset against the settings as they are now (a stale or missing token changes nothing).
 pub fn apply_settings(p: &Project, scope: Scope, id: &str, model: &str, target: &str, token: &str) -> Result<Value> {
-    if !matches!(target, "settings_teacher" | "settings_vllm") {
+    if !matches!(target, "settings_teacher" | "settings_vllm" | "settings_llama" | "settings_forward") {
         return Err(Error::new("Only the settings targets are applied here; the pages fill their own settings."));
     }
     let pv = apply_preview(p, scope, id, model, target, &Map::new())?;
@@ -149,6 +161,9 @@ pub fn apply_settings(p: &Project, scope: Scope, id: &str, model: &str, target: 
             "max_num_seqs" => s.vllm.teacher.max_num_seqs = to,
             "vllm_batch_tokens" => s.vllm.teacher.batch_tokens = to,
             "gpu_util_pct" => s.vllm.teacher.gpu_util_pct = to,
+            "try_calib_batch" => s.try_calib_batch = to,
+            "think_batch" => s.think_batch = to,
+            "llama_ngl" => s.llama_ngl = Some(to).filter(|n| *n < super::llama::ALL),          // "all of them" is the empty setting
             _ => continue,
         }
         done.push(c);
@@ -176,6 +191,9 @@ fn label(knob: &str) -> &str {
         "student_batch_tokens" => "Tokens per forward pass",
         "teacher_batch_tokens" => "Teacher tokens per forward pass",
         "max_num_seqs" => "vLLM rows scored at once",
+        "llama_ngl" => "llama.cpp: layers on the card",
+        "try_calib_batch" => "Try first: rows measured together",
+        "think_batch" => "Thinking check: questions asked together",
         "vllm_batch_tokens" => "vLLM tokens per batch",
         "gpu_util_pct" => "vLLM share of the card (%)",
         other => other,
@@ -188,12 +206,12 @@ fn label(knob: &str) -> &str {
 pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, target: &str, current: &Map<String, Value>) -> Result<Value> {
     let settings_now;
     let current = match target {
-        "settings_teacher" | "settings_vllm" => {
+        "settings_teacher" | "settings_vllm" | "settings_llama" | "settings_forward" => {
             settings_now = settings_current(&crate::settings::Settings::load());
             &settings_now
         }
         "heal_card" | "auto" | "try" | "think" | "imatrix" => current,
-        _ => return Err(Error::new("Apply to what? heal_card, auto, settings_teacher, settings_vllm, try, think or imatrix.")),
+        _ => return Err(Error::new("Apply to what? heal_card, auto, settings_teacher, settings_vllm, settings_llama, settings_forward, try, think or imatrix.")),
     };
     let store = Store::new(Some(&p.folder));
     let preset = store.get(scope, id)?;
@@ -204,8 +222,9 @@ pub fn apply_preview(p: &Project, scope: Scope, id: &str, model: &str, target: &
         return Err(Error::new(format!("That preset was measured on another PC ({}): it is listed but never applied here.", preset.machine.gpu)));
     }
     let mut values = if kind.whole() { preset.values() } else { preset.transferable_values() };
-    if let Some(keys) = target_keys(target) {
-        values.retain(|k, _| keys.contains(&k.as_str()));          // a settings target only takes its own knobs
+    match target_keys(target) {
+        Some(keys) => values.retain(|k, _| keys.contains(&k.as_str())),          // a settings target only takes its own knobs
+        None => values.retain(|k, _| !super::real::SETTINGS_KEYS.contains(&k.as_str())),          // the pages' own fields never take a saved setting
     }
     let mut changes = Vec::new();
     for (k, from, to) in diff(current, &values) {
@@ -251,5 +270,6 @@ pub fn tuned_snapshot(p: &Project, scope: Scope, id: &str) -> Result<crate::resh
         preset_id: preset.id.clone(), scope: format!("{}", match scope { Scope::Project => "project", Scope::Library => "library" }), name: preset.name.clone(), match_kind: "chosen".into(), values: preset.values(),
         tokens_per_s: m.and_then(|m| m["tokens_per_s"].as_f64()), measured_student_b: m.and_then(|m| m["student_b"].as_f64()).or(Some(preset.model.params as f64 / 1e9).filter(|b| *b > 0.0)),
         default_tokens_per_s: m.and_then(|m| m["default_tokens_per_s"].as_f64()),
+        chosen_keys: preset.functions.values().flat_map(|f| f.chosen.keys().cloned()).collect(),
     })
 }

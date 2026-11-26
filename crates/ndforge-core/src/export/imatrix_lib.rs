@@ -500,7 +500,7 @@ pub fn build_job(p: &Project, spec: &MakeSpec, id: &str, stop_file: &Path) -> Re
         _ => return Err(Error::new("Choose the calibration text: your saved data, or a text file of your own.")),
     };
     Ok(json!({"job": "imatrix_make", "root": lib_dir(p), "id": id, "label": tidy_label(&spec.label), "model_name": name, "stop_file": stop_file, "chunks": spec.chunks, "ctx": IMATRIX_CTX,
-              "nextn": spec.nextn, "ngl": 99, "dat": spec.dat, "statistics": true, "source": source, "calibration": calibration}))
+              "nextn": spec.nextn, "ngl": crate::settings::Settings::load().llama_ngl.unwrap_or(99), "dat": spec.dat, "statistics": true, "source": source, "calibration": calibration}))
 }
 
 /// The name an id is made from (the same one `build_job` puts in the job).

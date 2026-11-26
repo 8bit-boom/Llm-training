@@ -212,6 +212,7 @@ fn help_pages_render() {
     assert!(help_markdown("data").contains("Training bundle"));
     let u = help_markdown("use");
     assert!(u.contains("Mixed precision (our own recipe)") && u.contains("Compare these sizes") && u.contains("experimental") && u.contains("whole batch") && !u.contains("UD-") && !u.contains("Dynamic"));
+    assert!(help_markdown("tune").contains("Not tested: sequence length") && help_markdown("guide").contains("Find the best settings for this PC"));
     let m = help_markdown("imatrix");
     assert!(m.contains("Merge matrices") && m.contains("adds the statistics") && m.contains("unmodified base model") && m.contains("imatrix_downloads") && m.contains("**size**") && !m.contains("UD-") && !m.contains("Dynamic"));
     let q = help_markdown("quantcheck");

@@ -44,6 +44,14 @@ pub fn overrides(v: &Variant, seed: u64) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("seed".into(), json!(seed));
     match v.knob.as_str() {
+        "combined" => {
+            for (k, x) in v.value.as_object().into_iter().flatten() {
+                m.insert(k.clone(), x.clone());
+                if k == "rank" {
+                    m.insert("alpha".into(), x.clone());
+                }
+            }
+        }
         "rank" => {
             m.insert("rank".into(), v.value.clone());
             m.insert("alpha".into(), v.value.clone());
@@ -77,7 +85,7 @@ pub fn decide_quality(rows: &[Value], card_mb: Option<f64>) -> (Vec<KnobDecision
     let base = b.map(|b| (a + b) / 2.0).unwrap_or(a);
     let noise = b.map(|b| (a - b).abs()).unwrap_or(0.0);
     let need = (2.0 * noise).max(0.01 * base).max(if b.is_none() { DEFAULT_SPREAD * base } else { 0.0 });
-    let mut knobs: Vec<String> = rows.iter().filter_map(|r| r["knob"].as_str().filter(|k| !k.is_empty()).map(String::from)).collect();
+    let mut knobs: Vec<String> = rows.iter().filter_map(|r| r["knob"].as_str().filter(|k| !k.is_empty() && *k != "combined").map(String::from)).collect();
     knobs.dedup();
     let mut seen = std::collections::BTreeSet::new();
     knobs.retain(|k| seen.insert(k.clone()));
@@ -98,7 +106,44 @@ pub fn decide_quality(rows: &[Value], card_mb: Option<f64>) -> (Vec<KnobDecision
         }
     }
     let _ = needed_gain;
+    confirm_together(&mut out, rows, base, need, card_mb);
     (out, noise, base)
+}
+
+/// The knobs were each tried alone; the settings that won are now ALSO tried together (the row `combined`, when the run made it). They are kept together only when the combination beats the baseline by the same
+/// margin and gets at least 90 % of the best single gain; else only the best single knob stays and the others say they did not add up. A combination that did not finish or was not tried changes nothing here.
+fn confirm_together(out: &mut [KnobDecision], rows: &[Value], base: f64, need: f64, card_mb: Option<f64>) {
+    let changed = out.iter().filter(|k| k.changed).count();
+    if changed < 2 {
+        return;
+    }
+    let Some(c) = rows.iter().find(|r| r["id"] == "combined" && r["ok"] == true).filter(|r| card_mb.is_none_or(|m| r["peak_vram_mb"].as_f64().unwrap_or(0.0) <= VRAM_SHARE_LIMIT * m)) else {
+        let why = rows.iter().find(|r| r["id"] == "combined").map(|r| if r["oom"] == true { "out of memory".to_string() } else { "did not finish".to_string() });
+        if let Some(why) = why {
+            for k in out.iter_mut().filter(|k| k.changed) {
+                k.why += &format!(" Tried together with the other winners, the combination {why}: this was not confirmed.");
+            }
+        }
+        return;
+    };
+    let gain_c = after(c).map(|x| base - x).unwrap_or(f64::MIN);
+    let best = out.iter().filter(|k| k.changed).map(|k| k.gain_loss).fold(f64::MIN, f64::max);
+    if gain_c > need && gain_c >= 0.9 * best {
+        for k in out.iter_mut().filter(|k| k.changed) {
+            k.why += &format!(" Tried together with the other winners: {gain_c:.4} lower than yours, so they are kept together.");
+        }
+        return;
+    }
+    let keep = out.iter().filter(|k| k.changed).max_by(|a, b| a.gain_loss.partial_cmp(&b.gain_loss).unwrap_or(std::cmp::Ordering::Equal)).map(|k| k.knob.clone());
+    for k in out.iter_mut().filter(|k| k.changed) {
+        if Some(&k.knob) == keep.as_ref() {
+            k.why += &format!(" Tried together with the others the gain was {gain_c:.4}, not more than this one alone: only this setting is kept.");
+        } else {
+            k.changed = false;
+            k.chosen = Value::Null;
+            k.why = format!("{} did not add up: all the winners together gained {gain_c:.4} against {best:.4} for the best one alone, so only that one is kept.", k.knob);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +183,39 @@ mod tests {
         assert!(rank.changed && rank.chosen == json!(32), "128 is over 90 % of the card");
         let w = d.iter().find(|x| x.knob == "warmup").unwrap();
         assert!(!w.changed, "a gain inside the noise changes nothing");
+    }
+
+    fn two_winners() -> Vec<Value> {
+        vec![row("baseline", "", Value::Null, 2.00, 1000.0), row("baseline2", "", Value::Null, 2.02, 1000.0), row("rank=32", "rank", json!(32), 1.80, 1000.0), row("warmup=100", "warmup", json!(100), 1.85, 1000.0)]
+    }
+
+    #[test]
+    fn winners_that_also_win_together_are_kept_together() {
+        let mut rows = two_winners();
+        rows.push(json!({"id": "combined", "knob": "combined", "value": {"rank": 32, "warmup": 100}, "ok": true, "held_after": 1.72, "peak_vram_mb": 1000.0}));
+        let (d, _, _) = decide_quality(&rows, Some(10000.0));
+        assert!(d.iter().all(|k| k.changed) && d.len() == 2 && d[0].why.contains("kept together"), "{d:?}");
+    }
+
+    #[test]
+    fn winners_that_do_not_add_up_leave_only_the_best_one() {
+        let mut rows = two_winners();
+        rows.push(json!({"id": "combined", "knob": "combined", "value": {"rank": 32, "warmup": 100}, "ok": true, "held_after": 1.95, "peak_vram_mb": 1000.0}));
+        let (d, _, _) = decide_quality(&rows, Some(10000.0));
+        let rank = d.iter().find(|k| k.knob == "rank").unwrap();
+        let warm = d.iter().find(|k| k.knob == "warmup").unwrap();
+        assert!(rank.changed && !warm.changed && warm.why.contains("did not add up"), "{d:?}");
+        let mut failed = two_winners();
+        failed.push(json!({"id": "combined", "knob": "combined", "ok": false, "oom": true}));
+        let (d2, _, _) = decide_quality(&failed, Some(10000.0));
+        assert!(d2.iter().all(|k| k.changed) && d2[0].why.contains("not confirmed"), "an unconfirmed combination does not remove a winner, and says so: {d2:?}");
+    }
+
+    #[test]
+    fn the_combined_overrides_set_every_knob_and_the_alpha_with_the_rank() {
+        let v = Variant { id: "combined".into(), knob: "combined".into(), value: json!({"rank": 32, "warmup": 100}), label: "all".into() };
+        let o = overrides(&v, 1);
+        assert_eq!((o["rank"].clone(), o["alpha"].clone(), o["warmup"].clone()), (json!(32), json!(32), json!(100)));
     }
 
     #[test]

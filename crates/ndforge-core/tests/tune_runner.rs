@@ -48,6 +48,22 @@ fn a_candidate_above_90_percent_of_the_card_or_with_another_first_loss_is_exclud
 }
 
 #[test]
+fn the_original_s_batch_is_compared_with_the_budget_the_person_has_now() {
+    let rows = vec![row(0, 1000.0, 9000.0, 3.0), row(4096, 1300.0, 11000.0, 3.0), row(16384, 1500.0, 15000.0, 3.0), row(65536, 1510.0, 30000.0, 3.0)];
+    let d = decide_teacher(&rows, Some(32607.0), 0.02, 4096);
+    assert_eq!((d.chosen, d.changed), (16384, true), "{d:?}");
+    assert!((d.gain - 1.15).abs() < 0.01, "the gain is over the current 4096, not over the fixed rows: {}", d.gain);
+    let same = decide_teacher(&rows, Some(32607.0), 0.02, 16384);
+    assert_eq!((same.chosen, same.changed), (16384, false), "65536 is within the noise of the current 16384 and uses far more memory: {same:?}");
+    let back = decide_teacher(&[row(0, 1000.0, 9000.0, 3.0), row(16384, 700.0, 15000.0, 3.0)], Some(32607.0), 0.02, 16384);
+    assert_eq!((back.chosen, back.changed), (0, true), "a current budget that is clearly slower than the fixed rows goes back to it: {back:?}");
+    let odd = decide_teacher(&[row(0, 1000.0, 9000.0, 3.0), row(8192, 1400.0, 15000.0, 3.0)], Some(32607.0), 0.02, 20000);
+    assert_eq!((odd.chosen, odd.changed), (8192, true), "a current value that was not measured is compared with the fixed rows");
+    let bad = decide_teacher(&[row(0, 1000.0, 9000.0, 3.0), row(8192, 1400.0, 15000.0, 3.2)], Some(32607.0), 0.02, 16384);
+    assert!(!bad.changed && bad.chosen == 16384 && bad.why.contains("NOT equivalent"), "{bad:?}");
+}
+
+#[test]
 fn the_loss_rows_decide_the_chunk_and_the_logits() {
     let rows = vec![json!({"id": "current", "chunk": 128, "head_checkpoint": true, "ok": true, "tokens_per_s": 300.0}), json!({"id": "chunk_256", "chunk": 256, "head_checkpoint": true, "ok": true, "tokens_per_s": 318.0}),
                     json!({"id": "keep_logits_chunk_256", "chunk": 256, "head_checkpoint": false, "ok": true, "tokens_per_s": 345.0}), json!({"id": "chunk_512", "ok": false, "oom": true})];
@@ -97,6 +113,13 @@ fn fx() -> Fx {
     let mut outs = BTreeMap::new();
     outs.insert("heal.student_batch".to_string(), Ok(TestOut { rows: vec![row(0, 324.0, 21000.0, 2.0), row(4096, 780.0, 24000.0, 2.0)], raw: json!({"spread": 0.02, "rows": {"mean": 173}}), ..Default::default() }));
     outs.insert("heal.loss".to_string(), Ok(TestOut { rows: vec![json!({"id": "current", "chunk": 128, "head_checkpoint": true, "ok": true, "tokens_per_s": 300.0}), json!({"id": "keep_logits_chunk_256", "chunk": 256, "head_checkpoint": false, "ok": true, "tokens_per_s": 345.0})], ..Default::default() }));
+    outs.insert("teacher.standard".to_string(), Ok(TestOut { rows: vec![row(0, 1000.0, 9000.0, 3.0), row(8192, 1100.0, 12000.0, 3.0), row(32768, 1600.0, 20000.0, 3.0)], raw: json!({"spread": 0.02}), ..Default::default() }));
+    let vrow = |id: &str, knob: &str, value: Value, t: f64| json!({"id": id, "knob": knob, "value": value, "label": id, "ok": true, "tokens_per_s": t, "top1": 0.99, "kl": 0.004, "gpu_lowered": false});
+    outs.insert("teacher.vllm".to_string(), Ok(TestOut { rows: vec![vrow("baseline", "", Value::Null, 3000.0), vrow("baseline2", "", Value::Null, 3030.0), vrow("max_num_seqs=64", "max_num_seqs", json!(64), 4100.0), vrow("gpu_util_pct=80", "gpu_util_pct", json!(80), 3050.0)], ..Default::default() }));
+    outs.insert("try.calib_batch".to_string(), Ok(TestOut { rows: vec![row(0, 500.0, 9000.0, 2.5), row(1, 300.0, 6000.0, 2.5), row(8, 800.0, 14000.0, 2.5), row(16, 810.0, 25000.0, 2.5)], raw: json!({"spread": 0.02}), ..Default::default() }));
+    outs.insert("think.batch".to_string(), Ok(TestOut { rows: vec![row(0, 100.0, 9000.0, 0.0), row(16, 104.0, 12000.0, 0.0)], raw: json!({"spread": 0.03}), ..Default::default() }));
+    outs.insert("disk".to_string(), Ok(TestOut { rows: vec![json!({"mb": 2048.0, "write_mb_s": 1800.0, "read_mb_s": 3200.0})], raw: json!({"mb": 2048.0, "write_mb_s": 1800.0, "read_mb_s": 3200.0, "dir": "D:/models"}), ..Default::default() }));
+    outs.insert("llama.offload".to_string(), Ok(TestOut { rows: vec![json!({"ngl": 99, "ok": false, "oom": true, "error": "cudaMalloc failed"}), json!({"ngl": 48, "ok": true, "tokens_per_s": 180.0})], raw: json!({"gguf": "model-f16.gguf", "gguf_mb": 54000}), ..Default::default() }));
     Fx { events: vec![], outs, stop_after_tests: None, ran: vec![], gpu: Some((30000, 32607, vec![])), dirs: vec![] }
 }
 
@@ -192,12 +215,16 @@ fn a_failed_test_is_recorded_and_the_run_goes_on() {
 #[test]
 fn the_hours_cap_drops_the_tail_and_a_test_this_version_cannot_run_is_not_planned() {
     let t = tempfile::tempdir().unwrap();
-    let (_, st, _) = setup(&t, &["heal.student_batch", "heal.loss", "heal.quality", "disk"], Some(0.6));
+    let (_, st, _) = setup(&t, &["heal.student_batch", "heal.loss", "heal.quality", "nothing"], Some(0.6));
     assert_eq!(st.tests.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), vec!["heal.student_batch"], "36 minutes cover the first test only; the others are not built or do not fit");
-    let spec = Spec { model: "m".into(), tests: vec!["heal.student_batch".into(), "teacher.standard".into()], ..Default::default() };
-    let v = plan_view(&spec, 20.1, 1_000_000, &BTreeMapNotes::new());
-    let q = v["tests"].as_array().unwrap().iter().find(|x| x["id"] == "teacher.standard").unwrap();
-    assert!(q["unavailable"].as_str().unwrap().contains("not built") && q["tier"] == 1);
+    let spec = Spec { model: "m".into(), tests: vec!["heal.student_batch".into(), "disk".into(), "finetune.speed".into()], ..Default::default() };
+    let mut notes = BTreeMapNotes::new();
+    notes.insert("disk".into(), "The drive has 1.0 GB free and the test needs 4.0 GB.".into());
+    let v = plan_view(&spec, 20.1, 1_000_000, &notes);
+    let q = v["tests"].as_array().unwrap().iter().find(|x| x["id"] == "disk").unwrap();
+    assert!(q["unavailable"].as_str().unwrap().contains("needs 4.0 GB") && q["tier"] == 3);
+    assert!(CATALOG.iter().all(|d| d.built), "every test of the catalog is built in this version");
+    assert!(v["tests"].as_array().unwrap().iter().all(|x| x["id"] != "finetune.speed"), "a test that is not in the catalog is not planned");
     let total = v["total_minutes"].as_array().unwrap();
     assert!(total[0].as_f64().unwrap() >= 15.0 && total[1].as_f64().unwrap() <= 26.0, "only the test that can run counts: {total:?}");
     assert!(v["done_between"][1].as_i64().unwrap() > v["done_between"][0].as_i64().unwrap());
@@ -243,4 +270,81 @@ fn the_quality_trials_become_a_quality_class_result_that_says_short_trial_and_ch
     assert_eq!((fr.class.as_str(), fr.tier), ("quality", 2));
     assert_eq!(fr.chosen.get("rank"), Some(&json!(32)));
     assert!(!fr.chosen.contains_key("warmup") && fr.note.contains("short trial, not a full heal"), "{}", fr.note);
+}
+
+#[test]
+fn the_teacher_test_runs_after_the_exact_ones_and_lands_in_the_preset_as_the_teacher_batch() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["teacher.standard", "heal.loss"], None);
+    assert_eq!(st.tests.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), vec!["heal.loss", "teacher.standard"]);
+    let mut f = fx();
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    let r = st.tests.iter().find(|x| x.id == "teacher.standard").unwrap();
+    assert_eq!(r.status, "done");
+    let fr = r.result.as_ref().expect("a better budget makes a result");
+    assert_eq!(fr.chosen["teacher_batch_tokens"], json!(32768));
+    assert_eq!(fr.default["teacher_batch_tokens"], json!(16384), "the default is the Settings value when the card says nothing");
+    assert_eq!((fr.tier, fr.class.as_str()), (1, "tol"));
+}
+
+#[test]
+fn the_vllm_test_keeps_only_the_settings_that_won_and_says_they_were_tried_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["teacher.vllm"], None);
+    let mut f = fx();
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    let r = &st.tests[0];
+    let fr = r.result.as_ref().expect("max_num_seqs wins");
+    assert_eq!(fr.chosen.len(), 1);
+    assert_eq!(fr.chosen["max_num_seqs"], json!(64));
+    assert!(fr.note.contains("tried alone") && fr.note.contains("gpu_util_pct: No value is clearly faster"), "{}", fr.note);
+    assert_eq!((fr.tier, fr.class.as_str()), (1, "tol"));
+    let p = store.get(Scope::Project, st.preset_id.as_ref().unwrap()).unwrap();
+    assert_eq!(p.values()["max_num_seqs"], json!(64), "the preset carries the engine setting, for the settings target");
+}
+
+#[test]
+fn the_offload_test_makes_a_setting_only_when_all_the_layers_did_not_fit() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["llama.offload"], None);
+    let mut f = fx();
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    let fr = st.tests[0].result.as_ref().expect("48 layers ran where 99 did not");
+    assert_eq!((fr.chosen["llama_ngl"].clone(), fr.default["llama_ngl"].clone()), (json!(48), json!(99)));
+    assert_eq!((fr.tier, fr.class.as_str()), (3, "exact"));
+    assert!(fr.note.contains("99 layers: out of memory"), "{}", fr.note);
+    assert_eq!(ndforge_core::tune::llama::candidates(64)[0], 99);
+    let (proj2, mut st2, store2) = setup(&tempfile::tempdir().unwrap(), &["llama.offload"], None);
+    let mut g = fx();
+    g.outs.insert("llama.offload".to_string(), Ok(TestOut { rows: vec![json!({"ngl": 99, "ok": true, "tokens_per_s": 900.0})], ..Default::default() }));
+    run(&mut g, &proj2, &mut st2, Some(32607.0), &store2).unwrap();
+    assert!(st2.tests[0].result.is_none(), "everything fits: nothing to change");
+}
+
+#[test]
+fn the_forward_pass_batch_tests_decide_their_own_settings_and_say_what_the_number_counts() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["try.calib_batch", "think.batch"], None);
+    let mut f = fx();
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    let calib = st.tests.iter().find(|x| x.id == "try.calib_batch").unwrap();
+    let fr = calib.result.as_ref().expect("8 rows together is 1.6 times as fast");
+    assert_eq!(fr.chosen["try_calib_batch"], json!(8), "16 is within the noise of 8 and takes far more memory");
+    assert!(fr.note.contains("rows together") && fr.class == "tol");
+    let think = st.tests.iter().find(|x| x.id == "think.batch").unwrap();
+    assert!(think.result.is_none(), "4 % is inside the noise: the questions stay as they are");
+    assert!(think.decision["why"].as_str().unwrap().contains("Within noise"), "{}", think.decision);
+    assert_eq!(def("think.batch").unwrap().class, "stat", "sampling makes it the same on average, not one by one");
+}
+
+#[test]
+fn the_disk_test_decides_nothing_but_keeps_its_numbers_in_the_preset() {
+    let t = tempfile::tempdir().unwrap();
+    let (proj, mut st, store) = setup(&t, &["disk"], None);
+    let mut f = fx();
+    run(&mut f, &proj, &mut st, Some(32607.0), &store).unwrap();
+    let fr = st.tests[0].result.as_ref().expect("the numbers are kept");
+    assert!(fr.chosen.is_empty() && fr.measured["write_mb_s"] == json!(1800.0) && fr.measured["read_mb_s"] == json!(3200.0));
+    let p = store.get(Scope::Project, st.preset_id.as_ref().unwrap()).unwrap();
+    assert!(p.functions.contains_key("disk") && p.transferable_values().is_empty());
 }

@@ -134,7 +134,7 @@ test("one click starts the run with the ticked tests, the cap and the card's set
 });
 
 test("the events fill the progress and the live rows, and the end shows Apply and save preset with every change and its gain", async () => {
-  const b = tunePage({ tune_apply_preview: pv });
+  const b = tunePage({ tune_apply_preview: (a) => (a.target === "heal_card" ? pv : { ...pv, changes: [] }) });
   await b.run("tuLoadPlan()");
   await b.run("tuGo()");
   await b.run(`onTuneEvent({ kind: "tune_test", index: 0, total: 2, id: "heal.student_batch", label: "Tokens per forward pass", status: "running" })`);
@@ -144,10 +144,11 @@ test("the events fill the progress and the live rows, and the end shows Apply an
   assert.match(html, /4096 tokens per forward pass is 2\.41 times as fast as one row/);
   await b.run(`onTuneEvent({ kind: "done", data: { run: "20261122-1000", status: "done", preset_id: "t-new" } })`);
   html = b.run("tuAutoHtml()");
-  assert.match(html, /Apply and save preset/); assert.match(html, /already saved/); assert.match(html, /Tokens per forward pass<\/td><td>0<\/td><td><strong>8192<\/strong><\/td><td>×2\.41/);
+  assert.match(html, /Apply and save preset/); assert.match(html, /already saved/); assert.match(html, /Tokens per forward pass<\/td><td class="dim small">Heal card<\/td><td>0<\/td><td><strong>8192<\/strong><\/td><td>×2\.41/);
   assert.match(html, /id="tu-apply-all"(?![^>]*disabled)/);
-  const prev = plain(b.calls.filter((c) => c[0] === "tune_apply_preview").pop()[1]);
+  const prev = plain(b.calls.filter((c) => c[0] === "tune_apply_preview")[0][1]);
   assert.deepEqual([prev.presetId, prev.scope, prev.target], ["t-new", "project", "heal_card"]);
+  assert.deepEqual(b.calls.filter((c) => c[0] === "tune_apply_preview").map((c) => plain(c[1]).target), ["heal_card", "settings_teacher", "settings_vllm", "settings_llama", "settings_forward"], "the saved settings are previewed too");
   b.run("wireTune()");
   b.els["tu-apply-all"].onclick();
   assert.equal(b.run("rs.hlSpec.student_batch_tokens"), 8192); assert.equal(b.run("rs.hlSpec.kl_chunk"), 256);
@@ -178,4 +179,47 @@ test("the Heal card and the Auto page have the Auto button, and Auto can use a t
   a.run(`ac.tunedList = [{ id: "t-aaa", scope: "project", name: "Tested", model: "slim-w" }]; ac.tunedSnap = ${JSON.stringify({ preset_id: "t-aaa", values: { student_batch_tokens: 8192, kl_chunk: 256, seq: 4096 }, tokens_per_s: 780 })}`);
   const html = a.run(`acTunedHtml("")`);
   assert.match(html, /Use tested settings for this PC/); assert.match(html, /student batch tokens 8192, kl chunk 256/); assert.doesNotMatch(html, /seq 4096/); assert.match(html, /measured 780 tokens\/s/);
+});
+
+test("the saved settings a test decided are in the same confirmation and are applied with the token of their own preview", async () => {
+  const spv = { changes: [{ setting: "teacher_batch_tokens", label: "Teacher tokens per forward pass", from: 16384, to: 32768, gain: 1.4, function: "teacher.standard", class: "tol", why: "" }], token: "a-teacher", name: "Tested", whole: true, kind: "exact", note: "", stale: [], gain: 1.4, context: [] };
+  const b = tunePage({ tune_apply_preview: (a) => (a.target === "heal_card" ? pv : a.target === "settings_teacher" ? spv : { ...pv, changes: [] }), tune_apply: { applied: [] } });
+  await b.run("tuLoadPlan()");
+  await b.run("tuGo()");
+  await b.run(`onTuneEvent({ kind: "done", data: { run: "20261122-1000", status: "done", preset_id: "t-new" } })`);
+  const html = b.run("tuAutoHtml()");
+  assert.match(html, /Teacher tokens per forward pass<\/td><td class="dim small">Settings<\/td><td>16384<\/td><td><strong>32768<\/strong>/);
+  assert.match(html, /Tokens per forward pass<\/td><td class="dim small">Heal card<\/td>/);
+  b.run("wireTune()");
+  await b.els["tu-apply-all"].onclick();
+  const applied = b.calls.filter((c) => c[0] === "tune_apply").map((c) => plain(c[1]));
+  assert.deepEqual(applied.map((a) => [a.target, a.token, a.presetId, a.scope, a.model]), [["settings_teacher", "a-teacher", "t-new", "project", "slim-w"]], "only the target with changes, with its own token");
+  assert.equal(b.run("rs.hlSpec.student_batch_tokens"), 8192);
+  assert.match(b.run("renderTune()"), /Applied 2 changes to the Heal card and saved 1 program setting\./);
+});
+
+test("the Auto page says what Auto-cut takes from a preset and what it does not, and its button runs the one-click Auto for the latest made model", async () => {
+  const b = tunePage();
+  b.run(`page = "auto"; ac.tunedList = []; ac.tunedSnap = ${JSON.stringify({ preset_id: "t-aaa", values: { student_batch_tokens: 8192, teacher_batch_tokens: 32768, rank: 32, optimizer: "adamw", seq: 4096 }, chosen_keys: ["student_batch_tokens", "teacher_batch_tokens", "rank", "think_batch"], tokens_per_s: 780 })}`);
+  const html = b.run(`acTunedHtml("")`);
+  assert.match(html, /heals of this run use: student batch tokens 8192, teacher batch tokens 32768/);
+  assert.match(html, /Not taken by Auto-cut: rank 32/); assert.doesNotMatch(html, /Not taken by Auto-cut:[^<]*seq/);
+  assert.match(html, /short trial heals, not a full heal/); assert.match(html, /Program settings in this preset \(think batch\) are saved from the Tune page/);
+  assert.match(html, /id="ac-tune-auto"(?![^>]*disabled)[^>]*>Auto: test and choose the best settings for slim-w/);
+  b.run(`ac.tunedSnap = ${JSON.stringify({ preset_id: "t-bbb", values: { teacher_batch_tokens: 32768, kl_chunk: 256 }, chosen_keys: [] })}`);
+  assert.doesNotMatch(b.run(`acTunedHtml("")`), /teacher batch tokens/, "the card's untouched copy of a setting is not a test result");
+  const orig = b.run("globalThis.confirm = () => true; 1");
+  await b.run(`tuneAutoFor(acTuneModel())`);
+  const start = b.calls.find((c) => c[0] === "tune_start");
+  assert.ok(start, "the one-click Auto is started"); assert.equal(plain(start[1]).spec.model, "slim-w");
+  assert.equal(orig, 1);
+});
+
+test("the live table shows the number each kind of test measures: speed, the held-out loss of a short trial, layers on the card, the disk", async () => {
+  const b = tunePage();
+  await b.run("tuLoadPlan()");
+  b.run(`tu.runId = "20261122-1000"; tu.state = ${JSON.stringify(stateOf())}; tu.rows = { q: [{ id: "rank=32", label: "LoRA size 32", ok: true, held_after: 1.8123, peak_vram_mb: 20480 }], l: [{ ngl: 48, ok: true, tokens_per_s: 180 }], d: [{ write_mb_s: 1800, read_mb_s: 3200, mb: 2048 }] }`);
+  const html = b.run("tuLiveHtml()");
+  assert.match(html, /LoRA size 32<\/td><td>held-out loss 1\.8123 \(short trial\)<\/td><td>20\.0 GB/);
+  assert.match(html, /48 layers on the card<\/td><td>180 tokens\/s/); assert.match(html, /Disk<\/td><td>writes 1800 MB\/s, reads 3200 MB\/s/);
 });
