@@ -105,3 +105,27 @@ fn a_settings_target_needs_the_token_of_a_fresh_preview_and_changes_only_its_own
     let plain = ndforge_core::vllm::teacher_engine_job(&ndforge_core::settings::VllmSettings::default(), None);
     assert!(plain.get("max_num_seqs").is_none() && plain.get("batch_tokens").is_none() && plain.get("gpu_memory_utilization").is_none());
 }
+
+#[test]
+fn the_pages_cards_never_take_a_saved_setting_and_the_llama_offload_is_a_setting_of_its_own() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg"));
+    let p = Project::create(d.path(), "P").unwrap();
+    made_model(&p, "cut-a", 48);
+    let saved = save_card(&p, "cut-a", "A", Scope::Project, card(json!({"seq": 4096, "teacher_batch_tokens": 32768, "llama_ngl": 40, "max_num_seqs": 48})), "2026-11-22T10:00:00Z").unwrap();
+    let on_card = apply_preview(&p, Scope::Project, &saved.id, "cut-a", "heal_card", &Map::new()).unwrap();
+    let keys: Vec<&str> = on_card["changes"].as_array().unwrap().iter().map(|c| c["setting"].as_str().unwrap()).collect();
+    assert_eq!(keys, vec!["seq"], "the Heal card is filled with its own fields only: {keys:?}");
+    let pv = apply_preview(&p, Scope::Project, &saved.id, "cut-a", "settings_llama", &Map::new()).unwrap();
+    assert_eq!(pv["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(ndforge_core::settings::Settings::load().llama_ngl, None);
+    apply_settings(&p, Scope::Project, &saved.id, "cut-a", "settings_llama", pv["token"].as_str().unwrap()).unwrap();
+    assert_eq!(ndforge_core::settings::Settings::load().llama_ngl, Some(40));
+    let mut c = Map::new();
+    with_settings(&mut c);
+    assert_eq!(c["llama_ngl"], json!(40), "the run's card starts from the saved settings");
+    c.insert("teacher_batch_tokens".into(), json!(1));
+    with_settings(&mut c);
+    assert_eq!(c["teacher_batch_tokens"], json!(1), "a value the window sent is kept");
+}

@@ -265,7 +265,8 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
             job["engine"]["original"] = json!(true);          // the worker serves the configured pre-quantized checkpoint when the original does not fit (vllmquant.pick)
         }
     }
-    if let Some(b) = spec.batch.filter(|b| (1..=64).contains(b)) {
+    // the questions asked together: the window's choice, else the tested number of the settings, else the worker's own 8
+    if let Some(b) = spec.batch.or(Some(crate::settings::Settings::load().think_batch)).filter(|b| (1..=64).contains(b)) {
         job["batch"] = json!(b);
     }
     if let Some(n) = spec.max_new.filter(|n| (1..=65536).contains(n)) {

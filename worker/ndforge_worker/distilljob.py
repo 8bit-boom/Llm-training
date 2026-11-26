@@ -1657,6 +1657,47 @@ def _bench_batch_sweep(model, rows, reader, pad_id, k, vocab, chunk, head_ckpt, 
     return out
 
 
+def _bench_teacher_sweep(student, rows: list, d: dict, k: int, pad_id: int, b: dict, h: dict, cuda: bool) -> dict:
+    """bench.teacher_sweep: frees the student, loads the original as the heal does (`distill.teacher`), answers a sample of the real rows at every token budget of `healspeed.TEACHER_SWEEP` (0 = the fixed
+    `batch` rows) and returns `{"batch_sweep": {...}}` shaped like the student's sweep (`results` with `batch_tokens`, the noise, the recommendation). A budget that runs out of memory is a row."""
+    import gc
+    import torch
+    from . import healspeed, reshapejob
+    teacher = d.get("teacher") or {}
+    if not teacher.get("repo"):
+        raise ReshapeError("The test of the original's batch needs the original model (distill.teacher.repo).")
+    del student
+    gc.collect()
+    if cuda:
+        torch.cuda.empty_cache()
+    tdir = reshapejob._resolve_source(teacher["repo"])
+    protocol.progress("bench", 0.2, "Loading the original model")
+    held = [reshapejob._load(tdir, reshapejob._choose_load(teacher.get("load", "auto"), sum(r.nbytes for r in safetensors_io.list_tensors(tdir).values())), "load_teacher")]
+    chunk = int(d.get("chunk") or h["chunk"])
+    sample = healspeed.teacher_sample(rows, int(b.get("rows_tokens") or healspeed.TEACHER_SWEEP_TOKENS), int(h["seed"]))
+    card = torch.cuda.mem_get_info()[1] / 1e6 if cuda else None
+    try:
+        def answer(br):
+            try:
+                return _teacher_answers(held[0], br, k, chunk, pad_id)
+            except RuntimeError as exc:
+                if healmem.is_oom(exc):
+                    gc.collect()
+                    if cuda:
+                        torch.cuda.empty_cache()
+                    raise RuntimeError("out of memory") from None
+                raise
+        sweep = healspeed.teacher_sweep(sample, answer, rows_in_budget, max(1, int(h["batch"])), tuple(int(x) for x in b["teacher_sweep"]) if isinstance(b["teacher_sweep"], list) else healspeed.TEACHER_SWEEP,
+                                        card, int(b.get("sweep_repeat") or 2),
+                                        peak=(lambda: round(torch.cuda.max_memory_allocated() / 1e6)) if cuda else (lambda: None), reset_peak=torch.cuda.reset_peak_memory_stats if cuda else (lambda: None),
+                                        sync=torch.cuda.synchronize if cuda else (lambda: None))
+    finally:
+        held.clear()
+        reshapejob._free()
+    sweep["card_mb"] = round(card) if card else None
+    return {"batch_sweep": sweep, "teacher_sweep": True, "stopped": False, "targets": "rows"}
+
+
 def run_bench(cfg: dict) -> int:
     """job distill with `bench` (see `_run_bench`); with `bench.out_dir` the heal speed report is written on EVERY end, a failure included."""
     box: dict = {}
@@ -1730,6 +1771,12 @@ def _run_bench(cfg: dict, box: dict) -> int:
         raise ReshapeError("There is nothing to measure the speed on: the training data is empty.")
     inner = data.text_tokenizer(tokenizer)
     pad_id = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
+    if b.get("teacher_sweep"):
+        # the tuner's test of the original's tokens per forward pass: the student is not needed, the original answers the same real rows at several budgets (nothing is saved)
+        res = _bench_teacher_sweep(model, rows, d, k, pad_id, b, h, cuda)
+        protocol.progress("bench", 1.0, "")
+        protocol.result(res)
+        return 0
     collate = _distill_collator(pad_id, reader)
     batch = max(1, int(h["batch"]))
     vocab = int(model.get_output_embeddings().weight.shape[0])

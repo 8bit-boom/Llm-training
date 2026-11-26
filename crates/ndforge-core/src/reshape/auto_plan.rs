@@ -163,6 +163,9 @@ pub struct TunedUse {
     pub measured_student_b: Option<f64>,
     #[serde(default)]
     pub default_tokens_per_s: Option<f64>,
+    /// the knobs a TEST decided (not the card's untouched values): the original's batch is taken from the snapshot only when a test chose it
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_keys: Vec<String>,
 }
 
 impl TunedUse {
@@ -179,6 +182,17 @@ impl TunedUse {
         if let Some(c) = self.values.get("checkpointing").and_then(|v| v.as_str()).filter(|c| ["on", "off"].contains(c)) {
             spec.checkpointing = Some(c.to_string());
         }
+        if self.chosen_keys.iter().any(|k| k == "teacher_batch_tokens") {
+            spec.teacher_batch_tokens = n("teacher_batch_tokens");          // the original's answers (the cache step of the heal): a tolerance-class knob a test chose
+        }
+    }
+
+    /// What the snapshot drives in an Auto-cut run: `(drives, does_not)`: the speed knobs it carries (the numbers that change what the heals do or how fast) and what a preset also holds but an Auto run never takes.
+    pub fn drives(&self) -> (Vec<String>, Vec<String>) {
+        let speed = ["student_batch_tokens", "kl_chunk", "head_checkpoint", "checkpointing", "teacher_batch_tokens"];
+        let drives: Vec<String> = speed.iter().filter(|k| self.values.contains_key(**k) && (**k != "teacher_batch_tokens" || self.chosen_keys.iter().any(|c| c == **k))).map(|k| k.to_string()).collect();
+        let not: Vec<String> = self.values.keys().filter(|k| !drives.contains(k)).cloned().collect();
+        (drives, not)
     }
 }
 

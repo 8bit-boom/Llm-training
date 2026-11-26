@@ -1,7 +1,7 @@
 //! The instruction texts shown in the help panel of every page (Markdown files in `help/`, compiled in).
 use pulldown_cmark::{html, Options, Parser};
 
-const PAGES: [(&str, &str); 15] = [
+const PAGES: [(&str, &str); 16] = [
     ("welcome", include_str!("../help/welcome.md")),
     ("data", include_str!("../help/data.md")),
     ("dataset", include_str!("../help/dataset.md")),
@@ -12,6 +12,7 @@ const PAGES: [(&str, &str); 15] = [
     ("storage", include_str!("../help/storage.md")),
     ("memory", include_str!("../help/memory.md")),
     ("reshape", include_str!("../help/reshape.md")),
+    ("tune", include_str!("../help/tune.md")),
     ("imatrix", include_str!("../help/imatrix.md")),
     ("quantcheck", include_str!("../help/quantcheck.md")),
     ("setup", include_str!("../help/setup.md")),

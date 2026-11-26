@@ -246,6 +246,23 @@ pub fn candidates(p: &Project) -> Value {
     json!({"references": refs, "quants": quants})
 }
 
+/// The 16-bit GGUF the tuner's offload test runs on: the largest reference of `candidates` (an export's 16-bit file or one an earlier comparison kept), with its size in MB. None when the project has none.
+pub fn offload_reference(p: &Project) -> Option<(PathBuf, f64)> {
+    let c = candidates(p);
+    c["references"].as_array()?.iter().filter_map(|r| Some((PathBuf::from(r["path"].as_str()?), r["size_mb"].as_f64().unwrap_or(0.0)))).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// The tuner's test of llama.cpp's offload (docs/TUNE.md): the worker job `llama_offload_tune` runs a short `llama-imatrix` pass on the largest 16-bit GGUF of the project with fewer and fewer layers on the card
+/// (`candidates`, the most first) until one runs. Stop writes the STOP file of `work`; the worker kills llama.cpp and ends. Returns the worker's result (`rows`, `gguf`, `stopped`).
+pub fn offload_tune(p: &Project, candidates: &[u32], work: &Path, stop: &AtomicBool, on_event: &mut dyn FnMut(Value)) -> Result<Value> {
+    let (gguf, _) = offload_reference(p).ok_or_else(|| Error::new("There is no 16-bit GGUF in this project to test with: export a model as F16 once, or run Compare quants (it keeps a reference)."))?;
+    let py = python()?;
+    std::fs::create_dir_all(work)?;
+    let _ = std::fs::remove_file(work.join("STOP"));
+    let job = json!({"job": "llama_offload_tune", "gguf": gguf, "ctx": CTX, "chunks": 6, "candidates": candidates, "work": work, "stop_file": work.join("STOP")});
+    run_export_job(&py, &job, work, Some(IMATRIX_STOP_GRACE), stop, &mut |e| on_event(event(e)))
+}
+
 /// Everything the "Compare quants" card needs.
 pub fn state(p: &Project) -> Value {
     let runs: Vec<Value> = exportable_runs(p).iter().map(|r| json!({"name": r["name"], "model": r["model"], "status": r["status"]})).collect();
@@ -354,7 +371,7 @@ pub fn build_job(p: &Project, spec: &CompareSpec, id: &str, stop_file: &Path) ->
         }
         _ => return Err(Error::new("Choose the test text: the held-out part of your saved data, a general text, or a text file of your own.")),
     };
-    Ok(json!({"job": "quantcheck", "root": dir(p), "id": id, "resume": spec.resume.is_some(), "stop_file": stop_file, "chunks": spec.chunks, "ctx": CTX, "ngl": 99,
+    Ok(json!({"job": "quantcheck", "root": dir(p), "id": id, "resume": spec.resume.is_some(), "stop_file": stop_file, "chunks": spec.chunks, "ctx": CTX, "ngl": crate::settings::Settings::load().llama_ngl.unwrap_or(99),
               "keep_logits": spec.keep_logits, "reference": reference, "quants": quants, "text": text}))
 }
 

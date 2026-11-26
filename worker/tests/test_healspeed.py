@@ -70,3 +70,42 @@ def test_the_report_is_always_written_and_scrubbed(tmp_path, monkeypatch):
     assert "slow PyTorch kernels" in md and "fla is 3.1 times faster" in md and "best at 16 rows per forward (1500 tokens/s), against 1100 with the fixed 4" in md and "HAGS: on" in md
     assert "hypotheses until this report confirms them" in md
     assert json.loads(js)["status"] == "failed"
+
+
+def test_the_teacher_sweep_answers_the_same_rows_at_every_budget_and_measures_the_noise_and_the_memory():
+    import numpy as np
+    rows = [{"input_ids": list(range(n))} for n in (100, 90, 80, 70, 60, 50, 40, 30)]
+    seen: dict = {}
+
+    def answer(batch):
+        seen.setdefault("batches", []).append(len(batch))
+        return [(np.zeros((len(r["input_ids"]), 2)), np.full((len(r["input_ids"]), 2), -1.5), np.zeros(len(r["input_ids"]))) for r in batch]
+
+    clock = iter(x * 0.5 for x in range(10_000))
+    group = lambda lengths, budget: max(1, min(16, budget // lengths[0]))        # noqa: E731
+    out = hs.teacher_sweep(rows, answer, group, fixed_rows=2, budgets=(0, 200, 400), card_mb=1000, repeat=2, peak=lambda: 123, timer=lambda: next(clock))
+    res = out["results"]
+    assert [r["batch_tokens"] for r in res] == [0, 200, 400] and all(r["peak_vram_mb"] == 123 and r["first_loss"] == 1.5 for r in res)
+    assert out["rows"] == 8 and out["tokens"] == 520 and "spread" in out and out["recommended"]["value"] in (0, 200, 400)
+    assert seen["batches"][:4] == [2, 2, 2, 2], "budget 0 is the fixed rows per pass"
+
+
+def test_the_teacher_sample_is_seeded_keeps_the_longest_rows_and_stops_at_the_token_target():
+    rows = [{"input_ids": [0] * n} for n in [10] * 50 + [500]]
+    a = hs.teacher_sample(rows, want_tokens=100, seed=1)
+    b = hs.teacher_sample(rows, want_tokens=100, seed=1)
+    assert [len(r["input_ids"]) for r in a] == [len(r["input_ids"]) for r in b]
+    assert any(len(r["input_ids"]) == 500 for r in a) and sum(len(r["input_ids"]) for r in a) < 700
+
+
+def test_a_teacher_budget_that_runs_out_of_memory_is_a_row_and_the_larger_ones_are_skipped():
+    import numpy as np
+    rows = [{"input_ids": list(range(50))} for _ in range(8)]
+
+    def answer(batch):
+        if len(batch) > 2:
+            raise RuntimeError("out of memory")
+        return [(np.zeros((50, 2)), np.full((50, 2), -1.0), np.zeros(50)) for _ in batch]
+
+    out = hs.teacher_sweep(rows, answer, lambda lengths, budget: max(1, budget // 50), fixed_rows=1, budgets=(0, 100, 200, 400), repeat=1, timer=iter(range(0, 10_000)).__next__)
+    assert out["results"][2].get("oom") and out["results"][3].get("skipped") and out["results"][1]["tokens_per_s"]

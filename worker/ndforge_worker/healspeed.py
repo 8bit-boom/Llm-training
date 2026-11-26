@@ -265,6 +265,66 @@ def sweep(run_one, budgets=BATCH_TOKENS_SWEEP, card_mb=None, repeat=None) -> dic
     return {"results": results, "spread": spread, "recommended": recommend_batch_tokens(results, card_mb, spread)}
 
 
+TEACHER_SWEEP = (0, 4096, 8192, 16384, 32768, 65536)
+TEACHER_SWEEP_TOKENS = 300_000          # about this many tokens of real rows are answered for every budget
+TEACHER_WINDOW = 64                      # the cache job answers a window of this many rows in length order
+
+
+def teacher_sample(rows: list, want_tokens: int = TEACHER_SWEEP_TOKENS, seed: int = 3407, longest: int = 4) -> list:
+    """The rows the teacher sweep answers: a seeded sample of the real rows up to `want_tokens`, and always the `longest` longest rows (the worst case of a forward pass for the memory)."""
+    import random
+    order = list(range(len(rows)))
+    random.Random(seed).shuffle(order)
+    keep, total = [], 0
+    for i in order:
+        if total >= want_tokens:
+            break
+        keep.append(i)
+        total += len(rows[i]["input_ids"])
+    top = sorted(range(len(rows)), key=lambda i: -len(rows[i]["input_ids"]))[:longest]
+    keep += [i for i in top if i not in set(keep)]
+    return [rows[i] for i in keep]
+
+
+def teacher_pass(sample: list, answer, budget: int, fixed_rows: int, group, window: int = TEACHER_WINDOW, timer=time.monotonic, sync=lambda: None) -> dict:
+    """One pass of the original's answers over `sample` the way the cache job does it: windows of rows, longest first, batches by the token budget (`group(lengths_longest_first, budget)` = how many rows
+    go together; budget 0 = `fixed_rows` rows). `answer(batch_rows)` returns [(ids, logp, resid)] per row. -> {"tokens_per_s", "tokens", "seconds", "first_loss"}: first_loss is the mean top-1 negative
+    log-probability of the rows of the FIRST window (the same rows for every budget: if batching changed the answers, it moves)."""
+    sync()
+    t0, tokens = timer(), 0
+    probe_sum, probe_n = 0.0, 0
+    for w in range(0, len(sample), window):
+        win = sample[w:w + window]
+        order = sorted(range(len(win)), key=lambda j: -len(win[j]["input_ids"]))
+        pos = 0
+        while pos < len(order):
+            n = fixed_rows if budget <= 0 else group([len(win[j]["input_ids"]) for j in order[pos:pos + 16]], budget)
+            idx = order[pos:pos + max(1, n)]
+            got = answer([win[j] for j in idx])
+            for j, a in zip(idx, got):
+                tokens += len(win[j]["input_ids"])
+                if w == 0:
+                    probe_sum += float(-a[1][:, 0].mean())
+                    probe_n += 1
+            pos += len(idx)
+    sync()
+    secs = max(timer() - t0, 1e-9)
+    return {"tokens_per_s": round(tokens / secs, 2), "tokens": tokens, "seconds": round(secs, 2), "first_loss": round(probe_sum / probe_n, 6) if probe_n else None}
+
+
+def teacher_sweep(sample: list, answer, group, fixed_rows: int = 4, budgets=TEACHER_SWEEP, card_mb=None, repeat: int = 2, peak=lambda: None, reset_peak=lambda: None, **kw) -> dict:
+    """The original's tokens per forward pass (job key `teacher_batch_tokens`), measured on the real rows with the same machinery as the student's sweep: `sweep` gives the rows, the noise and the
+    recommendation (budget 0 = the fixed rows per pass is the baseline). The peak memory of every budget is read after its pass. -> {"results", "spread", "recommended", "rows", "tokens"}."""
+    def run_one(budget: int) -> dict:
+        reset_peak()
+        r = teacher_pass(sample, answer, budget, fixed_rows, group, **kw)
+        r["peak_vram_mb"] = peak()
+        return r
+    out = sweep(run_one, budgets, card_mb, repeat)
+    out["rows"], out["tokens"] = len(sample), sum(len(r["input_ids"]) for r in sample)
+    return out
+
+
 def environment_facts() -> dict:
     """Versions and the card (never raises): torch, triton(-windows), flash-linear-attention, transformers, the GPU's name and memory."""
     import importlib.metadata as md

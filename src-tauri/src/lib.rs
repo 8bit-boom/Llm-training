@@ -1927,11 +1927,22 @@ fn tune_snapshot(s: State<App>, preset_id: String, scope: String) -> Out<Value> 
 #[tauri::command(async)]
 fn tune_plan(s: State<App>, spec: Value) -> Out<Value> {
     let p = tune_project(&s)?;
-    let spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let mut spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    ndforge_core::tune::api::with_settings(&mut spec.card);
     let id = ndforge_core::tune::api::model_for(&p, &spec.model).map_err(|e| e.to_string())?;
     let mut notes = ndforge_core::tune::runner::BTreeMapNotes::new();
+    let vllm = ndforge_core::settings::Settings::load().vllm;
+    if !(vllm.enabled && vllm.teacher.enabled) {
+        notes.insert("teacher.vllm".into(), "vLLM is not switched on for the original's answers (Settings, vLLM engine): nothing to test.".into());
+    }
+    if let Some(free) = ndforge_core::tune::disk::fs_free(&ndforge_core::reshape::runs::models_dir(&p)).filter(|f| *f < ndforge_core::tune::disk::need_bytes(ndforge_core::tune::disk::DEFAULT_MB)) {
+        notes.insert("disk".into(), format!("The drive of your models has {:.1} GB free; the test needs {:.1} GB.", free as f64 / 1e9, ndforge_core::tune::disk::need_bytes(ndforge_core::tune::disk::DEFAULT_MB) as f64 / 1e9));
+    }
+    if ndforge_core::export::quantcheck::offload_reference(&p).is_none() {
+        notes.insert("llama.offload".into(), "There is no 16-bit GGUF in this project: export a model as F16 once (or run Compare quants, which keeps a reference).".into());
+    }
     if ndforge_core::train::runs::latest_version(&p).is_none() {
-        for t in ["heal.student_batch", "heal.loss", "heal.quality"] {
+        for t in ["heal.student_batch", "heal.loss", "heal.quality", "teacher.standard", "teacher.vllm", "try.calib_batch", "think.batch"] {
             notes.insert(t.into(), "Save a training-data version in Step 2 first: the tests use your real rows.".into());
         }
     }
@@ -1956,7 +1967,8 @@ fn chrono_secs() -> i64 {
 #[tauri::command]
 fn tune_start(app: tauri::AppHandle, s: State<App>, tasks: State<Tasks>, spec: Value) -> Out<Value> {
     let p = tune_project(&s)?;
-    let spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    let mut spec: ndforge_core::tune::runner::Spec = serde_json::from_value(spec).map_err(|e| format!("The choice is not valid: {e}"))?;
+    ndforge_core::tune::api::with_settings(&mut spec.card);
     if spec.tests.is_empty() {
         return Err("Tick at least one test.".into());
     }

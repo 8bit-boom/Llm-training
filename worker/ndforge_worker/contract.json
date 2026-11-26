@@ -15,6 +15,7 @@
   "imatrix_make",
   "imatrix_merge",
   "imatrix_published",
+  "llama_offload_tune",
   "mixed_plan",
   "quantcheck",
   "quantcheck_plan",
@@ -30,9 +31,11 @@
   "think_check_plan",
   "trace_gen",
   "train",
+  "tune_batch_bench",
   "vllm_container_probe",
   "vllm_selftest",
-  "vllm_teacher_check"
+  "vllm_teacher_check",
+  "vllm_teacher_tune"
  ],
  "events": [
   "distill_eval",
@@ -67,6 +70,8 @@
   "imatrix_failed",
   "imatrix_stopped",
   "llama_cpp_missing",
+  "llama_offload_tune_failed",
+  "llama_offload_tune_stopped",
   "matmul_failed",
   "mixed_failed",
   "no_cuda",
@@ -81,10 +86,12 @@
   "torch_missing",
   "trace_gen_failed",
   "train_failed",
+  "tune_batch_bench_failed",
   "unknown_job",
   "usage",
   "vllm_container_probe_failed",
   "vllm_selftest_failed",
-  "vllm_teacher_check_failed"
+  "vllm_teacher_check_failed",
+  "vllm_teacher_tune_failed"
  ]
 }

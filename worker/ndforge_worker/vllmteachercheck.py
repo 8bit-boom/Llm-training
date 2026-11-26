@@ -166,6 +166,42 @@ def pick_rows(n_available: int, n: int, np) -> list:
 
 # ---------------------------------------------------------------------------------------------------------------------------------- the job
 
+def prepare(job: dict, np, k: int, n_want: int, max_seq: int, teacher_dir, weights: str, stop_file):
+    """The rows and the reference answers of a check or a tuning measurement: an existing complete standard cache of the SAME original (job `reference_cache`) gives both without a GPU; else the standard teacher
+    (4-bit) answers `n_want` rows of the project's data first and is freed before the engine's container starts. -> (rows, ref, max_seq, ref_source)."""
+    from . import distilljob, reshapejob
+    ref_dir = job.get("reference_cache")
+    idx = _usable_reference(ref_dir, weights, k) if ref_dir else None
+    ref_source = None
+    if idx is not None:
+        all_rows = distilljob.load_rows(ref_dir)
+        have = min(int(idx.get("done_rows", 0)), len(all_rows))
+        picks = pick_rows(have, n_want, np)
+        rows = [all_rows[i] for i in picks]
+        max_seq = int(idx.get("max_len") or max_seq)
+        rd = distilljob.CacheReader(ref_dir)
+        ref = [rd.get(i) for i in picks]
+        ref_source = {"kind": "existing_cache", "folder": str(ref_dir), "note": f"An existing complete standard cache of the same original was used as the reference ({len(rows)} of its rows); no GPU was needed for it."}
+        protocol.log(ref_source["note"])
+    else:
+        from transformers import AutoTokenizer
+        student = Path(job["student"])
+        tok = AutoTokenizer.from_pretrained(str(student))
+        all_rows, _stats = distilljob.build_rows(tok, job["data"], job["model"].get("family", "generic"), max_seq, int(job.get("seed", 3407)))
+        proj = [r for r in all_rows if r.get("source") == "project"] or all_rows
+        rows = [proj[i] for i in pick_rows(len(proj), n_want, np)]
+        from .data import text_tokenizer
+        inner = text_tokenizer(tok)
+        pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
+        ref = _hf_reference(teacher_dir, rows, k, pad, stop_file)
+        reshapejob.release_gpu("the 4-bit original")             # the engine's container needs the card: nothing of the reference run may stay on it
+        ref_source = {"kind": "ran_standard_teacher", "note": f"The standard teacher (4-bit) answered the same {len(rows)} rows first; the two models were never on the card together."}
+    if not rows:
+        raise TeacherCheckError("There are no rows to compare (the project's heal data is empty).")
+    return rows, ref, max_seq, ref_source
+
+
+
 def _usable_reference(folder, origin_weights: str, k: int):
     """The index of `folder` when it is a complete standard (not vLLM) cache of this original with this k; else None."""
     idx = cachewrite.read_cache_index(folder)
@@ -229,34 +265,7 @@ def run(job: dict) -> int:
     except (vllmcache.VllmCacheError, vllmcache.vllmengine.EngineError) as exc:
         raise TeacherCheckError(str(exc)) from None
     # 1. the rows and the reference
-    ref_dir = job.get("reference_cache")
-    idx = _usable_reference(ref_dir, weights, k) if ref_dir else None
-    ref_source = None
-    if idx is not None:
-        all_rows = distilljob.load_rows(ref_dir)
-        have = min(int(idx.get("done_rows", 0)), len(all_rows))
-        picks = pick_rows(have, n_want, np)
-        rows = [all_rows[i] for i in picks]
-        max_seq = int(idx.get("max_len") or max_seq)
-        rd = distilljob.CacheReader(ref_dir)
-        ref = [rd.get(i) for i in picks]
-        ref_source = {"kind": "existing_cache", "folder": str(ref_dir), "note": f"An existing complete standard cache of the same original was used as the reference ({len(rows)} of its rows); no GPU was needed for it."}
-        protocol.log(ref_source["note"])
-    else:
-        from transformers import AutoTokenizer
-        student = Path(job["student"])
-        tok = AutoTokenizer.from_pretrained(str(student))
-        all_rows, _stats = distilljob.build_rows(tok, job["data"], job["model"].get("family", "generic"), max_seq, int(job.get("seed", 3407)))
-        proj = [r for r in all_rows if r.get("source") == "project"] or all_rows
-        rows = [proj[i] for i in pick_rows(len(proj), n_want, np)]
-        from .data import text_tokenizer
-        inner = text_tokenizer(tok)
-        pad = inner.pad_token_id if inner.pad_token_id is not None else (inner.eos_token_id or 0)
-        ref = _hf_reference(teacher_dir, rows, k, pad, stop_file)
-        reshapejob.release_gpu("the 4-bit original")             # the engine's container needs the card: nothing of the reference run may stay on it
-        ref_source = {"kind": "ran_standard_teacher", "note": f"The standard teacher (4-bit) answered the same {len(rows)} rows first; the two models were never on the card together."}
-    if not rows:
-        raise TeacherCheckError("There are no rows to compare (the project's heal data is empty).")
+    rows, ref, max_seq, ref_source = prepare(job, np, k, n_want, max_seq, teacher_dir, weights, stop_file)
     tokens = sum(len(r["input_ids"]) for r in rows)
     # 2. vLLM on the same rows (once, or twice with compare_kv: the exact cache, then the 8-bit one)
     vin = work / "vllm_in"

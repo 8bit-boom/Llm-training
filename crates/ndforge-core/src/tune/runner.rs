@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::decide::{decide_batch, decide_loss, DEFAULT_SPREAD};
+use super::decide::{decide_batch, decide_loss, decide_sized, DEFAULT_SPREAD};
 use super::identity::{MachineId, ModelIdentity};
 use super::preset::{FunctionResult, Guard, Preset};
 use crate::error::{Error, Result};
@@ -31,7 +31,7 @@ pub struct TestDef {
     pub need_share: f64,
 }
 
-pub const CATALOG: [TestDef; 5] = [
+pub const CATALOG: [TestDef; 9] = [
     TestDef { id: "heal.student_batch", label: "Tokens per forward pass", what: "Rows of similar length share one forward pass of the student: the same learning, usually much faster. Tests 0, 2048, 4096, 8192 and 16384 tokens on your real rows, with the worst-case update for the memory.",
               tier: 1, class: "tol", default_on: true, knobs: &["student_batch_tokens"], built: true, need_share: 0.55 },
     TestDef { id: "heal.loss", label: "Loss chunk and output-layer logits", what: "The KL chunk (64 to 512) and keeping the output layer's logits: the same maths, different speed and memory.",
@@ -39,9 +39,17 @@ pub const CATALOG: [TestDef; 5] = [
     TestDef { id: "heal.quality", label: "Quality settings (short trial heals)", what: "LoRA size, optimizer, warm-up and learning rate, each tried alone from your settings in a short real heal on your rows with the same seed; the held-out loss decides. A short trial, not a full heal.",
               tier: 2, class: "quality", default_on: true, knobs: &["rank", "optimizer", "warmup", "lr"], built: true, need_share: 0.6 },
     TestDef { id: "teacher.standard", label: "The original's answers: tokens per forward pass", what: "How many tokens of rows the original answers in one forward pass (the standard engine).",
-              tier: 1, class: "tol", default_on: true, knobs: &["teacher_batch_tokens"], built: false, need_share: 0.7 },
-    TestDef { id: "disk", label: "Disk speed", what: "Writes and reads a few GB on the drive that holds the models, to tell how long a cut or a merge will take.",
-              tier: 3, class: "exact", default_on: false, knobs: &[], built: false, need_share: 0.0 },
+              tier: 1, class: "tol", default_on: true, knobs: &["teacher_batch_tokens"], built: true, need_share: 0.7 },
+    TestDef { id: "teacher.vllm", label: "The original's answers with vLLM: engine settings", what: "Rows scored at once, tokens per batch and the share of the card, each tried alone from your settings against one reference; a faster setting that changes the answers is refused. Only when vLLM is switched on. Experimental.",
+              tier: 1, class: "tol", default_on: false, knobs: &["max_num_seqs", "vllm_batch_tokens", "gpu_util_pct"], built: true, need_share: 0.75 },
+    TestDef { id: "try.calib_batch", label: "Try first: rows measured together", what: "How many calibration rows go through the original together when Try first and the cut measure the layers: the same text, the same numbers, only faster. Loads the original.",
+              tier: 1, class: "tol", default_on: true, knobs: &["try_calib_batch"], built: true, need_share: 0.5 },
+    TestDef { id: "think.batch", label: "Thinking check: questions asked together", what: "How many of the thinking check's questions are asked at once. Measured on the cut model with the same sampling seed: the answers are the same on average, not one by one.",
+              tier: 1, class: "stat", default_on: true, knobs: &["think_batch"], built: true, need_share: 0.4 },
+    TestDef { id: "llama.offload", label: "llama.cpp: layers on the graphics card", what: "How many layers of a 16-bit GGUF llama.cpp puts on the card in the importance matrix and in Compare quants: all of them as they always did, or fewer when the file does not fit. Needs a 16-bit GGUF in the project and llama.cpp.",
+              tier: 3, class: "exact", default_on: true, knobs: &["llama_ngl"], built: true, need_share: 0.0 },
+    TestDef { id: "disk", label: "Disk speed", what: "Writes and reads back 2 GB on the drive that holds the models, to tell how long a cut or a merge will take. Decides no setting: the numbers go into the preset and the report.",
+              tier: 3, class: "exact", default_on: false, knobs: &[], built: true, need_share: 0.0 },
 ];
 
 pub fn def(id: &str) -> Option<&'static TestDef> {
@@ -55,7 +63,11 @@ pub fn estimate(id: &str, student_b: f64, trial_tokens_k: u32) -> (f64, f64) {
         "heal.student_batch" => (15.0 * sc, 25.0 * sc),
         "heal.loss" => (20.0 * sc, 35.0 * sc),
         "heal.quality" => ((12.0 + trial_tokens_k as f64 / 40.0) * 5.0 * sc, (20.0 + trial_tokens_k as f64 / 25.0) * 5.0 * sc),
-        "teacher.standard" => (10.0, 15.0),
+        "teacher.standard" => (10.0 + 4.0 * sc, 15.0 + 8.0 * sc),
+        "teacher.vllm" => (45.0 + 5.0 * sc, 80.0 + 10.0 * sc),
+        "try.calib_batch" => (8.0 + 6.0 * sc, 15.0 + 12.0 * sc),
+        "think.batch" => (6.0 + 3.0 * sc, 12.0 + 8.0 * sc),
+        "llama.offload" => (4.0, 20.0),
         "disk" => (2.0, 3.0),
         _ => (0.0, 0.0),
     }
@@ -186,6 +198,8 @@ pub struct TestCtx<'a> {
     pub student_b: f64,
     pub card_mb: Option<f64>,
     pub trial_tokens_k: u32,
+    /// the model's number of layers (the offload test's candidates)
+    pub layers: u32,
     pub dir: PathBuf,
 }
 
@@ -225,6 +239,79 @@ fn result_of(d: &TestDef, ctx: &TestCtx, out: &TestOut) -> (Value, Option<Functi
                 tried: out.rows.clone(), depends_on: deps, transferable: vec!["student_batch_tokens".into()], context, note: dec.why.clone(), ..Default::default()
             };
             (json!({"chosen": dec.chosen, "gain": dec.gain, "changed": dec.changed, "why": dec.why}), Some(fr))
+        }
+        "teacher.standard" | "try.calib_batch" | "think.batch" => {
+            let (knob, unit, dflt) = match d.id {
+                "teacher.standard" => ("teacher_batch_tokens", "tokens per forward pass", 16384u64),
+                "try.calib_batch" => ("try_calib_batch", "rows together", 0),
+                _ => ("think_batch", "questions together", 0),
+            };
+            let spread = out.raw["spread"].as_f64().unwrap_or(0.0);
+            let current = ctx.card.get(knob).and_then(Value::as_u64).unwrap_or(dflt) as u32;
+            let dec = decide_sized(&out.rows, ctx.card_mb, if spread > 0.0 { spread } else { DEFAULT_SPREAD }, current, unit);
+            let tps = |b: u32| out.rows.iter().find(|r| r["batch_tokens"].as_u64() == Some(b as u64)).and_then(|r| r["tokens_per_s"].as_f64());
+            let won = out.rows.iter().find(|r| r["batch_tokens"].as_u64() == Some(dec.chosen as u64)).cloned().unwrap_or(Value::Null);
+            if !dec.changed {
+                return (json!({"chosen": dec.chosen, "gain": dec.gain, "changed": false, "why": dec.why}), None);
+            }
+            let fr = FunctionResult {
+                chosen: json!({ knob: dec.chosen }).as_object().cloned().unwrap_or_default(), default: json!({ knob: current }).as_object().cloned().unwrap_or_default(),
+                gain: dec.gain, spread: dec.spread, class: d.class.into(), tier: d.tier, guards: dec.guards.clone(),
+                measured: json!({"tokens_per_s": won["tokens_per_s"], "default_tokens_per_s": tps(current).or(tps(0)), "peak_vram_mb": won["peak_vram_mb"], "student_b": ctx.student_b}),
+                tried: out.rows.clone(), depends_on: deps, transferable: vec![knob.into()], context, note: dec.why.clone(), ..Default::default()
+            };
+            (json!({"chosen": dec.chosen, "gain": dec.gain, "changed": true, "why": dec.why}), Some(fr))
+        }
+        "teacher.vllm" => {
+            let (decisions, noise, base) = super::vllm::decide(&out.rows);
+            if decisions.is_empty() {
+                return (json!({"changed": false, "why": "The measurement did not give a baseline, so nothing was decided."}), None);
+            }
+            let mut chosen = Map::new();
+            let mut default = Map::new();
+            let mut best_gain = 1.0f64;
+            for k in decisions.iter().filter(|k| k.changed) {
+                chosen.insert(k.knob.clone(), k.chosen.clone());
+                default.insert(k.knob.clone(), ctx.card.get(&k.knob).cloned().unwrap_or(json!(0)));
+                best_gain = best_gain.max(k.gain);
+            }
+            let note = format!("Each setting was tried alone from yours, not together. {}", decisions.iter().map(|k| format!("{}: {}", k.knob, k.why)).collect::<Vec<_>>().join(" "));
+            let decision = json!({"changed": !chosen.is_empty(), "chosen": chosen, "gain": best_gain, "noise": noise, "baseline_tokens_per_s": base, "why": note,
+                                  "knobs": decisions.iter().map(|k| json!({"knob": k.knob, "changed": k.changed, "chosen": k.chosen, "gain": k.gain, "why": k.why})).collect::<Vec<_>>()});
+            if chosen.is_empty() {
+                return (decision, None);
+            }
+            let fr = FunctionResult {
+                chosen, default, gain: best_gain, spread: noise, class: d.class.into(), tier: d.tier,
+                guards: vec![Guard { name: "same_answers_as_reference".into(), ok: true, value: Some(super::vllm::AGREEMENT_SLACK), limit: None }],
+                measured: json!({"tokens_per_s": base * best_gain, "default_tokens_per_s": base, "student_b": ctx.student_b}),
+                tried: out.rows.clone(), depends_on: vec!["gpu".into(), "driver_major".into(), "vllm_image".into()], transferable: vec![], context, note, ..Default::default()
+            };
+            (decision, Some(fr))
+        }
+        "llama.offload" => {
+            let dec = super::llama::decide(&out.rows);
+            let decision = super::llama::decision_json(&dec);
+            let (Some(ngl), true) = (dec.chosen, dec.changed) else { return (decision, None) };
+            let fr = FunctionResult {
+                chosen: json!({"llama_ngl": ngl}).as_object().cloned().unwrap_or_default(), default: json!({"llama_ngl": super::llama::ALL}).as_object().cloned().unwrap_or_default(),
+                gain: 1.0, spread: 0.0, class: d.class.into(), tier: d.tier, guards: vec![Guard { name: "runs_without_an_allocation_error".into(), ok: true, value: None, limit: None }],
+                measured: json!({"tokens_per_s": dec.tokens_per_s, "gguf": out.raw["gguf"], "gguf_mb": out.raw["gguf_mb"]}),
+                tried: out.rows.clone(), depends_on: vec!["gpu".into(), "driver_major".into(), "llama_cpp".into()], transferable: vec![], context, note: dec.why.clone(), ..Default::default()
+            };
+            (decision, Some(fr))
+        }
+        "disk" => {
+            let (w, r) = (out.raw["write_mb_s"].as_f64().unwrap_or(0.0), out.raw["read_mb_s"].as_f64().unwrap_or(0.0));
+            if w <= 0.0 || r <= 0.0 {
+                return (json!({"changed": false, "why": "The disk test did not give a speed."}), None);
+            }
+            let why = format!("Writes {w:.0} MB/s and reads {r:.0} MB/s on the drive of your models (the read may come partly from the system's cache). No setting depends on it.");
+            let fr = FunctionResult {
+                gain: 1.0, class: d.class.into(), tier: d.tier, measured: json!({"write_mb_s": w, "read_mb_s": r, "mb": out.raw["mb"], "dir": out.raw["dir"]}), tried: out.rows.clone(),
+                depends_on: vec![], note: why.clone(), ..Default::default()
+            };
+            (json!({"changed": false, "write_mb_s": w, "read_mb_s": r, "why": why}), Some(fr))
         }
         "heal.loss" => {
             let dec = decide_loss(&out.rows, 0.0);
@@ -307,7 +394,7 @@ pub fn run(fx: &mut dyn TuneFx, project: &Path, st: &mut RunState, card_mb: Opti
         fx.emit(json!({"kind": "tune_test", "index": i, "total": st.tests.len(), "id": d.id, "label": d.label, "status": "running"}));
         let t0 = std::time::Instant::now();
         let dir = project.join("benchmarks").join(format!("tune-{}", st.id)).join("tmp").join(d.id);
-        let ctx = TestCtx { model: &st.spec.model, card: &st.spec.card, student_b: st.student_b, card_mb, trial_tokens_k: st.spec.trial_tokens_k, dir: dir.clone() };
+        let ctx = TestCtx { model: &st.spec.model, card: &st.spec.card, student_b: st.student_b, card_mb, trial_tokens_k: st.spec.trial_tokens_k, layers: st.model.layers as u32, dir: dir.clone() };
         let out = fx.run_test(d, &ctx);
         let _ = std::fs::remove_dir_all(&dir);
         st.tests[i].seconds = t0.elapsed().as_secs_f64();
