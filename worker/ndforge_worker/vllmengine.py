@@ -21,6 +21,7 @@ The real launch needs the owner's PC.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import secrets
@@ -398,6 +399,12 @@ def docker_command(cfg: dict, port: int, args: list, *, mounts: list | None = No
     cmd = docker_prefix(cfg) + ["run", "--gpus", "all", "--ipc=host", "--name", container_name(port), "-p", f"127.0.0.1:{int(port)}:8000"]
     for src, dst, mode in mounts or []:
         cmd += ["-v", f"{src}:{dst}:{mode}"]
+    if (os.environ.get("HF_TOKEN") or "").strip():
+        cmd += ["-e", "HF_TOKEN"]          # the NAME only: docker takes the value from this process's environment, so it is on no command line, in no log and in no job file
+        if cfg.get("kind") == "docker_wsl":      # wsl.exe hands a Windows variable to the Linux side only when WSLENV lists it (UNVERIFIED on a real Windows + WSL machine)
+            names = [n for n in (os.environ.get("WSLENV") or "").split(":") if n]
+            if not any(n.split("/")[0] == "HF_TOKEN" for n in names):
+                os.environ["WSLENV"] = ":".join(names + ["HF_TOKEN"])
     return cmd + [cfg["image"]] + list(args)
 
 

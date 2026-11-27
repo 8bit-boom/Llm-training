@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import data, exportjob, fsutil, imatrix, llamacpp, protocol
+from . import data, exportjob, fsutil, hf_access, imatrix, llamacpp, protocol
 
 SOURCES = ("run", "model", "gguf")
 DAT_NAME = "imatrix.dat"
@@ -46,6 +46,8 @@ def plain(exc: BaseException) -> str:
     """A plain-language text for any exception that nobody planned for."""
     text = f"{type(exc).__name__}: {exc}"
     low = text.lower()
+    if hf_access.is_access_error(exc):
+        return hf_access.message()
     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC or "no space left" in low:
         return "The disk is full. Free some space (the matrix library sits in the project folder) and try again."
     if "out of memory" in low:

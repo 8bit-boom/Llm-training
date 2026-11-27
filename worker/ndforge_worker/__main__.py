@@ -53,6 +53,9 @@ def _explain(exc: Exception) -> str:
         return "The training software is incomplete (numpy). Run Training setup again."
     if "no module named" in low:
         return "A training library is missing in the training software. Run the training setup again. (" + text[:200] + ")"
+    from . import hf_access
+    if hf_access.is_access_error(exc):
+        return hf_access.message()
     if "401" in low or "gated" in low or "repository not found" in low:
         return "The model could not be downloaded from Hugging Face. Check the internet connection (and the model name). (" + text[:200] + ")"
     return text[:600]
