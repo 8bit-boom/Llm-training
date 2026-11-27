@@ -416,3 +416,14 @@ def run_plan(job: dict) -> int:
     protocol.reserve_stdout()
     protocol.result(plan_job(job))
     return 0
+
+
+# --- this program only (not part of the shared section above, which quant-convert-gui mirrors): the fused gate and up tensor of Inkling's packed experts ---
+_role_names_shared = role_names
+
+
+def role_names(arch) -> dict:      # noqa: F811 - wraps the shared one; every other family gets exactly its rules
+    roles = _role_names_shared(arch)
+    if str(arch).startswith("inkling") and "ffn_updown" in roles and "ffn_gate_up_exps" not in roles["ffn_updown"]:
+        roles["ffn_updown"] = [*roles["ffn_updown"], "ffn_gate_up_exps"]
+    return roles

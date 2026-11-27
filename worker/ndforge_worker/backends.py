@@ -215,7 +215,37 @@ def load_hf(cfg: dict):
     return get_peft_model(model, lora), tokenizer, None
 
 
+def load_inkling(cfg: dict):
+    """Inkling-2-Mini for healing (docs/MOE_GUIDE.md section 4): the packed model (`inkling_load.load_packed`: experts kept packed and frozen) with a LoRA on the dense attention
+    projections only. No 4-bit loading and no gradient checkpointing here: the experts are not trainable and decode a few at a time."""
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoTokenizer
+    from . import inkling_load, moeheal
+    h = cfg["hyper"]
+    repo = cfg.get("init_model") or cfg["model"]["repo"]
+    protocol.progress("load", 0.05, "Loading the model (the experts stay packed)")
+    tokenizer = AutoTokenizer.from_pretrained(repo)
+    model = inkling_load.load_packed(repo)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    protocol.progress("load", 0.8, "Adding the LoRA layers")
+    names = [n for n, m in model.named_modules() if m.__class__.__name__ == "Linear" or hasattr(m, "weight") and getattr(m.weight, "ndim", 0) == 2]
+    targets = moeheal.lora_targets(names)
+    if not targets:
+        raise RuntimeError("No attention layers were found to add the LoRA to: the model code of this transformers version names them differently.")
+    if cfg.get("init_adapter"):
+        from peft import PeftModel
+        return PeftModel.from_pretrained(model, cfg["init_adapter"], is_trainable=True), tokenizer, None
+    lora = LoraConfig(r=h["rank"], lora_alpha=h["alpha"], lora_dropout=0.0, bias="none", task_type="CAUSAL_LM", target_modules=targets)
+    peft_model = get_peft_model(model, lora)
+    if moeheal.freeze_packed(peft_model):
+        raise RuntimeError("An expert weight is trainable: the packed experts must stay frozen.")
+    return peft_model, tokenizer, None
+
+
 def load(cfg: dict, backend: str):
+    if (cfg.get("model") or {}).get("family") == "inkling2":
+        return load_inkling(cfg)
     if backend == "unsloth" and cfg.get("method") == "loftq":
         # LoftQ initializes its 4-bit base through PEFT itself; Unsloth's loader has no LoftQ path
         protocol.log("LoftQ needs PEFT's own quantization init; training with the standard engine.")

@@ -247,7 +247,18 @@ def _load(folder, mode: str, stage: str = "load_model", double_quant: bool = Fal
         return _load_model(folder, mode, double_quant) if double_quant else _load_model(folder, mode)
 
 
+def _is_inkling_folder(folder) -> bool:
+    try:
+        return json.loads((Path(folder) / "config.json").read_text(encoding="utf-8")).get("model_type") == "inkling2_loop"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _load_model(folder, mode: str, double_quant: bool = False):
+    if _is_inkling_folder(folder):
+        # a mixture of experts is only ever loaded packed (docs/MOE_GUIDE.md): this is also the in-process teacher of a heal (the load mode does not apply)
+        from . import inkling_load
+        return inkling_load.load_packed(folder)
     import torch
     from transformers import AutoModelForCausalLM
     kw: dict = {}

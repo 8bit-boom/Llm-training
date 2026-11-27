@@ -24,6 +24,7 @@ struct Fx {
     measures: Vec<(String, u32, String)>,
     made: BTreeSet<String>,
     heals: u32,
+    rounds_seen: Vec<Option<u32>>,
     removed: Vec<String>,
     /// the thinking check of a cut / healed model: "good" or "weak"; the first `weak_checks` checks of a cut are weak
     weak_cuts: u32,
@@ -127,6 +128,7 @@ impl Effects for Fx {
         Ok(Out::Done(json!({"main": if weak_now { weak() } else { good() }, "control": {"closed_rate": 1.0}, "suite_version": 1})))
     }
     fn heal(&mut self, student: &Student, _teacher: &str, spec: &HealSpec) -> Result<Out<HealRef>> {
+        self.rounds_seen.push(spec.rounds.as_ref().map(|r| r.round_m));
         if self.hit(format!("heal {student:?}")) {
             return Ok(Out::Stopped);
         }
@@ -362,4 +364,24 @@ fn change_settings_and_continue_works_for_a_mixture_of_experts() {
     assert_eq!(st.status, "done", "{:?}", st.error);
     assert_eq!(st.stages[0].plan.tokens_m, 40);
     assert_eq!(st.settings_changes.len(), 1);
+}
+
+#[test]
+fn a_failed_cut_heals_in_rounds_and_continue_keeps_them() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Fx { weak_cuts: 1, ..Default::default() };
+    let st = start(&p, &mut fx, spec("size", Some(12.0))).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(fx.rounds_seen, vec![Some(5)], "the heal was asked for in rounds of 5 million tokens");
+    assert!(st.spec.heal_rounds.is_some() && st.notes.iter().any(|n| n.contains("heals in rounds")));
+    // a stop in the middle of the heal and a continue: the same run, the rounds still on
+    let d2 = tempdir().unwrap();
+    let p2 = project(d2.path());
+    let mut b = Fx { weak_cuts: 1, stop_at: Some(9), ..Default::default() };
+    let s = start(&p2, &mut b, spec("size", Some(12.0))).unwrap();
+    assert_eq!(s.status, "stopped", "{:?} {}", s.error, s.step);
+    let s = resume(&p2, &mut b, &s.id).unwrap();
+    assert_eq!(s.status, "done", "{:?}", s.error);
+    assert!(b.rounds_seen.iter().all(|r| *r == Some(5)) && !b.rounds_seen.is_empty());
 }

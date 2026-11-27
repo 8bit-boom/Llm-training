@@ -1066,6 +1066,11 @@ pub fn vllm_teacher_gate(dir: &Path, spec: &HealSpec, origin: &str, mode: &str) 
     if !spec.vllm_teacher() {
         return Ok(None);
     }
+    if origin.to_ascii_lowercase().contains("inkling") {
+        // vLLM can serve Inkling's packed checkpoint (a nightly image; docs/MOE_GUIDE.md), but this program's teacher route quantizes a 16-bit original to 4 bit while loading, which is not
+        // what this model is: the original's answers come from the packed model in this program's own process (slower, exact). A refusal here is a fallback with a note, never a failure.
+        return Err(Error::new("vLLM for the original's answers is not built for Inkling-2-Mini yet: the packed original answers in this program's own process instead."));
+    }
     let s = crate::settings::Settings::load().vllm;
     if !s.enabled || !s.teacher.enabled {
         return Err(Error::new("vLLM for the original's answers is not switched on: open Settings, vLLM engine, and tick \"use vLLM for the original's answers\" (experimental)."));
@@ -1360,7 +1365,8 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     }
     let o = heal_source::read_origin(&dir)?;
     let (origin, family) = (o.teacher.clone(), o.family.clone());
-    if spec.thinking() && family != "qwen3_5" {
+    let inkling = family == "inkling2";
+    if spec.thinking() && family != "qwen3_5" && !inkling {
         return Err(Error::new("The thinking recipe is for Qwen3.5 and Qwen3.8 models (their chat template writes the reasoning). Untick \"Keep thinking\" for this model."));
     }
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: healing uses your world's text."))?;
@@ -1371,7 +1377,20 @@ pub fn heal(p: &Project, name: &str, spec: &HealSpec, vram_gb: Option<f64>, stop
     let (student_b, teacher_b) = (o.student_b, o.teacher_b);
     let dims = plan::HealDims::from_config(&o.config, student_b);
     let ch = heal_choice(spec, student_b, vram_gb, &dims);
-    let hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
+    let mut hp = plan::heal_plan_with(student_b, teacher_b, vram_gb, &dims, &ch.knobs);
+    if inkling {
+        // a mixture of experts heals with its experts packed and frozen and a LoRA on the dense parts: the dense plan's numbers do not apply (auto_moe::heal_gb is the estimate)
+        hp.student_method = "lora";
+        hp.mode = "cache";
+        hp.teacher_load = "auto";
+        hp.fits = true;
+        hp.why = None;
+        let packed = crate::reshape::moe::packed_bytes_of(&heal_source::student_folder(&dir)?.map(std::path::PathBuf::from).unwrap_or_default());
+        let need = packed as f64 / 1e9 * 1.3 + 8.0;
+        if vram_gb.is_some_and(|v| v < need) {
+            return Err(Error::new(format!("Healing this mixture of experts needs about {need:.0} GB on the card (its packed experts, the LoRA and the activations); this card has {:.0} GB.", vram_gb.unwrap_or(0.0))));
+        }
+    }
     if !hp.fits {
         return Err(Error::new(hp.why.clone().unwrap_or_else(|| "Healing does not fit this card.".into())));
     }

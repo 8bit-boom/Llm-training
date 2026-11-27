@@ -46,8 +46,10 @@ After pruning, the router's selection bias can be nudged toward the load the kep
 
 ## 4. Healing
 
-**Not built yet in this version.** Cutting, Try first, Auto-cut and the thinking check work; healing a cut Inkling does not: the Heal step of such a model stops with a plain message, and Auto-cut heals only when a cut fails its thinking check
-(so a cut that passes goes on without it). What follows is the design the heal will have (written down, untested). The teacher is the original packed model, the student the cut one. By default the student keeps its packed experts **frozen** and trains a LoRA on the dense parts
+**Built, never run on a real card.** The heal job loads the student packed (`backends.load_inkling`: experts frozen, a LoRA on the attention projections only, `moeheal.lora_targets`), computes the KL loss on the logits the model itself
+produces (final softcap 30, `distilljob.head_softcap`; the output layer already has the 200,058 real rows), and uses the packed model in this program's own process as the teacher (`reshapejob._load_model`). vLLM for the original's answers is refused for
+Inkling with a note (the program's vLLM route quantizes a 16-bit original while loading, which this packed model is not): the in-process teacher answers instead, slower. Auto-cut heals only a cut that fails its thinking check, **in rounds** of 5 million tokens
+with a quick check after each. The memory and time figures are estimates. The design below is what the code follows. The teacher is the original packed model, the student the cut one. By default the student keeps its packed experts **frozen** and trains a LoRA on the dense parts
 (attention projections, the loop gates), with the router frozen; the experts stay byte-identical, so the result stays in the authors' packed format. Distillation uses the model's final
 logit softcap (30) and its real vocabulary (200,058, not the padded 201,024). Budget: 20 M tokens for up to 25 % of the experts, 40 M for more, 80 M for fewer passes.
 Healing a 32 GB card needs the in-process packed teacher (about 20 GB) or vLLM nightly. Times are estimates: 20 M tokens is 4 to 7 hours **[not verified]**.
@@ -113,3 +115,11 @@ their expert counts. Removing experts from them is not built yet; they keep the 
 
 The Auto page handles this model end to end (docs/AUTO_CUT.md, "A mixture of experts"): choose **a smaller file** (the default), **faster answers** or **a better model** (which points to the Train page), give the size of the finished Q4_K_M file in GB, and the plan
 turns it into a number of experts per layer. It measures, tries, cuts, checks the thinking, heals only when the check fails, exports and compares. Loop passes are never taken out by Auto-cut. Everything in that flow except healing and the real jobs was tested with stand-ins.
+
+
+## Grow, export and quant: what exists
+
+- **Grow**: more loop passes (up to 8) and more experts per token (up to 4 times) are config-only copies and Try first questions (`goal` grow); nothing trains after them, and no one knows whether either helps.
+- **Mixed sizes**: the fused `ffn_gate_up_exps` tensor is in the "up/gate" role for Inkling only (every other family's rules are unchanged).
+- **Importance matrix along the expert axis**: `imatrixmoe.slice_experts` keeps the rows and counts of the kept experts of each layer. It is a tested building block; the Adapt step does not call it yet.
+- **Not built**: the NVFP4 file size, Compare quants for experts, and the Ollama install of an exported Inkling.

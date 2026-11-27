@@ -12,17 +12,19 @@ from __future__ import annotations
 
 import time
 
-from . import protocol
+from . import families, protocol
 from .data import text_tokenizer
 from .thinkcheck import ThinkCheckError
 
 DEFAULT_BATCH = 8
 
 
-def prompt_of(inner, request: dict) -> str:
-    """The text the model is given: its chat template with the generation prompt, and enable_thinking as the request says."""
+def prompt_of(inner, request: dict, family: str | None = None) -> str:
+    """The text the model is given: its chat template with the generation prompt, and enable_thinking as the request says (a family with its own template argument, Inkling's
+    `reasoning_effort`, gets that one)."""
     try:
-        return inner.apply_chat_template(request["messages"], tokenize=False, add_generation_prompt=True, enable_thinking=bool(request["thinking"]))
+        kw = families.think_kwargs(family, bool(request["thinking"])) if family else {"enable_thinking": bool(request["thinking"])}
+        return inner.apply_chat_template(request["messages"], tokenize=False, add_generation_prompt=True, **kw)
     except Exception as exc:        # noqa: BLE001 - a tokenizer with no chat template
         raise ThinkCheckError(f"The model's tokenizer cannot write the questions with a chat template ({type(exc).__name__}: {str(exc)[:120]}).") from exc
 
@@ -35,7 +37,7 @@ def stop_ids(inner, model) -> list:
         if v is not None and v not in ids:
             ids.append(int(v))
     unk = getattr(inner, "unk_token_id", None)
-    for name in ("<|im_end|>", "<|endoftext|>"):
+    for name in ("<|im_end|>", "<|endoftext|>", "<|content_model_end_sampling|>"):
         tid = inner.convert_tokens_to_ids(name)
         if tid is not None and tid != unk and tid not in ids:
             ids.append(int(tid))
@@ -91,7 +93,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
     pad_id = inner.pad_token_id
     batch = max(1, int(job.get("batch") or DEFAULT_BATCH))
     # the same kind of question together (same limit), the shortest prompts first: less padding
-    prompts = {r["id"]: prompt_of(inner, r) for r in requests}
+    prompts = {r["id"]: prompt_of(inner, r, job.get("family")) for r in requests}
     order = sorted(requests, key=lambda r: (not r["thinking"], len(prompts[r["id"]])))
     seed, n_batch, i = int(settings["seed"]), 0, 0
     counted = {"tokens": 0}

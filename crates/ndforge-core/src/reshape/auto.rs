@@ -1953,6 +1953,12 @@ fn step_heal_moe(p: &Project, st: &mut AutoState, idx: usize, fx: &mut dyn Effec
     }
     let passed = st.stages[idx].attempt == 0 && st.stages[idx].cut_check.as_ref().is_some_and(|c| c["verdict"].as_str().is_some_and(|v| v != "fail"));
     if !passed {
+        // a cut that failed its thinking check heals in rounds (a quick check every 5 million tokens, stopping as soon as it passes): the experts are frozen, so a round is cheap to judge
+        // and most of the budget is often not needed. The person's own rounds setting is kept.
+        if st.spec.heal_rounds.is_none() {
+            st.spec.heal_rounds = Some(auto_plan::HealRoundsOpt { round_m: 5, check: Some("quick".into()), first_check_m: Some(5) });
+            st.notes.push(format!("Stage {} heals in rounds of 5 million tokens with a quick thinking check after each, and stops as soon as the check passes.", idx + 1));
+        }
         return step_heal(st, idx, fx);
     }
     let cut = st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to go on with."))?;
