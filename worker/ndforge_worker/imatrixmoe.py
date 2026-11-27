@@ -10,7 +10,7 @@ import re
 
 import numpy as np
 
-_EXPS = re.compile(r"^blk\.(\d+)\.(ffn_(?:down|up|gate|gate_up)_exps)\.weight\.(in_sum2|counts)$")
+EXPS_RE = _EXPS = re.compile(r"^blk\.(\d+)\.(ffn_(?:down|up|gate|gate_up)_exps)\.weight\.(in_sum2|counts)$")
 
 
 class MoeMatrixError(ValueError):

@@ -211,6 +211,8 @@ class Cut:
     def __init__(self, name, origin_repo, origin_layers, src, inter_before, inter_after, kept_mlp, folder):
         self.name, self.origin_repo, self.origin_layers, self.src = name, origin_repo, origin_layers, src
         self.inter_before, self.inter_after, self.kept_mlp, self.folder = inter_before, inter_after, kept_mlp, folder
+        self.kept_experts = None          # a mixture of experts cut along the expert axis: {layer: [original expert numbers, in the new order]}
+        self.n_experts = None             # the experts per layer of the original
 
     @property
     def dropped(self) -> list:
@@ -327,7 +329,25 @@ def read_cut(model_dir, name: str = "", kept_layers=None) -> Cut:
                 raise AdaptRefused("bad_kept", f"The neurons kept in layer {j} of {name} are missing or do not fit ({after} of {before} expected). Its width record is damaged, so it is not used.")
     else:
         after = before
-    return Cut(name, origin.get("repo"), n_orig, src, before, after, kept_mlp, folder)
+    cut = Cut(name, origin.get("repo"), n_orig, src, before, after, kept_mlp, folder)
+    _read_moe(cut, meta, name, folder)
+    return cut
+
+
+def _read_moe(cut: Cut, meta: dict, name: str, folder) -> None:
+    """A cut of experts (shape "moe" with a `moe_kept.json`): which experts of every layer stayed, in their new order. Anything that does not fit is refused in plain words."""
+    moe = meta.get("moe") if isinstance(meta.get("moe"), dict) else None
+    if meta.get("shape") != "moe" or not moe or not moe.get("kept"):
+        return
+    try:
+        rec = json.loads((folder / str(moe["kept"])).read_text(encoding="utf-8"))
+        kept = {int(k): [int(x) for x in v] for k, v in rec["kept"].items()}
+        n_exp = int(rec["experts_before"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise AdaptRefused("bad_kept", f"The list of kept experts of {name} is missing or damaged, so the matrix cannot be cut to it.")
+    if sorted(kept) != list(range(cut.origin_layers)) or len({len(v) for v in kept.values()}) != 1 or any(len(set(v)) != len(v) or (v and (min(v) < 0 or max(v) >= n_exp)) for v in kept.values()):
+        raise AdaptRefused("bad_kept", f"The experts kept in {name} do not fit its record (every layer needs the same number of different experts of the original's {n_exp}), so they are not used.")
+    cut.kept_experts, cut.n_experts = kept, n_exp
 
 
 # ------------------------------------------------------------------------------------------------------------------ the plan: what comes out
@@ -368,10 +388,12 @@ def plan(entries, datasets, cut: Cut, weight: float = 1.0) -> dict:
         have = max(layers) + 1
         raise AdaptRefused("wrong_original", f"This matrix has data for {have} layers, but the original of the model {cut.name} ({cut.origin_repo or 'its original'}) has {cut.origin_layers}. "
                                               "It was not measured on that model (it may belong to another model, or to a model that was cut already). Choose the matrix of the original model.")
-    for l in trunk:
+    for l in ([] if cut.kept_experts else trunk):
         missing = [k for k in ("ffn_down.weight.in_sum2", "ffn_gate.weight.in_sum2", "ffn_up.weight.in_sum2") if k not in layers[l]]
         if missing:
             raise AdaptRefused("wrong_original", f"Layer {l} of this matrix has no {missing[0].split('.')[0]} statistics; every layer of the original model has ffn_down, ffn_gate and ffn_up, so this is not a whole matrix of it.")
+    if cut.kept_experts:
+        return _plan_experts(entries, cut, layers, other, extra)
     down = {l: layers[l][FFN_DOWN] for l in trunk}
     if cut.inter_before is not None and any(n != cut.inter_before for n in down.values()):
         bad = next(l for l, n in down.items() if n != cut.inter_before)
@@ -396,6 +418,27 @@ def plan(entries, datasets, cut: Cut, weight: float = 1.0) -> dict:
             "dropped_mtp": extra, "other": other}
 
 
+def _plan_experts(entries, cut: Cut, layers, other, extra) -> dict:
+    """The plan of a matrix of a mixture of experts cut along the expert axis: every layer stays (no layers dropped), the `*_exps` statistics shrink to the kept experts, the rest is copied."""
+    from . import imatrixmoe
+    n, k = cut.n_experts, len(next(iter(cut.kept_experts.values())))
+    out = []
+    for name, ln in entries:
+        mm = imatrixmoe.EXPS_RE.match(name)
+        if mm is None:
+            out.append((name, ln, name))
+        elif mm.group(3) == "counts":
+            if ln != n:
+                raise AdaptRefused("wrong_original", f"{name} has {ln} counts, but the original of {cut.name} has {n} experts per layer. This matrix was not measured on that model.")
+            out.append((name, k, name))
+        else:
+            if ln % n:
+                raise AdaptRefused("wrong_original", f"{name} has {ln} values, which cannot be split over the original's {n} experts. This matrix was not measured on that model.")
+            out.append((name, ln // n * k, name))
+    return {"entries": out, "layers_before": cut.origin_layers, "layers_after": cut.origin_layers, "kept": list(cut.src), "ffn_down_before": None, "ffn_down_after": None,
+            "dropped_mtp": extra, "other": other, "experts_before": n, "experts_after": k}
+
+
 def _is_down(name: str) -> bool:
     m = _LAYER_RE.match(name)
     return bool(m) and m.group(2) == FFN_DOWN
@@ -415,8 +458,16 @@ def adapt_arrays(m: Matrix, cut: Cut, weight: float, p: dict) -> dict:
         a = m.arrays[old]
         if cut.thinner and _is_down(new):
             a = a[cut.kept_mlp[int(_LAYER_RE.match(new).group(1))]]
+        if cut.kept_experts:
+            a = _expert_part(new, a, cut)
         out[new] = _weighted(a, weight)
     return out
+
+
+def _expert_part(name: str, a, cut: Cut):
+    """`a` (the source's array of this entry) reduced to the kept experts when it is an `*_exps` statistic of a mixture of experts cut"""
+    from . import imatrixmoe
+    return imatrixmoe.slice_experts({name: a}, cut.kept_experts, cut.n_experts)[name]
 
 
 def adapted_kvs(m: Matrix, name: str):
@@ -484,6 +535,8 @@ def verify(src: Matrix, out_path, cut: Cut, p: dict, weight: float) -> dict:
         a = src.arrays[old]
         if cut.thinner and _is_down(new):
             a = a[cut.kept_mlp[int(_LAYER_RE.match(new).group(1))]]
+        if cut.kept_experts:
+            a = _expert_part(new, a, cut)
         b = got.arrays[new]
         if weight == 1.0:
             same = numpy.array_equal(a, b) and float(a.astype(numpy.float64).sum()) == float(b.astype(numpy.float64).sum())
