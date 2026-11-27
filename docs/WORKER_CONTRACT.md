@@ -75,3 +75,8 @@ Additive: a heal-speed report's `environment` has `triton_match` ({torch, triton
 - NEW job `llama_offload_tune` and error codes `llama_offload_tune_failed`, `llama_offload_tune_stopped`: `{"gguf", "ctx", "chunks", "candidates": [99, ...], "work", "stop_file"}`; result `rows` (`ngl`, `ok`, `seconds`, `sec_per_pass`, `tokens_per_s`, `timed_by`, or `error`, `oom`), `gguf`, `gguf_mb`, `tool`, `stopped`.
 - `distill` job, `bench` object: `teacher_sweep` (a list of token budgets, 0 = the fixed rows; loads `distill.teacher`, result `batch_sweep` and `teacher_sweep: true`), `trial {tokens}` (a short real heal: result `held_before`, `held_after`, `improvement`, `updates`, `tokens`, `optimizer`, `rank`), and, earlier, `sweep_repeat`, `worst_case`.
 - `distill_cache` job: `teacher_batch_tokens` from a heal's own number (HealSpec) when set; the `engine` object's `max_num_seqs`, `batch_tokens`, `gpu_memory_utilization` only when set. `reshape` / `reshape_try` / `reshape_measure` `calibration.batch` only when set; `think_check` `batch` from the settings only when set. `imatrix_make` / `quantcheck` `ngl` from the settings (99 when empty).
+
+## The Hugging Face token (no contract change)
+
+Every job except `hello`, `selftest`, `mixed_plan`, `quantfit_estimate`, `llama_offload_tune` and `imatrix_dat` is started with the environment variable `HF_TOKEN` when the person saved a token (never in a job file). A refusal of the Hub (401 / 403, gated) is
+answered with a plain message under the job's own error code and points to the Hugging Face token card on the Training setup page. No job, event, error code or key was added or changed; `contract.json` is unchanged. See docs/HF_TOKEN.md.

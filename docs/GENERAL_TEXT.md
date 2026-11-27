@@ -112,8 +112,7 @@ Where things are stored:
 
 ### The token
 
-The token is passed to the worker **only as the environment variable `HF_TOKEN`**, only for the jobs that read general text from the Hub (`general_check`, `distill_cache`, `distill`
-with a general block, `export` with the matrix on; `envmgr::jobs::job_env`). It is never in `job.json`, in `heal.json`, in the page state (only `has_token`), in the log or in a problem
+The token is passed to the worker **only as the environment variable `HF_TOKEN`**, for every job that can reach the Hub (since the token became app-wide: docs/HF_TOKEN.md; `envmgr::jobs::job_env`). It is never in `job.json`, in `heal.json`, in the page state (only `has_token`), in the log or in a problem
 report: `scrub` (Rust, also used by the problem report) and `protocol.scrub` (worker, applied to every log and error line, and to the exact value of `HF_TOKEN`) replace `hf_` followed by
 20 or more letters or digits with `[token]`. A token is accepted only if it starts with `hf_`. Removing it deletes it from `secrets.json`.
 
