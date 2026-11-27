@@ -34,6 +34,12 @@ def problems(tag, root=ROOT):
         text = (root / crate).read_text(encoding="utf-8")
         if not re.search(r"^version\.workspace\s*=\s*true", text, re.M):
             out.append(f"{crate} must take its version from the workspace (version.workspace = true).")
+    for rel, key in (("worker/ndforge_worker/__init__.py", "__version__"), ("worker/pyproject.toml", "version")):
+        f = root / rel
+        if f.exists():
+            w = re.search(r"^\s*" + key + r"\s*=\s*\"([^\"]+)\"", f.read_text(encoding="utf-8"), re.M)
+            if w and w.group(1) != version:
+                out.append(f"{rel} says version {w.group(1)!r}, Cargo.toml says {version!r}; they must be the same.")
     iss = (root / "packaging" / "windows" / "ndforge.iss").read_text(encoding="utf-8")
     d = re.search(r'#define AppVersion "([^"]+)"', iss)
     if d and d.group(1) != version:

@@ -18,7 +18,8 @@ fn the_program_the_installer_and_the_worker_have_the_same_version() {
     let workspace = quoted_after(&cargo, "version").expect("version in Cargo.toml");
     assert_eq!(workspace, env!("CARGO_PKG_VERSION"), "the workspace version is the one this crate has");
     let tauri_v: serde_json::Value = serde_json::from_str(&tauri).unwrap();
-    assert_eq!(tauri_v["version"], workspace.as_str(), "src-tauri/tauri.conf.json");
+    // tauri.conf.json carries no version of its own (Tauri then takes Cargo's); if one is ever written back it must be the same
+    assert!(tauri_v["version"].is_null() || tauri_v["version"] == workspace.as_str(), "src-tauri/tauri.conf.json");
     assert_eq!(quoted_after(&init, "__version__").unwrap(), workspace, "worker/ndforge_worker/__init__.py");
     assert_eq!(quoted_after(&pyproject, "version").unwrap(), workspace, "worker/pyproject.toml");
 }
