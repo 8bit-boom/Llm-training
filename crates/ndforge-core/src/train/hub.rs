@@ -32,10 +32,18 @@ fn slug(repo: &str) -> String {
     format!("custom-{}", s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-"))
 }
 
-/// The chat format the worker knows for this model: "qwen3_5", "gemma4", or "generic" (the model's own chat template, its end-of-turn token).
+/// The chat format the worker knows for this model: "qwen3_5", "gemma4", "inkling2", or "generic" (the model's own chat template, its end-of-turn token).
 fn family_of(model_type: &str, architectures: &[String]) -> &'static str {
     let key = format!("{model_type} {}", architectures.join(" ")).to_lowercase().replace(['.', '-'], "_");
-    if key.contains("qwen3_5") { "qwen3_5" } else if key.contains("gemma4") || key.contains("gemma_4") { "gemma4" } else { "generic" }
+    if key.contains("qwen3_5") {
+        "qwen3_5"
+    } else if key.contains("gemma4") || key.contains("gemma_4") {
+        "gemma4"
+    } else if key.contains("inkling2") {
+        "inkling2"
+    } else {
+        "generic"
+    }
 }
 
 /// What a lookup found: the entry to add, and things the person should know first.
@@ -184,7 +192,9 @@ fn evaluate(ident: &Ident, info: &Value) -> Result<Found> {
     if cfg["auto_map"].is_object() {
         return Err(Error::new(format!("{label} needs its own program code to load (trust_remote_code). For safety ND Lore Forge does not run downloaded code; choose a model the standard libraries support.")));
     }
-    if cfg["quantization_config"].is_object() || tags.iter().any(|t| ["gptq", "awq", "bitsandbytes", "4-bit", "8-bit"].contains(&t.as_str())) {
+    // Inkling-2-Mini (and cuts of it) is stored in its authors' packed format on purpose; the program reads that format itself (docs/MOE_GUIDE.md)
+    let packed_ok = family_of(cfg["model_type"].as_str().unwrap_or(""), &[]) == "inkling2";
+    if !packed_ok && (cfg["quantization_config"].is_object() || tags.iter().any(|t| ["gptq", "awq", "bitsandbytes", "4-bit", "8-bit"].contains(&t.as_str()))) {
         return Err(Error::new(format!("{label} is already shrunk (quantized). Training needs the original 16-bit weights; ND Lore Forge shrinks the model itself when you choose QLoRA. Choose the original model.")));
     }
     // a chat template is what turns the practice conversations into the model's own format

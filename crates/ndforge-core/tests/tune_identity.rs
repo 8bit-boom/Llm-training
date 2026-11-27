@@ -110,3 +110,25 @@ fn the_machine_key_is_the_card_and_its_memory_only() {
     assert_ne!(a.key, machine_from("NVIDIA GeForce RTX 5090", 16000, "621.24", "windows 11", BTreeMap::new()).key);
     assert_eq!((minor_of("2.14.1+cu130"), minor_of("621.24"), major_of("621.24"), major_of("v3.8.0")), ("2.14".to_string(), "621.24".to_string(), "621".to_string(), "3".to_string()));
 }
+
+#[test]
+fn a_cut_of_a_mixture_of_experts_model_is_another_shape_and_dense_shapes_do_not_move() {
+    // the real Inkling-2-Mini config (worker/tests/data/inkling2_config.json)
+    let cfg: Value = serde_json::from_str(include_str!("../../../worker/tests/data/inkling2_config.json")).unwrap();
+    let base = shape_of_config(&cfg).0;
+    let mut e = cfg.clone();
+    e["text_config"]["n_routed_experts"] = json!(96);
+    let mut k = cfg.clone();
+    k["text_config"]["num_experts_per_tok"] = json!(6);
+    let mut p = cfg.clone();
+    p["text_config"]["loop_config"]["num_passes"] = json!(2);
+    let mut noise = cfg.clone();
+    noise["dtype"] = json!("float32");
+    assert!([&e, &k, &p].iter().all(|c| shape_of_config(c).0 != base), "experts, experts per token and loop passes are part of the shape");
+    assert_eq!(shape_of_config(&noise).0, base);
+    // a dense model that happens to name a per-token count does not get it into its shape (so every saved shape id stays what it was)
+    let mut dense = qwen_cfg();
+    let before = shape_of_config(&dense).0;
+    dense["text_config"]["num_experts_per_tok"] = json!(4);
+    assert_eq!(shape_of_config(&dense).0, before);
+}

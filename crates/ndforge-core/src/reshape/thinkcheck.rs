@@ -138,11 +138,14 @@ pub struct ThinkSpec {
     pub backend: Option<String>,
     /// the vLLM engine settings the worker gets (`vllm::engine_job`); the window's command fills it from the settings, the page does not send it
     pub engine: Option<Value>,
+    /// the chat-format family of the model ("inkling2": its own template arguments and sampling); None for every model that was checked before this existed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 impl Default for ThinkSpec {
     fn default() -> Self {
-        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None, round: None, backend: None, engine: None }
+        ThinkSpec { name: String::new(), target: default_target(), quick: false, gguf: None, load: None, batch: None, max_new: None, round: None, backend: None, engine: None, family: None }
     }
 }
 
@@ -271,6 +274,9 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
     }
     if let Some(n) = spec.max_new.filter(|n| (1..=65536).contains(n)) {
         job["max_new"] = json!(n);
+    }
+    if let Some(f) = spec.family.as_deref().filter(|f| !f.is_empty()) {
+        job["family"] = json!(f);
     }
     Ok(job)
 }

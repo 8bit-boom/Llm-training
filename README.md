@@ -25,6 +25,7 @@ runs in a small Python worker (Unsloth) that the program starts. Plan: [PLAN.md]
 | M12 Installers (Inno Setup, AppImage), in-app guide with screenshots, troubleshooting, problem report | Linux AppImage and .deb built and started here; the Windows installer and clean-machine runs are not verified (docs/INSTALL.md) |
 | M13 Slim or grow a model: layer pruning and depth up-scaling as a new base model | built and tested without a GPU (worker on stand-ins, a fake worker in the Rust tests, the page in a stand-in browser); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
 | M14 Thinner layers (width pruning) + healing by distillation | built and tested without a GPU or torch (numpy stand-ins, fake workers, the page in a stand-in browser; the CPU torch tests are written and have never run); needs a first run on the RTX 5090 (docs/RESHAPE.md, "Not verified yet") |
+| M15 Inkling-2-Mini and mixtures of experts: cut experts, experts per token and loop passes of a packed model byte for byte, Try first for experts, Auto-cut in one click, version checks (transformers, llama.cpp, vLLM, the model's repository) | built and tested with stand-ins that have the real tensor names and the packed layout (no GPU, no 20 GB checkpoint); healing and growing an Inkling are not built yet; needs a first run on the RTX 5090 (docs/MOE_GUIDE.md, "Not verified yet") |
 | Importance matrix for the small GGUF sizes (optional, Step 5) | built and tested with stand-in llama.cpp tools; not run with a real llama.cpp or GPU (docs/IMATRIX.md, "Not verified yet") |
 | Importance matrices as a separate function (make one without any GGUF export, keep a library, reuse it in exports, save a copy or a legacy .dat) | built and tested with stand-in tools and a stand-in browser; not run with a real llama.cpp (docs/IMATRIX.md, "The matrix library" and "Not verified yet") |
 | Compare quants (KL divergence of each quantised GGUF from the 16-bit model, a table, a chart with the Pareto line and a plain verdict) | built and tested with stand-in llama.cpp tools and a stand-in browser; not run with a real llama.cpp or GPU (docs/QUANT_COMPARE.md, "Not verified yet") |
@@ -78,7 +79,7 @@ Code: `crates/ndforge-core/src/dataset/` (`markup`, `docs`, `chunk`, `builders`,
 ## Training (M6)
 
 Step 3 trains a model with **LoRA** (16-bit by default; 4-bit QLoRA when memory is short) on the newest saved data version. `catalog/models.toml` lists the
-six models (repos checked on Hugging Face). The Rust program plans the run (`train/plan.rs`: presets Quick / Normal / Best, memory estimate, lowers batch and
+seven models (repos checked on Hugging Face). The Rust program plans the run (`train/plan.rs`: presets Quick / Normal / Best, memory estimate, lowers batch and
 sequence length to fit, replaces the estimate with the peak measured on this PC) and starts the Python worker (`worker/ndforge_worker/trainjob.py`), which
 reports JSON lines: `start`, `metric` (loss, learning rate, memory, GPU temperature, time left), `sample` (answers to fixed questions before/during/after
 training), `progress`, `log`, `result`. **Stop** writes a STOP file; the worker saves a checkpoint after the current step and exits (killed after 2 minutes

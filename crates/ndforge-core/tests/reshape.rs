@@ -3035,3 +3035,67 @@ fn the_variants_are_pure_and_round_two_only_offers_what_fits() {
     assert!(second_round(&rows, &HealKnobs { head_ckpt: false, ..k.clone() }, 16.0, &d, Some(32.0)).is_empty(), "already kept");
     assert!(best_row(&[json!({"ok": false})]).is_none());
 }
+
+#[test]
+fn moe_expert_count_rules_agree_with_the_worker() {
+    use ndforge_core::reshape::moe::{check_experts_kept, expert_counts_allowed, MoeInfo};
+    let cases: serde_json::Value = serde_json::from_slice(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker/tests/data/moe_cases.json")).unwrap()).unwrap();
+    for c in cases["counts"].as_array().unwrap() {
+        let got = expert_counts_allowed(c["experts"].as_u64().unwrap() as u32, c["top_k"].as_u64().unwrap() as u32);
+        assert_eq!(serde_json::to_value(got).unwrap(), c["allowed"], "{c}");
+    }
+    for c in cases["checks"].as_array().unwrap() {
+        let r = check_experts_kept(c["experts"].as_u64().unwrap() as u32, c["top_k"].as_u64().unwrap() as u32, c["keep"].as_u64().unwrap() as u32);
+        assert_eq!(r.is_none(), c["ok"].as_bool().unwrap(), "{c}: {r:?}");
+    }
+    // an inspect without "moe" (every dense model, every old worker) still reads, and one with it keeps its loop numbers
+    let old: Inspect = serde_json::from_value(json!({"supported": true, "layers": 4, "period": 2, "blocks": 2, "total_params": 10})).unwrap();
+    assert!(old.moe.is_none() && !serde_json::to_value(&old).unwrap().as_object().unwrap().contains_key("moe"));
+    let m: MoeInfo = serde_json::from_value(json!({"experts": 128, "top_k": 8, "core": [6, 18], "passes": 3, "future_key": 1})).unwrap();
+    assert!(m.looped() && m.core_layers() == 12 && m.visits_for(24, 3) == 48 && m.visits_for(24, 2) == 36);
+}
+
+/// the inspect of Inkling-2-Mini as the worker sends it (worker/tests/test_moe_layout.py pins the numbers)
+fn inkling() -> Inspect {
+    serde_json::from_value(json!({"model_type": "inkling2_loop", "supported": true, "layers": 24, "period": 6, "blocks": 4, "total_params": 26_388_641_280u64, "source_bytes": 19_525_870_752u64,
+        "has_vision": true, "width_supported": false, "layer_types": vec!["sliding_attention"; 24],
+        "moe": {"arch": "inkling2_loop", "experts": 128, "top_k": 8, "blocks": 4, "block_size": 6, "core": [6, 18], "passes": 3, "varloop": false, "visits": 48,
+                "expert_params": 24_461_180_928u64, "dense_params": 1_609_204_224u64, "packed_bytes": 19_525_870_752u64}})).unwrap()
+}
+
+#[test]
+fn an_inkling_cut_of_passes_or_top_k_is_validated_and_sent_as_config_only() {
+    let ins = inkling();
+    let cut = |v: serde_json::Value| -> ReshapeSpec { serde_json::from_value(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "x": 0}).as_object().unwrap().iter().chain(v.as_object().unwrap()).map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>().into()).unwrap() };
+    assert!(validate(&cut(json!({"passes": 2})), &ins).is_ok() && validate(&cut(json!({"top_k": 6})), &ins).is_ok() && validate(&cut(json!({"passes": 4, "top_k": 10})), &ins).is_ok());
+    let err = |v: serde_json::Value| validate(&cut(v), &ins).unwrap_err().0;
+    assert!(err(json!({"passes": 1})).contains("fixed loop") && err(json!({})).contains("Nothing to change") && err(json!({"top_k": 99})).contains("between 1 and 32"));
+    assert!(err(json!({"passes": 2, "blocks": 1})).contains("not available") && err(json!({"passes": 9})).contains("More than 8"));
+    assert!(err(json!({"passes": 2, "mode": "grow"})).contains("Only cutting"));
+    let mut var = ins.clone();
+    var.moe.as_mut().unwrap().varloop = true;
+    assert!(validate(&cut(json!({"passes": 1})), &var).is_ok());
+    // a dense model refuses these keys, and a spec without them serializes exactly as before
+    assert!(validate(&cut(json!({"passes": 2})), &big()).unwrap_err().0.contains("mixture-of-experts"));
+    let plain = serde_json::to_value(spec(Mode::Prune, 1)).unwrap();
+    assert!(plain.get("passes").is_none() && plain.get("top_k").is_none());
+}
+
+#[test]
+fn removing_experts_follows_the_owners_rules_in_the_validation() {
+    let ins = inkling();
+    let cut = |experts: serde_json::Value| -> ReshapeSpec { serde_json::from_value(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "experts": experts})).unwrap() };
+    for keep in [112, 96, 80, 64] {
+        assert!(validate(&cut(json!({"keep": keep})), &ins).is_ok(), "{keep}");
+    }
+    let err = |v: serde_json::Value| validate(&cut(v), &ins).unwrap_err().0;
+    assert!(err(json!({"keep": 100})).contains("multiple of 16") && err(json!({"keep": 16})).contains("at least 32") && err(json!({"keep": 48})).contains("at most 50 %"));
+    assert!(err(json!({"keep": 128})).contains("smaller") && err(json!({"keep": 96, "scoring": "magic"})).contains("ranked"));
+    // the defaults: REAP, with the router bias nudged
+    let e = cut(json!({"keep": 96})).experts.unwrap();
+    assert_eq!((e.scoring.as_str(), e.rebalance), ("reap", true));
+    // 4 x the experts per token also bounds the count from below: 16 per token means at least 64
+    let mut wide = ins.clone();
+    wide.moe.as_mut().unwrap().top_k = 16;
+    assert!(validate(&cut(json!({"keep": 48})), &wide).is_err() && validate(&cut(json!({"keep": 64})), &wide).is_ok());
+}

@@ -1,0 +1,15 @@
+{"counts": [
+  {"experts": 128, "top_k": 8, "allowed": [112, 96, 80, 64]},
+  {"experts": 128, "top_k": 16, "allowed": [112, 96, 80, 64]},
+  {"experts": 64, "top_k": 8, "allowed": [48, 32]},
+  {"experts": 32, "top_k": 8, "allowed": []},
+  {"experts": 256, "top_k": 8, "allowed": [240, 224, 208, 192, 176, 160, 144, 128]}
+ ],
+ "checks": [
+  {"experts": 128, "top_k": 8, "keep": 96, "ok": true},
+  {"experts": 128, "top_k": 8, "keep": 104, "ok": false},
+  {"experts": 128, "top_k": 8, "keep": 16, "ok": false},
+  {"experts": 128, "top_k": 8, "keep": 48, "ok": false},
+  {"experts": 128, "top_k": 8, "keep": 128, "ok": false},
+  {"experts": 128, "top_k": 16, "keep": 48, "ok": false}
+ ]}

@@ -56,6 +56,15 @@ pub fn shape_of_config(cfg: &Value) -> (String, ShapeFacts, Value) {
             m.insert(k.into(), cfg[k].clone());
         }
     }
+    // mixture-of-experts models with a loop (Inkling): the expert count, the experts used per token, the loop and the attention pattern change the memory and the speed,
+    // so a 96-expert cut must not share a preset with the 128-expert original. Only added when present, so every existing shape_id stays what it was.
+    if !tc["n_routed_experts"].is_null() {
+        for k in ["n_routed_experts", "num_experts_per_tok", "loop_config", "local_layer_ids", "n_shared_experts"] {
+            if !tc[k].is_null() {
+                m.insert(k.into(), tc[k].clone());
+            }
+        }
+    }
     let inter = tc["intermediate_size"].clone();
     m.insert("intermediate_size".into(), inter.clone());
     if let Value::Object(o) = tc {

@@ -1,0 +1,163 @@
+{
+ "model_type": "inkling2_loop",
+ "supported": true,
+ "why": null,
+ "layers": 24,
+ "layer_types": [
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "full_attention"
+ ],
+ "period": 6,
+ "blocks": 4,
+ "layer_params": [
+  1046454272,
+  1046454272,
+  1046454272,
+  1046454272,
+  1046454272,
+  1046606336,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048965632,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048813568,
+  1048965632,
+  1046454272,
+  1046454272,
+  1046454272,
+  1046454272,
+  1046454272,
+  1046606336
+ ],
+ "embed_params": 463159296,
+ "lm_head_params": 463159296,
+ "vision_params": 318256128,
+ "mtp_params": 0,
+ "other_params": 244224,
+ "total_params": 26388641280,
+ "bytes_per_param": 2.0,
+ "has_vision": true,
+ "tied": false,
+ "source_bytes": 19525870752,
+ "local": false,
+ "width_dims": null,
+ "width_supported": false,
+ "width_why": "Thinning the layers' width does not apply to a mixture of experts; remove experts instead.",
+ "width_choices": null,
+ "moe": {
+  "arch": "inkling2_loop",
+  "experts": 128,
+  "top_k": 8,
+  "expert_inter": 1152,
+  "shared": 0,
+  "router_scoring": "sigmoid",
+  "router_bias": true,
+  "blocks": 4,
+  "block_size": 6,
+  "core": [
+   6,
+   18
+  ],
+  "passes": 3,
+  "varloop": false,
+  "visits": 48,
+  "global_layers": [
+   5,
+   11,
+   17,
+   23
+  ],
+  "expert_params": 24461180928,
+  "dense_params": 1609204224,
+  "active_params": 4914401280,
+  "packed": {
+   "nvfp4": [
+    0,
+    19
+   ],
+   "mxfp8": [
+    20,
+    23
+   ]
+  },
+  "packed_bytes": 19525870752,
+  "bf16_bytes": 52777282560,
+  "mtp": {
+   "file": null,
+   "targets": [
+    5,
+    23,
+    41,
+    48
+   ]
+  },
+  "cuts": {
+   "experts": true,
+   "top_k": true,
+   "passes": "untrained",
+   "blocks": "expert-only",
+   "expert_width": "experimental"
+  },
+  "status": "supported",
+  "sizes": [
+   {
+    "experts": 128,
+    "params": 26388641280,
+    "packed_bytes": 19511202816,
+    "bf16_bytes": 52777282560
+   },
+   {
+    "experts": 112,
+    "params": 23330108544,
+    "packed_bytes": 17552397312,
+    "bf16_bytes": 46660217088
+   },
+   {
+    "experts": 96,
+    "params": 20271575808,
+    "packed_bytes": 15593591808,
+    "bf16_bytes": 40543151616
+   },
+   {
+    "experts": 80,
+    "params": 17213043072,
+    "packed_bytes": 13634786304,
+    "bf16_bytes": 34426086144
+   },
+   {
+    "experts": 64,
+    "params": 14154510336,
+    "packed_bytes": 11675980800,
+    "bf16_bytes": 28309020672
+   }
+  ]
+ }
+}

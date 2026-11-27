@@ -60,6 +60,8 @@ pub fn lock_of(st: &AutoState, key: &str) -> Lock {
     let all: Vec<usize> = (0..n).collect();
     match key {
         "model_id" | "target_b" | "keep_thinking" | "allow_many_blocks" | "cut" => lock(key, "locked", "This decides which model is cut and how: start a new run for another one.", None),
+        // a mixture of experts: the goal, the file size, the ranking and the experts per token decide WHICH cut is made; they stay free only until the measuring has begun
+        "moe" => if started(st, "measure") { lock(key, "locked", "The experts have been measured for this cut: start a new run for another size or goal.", None) } else { lock(key, "free", "Nothing has been measured yet.", None) },
         "preset" | "max_hours" | "notify_stages" | "retry_heal" | "back_off" => lock(key, "free", "Used when a step needs it.", None),
         "stages" => if started(st, "s1.cut") || started(st, "think_gate") { lock(key, "locked", "The cut of stage 1 is made already: the number of stages is fixed.", None) } else { lock(key, "free", "No cut has been made yet.", None) },
         "quick" | "search_minutes" => if started(st, "try") { lock(key, "locked", "Try first has started (or finished): how it looks for the cut is fixed.", None) } else { lock(key, "free", "Try first has not started.", None) },
@@ -84,7 +86,7 @@ pub fn lock_of(st: &AutoState, key: &str) -> Lock {
 pub fn lock_table(st: &AutoState) -> Vec<Lock> {
     ["preset", "stages", "quick", "search_minutes", "think_gate", "think_gate_n", "check_cut", "think_quick", "stage_a_tokens_m", "last_tokens_m", "share_teacher_cache", "heal_rounds", "retry_heal", "back_off", "imatrix",
      "max_hours", "vllm", "quants", "target_gb", "studio_publish", "keep_intermediate", "notify_stages", "model_id", "target_b", "keep_thinking", "allow_many_blocks", "cut"]
-        .iter().map(|k| lock_of(st, k)).collect()
+        .iter().map(|k| lock_of(st, k)).chain(st.spec.moe.is_some().then(|| lock_of(st, "moe"))).collect()
 }
 
 fn label(key: &str) -> &'static str {

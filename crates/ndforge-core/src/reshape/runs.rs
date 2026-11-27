@@ -85,6 +85,21 @@ pub fn name_for_shape(src: &ModelEntry, mode: Mode, layers_after: u32, width: Op
     format!("{}-{}-{}-{layers}{tail}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&src.name), mode.word())
 }
 
+/// The name of a made mixture-of-experts model: `…-moe-p2-k6` (loop passes, experts per token).
+pub fn name_for_moe(src: &ModelEntry, spec: &ReshapeSpec) -> String {
+    let mut tail = String::new();
+    if let Some(p) = spec.passes {
+        tail += &format!("-p{p}");
+    }
+    if let Some(k) = spec.top_k {
+        tail += &format!("-k{k}");
+    }
+    if let Some(e) = &spec.experts {
+        tail = format!("-e{}{tail}", e.keep);
+    }
+    format!("{}-{}-moe{tail}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&src.name))
+}
+
 /// The key of a measurement: model, data version, samples, length and the way it was loaded. The same key is the same measurement.
 pub fn scores_key(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str) -> String {
     scores_key_with(source_repo, version, samples, len, load, None)
@@ -172,7 +187,8 @@ pub fn inspect(m: &ModelEntry, kill: &AtomicBool, on_event: &mut dyn FnMut(Value
 /// The job the worker gets. Slimming by measuring needs a saved training-data version (the layers are measured on the project's own text).
 pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect, name: &str) -> Result<Value> {
     plan::validate(spec, ins)?;
-    let measures = spec.mode == Mode::Prune && (spec.drop_layers.is_none() || spec.width.is_some());
+    // a mixture-of-experts cut that only changes the config (loop passes, experts per token) measures nothing
+    let measures = spec.mode == Mode::Prune && (spec.drop_layers.is_none() || spec.width.is_some()) && ins.inkling().is_none();
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
     let train = version.map(|n| p.folder.join("datasets").join(format!("v{n}")).join("train.jsonl")).filter(|f| f.is_file());
     if measures && train.is_none() {
@@ -188,6 +204,21 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         "load": spec.load, "check": !spec.skip_check, "shard_gb": 5,
         "out": dir.join("model.partial"), "final": dir.join("model"),
     });
+    if let Some(p) = spec.passes {
+        job["passes"] = json!(p);
+    }
+    if let Some(k) = spec.top_k {
+        job["top_k"] = json!(k);
+    }
+    if let Some(e) = &spec.experts {
+        // the removal follows a measurement of the experts on this project's text: the same folder `measure_with` wrote (same key: model, data version, samples, length, load)
+        let key = scores_key_with(&m.repo, version, spec.calib_samples, spec.calib_len, &spec.load, None);
+        let dir = scores_dir(p, &key);
+        if !dir.join("moe_scores.json").is_file() {
+            return Err(Error::new("Measure the experts first (on this page, \"Measure the experts\"): which ones to remove is decided by what they do on your text."));
+        }
+        job["experts"] = json!({"keep": e.keep, "scoring": e.scoring, "rebalance": e.rebalance, "scores_dir": dir});
+    }
     if let Some(w) = &spec.width {
         job["width"] = json!({"intermediate_size": w.intermediate, "linear_num_value_heads": w.lin_v_heads, "num_attention_heads": w.heads});
         job["scores_dir"] = json!(scores_dir(p, &scores_key_with(&m.repo, version, samples, spec.calib_len, &spec.load, spec.reasoning.as_ref())));
@@ -242,6 +273,9 @@ impl Drop for Active {
 }
 
 fn layers_after(ins: &Inspect, spec: &ReshapeSpec) -> u32 {
+    if ins.inkling().is_some() {
+        return ins.layers;
+    }
     match (&spec.drop_layers, spec.mode) {
         (Some(d), Mode::Prune) => ins.layers.saturating_sub(d.len() as u32),
         (_, Mode::Prune) => ins.layers.saturating_sub(spec.blocks * ins.period),
@@ -262,7 +296,7 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
     let ins = inspect(&m, &stop, on_event)?;
     plan::validate(spec, &ins)?;
     let depth_removed = spec.blocks > 0 || spec.drop_layers.is_some();
-    let make_name = || name_for_shape(&m, spec.mode, layers_after(&ins, spec), spec.width.as_ref(), depth_removed);
+    let make_name = || if ins.inkling().is_some() { name_for_moe(&m, spec) } else { name_for_shape(&m, spec.mode, layers_after(&ins, spec), spec.width.as_ref(), depth_removed) };
     let mut name = make_name();
     // two models made in the same second (or a folder left over) never share a folder
     let mut n = 1;
@@ -1781,7 +1815,7 @@ pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, loa
 pub fn measurement_info_with(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Value {
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
     let key = scores_key_with(&m.repo, version, samples, len, load, reasoning);
-    let meta = read_json(&scores_dir(p, &key).join("scores.json"));
+    let meta = read_json(&scores_dir(p, &key).join("scores.json")).or_else(|| read_json(&scores_dir(p, &key).join("moe_scores.json")).map(|v| v["meta"].clone()));
     json!({"key": key, "exists": meta.is_some(), "tokens": meta.as_ref().map(|x| x["tokens"].clone()), "load": meta.as_ref().map(|x| x["load"].clone()),
            "created": meta.as_ref().map(|x| x["created"].clone()), "data_version": version})
 }
@@ -1798,10 +1832,13 @@ pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &
     if let Some(r) = reasoning {
         r.validate()?;
     }
-    if !["auto", "16bit", "4bit", "offload"].contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
+    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+    // a mixture of experts (Inkling) is measured by its own job: it is loaded packed ("auto" | "packed" | "hf"), not in 16 or 4 bit
+    let moe = m.family == "inkling2";
+    let loads: &[&str] = if moe { &["auto", "packed", "hf"] } else { &["auto", "16bit", "4bit", "offload"] };
+    if !loads.contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
         return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
     }
-    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the layers are measured on your own text."))?;
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
     if !train.is_file() {
@@ -1812,7 +1849,7 @@ pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &
     let folder = scores_dir(p, &key);
     let _active = Active::begin(&folder)?;
     let job = json!({
-        "job": "reshape_measure", "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
+        "job": if moe { "moe_measure" } else { "reshape_measure" }, "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
         "calibration": calibration_json(Some(&train), samples, len, Some(version), reasoning),
     });
     let stop_dir = models_dir(p).join("_scores");
@@ -1902,6 +1939,9 @@ pub struct TrySpec {
     /// the automatic search of the best cut (reshape::search): `{groups, budget_min, thorough, ...}`; the worker plans the rounds itself and measures in one job
     #[serde(default)]
     pub search: Option<Value>,
+    /// a mixture of experts (Inkling): the questions to answer, `{"keys": ["e=96", "k=6", ...], "goal": "size" | "speed" | "grow"}` (the worker's default list for the goal when no keys); not sent unless set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<Value>,
 }
 
 /// The most cuts one request may ask for (a safety net; the page asks for far fewer).
@@ -1911,8 +1951,13 @@ pub const TRY_SEARCH_MAX_GROUPS: usize = 8;
 
 impl TrySpec {
     pub fn validate(&self) -> Result<()> {
-        if !["auto", "16bit", "4bit", "offload"].contains(&self.load.as_str()) {
+        if !["auto", "16bit", "4bit", "offload", "packed", "hf"].contains(&self.load.as_str()) {
             return Err(Error::new(format!("Unknown way of loading the model: {}.", self.load)));
+        }
+        if let Some(m) = &self.moe {
+            if m["keys"].as_array().is_some_and(|k| k.len() > 40 || k.iter().any(|x| !x.as_str().is_some_and(|t| t.len() < 40 && t.chars().all(|c| c.is_ascii_alphanumeric() || "=|_".contains(c))))) || m["goal"].as_str().is_some_and(|g| !["size", "speed", "grow"].contains(&g)) {
+                return Err(Error::new("The questions to try for a mixture of experts are not valid."));
+            }
         }
         if !["contiguous", "separate"].contains(&self.strategy.as_str()) {
             return Err(Error::new(format!("Unknown way of choosing layers: {}.", self.strategy)));
@@ -1963,6 +2008,9 @@ impl TrySpec {
         if let Some(s) = &self.search {
             w["search"] = s.clone();
         }
+        if let Some(m) = &self.moe {
+            w["moe"] = m.clone();
+        }
         w
     }
 }
@@ -1980,12 +2028,16 @@ pub fn try_job(p: &Project, m: &ModelEntry, spec: &TrySpec, plan_only: bool) -> 
     if !train.is_file() {
         return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
     }
-    Ok(json!({
+    let mut job = json!({
         "job": "reshape_try", "source": {"repo": m.repo, "family": m.family}, "load": spec.load, "out_dir": try_dir(p, m, version, spec), "plan_only": plan_only, "force": spec.force,
         "calibration": calibration_json(Some(&train), spec.samples, spec.len, Some(version), spec.reasoning.as_ref()),
         "measure_dir": scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load, spec.reasoning.as_ref())), "measure_samples": spec.measure_samples,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "strategy": spec.strategy, "want": spec.want(), "params_b": spec.params_b,
-    }))
+    });
+    if spec.moe.is_some() {
+        job["scores_dir"] = job["out_dir"].clone();         // the answers and the measurement of the experts share one folder (`moe_try.json` next to `moe_scores.json`)
+    }
+    Ok(job)
 }
 
 fn try_model(spec: &TrySpec) -> Result<ModelEntry> {
@@ -2011,7 +2063,13 @@ pub fn try_results(p: &Project, model_id: &str, samples: u32, len: u32, load: &s
 pub fn try_results_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Value> {
     let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let Some((version, _)) = crate::train::runs::latest_version(p) else { return Ok(json!({"exists": false})) };
-    let file = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning)).join("reshape_try.json");
+    let dir = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning));
+    // a mixture of experts keeps its answers in `moe_try.json` (worker/ndforge_worker/moetry.py)
+    if let Some(v) = read_json(&dir.join("moe_try.json")) {
+        return Ok(json!({"exists": true, "analysis": v["analysis"], "tokens": v["passes"].as_object().map(|o| o.values().map(|r| r["tokens"].as_f64().unwrap_or(0.0)).sum::<f64>()), "load": v["meta"]["load"],
+                         "passes": v["passes"].as_object().map(|o| o.len()).unwrap_or(0)}));
+    }
+    let file = dir.join("reshape_try.json");
     let Some(v) = read_json(&file) else { return Ok(json!({"exists": false})) };
     if v["key"]["source"] != json!(m.repo) || v["key"]["data_version"] != json!(version) {
         return Ok(json!({"exists": false}));

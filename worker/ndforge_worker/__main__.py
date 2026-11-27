@@ -189,6 +189,18 @@ def _run(kind, job: dict) -> int:
             traceback.print_exc()
             protocol.error("evaluate_failed", _explain(exc))
             return 1
+    if kind == "moe_measure":
+        from . import moemeasure, reshape
+        try:
+            return moemeasure.run(job)
+        except reshape.ReshapeError as exc:   # a plain-language refusal: no traceback text
+            protocol.error("reshape_refused", str(exc))
+            return 1
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            protocol.error("moe_measure_failed", _explain(exc))
+            return 1
     if kind in ("reshape_inspect", "reshape", "reshape_measure", "reshape_try"):
         from . import reshape, reshapejob, reshapetry
         try:

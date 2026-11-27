@@ -39,7 +39,7 @@ def render_chat(tokenizer, messages: list, fam_name: str):
     tok = _inner(tokenizer)
     if messages[-1]["role"] != "assistant":
         raise ValueError("the last message of a practice conversation must be the assistant's answer")
-    prompt = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True, **fam["prompt_kwargs"])
+    prompt = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True, **fam["prompt_kwargs"]) + fam.get("answer_open", "")
     end = fam["end"] if fam["end"] is not None else (tok.eos_token or "")
     return prompt, prompt + messages[-1]["content"] + end
 

@@ -43,6 +43,8 @@ fn hf() -> String {
                 "acme/base-model" => (200, chat(json!({"config": {"model_type": "llama", "tokenizer_config": {"eos_token": "</s>"}}}))),
                 "acme/custom-code" => (200, chat(json!({"config": {"model_type": "x", "auto_map": {"AutoModelForCausalLM": "modeling.X"}, "tokenizer_config": {"chat_template": "x"}}}))),
                 "acme/pre-quant" => (200, chat(json!({"config": {"model_type": "llama", "quantization_config": {"quant_method": "gptq"}, "tokenizer_config": {"chat_template": "x"}}}))),
+                "acme/Inkling-Cut" => (200, chat(json!({"tags": ["text-generation", "safetensors", "modelopt", "8-bit", "license:apache-2.0"], "pipeline_tag": "image-text-to-text",
+                    "config": {"model_type": "inkling2_loop", "architectures": ["Inkling2LoopForConditionalGeneration"], "quantization_config": {"quant_method": "modelopt"}, "tokenizer_config": {"chat_template": "x"}}}))),
                 "acme/image-model" => (200, chat(json!({"pipeline_tag": "text-to-image"}))),
                 "acme/bin-only" => (200, chat(json!({"siblings": [{"rfilename": "pytorch_model.bin", "size": 5}], "safetensors": null}))),
                 _ => (404, json!({"error": "Repository not found"})),
@@ -104,6 +106,21 @@ fn a_good_model_is_looked_up_sized_and_given_a_family() {
 }
 
 #[test]
+fn inkling_in_its_packed_format_is_accepted_and_gets_its_own_family() {
+    let (_g, _d) = setup();
+    let q = lookup("acme/Inkling-Cut").unwrap();
+    assert_eq!(q.entry.family, "inkling2");
+    assert!(q.warnings.iter().all(|w| !w.contains("only for Qwen3.5")), "{:?}", q.warnings);
+    // the packed format is only fine for this family: every other quantized model is still refused (see the pre-quant case below)
+    let spec = spec_for("inkling2", 8192);
+    assert!(spec.template.is_empty() && spec.stop.is_empty());
+    let mf = modelfile_text("m-q4_k_m.gguf", &spec, Some("mmproj.gguf"));
+    assert!(mf.contains("PARAMETER temperature 1") && mf.contains("PARAMETER top_p 1") && !mf.contains("TEMPLATE") && !mf.contains("top_k"), "{mf}");
+    let m = find("inkling-2-mini").unwrap();
+    assert_eq!((m.family.as_str(), m.repo.as_str(), m.params_b, m.vram_qlora_gb), ("inkling2", "thinkingmachines/Inkling-2-Mini", 26.39, 22.0));
+}
+
+#[test]
 fn what_cannot_be_trained_is_refused_in_plain_words() {
     let (_g, _d) = setup();
     let err = |r: &str| lookup(r).unwrap_err().0;
@@ -126,12 +143,12 @@ fn what_cannot_be_trained_is_refused_in_plain_words() {
 #[test]
 fn added_models_are_kept_listed_planned_and_removable() {
     let (_g, _d) = setup();
-    assert_eq!(models().len(), 6);
+    assert_eq!(models().len(), 7);
     let id = AppModel::custom_model_add("acme/Llama-3.2-3B-Instruct").unwrap();
     assert_eq!(id, "custom-acme-llama-3.2-3b-instruct");
     // only a model that passes the checks is ever saved
     assert!(AppModel::custom_model_add("acme/gated").is_err() && custom_models().len() == 1);
-    assert_eq!((models().len(), models()[6].custom, models()[0].custom), (7, true, false));
+    assert_eq!((models().len(), models()[7].custom, models()[0].custom), (8, true, false));
     let m = find(&id).unwrap();
     assert_eq!((m.family.as_str(), m.params_b), ("generic", 3.21));
     // it is planned like any other model
@@ -145,12 +162,12 @@ fn added_models_are_kept_listed_planned_and_removable() {
     // adding twice keeps one; built-in models cannot be removed; removing works and is remembered
     add_custom(m.clone()).unwrap();
     assert_eq!(custom_models().len(), 1);
-    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 7);
+    assert!(remove_custom("qwen3.5-4b").unwrap_err().0.contains("added yourself") && models().len() == 8);
     remove_custom(&id).unwrap();
-    assert_eq!((models().len(), find(&id).is_none()), (6, true));
+    assert_eq!((models().len(), find(&id).is_none()), (7, true));
     // a damaged file counts as no models
     std::fs::write(std::path::Path::new(&std::env::var("NDFORGE_CONFIG_DIR").unwrap()).join("custom_models.json"), "{ not json").unwrap();
-    assert_eq!(models().len(), 6);
+    assert_eq!(models().len(), 7);
 }
 
 #[test]

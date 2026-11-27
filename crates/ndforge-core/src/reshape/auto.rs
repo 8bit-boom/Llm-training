@@ -683,12 +683,14 @@ macro_rules! out {
 }
 
 fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> Result<Flow> {
-    let _ = p;
     if st.spec.vllm.as_ref().is_some_and(|v| v.any()) {
         fx.engine_cleanup();          // the card is free before every step: vLLM takes most of it and must never run next to a training or another job
     }
     match id {
         "plan" => step_plan(st, fx),
+        "measure" if st.spec.moe.is_some() => step_measure_moe(st, fx),
+        "try" if st.spec.moe.is_some() => step_try_moe(st, fx),
+        "think_gate" if st.spec.moe.is_some() => step_think_gate_moe(st, fx),
         "measure" => step_measure(st, fx),
         "try" => step_try(st, fx),
         "think_gate" => step_think_gate(st, fx),
@@ -702,7 +704,9 @@ fn run_step(p: &Project, st: &mut AutoState, id: &str, fx: &mut dyn Effects) -> 
             match what {
                 "cut" => step_cut(st, idx, fx),
                 "check_cut" => step_check_cut(st, idx, fx),
+                "heal" if st.spec.moe.is_some() => step_heal_moe(p, st, idx, fx),
                 "heal" => step_heal(st, idx, fx),
+                "check_heal" if st.spec.moe.is_some() && st.stages[idx].heal.as_ref().is_some_and(is_unhealed) => step_check_heal_moe(st, idx, fx),
                 "check_heal" => step_check_heal(st, idx, fx),
                 _ => Err(Error::new(format!("Unknown step {id}."))),
             }
@@ -831,6 +835,9 @@ fn step_plan(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
     let mut steps = vec![st.steps[0].clone()];
     steps.extend(steps_after_plan(&st.spec, st.stages.len() as u32, try_list >= 1));
     st.steps = steps;
+    if let Some(mi) = st.plan.as_ref().and_then(|p| p.moe.as_ref()) {
+        return Ok(Flow::Done(Some(format!("{} of {} experts per layer, {} per token: a {:.1} GB file at Q4_K_M", mi.experts_after, mi.experts_before, mi.top_k_after, mi.q4_gb))));
+    }
     Ok(Flow::Done(st.chosen.as_ref().map(|c| format!("aiming for {:.1} B: {} blocks, MLP {}", c.params_b, c.blocks, c.intermediate.map(|i| i.to_string()).unwrap_or_else(|| "unchanged".into())))))
 }
 
@@ -1178,6 +1185,9 @@ fn step_cut(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow
     }
     let input = st.input_id(idx).ok_or_else(|| Error::new("The model to cut is missing (the stage before has no healed model)."))?;
     let plan = st.stages[idx].plan.clone();
+    if plan.moe.is_some() {
+        return step_cut_moe(st, idx, &input, plan, fx);
+    }
     let period = st.inspect.as_ref().map(|i| i.period).unwrap_or(4);
     let mut spec = plan.reshape_spec(&input, st.reasoning(), CALIB_SAMPLES, WIDTH_SAMPLES);
     spec.load = st.plan.as_ref().map(|p| p.measure_load.clone()).unwrap_or_else(|| "auto".into());
@@ -1453,6 +1463,9 @@ fn too_late(st: &AutoState, idx: usize, retry: bool, now_secs: i64) -> Option<St
 /// or the card cannot heal the larger model.
 fn back_off_stage(st: &mut AutoState, idx: usize, vram_gb: Option<f64>) -> std::result::Result<String, String> {
     let ins = st.inspect.clone().ok_or_else(|| "The model's description is missing, so the cut cannot be backed off.".to_string())?;
+    if st.stages[idx].plan.moe.is_some() {
+        return back_off_moe(st, &ins, idx, vram_gb);
+    }
     let cur = st.stages[idx].plan.clone();
     let prev = match idx.checked_sub(1) {
         None => auto_plan::Step { blocks: 0, intermediate: auto_plan::full_width(&ins) },
@@ -1513,8 +1526,12 @@ fn cleanup_after(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result
     }
     let stage = idx as u32 + 1;
     let keep = st.stages[idx].heal.as_ref().map(|h| h.name.clone());
+    // a stage that was not healed (its cut passed the check) IS the model that goes on: its cut is not removed
+    let unhealed = st.stages[idx].heal.as_ref().is_some_and(is_unhealed);
+    let prev_unhealed = idx > 0 && st.stages[idx - 1].heal.as_ref().is_some_and(is_unhealed);
     let victims: Vec<usize> = st.made.iter().enumerate().filter(|(_, m)| !m.removed && (
-        (m.kind == "cut" && m.stage == stage) || (m.kind == "healed" && m.stage == stage && Some(&m.name) != keep.as_ref()) || (m.kind == "healed" && m.stage + 1 == stage)
+        (m.kind == "cut" && m.stage == stage && !unhealed) || (m.kind == "healed" && m.stage == stage && Some(&m.name) != keep.as_ref()) || (m.kind == "healed" && m.stage + 1 == stage)
+            || (prev_unhealed && m.kind == "cut" && m.stage + 1 == stage)
     )).map(|(i, _)| i).collect();
     for i in victims {
         let m = st.made[i].clone();
@@ -1686,4 +1703,341 @@ pub fn report_of(p: &Project, id: Option<&str>) -> Result<Value> {
     let mut r = auto_report::build(&st);
     auto_report::add_timings(&mut r, &st);
     Ok(json!({"run": st.id, "report": r, "markdown": auto_report::markdown(&r)}))
+}
+
+// ------------------------------------------------------------------------------------------------------------------ a mixture of experts (docs/MOE_GUIDE.md)
+// The same steps with the same ids (so the list, the progress bar, the report and "Change settings and continue" read the run unchanged); what they do inside is different:
+// measure counts what every expert does, try asks the loss of each cut by imitating it, the thinking gate cuts and checks the chosen cut once, a cut that passes its thinking check is
+// NOT healed (the heal runs when the check fails), and backing off gives 16 experts back.
+
+use super::auto_moe;
+
+/// A heal record that stands for "not healed": the cut itself goes on (`summary.unhealed`).
+fn is_unhealed(h: &HealRef) -> bool {
+    h.summary.as_ref().is_some_and(|s| s["unhealed"] == json!(true))
+}
+
+fn moe_samples(st: &AutoState) -> u32 {
+    st.spec.try_samples()
+}
+
+fn step_measure_moe(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    let id = st.original.as_ref().map(|o| o.id.clone()).unwrap_or_default();
+    let r = out!(fx.measure(&id, moe_samples(st), "auto", None)?);
+    st.measure = Some(json!({"key": r["key"], "tokens": r["tokens"], "load": r["load"], "loss": null, "stable_overlap": r["stable_overlap"]}));
+    Ok(Flow::Done(None))
+}
+
+fn moe_try_spec(st: &AutoState, keys: Vec<String>) -> Result<TrySpec> {
+    let o = st.original.as_ref().ok_or_else(|| Error::new("The model of this run is missing."))?;
+    let samples = moe_samples(st);
+    let v = json!({"model_id": o.id, "samples": samples, "len": auto_moe::MEASURE_LEN, "load": "auto", "measure_samples": samples, "moe": {"keys": keys}, "params_b": st.plan.as_ref().map(|p| p.original_b)});
+    let spec: TrySpec = serde_json::from_value(v).map_err(|e| Error::new(format!("The Try-first request is not valid: {e}")))?;
+    spec.validate()?;
+    Ok(spec)
+}
+
+fn row_loss(rows: &[Value], key: &str) -> Option<f64> {
+    rows.iter().find(|r| r["key"] == json!(key)).and_then(|r| r["loss"].as_f64())
+}
+
+fn row_band(rows: &[Value], key: &str) -> Option<String> {
+    rows.iter().find(|r| r["key"] == json!(key)).and_then(|r| r["band"].as_str().map(String::from))
+}
+
+/// Changes the choice of the run after Try first (the ranking and the experts per token): the plan, the candidate and every stage that has not run yet say the same.
+fn moe_adopt(st: &mut AutoState, scoring: &str, top_k: u32) {
+    if let Some(ma) = st.spec.moe.as_mut() {
+        ma.scoring = scoring.into();
+    }
+    let n = st.stages.len();
+    for (i, sg) in st.stages.iter_mut().enumerate() {
+        if let Some(m) = sg.plan.moe.as_mut() {
+            m.scoring = scoring.into();
+            if i + 1 == n {
+                m.top_k = top_k;
+            }
+        }
+    }
+    if let Some(pl) = st.plan.as_mut() {
+        for (i, sg) in pl.stages.iter_mut().enumerate() {
+            if let Some(m) = sg.moe.as_mut() {
+                m.scoring = scoring.into();
+                if i + 1 == n {
+                    m.top_k = top_k;
+                }
+            }
+        }
+        if let Some(mi) = pl.moe.as_mut() {
+            mi.scoring = scoring.into();
+            mi.top_k_after = top_k;
+        }
+        if let Some(c) = pl.chosen.as_mut().and_then(|c| c.moe.as_mut()) {
+            c.top_k = top_k;
+        }
+    }
+    if let Some(c) = st.chosen.as_mut().and_then(|c| c.moe.as_mut()) {
+        c.top_k = top_k;
+    }
+}
+
+/// Try first for a mixture of experts: the baseline, the chosen count with each ranking (REAP, frequency, routing weight), the neighbours of the count, and the experts per token the goal
+/// asks for. The ranking with the lowest loss is used; the experts per token is lowered only when Try first says it costs little (never "large"); loop passes are never asked.
+fn step_try_moe(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
+    let ins = st.inspect.clone().ok_or_else(|| Error::new("The model's description is missing."))?;
+    let (Some(m), Some(mi), Some(ma)) = (ins.inkling().cloned(), plan.moe.clone(), st.spec.moe.clone()) else { return Err(Error::new("The mixture-of-experts plan is missing.")) };
+    let count = mi.experts_after;
+    let mut keys: Vec<String> = vec!["base".into()];
+    if count < m.experts {
+        keys.push(format!("e={count}"));
+        keys.push(format!("e={count}|s=freq"));
+        keys.push(format!("e={count}|s=gate"));
+        keys.extend(plan.try_list.iter().filter_map(|c| c.moe.as_ref()).map(|c| c.experts).filter(|e| *e != count && *e < m.experts).map(|e| format!("e={e}")));
+    }
+    let ks: Vec<u32> = [6u32, 4].into_iter().filter(|k| *k < m.top_k).collect();
+    if ma.goal == "speed" || ma.top_k.is_some() {
+        for k in &ks {
+            keys.push(if count < m.experts { format!("e={count}|k={k}") } else { format!("k={k}") });
+        }
+    }
+    keys.dedup();
+    let analysis = out!(fx.try_run(&moe_try_spec(st, keys)?)?);
+    let rows = analysis["rows"].as_array().cloned().unwrap_or_default();
+    let (Some(base), true) = (row_loss(&rows, "base"), !rows.is_empty()) else {
+        st.notes.push("Try first gave no answer; the planner's choice is cut as planned.".into());
+        return Ok(Flow::Done(Some("no answer: the plan".into())));
+    };
+    // the ranking: the lowest loss among the three for the chosen count (REAP when they tie or when nothing is removed)
+    let mut scoring = ma.scoring.clone();
+    if count < m.experts {
+        let pick = [("reap", format!("e={count}")), ("freq", format!("e={count}|s=freq")), ("gate", format!("e={count}|s=gate"))].into_iter().filter_map(|(n, k)| row_loss(&rows, &k).map(|l| (n, l)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((n, l)) = pick {
+            if n != scoring && l < row_loss(&rows, &format!("e={count}")).unwrap_or(f64::MAX) * 0.995 {
+                st.notes.push(format!("Try first: ranking the experts by {} gives a lower error ({l:.3}) than {} ({:.3}); {} is used.", scoring_words(n), scoring_words(&scoring), row_loss(&rows, &format!("e={count}")).unwrap_or(0.0), scoring_words(n)));
+                scoring = n.into();
+            }
+        }
+    }
+    // the experts per token: the faster the goal wants, as far as Try first says it is cheap
+    let mut top_k = mi.top_k_after;
+    if top_k < m.top_k {
+        let key_of = |k: u32| if count < m.experts { format!("e={count}|k={k}") } else { format!("k={k}") };
+        let ok = |k: u32| row_band(&rows, &key_of(k)).is_some_and(|b| b != "large" && b != "?");
+        let want = top_k;
+        let choice = if ok(want) { Some(want) } else { ks.iter().rev().copied().filter(|k| *k > want).find(|k| ok(*k)) };
+        match choice {
+            Some(k) => top_k = k,
+            None => {
+                st.notes.push(format!("Try first: {want} experts per token costs too much ({}); the experts per token stay {}.", row_band(&rows, &key_of(want)).unwrap_or_else(|| "not measured".into()), m.top_k));
+                top_k = m.top_k;
+            }
+        }
+        if top_k != want && top_k < m.top_k {
+            st.notes.push(format!("Try first: {want} experts per token costs too much; {top_k} is used instead."));
+        }
+    }
+    let table: Vec<Value> = rows.iter().map(|r| json!({"key": r["key"], "experts": r["experts"], "top_k": r["top_k"], "passes": r["passes"], "scoring": r["scoring"], "loss": r["loss"], "rise": r["rise"], "band": r["band"],
+                                                       "coverage": r["coverage"], "load_spread": r["load_spread"]})).collect();
+    let winner = rows.iter().position(|r| r["key"] == json!(if count < m.experts { format!("e={count}") } else { "base".to_string() }));
+    st.try_result = Some(json!({"samples": moe_samples(st), "moe": true, "baseline": base, "rows": table, "winner": winner, "halves_agree": true, "scoring": scoring, "top_k": top_k}));
+    if scoring != ma.scoring || top_k != mi.top_k_after {
+        moe_adopt(st, &scoring, top_k);
+    }
+    st.measure = st.measure.take().map(|mut v| {
+        v["loss"] = json!(base);
+        v
+    });
+    let rise = row_loss(&rows, &format!("e={count}")).map(|l| (l - base) / base * 100.0);
+    Ok(Flow::Done(Some(match rise {
+        Some(r) => format!("{count} experts per layer: the error rises {r:.1} % (ranked by {})", scoring_words(&scoring)),
+        None => format!("{} experts per token", top_k),
+    })))
+}
+
+fn scoring_words(s: &str) -> &'static str {
+    match s {
+        "freq" => "how often the router picks them",
+        "gate" => "the routing weight",
+        _ => "REAP",
+    }
+}
+
+/// The thinking check before healing, for the one cut the run makes: it is cut from the original (every stage's final count), the original is checked once and then the cut. With one stage this
+/// cut IS the stage's cut (its two steps are skipped); with two it is deleted afterwards, stage 1 makes its own half cut.
+fn step_think_gate_moe(st: &mut AutoState, fx: &mut dyn Effects) -> Result<Flow> {
+    let plan = st.plan.clone().ok_or_else(|| Error::new("The plan is missing."))?;
+    if st.think_gate.as_ref().is_some_and(|g| g.get("winner").is_some()) {
+        return Ok(Flow::Skipped("already checked".into()));
+    }
+    let mut gate = st.think_gate.clone().unwrap_or_else(|| json!({"order": [0], "rows": [], "pending": null}));
+    let last = plan.stages.last().cloned().ok_or_else(|| Error::new("The plan has no stage."))?;
+    let (Some(mo), Some(mi)) = (last.moe.clone(), plan.moe.clone()) else { return Ok(Flow::Skipped("not a mixture of experts".into())) };
+    if mi.experts_after >= mi.experts_before && mi.top_k_after >= mi.top_k_before {
+        return Ok(Flow::Skipped("nothing is cut".into()));
+    }
+    let input = st.original.as_ref().map(|o| o.id.clone()).ok_or_else(|| Error::new("The model of this run is missing."))?;
+    let cut: CutRef = match serde_json::from_value::<CutRef>(gate["pending"]["cut"].clone()).ok() {
+        Some(c) => c,
+        None => {
+            let mut one = last.clone();
+            one.moe = Some(auto_moe::MoeStage { experts_before: mi.experts_before, ..mo });
+            let mut spec = one.reshape_spec(&input, None, moe_samples(st), moe_samples(st));
+            spec.skip_check = true;
+            let r = out!(fx.cut(&spec)?);
+            made(st, "cut", &r.name, Some(r.model_id.clone()), 0);
+            gate["pending"] = json!({"row": 0, "cut": r});
+            st.think_gate = Some(gate.clone());
+            r
+        }
+    };
+    if st.baseline.is_none() {
+        let r = out!(run_check(st, fx, "think_gate", &cut.name, "original")?);
+        st.baseline = Some(r);
+    }
+    let r = out!(run_check(st, fx, "think_gate", &cut.name, "cut")?);
+    let chk = check_json(&r, st.baseline.as_ref());
+    let loss = st.try_result.as_ref().and_then(|t| t["rows"].as_array()).and_then(|a| a.iter().find(|r| r["experts"] == json!(mi.experts_after) && r["scoring"].is_null() && r["top_k"] == json!(mi.top_k_before)).and_then(|r| r["loss"].as_f64()));
+    let row = json!({"row": 0, "experts": mi.experts_after, "top_k": mi.top_k_after, "params_b": last.params_b, "loss": loss, "cut": cut.name, "model_id": cut.model_id, "score": thinkcheck::think_score(&chk["main"]), "check": chk, "removed": false});
+    gate["rows"] = json!([row]);
+    gate["pending"] = Value::Null;
+    gate["winner"] = json!(0);
+    if let Some(base) = st.baseline.as_ref().filter(|b| thinkcheck::lost_much(&b["main"], &chk["main"])) {
+        gate["lost_much"] = json!(true);
+        st.notes.push(format!("The cut has lost much of its ability to finish its reasoning before healing (closed {:.0} % against {:.0} %). It is healed.", chk["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0, base["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0));
+    }
+    let say = format!("closed {:.0} %, loops {:.0} %", chk["main"]["closed_rate"].as_f64().unwrap_or(0.0) * 100.0, chk["main"]["loop_rate"].as_f64().unwrap_or(0.0) * 100.0);
+    if st.stages.len() == 1 {
+        if let Some(m) = st.made.iter_mut().find(|m| m.kind == "cut" && m.name == cut.name) {
+            m.stage = 1;
+        }
+        st.stages[0].cut = Some(cut);
+        st.stages[0].cut_check = Some(chk);
+        st.stages[0].cut_loss = loss;
+        for id in ["s1.cut", "s1.check_cut"] {
+            mark(st, id, "skipped", Some("made and checked in the thinking gate".into()));
+        }
+    } else if !st.spec.keep_intermediate {
+        remove_made(st, &cut.name, fx)?;
+        gate["rows"][0]["removed"] = json!(true);
+    }
+    st.think_gate = Some(gate);
+    Ok(Flow::Done(Some(format!("{} experts per layer, {} per token: {say}", mi.experts_after, mi.top_k_after))))
+}
+
+/// The cut of a stage: stage 1 cuts the original on the measurement the run made; a later stage first measures the healed model of the stage before (its experts have changed).
+fn step_cut_moe(st: &mut AutoState, idx: usize, input: &str, plan: StagePlan, fx: &mut dyn Effects) -> Result<Flow> {
+    let samples = moe_samples(st);
+    if idx > 0 {
+        out!(fx.measure(input, samples, "auto", None)?);
+    }
+    let mut spec = plan.reshape_spec(input, None, samples, samples);
+    spec.load = "auto".into();
+    spec.skip_check = true;
+    if idx == 0 {
+        st.stages[idx].cut_loss = st.try_result.as_ref().and_then(|t| t["rows"].as_array()).zip(plan.moe.as_ref()).and_then(|(a, m)| {
+            a.iter().find(|r| r["experts"] == json!(m.experts_after) && r["scoring"].is_null() && r["top_k"] == json!(m.top_k_before)).and_then(|r| r["loss"].as_f64())
+        });
+    }
+    let r = out!(fx.cut(&spec)?);
+    made(st, "cut", &r.name, Some(r.model_id.clone()), idx as u32 + 1);
+    st.stages[idx].cut = Some(r);
+    Ok(Flow::Done(None))
+}
+
+/// "Heal only if needed": a cut whose thinking check did not fail goes on as it is (its record stands for the healed model); a failed or missing check heals it as the dense run does.
+fn step_heal_moe(p: &Project, st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow> {
+    if st.stages[idx].heal.is_some() {
+        return Ok(Flow::Skipped("already healed".into()));
+    }
+    let passed = st.stages[idx].attempt == 0 && st.stages[idx].cut_check.as_ref().is_some_and(|c| c["verdict"].as_str().is_some_and(|v| v != "fail"));
+    if !passed {
+        return step_heal(st, idx, fx);
+    }
+    let cut = st.stages[idx].cut.clone().ok_or_else(|| Error::new("There is no cut to go on with."))?;
+    let dir = models_dir(p).join(&cut.name).join("model");
+    st.stages[idx].heal = Some(HealRef { name: cut.name.clone(), model_id: cut.model_id.clone(), dir: dir.to_string_lossy().to_string(), tokens_m: 0,
+                                         summary: Some(json!({"unhealed": true, "reason": "the cut passed its thinking check"}))});
+    st.notes.push(format!("Stage {} was not healed: its cut passed the thinking check. If the exported file answers worse than you want, heal it on the Slim page (Heal).", idx + 1));
+    Ok(Flow::Skipped("the cut passed its thinking check: not healed".into()))
+}
+
+/// The check of a stage that was not healed: the cut's own check stands.
+fn step_check_heal_moe(st: &mut AutoState, idx: usize, fx: &mut dyn Effects) -> Result<Flow> {
+    let chk = st.stages[idx].cut_check.clone().unwrap_or(Value::Null);
+    st.stages[idx].heal_check = Some(chk.clone());
+    st.stages[idx].passed = true;
+    // the stage before, if it was not healed either, handed its cut on: that cut can go now
+    if idx > 0 && !st.spec.keep_intermediate && st.stages[idx - 1].heal.as_ref().is_some_and(is_unhealed) {
+        if let Some(name) = st.stages[idx - 1].cut.as_ref().map(|c| c.name.clone()) {
+            remove_made(st, &name, fx)?;
+        }
+    }
+    Ok(Flow::Skipped("the cut's own check stands".into()))
+}
+
+/// Backing a mixture-of-experts cut off by one step: 16 experts per layer come back (the stages after it start from the new count); a stage that only lowered the experts per token gives them back.
+fn back_off_moe(st: &mut AutoState, ins: &Inspect, idx: usize, vram_gb: Option<f64>) -> std::result::Result<String, String> {
+    let cur = st.stages[idx].plan.clone();
+    let mo = cur.moe.clone().ok_or_else(|| "This stage is not a mixture-of-experts cut.".to_string())?;
+    let n = st.stages.len();
+    let last = idx + 1 == n;
+    let (after, top_k) = if mo.experts_after < mo.experts_before {
+        (mo.experts_after + 16, mo.top_k)
+    } else if last && mo.top_k < mo.top_k_before {
+        (mo.experts_after, if mo.top_k < 6 { 6.min(mo.top_k_before) } else { mo.top_k_before })
+    } else {
+        return Err(format!("Stage {} cannot be backed off any further.", idx + 1));
+    };
+    if after >= mo.experts_before && top_k >= mo.top_k_before {
+        return Err(format!("Backing off stage {} would leave nothing to cut in it.", idx + 1));
+    }
+    let mut plans: Vec<StagePlan> = st.stages.iter().map(|s| s.plan.clone()).collect();
+    let mut before = mo.experts_before;
+    for j in idx..n {
+        let (a, k) = if j == idx { (after, top_k) } else { (plans[j].moe.as_ref().map(|m| m.experts_after).unwrap_or(before).min(before), plans[j].moe.as_ref().map(|m| m.top_k).unwrap_or(top_k)) };
+        plans[j] = auto_moe::restage(ins, &st.spec, before, a, k, j as u32 + 1, n as u32, vram_gb).ok_or_else(|| "The cut could not be planned again.".to_string())?;
+        before = a;
+    }
+    if plans[idx].verdict == "over" {
+        return Err(format!("Backing off stage {} makes a model ({:.1} B) the card cannot heal (about {:.0} GB needed).", idx + 1, plans[idx].params_b, plans[idx].heal_gb));
+    }
+    let attempts = std::mem::take(&mut st.stages[idx].attempts);
+    for j in idx..n {
+        st.stages[j] = StageState::new(plans[j].clone());
+        if let Some(pl) = st.plan.as_mut() {
+            if let Some(slot) = pl.stages.get_mut(j) {
+                *slot = plans[j].clone();
+            }
+        }
+    }
+    st.stages[idx].attempts = attempts;
+    st.stages[idx].attempt = 2;
+    if last {
+        let m = plans[idx].moe.clone();
+        if let (Some(m), Some(pl)) = (m, st.plan.as_mut()) {
+            if let Some(mi) = pl.moe.as_mut() {
+                mi.experts_after = m.experts_after;
+                mi.top_k_after = m.top_k;
+                mi.q4_gb = m.q4_gb;
+                mi.packed_gb = m.packed_gb;
+                mi.active_b = m.active_b;
+            }
+            for c in [pl.chosen.as_mut(), st.chosen.as_mut()].into_iter().flatten() {
+                c.params = plans[idx].params;
+                c.params_b = plans[idx].params_b;
+                if let Some(x) = c.moe.as_mut() {
+                    x.experts = m.experts_after;
+                    x.top_k = m.top_k;
+                    x.q4_gb = m.q4_gb;
+                    x.packed_gb = m.packed_gb;
+                    x.active_b = m.active_b;
+                }
+            }
+        }
+    }
+    let nm = plans[idx].moe.clone().unwrap_or(mo.clone());
+    Ok(format!("Stage {} missed its thinking check twice: the cut is backed off one step ({} experts per layer, {} per token instead of {} and {}), so stage {} makes a {:.1} B model instead of {:.1} B.{}",
+               idx + 1, nm.experts_after, nm.top_k, mo.experts_after, mo.top_k, idx + 1, plans[idx].params_b, cur.params_b, if last { " The final size is larger than asked." } else { "" }))
 }

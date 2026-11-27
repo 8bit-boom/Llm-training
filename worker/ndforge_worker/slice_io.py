@@ -13,7 +13,7 @@ from .reshape import ReshapeError
 from .safetensors_io import TensorRef
 
 # little-endian raw element types (safetensors dtype -> numpy dtype string)
-RAW = {"BF16": "<u2", "F16": "<u2", "F32": "<f4", "F64": "<f8", "I64": "<i8", "I32": "<i4", "I16": "<i2", "I8": "i1", "U8": "u1", "BOOL": "u1"}
+RAW = {"BF16": "<u2", "F16": "<u2", "F32": "<f4", "F64": "<f8", "I64": "<i8", "I32": "<i4", "I16": "<i2", "I8": "i1", "U8": "u1", "BOOL": "u1", "F8_E4M3": "u1", "F8_E5M2": "u1"}
 NUMPY_MISSING = "The training software is incomplete (numpy). Run Training setup again."
 
 

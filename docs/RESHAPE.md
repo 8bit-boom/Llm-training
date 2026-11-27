@@ -441,3 +441,13 @@ Job key of `reshape`: `"width_scoring": "activation"` (default) | `"output"` (ex
 
 `reshape_try` choices carry `reconstruct: "pruned" | "original"` (Rust `TryChoice.reconstruct`, needs a width); see docs/TRY_FIRST.md ("Refitting the kept neurons"). No new job, event or error code: the progress step is `recon` (`protocol.progress` with a `layers` detail) and the timing line `recon`. Off by default and not measured on a real model.
 
+
+## A mixture of experts (Inkling-2-Mini)
+
+The Slim page knows one mixture of experts, `thinkingmachines/Inkling-2-Mini` (family `inkling2`, the seventh built-in model). Its inspect result has a `moe` block (`worker/ndforge_worker/moe_layout.py`, Rust `reshape/moe.rs`): the experts per layer, the experts per token, the loop
+(layers 6 to 17 run 3 times, so a token passes through 48 layer slots), the packed formats and a table of sizes for every allowed expert count. The page shows a card instead of the block slider: **loop passes** and **experts per token** (config only: the weights are copied),
+**remove experts** (after the experts were measured: `moe_measure`, then `reshape` with `experts`), a version check of the software it needs (`moe_compat`), the recommendations panel (`moe_recommend`) and Try first (`reshape_try` with `want.moe`). The method, the rules and the open
+questions are in docs/MOE_GUIDE.md; Auto-cut for it is in docs/AUTO_CUT.md. What the worker writes: `moe_scores.json` (the measurement, in the measurement's folder), `moe_try.json` (Try first's answers), and in a cut model `moe_kept.json` (which experts stayed, per layer) and `ndforge_reshape.json`
+with a `moe` block (`shape: "moe"`; every old key keeps its meaning).
+
+Not built: whole-block cuts for Inkling in the page (the config surgery exists and is tested, `moe_layout.fix_config_inkling(drop_blocks=...)`), healing and growing by training, the NVFP4 export size, and Ollama installs of the exported file.

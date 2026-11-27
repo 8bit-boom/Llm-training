@@ -14,6 +14,7 @@ import re
 from .safetensors_io import DTYPE_BYTES, OutTensor, TensorRef
 
 SUPPORTED_TYPES = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "llama", "mistral", "qwen2", "qwen3", "qwen3_moe"}
+PACKED_OK = {"inkling2_loop"}          # mixture-of-experts models whose packed expert format is cut byte for byte (moe_layout.py), so a quantization_config is fine
 REFUSED = {"gemma4": "Gemma 4 stores per-layer inputs for all layers in one table and shares attention memory between its last layers; "
                      "cutting or copying layers is not supported for it yet."}
 LAYER_PREFIXES = ("model.language_model.layers.", "model.layers.", "language_model.model.layers.")
@@ -53,8 +54,17 @@ def check_supported(cfg: dict) -> None:
             if mt == key or mt.startswith(key + "_"):
                 raise ReshapeError(why)
     mt = model_type(cfg)
-    if mt not in SUPPORTED_TYPES:
+    if mt == "inkling2":
+        raise ReshapeError("Inkling 2 Small (310 GB) is not supported; only Inkling-2-Mini can be reshaped.")
+    if mt not in SUPPORTED_TYPES and mt not in PACKED_OK:
         raise ReshapeError(UNSUPPORTED_TEXT + (f" (This one is of type {mt!r}.)" if mt else ""))
+    if mt in PACKED_OK:
+        if cfg.get("auto_map") or tc.get("auto_map"):
+            raise ReshapeError("This model needs its own program code to load (trust_remote_code); that is not supported here.")
+        n = tc.get("num_hidden_layers")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ReshapeError("The model's config.json has no usable num_hidden_layers.")
+        return
     if cfg.get("quantization_config") or tc.get("quantization_config"):
         raise ReshapeError("This model is stored in a compressed (quantized) form. Slim or grow needs the full 16-bit original.")
     if cfg.get("auto_map") or tc.get("auto_map"):

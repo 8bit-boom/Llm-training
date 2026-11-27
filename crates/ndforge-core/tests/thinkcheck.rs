@@ -489,3 +489,16 @@ fn llama_cpp_gets_an_8_bit_kv_cache_only_when_the_setting_says_so() {
     assert_eq!(build_job(&p, &s).unwrap()["cache_type"], "q8_0");
     std::env::remove_var("NDFORGE_CONFIG_DIR");
 }
+
+#[test]
+fn a_gguf_check_of_inkling_carries_its_family_and_a_dense_check_does_not() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    made(&p, "slim-a", false);
+    let gguf = d.path().join("m-Q4_K_M.gguf");
+    std::fs::write(&gguf, "GGUF").unwrap();
+    let with = ThinkSpec { name: "slim-a".into(), target: "gguf".into(), gguf: Some(gguf.to_string_lossy().to_string()), family: Some("inkling2".into()), ..Default::default() };
+    assert_eq!(build_job(&p, &with).unwrap()["family"], "inkling2");
+    let without = ThinkSpec { family: None, ..with.clone() };
+    assert!(build_job(&p, &without).unwrap().get("family").is_none(), "a check that was made before keeps its job exactly");
+}

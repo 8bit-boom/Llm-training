@@ -681,6 +681,10 @@ def run_try(cfg: dict) -> int:
     plan_only = bool(cfg.get("plan_only"))
     config, src_dir = _config_and_dir(repo, not plan_only)
     reshape.check_supported(config)
+    from . import moe_layout
+    if moe_layout.is_inkling(config):
+        from . import moetry
+        return moetry.run(cfg, src_dir or Path(repo), config)
     tc = reshape.text_config(config)
     types = reshape.layer_types_of(tc)
     period = reshapejob.check_period(config, types)

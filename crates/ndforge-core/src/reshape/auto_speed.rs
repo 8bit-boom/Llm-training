@@ -321,7 +321,7 @@ pub fn speed_info(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, history:
         }
     }
     // the shared sequence length (and with it the shared answers of the original)
-    if spec.stages > 1 && n > 1 {
+    if spec.stages > 1 && n > 1 && spec.moe.is_none() {
         let natural: Vec<u32> = auto_plan::stage_plans(ins, &AutoSpec { share_teacher_cache: false, ..spec.clone() }, &base_steps(ins, spec, &base_plan), vram_gb).iter().map(|s| s.seq).collect();
         let same_already = natural.windows(2).all(|w| w[0] == w[1]);
         let note = same_already.then(|| format!("On this card both stages already heal on sequence length {}: the original's answers are reused without this choice.", natural.first().copied().unwrap_or(0)));

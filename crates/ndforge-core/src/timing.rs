@@ -291,6 +291,26 @@ impl History {
             }
             // the size of the model the job is about, from the folder it loaded (16-bit files: 2 bytes a parameter)
             let model_b = |stage: &str| recs.iter().find(|t| t.stage == stage).and_then(gb).map(|g| g / 2.0);
+            // a mixture of experts (Inkling) is stored packed: its folder is not 2 bytes a parameter, and its speeds are not a dense model's. Its own keys: `moe_score_tok_s`, `moe_try_tok_s`
+            if header["source"]["family"] == "inkling2" {
+                match kind.as_str() {
+                    "moe_measure" => {
+                        if let Some(t) = recs.iter().find(|t| t.stage == "score") {
+                            if let Some(tok) = t.fields["tokens"].as_f64().filter(|x| *x > 0.0) {
+                                h.push("moe_score_tok_s", 1.0, tok / t.seconds.max(0.01));
+                            }
+                        }
+                    }
+                    "reshape_try" => {
+                        let rates: Vec<f64> = recs.iter().filter(|t| t.stage == "try_pass").filter_map(|t| t.fields["tokens"].as_f64().filter(|x| *x > 0.0).map(|tok| tok / t.seconds.max(0.01))).collect();
+                        if !rates.is_empty() {
+                            h.push("moe_try_tok_s", 1.0, median(&rates));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match kind.as_str() {
                 "distill_cache" => {
                     if let (Some(b), Some(t)) = (model_b("load_teacher"), recs.iter().find(|t| t.stage == "teacher_pass")) {

@@ -206,7 +206,7 @@ fn settings_roundtrip_and_recent() {
 
 #[test]
 fn help_pages_render() {
-    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape", "imatrix", "quantcheck"] {
+    for key in ["welcome", "data", "dataset", "train", "test", "use", "setup", "reshape", "moe", "imatrix", "quantcheck"] {
         assert!(help_html(key).contains("<h1>"), "{key}");
     }
     assert!(help_markdown("data").contains("Training bundle"));
@@ -217,6 +217,7 @@ fn help_pages_render() {
     assert!(m.contains("Merge matrices") && m.contains("adds the statistics") && m.contains("unmodified base model") && m.contains("imatrix_downloads") && m.contains("**size**") && !m.contains("UD-") && !m.contains("Dynamic"));
     let q = help_markdown("quantcheck");
     assert!(!q.contains("No help text") && q.contains("proxy") && q.contains("llama-perplexity") && q.contains("LLAMA_CPP_DIR") && q.contains("Lower left is better") && q.contains("Compare these sizes") && !q.contains("UD-"));
+    assert!(help_markdown("moe").contains("b12611") && help_markdown("moe").contains("Auto-cut never does this by itself"));
     assert!(help_html("nope").contains("No help text"));
     // the Slim or grow page has its own text, not the fallback, and it carries the honest expectations
     let r = help_markdown("reshape");
@@ -334,7 +335,7 @@ fn model_train_state_and_jobs() {
     m.dataset_generate(json!({})).unwrap();
     m.dataset_save().unwrap();
     let st = m.train_state(None).unwrap();
-    assert_eq!(st["models"].as_array().unwrap().len(), 6);
+    assert_eq!(st["models"].as_array().unwrap().len(), 7);
     assert_eq!(st["version"]["number"], 1);
     assert_eq!(st["env_ready"], false);
     let job = m.train_job("qwen3.5-4b", Method::Lora, Preset::Quick, &json!({"rank": 4, "lr": 0.0002}), None, None).unwrap();

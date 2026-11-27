@@ -2676,6 +2676,7 @@ function wireTest() {
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
 const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
+let moe = { tryGoal: "size", tryLoaded: false, reco: null, recoGoal: "size", recoErr: null, passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -3337,7 +3338,7 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
+let ac = { moe: { goal: "size", gb: null, topK: "", scoring: "reap", rebalance: true }, target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
   sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null, vl: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
@@ -3357,7 +3358,8 @@ function acDefaults() {
   const ins = acIns(); if (!ins) return;
   const total = ins.total_params / 1e9;
   if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
-  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5" || !!(ins.moe && ins.moe.arch === "inkling2_loop");
+  if (ins.moe && ins.moe.arch === "inkling2_loop" && ac.moe.gb == null) ac.moe.gb = acMoeDefaultGb(ins);
   if (!ac.spInit) { ac.spInit = true; acApplyPreset(total >= 15 ? "balanced" : "thorough"); }      // a big model takes days: Balanced is chosen for it, the recommended recipe is one click away
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
@@ -3425,7 +3427,8 @@ function acTunedHtml(lock) {
 }
 function acSpec() {
   const sp = ac.sp;
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
+  const mo = acMoeOn() ? { moe: { goal: ac.moe.goal, ...(+ac.moe.gb > 0 ? { target_gb: +ac.moe.gb } : {}), ...(ac.moe.topK ? { top_k: +ac.moe.topK } : {}), scoring: ac.moe.scoring, rebalance: !!ac.moe.rebalance } } : {};
+  return { ...mo, model_id: rs.model, target_b: acMoeOn() ? Math.max(1, Math.round((+ac.moe.gb || 12) / 0.61 * 10) / 10) : +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
     share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.tunedSnap ? { tuned: ac.tunedSnap } : {}), ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
@@ -3609,7 +3612,7 @@ function autoCard() {
   const run = ac.run, live = ac.running || (run && run.status === "running");
   const total = ins ? ins.total_params / 1e9 : 0;
   const pl = ac.plan;
-  const canThink = !!ins && ins.model_type === "qwen3_5";
+  const canThink = !!ins && (ins.model_type === "qwen3_5" || acMoeOn());
   const lock = live ? "disabled" : "";
   const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
     ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
@@ -3630,8 +3633,8 @@ function autoCard() {
   return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
     <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
     ${!ins ? `<p class="dim">Choose a model that can be slimmed in “Start from” above.</p>` : `
-    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
-    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
+    ${acMoeOn() ? acMoeBlock(pl, live) : `    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
+    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>`}
     ${ac.pin ? `<div class="ac-pin" id="ac-pin"><strong>Chosen cut:</strong> ${ac.pin.blocks.length ? `blocks ${esc(ranges(ac.pin.blocks))} out` : "no blocks out"}${ac.pin.intermediate ? `, MLP ${thou(ac.pin.intermediate)}` : ""}${ac.pin.loss != null ? `, text-prediction error ${(+ac.pin.loss).toFixed(3)}` : ""} <span class="dim small">found by the search on the Try first card${ac.pin.think ? " (its thinking was checked)" : ""}; Auto-cut does not search or try again${ac.pin.think ? " and skips the thinking check before healing" : ""}.</span> <button class="secondary" id="ac-pin-remove" ${lock}>Remove</button></div>` : ""}
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
     ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
@@ -3793,6 +3796,7 @@ function onAutoEvent(p) {
 }
 
 function wireAuto() {
+  wireAcMoe();
   const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
   set("ac-target", (e) => { ac.target = +e.value; });
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
@@ -4486,6 +4490,7 @@ function renderReshape() {
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
   const toAuto = `<div class="card wide"><p style="margin:0">Want it all in one click? <button class="link" id="rs-open-auto">Open Auto</button> <span class="dim small">(measures, cuts, heals, checks and exports, one step after the other)</span></p></div>`;
+  if (moeOn()) return head + msg + intro + toAuto + pick + moeCard(st) + moeMake(st) + healSection() + result + list + rsxCard(st);
   return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list + rsxCard(st);
 }
 
@@ -4541,6 +4546,7 @@ async function rsOptions() {
   rs.loadingOpts = false;
   if (onReshape()) render();
   rsMeasInfo();
+  moeLoad(false);
 }
 
 // the second step of a way with two value heads: 48 -> 32 (one step only)
@@ -4607,7 +4613,7 @@ function onReshapeEvent(p) {
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
     rs.running = false; rs.text = ""; rs.progress = null;
     if (p.kind === "error") rs.error = p.text; else rs.ok = "Measured. The result is kept for every size on this data.";
-    rsMeasInfo(); return;
+    rsMeasInfo(); moeMeasInfo(); return;
   }
   if (p.kind === "progress") { rs.text = p.text || p.step; rs.progress = p.value; }
   else if (p.kind === "log") rs.log.push(p.text);
@@ -4888,6 +4894,7 @@ function wireReshape() {
   const num = (id, key) => { const e = $(id); if (e) e.onchange = () => { const v = parseInt(e.value, 10); rs[key] = Number.isFinite(v) && v >= 0 && v <= 8 ? v : 1; render(); }; };
   num("rs-pf", "pf"); num("rs-pl", "pl");
   const dr = $("rs-drop"); if (dr) dr.onchange = () => { rs.dropText = dr.value; render(); };
+  wireMoe();
   on("rs-go", async () => {
     rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
     try { await invoke("reshape_start", { spec: rsSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
@@ -5360,3 +5367,217 @@ async function init() {
   go("welcome");
 }
 init();
+
+
+// ----------------------------------------------------------------------------------------------------------------- mixture of experts: Inkling-2-Mini (docs/MOE_GUIDE.md)
+// The card replaces "What to do" for a model whose inspect has `moe` (arch inkling2_loop): its facts, the software it needs (moe_compat), and the cuts that exist
+// without measuring: loop passes and experts per token (config only). Removing experts follows the measuring (moe_measure).
+function moeOn() { const i = rs.options && rs.options.inspect; return !!(i && i.supported && i.moe && i.moe.arch === "inkling2_loop"); }
+
+async function moeLoad(withRepo) {
+  if (!moeOn() || !rs.model) return;
+  if (moe.model !== rs.model) { moe.compat = null; moe.repo = null; moe.model = rs.model; moe.passes = ""; moe.topK = ""; moe.experts = ""; }
+  moe.loading = true; moe.err = null; if (onReshape()) render();
+  try { const r = await invoke("moe_compat", { model: rs.model, checkRepo: !!withRepo }); moe.compat = r; if (r.repo) moe.repo = r.repo; } catch (e) { moe.err = String(e); }
+  moe.loading = false; moe.checking = false;
+  if (onReshape()) render();
+  moeMeasInfo();
+}
+
+// is there a measurement of the experts of this model on the saved data with these settings?
+async function moeMeasInfo() {
+  if (!moeOn() || !rs.model || !rs.state || !rs.state.dataset_version) return;
+  try { moe.meas = await invoke("reshape_measurement", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto" }) || null; } catch (_) { moe.meas = null; }
+  if (onReshape()) render();
+}
+
+// Try first for experts: the loss of each cut by imitating it on your text, without making it (the worker's moetry.py). Rows come back as `analysis.rows`.
+function moeTryHtml() {
+  const tr = rs.tr, a = tr.analysis && Array.isArray(tr.analysis.rows) ? tr.analysis : null, busy = rs.running || rs.testing || tr.running;
+  const goal = (g, l) => `<option value="${g}" ${moe.tryGoal === g ? "selected" : ""}>${l}</option>`;
+  const measured = !!(moe.meas && moe.meas.exists);
+  const rows = a ? `<table class="tbl" id="moe-try-table"><tr><th>Question</th><th>Experts</th><th>Per token</th><th>Passes</th><th>Error</th><th>Rise</th><th>Routing kept</th><th>Load spread</th><th></th></tr>${a.rows.map((r) => `<tr><td>${esc(r.key)}</td><td>${r.experts}</td><td>${r.top_k}</td><td>${r.passes}</td><td>${(+r.loss).toFixed(3)}</td><td>${r.rise == null ? "" : (r.rise * 100).toFixed(1) + " % (" + esc(r.band) + ")"}</td><td>${r.coverage == null ? "" : (r.coverage * 100).toFixed(0) + " %"}</td><td>${r.load_spread == null ? "" : (+r.load_spread).toFixed(2)}</td>
+      <td>${r.key === "base" ? "" : `<button class="link" data-moeuse="${esc(r.key)}" ${busy ? "disabled" : ""}>Use</button>`}</td></tr>`).join("")}</table>` : "";
+  return `<details id="moe-try" ${a || tr.running ? "open" : ""}><summary>Try first: what does each cut cost?</summary>
+    <p class="dim small">Imitates the cut on your text and measures the error without writing a model: seconds to minutes per question after the model is loaded. Fewer loop passes and more experts per token are only ever asked here, never done by Auto-cut. Removing experts needs the measurement above.</p>
+    <div class="row"><label>Questions for <select id="moe-try-goal" ${busy ? "disabled" : ""}>${goal("size", "a smaller file")}${goal("speed", "faster answers")}${goal("grow", "growing (more passes, more experts per token)")}</select></label>
+      <button class="secondary" id="moe-try-go" ${busy || !rs.state.dataset_version || !measured ? "disabled" : ""}>Try the cuts</button><button class="secondary" id="moe-try-stop" ${tr.running ? "" : "disabled"}>Stop</button></div>
+    ${!measured ? `<p class="dim small">Measure the experts first (above).</p>` : ""}
+    ${tr.running ? `<div class="stepline" aria-live="polite">${esc(tr.text || "")}</div>${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}` : ""}${rows}</details>`;
+}
+
+async function moeTryLoad() {
+  if (!moeOn() || !rs.model || !rs.state || !rs.state.dataset_version || moe.tryLoaded) return;
+  moe.tryLoaded = true;
+  try { const r = await invoke("reshape_try_results", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto" }); if (r && r.exists && r.analysis && Array.isArray(r.analysis.rows)) rs.tr.analysis = r.analysis; } catch (_) { /* no answers yet */ }
+  if (onReshape()) render();
+}
+
+function moeTrySpec() {
+  return { model_id: rs.model, samples: moe.samples, len: moe.len, load: "auto", measure_samples: moe.samples, moe: { goal: moe.tryGoal === "speed" ? "speed" : moe.tryGoal === "grow" ? "grow" : "size" } };
+}
+
+async function moeReco() {
+  if (!moeOn() || !rs.model) return;
+  moe.recoErr = null;
+  try { moe.reco = await invoke("moe_recommend", { model: rs.model, goal: moe.recoGoal, targetGb: null }); } catch (e) { moe.recoErr = String(e); }
+  if (onReshape()) render();
+}
+
+// the panel: the order of work for the goal on this card, what it should cost, what to watch for and what nobody knows yet
+function moeRecoHtml() {
+  const r = moe.reco;
+  const goal = (g, l) => `<label class="opt"><input type="radio" name="moe-reco-goal" value="${g}" ${moe.recoGoal === g ? "checked" : ""}> ${l}</label>`;
+  const body = moe.recoErr ? `<div class="err">${esc(moe.recoErr)}</div>` : !r ? `<p class="dim">Loading…</p>` : r.blocked ? `<p class="warn">${esc(r.blocked)}</p>` : `
+    <ol id="moe-reco-order">${r.order.map((x) => `<li><strong>${esc(x.title)}</strong> <span class="dim small">${esc(x.text)}</span></li>`).join("")}</ol>
+    ${r.expected.length ? `<table class="tbl" id="moe-reco-table"><tr><th>Try</th><th>Experts</th><th>Per token</th><th>Passes</th><th>Q4 file</th><th>Packed</th><th>Works per token</th><th>Heal</th><th>Disk at most</th></tr>${r.expected.map((e) => `<tr><td>${esc(e.key)}</td><td>${e.experts}</td><td>${e.top_k}</td><td>${e.passes}</td><td>${e.q4_gb} GB</td><td>${e.packed_gb} GB</td><td>${e.active_b} B</td><td>${e.heal_tokens_m} M tokens, ${e.heal_hours[0]}–${e.heal_hours[1]} h, ${e.heal_gb} GB</td><td>${e.disk_peak_gb} GB</td></tr>`).join("")}</table>` : ""}
+    ${r.warnings.map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
+    <details><summary>Not known yet</summary><ul>${r.unknowns.map((u) => `<li class="dim small">${esc(u)}</li>`).join("")}</ul></details>`;
+  return `<details id="moe-reco" open><summary>Recommendations for this card</summary>
+    <div class="row">${goal("size", "A smaller file")}${goal("speed", "Faster answers")}${goal("train", "A model that knows my project")}</div>${body}</details>`;
+}
+
+async function moeMeasure(force) {
+  rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+  try { await invoke("reshape_measure", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto", force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+}
+
+function moeSize(b) { return b ? (b / 1e9).toFixed(1) + " GB" : "?"; }
+
+function moeCompatHtml() {
+  const c = moe.compat; if (!c) return moe.loading ? `<p class="dim">Checking the installed software…</p>` : "";
+  const rows = (c.findings || []).map((f) => `<li class="pf-${f.status === "ok" ? "ok" : f.status === "too_old" ? "fail" : "warn"}"><strong>${esc(f.tool)}</strong> ${esc(f.have || "not known")} <span class="dim">(needs ${esc(f.need)})</span> — ${esc(f.message)}
+    ${f.fix ? `<div class="small">${esc(f.fix)}</div>` : ""}${f.command ? `<div class="small"><code>${esc(f.command)}</code>${f.rollback ? ` <span class="dim">to go back: <code>${esc(f.rollback)}</code></span>` : ""}</div>` : ""}</li>`).join("");
+  const repo = moe.repo ? `<p class="${moe.repo.changed ? "warn" : "dim"} small">${esc(moe.repo.message)}</p>` : "";
+  return `<div class="pf ${c.summary ? "pf-bad" : ""}"><div class="small dim">Software this model needs</div><ul>${rows}</ul>${c.summary ? `<div class="warn">${esc(c.summary)}</div>` : ""}</div>${repo}`;
+}
+
+function moeCard(st) {
+  const ins = rs.options.inspect, m = ins.moe, busy = rs.running || rs.testing;
+  const counts = (m.sizes || []).filter((x) => x.experts < m.experts);
+  const passOpts = [["", "keep " + m.passes], ...(m.varloop ? [["1", "1 pass"]] : []), ["2", "2 passes (never trained so; ask Try first)"], ["4", "4 passes (never trained so)"]].filter(([v]) => v === "" || +v !== m.passes);
+  const topOpts = [["", "keep " + m.top_k], ["6", "6"], ["4", "4"], ["10", "10 (grow)"]].filter(([v]) => v === "" || +v !== m.top_k);
+  const gb = (x) => (x / 1e9).toFixed(1);
+  return `<div class="card wide"><h2>2 · What to change <span class="dim small">(mixture of experts)</span></h2>
+    <p>${m.experts} experts in each of ${ins.layers} layers, ${m.top_k} used per token. The middle layers ${m.core[0]}–${m.core[1] - 1} run ${m.passes} times, so a token passes through ${m.visits} layer slots.
+    About ${gb(m.active_params)} B parameters work per token of ${gb(ins.total_params)} B in all; the file is ${moeSize(m.packed_bytes)} in the authors' packed format.</p>
+    ${moeCompatHtml()}
+    <div class="row"><button class="secondary" id="moe-check" ${moe.checking || busy ? "disabled" : ""}>Check the model's repository for changes</button>
+      <button class="secondary" id="moe-recheck" ${moe.loading ? "disabled" : ""}>Check the software again</button></div>
+    ${moe.err ? `<div class="err">${esc(moe.err)}</div>` : ""}
+    ${moeRecoHtml()}
+    ${moeTryHtml()}
+    <details id="moe-help"><summary>How cutting a mixture of experts works</summary>${moe.help || `<p class="dim">Loading…</p>`}</details>
+    <h3>Cuts that need no measuring</h3>
+    <div class="grid"><label>Loop passes<select id="moe-passes" ${busy ? "disabled" : ""}>${passOpts.map(([v, l]) => `<option value="${v}" ${moe.passes === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+      <label>Experts used per token<select id="moe-topk" ${busy ? "disabled" : ""}>${topOpts.map(([v, l]) => `<option value="${v}" ${moe.topK === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label></div>
+    <p class="dim small">Neither changes the weights: the new model is a copy of the files with another number in config.json. Fewer passes is not something this model was trained for (only the variable-loop research checkpoint ${esc("thinkingmachines/TML-d24-varloop-research")} was), so check the answers; fewer experts per token is untested by its authors too.
+    </p>
+    <h3>Remove experts</h3>
+    <p class="dim small">Which experts stay is decided by what each one does on <strong>your</strong> text (${esc(moe.scoring === "reap" ? "REAP: the router's weight times the size of the expert's output" : moe.scoring)}), added up over all ${m.passes} loop passes. The same number stays in every layer.</p>
+    <div class="grid"><label>Experts kept per layer<select id="moe-experts" ${busy ? "disabled" : ""}><option value="">keep all ${m.experts}</option>${counts.map((x) => `<option value="${x.experts}" ${moe.experts === String(x.experts) ? "selected" : ""}>${x.experts} (${gb(x.packed_bytes)} GB packed, ${(x.params / 1e9).toFixed(1)} B)</option>`).join("")}</select></label>
+      ${state.settings.expert_mode ? `<label>Ranked by<select id="moe-scoring"><option value="reap" ${moe.scoring === "reap" ? "selected" : ""}>REAP (recommended)</option><option value="freq" ${moe.scoring === "freq" ? "selected" : ""}>how often the router picks it</option><option value="gate" ${moe.scoring === "gate" ? "selected" : ""}>routing weight</option></select></label>` : ""}
+      <label class="opt"><input type="checkbox" id="moe-rebalance" ${moe.rebalance ? "checked" : ""}> Even out the router afterwards (no training)</label></div>
+    ${moeMeasLine()}</div>`;
+}
+
+function moeMeasLine() {
+  const me = moe.meas;
+  const busy = rs.running || rs.testing;
+  const state_ = !rs.state.dataset_version ? `<span class="warn">Save a training-data version in Step 2 first: the experts are measured on your own text.</span>`
+    : me && me.exists ? `<span class="ok">Measured on data version v${me.data_version} (${thou(Math.round(me.tokens || 0))} tokens, loaded ${esc(me.load || "")}). It is reused for every count.</span>`
+    : `<span class="dim">Not measured yet (${moe.samples} samples of ${moe.len} tokens; about 5 to 15 minutes on a 32 GB card, an estimate).</span>`;
+  return `<div class="row">${state_} <button class="secondary" id="moe-measure" ${busy || !rs.state.dataset_version ? "disabled" : ""}>${me && me.exists ? "Measure again" : "Measure the experts"}</button></div>`;
+}
+
+function moeSpec() {
+  const spec = { source_model_id: rs.model, mode: "prune", blocks: 0, calib_samples: moe.samples, calib_len: moe.len, load: "auto" };
+  if (moe.passes) spec.passes = +moe.passes;
+  if (moe.topK) spec.top_k = +moe.topK;
+  if (moe.experts) spec.experts = { keep: +moe.experts, scoring: moe.scoring, rebalance: !!moe.rebalance };
+  return spec;
+}
+
+function moeMake(st) {
+  const any = !!(moe.passes || moe.topK || moe.experts), m = rs.options.inspect.moe;
+  const bytes = moe.experts ? (((m.sizes || []).find((x) => String(x.experts) === moe.experts) || {}).packed_bytes || m.packed_bytes) : m.packed_bytes;
+  const need = (bytes / 1e9) * 1.05 + (moe.experts ? 0.5 : 0);
+  const low = st.free_disk_gb != null && st.free_disk_gb < need;
+  const unmeasured = !!moe.experts && !(moe.meas && moe.meas.exists);
+  const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : !any ? "Choose a number of passes, of experts per token or of experts to keep." : unmeasured ? "Measure the experts first." : low ? `Not enough free disk space: ${need.toFixed(1)} GB needed, ${st.free_disk_gb} GB free.` : "";
+  return `<div class="card wide"><h2>3 · Make the model</h2>
+    <div class="row"><button class="primary" id="moe-go" ${rs.running || rs.testing || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
+    ${why && any !== false ? `<div class="dim small">${esc(why)}</div>` : ""}
+    <div class="dim small">${moe.experts ? "The kept experts are cut out of the packed files byte for byte" : "The weights are copied"} (about ${need.toFixed(0)} GB of free disk space); the new model is saved in this project and listed in Step 3.</div>
+    ${rs.running ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
+    ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
+}
+
+function wireMoe() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  if (moeOn() && moe.help == null && !moe.helpLoading) { moe.helpLoading = true; invoke("help", { key: "moe" }).then((h) => { moe.help = h; }).catch(() => { moe.help = ""; }).finally(() => { moe.helpLoading = false; if (onReshape()) render(); }); }
+  const p = $("moe-passes"); if (p) p.onchange = () => { moe.passes = p.value; render(); };
+  const k = $("moe-topk"); if (k) k.onchange = () => { moe.topK = k.value; render(); };
+  const ex = $("moe-experts"); if (ex) ex.onchange = () => { moe.experts = ex.value; render(); };
+  const sc = $("moe-scoring"); if (sc) sc.onchange = () => { moe.scoring = sc.value; render(); };
+  const rb = $("moe-rebalance"); if (rb) rb.onchange = () => { moe.rebalance = rb.checked; };
+  on("moe-measure", () => moeMeasure(!!(moe.meas && moe.meas.exists)));
+  document.querySelectorAll("input[name=moe-reco-goal]").forEach((r) => r.onchange = () => { moe.recoGoal = r.value; moe.reco = null; moeReco(); render(); });
+  if (moeOn() && moe.reco == null && !moe.recoErr && !moe.recoLoading) { moe.recoLoading = true; moeReco().finally(() => { moe.recoLoading = false; }); }
+  const tg = $("moe-try-goal"); if (tg) tg.onchange = () => { moe.tryGoal = tg.value; render(); };
+  on("moe-try-go", async () => {
+    const tr = rs.tr; tr.running = true; tr.text = "Starting…"; tr.progress = null; rs.error = null; rs.ok = null; rs.log = []; render();
+    try { await invoke("reshape_try_start", { spec: moeTrySpec() }); } catch (e) { tr.running = false; rs.error = String(e); render(); }
+  });
+  on("moe-try-stop", () => { rs.tr.text = "Stopping…"; invoke("reshape_stop"); render(); });
+  document.querySelectorAll("[data-moeuse]").forEach((b) => b.onclick = () => {
+    const q = Object.fromEntries(b.dataset.moeuse.split("|").map((x) => x.split("=")));
+    if (q.e) moe.experts = String(q.e); if (q.k) moe.topK = String(q.k); if (q.p) moe.passes = String(q.p); if (q.s) moe.scoring = q.s;
+    render();
+  });
+  moeTryLoad();
+  on("moe-check", () => { moe.checking = true; moeLoad(true); });
+  on("moe-recheck", () => moeLoad(false));
+  on("moe-go", async () => {
+    rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_start", { spec: moeSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+  });
+}
+
+
+// ----------------------------------------------------------------------------------------------------------------- Auto-cut of a mixture of experts (docs/MOE_GUIDE.md)
+// The size is the finished Q4_K_M file in GB (the plan turns it into a number of experts per layer: multiples of 16, never below 32, at most half per stage); the goal is a smaller file
+// (the default), faster answers (fewer experts per token) or quality (nothing to cut: the Train page); loop passes are never taken out by Auto-cut.
+function acMoeOn() { const i = acIns(); return !!(i && i.moe && i.moe.arch === "inkling2_loop"); }
+const acMoeQ4 = (params) => params * 0.61 / 1e9;
+function acMoeDefaultGb(ins) {
+  const row = (ins.moe.sizes || []).find((x) => x.experts === 96) || (ins.moe.sizes || [])[1];
+  return row ? Math.round(acMoeQ4(row.params) * 2) / 2 + 0.5 : 12;
+}
+function acMoeBlock(pl, live) {
+  const ins = acIns(), m = ins.moe, lock = live ? "disabled" : "", g = ac.moe;
+  const sizes = (m.sizes || []).map((x) => acMoeQ4(x.params));
+  const lo = Math.max(3, Math.floor(Math.min(...sizes) * 2) / 2), hi = Math.floor(Math.max(...sizes) * 0.97 * 2) / 2;
+  const mi = pl && pl.moe;
+  const row = (n, lbl, val) => `<label class="opt"><input type="radio" name="ac-goal" value="${n}" ${g.goal === n ? "checked" : ""} ${lock}> <strong>${lbl}</strong> <span class="dim small">${val}</span></label>`;
+  const table = mi ? `<table class="tbl" id="ac-moe-table"><tr><th>Experts per layer</th><th>Q4_K_M file</th><th>Packed</th><th>Parameters</th><th>Stages</th></tr>${mi.table.map((r) => `<tr class="${r.experts === mi.experts_after ? "ac-pick" : ""}"><td>${r.experts}${r.experts === mi.experts_after ? " ◀" : ""}</td><td>${r.q4_gb} GB</td><td>${r.packed_gb} GB</td><td>${r.params_b} B</td><td>${r.stages || "–"}</td></tr>`).join("")}</table>` : "";
+  return `<div id="ac-moe"><p><strong>Mixture of experts</strong>: ${m.experts} experts in each of ${ins.layers} layers, ${m.top_k} used per token; the middle layers run ${m.passes} times.</p>
+    ${row("size", "A smaller file", "(recommended): fewer experts per layer, so the finished GGUF fits a smaller card or leaves room for more context")}
+    ${row("speed", "Faster answers", "fewer experts per token (Try first measures what it costs before it is used)")}
+    ${row("quality", "A better model for my project", "cutting does not make it better: this one points you to training")}
+    ${g.goal === "quality" ? `<div class="warn" id="ac-moe-quality">Train the uncut model on the Train page (QLoRA needs about 22 GB) instead; cutting only makes it smaller or faster.</div>` : `
+    ${g.goal === "size" || +g.gb > 0 ? `<div class="row"><label>The finished file (Q4_K_M) about <strong id="ac-moe-gb-n">${(+g.gb).toFixed(1)}</strong> GB${mi ? ` &rarr; <strong>${mi.experts_after}</strong> of ${mi.experts_before} experts per layer, about ${mi.q4_gb} GB, ${mi.active_b} B parameters work per token` : ""}</label></div>
+    <input type="range" id="ac-moe-gb" min="${lo}" max="${hi}" step="0.5" value="${Math.min(hi, Math.max(lo, +g.gb || lo))}" style="width:100%;max-width:560px" ${lock}>` : ""}
+    <div class="grid"><label>Experts used per token<select id="ac-moe-topk" ${lock}><option value="" ${g.topK === "" ? "selected" : ""}>${g.goal === "speed" ? "6 (Try first checks the cost)" : "keep " + m.top_k}</option>${[6, 4].filter((k) => k < m.top_k).map((k) => `<option value="${k}" ${String(g.topK) === String(k) ? "selected" : ""}>${k}</option>`).join("")}</select></label>
+      ${state.settings.expert_mode ? `<label>Ranked by<select id="ac-moe-scoring" ${lock}><option value="reap" ${g.scoring === "reap" ? "selected" : ""}>REAP (recommended)</option><option value="freq" ${g.scoring === "freq" ? "selected" : ""}>how often picked</option><option value="gate" ${g.scoring === "gate" ? "selected" : ""}>routing weight</option></select></label>` : ""}
+      <label class="opt"><input type="checkbox" id="ac-moe-rebalance" ${g.rebalance ? "checked" : ""} ${lock}> Even out the router after the cut (no training)</label></div>`}
+    <p class="dim small" id="ac-moe-passes">Loop passes: Auto-cut never takes them out (this model was trained with ${m.passes}). ${mi ? esc(mi.passes_note) : ""}</p>${table}</div>`;
+}
+function wireAcMoe() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onchange = fn; };
+  document.querySelectorAll("input[name=ac-goal]").forEach((r) => r.onchange = () => { ac.moe.goal = r.value; if (r.value === "speed" && !ac.moe.topK) ac.moe.topK = "6"; if (r.value === "size") ac.moe.topK = ""; acRefresh(); render(); });
+  const g = $("ac-moe-gb"); if (g) { g.oninput = () => { ac.moe.gb = +g.value; const n = $("ac-moe-gb-n"); if (n) n.textContent = (+g.value).toFixed(1); }; g.onchange = () => { acRefresh(); render(); }; }
+  on("ac-moe-topk", () => { ac.moe.topK = $("ac-moe-topk").value; acRefresh(); render(); });
+  on("ac-moe-scoring", () => { ac.moe.scoring = $("ac-moe-scoring").value; acRefresh(); render(); });
+  on("ac-moe-rebalance", () => { ac.moe.rebalance = $("ac-moe-rebalance").checked; acRefresh(); render(); });
+}
