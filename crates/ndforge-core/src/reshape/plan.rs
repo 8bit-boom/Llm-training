@@ -217,6 +217,27 @@ pub struct ReshapeSpec {
     /// mixture of experts: experts used per token after the cut. None = unchanged; not sent unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
+    /// mixture of experts: remove experts so that `keep` stay in every layer (needs the experts measured first); not sent unless set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experts: Option<MoeExperts>,
+}
+
+/// Removing experts: how many stay per layer, how they are ranked ("reap" | "freq" | "gate") and whether the router's selection bias is nudged afterwards (no training).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoeExperts {
+    pub keep: u32,
+    #[serde(default = "reap")]
+    pub scoring: String,
+    #[serde(default = "yes_true")]
+    pub rebalance: bool,
+}
+
+fn reap() -> String {
+    "reap".into()
+}
+
+fn yes_true() -> bool {
+    true
 }
 
 /// How the kept neurons are refitted: `variant` "pruned" (fit on what the cut model feeds each layer) or "original" (on the uncut model's activations), `alpha` the ridge strength

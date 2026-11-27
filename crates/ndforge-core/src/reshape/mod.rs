@@ -14,6 +14,7 @@ pub mod heal_speed;
 pub mod heal_rounds;
 pub mod heal_source;
 pub mod moe;
+pub mod moe_compat;
 pub mod plan;
 pub mod runs;
 pub mod search;

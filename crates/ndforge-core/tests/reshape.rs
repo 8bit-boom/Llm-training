@@ -3080,3 +3080,22 @@ fn an_inkling_cut_of_passes_or_top_k_is_validated_and_sent_as_config_only() {
     let plain = serde_json::to_value(spec(Mode::Prune, 1)).unwrap();
     assert!(plain.get("passes").is_none() && plain.get("top_k").is_none());
 }
+
+#[test]
+fn removing_experts_follows_the_owners_rules_in_the_validation() {
+    let ins = inkling();
+    let cut = |experts: serde_json::Value| -> ReshapeSpec { serde_json::from_value(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "experts": experts})).unwrap() };
+    for keep in [112, 96, 80, 64] {
+        assert!(validate(&cut(json!({"keep": keep})), &ins).is_ok(), "{keep}");
+    }
+    let err = |v: serde_json::Value| validate(&cut(v), &ins).unwrap_err().0;
+    assert!(err(json!({"keep": 100})).contains("multiple of 16") && err(json!({"keep": 16})).contains("at least 32") && err(json!({"keep": 48})).contains("at most 50 %"));
+    assert!(err(json!({"keep": 128})).contains("smaller") && err(json!({"keep": 96, "scoring": "magic"})).contains("ranked"));
+    // the defaults: REAP, with the router bias nudged
+    let e = cut(json!({"keep": 96})).experts.unwrap();
+    assert_eq!((e.scoring.as_str(), e.rebalance), ("reap", true));
+    // 4 x the experts per token also bounds the count from below: 16 per token means at least 64
+    let mut wide = ins.clone();
+    wide.moe.as_mut().unwrap().top_k = 16;
+    assert!(validate(&cut(json!({"keep": 48})), &wide).is_err() && validate(&cut(json!({"keep": 64})), &wide).is_ok());
+}

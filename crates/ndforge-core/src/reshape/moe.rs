@@ -170,8 +170,16 @@ pub fn validate_cut(spec: &ReshapeSpec, m: &MoeInfo) -> Result<()> {
     if spec.blocks > 0 || spec.drop_layers.is_some() {
         return Err(Error::new("Removing whole blocks of an Inkling model is not available in this version of the program."));
     }
-    if spec.passes.is_none() && spec.top_k.is_none() {
-        return Err(Error::new("Nothing to change: choose the number of loop passes or of experts per token."));
+    if spec.passes.is_none() && spec.top_k.is_none() && spec.experts.is_none() {
+        return Err(Error::new("Nothing to change: choose the number of loop passes, of experts per token or of experts to keep."));
+    }
+    if let Some(e) = &spec.experts {
+        if !["reap", "freq", "gate"].contains(&e.scoring.as_str()) {
+            return Err(Error::new("The way experts are ranked is reap (the default), freq or gate."));
+        }
+        if let Some(why) = check_experts_kept(m.experts, spec.top_k.unwrap_or(m.top_k), e.keep) {
+            return Err(Error::new(why));
+        }
     }
     if let Some(p) = spec.passes {
         if !m.looped() && m.core_layers() == 0 {

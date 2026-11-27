@@ -2676,6 +2676,7 @@ function wireTest() {
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
 const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
+let moe = { passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -4486,6 +4487,7 @@ function renderReshape() {
     `<tr><td>${esc(m.name)}</td><td>${esc(m.status)}${m.error ? `<div class="dim small">${esc(m.error)}</div>` : ""}</td><td>${m.summary ? m.summary.layers_before + " → " + m.summary.layers_after + (m.summary.width ? ", MLP " + thou(m.summary.width.before.intermediate_size) + " → " + thou(m.summary.width.after.intermediate_size) : "") : ""}</td><td>${m.size_gb ? m.size_gb + " GB" : ""}${m.healed ? ` <span class="tag">healed</span>` : ""}</td><td>${m.test ? esc(m.test.verdict.headline) : "–"}</td>
       <td>${m.summary ? `<button class="link" data-rsshow="${esc(m.name)}">Show</button> ` : ""}<button class="link" data-rsdelete="${esc(m.name)}" ${rs.running || rs.testing ? "disabled" : ""}>Delete</button></td></tr>`).join("")}</table></div>` : "";
   const toAuto = `<div class="card wide"><p style="margin:0">Want it all in one click? <button class="link" id="rs-open-auto">Open Auto</button> <span class="dim small">(measures, cuts, heals, checks and exports, one step after the other)</span></p></div>`;
+  if (moeOn()) return head + msg + intro + toAuto + pick + moeCard(st) + moeMake(st) + healSection() + result + list + rsxCard(st);
   return head + msg + intro + toAuto + pick + size + tryCard() + make + healSection() + result + list + rsxCard(st);
 }
 
@@ -4541,6 +4543,7 @@ async function rsOptions() {
   rs.loadingOpts = false;
   if (onReshape()) render();
   rsMeasInfo();
+  moeLoad(false);
 }
 
 // the second step of a way with two value heads: 48 -> 32 (one step only)
@@ -4607,7 +4610,7 @@ function onReshapeEvent(p) {
   if (p.phase === "measure" && (p.kind === "done" || p.kind === "error")) {
     rs.running = false; rs.text = ""; rs.progress = null;
     if (p.kind === "error") rs.error = p.text; else rs.ok = "Measured. The result is kept for every size on this data.";
-    rsMeasInfo(); return;
+    rsMeasInfo(); moeMeasInfo(); return;
   }
   if (p.kind === "progress") { rs.text = p.text || p.step; rs.progress = p.value; }
   else if (p.kind === "log") rs.log.push(p.text);
@@ -4888,6 +4891,7 @@ function wireReshape() {
   const num = (id, key) => { const e = $(id); if (e) e.onchange = () => { const v = parseInt(e.value, 10); rs[key] = Number.isFinite(v) && v >= 0 && v <= 8 ? v : 1; render(); }; };
   num("rs-pf", "pf"); num("rs-pl", "pl");
   const dr = $("rs-drop"); if (dr) dr.onchange = () => { rs.dropText = dr.value; render(); };
+  wireMoe();
   on("rs-go", async () => {
     rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
     try { await invoke("reshape_start", { spec: rsSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
@@ -5360,3 +5364,117 @@ async function init() {
   go("welcome");
 }
 init();
+
+
+// ----------------------------------------------------------------------------------------------------------------- mixture of experts: Inkling-2-Mini (docs/MOE_GUIDE.md)
+// The card replaces "What to do" for a model whose inspect has `moe` (arch inkling2_loop): its facts, the software it needs (moe_compat), and the cuts that exist
+// without measuring: loop passes and experts per token (config only). Removing experts follows the measuring (moe_measure).
+function moeOn() { const i = rs.options && rs.options.inspect; return !!(i && i.supported && i.moe && i.moe.arch === "inkling2_loop"); }
+
+async function moeLoad(withRepo) {
+  if (!moeOn() || !rs.model) return;
+  if (moe.model !== rs.model) { moe.compat = null; moe.repo = null; moe.model = rs.model; moe.passes = ""; moe.topK = ""; moe.experts = ""; }
+  moe.loading = true; moe.err = null; if (onReshape()) render();
+  try { const r = await invoke("moe_compat", { model: rs.model, checkRepo: !!withRepo }); moe.compat = r; if (r.repo) moe.repo = r.repo; } catch (e) { moe.err = String(e); }
+  moe.loading = false; moe.checking = false;
+  if (onReshape()) render();
+  moeMeasInfo();
+}
+
+// is there a measurement of the experts of this model on the saved data with these settings?
+async function moeMeasInfo() {
+  if (!moeOn() || !rs.model || !rs.state || !rs.state.dataset_version) return;
+  try { moe.meas = await invoke("reshape_measurement", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto" }) || null; } catch (_) { moe.meas = null; }
+  if (onReshape()) render();
+}
+
+async function moeMeasure(force) {
+  rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+  try { await invoke("reshape_measure", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto", force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+}
+
+function moeSize(b) { return b ? (b / 1e9).toFixed(1) + " GB" : "?"; }
+
+function moeCompatHtml() {
+  const c = moe.compat; if (!c) return moe.loading ? `<p class="dim">Checking the installed software…</p>` : "";
+  const rows = (c.findings || []).map((f) => `<li class="pf-${f.status === "ok" ? "ok" : f.status === "too_old" ? "fail" : "warn"}"><strong>${esc(f.tool)}</strong> ${esc(f.have || "not known")} <span class="dim">(needs ${esc(f.need)})</span> — ${esc(f.message)}
+    ${f.fix ? `<div class="small">${esc(f.fix)}</div>` : ""}${f.command ? `<div class="small"><code>${esc(f.command)}</code>${f.rollback ? ` <span class="dim">to go back: <code>${esc(f.rollback)}</code></span>` : ""}</div>` : ""}</li>`).join("");
+  const repo = moe.repo ? `<p class="${moe.repo.changed ? "warn" : "dim"} small">${esc(moe.repo.message)}</p>` : "";
+  return `<div class="pf ${c.summary ? "pf-bad" : ""}"><div class="small dim">Software this model needs</div><ul>${rows}</ul>${c.summary ? `<div class="warn">${esc(c.summary)}</div>` : ""}</div>${repo}`;
+}
+
+function moeCard(st) {
+  const ins = rs.options.inspect, m = ins.moe, busy = rs.running || rs.testing;
+  const counts = (m.sizes || []).filter((x) => x.experts < m.experts);
+  const passOpts = [["", "keep " + m.passes], ...(m.varloop ? [["1", "1 pass"]] : []), ["2", "2 passes (never trained so; ask Try first)"], ["4", "4 passes (never trained so)"]].filter(([v]) => v === "" || +v !== m.passes);
+  const topOpts = [["", "keep " + m.top_k], ["6", "6"], ["4", "4"], ["10", "10 (grow)"]].filter(([v]) => v === "" || +v !== m.top_k);
+  const gb = (x) => (x / 1e9).toFixed(1);
+  return `<div class="card wide"><h2>2 · What to change <span class="dim small">(mixture of experts)</span></h2>
+    <p>${m.experts} experts in each of ${ins.layers} layers, ${m.top_k} used per token. The middle layers ${m.core[0]}–${m.core[1] - 1} run ${m.passes} times, so a token passes through ${m.visits} layer slots.
+    About ${gb(m.active_params)} B parameters work per token of ${gb(ins.total_params)} B in all; the file is ${moeSize(m.packed_bytes)} in the authors' packed format.</p>
+    ${moeCompatHtml()}
+    <div class="row"><button class="secondary" id="moe-check" ${moe.checking || busy ? "disabled" : ""}>Check the model's repository for changes</button>
+      <button class="secondary" id="moe-recheck" ${moe.loading ? "disabled" : ""}>Check the software again</button></div>
+    ${moe.err ? `<div class="err">${esc(moe.err)}</div>` : ""}
+    <details id="moe-help"><summary>How cutting a mixture of experts works</summary>${moe.help || `<p class="dim">Loading…</p>`}</details>
+    <h3>Cuts that need no measuring</h3>
+    <div class="grid"><label>Loop passes<select id="moe-passes" ${busy ? "disabled" : ""}>${passOpts.map(([v, l]) => `<option value="${v}" ${moe.passes === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+      <label>Experts used per token<select id="moe-topk" ${busy ? "disabled" : ""}>${topOpts.map(([v, l]) => `<option value="${v}" ${moe.topK === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label></div>
+    <p class="dim small">Neither changes the weights: the new model is a copy of the files with another number in config.json. Fewer passes is not something this model was trained for (only the variable-loop research checkpoint ${esc("thinkingmachines/TML-d24-varloop-research")} was), so check the answers; fewer experts per token is untested by its authors too.
+    </p>
+    <h3>Remove experts</h3>
+    <p class="dim small">Which experts stay is decided by what each one does on <strong>your</strong> text (${esc(moe.scoring === "reap" ? "REAP: the router's weight times the size of the expert's output" : moe.scoring)}), added up over all ${m.passes} loop passes. The same number stays in every layer.</p>
+    <div class="grid"><label>Experts kept per layer<select id="moe-experts" ${busy ? "disabled" : ""}><option value="">keep all ${m.experts}</option>${counts.map((x) => `<option value="${x.experts}" ${moe.experts === String(x.experts) ? "selected" : ""}>${x.experts} (${gb(x.packed_bytes)} GB packed, ${(x.params / 1e9).toFixed(1)} B)</option>`).join("")}</select></label>
+      ${state.settings.expert_mode ? `<label>Ranked by<select id="moe-scoring"><option value="reap" ${moe.scoring === "reap" ? "selected" : ""}>REAP (recommended)</option><option value="freq" ${moe.scoring === "freq" ? "selected" : ""}>how often the router picks it</option><option value="gate" ${moe.scoring === "gate" ? "selected" : ""}>routing weight</option></select></label>` : ""}
+      <label class="opt"><input type="checkbox" id="moe-rebalance" ${moe.rebalance ? "checked" : ""}> Even out the router afterwards (no training)</label></div>
+    ${moeMeasLine()}</div>`;
+}
+
+function moeMeasLine() {
+  const me = moe.meas;
+  const busy = rs.running || rs.testing;
+  const state_ = !rs.state.dataset_version ? `<span class="warn">Save a training-data version in Step 2 first: the experts are measured on your own text.</span>`
+    : me && me.exists ? `<span class="ok">Measured on data version v${me.data_version} (${thou(Math.round(me.tokens || 0))} tokens, loaded ${esc(me.load || "")}). It is reused for every count.</span>`
+    : `<span class="dim">Not measured yet (${moe.samples} samples of ${moe.len} tokens; about 5 to 15 minutes on a 32 GB card, an estimate).</span>`;
+  return `<div class="row">${state_} <button class="secondary" id="moe-measure" ${busy || !rs.state.dataset_version ? "disabled" : ""}>${me && me.exists ? "Measure again" : "Measure the experts"}</button></div>`;
+}
+
+function moeSpec() {
+  const spec = { source_model_id: rs.model, mode: "prune", blocks: 0, calib_samples: moe.samples, calib_len: moe.len, load: "auto" };
+  if (moe.passes) spec.passes = +moe.passes;
+  if (moe.topK) spec.top_k = +moe.topK;
+  if (moe.experts) spec.experts = { keep: +moe.experts, scoring: moe.scoring, rebalance: !!moe.rebalance };
+  return spec;
+}
+
+function moeMake(st) {
+  const any = !!(moe.passes || moe.topK || moe.experts), m = rs.options.inspect.moe;
+  const bytes = moe.experts ? (((m.sizes || []).find((x) => String(x.experts) === moe.experts) || {}).packed_bytes || m.packed_bytes) : m.packed_bytes;
+  const need = (bytes / 1e9) * 1.05 + (moe.experts ? 0.5 : 0);
+  const low = st.free_disk_gb != null && st.free_disk_gb < need;
+  const unmeasured = !!moe.experts && !(moe.meas && moe.meas.exists);
+  const why = !st.env_ready ? "The training software is not installed yet (Training setup)." : !any ? "Choose a number of passes, of experts per token or of experts to keep." : unmeasured ? "Measure the experts first." : low ? `Not enough free disk space: ${need.toFixed(1)} GB needed, ${st.free_disk_gb} GB free.` : "";
+  return `<div class="card wide"><h2>3 · Make the model</h2>
+    <div class="row"><button class="primary" id="moe-go" ${rs.running || rs.testing || why ? "disabled" : ""}>Make the model</button><button class="secondary" id="rs-stop" ${rs.running ? "" : "disabled"}>Stop</button></div>
+    ${why && any !== false ? `<div class="dim small">${esc(why)}</div>` : ""}
+    <div class="dim small">${moe.experts ? "The kept experts are cut out of the packed files byte for byte" : "The weights are copied"} (about ${need.toFixed(0)} GB of free disk space); the new model is saved in this project and listed in Step 3.</div>
+    ${rs.running ? `<div class="stepline" aria-live="polite">${esc(rs.text)}</div>${rs.progress != null ? `<progress max="1" value="${rs.progress}"></progress>` : ""}` : ""}
+    ${rs.log.length ? `<details><summary>Log</summary><pre class="log">${rs.log.slice(-120).map(esc).join("\n")}</pre></details>` : ""}</div>`;
+}
+
+function wireMoe() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  if (moeOn() && moe.help == null && !moe.helpLoading) { moe.helpLoading = true; invoke("help", { key: "moe" }).then((h) => { moe.help = h; }).catch(() => { moe.help = ""; }).finally(() => { moe.helpLoading = false; if (onReshape()) render(); }); }
+  const p = $("moe-passes"); if (p) p.onchange = () => { moe.passes = p.value; render(); };
+  const k = $("moe-topk"); if (k) k.onchange = () => { moe.topK = k.value; render(); };
+  const ex = $("moe-experts"); if (ex) ex.onchange = () => { moe.experts = ex.value; render(); };
+  const sc = $("moe-scoring"); if (sc) sc.onchange = () => { moe.scoring = sc.value; render(); };
+  const rb = $("moe-rebalance"); if (rb) rb.onchange = () => { moe.rebalance = rb.checked; };
+  on("moe-measure", () => moeMeasure(!!(moe.meas && moe.meas.exists)));
+  on("moe-check", () => { moe.checking = true; moeLoad(true); });
+  on("moe-recheck", () => moeLoad(false));
+  on("moe-go", async () => {
+    rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
+    try { await invoke("reshape_start", { spec: moeSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
+  });
+}

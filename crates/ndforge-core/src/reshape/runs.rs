@@ -94,6 +94,9 @@ pub fn name_for_moe(src: &ModelEntry, spec: &ReshapeSpec) -> String {
     if let Some(k) = spec.top_k {
         tail += &format!("-k{k}");
     }
+    if let Some(e) = &spec.experts {
+        tail = format!("-e{}{tail}", e.keep);
+    }
     format!("{}-{}-moe{tail}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&src.name))
 }
 
@@ -206,6 +209,15 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
     }
     if let Some(k) = spec.top_k {
         job["top_k"] = json!(k);
+    }
+    if let Some(e) = &spec.experts {
+        // the removal follows a measurement of the experts on this project's text: the same folder `measure_with` wrote (same key: model, data version, samples, length, load)
+        let key = scores_key_with(&m.repo, version, spec.calib_samples, spec.calib_len, &spec.load, None);
+        let dir = scores_dir(p, &key);
+        if !dir.join("moe_scores.json").is_file() {
+            return Err(Error::new("Measure the experts first (on this page, \"Measure the experts\"): which ones to remove is decided by what they do on your text."));
+        }
+        job["experts"] = json!({"keep": e.keep, "scoring": e.scoring, "rebalance": e.rebalance, "scores_dir": dir});
     }
     if let Some(w) = &spec.width {
         job["width"] = json!({"intermediate_size": w.intermediate, "linear_num_value_heads": w.lin_v_heads, "num_attention_heads": w.heads});
@@ -1803,7 +1815,7 @@ pub fn measurement_info(p: &Project, m: &ModelEntry, samples: u32, len: u32, loa
 pub fn measurement_info_with(p: &Project, m: &ModelEntry, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Value {
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
     let key = scores_key_with(&m.repo, version, samples, len, load, reasoning);
-    let meta = read_json(&scores_dir(p, &key).join("scores.json"));
+    let meta = read_json(&scores_dir(p, &key).join("scores.json")).or_else(|| read_json(&scores_dir(p, &key).join("moe_scores.json")).map(|v| v["meta"].clone()));
     json!({"key": key, "exists": meta.is_some(), "tokens": meta.as_ref().map(|x| x["tokens"].clone()), "load": meta.as_ref().map(|x| x["load"].clone()),
            "created": meta.as_ref().map(|x| x["created"].clone()), "data_version": version})
 }
@@ -1820,10 +1832,13 @@ pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &
     if let Some(r) = reasoning {
         r.validate()?;
     }
-    if !["auto", "16bit", "4bit", "offload"].contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
+    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+    // a mixture of experts (Inkling) is measured by its own job: it is loaded packed ("auto" | "packed" | "hf"), not in 16 or 4 bit
+    let moe = m.family == "inkling2";
+    let loads: &[&str] = if moe { &["auto", "packed", "hf"] } else { &["auto", "16bit", "4bit", "offload"] };
+    if !loads.contains(&load) || !(8..=4096).contains(&samples) || !(32..=8192).contains(&len) {
         return Err(Error::new("Measure on 8 to 4096 samples of 32 to 8192 tokens."));
     }
-    let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let (version, _) = crate::train::runs::latest_version(p).ok_or_else(|| Error::new("Save a training-data version in Step 2 first: the layers are measured on your own text."))?;
     let train = p.folder.join("datasets").join(format!("v{version}")).join("train.jsonl");
     if !train.is_file() {
@@ -1834,7 +1849,7 @@ pub fn measure_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &
     let folder = scores_dir(p, &key);
     let _active = Active::begin(&folder)?;
     let job = json!({
-        "job": "reshape_measure", "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
+        "job": if moe { "moe_measure" } else { "reshape_measure" }, "source": {"repo": m.repo, "family": m.family}, "load": load, "out_dir": folder, "force": force,
         "calibration": calibration_json(Some(&train), samples, len, Some(version), reasoning),
     });
     let stop_dir = models_dir(p).join("_scores");
