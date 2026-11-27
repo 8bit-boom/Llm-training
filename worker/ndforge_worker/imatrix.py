@@ -132,9 +132,21 @@ def converter_has_no_mtp(conv) -> bool:
     return _NO_MTP_SUPPORT[key]
 
 
+def is_inkling_folder(folder) -> bool:
+    import json
+    try:
+        mt = json.loads((Path(folder) / "config.json").read_text(encoding="utf-8")).get("model_type")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return mt == "inkling2_loop"
+
+
 def no_mtp_extra(conv, folder) -> list:
     """["--no-mtp"] when the model in FOLDER has no MTP head (config keys 0 / absent and no `mtp.` tensors) and the converter has the flag, else []. A newer converter asserts
-    when a model has no head and the flag is missing; a model that has one is converted exactly as before."""
+    when a model has no head and the flag is missing; a model that has one is converted exactly as before. Inkling-2-Mini never gets it: its drafter is a file of its own that the
+    converter skips by itself, and `mtp_config` in its config.json is not a Qwen-style head."""
+    if is_inkling_folder(folder):
+        return []
     if folder_has_mtp(folder) is False and converter_has_no_mtp(conv):
         return ["--no-mtp"]
     return []

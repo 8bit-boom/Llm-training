@@ -3338,7 +3338,7 @@ function madeCard(m) {
 // ------------------------------------------------------------------------------------------------------------ Auto-cut (one click)
 // The steps of this page as one run: measure, try the cuts, cut, heal, check, export, optionally put the files into Unsloth Studio (docs/AUTO_CUT.md). The plan comes from the
 // program (auto_plan, no job runs); the run's state is a file that the stepper reads (auto_status), so a stop or a closed program loses nothing.
-let ac = { target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
+let ac = { moe: { goal: "size", gb: null, topK: "", scoring: "reap", rebalance: true }, target: null, thinking: null, gate: true, gateN: 2, stages: 2, quick: false,
   sp: { search: null, stage_a: null, last: null, tq: null, check_cut: true, retry_heal: true, back_off: true, share: false, imatrix: true, hr: null, vl: null }, spInit: false, advOpen: false, maxOn: false, maxH: "", keep: false, many: false, notifyStages: true, publish: false, gbOn: false, gb: "", plan: null, planFor: "", planErr: null, planTok: 0,
   prog: null, pin: null, run: null, running: false, text: "", progress: null, err: null, report: null, loaded: false, share: null, shareOpen: false, shareNote: null };
 // The speed settings of Auto-cut: the same table as crates/ndforge-core/src/reshape/auto_speed.json (ui/smoke/autocut.test.mjs compares them).
@@ -3358,7 +3358,8 @@ function acDefaults() {
   const ins = acIns(); if (!ins) return;
   const total = ins.total_params / 1e9;
   if (ac.target == null) ac.target = Math.round(total * 0.76 * 2) / 2;
-  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5";
+  if (ac.thinking == null) ac.thinking = ins.model_type === "qwen3_5" || !!(ins.moe && ins.moe.arch === "inkling2_loop");
+  if (ins.moe && ins.moe.arch === "inkling2_loop" && ac.moe.gb == null) ac.moe.gb = acMoeDefaultGb(ins);
   if (!ac.spInit) { ac.spInit = true; acApplyPreset(total >= 15 ? "balanced" : "thorough"); }      // a big model takes days: Balanced is chosen for it, the recommended recipe is one click away
   if (!ac.share) { const sh = state.settings && state.settings.studio_share; ac.share = sh ? { ...sh } : { host_path: "", container_path: "", register_scan_folder: true, finetune_handoff: false }; }
 }
@@ -3426,7 +3427,8 @@ function acTunedHtml(lock) {
 }
 function acSpec() {
   const sp = ac.sp;
-  return { model_id: rs.model, target_b: +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
+  const mo = acMoeOn() ? { moe: { goal: ac.moe.goal, ...(+ac.moe.gb > 0 ? { target_gb: +ac.moe.gb } : {}), ...(ac.moe.topK ? { top_k: +ac.moe.topK } : {}), scoring: ac.moe.scoring, rebalance: !!ac.moe.rebalance } } : {};
+  return { ...mo, model_id: rs.model, target_b: acMoeOn() ? Math.max(1, Math.round((+ac.moe.gb || 12) / 0.61 * 10) / 10) : +ac.target, keep_thinking: !!ac.thinking, think_gate: !!ac.thinking && !!ac.gate, think_gate_n: ac.gateN, stages: ac.stages, quick: ac.quick, keep_intermediate: ac.keep, allow_many_blocks: ac.many, quants: ["q4_k_m"], studio_publish: ac.publish,
     ...(ac.gbOn && +ac.gb > 0 ? { target_gb: +ac.gb } : {}), preset: acPresetNow(), stage_a_tokens_m: sp.stage_a, last_tokens_m: sp.last, think_quick: sp.tq, check_cut: !!sp.check_cut, retry_heal: !!sp.retry_heal, back_off: !!sp.back_off,
     share_teacher_cache: !!sp.share, imatrix: !!sp.imatrix, ...(ac.tunedSnap ? { tuned: ac.tunedSnap } : {}), ...(sp.sbt ? { student_batch_tokens: +sp.sbt } : {}), ...(sp.hr ? { heal_rounds: sp.hr } : {}), ...(vllmSettings().enabled && sp.vl && (sp.vl.teacher_cache || sp.vl.checks || sp.vl.automatic) ? { vllm: { teacher_cache: !!sp.vl.teacher_cache, checks: !!sp.vl.checks, automatic: !!sp.vl.automatic, ...(sp.vl.kv_fp8 ? { kv_fp8: true } : {}) } } : {}), notify_stages: ac.notifyStages !== false, ...(sp.search ? { search_minutes: +sp.search } : {}), ...(ac.pin ? { cut: ac.pin } : {}), ...(ac.maxOn && +ac.maxH >= 1 ? { max_hours: +ac.maxH } : {}) };
 }
@@ -3610,7 +3612,7 @@ function autoCard() {
   const run = ac.run, live = ac.running || (run && run.status === "running");
   const total = ins ? ins.total_params / 1e9 : 0;
   const pl = ac.plan;
-  const canThink = !!ins && ins.model_type === "qwen3_5";
+  const canThink = !!ins && (ins.model_type === "qwen3_5" || acMoeOn());
   const lock = live ? "disabled" : "";
   const sizes = pl && pl.stages && pl.stages.length ? `<table class="tbl"><tr><th>Stage</th><th>Model</th><th>Cut</th><th>Heal</th><th>Card</th></tr>${pl.stages.map((g) => `<tr><td>${g.index} of ${g.of}</td><td>${g.params_b.toFixed(1)} B${g.blocks_cut ? `, ${g.blocks_cut} block${g.blocks_cut === 1 ? "" : "s"} out` : ""}${g.width ? `, MLP ${thou(g.width)}` : ""}</td><td>${g.cut_pct} % of the original</td><td>${g.tokens_m} M tokens, about ${g.hours[0]}–${g.hours[1]} h</td><td>${g.heal_gb} GB (${esc(g.verdict)})</td></tr>`).join("")}</table>
     ${pl.disk ? `<p class="dim small">Disk: up to ${Math.round(pl.disk.peak_gb)} GB at "${esc(pl.disk.peak_step)}", ${Math.round(pl.disk.final_gb)} GB left at the end${pl.disk.free_gb != null ? ` (${Math.round(pl.disk.free_gb)} GB free)` : ""}.</p>` : ""}` : "";
@@ -3631,8 +3633,8 @@ function autoCard() {
   return `<div class="card wide" id="ac-card"><h2>Auto-cut (one click)</h2>
     <p class="dim small">Measures the model, tries a few cuts, cuts in stages, heals each stage against the original, checks that it still thinks, and exports the GGUF files. It takes many hours; you can stop it and continue later. Nothing of the original is touched.</p>
     ${!ins ? `<p class="dim">Choose a model that can be slimmed in “Start from” above.</p>` : `
-    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
-    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>
+    ${acMoeOn() ? acMoeBlock(pl, live) : `    <div class="row"><label>Aim for <strong id="ac-target-n">${(+ac.target).toFixed(1)}</strong> B parameters (the model has ${total.toFixed(1)} B)</label></div>
+    <input type="range" id="ac-target" min="${Math.max(3, Math.ceil(total * 0.3))}" max="${Math.floor(total * 0.95 * 2) / 2}" step="0.5" value="${ac.target}" style="width:100%;max-width:560px" ${lock}>`}
     ${ac.pin ? `<div class="ac-pin" id="ac-pin"><strong>Chosen cut:</strong> ${ac.pin.blocks.length ? `blocks ${esc(ranges(ac.pin.blocks))} out` : "no blocks out"}${ac.pin.intermediate ? `, MLP ${thou(ac.pin.intermediate)}` : ""}${ac.pin.loss != null ? `, text-prediction error ${(+ac.pin.loss).toFixed(3)}` : ""} <span class="dim small">found by the search on the Try first card${ac.pin.think ? " (its thinking was checked)" : ""}; Auto-cut does not search or try again${ac.pin.think ? " and skips the thinking check before healing" : ""}.</span> <button class="secondary" id="ac-pin-remove" ${lock}>Remove</button></div>` : ""}
     <label class="opt"><input type="checkbox" id="ac-think" ${ac.thinking ? "checked" : ""} ${canThink && !live ? "" : "disabled"}> Keep it able to think (recommended): measure and heal on reasoning text, check the answers, keep the thinking template${canThink ? "" : " <span class=\"dim small\">(only Qwen3.5 / 3.8)</span>"}</label>
     ${ac.thinking ? `<label class="opt"><input type="checkbox" id="ac-gate" ${ac.gate ? "checked" : ""} ${live ? "disabled" : ""}> Check the thinking of the best 2 cuts before healing${pl && pl.think_gate_minutes ? ` (about ${Math.round(pl.think_gate_minutes)} min more)` : ""} <span class="dim small">a cut with a low error can still have lost its thinking; this chooses between the cuts by how they think</span></label>` : ""}
@@ -3794,6 +3796,7 @@ function onAutoEvent(p) {
 }
 
 function wireAuto() {
+  wireAcMoe();
   const set = (id, f) => { const e = $(id); if (e) e.onchange = () => { f(e); ac.err = null; render(); }; };
   set("ac-target", (e) => { ac.target = +e.value; });
   const t = $("ac-target"); if (t) t.oninput = () => { const n = $("ac-target-n"); if (n) n.textContent = (+t.value).toFixed(1); };
@@ -5477,4 +5480,42 @@ function wireMoe() {
     rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
     try { await invoke("reshape_start", { spec: moeSpec() }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
   });
+}
+
+
+// ----------------------------------------------------------------------------------------------------------------- Auto-cut of a mixture of experts (docs/MOE_GUIDE.md)
+// The size is the finished Q4_K_M file in GB (the plan turns it into a number of experts per layer: multiples of 16, never below 32, at most half per stage); the goal is a smaller file
+// (the default), faster answers (fewer experts per token) or quality (nothing to cut: the Train page); loop passes are never taken out by Auto-cut.
+function acMoeOn() { const i = acIns(); return !!(i && i.moe && i.moe.arch === "inkling2_loop"); }
+const acMoeQ4 = (params) => params * 0.61 / 1e9;
+function acMoeDefaultGb(ins) {
+  const row = (ins.moe.sizes || []).find((x) => x.experts === 96) || (ins.moe.sizes || [])[1];
+  return row ? Math.round(acMoeQ4(row.params) * 2) / 2 + 0.5 : 12;
+}
+function acMoeBlock(pl, live) {
+  const ins = acIns(), m = ins.moe, lock = live ? "disabled" : "", g = ac.moe;
+  const sizes = (m.sizes || []).map((x) => acMoeQ4(x.params));
+  const lo = Math.max(3, Math.floor(Math.min(...sizes) * 2) / 2), hi = Math.floor(Math.max(...sizes) * 0.97 * 2) / 2;
+  const mi = pl && pl.moe;
+  const row = (n, lbl, val) => `<label class="opt"><input type="radio" name="ac-goal" value="${n}" ${g.goal === n ? "checked" : ""} ${lock}> <strong>${lbl}</strong> <span class="dim small">${val}</span></label>`;
+  const table = mi ? `<table class="tbl" id="ac-moe-table"><tr><th>Experts per layer</th><th>Q4_K_M file</th><th>Packed</th><th>Parameters</th><th>Stages</th></tr>${mi.table.map((r) => `<tr class="${r.experts === mi.experts_after ? "ac-pick" : ""}"><td>${r.experts}${r.experts === mi.experts_after ? " ◀" : ""}</td><td>${r.q4_gb} GB</td><td>${r.packed_gb} GB</td><td>${r.params_b} B</td><td>${r.stages || "–"}</td></tr>`).join("")}</table>` : "";
+  return `<div id="ac-moe"><p><strong>Mixture of experts</strong>: ${m.experts} experts in each of ${ins.layers} layers, ${m.top_k} used per token; the middle layers run ${m.passes} times.</p>
+    ${row("size", "A smaller file", "(recommended): fewer experts per layer, so the finished GGUF fits a smaller card or leaves room for more context")}
+    ${row("speed", "Faster answers", "fewer experts per token (Try first measures what it costs before it is used)")}
+    ${row("quality", "A better model for my project", "cutting does not make it better: this one points you to training")}
+    ${g.goal === "quality" ? `<div class="warn" id="ac-moe-quality">Train the uncut model on the Train page (QLoRA needs about 22 GB) instead; cutting only makes it smaller or faster.</div>` : `
+    ${g.goal === "size" || +g.gb > 0 ? `<div class="row"><label>The finished file (Q4_K_M) about <strong id="ac-moe-gb-n">${(+g.gb).toFixed(1)}</strong> GB${mi ? ` &rarr; <strong>${mi.experts_after}</strong> of ${mi.experts_before} experts per layer, about ${mi.q4_gb} GB, ${mi.active_b} B parameters work per token` : ""}</label></div>
+    <input type="range" id="ac-moe-gb" min="${lo}" max="${hi}" step="0.5" value="${Math.min(hi, Math.max(lo, +g.gb || lo))}" style="width:100%;max-width:560px" ${lock}>` : ""}
+    <div class="grid"><label>Experts used per token<select id="ac-moe-topk" ${lock}><option value="" ${g.topK === "" ? "selected" : ""}>${g.goal === "speed" ? "6 (Try first checks the cost)" : "keep " + m.top_k}</option>${[6, 4].filter((k) => k < m.top_k).map((k) => `<option value="${k}" ${String(g.topK) === String(k) ? "selected" : ""}>${k}</option>`).join("")}</select></label>
+      ${state.settings.expert_mode ? `<label>Ranked by<select id="ac-moe-scoring" ${lock}><option value="reap" ${g.scoring === "reap" ? "selected" : ""}>REAP (recommended)</option><option value="freq" ${g.scoring === "freq" ? "selected" : ""}>how often picked</option><option value="gate" ${g.scoring === "gate" ? "selected" : ""}>routing weight</option></select></label>` : ""}
+      <label class="opt"><input type="checkbox" id="ac-moe-rebalance" ${g.rebalance ? "checked" : ""} ${lock}> Even out the router after the cut (no training)</label></div>`}
+    <p class="dim small" id="ac-moe-passes">Loop passes: Auto-cut never takes them out (this model was trained with ${m.passes}). ${mi ? esc(mi.passes_note) : ""}</p>${table}</div>`;
+}
+function wireAcMoe() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onchange = fn; };
+  document.querySelectorAll("input[name=ac-goal]").forEach((r) => r.onchange = () => { ac.moe.goal = r.value; if (r.value === "speed" && !ac.moe.topK) ac.moe.topK = "6"; if (r.value === "size") ac.moe.topK = ""; acRefresh(); render(); });
+  const g = $("ac-moe-gb"); if (g) { g.oninput = () => { ac.moe.gb = +g.value; const n = $("ac-moe-gb-n"); if (n) n.textContent = (+g.value).toFixed(1); }; g.onchange = () => { acRefresh(); render(); }; }
+  on("ac-moe-topk", () => { ac.moe.topK = $("ac-moe-topk").value; acRefresh(); render(); });
+  on("ac-moe-scoring", () => { ac.moe.scoring = $("ac-moe-scoring").value; acRefresh(); render(); });
+  on("ac-moe-rebalance", () => { ac.moe.rebalance = $("ac-moe-rebalance").checked; acRefresh(); render(); });
 }

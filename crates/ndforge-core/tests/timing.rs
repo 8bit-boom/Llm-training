@@ -192,3 +192,19 @@ fn a_speed_test_log_gives_its_own_rate_and_is_not_taken_for_a_training_run() {
     let both = History::from_texts(&[bench, train, merge]);
     assert!((both.pick("train_tok_b_s", 21.0).unwrap().0 - 14_700.0).abs() < 1.0);
 }
+
+#[test]
+fn a_mixture_of_experts_teaches_its_own_keys_and_never_the_dense_ones() {
+    let job = |kind: &str| json!({"job": kind, "source": {"repo": "thinkingmachines/Inkling-2-Mini", "family": "inkling2"}});
+    let measure = log(job("moe_measure"), &[rec("load_model", 60.0, json!({"load": "auto", "bytes": 19.5e9})), rec("score", 100.0, json!({"tokens": 131072.0, "load": "packed"}))], &[]);
+    let tries = log(job("reshape_try"), &[rec("load_model", 60.0, json!({"load": "auto", "bytes": 19.5e9})), rec("try_pass", 20.0, json!({"tokens": 131072.0})), rec("try_pass", 40.0, json!({"tokens": 131072.0}))], &[]);
+    let h = History::from_texts(&[measure, tries]);
+    let (score, _) = h.pick("moe_score_tok_s", 1.0).unwrap();
+    assert!((score - 1310.72).abs() < 0.01, "{score}");
+    let (try_rate, _) = h.pick("moe_try_tok_s", 1.0).unwrap();
+    assert!((try_rate - (6553.6 + 3276.8) / 2.0).abs() < 0.01, "{try_rate}");
+    assert!(h.pick("score_tok_b_s", 10.0).is_none() && h.pick("try_tok_b_s", 10.0).is_none(), "a packed folder is not 2 bytes a parameter");
+    // the dense kind of the same logs (no family) still teaches the dense keys
+    let dense = log(json!({"job": "reshape_measure", "source": {"repo": "x"}}), &[rec("load_model", 10.0, json!({"load": "16bit", "bytes": 4.0e9})), rec("score", 10.0, json!({"tokens": 1000.0}))], &[]);
+    assert!(History::from_texts(&[dense]).pick("score_tok_b_s", 2.0).is_some());
+}

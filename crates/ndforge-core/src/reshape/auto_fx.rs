@@ -36,6 +36,40 @@ impl<'a> RealEffects<'a> {
         RealEffects { p, stop, vram_gb, on_event, step: "plan".into(), imatrix: true, tracker: super::auto_progress::ProgressTracker::new() }
     }
 
+    /// Is the made model `name` (a folder under `models/`) a cut of Inkling-2-Mini? Its thinking is checked through a GGUF file (llama.cpp), not through Transformers.
+    fn is_inkling(&self, name: &str) -> bool {
+        runs::valid_name(name).is_ok() && runs::read_json(&runs::models_dir(self.p).join(name).join("ndforge_reshape.json")).is_some_and(|m| m["origin"]["family"] == "inkling2")
+    }
+
+    /// The thinking check of a mixture of experts: the model (the original, the cut or the healed one) is made into a Q4_K_M GGUF, llama.cpp answers the questions with Inkling's own
+    /// template arguments and sampling, and the file is deleted again. Each check pays for a conversion (minutes) and a load; the original is checked once per run.
+    fn think_check_inkling(&mut self, name: &str, target: &str, quick: bool) -> Result<Out<Value>> {
+        use crate::export::runs::{execute_no_train, exports_dir, ModelSource};
+        let meta = runs::read_json(&runs::models_dir(self.p).join(name).join("ndforge_reshape.json")).unwrap_or(Value::Null);
+        let src = match target {
+            "original" => ModelSource::Hub { repo: meta["origin"]["repo"].as_str().ok_or_else(|| Error::new("The original of this model is not recorded."))?.to_string() },
+            "cut" => ModelSource::Made { name: name.into(), sub: "model".into() },
+            "healed" => ModelSource::Made { name: name.into(), sub: "healed".into() },
+            other => return Err(Error::new(format!("Unknown thing to check: {other}"))),
+        };
+        let stop = self.stop.clone();
+        let imatrix = ImatrixOptions { enabled: false, ..ImatrixOptions::default() };
+        let metas = execute_no_train(self.p, &src, &["q4_k_m".to_string()], NUM_CTX, false, &imatrix, &MixedOptions::default(), &stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
+        if self.stop.load(Ordering::SeqCst) && metas.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
+            return Ok(Out::Stopped);
+        }
+        let metas = metas?;
+        let exports = exports_dir(self.p);
+        let (Some(dir_name), Some(file)) = (metas.first().and_then(|m| m["name"].as_str()), metas.first().and_then(|m| m["gguf_file"].as_str())) else {
+            return Err(Error::new("The GGUF file for the thinking check was not made."));
+        };
+        let gguf = exports.join(dir_name).join(file);
+        let spec = ThinkSpec { name: name.into(), target: "gguf".into(), quick, gguf: Some(gguf.to_string_lossy().to_string()), family: Some("inkling2".into()), ..ThinkSpec::default() };
+        let r = thinkcheck::run(self.p, &spec, self.stop.clone(), &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
+        let _ = std::fs::remove_dir_all(exports.join(dir_name));           // the file was only made for the check
+        done(r, Ok)
+    }
+
     /// The export of the healed model with the options of the mixed sizes.
     #[allow(clippy::too_many_arguments)]
     fn export_with(&mut self, run: &str, healed: &HealRef, family: &str, quants: &[String], keep_thinking: bool, mixed: &MixedOptions) -> Result<Out<Value>> {
@@ -163,7 +197,10 @@ impl Effects for RealEffects<'_> {
     }
 
     fn think_check(&mut self, name: &str, target: &str, quick: bool, gguf: Option<&str>) -> Result<Out<Value>> {
-        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None, round: None, backend: None, engine: None };
+        if gguf.is_none() && self.is_inkling(name) {
+            return self.think_check_inkling(name, target, quick);
+        }
+        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: gguf.map(String::from), load: None, batch: None, max_new: None, round: None, backend: None, engine: None, family: None };
         let stop = self.stop.clone();
         let r = thinkcheck::run(self.p, &spec, stop, &mut |e| send(&mut *self.on_event, &mut self.tracker, &self.step, e));
         done(r, Ok)
@@ -195,7 +232,7 @@ impl Effects for RealEffects<'_> {
         if let Some(bad) = facts.iter().find(|c| c.light == crate::envmgr::health::Light::Fail) {
             return fall(self, format!("vLLM cannot start now: {}", bad.detail));
         }
-        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: None, load: None, batch: None, max_new: None, round: None, backend: Some("vllm".into()), engine: Some(crate::vllm::engine_job_with_card(&s)) };
+        let spec = ThinkSpec { name: name.into(), target: target.into(), quick, gguf: None, load: None, batch: None, max_new: None, round: None, backend: Some("vllm".into()), engine: Some(crate::vllm::engine_job_with_card(&s)), family: None };
         let mut spec = spec;
         if engine == "vllm_fp8kv" {
             if let Some(e) = spec.engine.as_mut() {

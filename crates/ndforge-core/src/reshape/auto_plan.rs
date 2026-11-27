@@ -141,6 +141,9 @@ pub struct AutoSpec {
     /// a tested preset for this PC (a snapshot, docs/TUNE.md); None = the heals as they always were (the key is then not written)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned: Option<TunedUse>,
+    /// a mixture of experts (Inkling): the goal, the size of the file, experts per token; None = a dense model, the run as it always was (the key is then not written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<super::auto_moe::MoeAuto>,
 }
 
 /// A tested preset used by an Auto-cut run: a SNAPSHOT of the values and the measured numbers at Start, so a later edit of the preset never changes a running run (docs/TUNE.md).
@@ -240,7 +243,7 @@ impl AutoSpec {
     pub fn new(model_id: &str, target_b: f64) -> Self {
         AutoSpec {
             model_id: model_id.into(), target_b, keep_thinking: true, stages: 2, quick: false, keep_intermediate: false, allow_many_blocks: false, quants: q4(), studio_publish: false, think_gate: true, think_gate_n: 2, target_gb: None,
-            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None, vllm: None, student_batch_tokens: None, tuned: None,
+            preset: None, stage_a_tokens_m: None, last_tokens_m: None, think_quick: None, check_cut: true, retry_heal: true, back_off: true, share_teacher_cache: false, imatrix: true, max_hours: None, notify_stages: true, search_minutes: None, cut: None, heal_rounds: None, vllm: None, student_batch_tokens: None, tuned: None, moe: None,
         }
     }
 
@@ -253,7 +256,9 @@ impl AutoSpec {
         if self.student_batch_tokens.is_some_and(|n| n != 0 && !(512..=65_536).contains(&n)) {
             return Err(Error::new("Tokens per forward pass must be 0 (one row at a time) or between 512 and 65,536."));
         }
-        if !(1.0..=1000.0).contains(&self.target_b) || !self.target_b.is_finite() {
+        if let Some(m) = &self.moe {
+            m.validate().map_err(Error::new)?;
+        } else if !(1.0..=1000.0).contains(&self.target_b) || !self.target_b.is_finite() {
             return Err(Error::new("The size to aim for must be between 1 and 1000 billion parameters."));
         }
         if !(1..=2).contains(&self.stages) {
@@ -358,6 +363,9 @@ pub struct Candidate {
     pub on_target: bool,
     /// more than `MAX_BLOCKS_FREE` blocks: needs the owner's confirmation
     pub needs_confirmation: bool,
+    /// a mixture of experts: the experts kept, per token, the loop passes and the sizes (None for a dense candidate)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<super::auto_moe::MoeCandidate>,
 }
 
 impl Candidate {
@@ -470,7 +478,7 @@ fn candidate(ins: &Inspect, blocks: u32, intermediate: Option<u32>, target_param
     };
     Candidate {
         blocks, intermediate, layers: ins.layers.saturating_sub(blocks * ins.period), params, params_b: (params as f64 / 1e9 * 100.0).round() / 100.0,
-        error_pct: (err * 1000.0).round() / 10.0, width_cut: (cut * 1000.0).round() / 1000.0, on_target: err.abs() <= TARGET_TOLERANCE, needs_confirmation: blocks > MAX_BLOCKS_FREE,
+        error_pct: (err * 1000.0).round() / 10.0, width_cut: (cut * 1000.0).round() / 1000.0, on_target: err.abs() <= TARGET_TOLERANCE, needs_confirmation: blocks > MAX_BLOCKS_FREE, moe: None,
     }
 }
 
@@ -611,6 +619,9 @@ pub struct StagePlan {
     /// where this stage's parameters are (text layers, embeddings, output, vision, multi-token head); absent in an older saved plan
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breakdown: Option<plan::ParamsBreakdown>,
+    /// a mixture of experts: the experts before and after this stage and what they cost (None for a dense stage)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<super::auto_moe::MoeStage>,
 }
 
 impl StagePlan {
@@ -619,6 +630,17 @@ impl StagePlan {
         let mut v = json!({"source_model_id": source_model_id, "mode": "prune", "blocks": self.blocks_cut, "calib_samples": samples, "width_samples": width_samples, "calib_len": 512});
         if let Some(w) = self.width {
             v["width"] = json!({"intermediate": w});
+        }
+        if let Some(m) = &self.moe {
+            // a mixture of experts: the cut keeps `experts_after` per layer (and changes the experts per token in the last stage), nothing is measured on the layers
+            v["blocks"] = json!(0);
+            v["calib_len"] = json!(super::auto_moe::MEASURE_LEN);
+            if m.experts_after < m.experts_before {
+                v["experts"] = json!({"keep": m.experts_after, "scoring": m.scoring, "rebalance": m.rebalance});
+            }
+            if m.top_k != m.top_k_before {
+                v["top_k"] = json!(m.top_k);
+            }
         }
         let mut spec: plan::ReshapeSpec = serde_json::from_value(v).unwrap_or_else(|_| unreachable!("a spec made of known keys"));
         spec.reasoning = reasoning;
@@ -693,7 +715,7 @@ fn stage_with_seq(ins: &Inspect, spec: &AutoSpec, prev: Step, st: Step, index: u
         heal_gb: hp.est_gb, verdict: hp.verdict.to_string(), mode: hp.mode.to_string(),
         hours: (((hp.hours_per_10m.0 * m) * 10.0).round() / 10.0, ((hp.hours_per_10m.1 * m) * 10.0).round() / 10.0),
         teacher_load: ch.teacher_load.clone().unwrap_or_else(|| hp.teacher_load.to_string()), seq_pinned: pin.is_some(),
-        breakdown: breakdown_of(ins, st.blocks, st.intermediate),
+        breakdown: breakdown_of(ins, st.blocks, st.intermediate), moe: None,
     }
 }
 
@@ -859,14 +881,20 @@ pub struct AutoPlan {
     /// with "I have at most N hours": the settings that were given up to fit, or the refusal (`auto_speed::fit_budget`); None without a limit
     #[serde(default)]
     pub budget: Option<super::auto_speed::BudgetFit>,
+    /// a mixture of experts: the goal, the count chosen, the table of counts with their file sizes (None for a dense plan; the key is then not written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<super::auto_moe::MoePlanInfo>,
 }
 
 /// The whole plan. `vram_gb` and `free_gb` (the disk the run writes to) may be unknown.
 pub fn plan(ins: &Inspect, spec: &AutoSpec, vram_gb: Option<f64>, free_gb: Option<f64>) -> AutoPlan {
+    if spec.moe.is_some() {
+        return super::auto_moe::plan(ins, spec, vram_gb, free_gb);
+    }
     let original_b = ins.total_params as f64 / 1e9;
     let mut out = AutoPlan {
         ok: false, blockers: Vec::new(), warnings: Vec::new(), original_b: (original_b * 100.0).round() / 100.0, target_b: spec.target_b, candidates: Vec::new(), chosen: None,
-        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, time: None, speed: None, budget: None,
+        try_list: Vec::new(), stages: Vec::new(), disk: None, measure_load: plan::scoring_load(ins.total_params, ins.bytes_per_param, vram_gb).to_string(), heal_hours: (0.0, 0.0), think_gate_minutes: None, measured_minutes: None, moe: None, time: None, speed: None, budget: None,
     };
     if let Err(e) = spec.validate() {
         out.blockers.push(e.0);

@@ -107,7 +107,7 @@ pub fn build(st: &AutoState) -> Value {
     }
     failed.extend(failed_gates(&st.gguf_check));
     failed.dedup();
-    json!({
+    let mut r = json!({
         "run": st.id, "status": st.status, "step": st.step, "error": st.error, "created": st.created, "updated": st.updated,
         "model": original.map(|o| o.name.clone()), "original_b": plan.map(|p| p.original_b), "target_b": st.spec.target_b, "actual_b": actual_b,
         "blocks_removed": last.map(|s| s.plan.blocks_after), "mlp_width": last.and_then(|s| s.plan.intermediate_after),
@@ -127,7 +127,27 @@ pub fn build(st: &AutoState) -> Value {
         "estimate": estimate_json(st, active),
         "vllm": vllm_json(st),
         "settings_changes": st.settings_changes,
-    })
+    });
+    if st.spec.moe.is_some() {
+        r["moe"] = moe_json(st);
+    }
+    r
+}
+
+/// A mixture-of-experts run: what was asked, the experts kept in every layer (the same number everywhere; which ones differ per layer and are in `moe_kept.json` of the cut model), what was
+/// not healed and why, the experts per token, the active parameters and the file sizes. Added to the report only for such a run, so a dense report is what it was.
+fn moe_json(st: &AutoState) -> Value {
+    let layers = st.inspect.as_ref().map(|i| i.layers).unwrap_or(0);
+    let mi = st.plan.as_ref().and_then(|p| p.moe.clone());
+    let stages: Vec<Value> = st.stages.iter().map(|g| {
+        let m = g.plan.moe.as_ref();
+        json!({"index": g.plan.index, "experts_before": m.map(|x| x.experts_before), "experts_after": m.map(|x| x.experts_after), "top_k": m.map(|x| x.top_k), "scoring": m.map(|x| x.scoring.clone()),
+               "active_b": m.map(|x| x.active_b), "q4_gb": m.map(|x| x.q4_gb), "packed_gb": m.map(|x| x.packed_gb), "healed": g.heal.as_ref().is_some_and(|h| h.tokens_m > 0), "kept_per_layer": m.map(|x| vec![x.experts_after; layers as usize])})
+    }).collect();
+    json!({"goal": mi.as_ref().map(|m| m.goal.clone()), "target_gb": mi.as_ref().and_then(|m| m.target_gb), "experts_before": mi.as_ref().map(|m| m.experts_before), "experts_after": mi.as_ref().map(|m| m.experts_after),
+           "top_k_before": mi.as_ref().map(|m| m.top_k_before), "top_k_after": mi.as_ref().map(|m| m.top_k_after), "loop_passes": mi.as_ref().map(|m| m.passes), "q4_gb": mi.as_ref().map(|m| m.q4_gb),
+           "packed_gb": mi.as_ref().map(|m| m.packed_gb), "active_b": mi.as_ref().map(|m| m.active_b), "scoring": mi.as_ref().map(|m| m.scoring.clone()), "layers": layers, "stages": stages,
+           "passes_note": mi.as_ref().map(|m| m.passes_note.clone())})
 }
 
 /// The experimental vLLM engine in this run (`spec.vllm`): what was asked, what the plan decided for every step and why, and what each step that used it (or fell back from it) measured.
@@ -320,6 +340,21 @@ pub fn markdown(r: &Value) -> String {
     s.push_str(&format!("- Keep thinking: {}. Stages: {}. Retries: {}. Time (the steps added up): {} minutes.\n", if r["keep_thinking"] == true { "yes" } else { "no" }, r["stages"].as_array().map(|a| a.len()).unwrap_or(0), r["retries"].as_u64().unwrap_or(0), num(&r["active_minutes"], 1)));
     if let Some(d) = r["disk"].as_object() {
         s.push_str(&format!("- Disk (planned, not measured): peak {} GB at \"{}\", {} GB left at the end.\n", num(&d["peak_gb"], 1), d["peak_step"].as_str().unwrap_or(""), num(&d["final_gb"], 1)));
+    }
+    if let Some(m) = r["moe"].as_object() {
+        s.push_str(&format!("\n## Mixture of experts\n\n- Goal: {}. Experts kept in every one of the {} layers: {} of {} (which ones differ per layer: `moe_kept.json` in the cut model's folder).\n",
+                            m["goal"].as_str().unwrap_or(""), m["layers"], m["experts_after"], m["experts_before"]));
+        s.push_str(&format!("- Experts per token: {} (was {}). Loop passes: {} (unchanged: Auto-cut never takes them out). About {} B parameters work per token.\n", m["top_k_after"], m["top_k_before"], m["loop_passes"], num(&m["active_b"], 2)));
+        s.push_str(&format!("- Files: about {} GB at Q4_K_M{}; the packed model is {} GB.\n", num(&m["q4_gb"], 1), m["target_gb"].as_f64().map(|t| format!(" (you asked for {t:.1} GB)")).unwrap_or_default(), num(&m["packed_gb"], 1)));
+        for g in m["stages"].as_array().cloned().unwrap_or_default() {
+            s.push_str(&format!("- Stage {}: {} to {} experts per layer, ranked by {}{}.\n", g["index"], g["experts_before"], g["experts_after"], g["scoring"].as_str().unwrap_or("reap"), if g["healed"] == true { ", healed" } else { ", not healed (its cut passed the thinking check)" }));
+        }
+        if let Some(rows) = r["try"]["rows"].as_array().filter(|a| !a.is_empty() && r["try"]["moe"] == true) {
+            s.push_str("\n| Try first | Experts | Per token | Ranked by | Error | Rise |\n|---|---|---|---|---|---|\n");
+            for x in rows {
+                s.push_str(&format!("| {} | {} | {} | {} | {} | {} |\n", x["key"].as_str().unwrap_or(""), x["experts"], x["top_k"], x["scoring"].as_str().unwrap_or("reap"), num(&x["loss"], 3), x["rise"].as_f64().map(|v| format!("{:.1} % ({})", v * 100.0, x["band"].as_str().unwrap_or(""))).unwrap_or_default()));
+            }
+        }
     }
     s.push_str("\n## Stages\n\n| Stage | Size (B) | Cut (%) | Blocks cut | MLP width | Tokens (M) | KL first | KL last | Loss before | Loss after | Teacher loss | Tries | Result |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for st in r["stages"].as_array().cloned().unwrap_or_default() {

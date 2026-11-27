@@ -3,6 +3,7 @@
 //! worker jobs and keeps the result under `models/<name>/` in the project. The method and its limits are written up in docs/RESHAPE.md.
 pub mod auto;
 pub mod auto_fx;
+pub mod auto_moe;
 pub mod auto_plan;
 pub mod auto_progress;
 pub mod auto_report;

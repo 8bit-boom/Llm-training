@@ -162,3 +162,21 @@ def test_shared_cases_with_the_rust_side():
         except ml.MoeError:
             ok = False
         assert ok == c["ok"], c
+
+
+def test_the_inspect_fixture_the_rust_tests_read_is_what_the_code_makes(real_cfg):
+    """crates/ndforge-core/tests/auto_moe.rs plans from this file: it must stay what `inspect` makes for the real model"""
+    made = reshapejob._inspect_inkling(real_cfg, REAL_TENSORS, 24, "inkling2_loop", False, 19_525_870_752, 64)
+    assert json.loads((inkfake.DATA / "inkling2_inspect.json").read_text(encoding="utf-8")) == json.loads(json.dumps(made))
+
+
+def test_the_converter_never_gets_no_mtp_for_inkling(tmp_path):
+    """a cut that dropped mtp_config (passes, blocks) must not be converted with the Qwen-style --no-mtp flag"""
+    from ndforge_worker import imatrix
+    conv = tmp_path / "convert_hf_to_gguf.py"
+    conv.write_text('parser.add_argument("--no-mtp")', encoding="utf-8")
+    inkfake.write_folder(tmp_path / "i")
+    cfg = json.loads((tmp_path / "i" / "config.json").read_text())
+    del cfg["mtp_config"]
+    (tmp_path / "i" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    assert imatrix.no_mtp_extra(conv, tmp_path / "i") == []

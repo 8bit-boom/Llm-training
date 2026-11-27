@@ -34,6 +34,19 @@ def family(name: str) -> dict:
     return FAMILIES.get(name, FAMILIES["generic"])
 
 
+def think_kwargs(name: str, on: bool) -> dict:
+    """The chat-template arguments that switch thinking on or off for a family: `enable_thinking` for the Qwen3.5 and Gemma 4 templates, `reasoning_effort` (a level) for Inkling's."""
+    think = family(name).get("think") or {}
+    if think.get("effort_on"):
+        return {"reasoning_effort": think["effort_on"] if on else think["effort_off"]}
+    return {"enable_thinking": bool(on)}
+
+
+def sampling_of(name: str, default: dict) -> dict:
+    """The sampling a family recommends, over `default` (the Qwen numbers the check always used): Inkling's authors say temperature 1.0, top-p 1.0, no top-k."""
+    return {**default, **(family(name).get("sampling") or {})}
+
+
 def default_non_thinking(template: str) -> str:
     """Qwen3.5's chat template starts the answer with "<think>" unless `enable_thinking` is false. The model here is trained WITHOUT thinking, so the
     exported template answers without thinking unless thinking is asked for explicitly (llama.cpp and Unsloth Studio use the template inside the GGUF)."""

@@ -82,7 +82,11 @@ def load_suite(path=None) -> dict:
 def settings_of(job: dict) -> dict:
     """The settings a check runs with (and its cache is keyed by): quick or full, sampling, token limits, and whether the control questions are asked."""
     quick = bool(job.get("quick", False))
-    s = {**SAMPLING, **{k: job[k] for k in SAMPLING if job.get(k) is not None}}
+    base = SAMPLING
+    if job.get("family"):
+        from .families import sampling_of
+        base = sampling_of(str(job["family"]), SAMPLING)          # a family with its own recommended sampling (Inkling); the Qwen numbers otherwise
+    s = {**base, **{k: job[k] for k in SAMPLING if job.get(k) is not None}}
     s.update(quick=quick, max_new=int(job.get("max_new") or MAX_NEW["quick" if quick else "full"]), control_max_new=MAX_NEW["control"],
              control=bool(job.get("control", True)), suite_version=SUITE_VERSION)
     return s
@@ -95,11 +99,28 @@ def questions(suite: dict, settings: dict) -> tuple[list, list]:
 
 # ------------------------------------------------------------------------------------------------------------------ reading an output
 
+SEG_THINK, SEG_TEXT, SEG_END, SEG_TURN, SEG_EOS = "<|content_thinking|>", "<|content_text|>", "<|end_message|>", "<|message_model|>", "<|content_model_end_sampling|>"
+
+
+def split_segments(text: str) -> dict:
+    """Inkling's format: `<|message_model|><|content_thinking|>TRACE<|end_message|>` (one or more) then `<|message_model|><|content_text|>ANSWER<|end_message|><|content_model_end_sampling|>`.
+    "think" is every trace segment joined, "answer" the text of the last answer segment, "closed" is true when an answer segment follows a trace."""
+    import re
+    clean = text.replace(SEG_EOS, "")
+    traces = [m.group(1) for m in re.finditer(re.escape(SEG_THINK) + r"(.*?)(?:" + re.escape(SEG_END) + r"|$)", clean, re.S)]
+    answers = [m.group(1) for m in re.finditer(re.escape(SEG_TEXT) + r"(.*?)(?:" + re.escape(SEG_END) + r"|" + re.escape(SEG_TURN) + r"|$)", clean, re.S)]
+    think = "\n".join(t.strip() for t in traces if t.strip())
+    closed = bool(answers) and (not traces or clean.rfind(SEG_TEXT) > clean.rfind(SEG_THINK))
+    return {"think": think, "answer": answers[-1].strip() if answers and closed else "", "closed": closed if traces else bool(answers)}
+
+
 def split_output(text: str, started_in_think: bool = True) -> dict:
     """{"think": the reasoning text or "", "answer": what follows it, "closed": </think> was written}. With thinking on, the prompt already ends with `<think>\\n`, so the
     generated text starts INSIDE the reasoning; a `<think>` at its start (a template that did not open the block) is dropped. Without a `</think>` the whole text is
     reasoning that never ended (answer "") when thinking is on, and the answer when it is not."""
     t = text or ""
+    if SEG_THINK in t or SEG_TEXT in t:
+        return split_segments(t)                       # a model that writes its turn in segments (Inkling): the markers are special tokens, never in Qwen's text
     if THINK_CLOSE in t:
         head, _, answer = t.partition(THINK_CLOSE)
         think = head.split(THINK_OPEN)[-1] if THINK_OPEN in head else head

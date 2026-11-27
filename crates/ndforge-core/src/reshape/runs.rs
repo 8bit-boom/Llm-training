@@ -1939,6 +1939,9 @@ pub struct TrySpec {
     /// the automatic search of the best cut (reshape::search): `{groups, budget_min, thorough, ...}`; the worker plans the rounds itself and measures in one job
     #[serde(default)]
     pub search: Option<Value>,
+    /// a mixture of experts (Inkling): the questions to answer, `{"keys": ["e=96", "k=6", ...], "goal": "size" | "speed"}` (the worker's default list for the goal when no keys); not sent unless set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<Value>,
 }
 
 /// The most cuts one request may ask for (a safety net; the page asks for far fewer).
@@ -1948,8 +1951,13 @@ pub const TRY_SEARCH_MAX_GROUPS: usize = 8;
 
 impl TrySpec {
     pub fn validate(&self) -> Result<()> {
-        if !["auto", "16bit", "4bit", "offload"].contains(&self.load.as_str()) {
+        if !["auto", "16bit", "4bit", "offload", "packed", "hf"].contains(&self.load.as_str()) {
             return Err(Error::new(format!("Unknown way of loading the model: {}.", self.load)));
+        }
+        if let Some(m) = &self.moe {
+            if m["keys"].as_array().is_some_and(|k| k.len() > 40 || k.iter().any(|x| !x.as_str().is_some_and(|t| t.len() < 40 && t.chars().all(|c| c.is_ascii_alphanumeric() || "=|_".contains(c))))) || m["goal"].as_str().is_some_and(|g| !["size", "speed"].contains(&g)) {
+                return Err(Error::new("The questions to try for a mixture of experts are not valid."));
+            }
         }
         if !["contiguous", "separate"].contains(&self.strategy.as_str()) {
             return Err(Error::new(format!("Unknown way of choosing layers: {}.", self.strategy)));
@@ -2000,6 +2008,9 @@ impl TrySpec {
         if let Some(s) = &self.search {
             w["search"] = s.clone();
         }
+        if let Some(m) = &self.moe {
+            w["moe"] = m.clone();
+        }
         w
     }
 }
@@ -2017,12 +2028,16 @@ pub fn try_job(p: &Project, m: &ModelEntry, spec: &TrySpec, plan_only: bool) -> 
     if !train.is_file() {
         return Err(Error::new("The saved training data of this project is missing. Save a version in Step 2 again."));
     }
-    Ok(json!({
+    let mut job = json!({
         "job": "reshape_try", "source": {"repo": m.repo, "family": m.family}, "load": spec.load, "out_dir": try_dir(p, m, version, spec), "plan_only": plan_only, "force": spec.force,
         "calibration": calibration_json(Some(&train), spec.samples, spec.len, Some(version), spec.reasoning.as_ref()),
         "measure_dir": scores_dir(p, &scores_key_with(&m.repo, Some(version), spec.measure_samples, spec.len, &spec.load, spec.reasoning.as_ref())), "measure_samples": spec.measure_samples,
         "protect": {"first": spec.protect_first, "last": spec.protect_last}, "strategy": spec.strategy, "want": spec.want(), "params_b": spec.params_b,
-    }))
+    });
+    if spec.moe.is_some() {
+        job["scores_dir"] = job["out_dir"].clone();         // the answers and the measurement of the experts share one folder (`moe_try.json` next to `moe_scores.json`)
+    }
+    Ok(job)
 }
 
 fn try_model(spec: &TrySpec) -> Result<ModelEntry> {
@@ -2048,7 +2063,13 @@ pub fn try_results(p: &Project, model_id: &str, samples: u32, len: u32, load: &s
 pub fn try_results_with(p: &Project, model_id: &str, samples: u32, len: u32, load: &str, reasoning: Option<&ReasoningCalib>) -> Result<Value> {
     let m = catalog::find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
     let Some((version, _)) = crate::train::runs::latest_version(p) else { return Ok(json!({"exists": false})) };
-    let file = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning)).join("reshape_try.json");
+    let dir = scores_dir(p, &scores_key_with(&m.repo, Some(version), samples, len, load, reasoning));
+    // a mixture of experts keeps its answers in `moe_try.json` (worker/ndforge_worker/moetry.py)
+    if let Some(v) = read_json(&dir.join("moe_try.json")) {
+        return Ok(json!({"exists": true, "analysis": v["analysis"], "tokens": v["passes"].as_object().map(|o| o.values().map(|r| r["tokens"].as_f64().unwrap_or(0.0)).sum::<f64>()), "load": v["meta"]["load"],
+                         "passes": v["passes"].as_object().map(|o| o.len()).unwrap_or(0)}));
+    }
+    let file = dir.join("reshape_try.json");
     let Some(v) = read_json(&file) else { return Ok(json!({"exists": false})) };
     if v["key"]["source"] != json!(m.repo) || v["key"]["data_version"] != json!(version) {
         return Ok(json!({"exists": false}));

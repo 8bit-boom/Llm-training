@@ -123,9 +123,11 @@ class Server:
             pass
 
 
-def body_of(request: dict, settings: dict) -> dict:
+def body_of(request: dict, settings: dict, family: str | None = None) -> dict:
+    from .families import think_kwargs
+    kwargs = think_kwargs(family, bool(request["thinking"])) if family else {"enable_thinking": bool(request["thinking"])}
     return {"model": "model", "messages": request["messages"], "temperature": settings["temperature"], "top_p": settings["top_p"], "top_k": settings["top_k"],
-            "seed": settings["seed"], "max_tokens": request["max_new"], "stream": False, "chat_template_kwargs": {"enable_thinking": bool(request["thinking"])}}
+            "seed": settings["seed"], "max_tokens": request["max_new"], "stream": False, "chat_template_kwargs": kwargs}
 
 
 def text_of(message: dict, finish: str, thinking: bool) -> str:
@@ -137,8 +139,8 @@ def text_of(message: dict, finish: str, thinking: bool) -> str:
     return content
 
 
-def ask(url: str, request: dict, settings: dict) -> dict:
-    data = json.dumps(body_of(request, settings)).encode("utf-8")
+def ask(url: str, request: dict, settings: dict, family: str | None = None) -> dict:
+    data = json.dumps(body_of(request, settings, family)).encode("utf-8")
     req = urllib.request.Request(url + "/v1/chat/completions", data=data, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
@@ -170,7 +172,7 @@ def generate(requests: list, settings: dict, on_result, should_stop, job: dict) 
         protocol.progress("load", 1.0, "")
         t_gen[0] = time.monotonic()
         pool = ThreadPoolExecutor(max_workers=int(job.get("parallel") or DEFAULT_PARALLEL))
-        pending = {pool.submit(ask, server.url, r, settings) for r in requests}
+        pending = {pool.submit(ask, server.url, r, settings, job.get("family")) for r in requests}
         while pending and not should_stop():                    # looks at the Stop file twice a second while the questions run
             done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
             for f in done:
