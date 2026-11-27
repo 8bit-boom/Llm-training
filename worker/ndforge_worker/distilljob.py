@@ -43,10 +43,12 @@ def kd_topk_loss(student_logp, ids, logp, resid, mask):
     return ((main + rest) * m).sum(), m.sum()
 
 
-def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask):
+def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask, softcap=None):
     import torch
     import torch.nn.functional as F
     logits = (h.to(weight.dtype) @ weight.t()).float()      # the output layer may be 16-bit (kbit_upcast off): the matrix product runs in its type, everything after it in 32-bit
+    if softcap:                                             # Inkling: logits = tanh(logits / 30) * 30 before the softmax (config.final_logit_softcapping); None for every other model
+        logits = torch.tanh(logits / softcap) * softcap
     kd, _ = kd_topk_loss(torch.log_softmax(logits, dim=-1), ids, logp, resid, mask)
     if labels is None:
         return kd, kd.new_zeros(())
@@ -54,10 +56,11 @@ def _chunk_losses(h, weight, ids, logp, resid, mask, labels, label_mask):
     return kd, (ce * label_mask.float()).sum()
 
 
-def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None, checkpoint_head: bool = True):
+def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None, label_mask=None, checkpoint_head: bool = True, softcap: float | None = None):
     """hidden [n, C] (the student's last hidden states), weight [V, C] (its output layer), targets = the teacher's (ids [n, k], logp [n, k], resid [n]),
     mask [n]. The logits are made `chunk` tokens at a time inside torch.utils.checkpoint, so at most chunk x V floats exist (the backward pass makes them again).
     With labels [n] (the next token, any value where label_mask is 0) the cross-entropy over label_mask is returned as well.
+    `softcap` (Inkling's final logit softcap, 30) bounds the logits the way the model's own forward does; None leaves them as they were.
     `checkpoint_head=False` keeps every chunk's logits for the backward pass instead of making them again: faster, and the same numbers, but about tokens x V x 10 bytes of memory.
     Returns (kd_sum, n_tokens, ce_sum, n_label_tokens); divide to get means."""
     import torch
@@ -67,7 +70,7 @@ def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None
     kd_total, ce_total = hidden.new_zeros((), dtype=torch.float32), hidden.new_zeros((), dtype=torch.float32)
     for a in range(0, n, max(1, int(chunk))):
         b = min(n, a + chunk)
-        args = (hidden[a:b], weight, ids[a:b], logp[a:b], resid[a:b], mask[a:b], None if labels is None else labels[a:b], None if label_mask is None else label_mask[a:b])
+        args = (hidden[a:b], weight, ids[a:b], logp[a:b], resid[a:b], mask[a:b], None if labels is None else labels[a:b], None if label_mask is None else label_mask[a:b]) + ((softcap,) if softcap else ())
         kd, ce = checkpoint(_chunk_losses, *args, use_reentrant=False) if checkpoint_head else _chunk_losses(*args)
         kd_total = kd_total + kd
         ce_total = ce_total + ce
