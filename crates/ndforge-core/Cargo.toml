@@ -18,6 +18,8 @@ regex = "1"
 ureq = { version = "2", features = ["json"] }
 flate2 = "1"
 tiny_http = "0.12"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

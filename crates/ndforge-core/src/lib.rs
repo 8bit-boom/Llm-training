@@ -28,6 +28,7 @@ pub mod sample;
 pub mod teacher;
 pub mod timing;
 pub mod unsloth;
+pub mod update;
 pub mod vllm;
 pub mod winhints;
 pub mod vllm_plan;

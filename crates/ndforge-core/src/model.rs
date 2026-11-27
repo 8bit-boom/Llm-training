@@ -68,8 +68,9 @@ impl AppModel {
             "bundle": bundle,
             "recent": recent,
             "settings": {"keep_awake": self.settings.keep_awake, "keep_display_on": self.settings.keep_display_on, "expert_mode": self.settings.expert_mode, "show_help_panel": self.settings.show_help_panel, "theme": self.settings.theme, "unsloth": self.settings.unsloth,
-                         "auto_continue_interrupted": self.settings.auto_continue_interrupted, "notifications": self.settings.notifications, "webhook_url": self.settings.webhook_url, "vllm": self.settings.vllm},
+                         "auto_continue_interrupted": self.settings.auto_continue_interrupted, "notifications": self.settings.notifications, "check_updates": self.settings.check_updates, "webhook_url": self.settings.webhook_url, "vllm": self.settings.vllm},
             "projects_dir": default_projects_dir(),
+            "app_version": crate::update::APP_VERSION,
         })
     }
 
@@ -143,6 +144,7 @@ impl AppModel {
             "keep_display_on" => self.settings.keep_display_on = value,
             "auto_continue_interrupted" => self.settings.auto_continue_interrupted = value,
             "notifications" => self.settings.notifications = value,
+            "check_updates" => self.settings.check_updates = value,
             other => return Err(Error::new(format!("Unknown setting: {other}"))),
         }
         self.settings.save();
