@@ -681,6 +681,9 @@ def run_try(cfg: dict) -> int:
     plan_only = bool(cfg.get("plan_only"))
     config, src_dir = _config_and_dir(repo, not plan_only)
     reshape.check_supported(config)
+    from . import moe_layout
+    if moe_layout.is_inkling(config):
+        raise ReshapeError("Try first for a mixture of experts (experts, experts per token, loop passes) is not available in this version of the program.")
     tc = reshape.text_config(config)
     types = reshape.layer_types_of(tc)
     period = reshapejob.check_period(config, types)

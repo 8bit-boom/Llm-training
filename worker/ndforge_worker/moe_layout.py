@@ -400,7 +400,7 @@ def fix_config_inkling(cfg: dict, passes: int | None = None, top_k: int | None =
     if experts is not None and experts != experts_of(cfg):
         check_experts_kept(experts_of(cfg), top_k_of(new), experts)
         tc["n_routed_experts"] = int(experts)
-    if drop_blocks:
+    if drop_blocks is not None:
         why = blocks_removed_ok(cfg, drop_blocks)
         if why:
             raise MoeError(why)

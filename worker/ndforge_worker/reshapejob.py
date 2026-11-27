@@ -1053,6 +1053,9 @@ def run(cfg: dict) -> int:
     protocol.progress("inspect", 0.0, "Reading the model's layout")
     config = json.loads((src_dir / "config.json").read_text(encoding="utf-8"))
     reshape.check_supported(config)
+    if moe_layout.is_inkling(config):
+        from . import moejob
+        return moejob.run(cfg, src_dir, config)
     tc = reshape.text_config(config)
     n_layers = int(tc["num_hidden_layers"])
     tensors = safetensors_io.list_tensors(src_dir)
