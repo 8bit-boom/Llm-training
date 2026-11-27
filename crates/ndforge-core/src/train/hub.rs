@@ -82,10 +82,14 @@ pub fn lookup(input: &str) -> Result<Found> {
     }
     let url = format!("{}/api/models/{repo}?blobs=true", base());
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build();
-    let info: Value = match agent.get(&url).set("User-Agent", "nd-lore-forge").call() {
+    let mut req = agent.get(&url).set("User-Agent", "nd-lore-forge");
+    if let Some(auth) = crate::general::hub_authorization() {
+        req = req.set("Authorization", &auth);
+    }
+    let info: Value = match req.call() {
         Ok(r) => r.into_json().map_err(|e| Error::new(format!("Hugging Face's answer was not readable: {e}")))?,
         Err(ureq::Error::Status(404, _)) => return Err(Error::new(format!("{repo} was not found on Hugging Face. Check the spelling; a private model cannot be used."))),
-        Err(ureq::Error::Status(401 | 403, _)) => return Err(Error::new(format!("{repo} needs a Hugging Face login (it is gated or private). Only open models can be added for now."))),
+        Err(ureq::Error::Status(401 | 403, _)) => return Err(Error::new(crate::general::hub_refused(&format!("access to {repo}")))),
         Err(ureq::Error::Status(code, _)) => return Err(Error::new(format!("Hugging Face answered with an error ({code}). Try again in a moment."))),
         Err(ureq::Error::Transport(t)) => return Err(Error::new(format!("Hugging Face could not be reached. Check the internet connection. [{t}]"))),
     };

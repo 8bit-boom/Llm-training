@@ -192,7 +192,7 @@ fn the_token_is_kept_with_the_secrets_checked_and_never_in_the_state() {
 }
 
 #[test]
-fn the_token_goes_to_the_jobs_that_read_general_text_and_to_no_other() {
+fn the_token_goes_to_every_job_that_can_reach_the_hub() {
     let (_g, _d) = setup();
     let t = format!("hf_{}", "Mn5".repeat(11));
     token_set(&t).unwrap();
@@ -202,8 +202,15 @@ fn the_token_goes_to_the_jobs_that_read_general_text_and_to_no_other() {
     assert_eq!(env(json!({"job": "distill_cache", "data": {"general": {"share": 0.5}}})), want);
     assert_eq!(env(json!({"job": "distill", "dataset": {"general": {"share": 0.5}}})), want);
     assert_eq!(env(json!({"job": "export", "imatrix": {"enabled": true}})), want);
-    assert!(env(json!({"job": "distill_cache", "data": {"general": null}})).is_empty());
-    assert!(env(json!({"job": "export"})).is_empty() && env(json!({"job": "train"})).is_empty() && env(json!({"job": "distill_merge"})).is_empty());
+    assert_eq!(env(json!({"job": "distill_cache", "data": {"general": null}})), want, "the teacher is fetched with it, with or without general text");
+    // every job that can download from the Hub gets it (an export of a listed model, a plain train or merge, a think check, a reshape ...)
+    for j in ["export", "train", "distill_merge", "think_check", "reshape", "reshape_try", "reshape_inspect", "reshape_measure", "heal_check", "imatrix_make", "evaluate", "trace_gen", "vllm_teacher_check", "tune_batch_bench", "vllm_selftest"] {
+        assert_eq!(env(json!({"job": j})), want, "{j}");
+    }
+    // and not the jobs that never reach the Hub
+    for j in ["hello", "selftest", "mixed_plan", "quantfit_estimate", "llama_offload_tune", "imatrix_dat"] {
+        assert!(env(json!({"job": j})).is_empty(), "{j}");
+    }
     // a job file never holds it: the blocks are made from the source only
     assert!(!job_block(&GeneralSource::hub("a/b"), 0.5).to_string().contains(&t));
 }

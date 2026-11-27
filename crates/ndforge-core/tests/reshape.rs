@@ -1872,7 +1872,7 @@ fn healing_uses_the_chosen_dataset_and_the_token_only_through_the_environment() 
     assert_eq!(jobs[1]["dataset"]["general"], *g);
     assert!(jobs.iter().all(|j| !j.to_string().contains(&token) && !j.to_string().contains("hf_")), "the token is never in a job file");
     let env = healer_env(d.path());
-    assert_eq!(env.iter().map(|(j, t)| (j.as_str(), t.is_some())).collect::<Vec<_>>(), [("distill_cache", true), ("distill", true), ("distill_merge", false)]);
+    assert_eq!(env.iter().map(|(j, t)| (j.as_str(), t.is_some())).collect::<Vec<_>>(), [("distill_cache", true), ("distill", true), ("distill_merge", true)]);
     assert!(env.iter().filter_map(|(_, t)| t.as_ref()).all(|t| *t == token));
     // what the page reads back says which dataset was used or skipped, and the token is nowhere in it
     let h = std::fs::read_to_string(p.folder.join("models/slim/heal.json")).unwrap();

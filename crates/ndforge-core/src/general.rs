@@ -306,6 +306,21 @@ pub fn token_set(token: &str) -> Result<()> {
     crate::secrets::set(TOKEN_SECRET, t)
 }
 
+/// The `Authorization` header value for a request of this program to the Hub (`Bearer <token>`), or None without a saved token. Only for requests to huggingface.co (or the
+/// address `NDFORGE_HF_URL` moves it to); the value is never logged or put in an error text.
+pub fn hub_authorization() -> Option<String> {
+    crate::secrets::get(TOKEN_SECRET).filter(|t| !t.trim().is_empty()).map(|t| format!("Bearer {}", t.trim()))
+}
+
+/// The plain sentence for a Hub answer of 401 or 403 (gated, private, or a token that is missing or not valid), pointing to the Settings card (docs/HF_TOKEN.md).
+pub fn hub_refused(subject: &str) -> String {
+    if token_present() {
+        format!("Hugging Face refused {subject} although a Hugging Face token is saved: the token may be invalid or expired, or this model is gated and your account has no access yet (open the model's page on Hugging Face and accept its terms). Check the token in the \"Hugging Face token\" card on the Training setup page (Settings).")
+    } else {
+        format!("Hugging Face refused {subject}: the model is gated or private, or a Hugging Face token is needed and none is saved. Make a read token at huggingface.co/settings/tokens, save it in the \"Hugging Face token\" card on the Training setup page (Settings), accept the model's terms on its page if it has any, and try again.")
+    }
+}
+
 pub fn token_clear() -> Result<()> {
     crate::secrets::remove(TOKEN_SECRET)
 }

@@ -124,7 +124,7 @@ fn inkling_in_its_packed_format_is_accepted_and_gets_its_own_family() {
 fn what_cannot_be_trained_is_refused_in_plain_words() {
     let (_g, _d) = setup();
     let err = |r: &str| lookup(r).unwrap_err().0;
-    assert!(err("acme/missing").contains("was not found") && err("acme/login").contains("login"));
+    assert!(err("acme/missing").contains("was not found") && err("acme/login").contains("Hugging Face token") && err("acme/login").contains("Training setup"));
     assert!(err("acme/gated").contains("gated or private"));
     assert!(err("acme/Model-GGUF").contains("GGUF") && err("acme/Model-GGUF").contains("original weights"));
     assert!(err("acme/base-model").contains("no chat template") && err("acme/base-model").contains("Instruct"));
@@ -285,4 +285,47 @@ fn old_custom_model_files_still_load_and_new_fields_are_kept() {
     assert_eq!(back[1].derived_from.as_deref(), Some("a/b"));
     assert_eq!(back[1].reshape.as_deref(), Some("slimmed: 64 → 48 layers"));
     assert_eq!(text.matches("derived_from").count(), 1, "entries without the field do not write it");
+}
+
+/// A stand-in Hub that remembers the Authorization header of every request and answers 401 for a private repository unless the right token came.
+fn hf_recording(seen: std::sync::Arc<Mutex<Vec<Option<String>>>>) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", server.server_addr().to_ip().unwrap().port());
+    std::thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let auth = req.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+            seen.lock().unwrap().push(auth.clone());
+            let ok = auth.as_deref() == Some("Bearer hf_FAKETOKEN123");
+            let (code, body) = if req.url().contains("acme/private") && !ok { (401, json!({"error": "Invalid credentials in Authorization header"})) } else { (200, chat(json!({}))) };
+            let _ = req.respond(tiny_http::Response::from_string(body.to_string()).with_status_code(code).with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap()));
+        }
+    });
+    url
+}
+
+#[test]
+fn the_saved_token_is_sent_as_an_authorization_header_and_a_refusal_points_to_the_settings_card() {
+    let g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempdir().unwrap();
+    std::env::set_var("NDFORGE_CONFIG_DIR", d.path().join("cfg-auth"));
+    let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+    std::env::set_var("NDFORGE_HF_URL", hf_recording(seen.clone()));
+    // no token: no header, and the refusal says what to do
+    let e = lookup("acme/private").unwrap_err().0;
+    assert!(e.contains("none is saved") && e.contains("huggingface.co/settings/tokens") && e.contains("Hugging Face token"), "{e}");
+    assert_eq!(seen.lock().unwrap().clone(), vec![None]);
+    // a wrong token is refused too, and the text says the token was not accepted but does not repeat it
+    ndforge_core::general::token_set("hf_WRONGTOKEN12345").unwrap();
+    let e = lookup("acme/private").unwrap_err().0;
+    assert!(e.contains("although a Hugging Face token is saved") && !e.contains("hf_WRONG"), "{e}");
+    // the right one is sent and the lookup works
+    ndforge_core::general::token_set("hf_FAKETOKEN123").unwrap();
+    assert!(lookup("acme/private").is_ok());
+    assert_eq!(seen.lock().unwrap().last().unwrap().as_deref(), Some("Bearer hf_FAKETOKEN123"));
+    // the moe_compat revision check sends it as well
+    seen.lock().unwrap().clear();
+    let _ = ndforge_core::reshape::moe_compat::fetch_repo_state();
+    assert_eq!(seen.lock().unwrap().last().unwrap().as_deref(), Some("Bearer hf_FAKETOKEN123"));
+    ndforge_core::general::token_clear().unwrap();
+    drop(g);
 }

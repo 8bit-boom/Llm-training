@@ -38,18 +38,14 @@ pub enum WorkerEvent {
     Other(Value),
 }
 
-/// The environment variables a job gets besides the usual ones: HF_TOKEN (the person's Hugging Face token, kept with the other secrets) for the jobs that read
-/// general text from the Hub. The token is never part of the job file.
+/// The jobs that never fetch anything from Hugging Face (they read a local file, plan, or only report): they get no token. Every other job can reach huggingface.co
+/// (a model to fetch or add, a cut or grow, an export of a listed model, the healing teacher and student, a thinking check, general text ...), so it gets the token.
+pub const NO_HUB_JOBS: [&str; 6] = ["hello", "selftest", "mixed_plan", "quantfit_estimate", "llama_offload_tune", "imatrix_dat"];
+
+/// The environment variables a job gets besides the usual ones: HF_TOKEN (the person's Hugging Face token, kept with the other secrets; docs/HF_TOKEN.md) for every
+/// job that can download from the Hub (all but `NO_HUB_JOBS`). `huggingface_hub` (and so transformers and datasets) reads HF_TOKEN by itself. The token is never part of the job file.
 pub fn job_env(job: &Value) -> Vec<(String, String)> {
-    let reads_general = match job["job"].as_str() {
-        Some("general_check") => true,
-        Some("distill_cache") => job["data"]["general"].is_object(),
-        Some("distill") => job["dataset"]["general"].is_object(),
-        Some("export") => job["imatrix"]["enabled"] == true,
-        Some("imatrix_make") => true,           // the general text, and a model that is a Hugging Face id (a gated one needs the token)
-        _ => false,
-    };
-    if !reads_general {
+    if job["job"].as_str().is_some_and(|j| NO_HUB_JOBS.contains(&j)) {
         return Vec::new();
     }
     crate::secrets::get(crate::general::TOKEN_SECRET).map(|t| vec![("HF_TOKEN".to_string(), t)]).unwrap_or_default()
