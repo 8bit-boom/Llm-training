@@ -1,4 +1,6 @@
 ; Inno Setup script for ND Lore Forge. Built by packaging/windows/build.ps1 (iscc /DAppVersion=0.1.0 ndforge.iss).
+; The in-app updater runs this installer again over the installed program: /SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART. The same AppId (below, never change it) makes
+; that an upgrade in place: same folder, same per-user / all-users choice, shortcuts and uninstaller kept; the worker and tools folders are replaced, the user's projects and settings are not in {app}.
 ; Installs per user by default (no administrator needed); a user can choose "for all users" in the dialog.
 #ifndef AppVersion
   #define AppVersion "0.1.0"
@@ -15,6 +17,8 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+UsePreviousPrivileges=yes
+CloseApplications=yes
 OutputDir=..\..\dist
 OutputBaseFilename=ND-Lore-Forge-Setup-{#AppVersion}
 Compression=lzma2
@@ -40,8 +44,18 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Run]
 Filename: "{app}\nd-lore-forge.exe"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
+; a silent upgrade started with /RESTARTAPPLICATIONS (the in-app updater) starts the program again; the program allows one instance, so a second start does no harm
+Filename: "{app}\nd-lore-forge.exe"; Flags: nowait skipifnotsilent; Check: RestartRequested
 
 [Code]
+function RestartRequested(): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  for i := 1 to ParamCount do
+    if CompareText(ParamStr(i), '/RESTARTAPPLICATIONS') = 0 then Result := True;
+end;
+
 // The window is drawn by Microsoft Edge WebView2 (already on Windows 11 and on most up-to-date Windows 10). Tell the user if it is missing.
 function WebView2Installed(): Boolean;
 var v: String;

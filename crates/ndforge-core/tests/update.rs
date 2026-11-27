@@ -445,3 +445,47 @@ fn an_automatic_check_runs_at_most_once_in_24_hours_and_only_when_on() {
     let st = update::status(&c, true);
     assert_eq!((st["version"].as_str(), st["update"]["version"].as_str(), st["mode"].as_str()), (Some("0.1.0"), Some("0.2.0"), Some("checksum_only")));
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------- the owner's scripts talk to the program
+
+fn python_with_cryptography() -> Option<&'static str> {
+    ["python3", "python"].into_iter().find(|p| std::process::Command::new(p).args(["-c", "import cryptography"]).output().map(|o| o.status.success()).unwrap_or(false))
+}
+
+#[test]
+fn keys_and_signatures_made_by_the_scripts_verify_in_the_program() {
+    let Some(py) = python_with_cryptography() else { eprintln!("skipped: no python with the cryptography package"); return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+    let dir = tempfile::tempdir().unwrap();
+    let keyfile = dir.path().join("private.txt");
+    let run = |args: Vec<String>| std::process::Command::new(py).args(args).output().unwrap();
+    let out = run(vec![root.join("make_update_key.py").display().to_string(), "--out".into(), keyfile.display().to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let private = std::fs::read_to_string(&keyfile).unwrap();
+    assert!(!private.trim().is_empty() && !stdout.contains(private.trim()), "the private key is never printed");
+    let public = stdout.lines().find(|l| l.len() == 44 && l.ends_with('=')).expect("the public key line").to_string();
+    assert!(matches!(update::key_mode_of(&public), KeyMode::Signed(_)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&keyfile).unwrap().permissions().mode() & 0o077, 0, "the private key file is for the owner only");
+    }
+    // an existing file is never overwritten
+    assert!(!run(vec![root.join("make_update_key.py").display().to_string(), "--out".into(), keyfile.display().to_string()]).status.success());
+    assert_eq!(std::fs::read_to_string(&keyfile).unwrap(), private);
+    // sign a file, verify in Rust; the signature is for this file only
+    let f = dir.path().join(EXE);
+    std::fs::write(&f, b"installer bytes").unwrap();
+    let out = run(vec![root.join("sign_update.py").display().to_string(), "--key-file".into(), keyfile.display().to_string(), f.display().to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(private.trim()));
+    let sig = std::fs::read_to_string(dir.path().join(format!("{EXE}.sig"))).unwrap();
+    let KeyMode::Signed(k) = update::key_mode_of(&public) else { unreachable!() };
+    assert!(verify::verify(&k, &sig, &sha(b"installer bytes")));
+    assert!(!verify::verify(&k, &sig, &sha(b"another file")));
+    // a bad key is refused without echoing it
+    let out = std::process::Command::new(py).arg(root.join("sign_update.py")).arg(&f).env("UPDATE_SIGNING_KEY", "not-a-key-SECRETVALUE").output().unwrap();
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("SECRETVALUE") && !String::from_utf8_lossy(&out.stdout).contains("SECRETVALUE"));
+}
