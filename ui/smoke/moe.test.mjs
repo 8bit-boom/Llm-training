@@ -90,3 +90,18 @@ test("the recommendations panel shows the order of work, what to watch and what 
   assert.match(html, /name="moe-reco-goal" value="size" checked/);
   assert.deepEqual(JSON.parse(JSON.stringify(b.calls.filter((c) => c[0] === "moe_recommend").map((c) => c[1]))), [{ model: "inkling-2-mini", goal: "size", targetGb: null }]);
 });
+
+test("Try first for experts shows the rise of each cut and a row can be taken over", async () => {
+  const analysis = { baseline: 2.0, rows: [{ key: "base", experts: 128, top_k: 8, passes: 3, loss: 2.0, rise: 0, band: "small", coverage: null, load_spread: null },
+    { key: "e=96", experts: 96, top_k: 8, passes: 3, loss: 2.08, rise: 0.04, band: "moderate", coverage: 0.93, load_spread: 1.6 }, { key: "p=4", experts: 128, top_k: 8, passes: 4, loss: 2.5, rise: 0.25, band: "large", coverage: null, load_spread: null }] };
+  const b = open({ reshape_try_results: { exists: true, analysis }, reshape_measurement: { exists: true, tokens: 1000, load: "packed", data_version: 3 } });
+  b.run(`moe.meas = { exists: true, tokens: 1000, load: "packed", data_version: 3 };`);
+  await b.run("moeTryLoad()");
+  const html = b.run("renderReshape()");
+  assert.match(html, /id="moe-try-table"/); assert.match(html, /<td>e=96<\/td><td>96<\/td><td>8<\/td><td>3<\/td><td>2\.080<\/td><td>4\.0 % \(moderate\)<\/td><td>93 %<\/td><td>1\.60<\/td>/);
+  assert.match(html, /data-moeuse="p=4"/); assert.doesNotMatch(html, /data-moeuse="base"/);
+  assert.doesNotMatch(html, /id="moe-try-go" disabled/);
+  assert.deepEqual(JSON.parse(b.run("JSON.stringify(moeTrySpec())")), { model_id: "inkling-2-mini", samples: 64, len: 2048, load: "auto", measure_samples: 64, moe: { goal: "size" } });
+  b.run(`moe.tryGoal = "grow"`);
+  assert.equal(JSON.parse(b.run("JSON.stringify(moeTrySpec())")).moe.goal, "grow");
+});

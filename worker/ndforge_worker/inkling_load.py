@@ -222,7 +222,7 @@ def load_packed(folder, device=None, dtype=None, on_tensor=None):
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     cfg = json.loads((folder / "config.json").read_text(encoding="utf-8"))
     tc_dict = {k: v for k, v in moe_layout.text_cfg(cfg).items() if k != "model_type"}
-    tc = cmod.Inkling2LoopTextConfig(**tc_dict)
+    tc = cmod.Inkling2LoopTextConfig.from_dict(tc_dict)
 
     class _NoExperts(nn.Module):                            # the real experts are 48 GB: they are never built here
         def __init__(self, config):

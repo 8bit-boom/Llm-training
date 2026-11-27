@@ -1939,7 +1939,7 @@ pub struct TrySpec {
     /// the automatic search of the best cut (reshape::search): `{groups, budget_min, thorough, ...}`; the worker plans the rounds itself and measures in one job
     #[serde(default)]
     pub search: Option<Value>,
-    /// a mixture of experts (Inkling): the questions to answer, `{"keys": ["e=96", "k=6", ...], "goal": "size" | "speed"}` (the worker's default list for the goal when no keys); not sent unless set
+    /// a mixture of experts (Inkling): the questions to answer, `{"keys": ["e=96", "k=6", ...], "goal": "size" | "speed" | "grow"}` (the worker's default list for the goal when no keys); not sent unless set
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moe: Option<Value>,
 }
@@ -1955,7 +1955,7 @@ impl TrySpec {
             return Err(Error::new(format!("Unknown way of loading the model: {}.", self.load)));
         }
         if let Some(m) = &self.moe {
-            if m["keys"].as_array().is_some_and(|k| k.len() > 40 || k.iter().any(|x| !x.as_str().is_some_and(|t| t.len() < 40 && t.chars().all(|c| c.is_ascii_alphanumeric() || "=|_".contains(c))))) || m["goal"].as_str().is_some_and(|g| !["size", "speed"].contains(&g)) {
+            if m["keys"].as_array().is_some_and(|k| k.len() > 40 || k.iter().any(|x| !x.as_str().is_some_and(|t| t.len() < 40 && t.chars().all(|c| c.is_ascii_alphanumeric() || "=|_".contains(c))))) || m["goal"].as_str().is_some_and(|g| !["size", "speed", "grow"].contains(&g)) {
                 return Err(Error::new("The questions to try for a mixture of experts are not valid."));
             }
         }

@@ -46,15 +46,15 @@ After pruning, the router's selection bias can be nudged toward the load the kep
 
 ## 4. Healing
 
-[Built in a later step; this section describes the design and says so where it is not done yet.]
-The teacher is the original packed model, the student the cut one. By default the student keeps its packed experts **frozen** and trains a LoRA on the dense parts
+**Not built yet in this version.** Cutting, Try first, Auto-cut and the thinking check work; healing a cut Inkling does not: the Heal step of such a model stops with a plain message, and Auto-cut heals only when a cut fails its thinking check
+(so a cut that passes goes on without it). What follows is the design the heal will have (written down, untested). The teacher is the original packed model, the student the cut one. By default the student keeps its packed experts **frozen** and trains a LoRA on the dense parts
 (attention projections, the loop gates), with the router frozen; the experts stay byte-identical, so the result stays in the authors' packed format. Distillation uses the model's final
 logit softcap (30) and its real vocabulary (200,058, not the padded 201,024). Budget: 20 M tokens for up to 25 % of the experts, 40 M for more, 80 M for fewer passes.
 Healing a 32 GB card needs the in-process packed teacher (about 20 GB) or vLLM nightly. Times are estimates: 20 M tokens is 4 to 7 hours **[not verified]**.
 
 ## 5. Growing
 
-Two free grows exist as questions to try: loop passes 3 to 4 (+33 % compute per token) and experts per token 8 to 10. Nobody knows whether they help (the authors' discussion #51
+**Built as questions and config-only copies.** Two free grows exist as questions to try: loop passes 3 to 4 (+33 % compute per token) and experts per token 8 to 10. Nobody knows whether they help (the authors' discussion #51
 about changing top-k is unanswered). Adding experts (copying the most used ones) is a start for training, not an improvement by itself. Splitting experts and adding blocks are not offered.
 
 ## 6. Export
@@ -107,3 +107,9 @@ their expert counts. Removing experts from them is not built yet; they keep the 
 - That the exact tensor shapes I derived from the safetensors header (read from Hugging Face on 2026-11-26) hold for every future revision.
 - The size of the rebalance's effect, the best budget of tokens, the heal times, vLLM nightly on an RTX 5090 (the vLLM page does not list that card; SGLang's does).
 - Whether Ollama runs the exported file.
+
+
+## Auto-cut in one click
+
+The Auto page handles this model end to end (docs/AUTO_CUT.md, "A mixture of experts"): choose **a smaller file** (the default), **faster answers** or **a better model** (which points to the Train page), give the size of the finished Q4_K_M file in GB, and the plan
+turns it into a number of experts per layer. It measures, tries, cuts, checks the thinking, heals only when the check fails, exports and compares. Loop passes are never taken out by Auto-cut. Everything in that flow except healing and the real jobs was tested with stand-ins.

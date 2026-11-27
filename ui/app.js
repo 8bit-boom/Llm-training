@@ -2676,7 +2676,7 @@ function wireTest() {
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
 const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
-let moe = { reco: null, recoGoal: "size", recoErr: null, passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
+let moe = { tryGoal: "size", tryLoaded: false, reco: null, recoGoal: "size", recoErr: null, passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -5391,6 +5391,32 @@ async function moeMeasInfo() {
   if (onReshape()) render();
 }
 
+// Try first for experts: the loss of each cut by imitating it on your text, without making it (the worker's moetry.py). Rows come back as `analysis.rows`.
+function moeTryHtml() {
+  const tr = rs.tr, a = tr.analysis && Array.isArray(tr.analysis.rows) ? tr.analysis : null, busy = rs.running || rs.testing || tr.running;
+  const goal = (g, l) => `<option value="${g}" ${moe.tryGoal === g ? "selected" : ""}>${l}</option>`;
+  const measured = !!(moe.meas && moe.meas.exists);
+  const rows = a ? `<table class="tbl" id="moe-try-table"><tr><th>Question</th><th>Experts</th><th>Per token</th><th>Passes</th><th>Error</th><th>Rise</th><th>Routing kept</th><th>Load spread</th><th></th></tr>${a.rows.map((r) => `<tr><td>${esc(r.key)}</td><td>${r.experts}</td><td>${r.top_k}</td><td>${r.passes}</td><td>${(+r.loss).toFixed(3)}</td><td>${r.rise == null ? "" : (r.rise * 100).toFixed(1) + " % (" + esc(r.band) + ")"}</td><td>${r.coverage == null ? "" : (r.coverage * 100).toFixed(0) + " %"}</td><td>${r.load_spread == null ? "" : (+r.load_spread).toFixed(2)}</td>
+      <td>${r.key === "base" ? "" : `<button class="link" data-moeuse="${esc(r.key)}" ${busy ? "disabled" : ""}>Use</button>`}</td></tr>`).join("")}</table>` : "";
+  return `<details id="moe-try" ${a || tr.running ? "open" : ""}><summary>Try first: what does each cut cost?</summary>
+    <p class="dim small">Imitates the cut on your text and measures the error without writing a model: seconds to minutes per question after the model is loaded. Fewer loop passes and more experts per token are only ever asked here, never done by Auto-cut. Removing experts needs the measurement above.</p>
+    <div class="row"><label>Questions for <select id="moe-try-goal" ${busy ? "disabled" : ""}>${goal("size", "a smaller file")}${goal("speed", "faster answers")}${goal("grow", "growing (more passes, more experts per token)")}</select></label>
+      <button class="secondary" id="moe-try-go" ${busy || !rs.state.dataset_version || !measured ? "disabled" : ""}>Try the cuts</button><button class="secondary" id="moe-try-stop" ${tr.running ? "" : "disabled"}>Stop</button></div>
+    ${!measured ? `<p class="dim small">Measure the experts first (above).</p>` : ""}
+    ${tr.running ? `<div class="stepline" aria-live="polite">${esc(tr.text || "")}</div>${tr.progress != null ? `<progress max="1" value="${tr.progress}"></progress>` : ""}` : ""}${rows}</details>`;
+}
+
+async function moeTryLoad() {
+  if (!moeOn() || !rs.model || !rs.state || !rs.state.dataset_version || moe.tryLoaded) return;
+  moe.tryLoaded = true;
+  try { const r = await invoke("reshape_try_results", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto" }); if (r && r.exists && r.analysis && Array.isArray(r.analysis.rows)) rs.tr.analysis = r.analysis; } catch (_) { /* no answers yet */ }
+  if (onReshape()) render();
+}
+
+function moeTrySpec() {
+  return { model_id: rs.model, samples: moe.samples, len: moe.len, load: "auto", measure_samples: moe.samples, moe: { goal: moe.tryGoal === "speed" ? "speed" : moe.tryGoal === "grow" ? "grow" : "size" } };
+}
+
 async function moeReco() {
   if (!moeOn() || !rs.model) return;
   moe.recoErr = null;
@@ -5440,6 +5466,7 @@ function moeCard(st) {
       <button class="secondary" id="moe-recheck" ${moe.loading ? "disabled" : ""}>Check the software again</button></div>
     ${moe.err ? `<div class="err">${esc(moe.err)}</div>` : ""}
     ${moeRecoHtml()}
+    ${moeTryHtml()}
     <details id="moe-help"><summary>How cutting a mixture of experts works</summary>${moe.help || `<p class="dim">Loading…</p>`}</details>
     <h3>Cuts that need no measuring</h3>
     <div class="grid"><label>Loop passes<select id="moe-passes" ${busy ? "disabled" : ""}>${passOpts.map(([v, l]) => `<option value="${v}" ${moe.passes === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
@@ -5497,6 +5524,18 @@ function wireMoe() {
   on("moe-measure", () => moeMeasure(!!(moe.meas && moe.meas.exists)));
   document.querySelectorAll("input[name=moe-reco-goal]").forEach((r) => r.onchange = () => { moe.recoGoal = r.value; moe.reco = null; moeReco(); render(); });
   if (moeOn() && moe.reco == null && !moe.recoErr && !moe.recoLoading) { moe.recoLoading = true; moeReco().finally(() => { moe.recoLoading = false; }); }
+  const tg = $("moe-try-goal"); if (tg) tg.onchange = () => { moe.tryGoal = tg.value; render(); };
+  on("moe-try-go", async () => {
+    const tr = rs.tr; tr.running = true; tr.text = "Starting…"; tr.progress = null; rs.error = null; rs.ok = null; rs.log = []; render();
+    try { await invoke("reshape_try_start", { spec: moeTrySpec() }); } catch (e) { tr.running = false; rs.error = String(e); render(); }
+  });
+  on("moe-try-stop", () => { rs.tr.text = "Stopping…"; invoke("reshape_stop"); render(); });
+  document.querySelectorAll("[data-moeuse]").forEach((b) => b.onclick = () => {
+    const q = Object.fromEntries(b.dataset.moeuse.split("|").map((x) => x.split("=")));
+    if (q.e) moe.experts = String(q.e); if (q.k) moe.topK = String(q.k); if (q.p) moe.passes = String(q.p); if (q.s) moe.scoring = q.s;
+    render();
+  });
+  moeTryLoad();
   on("moe-check", () => { moe.checking = true; moeLoad(true); });
   on("moe-recheck", () => moeLoad(false));
   on("moe-go", async () => {

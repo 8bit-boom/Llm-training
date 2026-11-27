@@ -219,8 +219,13 @@ pub fn check_export_disk(need_gb: f64, free_gb: Option<f64>, dir: &std::path::Pa
 /// Billions of weights of a model folder, from the size of its 16-bit safetensors files (a rough figure for the disk check).
 fn folder_params_b(dir: &std::path::Path) -> f64 {
     let bytes: u64 = std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
-    bytes as f64 / 2e9
+    // Inkling-2-Mini is stored packed (NVFP4 / MXFP8): 19.5 GB for 26.4 billion weights, not 2 bytes each. The 16-bit GGUF made from it is 2 bytes a weight, so the disk check needs the real count.
+    let packed = read_json(&dir.join("config.json")).is_some_and(|c| c["model_type"] == "inkling2_loop");
+    bytes as f64 / if packed { PACKED_GB_PER_B * 1e9 } else { 2e9 }
 }
+
+/// GB of the packed Inkling-2-Mini checkpoint per billion weights (19.5 GB / 26.39 B).
+pub const PACKED_GB_PER_B: f64 = 0.74;
 
 /// Does the importance matrix do anything for this size? Not for Q8_0 and the 16-bit files.
 pub fn imatrix_helps(quant: &str) -> bool {
@@ -794,7 +799,7 @@ fn resolve_source(p: &Project, src: &ModelSource) -> Result<FolderJob> {
             let local = hub_model_local(&entry.repo);
             FolderJob {
                 name, model_dir: None, base_repo: entry.repo.clone(), family: entry.family.clone(), params_b: entry.params_b, vision_repo: None,
-                download_gb: if local { 0.0 } else { (entry.params_b * 2.0 * 10.0).round() / 10.0 },
+                download_gb: if local { 0.0 } else { (entry.params_b * if entry.family == "inkling2" { PACKED_GB_PER_B } else { 2.0 } * 10.0).round() / 10.0 },
                 source: json!({"kind": "hub", "repo": entry.repo}), auto_cut: false,
             }
         }
@@ -1100,5 +1105,23 @@ mod disk_tests {
         assert!(e.contains("about 40.0 GB are needed") && e.contains("41.0 GB are free") && e.contains("not enough free space"), "{e}");
         assert!(check_export_disk(40.0, Some(42.0), dir).is_ok(), "5 % to spare is enough");
         assert!(check_export_disk(40.0, None, dir).is_ok() && check_export_disk(0.0, Some(0.0), dir).is_ok(), "an unknown disk never refuses");
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+
+    #[test]
+    fn a_packed_inkling_folder_counts_its_real_weights_for_the_disk_check() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.json"), r#"{"model_type": "inkling2_loop"}"#).unwrap();
+        std::fs::write(d.path().join("model.safetensors"), vec![0u8; 7_400_000]).unwrap();
+        // 7.4 MB packed stand for 10 million weights, so the 16-bit GGUF made from it needs 20 MB (not the 14.8 MB a 2-bytes-a-weight count would say)
+        assert!((folder_params_b(d.path()) * 1e9 - 10_000_000.0).abs() < 1.0, "{}", folder_params_b(d.path()));
+        let dense = tempfile::tempdir().unwrap();
+        std::fs::write(dense.path().join("config.json"), r#"{"model_type": "qwen3_5"}"#).unwrap();
+        std::fs::write(dense.path().join("model.safetensors"), vec![0u8; 2_000_000]).unwrap();
+        assert!((folder_params_b(dense.path()) * 1e9 - 1_000_000.0).abs() < 1.0);
     }
 }

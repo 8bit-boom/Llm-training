@@ -43,7 +43,7 @@ def test_sliced_bytes_refuses_bad_requests(tmp_path):
         slice_io.sliced_bytes(ref, 0, [4])
     with pytest.raises(ReshapeError, match="outside"):
         slice_io.sliced_bytes(ref, 1, [-1])
-    bad = st.TensorRef(ref.file, "F8_E4M3", ref.shape, ref.start, ref.end)
+    bad = st.TensorRef(ref.file, "C64", ref.shape, ref.start, ref.end)
     with pytest.raises(ReshapeError, match="cannot be thinned"):
         slice_io.read_array(bad)
 

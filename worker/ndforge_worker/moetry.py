@@ -44,7 +44,10 @@ def default_questions(experts: int, top_k: int, passes: int, varloop: bool = Fal
     qs = ["base"]
     ks = [k for k in (6, 4) if k < top_k]
     ps = [p for p in ((1, 2) if varloop else (2,)) if p < passes]
-    if goal == "speed":
+    if goal == "grow":
+        # the two free grows: one more pass, more experts per token (nobody knows whether either helps: Try first measures it)
+        qs += [make_key(p=passes + 1), make_key(k=top_k + 2), make_key(p=passes + 1, k=top_k + 2)]
+    elif goal == "speed":
         qs += [make_key(k=k) for k in ks] + [make_key(p=p) for p in ps] + [make_key(e=n) for n in counts[:2]]
     else:
         qs += [make_key(e=n) for n in counts] + [make_key(k=k) for k in ks] + [make_key(p=p) for p in ps]
