@@ -677,3 +677,69 @@ def test_the_real_published_matrix_is_adapted_to_a_cut_27b_and_reads_back(tmp_pa
     assert np.array_equal(out.arrays[f"blk.{j}.ffn_down.weight.in_sum2"], m.arrays[f"blk.{src[j]}.ffn_down.weight.in_sum2"][kept[j]])
     assert np.array_equal(out.arrays["blk.30.ssm_out.weight.in_sum2"], m.arrays["blk.62.ssm_out.weight.in_sum2"]) and "blk.31.ssm_out.weight.in_sum2" not in out.arrays, "new 31 is old 63: a full-attention layer"
     print("real adapted:", nums["size"], "bytes,", nums["tensors_after"], "tensors")
+
+
+# ------------------------------------------------------------------------------------------------------------------ a mixture of experts, cut along the expert axis
+
+def moe_matrix(tmp_path, layers=3, experts=6, width=4):
+    """a matrix of the layout llama.cpp writes for a mixture of experts: per layer an attention tensor and the expert tensors (n_expert x n_in values, one count per expert)"""
+    base = ad.read_matrix(matrix(tmp_path / "dense.imatrix")[0])
+    names, arrays = [], {}
+    rng = np.random.RandomState(1)
+    for l in range(layers):
+        for tail, n in (("attn_q.weight.in_sum2", 5), ("attn_q.weight.counts", 1), ("ffn_down_exps.weight.in_sum2", experts * width), ("ffn_down_exps.weight.counts", experts),
+                        ("ffn_gate_up_exps.weight.in_sum2", experts * 2), ("ffn_gate_up_exps.weight.counts", experts)):
+            names.append(f"blk.{l}.{tail}")
+            arrays[names[-1]] = (rng.rand(n) * 10 + 1).astype("float32")
+    m = ad.Matrix(base.kvs, names, arrays, base.alignment)
+    path = tmp_path / "moe.imatrix"
+    ad.write_matrix(path, m)
+    return path, arrays
+
+
+def moe_cut(root, kept, experts=6, layers=3, name="inkling-cut"):
+    d = Path(root) / "models" / name / "model"
+    d.mkdir(parents=True)
+    (d / "moe_kept.json").write_text(json.dumps({"scoring": "reap", "experts_before": experts, "kept": {str(k): v for k, v in kept.items()}}), encoding="utf-8")
+    meta = {"format": 3, "origin": {"repo": "thinkingmachines/Inkling-2-Mini", "family": "inkling2", "layers": layers}, "mode": "prune", "layers": layers, "src_layers": list(range(layers)), "dropped": [],
+            "duplicated": [], "zero_init": [], "shape": "moe", "moe": {"kept": "moe_kept.json", "experts": [experts, len(kept[0])]}}
+    (d / "ndforge_reshape.json").write_text(json.dumps(meta), encoding="utf-8")
+    return d.parent
+
+
+def test_a_matrix_of_experts_is_cut_to_the_kept_experts_and_read_back(tmp_path):
+    path, arrays = moe_matrix(tmp_path)
+    kept = {0: [4, 1], 1: [0, 5], 2: [3, 2]}
+    cut = ad.read_cut(moe_cut(tmp_path, kept), "inkling-cut")
+    assert cut.kept_experts == kept and cut.n_experts == 6
+    dst = tmp_path / "out.imatrix"
+    r = ad.adapt_file(path, dst, cut, 1.0)                  # verify() reads the file back and compares every entry with the source's kept part
+    got = ad.read_matrix(dst)
+    down0 = got.arrays["blk.0.ffn_down_exps.weight.in_sum2"]
+    src = arrays["blk.0.ffn_down_exps.weight.in_sum2"].reshape(6, 4)
+    assert down0.reshape(2, 4).tolist() == src[[4, 1]].tolist()
+    assert got.arrays["blk.1.ffn_gate_up_exps.weight.counts"].tolist() == arrays["blk.1.ffn_gate_up_exps.weight.counts"][[0, 5]].tolist()
+    assert got.arrays["blk.2.attn_q.weight.in_sum2"].tolist() == arrays["blk.2.attn_q.weight.in_sum2"].tolist()
+    assert r["plan"]["experts_before"] == 6 and r["plan"]["experts_after"] == 2 and r["plan"]["layers_after"] == 3
+
+
+def test_a_weight_applies_and_a_matrix_of_another_model_is_refused(tmp_path):
+    path, arrays = moe_matrix(tmp_path)
+    cut = ad.read_cut(moe_cut(tmp_path, {0: [0, 1], 1: [0, 1], 2: [0, 1]}), "inkling-cut")
+    dst = tmp_path / "w.imatrix"
+    ad.adapt_file(path, dst, cut, 2.0)
+    assert ad.read_matrix(dst).arrays["blk.0.ffn_down_exps.weight.counts"].tolist() == pytest.approx((arrays["blk.0.ffn_down_exps.weight.counts"][[0, 1]] * 2).tolist())
+    (tmp_path / "x").mkdir()
+    other, _ = moe_matrix(tmp_path / "x", experts=8)
+    with pytest.raises(ad.AdaptRefused, match="not measured on that model"):
+        ad.adapt_file(other, tmp_path / "bad.imatrix", cut, 1.0)
+
+
+def test_a_damaged_record_of_kept_experts_is_refused(tmp_path):
+    root = moe_cut(tmp_path, {0: [0, 1], 1: [0, 1], 2: [0, 1]})
+    (root / "model" / "moe_kept.json").write_text(json.dumps({"experts_before": 6, "kept": {"0": [0, 1], "1": [0, 9], "2": [0, 1]}}))
+    with pytest.raises(ad.AdaptRefused, match="do not fit"):
+        ad.read_cut(root, "inkling-cut")
+    (root / "model" / "moe_kept.json").unlink()
+    with pytest.raises(ad.AdaptRefused, match="missing or damaged"):
+        ad.read_cut(root, "inkling-cut")
