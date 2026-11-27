@@ -576,7 +576,7 @@ function gcHtml(scope) {
       ${c.sample && c.sample.length ? `<pre class="small">${c.sample.map((s) => esc(s)).join("\n———\n")}</pre>` : ""}${c.license ? `<br>Licence on the Hub: ${esc(c.license)}${c.gated ? " (gated)" : ""}` : ""}</div>` : "";
   const token = `<details ${e && e.gated || (sc.check && sc.check.verdict === "needs_access") ? "open" : ""}><summary>Hugging Face token ${st.has_token ? "(saved)" : "(none)"}</summary>
       <div class="row"><input type="password" id="gc-token" placeholder="hf_…" value="${esc(gc.tokenText)}" autocomplete="off"> <button class="secondary" id="gc-token-save">Save token</button> ${st.has_token ? `<button class="link" id="gc-token-clear">Remove token</button>` : ""}</div>
-      <p class="dim small">Only for gated datasets (<a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">make a read token</a>). It is kept with your other keys on this computer and handed to the worker as an environment variable; it is never put in a job file or the log.</p></details>`;
+      <p class="dim small">For gated datasets and models (the same token is on the Training setup page; <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">make a read token</a>). It is kept with your other keys on this computer and handed to the worker as an environment variable; it is never put in a job file or the log.</p></details>`;
   return `<div class="chooser" data-scope="${scope}"><div class="row"><label>General text <select id="${id("sel")}" ${busy ? "disabled" : ""}>${opts}</select></label>
       ${e && e.custom ? `<button class="link" id="${id("remove")}">Remove from my list</button>` : ""}</div>${info}${own}
     <div class="row"><button class="secondary" id="${id("check")}" ${busy ? "disabled" : ""}>Check it</button>${sel === "own" ? `<button class="secondary" id="${id("add")}">Add to my list</button>` : ""}</div>
@@ -2536,6 +2536,39 @@ function tuneListHtml() {
   return `${rows ? `<table class="tbl" id="tn-list"><tr><th>Preset</th><th>Match</th><th>Date</th><th>Measured</th><th></th></tr>${rows}</table>` : `<p class="dim" id="tn-empty">No preset yet. Save the settings of the Heal card as one, or let Auto test this PC.</p>`}${bad || ""}`;
 }
 
+// ------------------------------------------------------------------------------------------------------ the Hugging Face token (docs/HF_TOKEN.md)
+// One token for the whole program: gated or large model downloads and every job that fetches from huggingface.co. It is kept with the other secrets (secrets.json), never shown
+// again after it is saved, and handed to a job only as the environment variable HF_TOKEN. The General-text chooser's token box (gc-token) uses the same two commands and the same saved state.
+const hf = { text: "", error: null, busy: false, loading: false };
+function hfHasToken() { return !!(gc.state && gc.state.has_token); }
+function hfEnsure() {
+  if (gc.state || hf.loading) return;
+  hf.loading = true;
+  invoke("general_state").then((st) => { gcUse(st); hf.loading = false; if (page === "setup") render(); }).catch((e) => { hf.loading = false; hf.error = String(e); });
+}
+function renderHfToken() {
+  hfEnsure();
+  const has = hfHasToken(), known = !!gc.state;
+  return `<div class="card wide" id="hf-card"><h2>Hugging Face token <span class="dim small" id="hf-state">${!known ? "(checking…)" : has ? "(saved)" : "(not saved)"}</span></h2>
+    <p>Needed for gated or very large model downloads (for example Inkling-2-Mini) and for any job that fetches from huggingface.co. Leave it empty if every model you use is open.</p>
+    <div class="row"><input type="password" id="hf-token" placeholder="${has ? "A token is saved; type a new one to replace it" : "hf_…"}" value="${esc(hf.text)}" autocomplete="off" style="min-width:300px">
+      <button class="secondary" id="hf-token-save" ${hf.busy ? "disabled" : ""}>Save token</button>${has ? ` <button class="link" id="hf-token-clear" ${hf.busy ? "disabled" : ""}>Remove token</button>` : ""}</div>
+    ${hf.error ? `<p class="err small" id="hf-error">${esc(hf.error)}</p>` : ""}
+    <p class="dim small">A read token is enough. Make one at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>; for a gated model also open the model's page on Hugging Face and accept its terms with the same account.
+      The token is kept only in this program's secrets file on this computer and is sent to the training software as the environment variable HF_TOKEN. It is never written into job files, logs, reports or problem reports, and it is not shown again after saving.</p></div>`;
+}
+function hfWire() {
+  const on = (x, fn) => { const el = $(x); if (el) el.onclick = fn; };
+  const tk = $("hf-token"); if (tk) tk.onchange = () => { hf.text = tk.value; };
+  const call = async (run) => {
+    hf.busy = true; hf.error = null;
+    try { const st = await run(); if (st && st.presets) { gc.state = st; gc.src = st; } } catch (e) { hf.error = String(e); }
+    hf.busy = false; render();
+  };
+  on("hf-token-save", async () => { const el = $("hf-token"), v = (el ? el.value : hf.text).trim(); hf.text = ""; if (el) el.value = ""; await call(() => invoke("hf_token_set", { token: v })); });
+  on("hf-token-clear", async () => { hf.text = ""; await call(() => invoke("hf_token_clear", {})); });
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -2557,6 +2590,7 @@ function renderSetup() {
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderHfToken()}
     ${renderTimeCard()}
     ${renderLlamaSection()}
     ${renderVllm()}
@@ -5197,6 +5231,7 @@ function wire() {
   on("install", () => startEnv("env_install", { unsloth: !env.noUnsloth }));
   on("selftest", () => startEnv("env_selftest"));
   on("tm-load", () => tmLoad());
+  hfWire();
   on("kernels", () => startEnv("env_install_kernels"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);

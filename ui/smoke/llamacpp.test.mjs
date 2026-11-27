@@ -120,7 +120,7 @@ test("an update is a hint with its own button; the check says when there is none
   assert.match(html, /A newer release is available: <strong>b6100<\/strong> \(installed: b6000\)/); assert.match(html, /class="secondary lc-start" data-backend="cuda">Update<\/button>/);
   wired(b, { ".lc-start": [{}, { backend: "cuda" }] });
   await click(b, ".lc-start", 1);   // Update: the same backend as the installed one
-  assert.deepEqual(b.calls.at(-1), ["llamacpp_plan", { backend: "cuda", tag: null }]);
+  assert.deepEqual(b.calls.filter((c) => c[0].startsWith("llamacpp")).at(-1), ["llamacpp_plan", { backend: "cuda", tag: null }]);
   const b2 = browser({ llamacpp_check_update: { installed: "b6000", latest: "b6000", newer: false } });
   setup(b2, installed()); await click(b2, ".lc-check");
   html = section(b2.run("renderSetup()"));
@@ -148,7 +148,7 @@ test("Expert mode adds the choice of build and the CPU button; the choice is wha
   assert.match(html, /<select id="lc-backend"[^>]*>[^]*value="vulkan"[^]*value="cpu"[^]*value="build"/); assert.match(html, /lc-cpu/);
   b.els["lc-backend"].value = "vulkan"; b.els["lc-backend"].onchange();
   await click(b, ".lc-start");
-  assert.deepEqual(b.calls.at(-1), ["llamacpp_plan", { backend: "vulkan", tag: null }]);
+  assert.deepEqual(b.calls.filter((c) => c[0].startsWith("llamacpp")).at(-1), ["llamacpp_plan", { backend: "vulkan", tag: null }]);
   assert.doesNotMatch(section(setup(browser(), absent())), /id="lc-backend"/, "not shown in the simple mode");
 });
 
