@@ -3099,3 +3099,15 @@ fn removing_experts_follows_the_owners_rules_in_the_validation() {
     wide.moe.as_mut().unwrap().top_k = 16;
     assert!(validate(&cut(json!({"keep": 48})), &wide).is_err() && validate(&cut(json!({"keep": 64})), &wide).is_ok());
 }
+
+#[test]
+fn growing_an_inkling_is_one_more_pass_and_more_experts_per_token() {
+    let ins = inkling();
+    let grow = |v: serde_json::Value| -> ReshapeSpec { serde_json::from_value(v).unwrap() };
+    for v in [json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "passes": 4}), json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "top_k": 10}),
+              json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "passes": 4, "top_k": 10})] {
+        assert!(validate(&grow(v.clone()), &ins).is_ok(), "{v}");
+    }
+    assert!(validate(&grow(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "passes": 9})), &ins).is_err());
+    assert!(validate(&grow(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "top_k": 33})), &ins).is_err());
+}

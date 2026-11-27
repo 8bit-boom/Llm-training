@@ -75,6 +75,8 @@ def role_names(arch) -> dict:
     hybrid = arch in HYBRID_ARCHS
     roles = {"attn_kvo": ["attn_k", "attn_v", "attn_output", r"nextn\.eh_proj"] + ([] if hybrid else ["attn_qkv"]), "attn_q": ["attn_q"], "ffn_down": ["ffn_down", "ffn_down_exps", "ffn_down_shexp"],
              "ffn_updown": ["ffn_up", "ffn_gate", "ffn_up_exps", "ffn_gate_exps", "ffn_up_shexp", "ffn_gate_shexp"]}
+    if str(arch).startswith("inkling"):
+        roles["ffn_updown"].insert(4, "ffn_gate_up_exps")          # the fused gate and up of the packed experts (only this family: every other model's rules stay as they were)
     if hybrid:
         roles["lin"] = ["attn_qkv_gate", "attn_qkv", "attn_gate", "ssm_out", "ssm_beta_alpha", "ssm_beta", "ssm_alpha"]
     return {r: roles[r] for r in ROLES if r in roles}
