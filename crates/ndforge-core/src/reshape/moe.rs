@@ -199,3 +199,8 @@ pub fn validate_cut(spec: &ReshapeSpec, m: &MoeInfo) -> Result<()> {
     }
     Ok(())
 }
+
+/// Bytes of the `.safetensors` files of a model folder (a packed mixture of experts is stored packed, so this is its size on the card too).
+pub fn packed_bytes_of(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
+}

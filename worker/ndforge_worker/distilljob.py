@@ -78,6 +78,21 @@ def chunked_kd_loss(hidden, weight, targets, mask, chunk: int = 256, labels=None
     return kd_total, mask.float().sum(), ce_total, n_label
 
 
+def head_softcap(model):
+    """The final logit softcap the model's own forward applies (Inkling: 30), else None. Only Inkling is asked: another family's softcap setting is left as it always was."""
+    base = getattr(model, "base_model", None)
+    cfg = getattr(getattr(base, "model", None), "config", None) or getattr(model, "config", None)
+    if cfg is None or "inkling2" not in str(getattr(cfg, "model_type", "")):
+        return None
+    from .moeheal import softcap_of
+    return softcap_of({"final_logit_softcapping": getattr(cfg, "final_logit_softcapping", None)})
+
+
+def _capped(logits, softcap):
+    import torch
+    return torch.tanh(logits / softcap) * softcap if softcap else logits
+
+
 def forward_hidden(model, input_ids, attention_mask):
     """(hidden [b, t, C], the model's output): the hidden states after the final norm of every position, taken with a hook on the final norm. The model is
     called with logits_to_keep=1, so only the last position goes through the (huge) output layer; the training loss makes the other logits in chunks."""
@@ -758,7 +773,8 @@ def _teacher_answers(model, batch_rows: list, k: int, chunk: int, pad_id: int):
         for i, r in enumerate(batch_rows):
             h = hidden[i, :len(r["input_ids"])]
             # the chunks stay on the card (the logits of one chunk at a time bound the memory), and the row comes back to the host in one go
-            parts = [topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+            cap = head_softcap(model)
+            parts = [topk_from_logits(_capped(h[a:a + chunk].to(weight.dtype) @ weight.t(), cap), k) for a in range(0, h.shape[0], chunk)]
             out.append(tuple(torch.cat([p[j] for p in parts]).cpu().numpy() for j in range(3)))
     return out
 
@@ -1263,7 +1279,8 @@ def _teacher_targets(teacher, ids, att, k: int, chunk: int):
         hidden, _ = forward_hidden(teacher, ids.to(next(teacher.parameters()).device), att.to(next(teacher.parameters()).device))
         h = hidden[att.bool().to(hidden.device)]
         weight = teacher.get_output_embeddings().weight
-        parts = [topk_from_logits(h[a:a + chunk].to(weight.dtype) @ weight.t(), k) for a in range(0, h.shape[0], chunk)]
+        cap = head_softcap(teacher)
+        parts = [topk_from_logits(_capped(h[a:a + chunk].to(weight.dtype) @ weight.t(), cap), k) for a in range(0, h.shape[0], chunk)]
     return tuple(torch.cat([p[j] for p in parts]).to(ids.device) for j in range(3))
 
 
@@ -1281,7 +1298,7 @@ def student_loss(model, inputs, targets_fn, alpha: float, chunk: int, checkpoint
     if alpha < 1.0:
         nxt = torch.cat([inputs["labels"][:, 1:], torch.full_like(inputs["labels"][:, :1], -100)], dim=1).to(h.device)[sel]
         lab_mask, labels = nxt != -100, nxt.clamp(min=0)
-    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask, checkpoint_head)
+    kd, n, ce, n_lab = chunked_kd_loss(h, weight, targets, torch.ones(h.shape[0], device=h.device), chunk, labels, lab_mask, checkpoint_head, softcap=head_softcap(model))
     kd_mean = kd / n.clamp(min=1)
     ce_mean = ce / n_lab.clamp(min=1) if labels is not None else kd_mean.new_zeros(())
     loss = alpha * kd_mean + (1.0 - alpha) * ce_mean if alpha < 1.0 else kd_mean
@@ -1300,7 +1317,7 @@ def student_loss_rows(model, inputs, targets_fn, chunk: int, checkpoint_head: bo
     w = (1.0 / lens.float()).unsqueeze(1).expand(att.shape).to(h.device)[sel]
     weight = model.get_output_embeddings().weight
     targets = tuple(t.to(h.device) for t in targets_fn(inputs))
-    kd, n_rows, _, _ = chunked_kd_loss(h, weight, targets, w, chunk, None, None, checkpoint_head)
+    kd, n_rows, _, _ = chunked_kd_loss(h, weight, targets, w, chunk, None, None, checkpoint_head, softcap=head_softcap(model))
     return kd, n_rows
 
 

@@ -38,14 +38,14 @@ impl<'a> RealEffects<'a> {
 
     /// Is the made model `name` (a folder under `models/`) a cut of Inkling-2-Mini? Its thinking is checked through a GGUF file (llama.cpp), not through Transformers.
     fn is_inkling(&self, name: &str) -> bool {
-        runs::valid_name(name).is_ok() && runs::read_json(&runs::models_dir(self.p).join(name).join("ndforge_reshape.json")).is_some_and(|m| m["origin"]["family"] == "inkling2")
+        runs::valid_name(name).is_ok() && runs::read_json(&runs::models_dir(self.p).join(name).join("model").join("ndforge_reshape.json")).is_some_and(|m| m["origin"]["family"] == "inkling2")
     }
 
     /// The thinking check of a mixture of experts: the model (the original, the cut or the healed one) is made into a Q4_K_M GGUF, llama.cpp answers the questions with Inkling's own
     /// template arguments and sampling, and the file is deleted again. Each check pays for a conversion (minutes) and a load; the original is checked once per run.
     fn think_check_inkling(&mut self, name: &str, target: &str, quick: bool) -> Result<Out<Value>> {
         use crate::export::runs::{execute_no_train, exports_dir, ModelSource};
-        let meta = runs::read_json(&runs::models_dir(self.p).join(name).join("ndforge_reshape.json")).unwrap_or(Value::Null);
+        let meta = runs::read_json(&runs::models_dir(self.p).join(name).join("model").join("ndforge_reshape.json")).unwrap_or(Value::Null);
         let src = match target {
             "original" => ModelSource::Hub { repo: meta["origin"]["repo"].as_str().ok_or_else(|| Error::new("The original of this model is not recorded."))?.to_string() },
             "cut" => ModelSource::Made { name: name.into(), sub: "model".into() },

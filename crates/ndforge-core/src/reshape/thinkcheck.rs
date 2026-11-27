@@ -277,6 +277,8 @@ pub fn build_job(p: &Project, spec: &ThinkSpec) -> Result<Value> {
     }
     if let Some(f) = spec.family.as_deref().filter(|f| !f.is_empty()) {
         job["family"] = json!(f);
+    } else if read_json(&models_dir(p).join(&spec.name).join("model").join("ndforge_reshape.json")).is_some_and(|m| m["origin"]["family"] == "inkling2") {
+        job["family"] = json!("inkling2");          // a check of an Inkling (the original, a cut, a round of its heal) asks with its own template argument and sampling
     }
     Ok(job)
 }

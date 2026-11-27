@@ -51,3 +51,31 @@ def test_the_training_text_is_read_back_by_the_thinking_check():
 def test_softcap_is_read_from_the_config():
     assert moeheal.softcap_of({"text_config": {"final_logit_softcapping": 30.0}}) == 30.0
     assert moeheal.softcap_of({"model_type": "qwen3_5"}) is None
+
+
+def test_the_head_softcap_is_asked_of_inkling_only():
+    import types
+    ink = types.SimpleNamespace(config=types.SimpleNamespace(model_type="inkling2_loop", final_logit_softcapping=30.0))
+    gem = types.SimpleNamespace(config=types.SimpleNamespace(model_type="gemma4", final_logit_softcapping=30.0))
+    assert dj.head_softcap(ink) == 30.0 and dj.head_softcap(gem) is None and dj.head_softcap(types.SimpleNamespace()) is None
+
+
+def test_an_inkling_folder_is_loaded_packed_and_a_dense_one_is_not(tmp_path, monkeypatch):
+    import json
+
+    from ndforge_worker import inkling_load, reshapejob
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "inkling2_loop"}))
+    assert reshapejob._is_inkling_folder(tmp_path)
+    seen = []
+    monkeypatch.setattr(inkling_load, "load_packed", lambda f, **k: seen.append(str(f)) or "packed")
+    assert reshapejob._load_model(tmp_path, "4bit") == "packed" and seen == [str(tmp_path)]
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    assert not reshapejob._is_inkling_folder(tmp_path)
+
+
+def test_backends_load_routes_inkling_to_the_packed_loader(monkeypatch):
+    from ndforge_worker import backends
+    monkeypatch.setattr(backends, "load_inkling", lambda cfg: ("ink", None, None))
+    monkeypatch.setattr(backends, "load_hf", lambda cfg: ("hf", None, None))
+    assert backends.load({"model": {"family": "inkling2"}}, "hf")[0] == "ink"
+    assert backends.load({"model": {"family": "qwen3_5"}}, "hf")[0] == "hf"
