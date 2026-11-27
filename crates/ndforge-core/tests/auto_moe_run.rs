@@ -341,3 +341,25 @@ fn the_report_shows_the_experts_kept_in_every_layer_and_the_active_parameters() 
     assert!(md.contains("## Mixture of experts") && md.contains("Experts kept in every one of the 24 layers: 96 of 128") && md.contains("not healed") && md.contains("never takes them out"), "{md}");
     assert!(md.contains("| Try first | Experts |") && md.contains("e=96"), "{md}");
 }
+
+#[test]
+fn change_settings_and_continue_works_for_a_mixture_of_experts() {
+    let d = tempdir().unwrap();
+    let p = project(d.path());
+    let mut fx = Fx { weak_cuts: 100, stop_at: Some(6), ..Default::default() };
+    let st = start(&p, &mut fx, spec("size", Some(12.0))).unwrap();
+    assert_eq!(st.status, "stopped", "{:?} {:?}", st.error, st.step);
+    let patch: serde_json::Map<String, Value> = json!({"last_tokens_m": 80, "moe": {"goal": "size", "target_gb": 9.0, "scoring": "reap", "rebalance": true}}).as_object().unwrap().clone();
+    let pv = change_preview(&p, &st.id, &patch, Some(32.0)).unwrap();
+    let locks: std::collections::BTreeMap<String, String> = pv["locks"].as_array().unwrap().iter().map(|l| (l["key"].as_str().unwrap().to_string(), l["state"].as_str().unwrap().to_string())).collect();
+    assert_eq!(locks.get("moe").map(String::as_str), Some("locked"), "the cut is decided once the experts are measured: {locks:?}");
+    assert_eq!(locks.get("last_tokens_m").map(String::as_str), Some("free"));
+    // the tokens alone change the time and the plan, and the run goes on to the end
+    let patch: serde_json::Map<String, Value> = json!({"last_tokens_m": 40}).as_object().unwrap().clone();
+    let pv = change_preview(&p, &st.id, &patch, Some(32.0)).unwrap();
+    assert_eq!(pv["can_change"], json!(true));
+    let st = resume_with(&p, &mut fx, &st.id, Some((patch, true))).unwrap();
+    assert_eq!(st.status, "done", "{:?}", st.error);
+    assert_eq!(st.stages[0].plan.tokens_m, 40);
+    assert_eq!(st.settings_changes.len(), 1);
+}

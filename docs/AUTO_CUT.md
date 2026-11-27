@@ -354,3 +354,21 @@ A step's `started` / `finished` only describe its last attempt. The state now ke
 
 ## Tested settings (docs/TUNE.md)
 "Use tested settings for this PC" on the Auto page takes a snapshot of a preset when the run starts. Every heal of the run gets its speed knobs (`student_batch_tokens`, `kl_chunk`, `head_checkpoint`, `checkpointing`) and, only when a test chose it, `teacher_batch_tokens` (the original's answers; a heal in rounds still reads the saved setting). The quality knobs of a preset (LoRA size, optimizer, warm-up, learning rate: from short trial heals) are never taken by Auto-cut. The time estimate uses the measured student tokens/s. The Auto page's own button runs the one-click tuning for the latest made model.
+
+
+## A mixture of experts (Inkling-2-Mini)
+
+Auto-cut handles a mixture of experts end to end (`AutoSpec.moe`; absent for every dense model, the key is then not written and the plan, the run and the report are what they were). The same steps with the same ids run, so
+the step list, the progress bar, "Change settings and continue" and the report read the run unchanged; what they do inside differs (plan: `reshape/auto_moe.rs`, steps: the end of `reshape/auto.rs`).
+
+- **The request**: a goal ("a smaller file" is the default; "faster answers"; "quality", which refuses with a pointer to the Train page), the size of the finished **Q4_K_M file in GB**, optionally the experts per token (6 or 4), the ranking
+  (REAP, frequency, routing weight) and whether the router bias is evened out afterwards. The plan turns the size into a number of experts per layer: a multiple of 16, never below 32 (or 4 x the experts per token), **at most half removed in one stage**
+  (so 128 to 64 is one stage, 128 to 32 two). **Auto-cut never takes loop passes out**: the plan says so and names `thinkingmachines/TML-d24-varloop-research`, which was trained for 1 or 2 passes.
+- **Steps**: plan, measure (what every expert does on the project's text, summed over all loop passes), Try first (the baseline, the chosen count with each ranking, the neighbouring counts, the experts per token the goal asks for; the ranking with the
+  lowest loss is used; fewer experts per token only when its rise is not "large"), the thinking gate (the one cut is made and its thinking checked against the original's), per stage cut / check / heal / check, export, check of the GGUF, compare, publish.
+- **Heal only if needed**: a cut whose thinking check did not fail is **not healed** (its record stands for the healed model, `summary.unhealed`); a failed or missing check heals it as a dense run does (healing an Inkling is **not built yet**: that step stops
+  with a plain refusal). A second failure heals again, a third gives **16 experts back** (`back_off`), a fourth ends the run.
+- **A second stage** measures the healed model of the first before it cuts.
+- **Thinking checks** go through a Q4_K_M GGUF (llama.cpp, Inkling's own template argument `reasoning_effort` and sampling 1.0 / 1.0 / no top-k): each check converts the model, asks the questions and deletes the file.
+- **Time**: formulas until this computer's own jobs teach better (`moe_score_tok_s`, `moe_try_tok_s`, `write_gb_s` in the history); the plan says which steps use your history.
+- **Report**: a section "Mixture of experts" with the experts kept in every layer, the experts per token, the loop passes (unchanged), the parameters that work per token, the file sizes, which stage was healed, and Try first's table.

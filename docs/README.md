@@ -17,6 +17,7 @@ Start with the root [README](../README.md). The documents below describe what is
 | --- | --- |
 | [AUTO_CUT.md](AUTO_CUT.md) | Auto-cut: one click from a big model to a smaller one that still thinks |
 | [RESHAPE.md](RESHAPE.md) | Slim or grow a model: what was built and decided |
+| [MOE_GUIDE.md](MOE_GUIDE.md) | Cutting, healing and growing a mixture-of-experts model (Inkling-2-Mini): the cuts, the order of work on a 32 GB card, what is not verified |
 | [STORAGE.md](STORAGE.md) | The Storage page: where the disk went, guarded deletion |
 | [TRY_FIRST.md](TRY_FIRST.md) | Trying cuts before making one |
 | [HEAL_ANY_MODEL.md](HEAL_ANY_MODEL.md), [HEAL_SETTINGS.md](HEAL_SETTINGS.md) | Healing: any model, the settings, graphics memory, the teacher cache |

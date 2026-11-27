@@ -2676,7 +2676,7 @@ function wireTest() {
 // ------------------------------------------------------------------------------------------ slim or grow a model
 // the healing settings that are "automatic" until the person changes them (docs/HEAL_SETTINGS.md); null = what the program chooses for this model and card
 const HEAL_AUTO = { rank: null, seq: null, batch: null, per_update: null, checkpointing: "auto", method: null, optimizer: null, kl_chunk: null, k: null, teacher_load: null, warmup: null, kbit_upcast: null, head_checkpoint: null, student_batch_tokens: null };
-let moe = { passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
+let moe = { reco: null, recoGoal: "size", recoErr: null, passes: "", topK: "", experts: "", scoring: "reap", rebalance: true, samples: 64, len: 2048, meas: null, compat: null, repo: null, err: null, loading: false, checking: false, model: null };
 let rs = { state: null, model: "", mode: "prune", options: null, optErr: null, loadingOpts: false, token: 0, blocks: null, init: "identity", samples: 128, strategy: "contiguous", pf: 1, pl: 1, load: "auto",
   dropText: "", running: false, testing: null, text: "", progress: null, log: [], error: null, ok: null, view: null,
   // thinner layers (width): the way ("depth" | "width" | "both"), the chosen MLP width, the Expert axes, measuring, and healing
@@ -5391,6 +5391,26 @@ async function moeMeasInfo() {
   if (onReshape()) render();
 }
 
+async function moeReco() {
+  if (!moeOn() || !rs.model) return;
+  moe.recoErr = null;
+  try { moe.reco = await invoke("moe_recommend", { model: rs.model, goal: moe.recoGoal, targetGb: null }); } catch (e) { moe.recoErr = String(e); }
+  if (onReshape()) render();
+}
+
+// the panel: the order of work for the goal on this card, what it should cost, what to watch for and what nobody knows yet
+function moeRecoHtml() {
+  const r = moe.reco;
+  const goal = (g, l) => `<label class="opt"><input type="radio" name="moe-reco-goal" value="${g}" ${moe.recoGoal === g ? "checked" : ""}> ${l}</label>`;
+  const body = moe.recoErr ? `<div class="err">${esc(moe.recoErr)}</div>` : !r ? `<p class="dim">Loading…</p>` : r.blocked ? `<p class="warn">${esc(r.blocked)}</p>` : `
+    <ol id="moe-reco-order">${r.order.map((x) => `<li><strong>${esc(x.title)}</strong> <span class="dim small">${esc(x.text)}</span></li>`).join("")}</ol>
+    ${r.expected.length ? `<table class="tbl" id="moe-reco-table"><tr><th>Try</th><th>Experts</th><th>Per token</th><th>Passes</th><th>Q4 file</th><th>Packed</th><th>Works per token</th><th>Heal</th><th>Disk at most</th></tr>${r.expected.map((e) => `<tr><td>${esc(e.key)}</td><td>${e.experts}</td><td>${e.top_k}</td><td>${e.passes}</td><td>${e.q4_gb} GB</td><td>${e.packed_gb} GB</td><td>${e.active_b} B</td><td>${e.heal_tokens_m} M tokens, ${e.heal_hours[0]}–${e.heal_hours[1]} h, ${e.heal_gb} GB</td><td>${e.disk_peak_gb} GB</td></tr>`).join("")}</table>` : ""}
+    ${r.warnings.map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}
+    <details><summary>Not known yet</summary><ul>${r.unknowns.map((u) => `<li class="dim small">${esc(u)}</li>`).join("")}</ul></details>`;
+  return `<details id="moe-reco" open><summary>Recommendations for this card</summary>
+    <div class="row">${goal("size", "A smaller file")}${goal("speed", "Faster answers")}${goal("train", "A model that knows my project")}</div>${body}</details>`;
+}
+
 async function moeMeasure(force) {
   rs.running = true; rs.ok = null; rs.error = null; rs.log = []; rs.text = "Starting…"; rs.progress = null; render();
   try { await invoke("reshape_measure", { model: rs.model, samples: moe.samples, len: moe.len, load: "auto", force }); } catch (e) { rs.running = false; rs.error = String(e); render(); }
@@ -5419,6 +5439,7 @@ function moeCard(st) {
     <div class="row"><button class="secondary" id="moe-check" ${moe.checking || busy ? "disabled" : ""}>Check the model's repository for changes</button>
       <button class="secondary" id="moe-recheck" ${moe.loading ? "disabled" : ""}>Check the software again</button></div>
     ${moe.err ? `<div class="err">${esc(moe.err)}</div>` : ""}
+    ${moeRecoHtml()}
     <details id="moe-help"><summary>How cutting a mixture of experts works</summary>${moe.help || `<p class="dim">Loading…</p>`}</details>
     <h3>Cuts that need no measuring</h3>
     <div class="grid"><label>Loop passes<select id="moe-passes" ${busy ? "disabled" : ""}>${passOpts.map(([v, l]) => `<option value="${v}" ${moe.passes === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
@@ -5474,6 +5495,8 @@ function wireMoe() {
   const sc = $("moe-scoring"); if (sc) sc.onchange = () => { moe.scoring = sc.value; render(); };
   const rb = $("moe-rebalance"); if (rb) rb.onchange = () => { moe.rebalance = rb.checked; };
   on("moe-measure", () => moeMeasure(!!(moe.meas && moe.meas.exists)));
+  document.querySelectorAll("input[name=moe-reco-goal]").forEach((r) => r.onchange = () => { moe.recoGoal = r.value; moe.reco = null; moeReco(); render(); });
+  if (moeOn() && moe.reco == null && !moe.recoErr && !moe.recoLoading) { moe.recoLoading = true; moeReco().finally(() => { moe.recoLoading = false; }); }
   on("moe-check", () => { moe.checking = true; moeLoad(true); });
   on("moe-recheck", () => moeLoad(false));
   on("moe-go", async () => {
