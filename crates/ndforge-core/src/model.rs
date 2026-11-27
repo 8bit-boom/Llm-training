@@ -495,6 +495,29 @@ impl AppModel {
         }))
     }
 
+    /// Is the software here new enough for this model (only Inkling-2-Mini has needs), and has its repository changed since the program was tested?
+    /// Reads the installed versions (the worker's `hello`, llama.cpp's install record, the vLLM setting); `check_repo` also asks Hugging Face. Runs no cut.
+    pub fn moe_compat(model_id: &str, check_repo: bool) -> Result<Value> {
+        use crate::reshape::moe_compat as mc;
+        let m = find(model_id).ok_or_else(|| Error::new("That model is not in the list any more."))?;
+        let mut have = mc::Have::default();
+        let py = crate::envmgr::python_path(&crate::envmgr::env_dir());
+        if m.family == "inkling2" && py.is_file() {
+            let job = json!({"job": "hello"});
+            if let Ok(r) = crate::envmgr::jobs::run_job(&py, &crate::envmgr::worker_dir(), &job, &AtomicBool::new(false), &mut |_| {}) {
+                have.transformers = r["packages"]["transformers"].as_str().map(String::from);
+            }
+        }
+        let cfg = crate::envmgr::llamacpp::Config::from_env();
+        have.llama_tag = crate::envmgr::llamacpp::read_info(&cfg.install_dir()).ok().flatten().map(|i| i.tag);
+        let v = Settings::load().vllm;
+        if v.enabled {
+            have.vllm = Some(v.image);
+        }
+        let repo = if check_repo && m.family == "inkling2" { Some(mc::fetch_repo_state()?) } else { None };
+        Ok(mc::report(&m.family, &have, repo.as_ref()))
+    }
+
     /// What can be done with one model: its layout, every feasible size for `mode` ("prune" or "grow") and what to know first. May ask the worker (and the
     /// internet) the first time, so the window calls it off the main thread.
     pub fn reshape_options(&self, model_id: &str, mode: &str) -> Result<Value> {
@@ -532,7 +555,7 @@ impl AppModel {
         let default_blocks = options.last().map(|o| o.blocks.min((ins.blocks / 4).max(1))).unwrap_or(0);
         let base_spec = |blocks: u32, width: Option<plan::Width>| plan::ReshapeSpec {
             source_model_id: m.id.clone(), mode, blocks, strategy: "contiguous".into(), protect_first: 1, protect_last: 1, init: "identity".into(), calib_samples: 128, calib_len: 512,
-            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None, skip_check: false, width_scoring: None, reconstruct: None, passes: None, top_k: None,
+            load: "auto".into(), drop_layers: None, width, width_samples: 256, reasoning: None, skip_check: false, width_scoring: None, reconstruct: None, passes: None, top_k: None, experts: None,
         };
         // every size comes with the disk space it needs and what to know before choosing it
         let sized: Vec<Value> = options.iter().map(|o| {
