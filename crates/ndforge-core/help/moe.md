@@ -17,4 +17,6 @@ The page lists what is installed and what is missing: transformers 5.24 or newer
 1. Decide the goal: smaller file, faster answers, or teaching it your world (then train the uncut model and do not cut).
 2. Measure the experts. 3. Try first. 4. Cut 128 to 96. 5. Run the thinking check. 6. Heal only if the check fails. 7. Export with llama.cpp b12611 or newer.
 
+The Recommendations table also shows an NVFP4 size; it is only an estimate (no NVFP4 file is made). Healing uses the packed model in this program as the teacher (vLLM is not used for this model). An importance matrix of the original can be adapted to a cut that removed experts.
+
 Nothing here has been seen working on a real card yet. `docs/MOE_GUIDE.md` has the details and the list of what is not verified.

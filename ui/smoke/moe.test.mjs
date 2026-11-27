@@ -79,13 +79,13 @@ test("removing experts needs the measurement, then sends the count with its defa
 
 test("the recommendations panel shows the order of work, what to watch and what is not known", async () => {
   const reco = { goal: "size", blocked: null, order: [{ id: "goal", title: "Decide the goal", text: "A smaller file or faster answers." }, { id: "cut", title: "Remove experts: 128 to 96", text: "A byte copy." }],
-    first_try: ["base", "e=96"], expected: [{ key: "e=96", experts: 96, top_k: 8, passes: 3, q4_gb: 12.4, packed_gb: 15.6, active_b: 4.6, heal_tokens_m: 20, heal_hours: [4.3, 8.9], heal_gb: 24.8, disk_peak_gb: 61 }],
+    first_try: ["base", "e=96"], expected: [{ key: "e=96", experts: 96, top_k: 8, passes: 3, q4_gb: 12.4, nvfp4_gb: 15.9, f16_gb: 40.6, packed_gb: 15.6, active_b: 4.6, heal_tokens_m: 20, heal_hours: [4.3, 8.9], heal_gb: 24.8, disk_peak_gb: 61 }],
     warnings: ["16-bit LoRA needs about 59 GB."], unknowns: ["Every time and memory figure is an estimate."] };
   const b = open({ moe_recommend: reco });
   await b.run("moeReco()");
   const html = b.run("renderReshape()");
   assert.match(html, /id="moe-reco"/); assert.match(html, /<li><strong>Remove experts: 128 to 96<\/strong>/);
-  assert.match(html, /<td>e=96<\/td><td>96<\/td><td>8<\/td><td>3<\/td><td>12\.4 GB<\/td>/);
+  assert.match(html, /<td>e=96<\/td><td>96<\/td><td>8<\/td><td>3<\/td><td>12\.4 GB<\/td><td>15\.9 GB<\/td>/);
   assert.match(html, /16-bit LoRA needs about 59 GB/); assert.match(html, /Not known yet/);
   assert.match(html, /name="moe-reco-goal" value="size" checked/);
   assert.deepEqual(JSON.parse(JSON.stringify(b.calls.filter((c) => c[0] === "moe_recommend").map((c) => c[1]))), [{ model: "inkling-2-mini", goal: "size", targetGb: null }]);

@@ -85,6 +85,7 @@ mod reco {
         assert_eq!((e96.experts, e96.passes, e96.visits, e96.heal_tokens_m), (96, 3, 48, 20));
         assert!((12.0..13.0).contains(&e96.q4_gb) && (15.0..16.5).contains(&e96.packed_gb) && e96.heal_hours.0 > 3.0, "{e96:?}");
         assert!(e96.heal_gb < 32.0 && e96.disk_peak_gb > 40.0);
+        assert!((e96.nvfp4_gb - e96.packed_gb).abs() < 1.0 && (38.0..42.0).contains(&e96.f16_gb), "{e96:?}");
         assert!(r.warnings.iter().all(|w| !w.contains("too old")) && r.warnings.iter().any(|w| w.contains("59 GB")));
         assert!(r.unknowns.iter().any(|u| u.contains("nothing was run")));
     }

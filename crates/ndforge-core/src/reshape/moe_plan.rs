@@ -25,6 +25,10 @@ pub struct Expected {
     pub params_b: f64,
     pub packed_gb: f64,
     pub q4_gb: f64,
+    /// an NVFP4 GGUF would hold the experts as they are (4-bit values, 8-bit block scales): about the packed model's size. An ESTIMATE; the file is offered only after Compare quants has measured it
+    pub nvfp4_gb: f64,
+    /// the 16-bit reference file Compare quants needs on disk (2 bytes a weight), GB
+    pub f16_gb: f64,
     pub visits: u32,
     pub active_b: f64,
     pub heal_tokens_m: u32,
@@ -73,7 +77,7 @@ fn expected(ins: &Inspect, m: &MoeInfo, key: &str, experts: u32, top_k: u32, pas
     let cache = tokens as f64 * 1e6 * super::auto_plan::CACHE_BYTES_PER_TOKEN / 1e9;
     let _ = vram;
     Expected {
-        key: key.into(), experts, top_k, passes, params_b: ((params as f64 / 1e9) * 100.0).round() / 100.0, packed_gb: r1(packed), q4_gb: r1(auto_moe::q4_gb(params)), visits: m.visits_for(ins.layers, passes),
+        key: key.into(), experts, top_k, passes, params_b: ((params as f64 / 1e9) * 100.0).round() / 100.0, packed_gb: r1(packed), q4_gb: r1(auto_moe::q4_gb(params)), nvfp4_gb: r1(packed * 1.02), f16_gb: r1(params as f64 * 2.0 / 1e9), visits: m.visits_for(ins.layers, passes),
         active_b: (auto_moe::active_b(ins, m, experts, top_k, passes) * 100.0).round() / 100.0, heal_tokens_m: tokens, heal_hours: (r1(h.0), r1(h.1)), heal_gb: r1(auto_moe::heal_gb(ins, m, experts, 4096, 64, passes)),
         disk_peak_gb: r1(m.packed_bytes as f64 / 1e9 + packed + cache + packed),
     }
