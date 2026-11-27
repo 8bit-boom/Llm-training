@@ -75,8 +75,6 @@ def role_names(arch) -> dict:
     hybrid = arch in HYBRID_ARCHS
     roles = {"attn_kvo": ["attn_k", "attn_v", "attn_output", r"nextn\.eh_proj"] + ([] if hybrid else ["attn_qkv"]), "attn_q": ["attn_q"], "ffn_down": ["ffn_down", "ffn_down_exps", "ffn_down_shexp"],
              "ffn_updown": ["ffn_up", "ffn_gate", "ffn_up_exps", "ffn_gate_exps", "ffn_up_shexp", "ffn_gate_shexp"]}
-    if str(arch).startswith("inkling"):
-        roles["ffn_updown"].insert(4, "ffn_gate_up_exps")          # the fused gate and up of the packed experts (only this family: every other model's rules stay as they were)
     if hybrid:
         roles["lin"] = ["attn_qkv_gate", "attn_qkv", "attn_gate", "ssm_out", "ssm_beta_alpha", "ssm_beta", "ssm_alpha"]
     return {r: roles[r] for r in ROLES if r in roles}
@@ -418,3 +416,14 @@ def run_plan(job: dict) -> int:
     protocol.reserve_stdout()
     protocol.result(plan_job(job))
     return 0
+
+
+# --- this program only (not part of the shared section above, which quant-convert-gui mirrors): the fused gate and up tensor of Inkling's packed experts ---
+_role_names_shared = role_names
+
+
+def role_names(arch) -> dict:      # noqa: F811 - wraps the shared one; every other family gets exactly its rules
+    roles = _role_names_shared(arch)
+    if str(arch).startswith("inkling") and "ffn_updown" in roles and "ffn_gate_up_exps" not in roles["ffn_updown"]:
+        roles["ffn_updown"] = [*roles["ffn_updown"], "ffn_gate_up_exps"]
+    return roles
