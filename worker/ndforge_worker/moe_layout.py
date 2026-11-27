@@ -266,7 +266,7 @@ def group_params_moe(cfg: dict, tensors: dict, n_layers: int) -> dict:
     layers, experts, dense = [0] * n_layers, [0] * n_layers, [0] * n_layers
     g = {"embed": 0, "lm_head": 0, "vision": 0, "mtp": 0, "other": 0}
     packed: dict[int, str] = {}
-    loop = 0
+    loop = router = 0
     for name, (dtype, shape) in tensors.items():
         n = logical_params(name, dtype, shape)
         layer, role, _ = classify(name, INKLING)
@@ -285,6 +285,8 @@ def group_params_moe(cfg: dict, tensors: dict, n_layers: int) -> dict:
                 dense[layer] += n
                 if role == "loop_ctrl":
                     loop += n
+                if role in ("router", "router_bias"):
+                    router += n
         elif role == "embed":
             g["embed"] += n
         elif role == "output":
@@ -295,7 +297,7 @@ def group_params_moe(cfg: dict, tensors: dict, n_layers: int) -> dict:
                 loop += n
     total = sum(layers) + sum(g.values())
     return {"layers": layers, **g, "total": total, "bytes_per_param": 2.0, "experts": experts, "dense": dense, "expert_total": sum(experts),
-            "packed": [packed.get(i) for i in range(n_layers)], "loop": loop}
+            "packed": [packed.get(i) for i in range(n_layers)], "loop": loop, "router": router}
 
 
 def experts_of(cfg: dict) -> int:
@@ -397,7 +399,7 @@ def fix_config_inkling(cfg: dict, passes: int | None = None, top_k: int | None =
     if top_k is not None and top_k != top_k_of(cfg):
         check_top_k(cfg, top_k)
         tc["num_experts_per_tok"] = int(top_k)
-    if experts is not None and experts != experts_of(cfg):
+    if experts is not None:
         check_experts_kept(experts_of(cfg), top_k_of(new), experts)
         tc["n_routed_experts"] = int(experts)
     if drop_blocks is not None:
@@ -441,12 +443,12 @@ def size_table(groups: dict, cfg: dict, counts: list[int] | None = None) -> list
     e0 = experts_of(cfg)
     rows = []
     for n in counts if counts is not None else [e0] + expert_counts_allowed(e0, top_k_of(cfg)):
-        ex = groups["expert_total"] * n // e0
+        ex = (groups["expert_total"] + groups.get("router", 0)) * n // e0           # the router has one row (and one bias) per expert
         packed = 0
         for i, scheme in enumerate(groups["packed"]):
             per = groups["experts"][i] * n // e0
             packed += per * (0.5 + 1 / 16 if scheme == NVFP4 else 1 + 1 / 32 if scheme == MXFP8 else 2)
-        dense = groups["total"] - groups["expert_total"] - groups["vision"] - groups["mtp"]
+        dense = groups["total"] - groups["expert_total"] - groups.get("router", 0) - groups["vision"] - groups["mtp"]
         rows.append({"experts": n, "params": dense + ex + groups["vision"], "packed_bytes": int(packed + (dense + groups["vision"]) * 2),
                      "bf16_bytes": (dense + ex + groups["vision"]) * 2})
     return rows
@@ -501,3 +503,63 @@ def describe_per_expert(cfg: dict, tensors: dict, groups: dict) -> dict:
             "active_params": 0, "packed": {}, "packed_bytes": 0, "bf16_bytes": groups["total"] * 2, "mtp": {"file": None, "targets": []},
             "per_layer_experts": counts, "stored_per_expert": bool(counts), "status": LAYOUTS[arch]["status"], "sizes": [],
             "cuts": {"experts": bool(counts), "top_k": True, "passes": False, "blocks": False, "expert_width": False}}
+
+
+# ------------------------------------------------------------------------------------------------------------------ scores and choosing experts
+
+SCORINGS = ("reap", "freq", "gate")
+
+
+def select_experts(scores: dict, keep: int, scoring: str = "reap", layers: list[int] | None = None) -> dict:
+    """{layer: kept old expert ids, ascending}. `scores` = {"layers": {"<l>": {"reap": [E], "freq": [E], "gate": [E]}}} summed over every loop pass (the loop's passes share the
+    weights, so an expert matters by what it did in all of them). The `keep` experts with the highest score stay; ties go to the more used expert (freq), then the lower id.
+    Every layer keeps the same number: transformers, llama.cpp and the GGUF format take one expert count for the whole model."""
+    if scoring not in SCORINGS:
+        raise MoeError(f"Unknown way of ranking experts: {scoring!r}.")
+    table = scores.get("layers") or {}
+    want = layers if layers is not None else sorted(int(k) for k in table)
+    out = {}
+    for l in want:
+        row = table.get(str(l))
+        if not row or not isinstance(row.get(scoring), list):
+            raise MoeError(f"The measurement has no {scoring} scores for layer {l}.")
+        s, f = row[scoring], row.get("freq") or [0] * len(row[scoring])
+        if len(s) < keep:
+            raise MoeError(f"Layer {l} has only {len(s)} experts.")
+        order = sorted(range(len(s)), key=lambda e: (-float(s[e]), -float(f[e]), e))
+        out[l] = sorted(order[:keep])
+    return out
+
+
+def coverage(scores: dict, kept: dict) -> dict:
+    """{layer: share of the routing mass (gate scores) that the kept experts hold}; a cheap number to look at before any Try pass"""
+    out = {}
+    for l, ids in kept.items():
+        g = scores["layers"][str(l)].get("gate") or []
+        total = sum(g)
+        out[l] = (sum(g[e] for e in ids) / total) if total else 0.0
+    return out
+
+
+def rebalance_bias(bias: list, load: list, target: list | None = None, gamma: float = 1e-3, iterations: int = 20, stop_ratio: float = 1.5) -> list:
+    """Router-bias repair without training (aux-loss-free load balancing): bias_e += gamma x sign(target_e - load_e), `load` being the share of routed (token, visit) pairs each kept
+    expert gets in the pruned model and `target` the share it had in the original (uniform when None). One call is one small step; the job calls it with loads measured for the
+    updated bias. Here the loads are fixed, so the update is the sum of `iterations` equal steps unless the spread is already below `stop_ratio`."""
+    n = len(bias)
+    tgt = target if target is not None else [1.0 / n] * n
+    if load and max(load) / max(1e-12, sum(load) / n) < stop_ratio:
+        return list(bias)
+    return [float(b) + gamma * iterations * ((t > x) - (t < x)) for b, x, t in zip(bias, load, tgt)]
+
+
+def prune_layout(tensors: dict, kept: dict, keep: int) -> dict:
+    """{tensor name: kept ids or None}: the first-axis slice of each tensor of an Inkling folder that changes. Expert weights, their per-expert companions (scales, amax), the router
+    rows and the router bias are sliced; everything else, including the one-value `outer_scale_denominator`, is copied whole."""
+    out = {}
+    for name in tensors:
+        layer, role, _ = classify(name, INKLING)
+        if role in ("experts", "expert_companion", "router", "router_bias"):
+            if layer not in kept:
+                raise MoeError(f"No kept experts were chosen for layer {layer}.")
+            out[name] = kept[layer]
+    return out

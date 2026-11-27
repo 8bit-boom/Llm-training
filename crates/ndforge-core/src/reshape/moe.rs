@@ -4,6 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::plan::{Mode, ReshapeSpec};
+use crate::error::{Error, Result};
+
 /// Expert counts are multiples of this (decision D4: kernel friendly).
 pub const COUNT_STEP: u32 = 16;
 /// ... never below this many experts per layer,
@@ -154,4 +157,37 @@ pub fn check_experts_kept(experts: u32, top_k: u32, keep: u32) -> Option<String>
         return Some(format!("Remove at most {} % of the experts in one stage; cut again from the result for more.", (MAX_REMOVED * 100.0).round()));
     }
     None
+}
+
+/// What the worker would refuse for an Inkling cut, in plain words. Config-only cuts (loop passes, experts per token) today; experts and blocks follow.
+pub fn validate_cut(spec: &ReshapeSpec, m: &MoeInfo) -> Result<()> {
+    if spec.mode != Mode::Prune {
+        return Err(Error::new("Only cutting is possible for this model; growing is a loop-pass or experts-per-token change (Try first)."));
+    }
+    if spec.width.is_some() {
+        return Err(Error::new("Thinning the layers' width does not apply to a mixture of experts; remove experts instead."));
+    }
+    if spec.blocks > 0 || spec.drop_layers.is_some() {
+        return Err(Error::new("Removing whole blocks of an Inkling model is not available in this version of the program."));
+    }
+    if spec.passes.is_none() && spec.top_k.is_none() {
+        return Err(Error::new("Nothing to change: choose the number of loop passes or of experts per token."));
+    }
+    if let Some(p) = spec.passes {
+        if !m.looped() && m.core_layers() == 0 {
+            return Err(Error::new("This model has no loop; there are no passes to change."));
+        }
+        if p < 1 || (p < 2 && !m.varloop) {
+            return Err(Error::new("This model was built for a fixed loop and the GGUF converter refuses fewer than 2 passes; use the variable-loop research checkpoint (thinkingmachines/TML-d24-varloop-research) for 1 pass."));
+        }
+        if p > 8 {
+            return Err(Error::new("More than 8 passes is not offered."));
+        }
+    }
+    if let Some(k) = spec.top_k {
+        if k < 1 || k > m.experts.max(1) || k > 4 * m.top_k.max(1) {
+            return Err(Error::new(format!("Experts per token must be between 1 and {}.", (4 * m.top_k.max(1)).min(m.experts.max(1)))));
+        }
+    }
+    Ok(())
 }

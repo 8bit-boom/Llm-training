@@ -84,6 +84,14 @@ pub struct Inspect {
     pub moe: Option<super::moe::MoeInfo>,
 }
 
+impl Inspect {
+    /// The mixture-of-experts description of an Inkling model, whose cuts go through `moe` (config-only cuts, experts); None for a dense model and for the per-expert Qwen layouts,
+    /// which keep the depth-cut path they always had.
+    pub fn inkling(&self) -> Option<&super::moe::MoeInfo> {
+        self.moe.as_ref().filter(|m| m.arch == "inkling2_loop")
+    }
+}
+
 /// The sizes of a Qwen3.5-style model that width pruning works on (the worker's `reshape_width.width_dims`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -203,6 +211,12 @@ pub struct ReshapeSpec {
     /// did. Needs a width. Try first measures it first; nothing here says it keeps more quality. None = as it always was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconstruct: Option<ReconSpec>,
+    /// mixture of experts (Inkling): loop passes after the cut (3 -> 2 is never chosen by Auto-cut, only asked in Try first or in Expert mode). None = unchanged; not sent unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passes: Option<u32>,
+    /// mixture of experts: experts used per token after the cut. None = unchanged; not sent unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
 }
 
 /// How the kept neurons are refitted: `variant` "pruned" (fit on what the cut model feeds each layer) or "original" (on the uncut model's activations), `alpha` the ridge strength
@@ -466,6 +480,12 @@ const TOO_MANY: &str = "Slim at most half of the layers, and never the first or 
 pub fn validate(spec: &ReshapeSpec, ins: &Inspect) -> Result<()> {
     if !ins.supported {
         return Err(Error::new(ins.why.clone().unwrap_or_else(|| "Only Qwen3.5 and plain Llama/Qwen/Mistral-style models can be slimmed or grown so far.".into())));
+    }
+    if let Some(m) = ins.inkling() {
+        return super::moe::validate_cut(spec, m);
+    }
+    if spec.passes.is_some() || spec.top_k.is_some() {
+        return Err(Error::new("Loop passes and experts per token can only be changed for a mixture-of-experts model."));
     }
     if !["contiguous", "separate"].contains(&spec.strategy.as_str()) {
         return Err(Error::new(format!("Unknown way of choosing layers: {}.", spec.strategy)));

@@ -3054,3 +3054,29 @@ fn moe_expert_count_rules_agree_with_the_worker() {
     let m: MoeInfo = serde_json::from_value(json!({"experts": 128, "top_k": 8, "core": [6, 18], "passes": 3, "future_key": 1})).unwrap();
     assert!(m.looped() && m.core_layers() == 12 && m.visits_for(24, 3) == 48 && m.visits_for(24, 2) == 36);
 }
+
+/// the inspect of Inkling-2-Mini as the worker sends it (worker/tests/test_moe_layout.py pins the numbers)
+fn inkling() -> Inspect {
+    serde_json::from_value(json!({"model_type": "inkling2_loop", "supported": true, "layers": 24, "period": 6, "blocks": 4, "total_params": 26_388_641_280u64, "source_bytes": 19_525_870_752u64,
+        "has_vision": true, "width_supported": false, "layer_types": vec!["sliding_attention"; 24],
+        "moe": {"arch": "inkling2_loop", "experts": 128, "top_k": 8, "blocks": 4, "block_size": 6, "core": [6, 18], "passes": 3, "varloop": false, "visits": 48,
+                "expert_params": 24_461_180_928u64, "dense_params": 1_609_204_224u64, "packed_bytes": 19_525_870_752u64}})).unwrap()
+}
+
+#[test]
+fn an_inkling_cut_of_passes_or_top_k_is_validated_and_sent_as_config_only() {
+    let ins = inkling();
+    let cut = |v: serde_json::Value| -> ReshapeSpec { serde_json::from_value(json!({"source_model_id": "inkling-2-mini", "mode": "prune", "blocks": 0, "x": 0}).as_object().unwrap().iter().chain(v.as_object().unwrap()).map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>().into()).unwrap() };
+    assert!(validate(&cut(json!({"passes": 2})), &ins).is_ok() && validate(&cut(json!({"top_k": 6})), &ins).is_ok() && validate(&cut(json!({"passes": 4, "top_k": 10})), &ins).is_ok());
+    let err = |v: serde_json::Value| validate(&cut(v), &ins).unwrap_err().0;
+    assert!(err(json!({"passes": 1})).contains("fixed loop") && err(json!({})).contains("Nothing to change") && err(json!({"top_k": 99})).contains("between 1 and 32"));
+    assert!(err(json!({"passes": 2, "blocks": 1})).contains("not available") && err(json!({"passes": 9})).contains("More than 8"));
+    assert!(err(json!({"passes": 2, "mode": "grow"})).contains("Only cutting"));
+    let mut var = ins.clone();
+    var.moe.as_mut().unwrap().varloop = true;
+    assert!(validate(&cut(json!({"passes": 1})), &var).is_ok());
+    // a dense model refuses these keys, and a spec without them serializes exactly as before
+    assert!(validate(&cut(json!({"passes": 2})), &big()).unwrap_err().0.contains("mixture-of-experts"));
+    let plain = serde_json::to_value(spec(Mode::Prune, 1)).unwrap();
+    assert!(plain.get("passes").is_none() && plain.get("top_k").is_none());
+}

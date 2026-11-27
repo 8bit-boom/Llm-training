@@ -85,6 +85,18 @@ pub fn name_for_shape(src: &ModelEntry, mode: Mode, layers_after: u32, width: Op
     format!("{}-{}-{}-{layers}{tail}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&src.name), mode.word())
 }
 
+/// The name of a made mixture-of-experts model: `…-moe-p2-k6` (loop passes, experts per token).
+pub fn name_for_moe(src: &ModelEntry, spec: &ReshapeSpec) -> String {
+    let mut tail = String::new();
+    if let Some(p) = spec.passes {
+        tail += &format!("-p{p}");
+    }
+    if let Some(k) = spec.top_k {
+        tail += &format!("-k{k}");
+    }
+    format!("{}-{}-moe{tail}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), slug(&src.name))
+}
+
 /// The key of a measurement: model, data version, samples, length and the way it was loaded. The same key is the same measurement.
 pub fn scores_key(source_repo: &str, version: Option<u32>, samples: u32, len: u32, load: &str) -> String {
     scores_key_with(source_repo, version, samples, len, load, None)
@@ -172,7 +184,8 @@ pub fn inspect(m: &ModelEntry, kill: &AtomicBool, on_event: &mut dyn FnMut(Value
 /// The job the worker gets. Slimming by measuring needs a saved training-data version (the layers are measured on the project's own text).
 pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect, name: &str) -> Result<Value> {
     plan::validate(spec, ins)?;
-    let measures = spec.mode == Mode::Prune && (spec.drop_layers.is_none() || spec.width.is_some());
+    // a mixture-of-experts cut that only changes the config (loop passes, experts per token) measures nothing
+    let measures = spec.mode == Mode::Prune && (spec.drop_layers.is_none() || spec.width.is_some()) && ins.inkling().is_none();
     let version = crate::train::runs::latest_version(p).map(|(n, _)| n);
     let train = version.map(|n| p.folder.join("datasets").join(format!("v{n}")).join("train.jsonl")).filter(|f| f.is_file());
     if measures && train.is_none() {
@@ -188,6 +201,12 @@ pub fn build_job(p: &Project, m: &ModelEntry, spec: &ReshapeSpec, ins: &Inspect,
         "load": spec.load, "check": !spec.skip_check, "shard_gb": 5,
         "out": dir.join("model.partial"), "final": dir.join("model"),
     });
+    if let Some(p) = spec.passes {
+        job["passes"] = json!(p);
+    }
+    if let Some(k) = spec.top_k {
+        job["top_k"] = json!(k);
+    }
     if let Some(w) = &spec.width {
         job["width"] = json!({"intermediate_size": w.intermediate, "linear_num_value_heads": w.lin_v_heads, "num_attention_heads": w.heads});
         job["scores_dir"] = json!(scores_dir(p, &scores_key_with(&m.repo, version, samples, spec.calib_len, &spec.load, spec.reasoning.as_ref())));
@@ -242,6 +261,9 @@ impl Drop for Active {
 }
 
 fn layers_after(ins: &Inspect, spec: &ReshapeSpec) -> u32 {
+    if ins.inkling().is_some() {
+        return ins.layers;
+    }
     match (&spec.drop_layers, spec.mode) {
         (Some(d), Mode::Prune) => ins.layers.saturating_sub(d.len() as u32),
         (_, Mode::Prune) => ins.layers.saturating_sub(spec.blocks * ins.period),
@@ -262,7 +284,7 @@ pub fn execute_with_grace(p: &Project, spec: &ReshapeSpec, stop: Arc<AtomicBool>
     let ins = inspect(&m, &stop, on_event)?;
     plan::validate(spec, &ins)?;
     let depth_removed = spec.blocks > 0 || spec.drop_layers.is_some();
-    let make_name = || name_for_shape(&m, spec.mode, layers_after(&ins, spec), spec.width.as_ref(), depth_removed);
+    let make_name = || if ins.inkling().is_some() { name_for_moe(&m, spec) } else { name_for_shape(&m, spec.mode, layers_after(&ins, spec), spec.width.as_ref(), depth_removed) };
     let mut name = make_name();
     // two models made in the same second (or a folder left over) never share a folder
     let mut n = 1;
