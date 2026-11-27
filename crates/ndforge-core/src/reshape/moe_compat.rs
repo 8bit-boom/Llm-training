@@ -181,8 +181,13 @@ fn base() -> String {
 pub fn fetch_repo_state() -> Result<RepoState> {
     let url = format!("{}/api/models/{REPO}", base());
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build();
-    match agent.get(&url).set("User-Agent", "nd-lore-forge").call() {
+    let mut req = agent.get(&url).set("User-Agent", "nd-lore-forge");
+    if let Some(auth) = crate::general::hub_authorization() {
+        req = req.set("Authorization", &auth);
+    }
+    match req.call() {
         Ok(r) => Ok(repo_state(&r.into_json::<Value>().map_err(|e| Error::new(format!("Hugging Face's answer was not readable: {e}")))?)),
+        Err(ureq::Error::Status(401 | 403, _)) => Err(Error::new(crate::general::hub_refused(&format!("access to {REPO}")))),
         Err(ureq::Error::Status(code, _)) => Err(Error::new(format!("Hugging Face answered with an error ({code}) for {REPO}. Try again in a moment."))),
         Err(ureq::Error::Transport(t)) => Err(Error::new(format!("Hugging Face could not be reached. Check the internet connection. [{t}]"))),
     }

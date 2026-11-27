@@ -154,4 +154,7 @@ def result(data: dict) -> None:
 
 
 def error(code: str, message: str) -> None:
+    from . import hf_access          # a Hugging Face refusal (401 / 403 / gated) is always answered in the same plain words that point to Settings
+    if isinstance(message, str) and hf_access.SETTINGS_WORDS not in message and hf_access.is_access_error(message):
+        message = hf_access.message()
     emit("error", code=code, message=message)

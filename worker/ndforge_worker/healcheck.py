@@ -139,6 +139,10 @@ def facts_hub(repo: str) -> dict:
         cfg_path = Path(hf_hub_download(repo, "config.json"))
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except Exception as exc:                           # noqa: BLE001
+        from . import hf_access
+        if hf_access.is_access_error(exc):
+            f["error"] = hf_access.message(repo)
+            return f
         f["error"] = f"{repo} could not be read on Hugging Face ({type(exc).__name__}). Check the spelling and the internet connection; a private or gated model needs a login."
         return f
     _facts_from_config(f, cfg)

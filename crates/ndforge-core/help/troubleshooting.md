@@ -74,5 +74,8 @@ Press **Make a problem report** on the guide page to get a text with the facts b
 ## Teacher
 **The teacher keeps failing.** Test the connection first. For Ollama: the model must be downloaded (`ollama pull <name>`), the address like `http://truenas:11434`.
 
+## Hugging Face
+**"Hugging Face refused the download".** The model is gated or private, or the token is missing or not valid. Make a read token (huggingface.co/settings/tokens), save it in the **Hugging Face token** card on the Training setup page, accept the model's terms on its Hugging Face page, and try again.
+
 ## Still stuck
 Send the problem report, what you pressed and what the window said.

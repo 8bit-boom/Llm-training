@@ -43,3 +43,15 @@ test("the tokens and flags of the destructive commands are never an Option with 
   for (const [cmd, keys] of Object.entries({ storage_delete: ["ids", "dryRun", "pinned", "allowPinned"], imatrix_delete: ["id"], quantcheck_delete: ["id"], quantcheck_delete_logits: ["id"], reshape_remove: ["name"], model_remove: ["id"] }))
     for (const k of keys) assert.ok(c[cmd].find((p) => p.key === k).required, `${cmd}.${k} must be required`);
 });
+
+test("the Hugging Face token commands: `token` for the save, nothing for the clear, and the Settings card calls them with those keys", () => {
+  const c = rustCommands();
+  assert.deepEqual(c.hf_token_set.map((p) => p.key), ["token"]);
+  assert.ok(c.hf_token_set[0].required);
+  assert.deepEqual(c.hf_token_clear, []);
+  const calls = invokeCalls(js).filter((x) => x.cmd === "hf_token_set" || x.cmd === "hf_token_clear");
+  assert.ok(calls.length >= 2, "the card saves and clears with literal keys");
+  for (const x of calls) assert.deepEqual(checkArgs(x.cmd, Object.fromEntries((x.keys || []).map((k) => [k, 1]))), [], `line ${x.line}`);
+  assert.deepEqual(checkArgs("hf_token_set", { token: "hf_x" }), []);
+  assert.ok(checkArgs("hf_token_set", { hf_token: "hf_x" }).length >= 1, "a wrong key is caught");
+});

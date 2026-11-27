@@ -22,6 +22,7 @@ Start with the root [README](../README.md). The documents below describe what is
 | [TRY_FIRST.md](TRY_FIRST.md) | Trying cuts before making one |
 | [HEAL_ANY_MODEL.md](HEAL_ANY_MODEL.md), [HEAL_SETTINGS.md](HEAL_SETTINGS.md) | Healing: any model, the settings, graphics memory, the teacher cache |
 | [GENERAL_TEXT.md](GENERAL_TEXT.md) | The general text mixed into healing and the importance matrix |
+| [HF_TOKEN.md](HF_TOKEN.md) | The app-wide Hugging Face token: the Training setup card, which jobs get it, how it is kept, what a 401 / 403 says |
 | [THINKING_CHECK.md](THINKING_CHECK.md) | The thinking check, and how Stop ends everything a job started |
 | [IMATRIX.md](IMATRIX.md), [MIXED_QUANTS.md](MIXED_QUANTS.md), [QUANT_COMPARE.md](QUANT_COMPARE.md) | The GGUF export: importance matrix, mixed sizes (including the measured fit to a size), comparing sizes |
 | [PRUNE_QWEN38_27B.md](PRUNE_QWEN38_27B.md) | A worked example with the 27B model |
