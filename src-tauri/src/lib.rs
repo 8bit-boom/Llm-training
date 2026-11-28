@@ -2197,6 +2197,76 @@ fn llamacpp_check_update() -> Out<Value> {
     ndforge_core::envmgr::llamacpp::check_update(&ndforge_core::envmgr::llamacpp::Config::from_env()).map_err(|f| f.message)
 }
 
+// ------------------------------------------------------------------------------------------------------------------ the in-app updater (ndforge_core::update, docs/UPDATES.md)
+
+/// Version, the signed / checksum-only state, the saved "update available" (no network), the setting.
+#[tauri::command(async)]
+fn update_status(s: State<App>) -> Value {
+    let on = lock(&s).settings.check_updates;
+    ndforge_core::update::status(&ndforge_core::update::Config::production(), on)
+}
+
+/// Looks at the newest release. `auto` is REQUIRED: true = the check at start (only when the setting is on and 24 hours have passed; otherwise `{"skipped": true}`), false = the button (always asks).
+/// Never installs anything.
+#[tauri::command(async)]
+fn update_check(s: State<App>, auto: bool) -> Out<Value> {
+    use ndforge_core::update as up;
+    let cfg = up::Config::production();
+    let on = lock(&s).settings.check_updates;
+    match up::check_and_save(&cfg, auto, on).map_err(|f| f.message)? {
+        None => Ok(serde_json::json!({"skipped": true, "status": up::status(&cfg, on)})),
+        Some(c) => Ok(serde_json::json!({"skipped": false, "result": c.to_json(&cfg), "status": up::status(&cfg, on)})),
+    }
+}
+
+/// What the program is doing now, for the updater's refusal.
+fn update_activity(app: &tauri::AppHandle, job_running: bool) -> ndforge_core::update::install::Activity {
+    let (queue_running, queue_waiting) = queue_edit(app, |q| (q.running().map(|i| if i.label.is_empty() { i.kind.clone() } else { i.label.clone() }), if q.paused { 0 } else { q.items.iter().filter(|i| i.status == "queued").count() }));
+    ndforge_core::update::install::Activity { job_running, queue_running, queue_waiting }
+}
+
+/// Downloads the update, checks it and (only because `confirm` is true) starts the installer. `confirm` and `version` are REQUIRED: `version` is the one the person saw and must still be the newest one found.
+/// Refused with a plain message while a job, a queue run or an Auto run is active. Progress and the end come as `update-event` (kind progress | done | error). On Windows the program closes by itself a moment after `done`
+/// (action "restart"); on Linux `done` carries `action: "show_file"` and the instructions.
+#[tauri::command]
+fn update_install(app: tauri::AppHandle, tasks: State<Tasks>, confirm: bool, version: String) -> Out<()> {
+    use ndforge_core::update as up;
+    if !confirm {
+        return Err("The update was not confirmed, so nothing was installed.".into());
+    }
+    let cfg = up::Config::production();
+    let Some(update) = up::saved_update(&cfg).filter(|u| u.version == version) else {
+        return Err("That update is no longer the newest one found. Press \"Check for updates\" again.".into());
+    };
+    if let Some(why) = up::install::refusal(&update_activity(&app, tasks.busy.load(Ordering::SeqCst))) {
+        return Err(why);
+    }
+    let handle = app.clone();
+    spawn_task(app, &tasks, "update-event", move |cancel, emit| {
+        let dl = up::download(&cfg, &update, cancel, &mut |p| emit(serde_json::json!({"kind": "progress", "phase": p.phase, "done": p.done, "total": p.total}))).map_err(|f| f.message)?;
+        // the job flag is ours now; a queue run could have started in between
+        let activity = update_activity(&handle, false);
+        let out = up::install::install(&cfg, &dl, confirm, &activity, &up::install::SystemLauncher).map_err(|f| f.message)?;
+        let mut out = out;
+        out["version"] = Value::from(update.version.clone());
+        out["signed"] = Value::from(dl.signed);
+        if out["action"] == "restart" {
+            let h = handle.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                h.exit(0);
+            });
+        }
+        Ok(out)
+    })
+}
+
+/// Stops a running download.
+#[tauri::command]
+fn update_cancel(tasks: State<Tasks>) {
+    tasks.cancel.store(true, Ordering::SeqCst);
+}
+
 pub fn run() {
     // taken first, before anything reads or writes the settings folder
     let instance = ndforge_core::instance::acquire(&ndforge_core::paths::config_dir());
@@ -2249,7 +2319,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, export_restore_vision, export_model_state, export_model_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, moe_compat, moe_recommend, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, update_status, update_check, update_install, update_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, export_restore_vision, export_model_state, export_model_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, moe_compat, moe_recommend, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

@@ -194,3 +194,6 @@ p.hs-warn { color: #8a5a00; }
 .mem-pop td, .mem-pop th { text-align: left; padding: 2px 8px 2px 0; }
 .mem-pop .mem-bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 2px 0 6px; }
 .mem-pop .mem-bar > i { display: block; height: 100%; background: var(--accent, #4a7); }
+.statusbar #app-ver, .statusbar #upd-chip { flex: none; }
+.statusbar #upd-chip { font-size: 13px; font-weight: 600; color: var(--accent, #2a6fdb); }
+.statusbar #upd-chip[hidden] { display: none; }

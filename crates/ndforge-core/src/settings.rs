@@ -155,6 +155,8 @@ pub struct Settings {
     pub auto_continue_interrupted: bool,
     /// a desktop notification when a job or the queue ends (default on)
     pub notifications: bool,
+    /// look for a newer version when the program starts (at most once in 24 hours; never blocks the start) (default on)
+    pub check_updates: bool,
     /// an optional ntfy-style address that gets one line when a job ends: the kind of job and how it ended, never paths (default empty = off)
     pub webhook_url: String,
     pub ollama_servers: Vec<OllamaServer>,
@@ -186,7 +188,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true, keep_display_on: false, auto_continue_interrupted: false, notifications: true, webhook_url: String::new(),
+        Settings { expert_mode: false, show_help_panel: true, welcome_seen: false, theme: "auto".to_string(), keep_awake: true, keep_display_on: false, auto_continue_interrupted: false, notifications: true, check_updates: true, webhook_url: String::new(),
             ollama_servers: vec![OllamaServer { name: "This computer".into(), url: "http://localhost:11434".into() }], train_servers: Vec::new(), unsloth: None, studio_share: None, teacher: TeacherSettings::default(), vllm: VllmSettings::default(), teacher_batch_tokens: 16384, llama_ngl: None, try_calib_batch: 0, think_batch: 0, recent_projects: Vec::new(), load_note: None }
     }
 }

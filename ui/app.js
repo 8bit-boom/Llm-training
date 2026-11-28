@@ -2569,6 +2569,84 @@ function hfWire() {
   on("hf-token-clear", async () => { hf.text = ""; await call(() => invoke("hf_token_clear", {})); });
 }
 
+// ------------------------------------------------------------------------------------------------------ the in-app updater (docs/UPDATES.md)
+// Looks at the public GitHub releases, downloads the installer for this system, checks its checksum (and its signature when the program has a key) and starts it only after a click.
+// `check_updates` ("Check at start") is a setting; the program asks at most once in 24 hours and never waits for the answer. The footer chip shows an update found earlier.
+const upd = { st: null, res: null, checking: false, running: false, phase: "", done: 0, total: 0, error: null, result: null, loaded: false };
+function updFound() { const r = upd.res; if (r && r.state === "available" && r.update) return r.update; if (r && r.state === "up_to_date") return null; return upd.st && upd.st.update ? upd.st.update : null; }
+function updMb(n) { return (Number(n || 0) / 1e6).toFixed(1); }
+function updChip() {
+  const u = updFound(), chip = $("upd-chip"), ver = $("app-ver");
+  if (chip) { chip.hidden = !u; chip.textContent = u ? `Update available: ${u.version}` : ""; }
+  if (ver) ver.textContent = updVersion() ? `v${updVersion()}` : "";
+}
+function updVersion() { return (upd.st && upd.st.version) || (state && state.app_version) || ""; }
+async function updLoad() {
+  try { upd.st = await invoke("update_status"); } catch (_) { /* the card says what it knows */ }
+  upd.loaded = true; updChip(); if (page === "setup") render();
+  if (upd.st && upd.st.check_at_start) updCheck(true);                       // not awaited: never holds up the start
+}
+async function updCheck(auto) {
+  if (upd.checking || upd.running) return;
+  upd.checking = true; upd.error = null; upd.result = null; if (page === "setup") render();
+  try {
+    const r = await invoke("update_check", { auto });
+    if (r && r.status) upd.st = r.status;
+    if (r && !r.skipped) upd.res = r.result;
+    else if (r && r.skipped && !auto) upd.res = null;
+  } catch (e) { if (!auto) upd.error = String(e); }                            // a failed check at start is silent; the button shows the message
+  upd.checking = false; updChip(); if (page === "setup") render();
+}
+function renderUpdates() {
+  const st = upd.st, u = updFound(), r = upd.res, mode = st ? st.mode : "";
+  const modeLine = !st ? "" : `<p class="${mode === "signed" ? "ok" : "warn"} small" id="upd-mode">${esc(st.mode_text)}</p>`;
+  let status = "";
+  if (upd.checking) status = `<p class="dim" id="upd-status">Looking for a newer version…</p>`;
+  else if (upd.error) status = `<p class="err" id="upd-error">${esc(upd.error)}</p>`;
+  else if (r && r.state === "up_to_date") status = `<p class="ok" id="upd-status">You have the newest version.${r.note ? ` <span class="dim">${esc(r.note)}</span>` : ""}</p>`;
+  else if (st && st.checked_at && !u) status = `<p class="dim small" id="upd-status">Last checked ${esc(new Date(st.checked_at * 1000).toLocaleString())}. No newer version was found.</p>`;
+  const installable = u && u.name && (!r || r.installable !== false) && (!st || st.installable !== false);
+  const why = typeof jobWhy === "function" ? jobWhy() : "";
+  let banner = "";
+  if (u) {
+    const prog = upd.running ? `<div class="stepline" aria-live="polite" id="upd-phase">${esc({ checksums: "Reading the checksum list…", download: `Downloading… ${updMb(upd.done)} of ${updMb(upd.total)} MB`, verify: "Checking the checksum…", signature: "Checking the signature…" }[upd.phase] || "Starting…")}</div>
+      <progress id="upd-progress" max="${upd.total || 1}" value="${upd.total ? upd.done : 0}"></progress>` : "";
+    const res = upd.result ? `<p class="ok" id="upd-result">${esc(upd.result.text || "")}</p>` : "";
+    banner = `<div class="card" id="upd-banner"><h3>Version ${esc(u.version)} is available${u.size ? ` <span class="dim small">(${updMb(u.size)} MB)</span>` : ""}</h3>
+      ${u.notes ? `<pre class="log" id="upd-notes" style="max-height:220px;overflow:auto;white-space:pre-wrap">${esc(u.notes)}</pre>` : `<p class="dim small">The release has no notes.</p>`}
+      ${installable ? `<div class="row"><button class="primary" id="upd-install" ${upd.running ? "disabled" : ""}>Download and install</button>${upd.running ? ` <button class="secondary" id="upd-cancel">Cancel</button>` : ""}</div>
+        ${why && !upd.running ? `<p class="warn small" id="upd-why">Not now: ${esc(why)}. The update is refused while a job or a queue run is active; wait for it or stop it first.</p>` : ""}
+        <p class="dim small">Nothing is installed without this click. ${(st && st.os) === "windows" ? "The program closes, the installer replaces it, and it starts again; your projects and settings stay." : "On Linux the new file is only saved and shown; you start it yourself."} If anything fails, the version you have now stays as it is.</p>`
+        : `<p class="warn small" id="upd-problem">${esc((r && r.problem) || (st && st.installable === false ? "This program cannot install updates by itself here (see the mode note above)." : "This release has no installer for this system."))} ${u.html_url ? `<a href="${esc(u.html_url)}" target="_blank" rel="noopener">Release page</a>` : ""}</p>`}
+      ${prog}${res}</div>`;
+  }
+  return `<div class="card wide" id="upd-card"><h2>Updates <span class="dim small" id="upd-version">version ${esc(updVersion() || "?")}</span></h2>
+    <div class="row"><button class="secondary" id="upd-check" ${upd.checking || upd.running ? "disabled" : ""}>Check for updates</button>
+      <label class="opt"><input type="checkbox" id="upd-auto" ${state && state.settings && state.settings.check_updates === false ? "" : "checked"}> Check at start (at most once a day)</label></div>
+    ${modeLine}${status}${banner}
+    <p class="dim small">Updates come from this program's public releases on GitHub (nothing about you or your files is sent). To go back to the previous version, run its installer again (docs/UPDATES.md).</p></div>`;
+}
+function onUpdateEvent(p) {
+  if (p.kind === "progress") { upd.phase = p.phase; upd.done = p.done; upd.total = p.total; }
+  else if (p.kind === "done") { upd.running = false; upd.result = p.data || {}; upd.error = null; }
+  else if (p.kind === "error") { upd.running = false; upd.error = p.text; }
+  if (page === "setup") render();
+}
+function updWire() {
+  const on = (x, fn) => { const el = $(x); if (el) el.onclick = fn; };
+  on("upd-check", () => updCheck(false));
+  const au = $("upd-auto"); if (au) au.onchange = async () => { try { setState(await invoke("set_setting", { key: "check_updates", value: au.checked })); if (upd.st) upd.st.check_at_start = au.checked; } catch (e) { upd.error = String(e); } render(); };
+  on("upd-cancel", () => invoke("update_cancel"));
+  on("upd-install", async () => {
+    const u = updFound(); if (!u || upd.running) return;
+    const where = (upd.st && upd.st.os) === "windows" ? "ND Lore Forge will close, the installer will replace it and it will start again." : "The new file will be saved and shown; you start it yourself.";
+    if (!confirm(`Download and install version ${u.version}? ${where}`)) return;
+    upd.running = true; upd.error = null; upd.result = null; upd.phase = ""; upd.done = 0; upd.total = 0; render();
+    try { await invoke("update_install", { confirm: true, version: u.version }); }
+    catch (e) { upd.running = false; upd.error = String(e); render(); }       // refused at once (a job runs ...): the reason is plain text
+  });
+}
+
 function renderSetup() {
   const st = env.status;
   const checks = st ? st.checks.map((c) => `<li class="check lt-${c.light}"><span class="lamp">${LIGHT[c.light]}</span><div><strong>${esc(c.label)}</strong><div class="detail">${esc(c.detail)}</div>${c.fix ? `<div class="fix">${esc(c.fix)}</div>` : ""}</div></li>`).join("") : "<li>Checking…</li>";
@@ -2590,6 +2668,7 @@ function renderSetup() {
     ${env.progress != null ? `<progress max="1" value="${env.progress}"></progress>` : ""}
     ${env.error ? `<div class="err">${esc(env.error)}</div>` : ""}${result}
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
+    ${renderUpdates()}
     ${renderHfToken()}
     ${renderTimeCard()}
     ${renderLlamaSection()}
@@ -5185,6 +5264,7 @@ function render() {
   const el = $("page");
   el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "tune" ? renderTune() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
+  updChip();
   applyTheme();
   $("expert").checked = state.settings.expert_mode;
   $("helptoggle").checked = state.settings.show_help_panel;
@@ -5232,6 +5312,7 @@ function wire() {
   on("selftest", () => startEnv("env_selftest"));
   on("tm-load", () => tmLoad());
   hfWire();
+  updWire();
   on("kernels", () => startEnv("env_install_kernels"));
   on("cancelenv", () => invoke("env_cancel"));
   on("apply", applyFile);
@@ -5397,6 +5478,9 @@ async function init() {
   try { await tauri.event.listen("queue-event", () => quLoad()); } catch (_) { /* previews */ }
   quLoad();
   memPoll();
+  try { await tauri.event.listen("update-event", (e) => onUpdateEvent(e.payload)); } catch (_) { /* previews */ }
+  try { const c = document.getElementById("upd-chip"); if (c) c.onclick = () => go("setup"); } catch (_) { /* a preview */ }
+  updLoad();
   try { await tauri.event.listen("env-event", (e) => onEnvEvent(e.payload)); } catch (_) { /* events are optional in previews */ }
   for (const ch of STALL_CHANNELS) { try { await tauri.event.listen(ch, (e) => onStallEvent(e.payload)); } catch (_) { /* previews */ } }
   go("welcome");

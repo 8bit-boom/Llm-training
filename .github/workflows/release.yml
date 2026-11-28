@@ -8,7 +8,16 @@ on:
 permissions:
   contents: write
 jobs:
+  # The tag must be v<version of Cargo.toml> (the one place the version lives); a run by hand has no tag and only checks the files against each other.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: python3 scripts/check_release_version.py "$TAG"
   linux:
+    needs: [version]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +29,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: linux, path: "dist/ND-Lore-Forge-*" }
   windows:
+    needs: [version]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +62,21 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
+      # Signatures for the in-app updater (docs/UPDATES.md): ed25519, one <installer>.sig per installer, made with the secret UPDATE_SIGNING_KEY (base64 of the private seed from scripts/make_update_key.py).
+      # Without the secret nothing is signed and a note says so (the program then installs only after a checksum check). The key is read from the environment and never printed.
+      - name: Sign the installers for the updater
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -eu
+          mkdir -p out/sigs
+          if [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "unsigned for the updater" > out/UNSIGNED-UPDATES.txt
+            echo "No UPDATE_SIGNING_KEY secret: the installers get no .sig files."
+            exit 0
+          fi
+          pip install --quiet cryptography
+          python3 scripts/sign_update.py --outdir out/sigs $(find artifacts/windows artifacts/linux -type f \( -name 'ND-Lore-Forge-Setup-*.exe' -o -name 'ND-Lore-Forge-*.AppImage' \) -print)
       - name: Checksums and changes
         run: |
           set -eu
@@ -61,6 +86,7 @@ jobs:
           range=${prev:+$prev..}HEAD
           { echo "## Changes${prev:+ since $prev}"; echo; git log --pretty='- %s' $range | head -200; echo;
             if [ -f artifacts/windows/UNSIGNED.txt ]; then echo "The Windows installer is **not signed** (no certificate is set up yet): Windows may warn when you start it. Compare it with SHA256SUMS.txt."; fi;
+            if [ -f out/UNSIGNED-UPDATES.txt ]; then echo "The installers have **no update signature** (the secret UPDATE_SIGNING_KEY is not set): the in-app updater can only check the checksum."; fi;
             echo; echo "SHA256 of the files: see SHA256SUMS.txt."; } > out/NOTES.md
           { cat out/NOTES.md; echo; echo '```'; cat out/SHA256SUMS.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -78,4 +104,5 @@ jobs:
             artifacts/linux/**
             artifacts/windows/ND-Lore-Forge-Setup-*.exe
             artifacts/notes/SHA256SUMS.txt
+            artifacts/notes/sigs/*.sig
           body_path: artifacts/notes/NOTES.md
