@@ -29,7 +29,7 @@ pub enum Event {
 const TOTAL: usize = 5;
 
 /// The libraries the plain Transformers + PEFT + TRL fallback needs (what Unsloth would otherwise bring along).
-const FALLBACK_LIBS: [&str; 6] = ["transformers>=5", "trl", "peft", "datasets", "accelerate", "bitsandbytes"];
+const FALLBACK_LIBS: [&str; 6] = ["transformers>=5.24.0,<6", "trl", "peft", "datasets", "accelerate", "bitsandbytes"];
 
 /// The fast kernels of Qwen3.5's linear-attention layers, each tried on its own on both paths (with and without Unsloth): a failure never fails the install.
 /// triton-windows: the Triton they need, which PyTorch does not ship for Windows; flash-linear-attention: the delta-rule kernels (the big speed-up);
