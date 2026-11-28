@@ -72,7 +72,7 @@ calls the same `FastLanguageModel.reap_prune` Studio uses.
 | F8 | llama.cpp maps `mtp.layers.0.*` to layer index `num_hidden_layers` (nextn); if `mtp_num_hidden_layers == 0` and no MTP tensors are found, the converter asserts unless `--no-mtp` → **keep the MTP tensors and `mtp_num_hidden_layers` unchanged** | `conversion/qwen.py` `_QwenMtpMixin` |
 | F9 | Unknown layer counts load in llama.cpp as `LLM_TYPE_UNKNOWN` (a label only) | `src/models/qwen35.cpp` 25–30 |
 | F10 | `huggingface_hub.HfApi.get_safetensors_metadata(repo)` returns every tensor's dtype/shape without downloading weights | `huggingface_hub/hf_api.py:6669`, `utils/_safetensors.py` |
-| F11 | The worker env has `transformers>=5, trl, peft, datasets, accelerate, bitsandbytes` (+ Unsloth optional) | `crates/ndforge-core/src/envmgr/setup.rs:32` |
+| F11 | The worker env has `transformers>=5.24.0,<6, trl, peft, datasets, accelerate, bitsandbytes` (+ Unsloth optional) | `crates/ndforge-core/src/envmgr/setup.rs:32` |
 | F12 | CI runs worker tests with CPU torch + transformers ≥ 5 + accelerate; this sandbox has only numpy + pytest (no torch, transformers, safetensors) | `.github/workflows/ci.yml:47-49`; `pip list` here |
 | F13 | A local model folder is accepted as a base: `hub::lookup` → `lookup_local` → `describe_folder` (config, chat template, file sizes, README licence) → catalog entry saved in `custom_models.json`; params estimated from file size /2 with a warning | `crates/ndforge-core/src/train/hub.rs` |
 | F14 | Export: for a local base, `vision.fetch_mmproj` finds no `-GGUF` repo (`gguf_repo_candidates` returns `[]` for a dir) and falls back to `convert_hf_to_gguf.py --mmproj` on the base folder | `worker/ndforge_worker/exportjob.py` `run()`, `vision.py` |
