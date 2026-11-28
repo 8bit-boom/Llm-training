@@ -40,7 +40,7 @@ test("the checker catches the two mistakes that happened", () => {
 
 test("the tokens and flags of the destructive commands are never an Option with a permissive default", () => {
   const c = rustCommands();
-  for (const [cmd, keys] of Object.entries({ storage_delete: ["ids", "dryRun", "pinned", "allowPinned"], imatrix_delete: ["id"], quantcheck_delete: ["id"], quantcheck_delete_logits: ["id"], reshape_remove: ["name"], model_remove: ["id"] }))
+  for (const [cmd, keys] of Object.entries({ storage_delete: ["ids", "dryRun", "pinned", "allowPinned"], imatrix_delete: ["id"], quantcheck_delete: ["id"], quantcheck_delete_logits: ["id"], reshape_remove: ["name"], model_remove: ["id"], transformers_upgrade_start: ["confirm"], transformers_rollback_start: ["confirm", "version"] }))
     for (const k of keys) assert.ok(c[cmd].find((p) => p.key === k).required, `${cmd}.${k} must be required`);
 });
 
@@ -54,4 +54,14 @@ test("the Hugging Face token commands: `token` for the save, nothing for the cle
   for (const x of calls) assert.deepEqual(checkArgs(x.cmd, Object.fromEntries((x.keys || []).map((k) => [k, 1]))), [], `line ${x.line}`);
   assert.deepEqual(checkArgs("hf_token_set", { token: "hf_x" }), []);
   assert.ok(checkArgs("hf_token_set", { hf_token: "hf_x" }).length >= 1, "a wrong key is caught");
+});
+
+test("Upgrade transformers: confirm is a required bool (a mis-spelled or missing key is an error, not a silent install), and app.js calls it with the right keys", () => {
+  const c = rustCommands();
+  assert.deepEqual(c.transformers_upgrade_start.map((p) => p.key), ["confirm"]);
+  assert.ok(checkArgs("transformers_upgrade_start", { confirmed: true }).length >= 1 && checkArgs("transformers_upgrade_start", {}).length >= 1);
+  assert.ok(checkArgs("transformers_rollback_start", { confirm: true }).length >= 1, "the version is required too");
+  const calls = invokeCalls(js).filter((x) => x.cmd.startsWith("transformers_"));
+  assert.deepEqual(calls.map((x) => x.cmd).sort(), ["transformers_rollback_start", "transformers_upgrade_plan", "transformers_upgrade_plan", "transformers_upgrade_start"]);
+  for (const x of calls) assert.deepEqual(checkArgs(x.cmd, Object.fromEntries((x.keys || []).map((k) => [k, 1]))), [], `line ${x.line}`);
 });

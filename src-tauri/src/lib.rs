@@ -1837,6 +1837,40 @@ fn env_selftest(app: tauri::AppHandle, tasks: State<Tasks>) -> Out<()> {
 }
 
 
+// ------------------------------------------------------------------------------------------------------------------ Upgrade transformers (docs/TRANSFORMERS_UPGRADE.md)
+
+/// What "Upgrade transformers" would do, for the confirmation: the package, the target, the environment's Python, the installed version, what the program keeps (changes nothing).
+#[tauri::command(async)]
+fn transformers_upgrade_plan() -> Value {
+    ndforge_core::envmgr::transformers_upgrade::plan_view(&ndforge_core::envmgr::transformers_upgrade::Upgrade::production())
+}
+
+/// Upgrades transformers in the program's own environment. `confirm` is REQUIRED (true only after the person saw the plan). Refused while a job, a queue run or an Auto run is active.
+/// Progress and the end come as `env-event` (tagged task "transformers"); Cancel is `env_cancel`.
+#[tauri::command]
+fn transformers_upgrade_start(app: tauri::AppHandle, tasks: State<Tasks>, confirm: bool) -> Out<()> {
+    use ndforge_core::envmgr::transformers_upgrade as tu;
+    tu::check_start(confirm, &update_activity(&app, tasks.busy.load(Ordering::SeqCst))).map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    spawn_task(app, &tasks, "env-event", move |cancel, emit| {
+        let activity = || update_activity(&handle, false);
+        tu::run_upgrade(&tu::Upgrade::production(), confirm, &activity, cancel, emit).map_err(|e| e.to_string())
+    })
+}
+
+/// "Go back to <version>": installs the version the record holds. `confirm` and `version` (the one on the button) are REQUIRED.
+#[tauri::command]
+fn transformers_rollback_start(app: tauri::AppHandle, tasks: State<Tasks>, confirm: bool, version: String) -> Out<()> {
+    use ndforge_core::envmgr::transformers_upgrade as tu;
+    tu::check_start(confirm, &update_activity(&app, tasks.busy.load(Ordering::SeqCst))).map_err(|e| e.to_string())?;
+    let handle = app.clone();
+    spawn_task(app, &tasks, "env-event", move |cancel, emit| {
+        let activity = || update_activity(&handle, false);
+        tu::run_rollback(&tu::Upgrade::production(), confirm, &version, &activity, cancel, emit).map_err(|e| e.to_string())
+    })
+}
+
+
 // ------------------------------------------------------------------------------------------------------------------ Tune: tested settings and presets (ndforge_core::tune, docs/TUNE.md)
 
 fn tune_project(s: &State<App>) -> Out<ndforge_core::project::Project> {
@@ -2319,7 +2353,7 @@ pub fn run() {
         .manage(App(Mutex::new(AppModel::load())))
         .manage(Tasks::default())
         .manage(ScanTasks::default())
-        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, update_status, update_check, update_install, update_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, export_restore_vision, export_model_state, export_model_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, moe_compat, moe_recommend, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
+        .invoke_handler(tauri::generate_handler![get_state, preflight, diagnostics_save, timing_report, webhook_set, queue_list, queue_add, queue_remove, queue_move, queue_pause, queue_clear_finished, create_project, open_project, remove_world, check_bundle, apply_bundle, set_setting, set_theme, help, env_status, env_install, env_install_kernels, env_selftest, env_cancel, transformers_upgrade_plan, transformers_upgrade_start, transformers_rollback_start, llamacpp_status, llamacpp_plan, llamacpp_install, llamacpp_cancel, llamacpp_remove, llamacpp_check_update, update_status, update_check, update_install, update_cancel, dataset_state, dataset_generate, bench_start, bench_last, model_lookup, model_add, model_remove, problem_report, test_state, test_result, test_start, test_ask, test_save_transcript, teacher_set, teacher_check, teacher_start, teacher_clear, dataset_examples, dataset_set_status, dataset_set_status_matching, dataset_edit, dataset_save, studio_export, train_state, train_plan, train_start, set_shutdown_after, cancel_shutdown, train_stop, train_metrics, train_server_add, train_server_remove, train_server_check, unsloth_set, unsloth_remove, unsloth_check, export_state, export_start, export_restore_vision, export_model_state, export_model_start, mixed_plan, imatrix_list, imatrix_create, imatrix_stop, imatrix_import, imatrix_save_copy, imatrix_open_folder, imatrix_make_dat, imatrix_delete, imatrix_check, imatrix_merge, imatrix_published, imatrix_adapt_preview, imatrix_adapt, quantcheck_state, quantcheck_plan, quantcheck_start, quantcheck_stop, quantcheck_get, quantcheck_delete, quantcheck_delete_logits, quantfit_state, quantfit_estimate, quantfit_start, quantfit_stop, copy_adapter, ollama_install, ollama_probe, ollama_check, ollama_server_add, ollama_server_remove, retrain_info, retrain_start, reshape_state, reshape_options, moe_compat, moe_recommend, reshape_measurement, reshape_measure, reshape_start, reshape_stop, reshape_test, reshape_remove, heal_options, heal_estimate, heal_start, heal_bench_start, heal_bench_last, heal_speed_start, heal_speed_report, heal_candidates, heal_check, heal_pair, heal_pair_estimate, heal_source_start, heal_stop, general_state, general_choose, general_add, general_remove, general_ack, general_check, hf_token_set, hf_token_clear, reshape_try_plan, reshape_try_results, reshape_try_start, reshape_search_plan, reshape_search_start, reshape_search_status, think_check_results, think_check_plan, think_check_start, vllm_status, vllm_set, vllm_selftest_start, vllm_container_probe_start, vllm_selftest_report, vllm_selftest_files, vllm_teacher_check_start, trace_gen_state, trace_gen_start, auto_plan, auto_start, auto_change_preview, auto_stop, auto_status, auto_report, studio_share_set, studio_share_check, storage_scan, storage_delete, storage_cancel, memory_status, memory_free_plan, memory_free, tune_presets, tune_preset_save, tune_preset_rename, tune_preset_duplicate, tune_preset_delete, tune_preset_export, tune_preset_import, tune_apply_preview, tune_apply, tune_plan, tune_start, tune_continue, tune_stop, tune_state, tune_runs, tune_presets_here, tune_snapshot])
         .run(tauri::generate_context!())
         .expect("error while running ND Lore Forge");
 }

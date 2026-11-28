@@ -11,7 +11,7 @@ A mixture-of-experts model has many small feed-forward blocks, the **experts**, 
 - **Whole blocks** of 6 layers (expert mode): a quarter of the model per block, very risky.
 
 ## Software it needs
-The page lists what is installed and what is missing: transformers 5.24 or newer (for measuring, trying, healing and training), llama.cpp b12611 or newer (an older one gives garbage after the first loop pass), vLLM 0.35 or the nightly image (only for a fast teacher; the program falls back to its own slower one). Upgrading transformers only adds the model; Qwen and Gemma keep working. A button asks Hugging Face whether the model's files changed since the program was tested.
+The page lists what is installed and what is missing: transformers 5.24 or newer (for measuring, trying, healing and training), llama.cpp b12611 or newer (an older one gives garbage after the first loop pass), vLLM 0.35 or the nightly image (only for a fast teacher; the program falls back to its own slower one). Upgrading transformers only adds the model; Qwen and Gemma keep working. The button **Upgrade transformers** (also **Update** in the card "Python packages" on the Training setup page) does it for you: it shows what it will do, waits for **Confirm**, keeps PyTorch as it is, and puts the old version back by itself if anything fails. **Go back to ...** installs the earlier version again. It is refused while a job, a queue run or an Auto run is active. A button asks Hugging Face whether the model's files changed since the program was tested.
 
 ## Order of work on a 32 GB card
 1. Decide the goal: smaller file, faster answers, or teaching it your world (then train the uncut model and do not cut).

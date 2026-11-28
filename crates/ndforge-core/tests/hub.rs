@@ -115,7 +115,7 @@ fn inkling_in_its_packed_format_is_accepted_and_gets_its_own_family() {
     let spec = spec_for("inkling2", 8192);
     assert!(spec.template.is_empty() && spec.stop.is_empty());
     let mf = modelfile_text("m-q4_k_m.gguf", &spec, Some("mmproj.gguf"));
-    assert!(mf.contains("PARAMETER temperature 1") && mf.contains("PARAMETER top_p 1") && !mf.contains("TEMPLATE") && !mf.contains("top_k"), "{mf}");
+    assert!(mf.contains("PARAMETER temperature 1") && mf.contains("PARAMETER top_p 1") && !mf.contains("TEMPLATE") && mf.contains("PARAMETER top_k 0"), "{mf}");
     let m = find("inkling-2-mini").unwrap();
     assert_eq!((m.family.as_str(), m.repo.as_str(), m.params_b, m.vram_qlora_gb), ("inkling2", "thinkingmachines/Inkling-2-Mini", 26.39, 22.0));
 }

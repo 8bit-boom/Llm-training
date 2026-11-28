@@ -8,6 +8,7 @@ pub mod llamacpp;
 pub mod process;
 pub mod setup;
 pub mod tasks;
+pub mod transformers_upgrade;
 
 
 use std::path::{Path, PathBuf};
