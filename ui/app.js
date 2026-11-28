@@ -1839,7 +1839,9 @@ function fixActions(text) {
   if (typeof text !== "string") return { text, html: "" };
   const codes = [];
   const shown = text.replace(FIX_RE, (_, c) => { codes.push(c); return ""; }).trim();
-  const btns = [...new Set(codes)].flatMap((c) => FIX_BUTTONS[c] || []).map(([act, label]) => `<button class="secondary" data-fix="${act}">${esc(label)}</button>`).join(" ");
+  let btns = [...new Set(codes)].flatMap((c) => FIX_BUTTONS[c] || []).map(([act, label]) => `<button class="secondary" data-fix="${act}">${esc(label)}</button>`).join(" ");
+  // the worker's "needs the training software updated: transformers 5.24.0 or newer" (inkling_load.py): the upgrade is one click away (it asks to be confirmed first)
+  if (/needs the training software updated: transformers/i.test(shown)) btns = (btns ? btns + " " : "") + `<button class="secondary" data-fix="tf_upgrade">Upgrade transformers</button>`;
   return { text: shown, html: btns ? `<div class="row fix-row">${btns}</div>` : "" };
 }
 // `<div class="err">…</div>` for a worker error, with its buttons (tag: "div" or "p")
@@ -1860,6 +1862,7 @@ async function fixDo(act) {
       if (rs.hl && rs.hl.name) await rsLoadHeal(rs.hl.name);
       if (healUseSafer()) { render(); rsHealEstimate(); } else render();
     } else if (act === "repair") { await go("setup"); startEnv("env_install", { unsloth: !env.noUnsloth }); }
+    else if (act === "tf_upgrade") await tfAsk("upgrade");
   } catch (e) { alert(String(e)); }
 }
 const LC_WHY = { all: "It is needed to make GGUF files with llama.cpp (the importance matrix, the mixed sizes).", imatrix: "It is needed to measure an importance matrix.", perplexity: "Compare quants needs its llama-perplexity program.", merge: "Merging matrices needs its llama-imatrix program." };
@@ -2670,6 +2673,7 @@ function renderSetup() {
     ${env.log.length ? `<pre class="log" id="log">${log}</pre>` : ""}
     ${renderUpdates()}
     ${renderHfToken()}
+    ${renderPyPackages()}
     ${renderTimeCard()}
     ${renderLlamaSection()}
     ${renderVllm()}
@@ -2678,6 +2682,7 @@ function renderSetup() {
 
 async function refreshEnv() {
   env.status = await invoke("env_status");
+  tfLoad();
   if (page === "setup") render();
 }
 
@@ -2688,6 +2693,7 @@ async function startEnv(cmd, args) {
 }
 
 function onEnvEvent(p) {
+  if (p.task === "transformers" || (p.data && p.data.task === "transformers") || tf.running) { onTfEvent(p); return; }
   if (p.task === "llamacpp" || (p.data && p.data.task === "llamacpp") || (lc.running && (p.kind === "done" || p.kind === "error" || p.kind === "log" || p.kind === "step" || p.kind === "progress"))) { onLlamaEvent(p); return; }
   if (p.kind === "log") env.log.push(p.text);
   else if (p.kind === "step") { env.step = `Step ${p.index} of ${p.total}: ${p.text}`; env.progress = (p.index - 1) / p.total; }
@@ -5262,7 +5268,7 @@ function render() {
   if (!state) return;
   renderSteps();
   const el = $("page");
-  el.innerHTML = page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "tune" ? renderTune() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page);
+  el.innerHTML = tfDialogHtml() + (page === "welcome" ? renderWelcome() : page === "data" ? renderData() : page === "setup" ? renderSetup() : page === "dataset" ? renderDataset() : page === "train" ? renderTrain() : page === "storage" ? renderStorage() : page === "tune" ? renderTune() : page === "auto" ? renderAuto() : page === "reshape" ? renderReshape() : page === "use" ? renderUse() : page === "imatrix" ? renderImatrix() : page === "quantcheck" ? renderQuantcheck() : page === "test" ? renderTest() : page === "guide" ? renderGuide() : renderSoon(page));
   $("status").textContent = state.project ? `Project: ${state.project.name}  (${state.project.folder})` : "No project open";
   updChip();
   applyTheme();
@@ -5284,6 +5290,7 @@ function wire() {
   document.querySelectorAll(".recent button").forEach((b) => b.onclick = () => openProject(b.dataset.folder));
   document.querySelectorAll("[data-fix]").forEach((b) => b.onclick = () => fixDo(b.dataset.fix));
   wireQueue();
+  wireTf();
   const kd = $("keep-display"); if (kd) kd.onchange = async () => { try { setState(await invoke("set_setting", { key: "keep_display_on", value: kd.checked })); } catch (e) { alert(String(e)); } };
   const nf = $("notify-on"); if (nf) nf.onchange = async () => { try { setState(await invoke("set_setting", { key: "notifications", value: nf.checked })); } catch (e) { alert(String(e)); } };
   const wh = $("webhook-save"); if (wh) wh.onclick = async () => { try { setState(await invoke("webhook_set", { url: ($("webhook-url") || {}).value || "" })); } catch (e) { alert(String(e)); } };
@@ -5566,7 +5573,7 @@ function moeSize(b) { return b ? (b / 1e9).toFixed(1) + " GB" : "?"; }
 function moeCompatHtml() {
   const c = moe.compat; if (!c) return moe.loading ? `<p class="dim">Checking the installed software…</p>` : "";
   const rows = (c.findings || []).map((f) => `<li class="pf-${f.status === "ok" ? "ok" : f.status === "too_old" ? "fail" : "warn"}"><strong>${esc(f.tool)}</strong> ${esc(f.have || "not known")} <span class="dim">(needs ${esc(f.need)})</span> — ${esc(f.message)}
-    ${f.fix ? `<div class="small">${esc(f.fix)}</div>` : ""}${f.command ? `<div class="small"><code>${esc(f.command)}</code>${f.rollback ? ` <span class="dim">to go back: <code>${esc(f.rollback)}</code></span>` : ""}</div>` : ""}</li>`).join("");
+    ${f.fix ? `<div class="small">${esc(f.fix)}</div>` : ""}${f.command ? `<div class="small"><code>${esc(f.command)}</code>${f.rollback ? ` <span class="dim">to go back: <code>${esc(f.rollback)}</code></span>` : ""}</div>` : ""}${tfButtons(f)}</li>`).join("");
   const repo = moe.repo ? `<p class="${moe.repo.changed ? "warn" : "dim"} small">${esc(moe.repo.message)}</p>` : "";
   return `<div class="pf ${c.summary ? "pf-bad" : ""}"><div class="small dim">Software this model needs</div><ul>${rows}</ul>${c.summary ? `<div class="warn">${esc(c.summary)}</div>` : ""}</div>${repo}`;
 }
@@ -5699,4 +5706,117 @@ function wireAcMoe() {
   on("ac-moe-topk", () => { ac.moe.topK = $("ac-moe-topk").value; acRefresh(); render(); });
   on("ac-moe-scoring", () => { ac.moe.scoring = $("ac-moe-scoring").value; acRefresh(); render(); });
   on("ac-moe-rebalance", () => { ac.moe.rebalance = $("ac-moe-rebalance").checked; acRefresh(); render(); });
+}
+
+
+// ----------------------------------------------------------------------------------------------------------------- Upgrade transformers (docs/TRANSFORMERS_UPGRADE.md)
+// One confirmation dialog for the whole action (what it will do -> progress with Cancel -> the result). It is opened from the Slim page's software check, from the failure message of a job that needs
+// a newer transformers, and from the "Python packages" card on the Training setup page. Nothing is installed before the person presses "Confirm" in the dialog (`confirm: true` is required by the command).
+let tf = { info: null, open: false, mode: "upgrade", stage: "confirm", plan: null, running: false, step: "", progress: null, log: [], result: null, error: null };
+
+async function tfLoad() {
+  try { tf.info = await invoke("transformers_upgrade_plan"); } catch (_) { tf.info = null; }
+  try { if (page === "setup" || onReshape()) render(); } catch (_) { /* a preview without a window */ }
+}
+
+function tfButtons(f) {
+  if (f.tool !== "transformers") return "";
+  const i = tf.info || {}, off = tf.running || env.running ? "disabled" : "";
+  const up = f.status === "too_old" ? `<button class="primary" id="tf-upgrade" ${off}>Upgrade transformers</button>` : "";
+  const back = i.can_go_back ? `<button class="secondary" id="tf-back" ${off}>Go back to ${esc(i.previous)}</button>` : "";
+  return up || back ? `<div class="row">${up}${back}</div>` : "";
+}
+
+function renderPyPackages() {
+  const i = tf.info;
+  if (!i) return `<div class="card wide" id="tf-card"><h2>Python packages</h2><p class="dim">Looking at the training environment…</p></div>`;
+  const off = tf.running || env.running ? "disabled" : "";
+  const state = i.current == null ? `<span class="warn">not found</span>` : i.needed ? `<span class="warn">older than needed</span>` : `<span class="ok">new enough</span>`;
+  return `<div class="card wide" id="tf-card"><h2>Python packages</h2>
+    <table class="small"><tr><td>transformers installed</td><td><strong>${esc(i.current || "not found")}</strong></td></tr>
+    <tr><td>transformers needed</td><td><strong>${esc(i.min)}</strong> or newer <span class="dim">(Inkling-2-Mini; Qwen and Gemma need less and keep working)</span></td></tr>
+    <tr><td>state</td><td>${state}</td></tr></table>
+    ${i.problem ? `<p class="warn small">${esc(i.problem)}</p>` : ""}
+    <div class="row"><button class="primary" id="tf-update" ${off || !i.ready || !i.needed ? "disabled" : ""}>Update</button>
+      ${i.can_go_back ? `<button class="secondary" id="tf-back2" ${off}>Go back to ${esc(i.previous)}</button>` : ""}
+      <button class="secondary" id="tf-refresh" ${off}>Check again</button></div>
+    <p class="dim small">Update installs ${esc(i.target)} into the program's own environment after you confirm what it will do; it keeps PyTorch, and puts the old version back by itself if anything fails. No account or key is needed.</p></div>`;
+}
+
+async function tfAsk(mode) {
+  tf.open = true; tf.mode = mode; tf.stage = "confirm"; tf.plan = null; tf.error = null; tf.result = null; tf.log = []; tf.step = ""; tf.progress = null;
+  render();
+  try { tf.plan = await invoke("transformers_upgrade_plan"); } catch (e) { tf.error = String(e); }
+  tf.info = tf.plan || tf.info;
+  render();
+}
+
+async function tfConfirm() {
+  const p = tf.plan; if (!p || tf.running) return;
+  tf.running = true; tf.stage = "running"; tf.error = null; tf.log = []; tf.step = "Starting…"; tf.progress = null; render();
+  try {
+    if (tf.mode === "back") await invoke("transformers_rollback_start", { confirm: true, version: p.previous });
+    else await invoke("transformers_upgrade_start", { confirm: true });
+  } catch (e) { tf.running = false; tf.stage = "result"; tf.error = String(e); render(); }
+}
+
+function onTfEvent(p) {
+  if (p.kind === "log") tf.log.push(p.text);
+  else if (p.kind === "step") { tf.step = `Step ${p.index} of ${p.total}: ${p.text}`; tf.progress = (p.index - 1) / p.total; }
+  else if (p.kind === "progress") { tf.step = p.text || p.step; tf.progress = p.value; }
+  else if (p.kind === "done") { tf.running = false; tf.stage = "result"; tf.result = p.data || {}; tf.progress = null; tfAfter(); }
+  else if (p.kind === "error") { tf.running = false; tf.stage = "result"; tf.error = p.text; tf.progress = null; tfAfter(); }
+  render();
+  const l = $("tf-log"); if (l) l.scrollTop = l.scrollHeight;
+}
+
+// the pages show the new state: the plan (versions), the software check of the Slim page, the setup checklist
+function tfAfter() {
+  tfLoad();
+  try { if (moeOn()) moeLoad(false); } catch (_) { /* not on that page */ }
+  try { refreshEnv(); } catch (_) { /* a preview */ }
+}
+
+function tfDialogHtml() {
+  if (!tf.open) return "";
+  const p = tf.plan, back = tf.mode === "back";
+  const title = back ? `Go back to transformers ${esc((p && p.previous) || "")}` : "Upgrade transformers";
+  let body = "";
+  if (tf.stage === "confirm") {
+    const can = p && p.ready && (back ? p.can_go_back : p.needed !== false);
+    const facts = p ? (back
+      ? `<table class="small"><tr><td>Package</td><td>${esc(p.package)}</td></tr><tr><td>Installs</td><td><code>${esc(p.go_back_to || "")}</code></td></tr><tr><td>Python</td><td><code>${esc(p.python)}</code></td></tr><tr><td>Installed now</td><td>${esc(p.current || "not found")}</td></tr></table>
+         <p>This puts the version that was installed before the last upgrade back, into the program's own training environment. Inkling-2-Mini needs ${esc(p.min)} or newer, so it will say so again.</p>`
+      : `<table class="small"><tr><td>Package</td><td>${esc(p.package)}</td></tr><tr><td>Target</td><td><code>${esc(p.target)}</code></td></tr><tr><td>Python</td><td><code>${esc(p.python)}</code></td></tr><tr><td>Installed now</td><td>${esc(p.current || "not found")}</td></tr></table>
+         <ul>${(p.will_do || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`) : `<p class="dim">Looking at the environment…</p>`;
+    body = `${facts}${p && p.problem ? `<div class="err">${esc(p.problem)}</div>` : ""}${p && !back && p.needed === false ? `<p class="ok">transformers ${esc(p.current)} is already new enough.</p>` : ""}${tf.error ? `<div class="err">${esc(tf.error)}</div>` : ""}
+      <div class="row"><button class="primary" id="tf-confirm" ${can ? "" : "disabled"}>Confirm</button><button class="secondary" id="tf-dismiss">Not now</button></div>`;
+  } else if (tf.stage === "running") {
+    body = `<div class="stepline" aria-live="polite">${esc(tf.step)}</div>${tf.progress != null ? `<progress max="1" value="${tf.progress}"></progress>` : ""}
+      <pre class="log" id="tf-log">${tf.log.slice(-200).map(esc).join("\n")}</pre><div class="row"><button class="secondary" id="tf-cancel">Cancel</button></div>`;
+  } else {
+    const r = tf.result;
+    const list = (a) => `<ul class="small">${a.map((c) => `<li><code>${esc(c.name)}</code> ${esc(c.from || "–")} → ${esc(c.to || "removed")}</li>`).join("")}</ul>`;
+    const text = tf.error ? tf.error : r ? r.text : "";
+    const ok = !!r && r.ok === true && !tf.error;
+    body = `<div class="${ok ? "ok" : "err"}" id="tf-result">${esc(text)}</div>
+      ${r && r.changed && r.changed.length ? `<div class="small dim">Packages the installer changed:</div>${list(r.changed)}` : r && r.planned && r.planned.length ? `<div class="small dim">The installer would have changed:</div>${list(r.planned)}` : ""}
+      ${r && r.rolled_back ? `<p class="${r.rollback_ok ? "ok" : "err"} small">${r.rollback_ok ? "The previous version was put back and checked." : "The previous version could not be put back automatically."}</p>` : ""}
+      <details><summary>Log</summary><pre class="log">${tf.log.slice(-200).map(esc).join("\n")}</pre></details>
+      <div class="row"><button class="primary" id="tf-close">Close</button></div>`;
+  }
+  return `<div id="tf-dialog" class="tf-back" role="dialog" aria-modal="true" aria-label="${title}"><div class="tf-box"><h2>${title}</h2>${body}</div></div>`;
+}
+
+function wireTf() {
+  const on = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
+  on("tf-upgrade", () => tfAsk("upgrade"));
+  on("tf-update", () => tfAsk("upgrade"));
+  on("tf-back", () => tfAsk("back"));
+  on("tf-back2", () => tfAsk("back"));
+  on("tf-refresh", () => tfLoad());
+  on("tf-confirm", tfConfirm);
+  on("tf-dismiss", () => { tf.open = false; render(); });
+  on("tf-close", () => { tf.open = false; tf.stage = "confirm"; render(); });
+  on("tf-cancel", async () => { try { await invoke("env_cancel"); tf.step = "Stopping… (an install that was started is put back)"; render(); } catch (e) { alert(String(e)); } });
 }
