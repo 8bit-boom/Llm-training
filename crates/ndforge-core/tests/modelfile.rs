@@ -76,6 +76,13 @@ fn modelfile_and_create_body() {
     assert_eq!(b["parameters"]["top_p"], 0.95);
     let q = spec_for("qwen3_5", 8192);
     assert!(modelfile_text("m.gguf", &q, None).contains("PARAMETER stop \"<|im_end|>\"") && q.options.iter().any(|(k, v)| *k == "top_k" && *v == 20.0));
+    let inkling = spec_for("inkling2", 8192);
+    let inkling_mf = modelfile_text("inkling.gguf", &inkling, None);
+    assert!(inkling_mf.contains("PARAMETER temperature 1\n"));
+    assert!(inkling_mf.contains("PARAMETER top_p 1\n"));
+    assert!(inkling_mf.contains("PARAMETER top_k 0\n"));
+    assert!(inkling_mf.contains("PARAMETER min_p 0\n"));
+    assert!(inkling_mf.contains("PARAMETER num_ctx 8192\n"));
 }
 
 #[test]

@@ -84,6 +84,7 @@ Hugging Face discussions mention repetitive reasoning loops (#45, #48), which th
 1. **Measure** the experts once (minutes).
 2. **Try first** (about 20 passes): the baseline, fewer passes, fewer experts per token, 112/96/80/64 experts.
 3. For a smaller file: **128 to 96 experts**, make it, run the thinking check; if it passes, export without healing and compare the quants; if not, heal 20 M tokens and check again. Go to 64 only as a second stage with its own heal.
+   For a target of about 18 to 19 B parameters, 80 experts is the nearest standard count (about 17.2 B); 96 experts is a gentler cut at about 20.3 B.
 4. For speed: fewer experts per token first; fewer passes only if its error is small **and** the thinking check passes (expect to heal 40 to 80 M tokens), or start from the variable-loop research checkpoint.
 5. Export with llama.cpp b12611 or newer, an importance matrix adapted from the original's, Q4_K_M.
 
