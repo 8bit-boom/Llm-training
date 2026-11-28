@@ -5677,7 +5677,10 @@ function wireMoe() {
 function acMoeOn() { const i = acIns(); return !!(i && i.moe && i.moe.arch === "inkling2_loop"); }
 const acMoeQ4 = (params) => params * 0.61 / 1e9;
 function acMoeDefaultGb(ins) {
-  const row = (ins.moe.sizes || []).find((x) => x.experts === 96) || (ins.moe.sizes || [])[1];
+  // Inkling's nearest standard cut below 18-19B parameters is 80 experts
+  // (17.2B); 96 experts jumps to 20.3B. 96 remains the safer first cut
+  // because it removes fewer experts, and stays available in the table.
+  const row = (ins.moe.sizes || []).find((x) => x.experts === 80) || (ins.moe.sizes || []).find((x) => x.experts === 96) || (ins.moe.sizes || [])[1];
   return row ? Math.round(acMoeQ4(row.params) * 2) / 2 + 0.5 : 12;
 }
 function acMoeBlock(pl, live) {
@@ -5685,9 +5688,15 @@ function acMoeBlock(pl, live) {
   const sizes = (m.sizes || []).map((x) => acMoeQ4(x.params));
   const lo = Math.max(3, Math.floor(Math.min(...sizes) * 2) / 2), hi = Math.floor(Math.max(...sizes) * 0.97 * 2) / 2;
   const mi = pl && pl.moe;
+  const sizeNote = (m.sizes || []).length ? (() => {
+    const row = (n) => (m.sizes || []).find((x) => x.experts === n);
+    const c80 = row(80), c96 = row(96);
+    return c80 && c96 ? `<p class="dim small">Inkling cuts: 80 experts are about ${(c80.params / 1e9).toFixed(1)} B parameters (nearest to 18-19B); 96 experts are about ${(c96.params / 1e9).toFixed(1)} B and make a gentler 25% cut.</p>` : "";
+  })() : "";
   const row = (n, lbl, val) => `<label class="opt"><input type="radio" name="ac-goal" value="${n}" ${g.goal === n ? "checked" : ""} ${lock}> <strong>${lbl}</strong> <span class="dim small">${val}</span></label>`;
   const table = mi ? `<table class="tbl" id="ac-moe-table"><tr><th>Experts per layer</th><th>Q4_K_M file</th><th>Packed</th><th>Parameters</th><th>Stages</th></tr>${mi.table.map((r) => `<tr class="${r.experts === mi.experts_after ? "ac-pick" : ""}"><td>${r.experts}${r.experts === mi.experts_after ? " ◀" : ""}</td><td>${r.q4_gb} GB</td><td>${r.packed_gb} GB</td><td>${r.params_b} B</td><td>${r.stages || "–"}</td></tr>`).join("")}</table>` : "";
   return `<div id="ac-moe"><p><strong>Mixture of experts</strong>: ${m.experts} experts in each of ${ins.layers} layers, ${m.top_k} used per token; the middle layers run ${m.passes} times.</p>
+    ${sizeNote}
     ${row("size", "A smaller file", "(recommended): fewer experts per layer, so the finished GGUF fits a smaller card or leaves room for more context")}
     ${row("speed", "Faster answers", "fewer experts per token (Try first measures what it costs before it is used)")}
     ${row("quality", "A better model for my project", "cutting does not make it better: this one points you to training")}

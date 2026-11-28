@@ -23,6 +23,34 @@ const card = (b) => b.run("autoCard()");
 const plain = (x) => JSON.parse(JSON.stringify(x));
 const tick = () => new Promise((r) => setTimeout(r, 10));
 
+test("Inkling defaults to the nearest cut below 18-19B and keeps the 96-expert alternative", () => {
+  const b = browser();
+  const inkling = insp({
+    model_type: "inkling2_loop",
+    total_params: 26.38864128e9,
+    moe: {
+      arch: "inkling2_loop",
+      experts: 128,
+      top_k: 8,
+      passes: 3,
+      sizes: [
+        { experts: 128, params: 26.38864128e9 },
+        { experts: 112, params: 23.330108544e9 },
+        { experts: 96, params: 20.271575808e9 },
+        { experts: 80, params: 17.213043072e9 },
+        { experts: 64, params: 14.154510336e9 }
+      ]
+    }
+  });
+  open(b, {}, `ac.plan = ${JSON.stringify(plan())}`);
+  b.run(`rs.options = { inspect: ${JSON.stringify(inkling)}, options: [], width: null, width_options: null }; ac.moe.gb = null; acDefaults()`);
+  assert.equal(b.run("ac.moe.gb"), 11);
+  assert.equal(b.run("acMoeDefaultGb(acIns())"), 11);
+  assert.match(card(b), /Mixture of experts/);
+  assert.match(card(b), /nearest to 18-19B/);
+  assert.match(card(b), /96 experts are about 20\.3 B/);
+});
+
 test("the card has a size slider for the model, keep thinking on for Qwen3.5/3.8, two stages, and the plan once it is there", () => {
   const b = browser();
   open(b, {}, `ac.plan = ${JSON.stringify(plan())}`);
